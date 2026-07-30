@@ -454,20 +454,48 @@ fn not_enough_speech(windows: usize, seconds: f64) -> SpeakerNamingRefusal {
 ///
 /// Three things stack up, and leaving any of them out understates the answer:
 ///
-/// - naming counts the windows that *survive* main-cluster filtering, and that
-///   filter always discards a minority (the split is into two non-empty groups
-///   by construction, see [`evidence`]), so a turn has to plan one window more
-///   than the gate asks for;
+/// - naming counts the windows that *survive* main-cluster filtering, and a
+///   turn has to plan one window more than the gate asks for to cover the
+///   case where that filtering still discards one (see below -- this is no
+///   longer the *typical* case, but it remains the one this figure has to
+///   survive);
 /// - `n` overlapping windows span
 ///   `WINDOW_SECONDS + (n - 1) * WINDOW_STEP_SECONDS` of audio;
 /// - [`evidence::SEGMENT_EDGE_TRIM_SECONDS`] is charged at both ends of a turn
 ///   before windowing starts, so the turn must be that much longer again.
 ///
+/// # Why the "+1" margin is still charged, even though reclaim exists
+///
+/// Main-cluster filtering used to discard a minority unconditionally, so a
+/// planned-windows-minus-one margin was simply correct. It now reclaims that
+/// minority whenever the split lands at or under `evidence`'s
+/// `MIXED_MIN_SPLIT_DISTANCE` -- which real single-voice turns almost always
+/// do (measured 0.055-0.253 there) -- so *most* single-voice labels no longer
+/// lose anything here. The margin stays anyway, because reclaim is
+/// conditional on distance alone, not on label size, and a real single voice
+/// can still land above that distance by acoustic condition rather than
+/// identity (`evidence`'s module docs cite `R8001_M8004` `SPEAKER_00#0`: 95%
+/// one voice, split 0.80, never reclaimed). At the exact planned-window count
+/// this constant assumes (six), that particular escape does not exist yet --
+/// a six-window split can only be ruled single-voice through the same
+/// distance check that reclaims it, since one window out of six is already
+/// above the fraction floor that would otherwise excuse a large split
+/// distance -- so the bare minimum turn this constant describes clears with
+/// reclaim doing the work, not the margin. The margin is what keeps the
+/// *promise* correct for longer single-voice labels, where a large-enough
+/// window budget lets the fraction floor protect a label whose split distance
+/// reclaim does not reach. Removing it would make this figure a claim that
+/// happens to hold at the minimum length tested and silently stops holding
+/// past it -- exactly the kind of promise this constant exists to rule out.
+///
 /// The seconds gate is folded in with a `max` rather than assumed smaller, so
 /// retuning either constant keeps this honest, and
 /// `the_advertised_speech_length_is_long_enough_to_actually_clear_both_gates`
 /// runs the resulting figure through the real windowing rather than trusting
-/// this arithmetic.
+/// this arithmetic --
+/// `naming_still_clears_a_longer_single_voice_label_whose_minority_goes_unreclaimed`
+/// does the same for the case the margin exists for, where main-cluster
+/// filtering still discards a window despite a true single voice.
 const MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING: f64 = {
     let planned_windows = MIN_PURITY_VERDICT_WINDOWS as f64 + 1.0;
     let windowed_span = WINDOW_SECONDS + (planned_windows - 1.0) * evidence::WINDOW_STEP_SECONDS;
@@ -1179,6 +1207,36 @@ mod tests {
         &OneVoiceEmbedder
     }
 
+    /// One voice everywhere, except a window whose clip happens to start on a
+    /// marked sample, which embeds as a different voice instead.
+    ///
+    /// Models the real worst case `MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING`'s
+    /// margin defends: a genuine single voice whose windows still split, by
+    /// acoustic condition rather than identity, into a minority large-cluster
+    /// filtering keeps discarding. A single marked sample (rather than a
+    /// marked range) is enough and stays unambiguous even though windows
+    /// overlap: only the one window whose clip *starts* exactly on the mark
+    /// sees it as its first sample, because no other window starts there.
+    struct OneVoiceWithOneUnreclaimedOutlierWindow;
+
+    impl crate::diarize::embed::SpeakerEmbedder for OneVoiceWithOneUnreclaimedOutlierWindow {
+        fn embed(
+            &self,
+            samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+            Ok(if samples.first().copied().unwrap_or(0.0) > 0.5 {
+                SpeakerEmbedding::l2_normalized(vec![0.0, 1.0])
+            } else {
+                SpeakerEmbedding::l2_normalized(vec![1.0, 0.0])
+            })
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
     /// One label spanning `seconds` of continuous speech, with matching audio.
     fn one_speaker_scope(seconds: f32) -> (Vec<Segment>, Vec<f32>) {
         let segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
@@ -1190,9 +1248,16 @@ mod tests {
     /// The refusal itself is correct and stays -- what must not happen is the
     /// caller being told only "SPEAKER_01" with no way to distinguish this from
     /// a broken feature.
+    ///
+    /// 3.6s plans exactly one window (a second window needs 4.5s here), which
+    /// keeps this fixture meaningful regardless of main-cluster reclaim: with
+    /// only one window there is nothing for the AHC cut to split, so this is
+    /// the "never even reached two windows" shape of the refusal, not the
+    /// "lost one to the split" shape -- that one is exercised in
+    /// `naming_still_clears_a_longer_single_voice_label_whose_minority_goes_unreclaimed`.
     #[test]
     fn a_clip_too_short_to_judge_reports_how_short_it_was() {
-        let (mut segments, samples) = one_speaker_scope(4.27);
+        let (mut segments, samples) = one_speaker_scope(3.6);
         let unnamed = name_speakers_across_scopes_with(
             Some(one_voice_embedder()),
             &mut [SpeakerScope {
@@ -1225,10 +1290,10 @@ mod tests {
             "{seconds} vs {required_seconds}"
         );
         // The number a user is told to act on has to be one that works: the
-        // clip they were just refused for is 4.27s, so advice built from the
+        // clip they were just refused for is 3.6s, so advice built from the
         // 3.0s gate would send them back to fail again.
         assert!(
-            required_continuous_seconds > 4.27,
+            required_continuous_seconds > 3.6,
             "advice of {required_continuous_seconds}s would not have saved this clip"
         );
         // The gate is untouched: still anonymous, still no invented person.
@@ -1316,6 +1381,48 @@ mod tests {
                 SpeakerNamingRefusal::NotEnoughSpeech { .. }
             ),
             "a turn of the advertised length is still refused for being short: {:?}",
+            unnamed[0]
+        );
+    }
+
+    /// The case `MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING`'s "+1" margin
+    /// exists for: a genuinely single voice whose windows still split far
+    /// enough apart that main-cluster filtering does not reclaim the
+    /// minority, only surviving because the fraction floor
+    /// (`evidence::MIXED_MIN_SECOND_CLUSTER_FRACTION`) keeps the verdict at
+    /// single-voice regardless of that distance. This needs more than the bare
+    /// minimum window budget -- one window out of seven is the fewest that
+    /// clears the 0.15 fraction floor -- so it is a longer turn than the
+    /// advertised minimum, not the minimum itself; at the minimum's six
+    /// planned windows the fraction floor cannot excuse a distant split
+    /// (1/6 is already over 0.15), so reclaim is what clears the gate there
+    /// instead (see the previous test). Both paths have to work.
+    #[test]
+    fn naming_still_clears_a_longer_single_voice_label_whose_minority_goes_unreclaimed() {
+        // 7 planned windows: first=0.5, last=8.5, spanning 9.0s of turn.
+        let (mut segments, mut samples) = one_speaker_scope(9.0);
+        let marker_sample =
+            (evidence::SEGMENT_EDGE_TRIM_SECONDS * EMBEDDER_SAMPLE_RATE_HZ as f64) as usize;
+        samples[marker_sample] = 1.0;
+
+        let unnamed = name_speakers_across_scopes_with(
+            Some(&OneVoiceWithOneUnreclaimedOutlierWindow),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(unnamed.len(), 1, "{unnamed:?}");
+        assert!(
+            !matches!(
+                unnamed[0].reason,
+                SpeakerNamingRefusal::NotEnoughSpeech { .. }
+                    | SpeakerNamingRefusal::MixedVoices { .. }
+            ),
+            "a longer single-voice turn must still clear naming even when one \
+             window is never reclaimed: {:?}",
             unnamed[0]
         );
     }

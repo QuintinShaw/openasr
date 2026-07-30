@@ -46,8 +46,7 @@
 //! The same cut answers a second, *different* question -- is this label one
 //! person or two -- and it is essential that the two answers stay separate:
 //!
-//! - **The main cluster is the only source of centroid quality.** It is applied
-//!   unconditionally, whatever the verdict says.
+//! - **The main cluster is the only source of centroid quality.**
 //! - **The verdict only decides whether a name may be attached at all.**
 //!
 //! Collapsing these into one branch ("if mixed, do nothing") would make
@@ -60,6 +59,53 @@
 //! accepts* is still not poisoned: `R8001_M8004` `SPEAKER_03` slice 1 is 88%
 //! one speaker and passes as pure, and its main cluster is 92%. Two independent
 //! defences; the weaker one failing costs a name, not a wrong name.
+//!
+//! # When the split itself proves there is nothing to discard
+//!
+//! Filtering to the main cluster is not free: on a genuinely single-voice
+//! label it still throws away whatever the AHC cut calls the minority, purely
+//! because the cut is unconditional. For a short label that minority can be
+//! the difference between clearing [`MIN_PURITY_VERDICT_WINDOWS`] and not, so
+//! discarding it when nothing was gained is a pure loss, not a caution.
+//!
+//! [`MIXED_MIN_SPLIT_DISTANCE`] already answers "are these two clusters far
+//! enough apart to be two people" for the verdict; [`main_cluster`] asks the
+//! same geometric question and, when the answer is no, keeps every window
+//! instead of only the larger cluster. This does **not** collapse main-cluster
+//! filtering into the verdict: it consults only the distance, never
+//! [`MIXED_MIN_SECOND_CLUSTER_FRACTION`], so a label the verdict calls mixed on
+//! fraction grounds alone can still have its minority reclaimed if the two
+//! clusters are not actually far apart -- and conversely a label kept whole
+//! here can still fail the verdict's fraction gate and go unnamed. The two
+//! stay two decisions; they just now share the one measurement that is safe
+//! to share.
+//!
+//! Whether reusing the distance this way is safe rests entirely on the two
+//! populations not overlapping at 0.30, and that is measured, not assumed.
+//! Across the AliMeeting acceptance sessions and the ladder recordings this
+//! stage was validated on: labels confirmed single-voice by ground truth split
+//! at 0.055-0.253 whenever the split is what the verdict actually turns on
+//! (second cluster at or above [`MIXED_MIN_SECOND_CLUSTER_FRACTION`]); every
+//! label confirmed to genuinely contain two people splits no closer than
+//! 0.420. 0.30 sits in the gap with room on both sides -- about 0.05 below the
+//! highest confirmed-single split seen and 0.12 above the lowest
+//! confirmed-mixed one -- so reclaiming below it cannot let a real second
+//! speaker's windows back into a centroid. Reclaiming buys back exactly the
+//! windows a genuinely single voice was losing to an over-eager cut, at zero
+//! measured cost to the stitching distances the whole scheme exists to
+//! protect: three acceptance sessions' minimum different-speaker centroid
+//! distance held at 0.562 / 0.440 unchanged and rose from 0.471 to 0.481 on
+//! the third.
+//!
+//! A single-voice label whose split happens to land *above* 0.30 -- which
+//! happens; `R8001_M8004` `SPEAKER_00#0` is 95% one speaker and still splits
+//! at 0.80 -- gets no reclaim and keeps losing its minority exactly as before.
+//! That is intentional: the fraction gate ([`MIXED_MIN_SECOND_CLUSTER_FRACTION`])
+//! is what protects a label like that from being called mixed, and reclaiming
+//! on distance alone here would be reusing a signal past where it was shown
+//! safe. This is why `identity::MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING`
+//! still budgets for a minority being discarded rather than assuming reclaim
+//! always fires.
 
 use std::collections::BTreeMap;
 
@@ -157,6 +203,17 @@ const MIXED_MIN_SECOND_CLUSTER_FRACTION: f64 = 0.15;
 /// voice, split 0.224) -- which has four windows and so is refused a name by
 /// [`MIN_PURITY_VERDICT_WINDOWS`] anyway, and whose main cluster is 92% one
 /// speaker regardless. That is the two-defence structure working as intended.
+///
+/// [`main_cluster`] also reads this constant, for a related but distinct
+/// question: not "is this label mixed" (that also needs
+/// [`MIXED_MIN_SECOND_CLUSTER_FRACTION`]) but "does the split itself prove the
+/// second cluster is not a different person". Both questions are safe to
+/// answer off the same number because the same measurement backs both: see
+/// the module docs for why a 0.30 cut leaves room on both sides of the
+/// confirmed-single and confirmed-mixed populations. Any retuning of this
+/// constant moves both consumers at once, which is intended -- a value that
+/// stops being a safe mixed/single cutoff also stops being a safe reclaim
+/// cutoff, for the same reason.
 const MIXED_MIN_SPLIT_DISTANCE: f32 = 0.30;
 
 /// A label's windows, judged.
@@ -294,8 +351,12 @@ fn overlaps_another_label(window: &TimeRange, label: &str, ordered: &[(&str, Tim
 /// speakers converges to a perfectly stable blend under averaging, and only
 /// looking at the pairwise structure can see that it is a blend.
 pub(super) fn judge_windows(embeddings: &[SpeakerEmbedding], spans: &[TimeRange]) -> JudgedWindows {
-    let members = main_cluster(embeddings);
-    let single_voice = is_single_voice(embeddings);
+    // Computed once and handed to both consumers below: main-cluster filtering
+    // and the mixed-voice verdict ask two different questions of the same cut,
+    // and there is no reason to make the clusterer answer them separately.
+    let split = split_in_two(embeddings);
+    let members = main_cluster(embeddings, split.as_ref());
+    let single_voice = is_single_voice(embeddings, split.as_ref());
     let kept: Vec<SpeakerEmbedding> = members.iter().map(|&i| embeddings[i].clone()).collect();
     let kept_seconds = union_seconds(members.iter().filter_map(|&i| spans.get(i).copied()));
     JudgedWindows {
@@ -305,43 +366,72 @@ pub(super) fn judge_windows(embeddings: &[SpeakerEmbedding], spans: &[TimeRange]
     }
 }
 
-/// Indices of the larger of the two clusters the group splits into, in window
-/// order. Groups too small to split keep every window.
-fn main_cluster(embeddings: &[SpeakerEmbedding]) -> Vec<usize> {
-    let Some((main, _)) = split_in_two(embeddings) else {
+/// Indices of the windows main-cluster filtering keeps, in window order.
+///
+/// Ordinarily the larger of the two clusters the group splits into. Two
+/// situations keep every window instead: a group too small to split at all
+/// (`split` is `None`), and a group whose two clusters sit at or under
+/// [`MIXED_MIN_SPLIT_DISTANCE`] apart -- the clustering has itself proven the
+/// second cluster is not a different person, so discarding it would be a pure
+/// loss (see the module docs for why that distance-only check is safe to
+/// reuse here, and why it deliberately does not also consult
+/// [`MIXED_MIN_SECOND_CLUSTER_FRACTION`]).
+///
+/// `split` is the label's [`split_in_two`] result, computed once by
+/// [`judge_windows`] and shared with [`is_single_voice`].
+fn main_cluster(embeddings: &[SpeakerEmbedding], split: Option<&TwoClusterSplit>) -> Vec<usize> {
+    let Some(split) = split else {
         return (0..embeddings.len()).collect();
     };
-    main
+    if split
+        .distance
+        .is_some_and(|distance| distance <= MIXED_MIN_SPLIT_DISTANCE)
+    {
+        return (0..embeddings.len()).collect();
+    }
+    split.main.clone()
 }
 
-fn is_single_voice(embeddings: &[SpeakerEmbedding]) -> bool {
+/// Whether a group of windows passed as a single voice. See [`main_cluster`]
+/// for the `split` parameter.
+fn is_single_voice(embeddings: &[SpeakerEmbedding], split: Option<&TwoClusterSplit>) -> bool {
     if embeddings.len() < MIN_PURITY_VERDICT_WINDOWS {
         // Too few windows for the split to carry information. Reporting "single
         // voice" here is safe only because naming separately requires more
         // evidence than this; the verdict on its own never grants a name.
         return true;
     }
-    let Some((main, second)) = split_in_two(embeddings) else {
+    let Some(split) = split else {
         return true;
     };
-    let second_fraction = second.len() as f64 / embeddings.len() as f64;
+    let second_fraction = split.second.len() as f64 / embeddings.len() as f64;
     if second_fraction < MIXED_MIN_SECOND_CLUSTER_FRACTION {
         return true;
     }
-    let (Some(main_centroid), Some(second_centroid)) = (
-        centroid(main.iter().map(|&i| &embeddings[i])),
-        centroid(second.iter().map(|&i| &embeddings[i])),
-    ) else {
+    let Some(distance) = split.distance else {
         return true;
     };
-    let split_distance = 1.0 - main_centroid.cosine(&second_centroid);
-    split_distance <= MIXED_MIN_SPLIT_DISTANCE
+    distance <= MIXED_MIN_SPLIT_DISTANCE
 }
 
-/// `(larger, smaller)` member indices, each in window order. `None` when the
-/// group cannot be cut in two at all (fewer than two windows, or the clusterer
-/// could not separate them).
-fn split_in_two(embeddings: &[SpeakerEmbedding]) -> Option<(Vec<usize>, Vec<usize>)> {
+/// A label's windows cut into exactly two clusters, plus the one distance
+/// [`main_cluster`] and [`is_single_voice`] both read.
+struct TwoClusterSplit {
+    /// Larger cluster's member indices, in window order.
+    main: Vec<usize>,
+    /// Smaller cluster's member indices, in window order.
+    second: Vec<usize>,
+    /// Cosine distance between the two clusters' centroids. `None` only if a
+    /// centroid could not be computed at all (an embedding-dimension
+    /// mismatch); not expected in practice, and treated as "not proven safe"
+    /// by both consumers rather than panicking on it.
+    distance: Option<f32>,
+}
+
+/// Cut a label's windows into exactly two clusters and measure how far apart
+/// they are. `None` when the group cannot be cut in two at all (fewer than
+/// two windows, or the clusterer could not separate them).
+fn split_in_two(embeddings: &[SpeakerEmbedding]) -> Option<TwoClusterSplit> {
     use crate::diarize::clustering::{AgglomerativeClusterer, SpeakerClusterer};
 
     if embeddings.len() < 2 {
@@ -366,7 +456,20 @@ fn split_in_two(embeddings: &[SpeakerEmbedding]) -> Option<(Vec<usize>, Vec<usiz
     let mut groups = groups.into_iter();
     let main = groups.next()?;
     let second = groups.next()?;
-    Some((main, second))
+    let distance = match (
+        centroid(main.iter().map(|&i| &embeddings[i])),
+        centroid(second.iter().map(|&i| &embeddings[i])),
+    ) {
+        (Some(main_centroid), Some(second_centroid)) => {
+            Some(1.0 - main_centroid.cosine(&second_centroid))
+        }
+        _ => None,
+    };
+    Some(TwoClusterSplit {
+        main,
+        second,
+        distance,
+    })
 }
 
 /// Equal-weight mean of L2-normalized embeddings, re-normalized.
@@ -629,18 +732,89 @@ mod tests {
         assert!(centroid.cosine(&voice(0.0)) > 0.99);
     }
 
-    /// The split always takes something away, so a group sitting exactly on the
-    /// verdict floor cannot supply that many survivors. Naming therefore needs a
-    /// group with room to spare, which is the intended reading of the constant
-    /// and the reason it is documented as binding after the split.
+    /// A group sitting exactly on the verdict floor, all of it one tight voice:
+    /// the split still runs, but its own distance proves the minority is not a
+    /// second person, so nothing is thrown away. This is the reclaim this
+    /// stage exists for -- before it existed, a genuinely single voice this
+    /// short always lost a window here and could not clear
+    /// [`MIN_PURITY_VERDICT_WINDOWS`] regardless of how much more it spoke.
     #[test]
-    fn a_group_at_the_verdict_floor_cannot_supply_that_many_pure_windows() {
+    fn a_group_at_the_verdict_floor_keeps_every_window_when_the_split_proves_it_single() {
         let embeddings: Vec<SpeakerEmbedding> = (0..MIN_PURITY_VERDICT_WINDOWS)
             .map(|i| voice(i as f32 * 0.02))
             .collect();
         let judged = judge_windows(&embeddings, &spans(MIN_PURITY_VERDICT_WINDOWS));
         assert!(judged.single_voice);
-        assert!(judged.kept.len() < MIN_PURITY_VERDICT_WINDOWS);
+        assert_eq!(
+            judged.kept.len(),
+            MIN_PURITY_VERDICT_WINDOWS,
+            "the split distance here is far under the reclaim gate, so nothing should be discarded"
+        );
+    }
+
+    /// The other side of the same gate: a split whose distance sits above
+    /// [`MIXED_MIN_SPLIT_DISTANCE`] still loses its minority exactly as before
+    /// V3, even though the fraction floor calls the group single-voice. This
+    /// pins the reclaim as conditional, not unconditional -- V1's mistake.
+    #[test]
+    fn main_cluster_still_discards_the_minority_when_the_split_is_far_apart() {
+        let mut embeddings: Vec<SpeakerEmbedding> = (0..10).map(|_| voice(0.0)).collect();
+        embeddings[9] = voice(1.2); // 1 - cos(1.2) = 0.638, comfortably over 0.30
+        let judged = judge_windows(&embeddings, &spans(10));
+        assert!(
+            judged.single_voice,
+            "1 of 10 is below the second-cluster fraction floor"
+        );
+        assert_eq!(
+            judged.kept.len(),
+            9,
+            "the split lands well above the reclaim gate, so the outlier must still be dropped"
+        );
+    }
+
+    /// The reclaim gate is inclusive: exactly at [`MIXED_MIN_SPLIT_DISTANCE`]
+    /// the minority comes back, same as strictly under it. `1 - cos(angle) =
+    /// 0.30` at `angle = acos(0.70)`.
+    #[test]
+    fn main_cluster_reclaims_a_split_exactly_at_the_gate() {
+        let angle = 0.7_f32.acos();
+        let mut embeddings: Vec<SpeakerEmbedding> = (0..8).map(|_| voice(0.0)).collect();
+        embeddings[6] = voice(angle);
+        embeddings[7] = voice(angle);
+        let judged = judge_windows(&embeddings, &spans(8));
+        assert_eq!(
+            judged.kept.len(),
+            8,
+            "a split distance of exactly 0.30 must still be reclaimed (<=, not <)"
+        );
+    }
+
+    /// The efficiency change this stage also makes: `main_cluster` and
+    /// `is_single_voice` used to each cut the same windows into two clusters
+    /// independently. They now share one [`split_in_two`] call. Because the
+    /// clusterer is deterministic, calling it a second time on the same
+    /// embeddings must reproduce the exact same groups and distance --
+    /// otherwise sharing one call instead of two could have silently changed
+    /// what either consumer saw.
+    #[test]
+    fn split_in_two_is_deterministic_so_sharing_one_call_changes_nothing() {
+        let embeddings: Vec<SpeakerEmbedding> = (0..10)
+            .map(|i| if i % 2 == 0 { voice(0.0) } else { voice(1.2) })
+            .collect();
+        let first = split_in_two(&embeddings).expect("splits into two clusters");
+        let second = split_in_two(&embeddings).expect("splits into two clusters");
+        assert_eq!(first.main, second.main);
+        assert_eq!(first.second, second.second);
+        assert_eq!(first.distance, second.distance);
+
+        // And the two independent consumers, each fed that one shared split,
+        // must land on the answers the old two-call version was measured to
+        // give for this exact fixture (see
+        // `an_alternating_two_voice_group_is_not_single_voice`): mixed, main
+        // cluster only.
+        let judged = judge_windows(&embeddings, &spans(10));
+        assert!(!judged.single_voice);
+        assert_eq!(judged.kept.len(), first.main.len());
     }
 
     /// Below the group size where a two-way split means anything, no verdict is
