@@ -2489,6 +2489,7 @@ impl IntoResponse for ApiError {
                     | openasr_core::BackendError::ExecutionDeviceNotFound { .. }
                     | openasr_core::BackendError::ExecutionDeviceNotAddressable { .. }
                     | openasr_core::BackendError::ExecutionDeviceInitFailed { .. }
+                    | openasr_core::BackendError::NativeInsufficientHostMemory { .. }
                     | openasr_core::BackendError::NativeFailClosed { .. } => {
                         // Native backend "fail-closed" is a deliberate, client-facing
                         // refusal (unexecutable/unsupported request or unusable pack),

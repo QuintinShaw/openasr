@@ -775,6 +775,10 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::ExecutionDeviceInitFailed { .. } => FailureCategory::UnsupportedCapability,
         BackendError::TranscriptionCanceled => FailureCategory::Canceled,
         BackendError::ServeBatchUnavailable { .. } => FailureCategory::Transient,
+        // A pre-emptive admission rejection of the same failure class the
+        // raw ggml allocation error represents (issue #159), just caught
+        // before the graph build instead of during it.
+        BackendError::NativeInsufficientHostMemory { .. } => FailureCategory::Alloc,
         BackendError::NativeFailClosed { .. }
             if gpu_buffer_allocation_failure_backend(error).is_some() =>
         {
@@ -1212,6 +1216,20 @@ fn run_native_transcription_impl(
 
     let dispatch = shared_native_ggml_execution_dispatch();
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
+    // Reject before any decode graph gets built if this request's decoder KV
+    // footprint plainly does not fit this host's memory budget (issue #159:
+    // a large pack on a small-RAM machine surfacing as an opaque
+    // "ggml cpu graph backend buffer allocation failed" instead of an
+    // actionable error). Shared by CLI and server -- both funnel through this
+    // function -- and runs before `resolve_native_longform_policy` /
+    // dispatch, i.e. before the real graph build, not in the server route
+    // layer (which the CLI never goes through).
+    enforce_native_host_memory_admission(
+        selected_family.model_architecture,
+        &runtime_preflight.metadata,
+        runtime_source.path(),
+        audio_duration_seconds,
+    )?;
     let longform_resolution = resolve_native_longform_policy(
         request.longform.as_ref(),
         audio_duration_seconds,
@@ -2103,6 +2121,115 @@ fn apply_speaker_turns(
         }
     }
     transcription
+}
+
+/// This request's decoder KV admission facts for
+/// `moss-transcribe-diarize` -- the only family whose frontend audio-token
+/// rate is actually derived and pinned today (see `crate::capacity`'s
+/// frontend registry doc comment: the other four `Derived` families,
+/// qwen3-asr, firered-llm, mimo-asr, cohere-transcribe, still only carry a
+/// `PackCarried` provenance placeholder, not a computed rate). `None` means
+/// this family stays admission-unchecked this round -- opt-in, matching
+/// `CapacityModelDeclaration`'s own philosophy, not an oversight; wiring a
+/// family here without a real derived rate would either guess (risking a
+/// false rejection) or check nothing, so it is left for that family's own
+/// frontend-geometry follow-up.
+fn moss_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+) -> Option<(
+    crate::capacity::KvGeometry,
+    crate::nn::decoder::LlmKvCacheSpec,
+    usize,
+)> {
+    let decoder =
+        crate::models::moss_transcribe_diarize::runtime_contract::parse_decoder_metadata(metadata)
+            .ok()?;
+    let adaptor =
+        crate::models::moss_transcribe_diarize::runtime_contract::parse_adaptor_metadata(metadata)
+            .ok()?;
+    let derivation =
+        crate::models::moss_transcribe_diarize::capacity::moss_td_integral_window_derivation(
+            &decoder,
+            adaptor.merge_size,
+        );
+    if !derivation.chunk_seconds.is_finite() || derivation.chunk_seconds <= 0.0 {
+        return None;
+    }
+    // `ScopedSlices` guarantees no single decode ever spans more than the
+    // family's own machine-independent integral window, however long the
+    // recording is -- clamp the admission estimate there so a multi-hour
+    // recording is judged by what one decode actually needs, not by its
+    // full length. Falls back to one chunk's worth if the derivation itself
+    // cannot resolve an integral window (degenerate pack metadata; the
+    // family's own request-time gate fails closed on that separately).
+    let integral_seconds =
+        crate::capacity::derive_integral_seconds(&derivation).unwrap_or(derivation.chunk_seconds);
+    let admission_seconds = audio_duration_seconds
+        .max(0.0)
+        .min(integral_seconds.max(derivation.chunk_seconds));
+    let chunks = (admission_seconds / derivation.chunk_seconds)
+        .ceil()
+        .max(1.0);
+    if !chunks.is_finite() {
+        return None;
+    }
+    let required_positions = derivation.required_positions_for_chunks(chunks as usize);
+    let geometry = crate::models::moss_transcribe_diarize::capacity::moss_td_kv_geometry(&decoder);
+    // This family's whole-decoder never opts into the Q8_0 KV policy (only
+    // qwen3-asr's own executor calls `resolve_production_llm_kv_cache_policy`);
+    // moss's `Qwen3AsrLlmWholeDecoderGraphExecutor` construction never calls
+    // `set_kv_cache_policy`, so it always runs at
+    // `LlmKvCacheSpec::DEFAULT` -- the family's actual runtime fact, not a
+    // worst-case guess.
+    Some((
+        geometry,
+        crate::nn::decoder::LlmKvCacheSpec::DEFAULT,
+        required_positions,
+    ))
+}
+
+/// Reject this request before building its decode graph if its decoder KV
+/// footprint plainly does not fit this host's memory budget (issue #159's
+/// root cause class: a large pack on a small-RAM machine surfacing as an
+/// opaque `ggml cpu graph backend buffer allocation failed` instead of an
+/// actionable error). Fails OPEN whenever the answer is uncertain rather than
+/// definite -- an unresolvable family, unprobeable host RAM, or an unreadable
+/// pack file all fall through to "allow" (`crate::capacity`'s invariant:
+/// refuse only when certain it will not fit; the worst case is then no worse
+/// than today's raw ggml error).
+fn enforce_native_host_memory_admission(
+    model_architecture: &str,
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    pack_path: &Path,
+    audio_duration_seconds: f32,
+) -> Result<(), BackendError> {
+    if model_architecture != crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
+        return Ok(());
+    }
+    let Some((geometry, spec, required_positions)) =
+        moss_native_capacity_admission_facts(metadata, audio_duration_seconds)
+    else {
+        return Ok(());
+    };
+    let Some(host_total_memory_bytes) = crate::host::host_total_memory_bytes() else {
+        return Ok(());
+    };
+    let Ok(pack_metadata) = std::fs::metadata(pack_path) else {
+        return Ok(());
+    };
+    if let Err(rejection) = crate::capacity::evaluate_host_memory_admission(
+        &geometry,
+        spec,
+        required_positions,
+        pack_metadata.len(),
+        host_total_memory_bytes,
+    ) {
+        return Err(BackendError::NativeInsufficientHostMemory {
+            reason: rejection.user_message(),
+        });
+    }
+    Ok(())
 }
 
 fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch {
@@ -3059,6 +3186,98 @@ mod tests {
             SpeakerPlan::InDecoder
         );
         assert_eq!(SpeakerPlan::resolve(true, External), SpeakerPlan::External);
+    }
+
+    /// Synthetic GGUF metadata carrying the real shipped checkpoint's decoder
+    /// and adaptor facts (`moss_transcribe_diarize::capacity::shipped_pack_decoder_fixture`
+    /// and `SHIPPED_MERGE_SIZE`), so this test exercises the same dispatch
+    /// (`moss_native_capacity_admission_facts`) production reads real pack
+    /// metadata through, deterministically and without a real pack file.
+    fn moss_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+        use crate::models::moss_transcribe_diarize::runtime_contract::*;
+
+        let mut values = std::collections::BTreeMap::new();
+        for (key, value) in [
+            (LLM_N_LAYERS_KEY, 28u64),
+            (LLM_D_MODEL_KEY, 1024),
+            (LLM_FFN_DIM_KEY, 3072),
+            (LLM_N_HEADS_KEY, 16),
+            (LLM_N_KV_HEADS_KEY, 8),
+            (LLM_HEAD_DIM_KEY, 128),
+            (LLM_VOCAB_SIZE_KEY, 151_936),
+            (LLM_MAX_POSITIONS_KEY, 131_072),
+            (LLM_AUDIO_START_TOKEN_ID_KEY, 151_669),
+            (LLM_AUDIO_END_TOKEN_ID_KEY, 151_670),
+            (LLM_AUDIO_PAD_TOKEN_ID_KEY, 151_671),
+            (ADAPTOR_MERGE_SIZE_KEY, 4),
+            (ADAPTOR_INPUT_DIM_KEY, 1280),
+        ] {
+            values.insert(key.to_string(), V::U64(value));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// The dispatch a real request goes through (`moss_native_capacity_admission_facts`)
+    /// reproduces the same required-positions arithmetic
+    /// `moss_transcribe_diarize::capacity`'s own regression anchors pin,
+    /// clamped at the family's machine-independent 300s integral window
+    /// however long the recording actually is (issue #159's shape needs the
+    /// worst case a single decode ever spans, not the whole file's length).
+    #[test]
+    fn moss_capacity_admission_facts_match_the_pinned_derivation() {
+        let metadata = moss_shipped_pack_metadata_for_test();
+
+        // A short recording costs far fewer positions than the ceiling.
+        let (short_geometry, short_spec, short_positions) =
+            moss_native_capacity_admission_facts(&metadata, 11.04)
+                .expect("shipped-shaped metadata must derive admission facts");
+        assert_eq!(
+            short_geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 28,
+                kv_heads: 8,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(short_spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
+        // Cross-check against the same derivation function, called directly
+        // on the fixture the capacity module's own regression anchors use --
+        // not a hand-computed magic number.
+        let derivation =
+            crate::models::moss_transcribe_diarize::capacity::moss_td_integral_window_derivation(
+                &crate::models::moss_transcribe_diarize::capacity::shipped_pack_decoder_fixture(),
+                crate::models::moss_transcribe_diarize::capacity::SHIPPED_MERGE_SIZE,
+            );
+        assert_eq!(short_positions, derivation.required_positions_for_chunks(1));
+
+        // A multi-hour recording is clamped at the 300s integral window (10
+        // chunks -> 7806 positions, the same number
+        // `required_positions_walks_the_moss_window_from_both_sides` pins in
+        // `crate::capacity`'s own tests) rather than judged by its full length.
+        let (_, _, long_positions) = moss_native_capacity_admission_facts(&metadata, 3600.0)
+            .expect("shipped-shaped metadata must derive admission facts");
+        assert_eq!(long_positions, 7806);
+        assert!(short_positions < long_positions);
+    }
+
+    /// A family this round has not wired (its frontend audio-token rate is
+    /// still an unresolved `PackCarried` placeholder, see
+    /// `crate::capacity`'s frontend registry) must return `None`, not guess --
+    /// opt-in, not a blanket check.
+    #[test]
+    fn enforce_native_host_memory_admission_skips_unwired_families() {
+        let metadata = moss_shipped_pack_metadata_for_test();
+        assert!(
+            enforce_native_host_memory_admission(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                &metadata,
+                Path::new("/nonexistent/does-not-matter.oasr"),
+                3600.0,
+            )
+            .is_ok(),
+            "an unwired family must be allowed through unconditionally, not guessed at"
+        );
     }
 
     /// End of the chain for a moss-shaped decode: the family descriptor picks

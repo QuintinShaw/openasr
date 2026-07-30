@@ -1008,6 +1008,10 @@ pub enum BackendError {
         "Word-timestamp alignment refinement failed: {reason}\nThe request was rejected instead of returning approximate timestamps silently relabeled as aligned."
     )]
     WordTimestampAlignmentFailed { reason: String },
+    #[error(
+        "Native ASR Core rejected this request before building its decode graph: this host does not have enough memory for it.\n{reason}"
+    )]
+    NativeInsufficientHostMemory { reason: String },
 }
 
 impl BackendError {

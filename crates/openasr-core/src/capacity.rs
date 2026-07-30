@@ -447,6 +447,108 @@ pub(crate) fn derive_integral_seconds(derivation: &IntegralWindowDerivation) -> 
     largest_fitting.map(|chunks| chunks as f32 * derivation.chunk_seconds)
 }
 
+/// A family's decoder KV footprint for THIS request clearly does not fit this
+/// host's memory budget -- the reject-not-degrade admission outcome (design
+/// review 2026-07-27, point A: refuse rather than silently reslice/requant,
+/// which would make the same recording produce a different transcript on a
+/// 16 GiB machine than on a 64 GiB one). Every field the caller needs to
+/// render both a compact machine-readable trailer and a human paragraph is
+/// kept here rather than collapsed to a bool, so `Display` never has to be
+/// reverse-engineered by a test asserting on message text alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostMemoryCapacityRejection {
+    /// KV bytes at `required_positions` plus the pack's own on-disk bytes --
+    /// the two quantities [`evaluate_host_memory_admission`] actually knows.
+    pub needed_bytes: u64,
+    /// `host_total_memory_bytes * 3/4` (`crate::host::host_memory_budget_bytes`).
+    pub budget_bytes: u64,
+    pub host_total_memory_bytes: u64,
+    pub pack_bytes_on_disk: u64,
+    pub required_positions: usize,
+}
+
+impl HostMemoryCapacityRejection {
+    /// Compact `key:value,k=v,...` trailer, the same shape the
+    /// `core.native.longform.policy:...` provenance strings already use
+    /// elsewhere in this crate -- the full arithmetic a bug report needs,
+    /// in one line.
+    pub(crate) fn provenance(&self) -> String {
+        format!(
+            "core.native.capacity.admission:reject,needed_bytes={},budget_bytes={},host_total_memory_bytes={},pack_bytes_on_disk={},required_positions={}",
+            self.needed_bytes,
+            self.budget_bytes,
+            self.host_total_memory_bytes,
+            self.pack_bytes_on_disk,
+            self.required_positions,
+        )
+    }
+
+    /// User-facing English paragraph: what this request needed, what this
+    /// host offers, and what to try instead -- a clear error is not enough on
+    /// its own (the bar is "the user knows the next step"), and mirrors the
+    /// numbers-plus-suggestion shape `firered_llm::executor`'s existing
+    /// pack-does-not-fit-this-host's-budget message already uses.
+    pub(crate) fn user_message(&self) -> String {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        format!(
+            "This request needs about {needed_gib:.1} GiB (the model pack plus its decode \
+             context for {positions} decoder positions), but this host's admission budget is \
+             only {budget_gib:.1} GiB ({host_gib:.1} GiB total RAM x 75%).\n\
+             Try a smaller quantization (q8_0 or q4_k instead of fp16), a smaller model, or \
+             close other memory-heavy applications and retry.\n\
+             The request was rejected before building the decode graph, instead of failing \
+             later with an opaque ggml allocation error.\n\
+             {provenance}",
+            needed_gib = self.needed_bytes as f64 / GIB,
+            positions = self.required_positions,
+            budget_gib = self.budget_bytes as f64 / GIB,
+            host_gib = self.host_total_memory_bytes as f64 / GIB,
+            provenance = self.provenance(),
+        )
+    }
+}
+
+/// Evaluate whether `required_positions` decoder positions at `spec` for
+/// `geometry`, alongside `pack_bytes_on_disk` already resident from the
+/// mmap'd pack file, fit this host's memory budget
+/// (`crate::host::host_memory_budget_bytes`: 75% of total RAM, never
+/// `host_available_memory_bytes` -- see this module's invariants and
+/// `host_available_memory_bytes`'s own doc comment forbidding admission use).
+///
+/// Fails OPEN on a degenerate geometry (`kv_bytes_at_positions` erring):
+/// geometry validity is enforced elsewhere (pack import), not here, and
+/// "uncertain" always resolves to "allow" per invariant 1 -- refusing only
+/// when certain it will not fit. Deliberately omits any reserve for encoder
+/// activations / mel / compute graph beyond the two quantities exactly known
+/// here: inventing a family-general "working set" constant with no measured
+/// figure to draw from would either be large enough to risk rejecting a
+/// request that would actually fit (the one outcome invariant 1 forbids) or
+/// small enough not to matter, so the 25% of total memory the 75% budget
+/// already sets aside is left to cover it instead of a second guessed number.
+pub(crate) fn evaluate_host_memory_admission(
+    geometry: &KvGeometry,
+    spec: LlmKvCacheSpec,
+    required_positions: usize,
+    pack_bytes_on_disk: u64,
+    host_total_memory_bytes: u64,
+) -> Result<(), HostMemoryCapacityRejection> {
+    let Ok(kv_bytes) = kv_bytes_at_positions(geometry, spec, required_positions) else {
+        return Ok(());
+    };
+    let needed_bytes = kv_bytes.total().saturating_add(pack_bytes_on_disk);
+    let budget_bytes = crate::host::host_memory_budget_bytes(host_total_memory_bytes);
+    if needed_bytes <= budget_bytes {
+        return Ok(());
+    }
+    Err(HostMemoryCapacityRejection {
+        needed_bytes,
+        budget_bytes,
+        host_total_memory_bytes,
+        pack_bytes_on_disk,
+        required_positions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,5 +749,89 @@ mod tests {
         // The window still lands on 300s: 3836 + 3810 = 7646 <= 8192 and
         // 330s = (86 + 4125) + 4096 = 8307 > 8192.
         assert_eq!(derive_integral_seconds(&derivation), Some(300.0));
+    }
+
+    /// The #159 shape: a multi-gigabyte pack on a host whose budget cannot
+    /// possibly hold it, independent of how many KV positions the request
+    /// needs -- the pack bytes alone (qwen3-asr-1.7b's real shipped fp16
+    /// size) already exceed a 1 GiB host's 75% budget. Reproduces the
+    /// scenario with an injected test-constructed budget rather than a real
+    /// 16 GiB machine.
+    #[test]
+    fn host_memory_admission_rejects_a_pack_that_plainly_does_not_fit_a_tiny_host() {
+        let geometry = moss_geometry();
+        let tiny_host_total_memory_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB
+        let oversized_pack_bytes_on_disk: u64 = 4_704_801_920; // qwen3-asr-1.7b fp16 .oasr
+        let rejection = evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            512,
+            oversized_pack_bytes_on_disk,
+            tiny_host_total_memory_bytes,
+        )
+        .expect_err("a multi-GiB pack cannot fit a 1 GiB host's budget");
+        assert_eq!(
+            rejection.budget_bytes,
+            crate::host::host_memory_budget_bytes(tiny_host_total_memory_bytes)
+        );
+        assert!(rejection.needed_bytes > rejection.budget_bytes);
+
+        let message = rejection.user_message();
+        assert!(message.contains("needs about"), "{message}");
+        assert!(message.contains("admission budget is only"), "{message}");
+        assert!(message.contains("Try a smaller quantization"), "{message}");
+        assert!(
+            message.contains("core.native.capacity.admission:reject"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("needed_bytes={}", rejection.needed_bytes)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("budget_bytes={}", rejection.budget_bytes)),
+            "{message}"
+        );
+    }
+
+    /// Reverse case: the family's own worst-case ceiling (8192 positions,
+    /// `DEFAULT` policy) plus a modest pack size must still fit the repo's own
+    /// 8 GiB min-spec floor -- the same fact
+    /// `declared_position_cap_fits_min_spec_budget_under_every_policy` in
+    /// `moss_transcribe_diarize::capacity` already pins, exercised here
+    /// through the admission function a real request calls rather than the
+    /// raw KV arithmetic. Currently-working combos on a min-spec machine must
+    /// stay working.
+    #[test]
+    fn host_memory_admission_allows_the_shipped_worst_case_on_a_min_spec_host() {
+        let geometry = moss_geometry();
+        let modest_pack_bytes_on_disk: u64 = 1_500_000_000; // ~1.4 GiB, a q4_k-class pack
+        evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            8192,
+            modest_pack_bytes_on_disk,
+            crate::host::MIN_SPEC_TOTAL_MEMORY_BYTES,
+        )
+        .expect(
+            "the shipped worst-case ceiling plus a modest pack must fit the 8 GiB min-spec budget",
+        );
+    }
+
+    /// Fail open, not closed: a degenerate geometry is a different question
+    /// (`kv_bytes_per_position` already rejects it at pack-import time), so
+    /// admission must not ALSO refuse on it -- "uncertain" resolves to
+    /// "allow" per invariant 1.
+    #[test]
+    fn host_memory_admission_fails_open_on_degenerate_geometry() {
+        let degenerate = KvGeometry {
+            n_layers: 0,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        assert!(
+            evaluate_host_memory_admission(&degenerate, LlmKvCacheSpec::DEFAULT, 8192, 0, 1024)
+                .is_ok()
+        );
     }
 }
