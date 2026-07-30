@@ -1060,6 +1060,7 @@ impl MossTdGgmlExecutor {
             .into_decode_truncation(normalized.truncated_at_seconds);
         let transcription = Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             segments: normalized.segments,
             text: normalized.text,
             longform: None,

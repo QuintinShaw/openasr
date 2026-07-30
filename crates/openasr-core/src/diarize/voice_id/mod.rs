@@ -9,6 +9,7 @@ mod evidence;
 mod identity;
 mod ids;
 mod matcher;
+mod naming;
 mod prototypes;
 mod quality;
 mod service;
@@ -26,6 +27,7 @@ pub use identity::{
 };
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
+pub use naming::{SpeakerNamingRefusal, UnnamedSpeaker};
 pub use prototypes::{
     DEFAULT_CLUSTER_COSINE_DISTANCE, MAX_PROTOTYPES_PER_PERSON, PrototypeSample,
     build_person_prototypes, score_prototype,

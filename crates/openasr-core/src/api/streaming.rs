@@ -520,6 +520,7 @@ impl StreamingSession {
         let language = ordered.iter().find_map(|segment| segment.language.clone());
         Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text,
             segments,
             longform: None,

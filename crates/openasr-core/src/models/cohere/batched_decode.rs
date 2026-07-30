@@ -569,6 +569,7 @@ impl CohereBatchSlot {
         Ok(CohereDecoderGraphDecodeOutput {
             transcription: Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text,
                 segments,
                 longform: None,

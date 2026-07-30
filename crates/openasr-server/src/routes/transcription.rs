@@ -543,6 +543,7 @@ mod truncated_header_tests {
                     },
                 })
                 .collect(),
+            unnamed_speakers: Vec::new(),
         }
     }
 

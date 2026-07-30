@@ -736,6 +736,7 @@ pub(crate) mod source_tree_audit {
                 Ok(GgmlAsrExecutionResult {
                     transcription: crate::Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,

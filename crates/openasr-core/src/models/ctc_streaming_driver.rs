@@ -379,6 +379,7 @@ mod tests {
             Box::new(|audio| {
                 Ok(Transcription {
                     truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
                     text: format!("final{}", audio.samples_f32.len()),
                     segments: Vec::new(),
                     longform: None,
@@ -418,6 +419,7 @@ mod tests {
             Box::new(|audio| {
                 Ok(Transcription {
                     truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
                     text: format!("final{}", audio.samples_f32.len()),
                     segments: Vec::new(),
                     longform: None,
@@ -510,6 +512,7 @@ mod tests {
                     Ok(GgmlAsrExecutionResult {
                         transcription: Transcription {
                             truncated_decodes: Vec::new(),
+                            unnamed_speakers: Vec::new(),
                             text: String::new(),
                             segments: Vec::new(),
                             longform: None,

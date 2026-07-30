@@ -1363,6 +1363,7 @@ fn run_native_transcription_impl(
         if plan.slices.is_empty() {
             return Ok(Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: String::new(),
                 segments: Vec::new(),
                 longform: Some(build_longform_metadata(
@@ -1834,7 +1835,19 @@ fn finalize_native_transcription(
             speaker_scope_starts,
             prepared_audio,
         );
-        crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes)?;
+        let unnamed = crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes)?;
+        transcription.unnamed_speakers = unnamed;
+    } else {
+        // The external VAD + speaker-embedder pass judged its own speakers
+        // before the transcript existed; carry its refusals through the same
+        // field so a caller never has to know which segmentation source ran to
+        // find out why a speaker is anonymous. Filtered to the labels the
+        // finished transcript actually spells, matching the in-decoder path:
+        // a turn that ended up covering no segment is not a speaker the user
+        // can see, so reporting it would be reporting a label that is not
+        // there.
+        transcription.unnamed_speakers =
+            retain_visible_unnamed_speakers(speaker_turns.unnamed.clone(), &transcription.segments);
     }
     // Stamped after the body is assembled and before the transcript leaves the
     // engine, on every exit path: the per-decode results this run consumed are
@@ -1926,6 +1939,31 @@ struct SpeakerAttribution {
         crate::diarize::contract::SpeakerId,
         crate::diarize::enrollment::SpeakerDisplayAssignment,
     >,
+    /// Speakers this pass clustered but could not name, and why. The
+    /// counterpart of `identities`: between them they account for every
+    /// clustered speaker, so "anonymous" is never left unexplained.
+    unnamed: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
+}
+
+/// Drop refusals for labels the finished transcript does not spell, and for
+/// labels that ended up named after all.
+///
+/// The report is a statement about what the reader can see, so it is derived
+/// from the segments rather than from whatever the matching stage happened to
+/// consider.
+fn retain_visible_unnamed_speakers(
+    unnamed: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
+    segments: &[crate::Segment],
+) -> Vec<crate::diarize::voice_id::UnnamedSpeaker> {
+    let visible: std::collections::BTreeSet<&str> = segments
+        .iter()
+        .filter(|segment| segment.speaker_person_id.is_none())
+        .filter_map(|segment| segment.speaker_label.as_deref())
+        .collect();
+    unnamed
+        .into_iter()
+        .filter(|speaker| visible.contains(speaker.label.as_str()))
+        .collect()
 }
 
 /// Diarize the prepared audio into speaker turns, then match the optional
@@ -1989,27 +2027,39 @@ fn compute_speaker_attribution(
         }
     }
     let matcher = crate::diarize::voice_id::load_person_matcher_for_active_embedder();
-    let identities: BTreeMap<
+    let mut identities: BTreeMap<
         crate::diarize::contract::SpeakerId,
         crate::diarize::enrollment::SpeakerDisplayAssignment,
-    > = diarization
-        .centroids
-        .iter()
-        .filter_map(|(speaker_id, embedding)| {
-            matcher.best_match(embedding).map(|person_match| {
-                let assignment = crate::diarize::voice_id::VoiceIdAssignment::from_person_match(
-                    *speaker_id,
-                    &person_match,
-                );
-                (
-                    *speaker_id,
-                    crate::diarize::enrollment::SpeakerDisplayAssignment::from_voice_id_assignment(
-                        assignment,
-                    ),
-                )
-            })
-        })
-        .collect();
+    > = BTreeMap::new();
+    let mut unnamed: Vec<crate::diarize::voice_id::UnnamedSpeaker> = Vec::new();
+    for (speaker_id, embedding) in &diarization.centroids {
+        let Some(person_match) = matcher.best_match(embedding) else {
+            // This path has no evidence-quantity gate of its own -- the
+            // clusterer only ever hands over speakers it built a centroid for
+            // -- so the one refusal it can reach is "nobody in the library is
+            // this voice".
+            let scored = matcher.best_score_and_threshold(embedding);
+            unnamed.push(crate::diarize::voice_id::UnnamedSpeaker {
+                label: speaker_id.label(),
+                reason: crate::diarize::voice_id::SpeakerNamingRefusal::NoMatchInLibrary {
+                    library_empty: matcher.is_empty(),
+                    best_score: scored.map(|(score, _)| score),
+                    accept_threshold: scored.map(|(_, threshold)| threshold),
+                },
+            });
+            continue;
+        };
+        let assignment = crate::diarize::voice_id::VoiceIdAssignment::from_person_match(
+            *speaker_id,
+            &person_match,
+        );
+        identities.insert(
+            *speaker_id,
+            crate::diarize::enrollment::SpeakerDisplayAssignment::from_voice_id_assignment(
+                assignment,
+            ),
+        );
+    }
     if diarize_debug {
         for (speaker_id, assignment) in &identities {
             eprintln!(
@@ -2023,6 +2073,7 @@ fn compute_speaker_attribution(
     SpeakerAttribution {
         turns: diarization.turns,
         identities,
+        unnamed,
     }
 }
 
@@ -4375,6 +4426,7 @@ mod tests {
         let transcription = normalize_transcription_segments(
             Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: "hello world".to_string(),
                 segments: Vec::new(),
                 longform: None,
@@ -4394,6 +4446,7 @@ mod tests {
         let transcription = normalize_transcription_segments(
             Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: "a b".to_string(),
                 segments: vec![
                     Segment {
@@ -4433,6 +4486,7 @@ mod tests {
         let transcription = normalize_transcription_segments(
             Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: "long transcript".to_string(),
                 segments: vec![Segment {
                     start: 0.0,
@@ -4459,6 +4513,7 @@ mod tests {
         let transcription = normalize_transcription_segments(
             Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: "near full".to_string(),
                 segments: vec![Segment {
                     start: 0.0,
@@ -4835,6 +4890,7 @@ mod tests {
         // state on this machine -- fail-closed, never fabricated punctuation.
         let transcription = Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text: "hello world".to_string(),
             segments: vec![Segment {
                 start: 0.0,
@@ -5007,6 +5063,7 @@ mod tests {
                 return Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "ok-on-cpu".to_string(),
                         segments: Vec::new(),
                         longform: None,

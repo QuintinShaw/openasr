@@ -918,6 +918,7 @@ mod tests {
     fn transcription(text: &str) -> Transcription {
         Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text: text.to_string(),
             segments: vec![Segment {
                 start: 0.0,
@@ -937,6 +938,7 @@ mod tests {
     fn text_only_transcription(text: &str) -> Transcription {
         Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text: text.to_string(),
             segments: Vec::new(),
             longform: None,
@@ -1022,6 +1024,7 @@ mod tests {
             .join(" ");
         Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text: text.clone(),
             segments: vec![Segment {
                 start: 0.0,

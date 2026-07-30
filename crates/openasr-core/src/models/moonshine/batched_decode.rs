@@ -555,6 +555,7 @@ impl MoonshineBatchSlot {
         Ok(MoonshineDecodeOutput {
             transcription: Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text,
                 segments,
                 longform: None,

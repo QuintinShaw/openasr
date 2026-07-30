@@ -49,12 +49,24 @@
 //! gain (a familiar voice occasionally not recognized, one manual tap to fix)
 //! is being traded for transcripts that confidently attribute words to the
 //! wrong person.
+//!
+//! # Refusing silently is a separate mistake
+//!
+//! Erring toward anonymous is about the *verdict*; it says nothing about
+//! whether the verdict may be invisible. Every gate above therefore reports
+//! why it refused, as a [`UnnamedSpeaker`] return value rather than only as an
+//! `OPENASR_DIARIZE_DEBUG` line -- see [`naming`](super::naming) for why the
+//! three refusal reasons are three different things for a user to do, and why
+//! collapsing them into a bare `SPEAKER_01` reads as a broken feature.
+//! Reporting the reason is explicitly **not** a licence to lower a gate so the
+//! name appears instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
 use super::evidence::{self, JudgedWindows, MIN_PURITY_VERDICT_WINDOWS, WINDOW_SECONDS};
+use super::naming::{SpeakerNamingRefusal, UnnamedSpeaker};
 use crate::Segment;
 use crate::diarize::contract::{SpeakerEmbedding, TimeRange};
 
@@ -198,9 +210,17 @@ pub struct SpeakerScope<'a> {
 ///   anything went wrong. That is the exact silent-degrade this stage exists
 ///   to not do, so it fails closed with [`SpeakerIdentityError::EmbedderPackMissing`]
 ///   instead.
+///
+/// # Return value
+///
+/// Every label that came out anonymous, with the reason (see
+/// [`naming`](super::naming)). Named labels are absent -- they carry their
+/// person on every segment already. An empty vector therefore means "every
+/// speaker in this transcript has a name", and is the only shape a
+/// single-speaker recording of an enrolled person produces.
 pub fn name_speakers_across_scopes(
     scopes: &mut [SpeakerScope<'_>],
-) -> Result<(), SpeakerIdentityError> {
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     name_speakers_across_scopes_with(crate::diarize::embed::shared_embedder(), scopes)
 }
 
@@ -213,7 +233,7 @@ pub fn name_speakers_across_scopes(
 fn name_speakers_across_scopes_with(
     embedder: Option<&'static dyn crate::diarize::embed::SpeakerEmbedder>,
     scopes: &mut [SpeakerScope<'_>],
-) -> Result<(), SpeakerIdentityError> {
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     for scope in scopes.iter_mut() {
         normalize_local_labels(scope.segments);
     }
@@ -226,9 +246,18 @@ fn name_speakers_across_scopes_with(
         }
         // No embedder, nobody enrolled, one scope: separation stands, naming
         // was never going to do anything here regardless of the embedder.
-        return Ok(());
+        // Nothing was measured, so every label is unnamed for that reason and
+        // not for any judgement about its voice -- the one refusal that
+        // describes a missing pack rather than thin evidence.
+        return Ok(unnamed_speakers(scopes, &BTreeMap::new(), |_| {
+            SpeakerNamingRefusal::EmbedderUnavailable
+        }));
     };
 
+    // Why each label stayed anonymous, keyed by the label it was judged under.
+    // Filled as each gate refuses; a label that clears every gate and matches a
+    // person is removed again below.
+    let mut refusals: BTreeMap<String, SpeakerNamingRefusal> = BTreeMap::new();
     // Keyed by the label as it now reads, which is scope-unique after the
     // disambiguation pass above -- so evidence from two scopes is never pooled
     // into one centroid unless a caller genuinely produced one scope.
@@ -252,6 +281,12 @@ fn name_speakers_across_scopes_with(
                 log_naming_debug(format_args!(
                     "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows=0 decision=no-usable-window"
                 ));
+                // Same user-facing answer as failing the window/second gates
+                // below, reached one step earlier: the label produced windows
+                // the audio could not back. Reported rather than skipped so a
+                // label with no evidence at all is not the one case that
+                // silently vanishes from the report.
+                refusals.insert(label, not_enough_speech(0, 0.0));
                 continue;
             }
             let entry = LabelEvidence::from_windows(
@@ -303,28 +338,43 @@ fn name_speakers_across_scopes_with(
     }
 
     let matcher = super::load_person_matcher_for_active_embedder();
-    let matches: BTreeMap<String, super::PersonMatch> = evidence
-        .into_iter()
-        .filter_map(|(label, evidence)| {
-            let centroid = evidence.centroid_for_naming()?;
-            let matched = matcher.best_match(&centroid);
-            if crate::diarize::debug::diarize_debug_enabled() {
-                let (best, threshold) = matcher
-                    .best_score_and_threshold(&centroid)
-                    .map(|(score, threshold)| (format!("{score:.4}"), format!("{threshold:.4}")))
-                    .unwrap_or_else(|| ("n/a".to_string(), "n/a".to_string()));
-                log_naming_debug(format_args!(
-                    "stage=voice-id-match label={label} library_empty={} best_score={best} accept_threshold={threshold} decision={}",
-                    matcher.is_empty(),
-                    match &matched {
-                        Some(person) => format!("named:{}", person.person_id.as_str()),
-                        None => "anonymous".to_string(),
-                    },
-                ));
+    let mut matches: BTreeMap<String, super::PersonMatch> = BTreeMap::new();
+    for (label, evidence) in evidence {
+        let Some(centroid) = evidence.centroid_for_naming() else {
+            refusals.insert(label, evidence.refusal());
+            continue;
+        };
+        let matched = matcher.best_match(&centroid);
+        let scored = matcher.best_score_and_threshold(&centroid);
+        if crate::diarize::debug::diarize_debug_enabled() {
+            let (best, threshold) = scored
+                .map(|(score, threshold)| (format!("{score:.4}"), format!("{threshold:.4}")))
+                .unwrap_or_else(|| ("n/a".to_string(), "n/a".to_string()));
+            log_naming_debug(format_args!(
+                "stage=voice-id-match label={label} library_empty={} best_score={best} accept_threshold={threshold} decision={}",
+                matcher.is_empty(),
+                match &matched {
+                    Some(person) => format!("named:{}", person.person_id.as_str()),
+                    None => "anonymous".to_string(),
+                },
+            ));
+        }
+        match matched {
+            Some(matched) => {
+                matches.insert(label, matched);
             }
-            matched.map(|matched| (label, matched))
-        })
-        .collect();
+            None => {
+                refusals.insert(
+                    label,
+                    SpeakerNamingRefusal::NoMatchInLibrary {
+                        library_empty: matcher.is_empty(),
+                        best_score: scored.map(|(score, _)| score),
+                        accept_threshold: scored.map(|(_, threshold)| threshold),
+                    },
+                );
+            }
+        }
+    }
 
     for scope in scopes.iter_mut() {
         for segment in scope.segments.iter_mut() {
@@ -339,8 +389,95 @@ fn name_speakers_across_scopes_with(
             segment.speaker_snapshot_label = Some(person.display_name.clone());
         }
     }
-    Ok(())
+    Ok(unnamed_speakers(scopes, &refusals, |_| {
+        // A label the evidence pass never saw: it carries segments but
+        // produced no turn long enough to plan a window over, which is the
+        // shortest-speech end of the same gate.
+        not_enough_speech(0, 0.0)
+    }))
 }
+
+/// The labels a finished transcript still spells anonymously, in label order,
+/// each with the reason recorded for it (or `fallback` when no gate recorded
+/// one).
+///
+/// Read from the segments rather than from the evidence map on purpose: the
+/// segments are what a caller renders, so a label only appears here if the user
+/// can actually see it, and it appears under exactly the spelling the user
+/// sees -- after scope disambiguation and stitching have had their say.
+fn unnamed_speakers(
+    scopes: &[SpeakerScope<'_>],
+    refusals: &BTreeMap<String, SpeakerNamingRefusal>,
+    fallback: impl Fn(&str) -> SpeakerNamingRefusal,
+) -> Vec<UnnamedSpeaker> {
+    let mut labels: BTreeSet<&str> = BTreeSet::new();
+    for scope in scopes {
+        for segment in scope.segments.iter() {
+            if segment.speaker_person_id.is_some() {
+                continue;
+            }
+            if let Some(label) = segment.speaker_label.as_deref() {
+                labels.insert(label);
+            }
+        }
+    }
+    labels
+        .into_iter()
+        .map(|label| UnnamedSpeaker {
+            label: label.to_string(),
+            reason: refusals
+                .get(label)
+                .cloned()
+                .unwrap_or_else(|| fallback(label)),
+        })
+        .collect()
+}
+
+/// The "this voice did not talk for long enough" refusal, stated against the
+/// two gates [`LabelEvidence::centroid_for_naming`] applies.
+fn not_enough_speech(windows: usize, seconds: f64) -> SpeakerNamingRefusal {
+    SpeakerNamingRefusal::NotEnoughSpeech {
+        windows,
+        required_windows: MIN_PURITY_VERDICT_WINDOWS,
+        seconds,
+        required_seconds: MIN_NAMING_EVIDENCE_SECONDS,
+        required_continuous_seconds: MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING,
+    }
+}
+
+/// The shortest single uninterrupted turn that can clear naming's two gates.
+///
+/// Derived here, once, from the geometry that actually decides it, because
+/// every consumer that tried to state the requirement from a single threshold
+/// got it wrong: [`MIN_NAMING_EVIDENCE_SECONDS`] is 3.0 but is *not* the
+/// binding gate, so "speak for 3 seconds" is advice that fails on the retry.
+///
+/// Three things stack up, and leaving any of them out understates the answer:
+///
+/// - naming counts the windows that *survive* main-cluster filtering, and that
+///   filter always discards a minority (the split is into two non-empty groups
+///   by construction, see [`evidence`]), so a turn has to plan one window more
+///   than the gate asks for;
+/// - `n` overlapping windows span
+///   `WINDOW_SECONDS + (n - 1) * WINDOW_STEP_SECONDS` of audio;
+/// - [`evidence::SEGMENT_EDGE_TRIM_SECONDS`] is charged at both ends of a turn
+///   before windowing starts, so the turn must be that much longer again.
+///
+/// The seconds gate is folded in with a `max` rather than assumed smaller, so
+/// retuning either constant keeps this honest, and
+/// `the_advertised_speech_length_is_long_enough_to_actually_clear_both_gates`
+/// runs the resulting figure through the real windowing rather than trusting
+/// this arithmetic.
+const MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING: f64 = {
+    let planned_windows = MIN_PURITY_VERDICT_WINDOWS as f64 + 1.0;
+    let windowed_span = WINDOW_SECONDS + (planned_windows - 1.0) * evidence::WINDOW_STEP_SECONDS;
+    let evidence_span = if windowed_span > MIN_NAMING_EVIDENCE_SECONDS {
+        windowed_span
+    } else {
+        MIN_NAMING_EVIDENCE_SECONDS
+    };
+    evidence_span + 2.0 * evidence::SEGMENT_EDGE_TRIM_SECONDS
+};
 
 /// Single-scope convenience for the one caller that has a single decode unit
 /// (every offline transcription today). Same semantics as
@@ -348,7 +485,7 @@ fn name_speakers_across_scopes_with(
 pub fn name_speakers_from_labeled_segments(
     segments: &mut [Segment],
     samples: &[f32],
-) -> Result<(), SpeakerIdentityError> {
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }])
 }
 
@@ -424,6 +561,34 @@ impl LabelEvidence {
             && self.kept_seconds >= MIN_NAMING_EVIDENCE_SECONDS)
             .then(|| evidence::centroid(self.kept.iter()))
             .flatten()
+    }
+
+    /// Which gate of [`Self::centroid_for_naming`] refused, for a label that
+    /// has evidence but no naming centroid.
+    ///
+    /// The quantity gates are reported ahead of the purity verdict because
+    /// below [`MIN_PURITY_VERDICT_WINDOWS`] no verdict is claimed at all (see
+    /// [`evidence`]), so `single_voice` there is an absence of evidence rather
+    /// than a finding of two voices -- reporting "we heard two people" off it
+    /// would be inventing a fact. Above the quantity gates the verdict is real
+    /// and is the honest answer.
+    fn refusal(&self) -> SpeakerNamingRefusal {
+        if self.kept.len() < MIN_PURITY_VERDICT_WINDOWS
+            || self.kept_seconds < MIN_NAMING_EVIDENCE_SECONDS
+        {
+            return not_enough_speech(self.kept.len(), self.kept_seconds);
+        }
+        if !self.single_voice {
+            return SpeakerNamingRefusal::MixedVoices {
+                windows: self.kept.len(),
+                seconds: self.kept_seconds,
+            };
+        }
+        // Every gate passed and the centroid still came out empty: the kept
+        // embeddings could not be averaged (a zero-length or degenerate
+        // embedding space). Nothing was measurable, so say that rather than
+        // blaming the speaker's audio.
+        SpeakerNamingRefusal::EmbedderUnavailable
     }
 }
 
@@ -988,5 +1153,217 @@ mod tests {
         // participant in the evaluation corpus (37.78s over seven turns).
         let participant = [1.31, 6.04, 4.66, 1.86, 6.65, 13.85, 3.42];
         assert!(label_windows(&participant) >= MIN_PURITY_VERDICT_WINDOWS);
+    }
+
+    /// A constant, deterministic embedder so the naming path can be exercised
+    /// end to end without a model pack. Every window embeds to the same voice,
+    /// which is the point: the refusals under test are about *how much* voice
+    /// there is, never about which one.
+    struct OneVoiceEmbedder;
+
+    impl crate::diarize::embed::SpeakerEmbedder for OneVoiceEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+            Ok(SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    fn one_voice_embedder() -> &'static dyn crate::diarize::embed::SpeakerEmbedder {
+        &OneVoiceEmbedder
+    }
+
+    /// One label spanning `seconds` of continuous speech, with matching audio.
+    fn one_speaker_scope(seconds: f32) -> (Vec<Segment>, Vec<f32>) {
+        let segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
+        let samples = vec![0.0_f32; (seconds * EMBEDDER_SAMPLE_RATE_HZ as f32) as usize];
+        (segments, samples)
+    }
+
+    /// The reported case: a clip too short to produce the windows a name needs.
+    /// The refusal itself is correct and stays -- what must not happen is the
+    /// caller being told only "SPEAKER_01" with no way to distinguish this from
+    /// a broken feature.
+    #[test]
+    fn a_clip_too_short_to_judge_reports_how_short_it_was() {
+        let (mut segments, samples) = one_speaker_scope(4.27);
+        let unnamed = name_speakers_across_scopes_with(
+            Some(one_voice_embedder()),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(unnamed.len(), 1, "{unnamed:?}");
+        assert_eq!(unnamed[0].label, "SPEAKER_01");
+        let SpeakerNamingRefusal::NotEnoughSpeech {
+            windows,
+            required_windows,
+            seconds,
+            required_seconds,
+            required_continuous_seconds,
+        } = unnamed[0].reason
+        else {
+            panic!("expected a not-enough-speech refusal, got {:?}", unnamed[0]);
+        };
+        assert!(
+            windows < required_windows,
+            "{windows} vs {required_windows}"
+        );
+        assert_eq!(required_windows, MIN_PURITY_VERDICT_WINDOWS);
+        assert_eq!(required_seconds, MIN_NAMING_EVIDENCE_SECONDS);
+        assert!(
+            seconds < required_seconds,
+            "{seconds} vs {required_seconds}"
+        );
+        // The number a user is told to act on has to be one that works: the
+        // clip they were just refused for is 4.27s, so advice built from the
+        // 3.0s gate would send them back to fail again.
+        assert!(
+            required_continuous_seconds > 4.27,
+            "advice of {required_continuous_seconds}s would not have saved this clip"
+        );
+        // The gate is untouched: still anonymous, still no invented person.
+        assert_eq!(segments[0].speaker_label.as_deref(), Some("SPEAKER_01"));
+        assert!(segments[0].speaker_person_id.is_none());
+    }
+
+    /// Plenty of speech, nobody enrolled: a different situation with a
+    /// different remedy, and it has to read differently.
+    #[test]
+    fn a_long_clip_with_an_empty_library_reports_that_nobody_matched() {
+        let (mut segments, samples) = one_speaker_scope(30.0);
+        let unnamed = name_speakers_across_scopes_with(
+            Some(one_voice_embedder()),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(unnamed.len(), 1, "{unnamed:?}");
+        assert!(
+            matches!(
+                unnamed[0].reason,
+                SpeakerNamingRefusal::NoMatchInLibrary {
+                    library_empty: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            unnamed[0]
+        );
+    }
+
+    /// No embedder at all is the one refusal that describes a malfunction, and
+    /// it must not be dressed up as a judgement about the speaker's audio.
+    #[test]
+    fn a_missing_embedder_is_reported_as_a_missing_embedder() {
+        let mut segments = vec![labeled(0.0, 30.0, Some("SPEAKER_01"))];
+        let unnamed = name_speakers_across_scopes_with(
+            None,
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &[],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            unnamed,
+            vec![UnnamedSpeaker {
+                label: "SPEAKER_01".to_string(),
+                reason: SpeakerNamingRefusal::EmbedderUnavailable,
+            }]
+        );
+    }
+
+    /// The user-facing "speak for this long" figure has to be the one that
+    /// actually clears the gates, not the smaller threshold that does not.
+    ///
+    /// A speaker who follows advice derived from `MIN_NAMING_EVIDENCE_SECONDS`
+    /// alone produces too few windows and is refused a second time, so this
+    /// pins the derivation against the geometry that decides it.
+    #[test]
+    fn the_advertised_speech_length_is_long_enough_to_actually_clear_both_gates() {
+        let advertised = MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING;
+        assert!(advertised > MIN_NAMING_EVIDENCE_SECONDS);
+
+        // One continuous turn of exactly the advertised length must survive
+        // every gate, through the real windowing.
+        let (mut segments, samples) = one_speaker_scope(advertised as f32);
+        let unnamed = name_speakers_across_scopes_with(
+            Some(one_voice_embedder()),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .unwrap();
+        assert_eq!(unnamed.len(), 1, "{unnamed:?}");
+        assert!(
+            !matches!(
+                unnamed[0].reason,
+                SpeakerNamingRefusal::NotEnoughSpeech { .. }
+            ),
+            "a turn of the advertised length is still refused for being short: {:?}",
+            unnamed[0]
+        );
+    }
+
+    /// Enough windows but two voices in them: reported as its own thing, since
+    /// "record for longer" is not the remedy.
+    #[test]
+    fn a_mixed_label_is_reported_as_mixed_rather_than_as_too_short() {
+        let mut mixed = evidence_entry(0, vec![1.0, 0.0], PLENTY_OF_WINDOWS);
+        mixed.single_voice = false;
+        assert!(matches!(
+            mixed.refusal(),
+            SpeakerNamingRefusal::MixedVoices { .. }
+        ));
+    }
+
+    /// Below the purity-verdict window count no verdict is claimed at all (see
+    /// [`evidence`]), so a thin label must never be reported as "we heard two
+    /// people" -- that would be inventing a finding out of an absence of one.
+    #[test]
+    fn a_thin_label_is_never_reported_as_mixed_voices() {
+        let mut thin = evidence_entry(0, vec![1.0, 0.0], MIN_PURITY_VERDICT_WINDOWS - 1);
+        thin.single_voice = false;
+        assert!(matches!(
+            thin.refusal(),
+            SpeakerNamingRefusal::NotEnoughSpeech { .. }
+        ));
+    }
+
+    /// The report describes what the reader sees: it is keyed on the labels the
+    /// finished segments carry, and a named speaker is not in it at all.
+    #[test]
+    fn the_report_covers_exactly_the_anonymous_labels_on_the_segments() {
+        let mut segments = vec![
+            labeled(0.0, 1.0, Some("SPEAKER_01")),
+            labeled(1.0, 2.0, Some("SPEAKER_02")),
+            labeled(2.0, 3.0, Some("SPEAKER_01")),
+        ];
+        normalize_local_labels(&mut segments);
+        segments[1].speaker_person_id = Some("person_abc".to_string());
+        let scopes = [SpeakerScope {
+            segments: &mut segments,
+            samples: &[],
+        }];
+        let reported = unnamed_speakers(&scopes, &BTreeMap::new(), |_| {
+            SpeakerNamingRefusal::EmbedderUnavailable
+        });
+        let labels: Vec<&str> = reported.iter().map(|entry| entry.label.as_str()).collect();
+        assert_eq!(labels, vec!["SPEAKER_01"]);
     }
 }

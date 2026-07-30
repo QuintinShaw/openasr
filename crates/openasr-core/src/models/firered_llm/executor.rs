@@ -528,6 +528,7 @@ impl FireRedLlmGgmlExecutor {
         let text = result.text.trim().to_string();
         let transcription = Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             segments: vec![Segment {
                 start: 0.0,
                 end: audio_duration_seconds.max(0.0),

@@ -146,6 +146,7 @@ impl TranscriptAssembler {
         (
             Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text,
                 segments: self.segments,
                 longform: None,

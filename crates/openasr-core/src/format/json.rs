@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::api::backend::{Transcription, TranscriptionLongFormMetadata, TruncatedDecode};
+use crate::diarize::voice_id::SpeakerNamingRefusal;
 
 #[derive(Serialize)]
 pub(super) struct JsonTranscription<'a> {
@@ -14,6 +15,18 @@ pub(super) struct JsonTranscription<'a> {
     /// existing consumer sees no change until something actually went wrong.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     truncated: Vec<JsonTruncatedDecode>,
+    /// Speakers this transcript labels anonymously, with why Voice ID did not
+    /// name them.
+    ///
+    /// Present in the plain `json` format for the same reason `truncated` is:
+    /// "this speaker is a number because the recording was too short to judge"
+    /// is not a diagnostic detail a caller can be asked to opt into -- without
+    /// it a bare `SPEAKER_01` is indistinguishable from Voice ID being broken.
+    /// Omitted entirely when every speaker was named (and when nothing was
+    /// diarized at all), so an existing consumer sees no change until there is
+    /// something to explain.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unnamed_speakers: Vec<JsonUnnamedSpeaker<'a>>,
 }
 
 #[derive(Serialize)]
@@ -37,6 +50,9 @@ pub(super) struct VerboseJsonTranscription<'a> {
     /// See [`JsonTranscription::truncated`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     truncated: Vec<JsonTruncatedDecode>,
+    /// See [`JsonTranscription::unnamed_speakers`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unnamed_speakers: Vec<JsonUnnamedSpeaker<'a>>,
 }
 
 #[derive(Serialize)]
@@ -62,6 +78,97 @@ fn json_truncated_decodes(transcription: &Transcription) -> Vec<JsonTruncatedDec
             slice: truncated.slice_index,
             reason: truncated.truncation.reason.as_str(),
             covers_up_to_seconds: truncated.truncation.transcript_covers_up_to_seconds,
+        })
+        .collect()
+}
+
+/// One anonymous speaker and the reason Voice ID left it that way.
+///
+/// The numbers behind the verdict are on the wire, not only the verdict, so a
+/// client can say "2.0s of the 3.0s needed" instead of a bare "not enough" --
+/// and so a client that only knows `reason` can still render something useful
+/// for a reason it has never heard of.
+#[derive(Serialize)]
+struct JsonUnnamedSpeaker<'a> {
+    /// The `speaker_label` this transcript's segments carry.
+    label: &'a str,
+    /// `not-enough-speech`, `mixed-voices`, `no-match-in-library`, or
+    /// `embedder-unavailable`.
+    reason: &'static str,
+    /// Embedding windows / seconds of usable voice behind the label, and the
+    /// thresholds they were compared against. Present for the evidence
+    /// reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    windows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_windows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_seconds: Option<f64>,
+    /// How long one uninterrupted turn has to be to clear both gates. The one
+    /// figure fit to show a user: `required_seconds` is the smaller,
+    /// non-binding gate, so advice derived from it fails on the retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_continuous_seconds: Option<f64>,
+    /// Best similarity any enrolled person scored and the floor it had to
+    /// clear, plus whether anyone is enrolled at all. Present for
+    /// `no-match-in-library`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    library_empty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accept_threshold: Option<f32>,
+}
+
+fn json_unnamed_speakers(transcription: &Transcription) -> Vec<JsonUnnamedSpeaker<'_>> {
+    transcription
+        .unnamed_speakers
+        .iter()
+        .map(|speaker| {
+            let mut json = JsonUnnamedSpeaker {
+                label: &speaker.label,
+                reason: speaker.reason.kind(),
+                windows: None,
+                required_windows: None,
+                seconds: None,
+                required_seconds: None,
+                required_continuous_seconds: None,
+                library_empty: None,
+                best_score: None,
+                accept_threshold: None,
+            };
+            match &speaker.reason {
+                SpeakerNamingRefusal::EmbedderUnavailable => {}
+                SpeakerNamingRefusal::NotEnoughSpeech {
+                    windows,
+                    required_windows,
+                    seconds,
+                    required_seconds,
+                    required_continuous_seconds,
+                } => {
+                    json.windows = Some(*windows);
+                    json.required_windows = Some(*required_windows);
+                    json.seconds = Some(*seconds);
+                    json.required_seconds = Some(*required_seconds);
+                    json.required_continuous_seconds = Some(*required_continuous_seconds);
+                }
+                SpeakerNamingRefusal::MixedVoices { windows, seconds } => {
+                    json.windows = Some(*windows);
+                    json.seconds = Some(*seconds);
+                }
+                SpeakerNamingRefusal::NoMatchInLibrary {
+                    library_empty,
+                    best_score,
+                    accept_threshold,
+                } => {
+                    json.library_empty = Some(*library_empty);
+                    json.best_score = *best_score;
+                    json.accept_threshold = *accept_threshold;
+                }
+            }
+            json
         })
         .collect()
 }
@@ -161,6 +268,7 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
             text: &transcription.text,
             segments: json_segments(transcription, false),
             truncated: json_truncated_decodes(transcription),
+            unnamed_speakers: json_unnamed_speakers(transcription),
         }
     }
 }
@@ -181,6 +289,7 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
                 .as_ref()
                 .map(verbose_longform_metadata),
             truncated: json_truncated_decodes(transcription),
+            unnamed_speakers: json_unnamed_speakers(transcription),
         }
     }
 }

@@ -1033,6 +1033,7 @@ mod tests {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
@@ -1071,6 +1072,7 @@ mod tests {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "biased".to_string(),
                         segments: Vec::new(),
                         longform: None,
@@ -1134,6 +1136,7 @@ mod tests {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "must never run".to_string(),
                         segments: Vec::new(),
                         longform: None,
@@ -1220,6 +1223,7 @@ mod tests {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
@@ -1603,6 +1607,7 @@ mod tests {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
@@ -1694,6 +1699,7 @@ mod tests {
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,

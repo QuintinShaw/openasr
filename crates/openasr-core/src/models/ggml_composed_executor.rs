@@ -108,6 +108,7 @@ mod tests {
             Ok(GgmlAsrExecutionResult {
                 transcription: Transcription {
                     truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
                     text: self.text.to_string(),
                     segments: Vec::new(),
                     longform: None,

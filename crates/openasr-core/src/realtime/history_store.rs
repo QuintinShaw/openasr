@@ -167,6 +167,7 @@ impl DaemonHistoryDetail {
     pub fn to_transcription(&self) -> crate::api::backend::Transcription {
         crate::api::backend::Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text: self.text.clone(),
             segments: self.segments.clone(),
             longform: None,

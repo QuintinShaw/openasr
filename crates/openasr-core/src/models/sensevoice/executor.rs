@@ -372,6 +372,7 @@ impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: output.text,
                 segments,
                 longform: None,

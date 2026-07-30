@@ -244,6 +244,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 .join(" ");
             Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text,
                 segments,
                 longform: None,
@@ -315,6 +316,7 @@ fn cohere_plain_transcription_from_generated_tokens(
     };
     Ok(Transcription {
         truncated_decodes: Vec::new(),
+        unnamed_speakers: Vec::new(),
         text,
         segments,
         longform: None,

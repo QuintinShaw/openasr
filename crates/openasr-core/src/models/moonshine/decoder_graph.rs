@@ -293,6 +293,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
     Ok(MoonshineDecodeOutput {
         transcription: Transcription {
             truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
             text,
             segments,
             longform: None,

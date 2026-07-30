@@ -749,6 +749,7 @@ impl Qwen3AsrGgmlExecutor {
         let result = Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
                 truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text,
                 segments,
                 longform: None,

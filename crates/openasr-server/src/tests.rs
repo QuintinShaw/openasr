@@ -1566,6 +1566,7 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
         .with_voice_id(true);
     let transcription = Transcription {
         truncated_decodes: Vec::new(),
+        unnamed_speakers: Vec::new(),
         text: "hello with speaker".to_string(),
         segments: vec![openasr_core::Segment {
             start: 0.0,
@@ -1621,6 +1622,7 @@ fn record_file_transcription_history_skips_write_when_retention_off() {
     let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8");
     let transcription = Transcription {
         truncated_decodes: Vec::new(),
+        unnamed_speakers: Vec::new(),
         text: "never stored".to_string(),
         segments: Vec::new(),
         longform: None,
