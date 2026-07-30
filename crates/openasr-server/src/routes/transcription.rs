@@ -1917,6 +1917,41 @@ fn check_disk_headroom_bytes(available_bytes: Option<u64>, dir: &Path) -> Result
     }
 }
 
+/// Longest extension this preserves onto the upload's temp-file suffix. Every
+/// audio/video extension `openasr_core::recognized_audio_extensions()` names
+/// today is 4 characters or fewer (`webm`, `aiff`, ...); this bound exists
+/// only to keep a client-controlled string out of a filesystem path
+/// unbounded, not to encode which formats are supported (see this function's
+/// doc comment for why those two concerns are deliberately separate).
+const MAX_PRESERVED_EXTENSION_LEN: usize = 8;
+
+/// The suffix (including the leading dot) to give the upload's temp file, so
+/// the probing/decoding pipeline downstream (`openasr_core::prepare_audio_input`)
+/// sees the same extension the client's own filename carried, whether or not
+/// that extension is one this build actually knows how to decode.
+///
+/// This is deliberately *not* gated on `openasr_core::recognized_audio_extensions()`
+/// (an earlier version of this function was): that whitelist answers "can we
+/// decode this", not "is this string safe to put in a temp-file name", and
+/// conflating the two silently stripped the extension off any upload whose
+/// format this build did not yet recognize (or a client-chosen extension that
+/// happened not to be on the list for an unrelated reason) before the file
+/// ever reached the probe stage. The prepared-audio error path then reported
+/// "the file has no extension" for those uploads -- true of the temp file by
+/// that point, but false of what the client actually sent, and actively
+/// misleading (a user renaming their file did nothing, since the extension
+/// itself was never the problem). Extension recognition still fully governs
+/// *decoding* (`RECOGNIZED_EXTENSIONS` in `openasr_core::audio::types`); this
+/// function only governs what string is safe to echo into a filesystem path.
+///
+/// Safety here is a plain filesystem/charset concern: `Path::extension()` on
+/// the client's file-name basename (see the note on `..`/`/` below) already
+/// cannot contain a path separator, so the only remaining risks are length
+/// (bounded by `MAX_PRESERVED_EXTENSION_LEN`) and exotic bytes (bounded by
+/// requiring ASCII alphanumerics). A client-chosen extension outside that
+/// charset (or an upload with no extension at all) still loses its suffix --
+/// and the resulting "no extension" report is accurate for those, unlike the
+/// whitelist-driven version this replaces.
 fn safe_extension_suffix(file_name: &str) -> Option<String> {
     let extension = std::path::Path::new(file_name)
         .file_name()
@@ -1924,12 +1959,12 @@ fn safe_extension_suffix(file_name: &str) -> Option<String> {
         .and_then(std::path::Path::extension)
         .and_then(std::ffi::OsStr::to_str)?
         .to_ascii_lowercase();
-    // Single source of truth for the recognized-audio-extension whitelist
-    // (was a second hand-kept copy of the list in `openasr_core::audio::types`,
-    // which could silently drift from it).
-    openasr_core::recognized_audio_extensions()
-        .contains(&extension.as_str())
-        .then(|| format!(".{extension}"))
+    let is_safe = !extension.is_empty()
+        && extension.len() <= MAX_PRESERVED_EXTENSION_LEN
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric());
+    is_safe.then(|| format!(".{extension}"))
 }
 
 #[cfg(test)]
@@ -1937,15 +1972,133 @@ mod native_runtime_tests {
     use std::fs;
 
     use axum::{
-        extract::Path as AxumPath,
+        extract::{FromRequest, Path as AxumPath},
         http::StatusCode,
         response::{IntoResponse, Response},
     };
 
     use super::{
-        check_disk_headroom_bytes, native_asr_error_to_backend, parse_bool_field,
-        safe_extension_suffix, write_upload_temp_file,
+        ParsedTranscriptionRequest, check_disk_headroom_bytes, native_asr_error_to_backend,
+        parse_bool_field, parse_transcription_multipart, safe_extension_suffix,
+        write_upload_temp_file,
     };
+
+    /// Builds a real, well-formed multipart body for the `file`+`model`
+    /// fields and runs it through the actual `axum::extract::Multipart`
+    /// extractor (not a hand-rolled stand-in), then through
+    /// `parse_transcription_multipart` -- the same two steps a real upload
+    /// goes through -- so the resulting `ParsedTranscriptionRequest.request.input_path`
+    /// reflects exactly what the server would hand to `prepare_audio_input`.
+    async fn parse_uploaded_file(file_name: &str, bytes: &[u8]) -> ParsedTranscriptionRequest {
+        let boundary = "openasr-extension-test-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let multipart = axum::extract::Multipart::from_request(request, &())
+            .await
+            .expect("a well-formed multipart body must extract");
+
+        parse_transcription_multipart(Ok(multipart), openasr_core::BackendKind::Mock, None)
+            .await
+            .expect("a multipart body with valid file+model fields must parse")
+    }
+
+    /// Regression test for the "the file has no extension" report that was a
+    /// lie for any upload extension this build had not yet whitelisted: the
+    /// server used to derive the upload's temp-file suffix from
+    /// `openasr_core::recognized_audio_extensions()`, so a client-supplied
+    /// extension outside that list (whether genuinely unsupported or simply
+    /// not yet added, e.g. `aac` before it was) never reached the physical
+    /// temp file, and `probe_audio_input` then reported no extension at all --
+    /// not merely an unrecognized one. `.xyzaudio` here is deliberately not
+    /// (and never will be) in `RECOGNIZED_EXTENSIONS`, isolating the fix (the
+    /// extension must survive onto disk) from `RECOGNIZED_EXTENSIONS` growing
+    /// over time.
+    #[tokio::test]
+    async fn uploaded_file_with_an_unrecognized_extension_still_reaches_the_probe_stage() {
+        let parsed = parse_uploaded_file("voice.xyzaudio", b"not real audio bytes").await;
+
+        assert_eq!(
+            parsed
+                .request
+                .input_path
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("xyzaudio"),
+            "the temp file must keep the client's real extension"
+        );
+
+        let info = openasr_core::probe_audio_input(&parsed.request.input_path).unwrap();
+        assert_eq!(info.extension.as_deref(), Some("xyzaudio"));
+        assert!(!info.recognized_extension);
+
+        let error = openasr_core::prepare_audio_input(
+            &parsed.request.input_path,
+            &openasr_core::AudioPreparationOptions::new(openasr_core::BackendKind::Native)
+                .with_native_non_wav_conversion(true),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("extension .xyzaudio is not recognized"),
+            "error must name the real extension instead of claiming there is none: {message}"
+        );
+        assert!(!message.contains("the file has no extension"));
+    }
+
+    /// The user-facing symptom this whole fix targets: a bare-ADTS `.aac`
+    /// upload (WeChat voice messages and many other recorders emit exactly
+    /// this, not an m4a/mp4 container) must decode end to end -- multipart
+    /// upload, temp-file extension preserved, in-process symphonia decode --
+    /// not merely stop erroring.
+    #[tokio::test]
+    async fn uploaded_aac_file_decodes_end_to_end_through_the_real_upload_path() {
+        let fixture = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../openasr-core/tests/fixtures/tone_mono.aac"),
+        )
+        .unwrap();
+
+        let parsed = parse_uploaded_file("voice-message.aac", &fixture).await;
+        assert_eq!(
+            parsed
+                .request
+                .input_path
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("aac")
+        );
+
+        let prepared = openasr_core::prepare_audio_input(
+            &parsed.request.input_path,
+            &openasr_core::AudioPreparationOptions::new(openasr_core::BackendKind::Native)
+                .with_native_non_wav_conversion(true),
+        )
+        .expect("a real bare-ADTS .aac upload must decode via the in-process symphonia path");
+
+        assert_eq!(prepared.original().sample_rate_hz, Some(16_000));
+        assert_eq!(prepared.original().channels, Some(1));
+    }
 
     #[test]
     fn native_phrase_bias_error_maps_to_specific_backend_error() {
@@ -1997,11 +2150,34 @@ mod native_runtime_tests {
         assert_eq!(safe_extension_suffix("clip.webm").as_deref(), Some(".webm"));
     }
 
+    /// A client-chosen extension this build does not (yet) recognize as
+    /// decodable must still reach the temp file -- and therefore the probe
+    /// stage -- unmodified, so a later "unsupported input" error can name the
+    /// real extension instead of lying that the file had none. Recognizing an
+    /// extension as *decodable* is `openasr_core::recognized_audio_extensions()`'s
+    /// job (see `RECOGNIZED_EXTENSIONS` in `openasr_core::audio::types`), not
+    /// this function's.
     #[test]
-    fn safe_extension_suffix_rejects_unknown_or_missing_extensions() {
-        assert_eq!(safe_extension_suffix("sample.exe"), None);
+    fn safe_extension_suffix_preserves_extensions_this_build_does_not_decode() {
+        assert_eq!(safe_extension_suffix("voice.aac").as_deref(), Some(".aac"));
+        assert_eq!(safe_extension_suffix("sample.exe").as_deref(), Some(".exe"));
+        assert_eq!(
+            safe_extension_suffix("clip.unknown").as_deref(),
+            Some(".unknown")
+        );
+    }
+
+    #[test]
+    fn safe_extension_suffix_rejects_missing_or_unsafe_extensions() {
         assert_eq!(safe_extension_suffix("sample"), None);
         assert_eq!(safe_extension_suffix("sample."), None);
+        // Longer than `MAX_PRESERVED_EXTENSION_LEN` (9 chars): rejected on
+        // length, not on whether the format is recognized.
+        assert_eq!(safe_extension_suffix("clip.123456789"), None);
+        // Non-ASCII-alphanumeric characters are rejected even though
+        // `Path::extension()` on a basename can never smuggle a path
+        // separator through here.
+        assert_eq!(safe_extension_suffix("clip.mp3;rm"), None);
     }
 
     #[test]

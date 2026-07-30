@@ -2275,6 +2275,94 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
     assert!(rendered.contains("Could not transcribe audio"));
 }
 
+/// End-to-end regression for the reported bug: a bare-ADTS `.aac` upload (the
+/// exact shape WeChat and other recorders emit, not an m4a/mp4 container)
+/// used to fail with HTTP 400 "Unsupported audio input ... the file has no
+/// extension" -- a lie, since the client's upload plainly had a `.aac` name;
+/// the extension was silently stripped from the upload's own temp file before
+/// it ever reached the audio probe. This drives the exact same two steps a
+/// real multipart POST to `/v1/audio/transcriptions` goes through --
+/// `axum::extract::Multipart` extraction, then `parse_transcription_multipart`
+/// -- with a real bare-ADTS `.aac` fixture, then feeds the resulting request
+/// into the real native transcription path. With no real model behind the
+/// fixture pack, the run must still fail -- but only at model load ("Could
+/// not transcribe audio"), never at audio preparation, proving the upload's
+/// extension survived and the file decoded.
+#[tokio::test]
+async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparation() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("native-pack.oasr");
+    write_mock_gguf_runtime_source(&pack_root, Some("whisper-large-v3-turbo"));
+
+    let fixture_bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../openasr-core/tests/fixtures/tone_mono.aac"),
+    )
+    .unwrap();
+    let boundary = "openasr-native-aac-e2e-boundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice-message.aac\"\r\nContent-Type: audio/aac\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&fixture_bytes);
+    body.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}--\r\n"
+        )
+        .as_bytes(),
+    );
+    let http_request = axum::http::Request::builder()
+        .method("POST")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let multipart = <Multipart as axum::extract::FromRequest<()>>::from_request(http_request, &())
+        .await
+        .expect("a well-formed multipart body must extract");
+    let parsed = parse_transcription_multipart(Ok(multipart), BackendKind::Native, None)
+        .await
+        .expect("a multipart body with a real .aac file + valid model field must parse");
+    assert_eq!(
+        parsed
+            .request
+            .input_path
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("aac"),
+        "the server's own upload temp file must keep the real .aac extension"
+    );
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_root),
+    };
+    let error = transcribe_with_runtime(
+        runtime,
+        parsed.request,
+        std::sync::Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+            "test fixture",
+        )),
+    )
+    .await
+    .unwrap_err();
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("Could not transcribe audio"),
+        "a real .aac upload must reach model loading, not fail at audio preparation: {rendered}"
+    );
+    assert!(!rendered.contains("Unsupported audio input"));
+    assert!(!rendered.contains("the file has no extension"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn native_audio_preparation_does_not_consume_model_capacity() {
