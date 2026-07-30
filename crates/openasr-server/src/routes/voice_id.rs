@@ -635,7 +635,8 @@ fn extract_source_intervals(
     let source_path: &std::path::Path = source.path.as_ref();
     let prepared = openasr_core::prepare_audio_input(
         source_path,
-        &openasr_core::AudioPreparationOptions::new(openasr_core::BackendKind::Native),
+        &openasr_core::AudioPreparationOptions::new(openasr_core::BackendKind::Native)
+            .with_native_non_wav_conversion(true),
     )
     .map_err(|error| ApiError::BadRequest(format!("Could not decode source_audio: {error}")))?;
     let decoded = match prepared.samples() {
@@ -1158,7 +1159,10 @@ mod tests {
         http::{Request, header},
     };
 
-    use super::{Multipart, parse_enroll_multipart, resolve_initial_sample_labels};
+    use super::{
+        Multipart, parse_enroll_multipart, parse_source_enroll_multipart,
+        resolve_initial_sample_labels,
+    };
 
     #[test]
     fn initial_enrollment_sample_labels_preserve_client_values_and_fallbacks() {
@@ -1231,7 +1235,13 @@ mod tests {
     fn source_audio_intervals_are_aggregated_and_validated() {
         use std::io::Write;
 
-        let mut file = tempfile::NamedTempFile::new().unwrap();
+        // A `.wav` suffix here mirrors what `stream_voice_id_source` actually
+        // produces in production (it preserves the uploaded filename's
+        // extension) -- without it `extract_source_intervals` cannot tell
+        // this is a wav at all, which is exactly the code path
+        // `voice_id_registration_accepts_non_wav_and_non_conformant_wav_source_audio`
+        // below exercises for formats that are not already-conformant.
+        let mut file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
         file.write_all(&pcm16_wav()).unwrap();
         let source = super::UploadedVoiceIdSource {
             path: file.into_temp_path(),
@@ -1271,6 +1281,71 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Builds and parses a `/v1/voice-id/persons/from-audio`-style multipart
+    /// request carrying a single `source_audio` field (with `filename` so
+    /// `stream_voice_id_source` preserves its extension, exactly as a real
+    /// upload does) plus a short `intervals` entry -- the real path
+    /// `enroll_person_from_source_audio` runs in production.
+    async fn parse_source_enroll_with_file(
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<super::ParsedSourceEnroll, crate::ApiError> {
+        let boundary = "voice-id-source-test-boundary";
+        let mut body = Vec::new();
+        form_field(&mut body, boundary, "display_name", b"Alice");
+        // 0.3s leaves margin below the encoders' true ~0.5s content for any
+        // mp3 encoder priming/padding samples, so this stays valid regardless
+        // of the exact decoded sample count.
+        form_field(
+            &mut body,
+            boundary,
+            "intervals",
+            br#"[{"start":0.0,"end":0.3}]"#,
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"source_audio\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await;
+        parse_source_enroll_multipart(multipart).await
+    }
+
+    /// Regression test for the missing `.with_native_non_wav_conversion(true)`
+    /// switch on `extract_source_intervals`'s `prepare_audio_input` call
+    /// (0.1.24 regression): before the fix, `prepare_audio_input` took the
+    /// Native + conversion-disabled passthrough at the very top of
+    /// `prepare_external_input` for *any* source_audio, so a 44.1 kHz stereo
+    /// wav or an mp3 was handed straight to `load_native_wav_16khz_mono_f32_
+    /// v0` untouched and failed with "expected 16 kHz mono PCM16 or float32
+    /// WAV input for source_audio" -- a decode error, not an audio problem.
+    /// This is the test whose absence let that regression ship; it must
+    /// register successfully via the real multipart-parsing path.
+    #[tokio::test]
+    async fn voice_id_source_audio_registration_accepts_mp3_and_non_conformant_wav() {
+        let mp3 = include_bytes!("../../tests/fixtures/tone_stereo_44100.mp3");
+        let mp3_enroll = parse_source_enroll_with_file("clip.mp3", mp3)
+            .await
+            .expect("a 44.1 kHz stereo mp3 source_audio must register successfully");
+        assert!(!mp3_enroll.clip.samples.is_empty());
+
+        let wav = include_bytes!("../../tests/fixtures/tone_stereo_44100.wav");
+        let wav_enroll = parse_source_enroll_with_file("clip.wav", wav).await.expect(
+            "a 44.1 kHz stereo (non-conformant) wav source_audio must register successfully",
+        );
+        assert!(!wav_enroll.clip.samples.is_empty());
     }
 
     #[tokio::test]
