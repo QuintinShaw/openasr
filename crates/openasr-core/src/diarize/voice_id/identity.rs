@@ -235,6 +235,7 @@ fn name_speakers_across_scopes_with(
     let mut evidence: BTreeMap<String, LabelEvidence> = BTreeMap::new();
     for (scope_index, scope) in scopes.iter().enumerate() {
         for (label, windows) in evidence::plan_label_windows(scope.segments) {
+            let planned_windows = windows.len();
             let mut embeddings = Vec::with_capacity(windows.len());
             let mut spans = Vec::with_capacity(windows.len());
             for window in windows {
@@ -248,15 +249,28 @@ fn name_speakers_across_scopes_with(
                 spans.push(window);
             }
             if embeddings.is_empty() {
+                log_naming_debug(format_args!(
+                    "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows=0 decision=no-usable-window"
+                ));
                 continue;
             }
-            evidence.insert(
-                label,
-                LabelEvidence::from_windows(
-                    evidence::judge_windows(&embeddings, &spans),
-                    scope_index,
-                ),
+            let entry = LabelEvidence::from_windows(
+                evidence::judge_windows(&embeddings, &spans),
+                scope_index,
             );
+            log_naming_debug(format_args!(
+                "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows={} kept_windows={} kept_seconds={:.2} single_voice={} min_windows={MIN_PURITY_VERDICT_WINDOWS} min_seconds={MIN_NAMING_EVIDENCE_SECONDS:.2} naming_evidence={}",
+                embeddings.len(),
+                entry.kept.len(),
+                entry.kept_seconds,
+                entry.single_voice,
+                if entry.centroid_for_naming().is_some() {
+                    "accepted"
+                } else {
+                    "refused"
+                },
+            ));
+            evidence.insert(label, entry);
         }
     }
 
@@ -293,9 +307,22 @@ fn name_speakers_across_scopes_with(
         .into_iter()
         .filter_map(|(label, evidence)| {
             let centroid = evidence.centroid_for_naming()?;
-            matcher
-                .best_match(&centroid)
-                .map(|matched| (label, matched))
+            let matched = matcher.best_match(&centroid);
+            if crate::diarize::debug::diarize_debug_enabled() {
+                let (best, threshold) = matcher
+                    .best_score_and_threshold(&centroid)
+                    .map(|(score, threshold)| (format!("{score:.4}"), format!("{threshold:.4}")))
+                    .unwrap_or_else(|| ("n/a".to_string(), "n/a".to_string()));
+                log_naming_debug(format_args!(
+                    "stage=voice-id-match label={label} library_empty={} best_score={best} accept_threshold={threshold} decision={}",
+                    matcher.is_empty(),
+                    match &matched {
+                        Some(person) => format!("named:{}", person.person_id.as_str()),
+                        None => "anonymous".to_string(),
+                    },
+                ));
+            }
+            matched.map(|matched| (label, matched))
         })
         .collect();
 
@@ -541,6 +568,22 @@ fn disambiguate_labels_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
             segment.speaker_label = Some(global.clone());
         }
     }
+}
+
+/// Trace one naming decision on stderr under the shared `OPENASR_DIARIZE_DEBUG`
+/// gate.
+///
+/// Every gate in this module is deliberately silent toward the transcript (see
+/// the module docs), which leaves "a familiar voice was not named" and "the
+/// voice was never even measured" indistinguishable from the outside. These
+/// lines are the only place that difference is observable, so they report the
+/// evidence a decision was made on -- window counts, seconds, the similarity
+/// and the threshold it was compared against -- not just the verdict.
+fn log_naming_debug(fields: std::fmt::Arguments<'_>) {
+    if !crate::diarize::debug::diarize_debug_enabled() {
+        return;
+    }
+    eprintln!("openasr_diarize_debug {fields}");
 }
 
 /// The samples one window names, or `None` if the scope's audio does not

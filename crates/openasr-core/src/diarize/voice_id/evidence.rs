@@ -80,14 +80,15 @@ pub(super) const WINDOW_SECONDS: f64 = 2.0;
 /// window.
 pub(super) const WINDOW_STEP_SECONDS: f64 = 1.0;
 
-/// Cut off each end of a segment before windowing.
+/// Cut off each end of a turn before windowing.
 ///
-/// Segment boundaries are exactly where a segmenter's error lives; in this
-/// pipeline a segment already *is* one speaker turn (`plan_label_windows`
-/// takes each label's segments as given, one per turn), so this is a
-/// turn-edge trim in effect and the seconds right after a turn starts and
-/// right before it ends are the most likely to actually belong to whoever
-/// spoke before or after.
+/// Segment boundaries are exactly where a segmenter's error lives, and the
+/// boundary that carries that error is a *speaker change*: the seconds right
+/// after a turn starts and right before it ends are the most likely to
+/// actually belong to whoever spoke before or after. So this is charged once
+/// per turn, at the two edges [`label_turn_runs`] identifies as real, and not
+/// at every sentence boundary inside a turn -- see that function for what
+/// happened when it was.
 ///
 /// 0.5s replaces a prior 0.25s. Splitting three real recordings' windows by
 /// distance to the nearest turn boundary showed a quarter second was not
@@ -178,6 +179,10 @@ pub(super) struct JudgedWindows {
 /// contaminated by construction and no downstream filter should have to deal
 /// with it. Each label stops at [`MAX_WINDOWS_PER_LABEL`], so this also bounds
 /// the embedding work per scope.
+///
+/// They are planned over *turns* ([`label_turn_runs`]), not over the segments
+/// as handed in, so how finely the transcript happens to be cut cannot change
+/// how much evidence a voice is credited with.
 pub(super) fn plan_label_windows(segments: &[Segment]) -> BTreeMap<String, Vec<TimeRange>> {
     let mut ordered: Vec<(&str, TimeRange)> = segments
         .iter()
@@ -195,8 +200,8 @@ pub(super) fn plan_label_windows(segments: &[Segment]) -> BTreeMap<String, Vec<T
     ordered.sort_by(|a, b| a.1.start_s.total_cmp(&b.1.start_s));
 
     let mut planned: BTreeMap<String, Vec<TimeRange>> = BTreeMap::new();
-    for (label, range) in &ordered {
-        let windows = planned.entry((*label).to_string()).or_default();
+    for (label, range) in label_turn_runs(&ordered) {
+        let windows = planned.entry(label.to_string()).or_default();
         if windows.len() >= MAX_WINDOWS_PER_LABEL {
             continue;
         }
@@ -216,6 +221,61 @@ pub(super) fn plan_label_windows(segments: &[Segment]) -> BTreeMap<String, Vec<T
     }
     planned.retain(|_, windows| !windows.is_empty());
     planned
+}
+
+/// Each label's segments coalesced into the turns they came from, in start
+/// order.
+///
+/// # Why the segments cannot be windowed as given
+///
+/// [`SEGMENT_EDGE_TRIM_SECONDS`] is a *turn*-edge trim: it exists because the
+/// seconds right after a speaker starts and right before they stop are the
+/// ones most likely to belong to whoever spoke around them. It used to be
+/// applied per segment on the assumption -- stated in that constant's own docs
+/// -- that a segment already is one turn. That assumption does not survive the
+/// pipeline: subtitle-grade cue re-segmentation
+/// (`api::backend::cue_segmentation`) runs before this stage and cuts one turn
+/// into several sentence-sized segments, none of whose interior boundaries is
+/// a speaker change.
+///
+/// Charging the trim at every one of those boundaries is not a small loss. It
+/// costs a full second per cue *and* silently discards every cue shorter than
+/// `2 * SEGMENT_EDGE_TRIM_SECONDS + WINDOW_SECONDS` = 3.0s, which is most of
+/// them. Measured on a 14s single-speaker recording whose 12.9s turn arrived
+/// as four cues, the label yielded 3 windows instead of 10 -- under
+/// [`MIN_PURITY_VERDICT_WINDOWS`] -- so an enrolled speaker that scores 0.81
+/// against their own prototype was never even compared to it. The evidence
+/// gates are supposed to measure how much voice backs a label; per-segment
+/// windowing made them measure how finely the transcript was cut instead.
+///
+/// # What counts as one turn
+///
+/// Consecutive same-label segments separated by no more than
+/// [`SEGMENT_EDGE_TRIM_SECONDS`]. A pause that short is within-turn breathing
+/// -- shorter than the audio the trim was already prepared to throw away at
+/// each side of the boundary -- so bridging it admits no more untrusted audio
+/// than the previous behaviour did. Anything longer ends the run and both
+/// sides get trimmed as the genuine turn edges they are.
+///
+/// Bridging a gap cannot pull in another speaker: a window that reaches across
+/// a segment where a different label is active is still rejected by
+/// [`overlaps_another_label`] below, exactly as before.
+fn label_turn_runs<'a>(ordered: &[(&'a str, TimeRange)]) -> Vec<(&'a str, TimeRange)> {
+    let mut open: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut runs: Vec<(&'a str, TimeRange)> = Vec::new();
+    for (label, range) in ordered {
+        match open.get(label).copied() {
+            Some(index) if range.start_s - runs[index].1.end_s <= SEGMENT_EDGE_TRIM_SECONDS => {
+                let end = runs[index].1.end_s.max(range.end_s);
+                runs[index].1 = TimeRange::new(runs[index].1.start_s, end);
+            }
+            _ => {
+                open.insert(*label, runs.len());
+                runs.push((*label, *range));
+            }
+        }
+    }
+    runs
 }
 
 fn overlaps_another_label(window: &TimeRange, label: &str, ordered: &[(&str, TimeRange)]) -> bool {
@@ -403,6 +463,62 @@ mod tests {
             plan_label_windows(&[segment(0.0, 3.0, "SPEAKER_00")])["SPEAKER_00"].len(),
             1
         );
+    }
+
+    /// The regression this whole turn-run business exists for: how finely a
+    /// transcript is cut must not change how much evidence a voice has.
+    ///
+    /// One person talking continuously for 12s arrives as four sentence cues
+    /// once `cue_segmentation` has run. Windowed per cue that label yields one
+    /// window and is refused a name; windowed per turn it yields the ten
+    /// windows the same audio always deserved.
+    #[test]
+    fn a_turn_delivered_as_cues_keeps_the_whole_turns_windows() {
+        let whole_turn = plan_label_windows(&[segment(0.0, 12.0, "SPEAKER_00")]);
+        let cut_into_cues = plan_label_windows(&[
+            segment(0.0, 2.7, "SPEAKER_00"),
+            segment(3.0, 5.7, "SPEAKER_00"),
+            segment(6.0, 8.7, "SPEAKER_00"),
+            segment(9.0, 12.0, "SPEAKER_00"),
+        ]);
+        assert_eq!(whole_turn["SPEAKER_00"].len(), 10);
+        assert_eq!(cut_into_cues["SPEAKER_00"], whole_turn["SPEAKER_00"]);
+        assert!(cut_into_cues["SPEAKER_00"].len() >= MIN_PURITY_VERDICT_WINDOWS);
+    }
+
+    /// The other side of that rule: a real pause ends the turn, so both of its
+    /// edges are trimmed and no window is ever laid over the silence.
+    #[test]
+    fn a_pause_longer_than_the_trim_ends_the_turn() {
+        let planned = plan_label_windows(&[
+            segment(0.0, 3.0, "SPEAKER_00"),
+            segment(3.6, 6.6, "SPEAKER_00"),
+        ]);
+        let windows = &planned["SPEAKER_00"];
+        assert_eq!(windows.len(), 2);
+        for window in windows {
+            assert!(
+                window.end_s <= 3.0 || window.start_s >= 3.6,
+                "window {window:?} was laid over the pause"
+            );
+        }
+    }
+
+    /// Bridging a short gap must not be a way around the overlap rule: whoever
+    /// speaks inside the gap still blocks every window that reaches across it.
+    #[test]
+    fn another_label_inside_a_bridged_gap_still_blocks_the_crossing_window() {
+        let planned = plan_label_windows(&[
+            segment(0.0, 6.0, "SPEAKER_00"),
+            segment(6.1, 6.4, "SPEAKER_01"),
+            segment(6.5, 12.0, "SPEAKER_00"),
+        ]);
+        for window in &planned["SPEAKER_00"] {
+            assert!(
+                window.end_s <= 6.1 || window.start_s >= 6.4,
+                "window {window:?} crosses the interjection"
+            );
+        }
     }
 
     /// Where two labels are simultaneously active neither one gets a window:
