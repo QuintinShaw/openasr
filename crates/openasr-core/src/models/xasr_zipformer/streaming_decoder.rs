@@ -174,6 +174,50 @@ impl XasrIncrementalDecoder {
         self.detokenizer.rebase_preserving_boundary_context();
         debug_assert_eq!(self.decoded_tokens, self.decode_state.emitted_history_len());
     }
+
+    /// Adaptive early-exit predicate for the final-flush pad loop in
+    /// [`IncrementalAudioDecoder::finish`]: true once the model has settled on
+    /// the end of the utterance. The `#[cfg(test)]` escape hatch forces the loop
+    /// to run every pad hop so a golden test can byte-compare "early exit"
+    /// against "pad the full 0.8 s" on the same decoder.
+    fn finish_endpoint_reached(&self, new_tokens_this_hop: usize) -> bool {
+        #[cfg(test)]
+        if FORCE_FULL_FLUSH.with(std::cell::Cell::get) {
+            return false;
+        }
+        xasr_finish_endpoint_reached(new_tokens_this_hop, self.detokenizer.text())
+    }
+}
+
+/// The tail text already ends a sentence: its last visible character is one of
+/// the terminal punctuation marks the streaming zipformer emits only after
+/// seeing trailing silence. Matches the batch golden's punctuation set in this
+/// file.
+fn xasr_tail_is_sentence_terminal(tail_text: &str) -> bool {
+    tail_text
+        .trim_end()
+        .ends_with(['.', '?', '!', '\u{3002}', '\u{ff1f}', '\u{ff01}'])
+}
+
+/// Whether the final-flush pad loop can safely stop after this hop. BOTH
+/// conditions are required: the tail must already carry sentence-terminal
+/// punctuation (the sole reason the flush pads with silence at all) AND this
+/// hop must have produced no new non-blank token (the padded frames
+/// greedy-decoded to all blanks, i.e. the model answered the silence with
+/// blanks). Only then are the remaining pad hops -- more of the same trailing
+/// silence -- safe to skip. Requiring terminal punctuation keeps early exit
+/// from ever dropping it; requiring a zero-emission hop keeps it from cutting
+/// off a word the model is still emitting.
+fn xasr_finish_endpoint_reached(new_tokens_this_hop: usize, tail_text: &str) -> bool {
+    new_tokens_this_hop == 0 && xasr_tail_is_sentence_terminal(tail_text)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override: when set, [`XasrIncrementalDecoder::finish_endpoint_reached`]
+    /// never fires, so `finish` pads the full 0.8 s and decodes every hop --
+    /// the byte-for-byte baseline the early-exit golden compares against.
+    static FORCE_FULL_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl IncrementalAudioDecoder for XasrIncrementalDecoder {
@@ -192,17 +236,57 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         let _thread_override = install_request_inference_threads_override(
             self.request.request_options.inference_threads,
         );
-        // Final flush: append the tail padding so the model sees the trailing
-        // silence it needs to emit end-of-sentence tokens (terminal
-        // punctuation). Mirrors the batch path in `PooledRuntime::transcribe`;
-        // the session driver guarantees finish() runs at most once.
-        if !self.audio.is_empty() {
-            self.audio.extend(std::iter::repeat_n(
-                0.0f32,
-                XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES,
-            ));
+        if self.audio.is_empty() {
+            return self.process_available_chunks(true);
         }
-        self.process_available_chunks(true)
+        // Final flush: append the tail padding so the model sees the trailing
+        // silence it needs to emit the last sentence's terminal punctuation
+        // (mirrors the batch path in `PooledRuntime::transcribe`). Appending the
+        // whole 0.8 s up front -- rather than growing it hop by hop -- keeps
+        // every fbank row byte-identical to a full-pad flush, so the adaptive
+        // early exit below can only ever skip trailing hops, never change the
+        // rows the retained hops decode. The session driver guarantees finish()
+        // runs at most once.
+        self.audio.extend(std::iter::repeat_n(
+            0.0f32,
+            XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES,
+        ));
+        let total_samples = self.dropped_samples + self.audio.len();
+        let target_total_frames = total_frame_count_for_samples(total_samples);
+        if target_total_frames == 0 {
+            return Ok(String::new());
+        }
+        self.extend_feature_rows(target_total_frames)?;
+
+        // Decode the flush hops one at a time and stop as soon as the model has
+        // settled on the end of the utterance: the tail already carries terminal
+        // punctuation AND this hop produced no new non-blank token (the padded
+        // frames greedy-decoded to all blanks). The real audio's last word is
+        // never at risk -- it lives in the hops before any padding and is always
+        // decoded. The 0.8 s pad stays the hard upper bound: if the heuristic
+        // never fires (e.g. a clause that ends without terminal punctuation)
+        // every hop runs, exactly like the pad-all-then-flush path, so this can
+        // only skip work, never change a retained hop's output.
+        let executor_id = self.executor_id;
+        let adapter_id = self.adapter_id;
+        let mut delta = String::new();
+        loop {
+            let outcome = self
+                .runtime
+                .decode_next_chunk(&mut self.decode_state, &self.features, true)
+                .map_err(|error| {
+                    GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error)
+                })?;
+            if !outcome.processed {
+                break;
+            }
+            delta.push_str(&self.text_delta()?);
+            if self.finish_endpoint_reached(outcome.new_tokens) {
+                break;
+            }
+        }
+        self.drain_consumed_prefix();
+        Ok(delta)
     }
 
     fn reset(&mut self) {
@@ -258,6 +342,43 @@ mod tests {
     use super::*;
     use crate::ggml_runtime::{GgufTensorDataReader, read_gguf_metadata};
     use crate::models::xasr_zipformer::executor::transcribe_xasr_zipformer_pcm;
+
+    #[test]
+    fn endpoint_requires_both_terminal_punctuation_and_a_silent_hop() {
+        // Fires: terminal punctuation is present and the hop added nothing.
+        assert!(xasr_finish_endpoint_reached(0, "hello world."));
+        assert!(xasr_finish_endpoint_reached(0, "hello world.  "));
+        assert!(xasr_finish_endpoint_reached(0, "\u{4f60}\u{597d}\u{3002}"));
+        // Negative: the hop was silent but the tail is not sentence-final, so
+        // the model may still owe the closing punctuation -- keep padding.
+        assert!(!xasr_finish_endpoint_reached(0, "hello world"));
+        assert!(!xasr_finish_endpoint_reached(0, "hello,"));
+        assert!(!xasr_finish_endpoint_reached(0, ""));
+        // Negative: punctuation is there but the hop still emitted a token, so
+        // the model has not settled -- never cut off an in-flight emission.
+        assert!(!xasr_finish_endpoint_reached(1, "hello world."));
+        assert!(!xasr_finish_endpoint_reached(3, "hello world."));
+    }
+
+    #[test]
+    fn tail_terminal_check_matches_the_batch_golden_punctuation_set() {
+        for terminal in ['.', '?', '!', '\u{3002}', '\u{ff1f}', '\u{ff01}'] {
+            assert!(
+                xasr_tail_is_sentence_terminal(&format!("done{terminal}")),
+                "'{terminal}' must count as sentence-terminal"
+            );
+            // Trailing whitespace must not hide the terminal mark.
+            assert!(xasr_tail_is_sentence_terminal(&format!(
+                "done{terminal} \t"
+            )));
+        }
+        for non_terminal in [',', ';', ':', '\u{ff0c}', '-'] {
+            assert!(
+                !xasr_tail_is_sentence_terminal(&format!("clause{non_terminal}")),
+                "'{non_terminal}' must not count as sentence-terminal"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "host-local: requires the X-ASR q8_0 pack under tmp/xasr-test/out"]
@@ -430,6 +551,76 @@ mod tests {
             decoder.dropped_frames,
             decoder.features.n_frames
         );
+    }
+
+    #[test]
+    #[ignore = "host-local: requires the X-ASR q8_0 pack under tmp/xasr-test/out"]
+    fn early_exit_finish_matches_full_pad_finish_byte_for_byte() {
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr");
+        if !pack.exists() {
+            eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
+            return;
+        }
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            ),
+        );
+        let mut request = xasr_streaming_request();
+        request.runtime_source_path = pack.clone();
+        request.resolved_runtime = resolved_runtime;
+
+        // Streams `wav` in small chunks then flushes, returning the final-flush
+        // delta. With `force_full` the endpoint heuristic is disabled, so
+        // finish pads the full 0.8 s and decodes every hop -- the baseline the
+        // early-exit path must reproduce byte-for-byte.
+        let finish_delta = |wav: &str, force_full: bool| -> String {
+            let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures")
+                    .join(wav)
+                    .canonicalize()
+                    .expect("fixture wav path must exist"),
+                "xasr early-exit parity test",
+                "xasr early-exit parity test",
+            )
+            .expect("sample wav should load");
+            let runtime = super::super::runtime::checkout_prepared_runtime(
+                &runtime_source,
+                resolved_runtime.backend(),
+            )
+            .expect("streaming runtime");
+            let mut decoder = XasrIncrementalDecoder::new(
+                &request,
+                crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
+                crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
+                runtime,
+            );
+            for chunk in samples.chunks(320) {
+                decoder.accept_samples(chunk).expect("stream chunk");
+            }
+            FORCE_FULL_FLUSH.with(|f| f.set(force_full));
+            let delta = decoder.finish().expect("stream finish");
+            FORCE_FULL_FLUSH.with(|f| f.set(false));
+            delta
+        };
+
+        // en, zh-en mixed, and a short zh clip: representative of the punctuation
+        // the adaptive early exit keys off. Any divergence means the heuristic
+        // dropped or added a token relative to padding the full 0.8 s.
+        for wav in ["jfk.wav", "en_zh_mixed.wav", "zh_sample.wav"] {
+            let early = finish_delta(wav, false);
+            let full = finish_delta(wav, true);
+            eprintln!("xasr early-exit vs full-pad {wav}: early_finish={early:?}");
+            assert_eq!(
+                early, full,
+                "early-exit finish must byte-match full-pad finish for {wav}"
+            );
+        }
     }
 
     fn xasr_streaming_request() -> GgmlAsrStreamingSessionRequest {
