@@ -19,6 +19,7 @@
 //! `docs` note in `encoder_graph.rs` on the long-audio context-window bound.
 
 pub(crate) mod decode_executor;
+pub(crate) mod decode_session;
 pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;

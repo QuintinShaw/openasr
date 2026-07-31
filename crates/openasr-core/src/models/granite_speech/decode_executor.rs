@@ -1,28 +1,23 @@
-//! Granite Speech decode-step executor: wires `decoder_graph::prefill_logits`
-//! into the shared greedy-decode driver
-//! (`seq2seq_greedy_decode::run_seq2seq_greedy_decode_loop_with_adapter_v0`,
+//! Granite Speech decode-step executors: wire an incremental-KV
+//! `decode_session::GraniteSpeechDecodeSession` into the shared greedy-decode
+//! driver (`seq2seq_greedy_decode::run_seq2seq_greedy_decode_loop_with_adapter_v0`,
 //! reached the same way every other builtin family reaches it -- see
 //! `AGENTS.md`'s "one greedy decode driver" invariant). This module never
 //! picks a token itself; `decode_step_logits` only returns a logits row, and
 //! the shared driver owns argmax, suppression, stop-token, and the
 //! degenerate-loop guard.
 //!
-//! KV-cache note (explicitly scoped this way, see the coordinator note this
-//! was written against): another in-flight change is reworking the shared
-//! `nn::decoder` graph-reuse/KV-cache mechanism that qwen's production decode
-//! depends on. Rather than build a second, competing incremental-KV
-//! mechanism inside this family while that lands, this executor recomputes
-//! the *entire* prefix from scratch every step via `prefill_logits` (a plain
-//! non-incremental forward, see that module's doc) and reads off the last
-//! position's logits. This is the "use the current mechanism" instruction
-//! taken literally: `prefill_logits` IS the current (only) mechanism this
-//! family has, so decode-step-N is just prefill over
-//! `initial_prompt_tokens ++ generated_tokens_so_far`. It is O(n^2) in total
-//! decoded length and does not share this family's future incremental
-//! KV-cache session; once the shared graph-reuse mechanism lands, swapping
-//! this executor to it is a local, non-invasive change (the
-//! `Seq2SeqGreedyDecodeStepExecutor` boundary is exactly where that swap
-//! happens, nothing above this module needs to change).
+//! Incremental KV cache: the first `decode_step_logits` call prefills the whole
+//! prompt into a persistent session (seeding every layer's K/V); each later call
+//! computes Q/K/V for only the newly generated token, appends its K/V, and
+//! attends the single new query against the full cached history (see
+//! `decode_session`). This is the same incremental-decode shape every other
+//! autoregressive family here already uses (qwen `Qwen3AsrLayerKvCacheState`,
+//! firered-llm, cohere), and it replaces the earlier
+//! recompute-the-entire-prefix-every-step path that was `O(n^2)` in decoded
+//! length (~430x realtime for the 2B Granite decoder). The session's outputs are
+//! bit-identical to that full recompute -- proven by
+//! `decode_session`'s `granite_incremental_decode_matches_full_recompute_bit_exact`.
 
 #![allow(dead_code)]
 
@@ -32,15 +27,57 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 
+use super::decode_session::GraniteSpeechDecodeSession;
 use super::decoder_graph::{
-    GraniteSpeechDecoderConfig, GraniteSpeechDecoderWeightProvider, embed_token_row,
-    prefill_logits, prefill_logits_from_embeddings,
+    GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, GraniteSpeechDecoderWeightProvider,
+    embed_token_row,
 };
 
+fn map_step_error(
+    step_index: usize,
+    label: &'static str,
+) -> impl Fn(GraniteSpeechDecoderError) -> Seq2SeqGreedyDecodeError {
+    move |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+        reason: format!("granite-speech {label} decoder step {step_index}: {error}"),
+    }
+}
+
+/// Assert the shared greedy driver is calling us in the strict incremental
+/// order the KV cache session assumes: step 0 with no generated tokens (prefill
+/// covers the prompt), then exactly one new token per step. Fails closed rather
+/// than silently returning stale logits if that invariant is ever violated.
+fn incremental_new_token(
+    session: &GraniteSpeechDecodeSession<'_>,
+    prompt_len: usize,
+    input: &Seq2SeqGreedyDecodeStepInput<'_>,
+) -> Result<u32, Seq2SeqGreedyDecodeError> {
+    let expected_cached = prompt_len + input.generated_tokens.len().saturating_sub(1);
+    let new_token = input.generated_tokens.last().copied();
+    match new_token {
+        Some(token) if session.cached_positions() == expected_cached => Ok(token),
+        _ => Err(Seq2SeqGreedyDecodeError::DecoderStepFailed {
+            reason: format!(
+                "granite-speech decoder step {} out of incremental order: cached {} positions, \
+                 {} generated tokens, prompt {}",
+                input.step_index,
+                session.cached_positions(),
+                input.generated_tokens.len(),
+                prompt_len
+            ),
+        }),
+    }
+}
+
+/// Incremental-KV greedy step executor for a text-token prompt. Builds a
+/// persistent [`GraniteSpeechDecodeSession`] on the first call (prefilling the
+/// prompt), then advances it one token per step -- eliminating the historical
+/// per-step full-prefix recompute (`O(n^2)` decode).
 pub(crate) struct GraniteSpeechDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
     provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     backend: GgmlCpuGraphBackend,
+    session: Option<GraniteSpeechDecodeSession<'p>>,
+    prompt_len: usize,
 }
 
 impl<'p> GraniteSpeechDecodeStepExecutor<'p> {
@@ -53,6 +90,8 @@ impl<'p> GraniteSpeechDecodeStepExecutor<'p> {
             config,
             provider,
             backend,
+            session: None,
+            prompt_len: 0,
         }
     }
 }
@@ -62,20 +101,33 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
         &mut self,
         input: Seq2SeqGreedyDecodeStepInput<'_>,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
-        let mut token_ids: Vec<u32> =
-            Vec::with_capacity(input.initial_prompt_tokens.len() + input.generated_tokens.len());
-        token_ids.extend_from_slice(input.initial_prompt_tokens);
-        token_ids.extend_from_slice(input.generated_tokens);
+        // Steps after the first advance the existing session by one token.
+        if let Some(session) = self.session.as_mut() {
+            let new_token = incremental_new_token(session, self.prompt_len, &input)?;
+            let logits = session
+                .decode_step(new_token)
+                .map_err(map_step_error(input.step_index, "text"))?;
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits,
+                greedy_token_hint: None,
+            });
+        }
 
-        let output = prefill_logits(&self.config, self.provider, &token_ids, self.backend)
-            .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                reason: format!("granite-speech decoder step {}: {error}", input.step_index),
-            })?;
-
-        let vocab_size = output.vocab_size;
-        let last_start = (output.n_tokens - 1) * vocab_size;
-        let logits = output.logits[last_start..last_start + vocab_size].to_vec();
-
+        // First call: prefill the text-token prompt into a fresh session.
+        let hidden = self.config.hidden_size;
+        let mut embeddings = Vec::with_capacity(input.initial_prompt_tokens.len() * hidden);
+        for &token_id in input.initial_prompt_tokens {
+            let row = embed_token_row(&self.config, self.provider, token_id)
+                .map_err(map_step_error(input.step_index, "text"))?;
+            embeddings.extend_from_slice(row);
+        }
+        let mut session = GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend)
+            .map_err(map_step_error(input.step_index, "text"))?;
+        let logits = session
+            .prefill(&embeddings, input.initial_prompt_tokens.len())
+            .map_err(map_step_error(input.step_index, "text"))?;
+        self.prompt_len = input.initial_prompt_tokens.len();
+        self.session = Some(session);
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits,
             greedy_token_hint: None,
@@ -83,22 +135,22 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
     }
 }
 
-/// Same recompute-per-step approach as [`GraniteSpeechDecodeStepExecutor`],
-/// but for a prompt containing a spliced-in audio embedding sequence (see
+/// Same incremental-KV session as [`GraniteSpeechDecodeStepExecutor`], but for a
+/// prompt containing a spliced-in audio embedding sequence (see
 /// `prompt::build_audio_prompt_embeddings`): the fixed prompt prefix's
-/// embeddings (audio + text) are precomputed once at construction; each step
-/// re-embeds only the newly generated (always plain-text) tokens and
-/// concatenates them onto the stored prefix before calling
-/// `prefill_logits_from_embeddings`. `input.initial_prompt_tokens` must be
-/// the exact token-id sequence `initial_prompt_embeddings` was built from
-/// (used for its length, and so the shared driver's phrase-bias/stop-token
-/// bookkeeping still sees real token ids) -- this executor never re-derives
-/// embeddings from it.
+/// embeddings (audio + text) are prefilled once; each subsequent step embeds
+/// only the single newly generated (always plain-text) token and advances the
+/// cache. `input.initial_prompt_tokens` must be the exact token-id sequence
+/// `initial_prompt_embeddings` was built from (used for its length, and so the
+/// shared driver's phrase-bias/stop-token bookkeeping still sees real token
+/// ids) -- this executor never re-derives the prompt embeddings from it.
 pub(crate) struct GraniteSpeechAudioDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
     provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     backend: GgmlCpuGraphBackend,
     initial_prompt_embeddings: Vec<f32>,
+    session: Option<GraniteSpeechDecodeSession<'p>>,
+    prompt_len: usize,
 }
 
 impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
@@ -113,6 +165,8 @@ impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
             provider,
             backend,
             initial_prompt_embeddings,
+            session: None,
+            prompt_len: 0,
         }
     }
 }
@@ -122,35 +176,30 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
         &mut self,
         input: Seq2SeqGreedyDecodeStepInput<'_>,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
-        let map_err = |error: super::decoder_graph::GraniteSpeechDecoderError| {
-            Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                reason: format!(
-                    "granite-speech audio decoder step {}: {error}",
-                    input.step_index
-                ),
-            }
-        };
-
-        let n_tokens = input.initial_prompt_tokens.len() + input.generated_tokens.len();
-        let mut embeddings = self.initial_prompt_embeddings.clone();
-        for &token_id in input.generated_tokens {
-            let row = embed_token_row(&self.config, self.provider, token_id).map_err(map_err)?;
-            embeddings.extend_from_slice(row);
+        // Steps after the first advance the existing session by one token.
+        if let Some(session) = self.session.as_mut() {
+            let new_token = incremental_new_token(session, self.prompt_len, &input)?;
+            let logits = session
+                .decode_step(new_token)
+                .map_err(map_step_error(input.step_index, "audio"))?;
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits,
+                greedy_token_hint: None,
+            });
         }
 
-        let output = prefill_logits_from_embeddings(
-            &self.config,
-            self.provider,
-            &embeddings,
-            n_tokens,
-            self.backend,
-        )
-        .map_err(map_err)?;
-
-        let vocab_size = output.vocab_size;
-        let last_start = (output.n_tokens - 1) * vocab_size;
-        let logits = output.logits[last_start..last_start + vocab_size].to_vec();
-
+        // First call: prefill the audio-spliced prompt embeddings into a fresh
+        // session (never re-derived from the token ids -- see the struct doc).
+        let mut session = GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend)
+            .map_err(map_step_error(input.step_index, "audio"))?;
+        let logits = session
+            .prefill(
+                &self.initial_prompt_embeddings,
+                input.initial_prompt_tokens.len(),
+            )
+            .map_err(map_step_error(input.step_index, "audio"))?;
+        self.prompt_len = input.initial_prompt_tokens.len();
+        self.session = Some(session);
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits,
             greedy_token_hint: None,

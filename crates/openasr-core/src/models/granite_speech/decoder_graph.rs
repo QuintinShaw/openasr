@@ -129,7 +129,7 @@ impl GraniteSpeechDecoderWeightProvider for HashMap<String, Vec<f32>> {
     }
 }
 
-struct DecoderLayerWeights<'a> {
+pub(crate) struct DecoderLayerWeights<'a> {
     attn_norm_w: GgmlCpuTensor<'a>,
     q_w: GgmlCpuTensor<'a>,
     k_w: GgmlCpuTensor<'a>,
@@ -242,7 +242,7 @@ fn build_layer_weights<'a, 'p>(
     })
 }
 
-fn linear<'a>(
+pub(crate) fn linear<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     weight: GgmlCpuTensor<'a>,
     input: GgmlCpuTensor<'a>,
@@ -251,7 +251,7 @@ fn linear<'a>(
     graph.mul_mat(weight, input).map_err(ggml_err(stage))
 }
 
-fn rms_norm<'a>(
+pub(crate) fn rms_norm<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
     eps: f32,
@@ -264,7 +264,7 @@ fn rms_norm<'a>(
 
 /// `[n_tokens, n_tokens]` additive causal mask (`0` where `key <= query`,
 /// `f32::MIN` otherwise), row-major `[query][key]`.
-fn causal_mask(n_tokens: usize) -> Vec<f32> {
+pub(crate) fn causal_mask(n_tokens: usize) -> Vec<f32> {
     let mut mask = vec![0.0f32; n_tokens * n_tokens];
     for q in 0..n_tokens {
         for k in 0..n_tokens {
@@ -276,22 +276,36 @@ fn causal_mask(n_tokens: usize) -> Vec<f32> {
     mask
 }
 
-#[allow(clippy::too_many_arguments)]
-fn decoder_layer<'a>(
+/// Per-head query/key/value projections for one Granite decoder layer, already
+/// RoPE-rotated and permuted to `[head_dim, n_tokens, heads]` (query-major, the
+/// layout the batched `mul_mat` attention consumes; GQA broadcast relies on
+/// `kv_heads` dividing `q_heads`). `k_perm`/`v_perm` are exactly the per-token
+/// K/V an incremental KV-cache must persist (see
+/// `decode_session::GraniteSpeechDecodeSession`).
+pub(crate) struct GranitePreAttention<'a> {
+    pub q_perm: GgmlCpuTensor<'a>,
+    pub k_perm: GgmlCpuTensor<'a>,
+    pub v_perm: GgmlCpuTensor<'a>,
+}
+
+/// The pre-attention half of a Granite decoder layer: `rms_norm -> q/k/v proj
+/// -> reshape-to-heads -> RoPE(q,k) -> permute+cont to query-major`. Shared,
+/// byte-for-byte, by the one-shot prefill (`decoder_layer`) and the incremental
+/// decode step, so a cached K/V produced here is provably identical to the K/V
+/// a full recompute would produce at the same position.
+pub(crate) fn granite_pre_attention<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     hidden: GgmlCpuTensor<'a>,
     positions: GgmlCpuTensor<'a>,
-    mask: GgmlCpuTensor<'a>,
     weights: &DecoderLayerWeights<'a>,
     config: &GraniteSpeechDecoderConfig,
     n_tokens: usize,
     rope: GgmlRopeExtParams,
-) -> Result<GgmlCpuTensor<'a>, GraniteSpeechDecoderError> {
+) -> Result<GranitePreAttention<'a>, GraniteSpeechDecoderError> {
     let map = ggml_err("decoder_layer");
     let head_dim = config.head_dim;
     let q_heads = config.num_heads;
     let kv_heads = config.num_kv_heads;
-    let q_width = q_heads * head_dim;
 
     let normed = rms_norm(graph, hidden, config.rms_norm_eps, weights.attn_norm_w)?;
     let q = linear(graph, weights.q_w, normed, "q_proj")?;
@@ -314,22 +328,39 @@ fn decoder_layer<'a>(
     // -> [head_dim, n_tokens, heads] (query-major) for the batched mul_mat
     // attention below; GQA broadcast relies on kv_heads dividing q_heads
     // (native ggml mul_mat batch broadcast, no repeat_kv materialization).
-    let q = graph
+    let q_perm = graph
         .cont(graph.permute(q, 0, 2, 1, 3).map_err(map)?)
         .map_err(map)?;
-    let k = graph
+    let k_perm = graph
         .cont(graph.permute(k, 0, 2, 1, 3).map_err(map)?)
         .map_err(map)?;
-    let v = graph
+    let v_perm = graph
         .cont(graph.permute(v, 0, 2, 1, 3).map_err(map)?)
         .map_err(map)?;
 
-    let scores = graph.mul_mat(k, q).map_err(map)?;
-    let probs = graph
-        .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
-        .map_err(map)?;
-    let v_t = graph.cont(graph.transpose(v).map_err(map)?).map_err(map)?;
-    let attended = graph.mul_mat(v_t, probs).map_err(map)?;
+    Ok(GranitePreAttention {
+        q_perm,
+        k_perm,
+        v_perm,
+    })
+}
+
+/// The post-attention half of a Granite decoder layer: fold the attention
+/// context back to `[q_width, n_tokens]`, o-project + residual-scale into the
+/// residual stream, then the SwiGLU MLP + residual-scale. `attended` is the raw
+/// attention output `[head_dim, n_q, q_heads]`. Shared byte-for-byte by prefill
+/// and incremental decode (see `granite_pre_attention`).
+pub(crate) fn granite_post_attention<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    hidden: GgmlCpuTensor<'a>,
+    attended: GgmlCpuTensor<'a>,
+    weights: &DecoderLayerWeights<'a>,
+    config: &GraniteSpeechDecoderConfig,
+    n_tokens: usize,
+) -> Result<GgmlCpuTensor<'a>, GraniteSpeechDecoderError> {
+    let map = ggml_err("decoder_layer");
+    let q_width = config.num_heads * config.head_dim;
+
     let attended = graph
         .cont(graph.permute(attended, 0, 2, 1, 3).map_err(map)?)
         .map_err(map)?;
@@ -351,6 +382,32 @@ fn decoder_layer<'a>(
         .scale(ffn_out, config.residual_multiplier)
         .map_err(map)?;
     graph.add(hidden, ffn_out).map_err(map)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decoder_layer<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    hidden: GgmlCpuTensor<'a>,
+    positions: GgmlCpuTensor<'a>,
+    mask: GgmlCpuTensor<'a>,
+    weights: &DecoderLayerWeights<'a>,
+    config: &GraniteSpeechDecoderConfig,
+    n_tokens: usize,
+    rope: GgmlRopeExtParams,
+) -> Result<GgmlCpuTensor<'a>, GraniteSpeechDecoderError> {
+    let map = ggml_err("decoder_layer");
+    let pre = granite_pre_attention(graph, hidden, positions, weights, config, n_tokens, rope)?;
+
+    let scores = graph.mul_mat(pre.k_perm, pre.q_perm).map_err(map)?;
+    let probs = graph
+        .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
+        .map_err(map)?;
+    let v_t = graph
+        .cont(graph.transpose(pre.v_perm).map_err(map)?)
+        .map_err(map)?;
+    let attended = graph.mul_mat(v_t, probs).map_err(map)?;
+
+    granite_post_attention(graph, hidden, attended, weights, config, n_tokens)
 }
 
 pub(crate) struct GraniteSpeechDecoderPrefillOutput {
@@ -581,4 +638,167 @@ pub(crate) fn prefill_logits_from_embeddings(
         hidden_out,
         logits,
     })
+}
+
+/// Per-layer weight-tensor handles, held in a persistent static arena.
+struct GraniteLayerWeightHandles {
+    attn_norm: GgmlStaticTensor,
+    q: GgmlStaticTensor,
+    k: GgmlStaticTensor,
+    v: GgmlStaticTensor,
+    o: GgmlStaticTensor,
+    ffn_norm: GgmlStaticTensor,
+    gate: GgmlStaticTensor,
+    up: GgmlStaticTensor,
+    down: GgmlStaticTensor,
+}
+
+/// All Granite decoder weights uploaded ONCE into a static tensor arena that
+/// survives across every `GgmlCpuGraphRunner::start_graph` call (`start_graph`
+/// only `ggml_reset`s the runner's own graph context, never this arena's --
+/// see that method's doc). This is what lets the incremental decode session
+/// (`decode_session`) prefill + run every single-token step against the same
+/// 2B-parameter weight upload instead of re-uploading the whole decoder every
+/// token; only the tiny per-step inputs (one embedding, one position, the K/V
+/// history views) live in the reset-per-step graph context.
+pub(crate) struct GraniteDecoderWeightArena {
+    arena: GgmlStaticTensorArena,
+    layers: Vec<GraniteLayerWeightHandles>,
+    final_norm: GgmlStaticTensor,
+    lm_head: GgmlStaticTensor,
+}
+
+impl GraniteDecoderWeightArena {
+    /// Allocate every weight tensor in a fresh static arena and upload the
+    /// provider's f32 weights once. All allocation happens before the first
+    /// upload (the arena finalizes its backend buffer on first write and
+    /// refuses further allocation afterward).
+    pub(crate) fn load<'p>(
+        runner: &GgmlCpuGraphRunner,
+        config: &GraniteSpeechDecoderConfig,
+        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    ) -> Result<Self, GraniteSpeechDecoderError> {
+        let tensor_count = 32 + 32 * config.num_layers;
+        let arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(tensor_count);
+        let arena = runner
+            .start_static_tensor_arena(arena_bytes)
+            .map_err(ggml_err("session_static_tensor_arena"))?;
+
+        let d = config.hidden_size;
+        let q_width = config.num_heads * config.head_dim;
+        let kv_width = config.num_kv_heads * config.head_dim;
+        let inter = config.intermediate_size;
+
+        // (handle, weight data) pairs, filled during allocation and uploaded
+        // in one pass afterward (the arena finalizes its backend buffer on the
+        // first write and refuses further allocation, so all `new_tensor_*`
+        // calls must precede all uploads).
+        let mut pending: Vec<(GgmlStaticTensor, &'p [f32])> = Vec::new();
+        let alloc_1d = |name: &str,
+                        len: usize,
+                        pending: &mut Vec<(GgmlStaticTensor, &'p [f32])>|
+         -> Result<GgmlStaticTensor, GraniteSpeechDecoderError> {
+            let data = fetch_weight(provider, name, len)?;
+            let handle = arena
+                .new_tensor_1d_f32(len, "granite_speech_session_weight")
+                .map_err(ggml_err("session_weight_alloc_1d"))?;
+            pending.push((handle, data));
+            Ok(handle)
+        };
+        let alloc_2d = |name: &str,
+                        ne0: usize,
+                        ne1: usize,
+                        pending: &mut Vec<(GgmlStaticTensor, &'p [f32])>|
+         -> Result<GgmlStaticTensor, GraniteSpeechDecoderError> {
+            let data = fetch_weight(provider, name, ne0 * ne1)?;
+            let handle = arena
+                .new_tensor_2d_f32(ne0, ne1, "granite_speech_session_weight")
+                .map_err(ggml_err("session_weight_alloc_2d"))?;
+            pending.push((handle, data));
+            Ok(handle)
+        };
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for index in 0..config.num_layers {
+            let p = |suffix: &str| format!("language_model.model.layers.{index}.{suffix}");
+            layers.push(GraniteLayerWeightHandles {
+                attn_norm: alloc_1d(&p("input_layernorm.weight"), d, &mut pending)?,
+                q: alloc_2d(&p("self_attn.q_proj.weight"), d, q_width, &mut pending)?,
+                k: alloc_2d(&p("self_attn.k_proj.weight"), d, kv_width, &mut pending)?,
+                v: alloc_2d(&p("self_attn.v_proj.weight"), d, kv_width, &mut pending)?,
+                o: alloc_2d(&p("self_attn.o_proj.weight"), q_width, d, &mut pending)?,
+                ffn_norm: alloc_1d(&p("post_attention_layernorm.weight"), d, &mut pending)?,
+                gate: alloc_2d(&p("mlp.gate_proj.weight"), d, inter, &mut pending)?,
+                up: alloc_2d(&p("mlp.up_proj.weight"), d, inter, &mut pending)?,
+                down: alloc_2d(&p("mlp.down_proj.weight"), inter, d, &mut pending)?,
+            });
+        }
+        let final_norm = alloc_1d("language_model.model.norm.weight", d, &mut pending)?;
+        let lm_head = alloc_2d(
+            "language_model.lm_head.weight",
+            config.hidden_size,
+            config.vocab_size,
+            &mut pending,
+        )?;
+
+        let mut arena = arena;
+        for (handle, data) in &pending {
+            arena
+                .set_f32_slice(*handle, data, "granite_speech_session_weight")
+                .map_err(ggml_err("session_upload_weight"))?;
+        }
+
+        Ok(Self {
+            arena,
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+
+    /// Fresh per-graph `GgmlCpuTensor` wrappers over layer `index`'s persistent
+    /// weight tensors (re-derived every step; the underlying arena storage is
+    /// uploaded once).
+    pub(crate) fn layer_weights<'a>(&self, index: usize) -> DecoderLayerWeights<'a> {
+        let h = &self.layers[index];
+        DecoderLayerWeights {
+            attn_norm_w: self.arena.graph_tensor(h.attn_norm),
+            q_w: self.arena.graph_tensor(h.q),
+            k_w: self.arena.graph_tensor(h.k),
+            v_w: self.arena.graph_tensor(h.v),
+            o_w: self.arena.graph_tensor(h.o),
+            ffn_norm_w: self.arena.graph_tensor(h.ffn_norm),
+            gate_w: self.arena.graph_tensor(h.gate),
+            up_w: self.arena.graph_tensor(h.up),
+            down_w: self.arena.graph_tensor(h.down),
+        }
+    }
+
+    pub(crate) fn final_norm_weight<'a>(&self) -> GgmlCpuTensor<'a> {
+        self.arena.graph_tensor(self.final_norm)
+    }
+
+    pub(crate) fn lm_head_weight<'a>(&self) -> GgmlCpuTensor<'a> {
+        self.arena.graph_tensor(self.lm_head)
+    }
+}
+
+fn fetch_weight<'p>(
+    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    name: &str,
+    expected: usize,
+) -> Result<&'p [f32], GraniteSpeechDecoderError> {
+    let data = provider
+        .tensor(name)
+        .ok_or_else(|| GraniteSpeechDecoderError::MissingWeight {
+            name: name.to_string(),
+        })?;
+    if data.len() != expected {
+        return Err(GraniteSpeechDecoderError::WeightLen {
+            name: name.to_string(),
+            expected,
+            actual: data.len(),
+        });
+    }
+    Ok(data)
 }
