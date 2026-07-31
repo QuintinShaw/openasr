@@ -51,6 +51,32 @@ pub(super) struct XasrZipformerPreparedRuntime {
     joiner: XasrJoiner,
 }
 
+/// Result of decoding a single streaming hop via
+/// [`XasrZipformerPreparedRuntime::decode_next_chunk`].
+pub(super) struct HopDecodeOutcome {
+    /// Non-blank tokens the greedy step appended to `state.emitted` for this
+    /// hop.
+    pub new_tokens: usize,
+    /// False once the loop's break conditions are met and no hop was decoded;
+    /// callers stop iterating when this is false.
+    pub processed: bool,
+    /// This hop's greedy decode time, so the multi-hop
+    /// [`XasrZipformerPreparedRuntime::decode_available_chunks`] caller can keep
+    /// logging the same aggregate `greedy` profile line it did before the loop
+    /// body was split into this single-step entry point.
+    greedy_elapsed: Duration,
+}
+
+impl HopDecodeOutcome {
+    fn skipped() -> Self {
+        Self {
+            new_tokens: 0,
+            processed: false,
+            greedy_elapsed: Duration::ZERO,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct XasrChunkedDecodeState {
     feature_cursor: usize,
@@ -360,105 +386,19 @@ impl XasrZipformerPreparedRuntime {
         features: &XasrFbankFeatures,
         final_flush: bool,
     ) -> Result<usize, String> {
-        let chunk_hop = self.metadata.decode_chunk_len;
-        let chunk_input_frames = chunk_hop
-            .checked_add(XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES)
-            .ok_or_else(|| "xasr chunk frame count overflows".to_string())?;
         let mut new_tokens = 0usize;
         let mut greedy_elapsed = Duration::ZERO;
         let mut processed_chunks = 0usize;
 
         loop {
-            if state.feature_cursor >= features.n_frames {
+            let outcome = self.decode_next_chunk(state, features, final_flush)?;
+            if !outcome.processed {
                 break;
-            }
-            let remaining = features.n_frames - state.feature_cursor;
-            if !state.first_chunk && remaining <= XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES {
-                break;
-            }
-            if !final_flush {
-                let end_frame = state
-                    .feature_cursor
-                    .checked_add(chunk_input_frames)
-                    .ok_or_else(|| "xasr chunk end frame overflows".to_string())?;
-                if end_frame > features.n_frames {
-                    break;
-                }
-            }
-
-            let real_chunk_frames = if final_flush {
-                remaining.min(chunk_input_frames)
-            } else {
-                chunk_input_frames
-            };
-            let input = XasrEncoderFeatureInput::new(
-                chunk_input_frames,
-                features.n_mels,
-                feature_chunk_rows(
-                    features,
-                    state.feature_cursor,
-                    real_chunk_frames,
-                    chunk_input_frames,
-                )?,
-            )
-            .map_err(|e| e.to_string())?;
-            let chunk_profile = xasr_profile_start();
-            let chunk = self
-                .encoder
-                .encode_streaming_chunk_from_features(&input, state.encoder_state.as_ref())
-                .map_err(|e| e.to_string())?;
-            xasr_profile_log(
-                "encoder_chunk",
-                chunk_profile,
-                format_args!(
-                    "chunk={} cursor={} real_frames={} padded_frames={} output_frames={}",
-                    state.chunk_index,
-                    state.feature_cursor,
-                    real_chunk_frames,
-                    chunk_input_frames,
-                    chunk.output.frames
-                ),
-            );
-
-            // The chunk's emissions index encoder frames from the offset the
-            // stream had before this chunk's output was appended.
-            let chunk_frame_offset = state.encoder_frames;
-            state.encoder_frames = state
-                .encoder_frames
-                .checked_add(chunk.output.frames)
-                .ok_or_else(|| "xasr encoder frame count overflows".to_string())?;
-            let greedy_profile = xasr_profile_start();
-            let emitted = greedy_decode_frames_incremental(
-                &chunk.output.rows,
-                chunk.output.frames,
-                self.metadata.encoder_output_dim(),
-                &self.decoder,
-                &self.joiner,
-                self.metadata.blank_id,
-                DEFAULT_MAX_SYMBOLS_PER_FRAME,
-                &mut state.context,
-                &mut state.emitted,
-                &mut state.emitted_frames,
-                &mut state.emitted_probabilities,
-                chunk_frame_offset,
-            )?;
-            if let Some(started_at) = greedy_profile {
-                greedy_elapsed += started_at.elapsed();
             }
             new_tokens = new_tokens
-                .checked_add(emitted)
+                .checked_add(outcome.new_tokens)
                 .ok_or_else(|| "xasr emitted token count overflows".to_string())?;
-            state.encoder_state = Some(chunk.state);
-            let advance = chunk_hop.min(remaining);
-            state.feature_cursor = state
-                .feature_cursor
-                .checked_add(advance)
-                .ok_or_else(|| "xasr chunk cursor overflows".to_string())?;
-            state.first_chunk = false;
-            state.chunk_index = state
-                .chunk_index
-                .checked_add(1)
-                .ok_or_else(|| "xasr chunk index overflows".to_string())?;
+            greedy_elapsed += outcome.greedy_elapsed;
             processed_chunks = processed_chunks
                 .checked_add(1)
                 .ok_or_else(|| "xasr processed chunk count overflows".to_string())?;
@@ -472,6 +412,122 @@ impl XasrZipformerPreparedRuntime {
             );
         }
         Ok(new_tokens)
+    }
+
+    /// Decodes exactly one streaming hop from `features` at the current
+    /// `state.feature_cursor`, mirroring a single iteration of the loop
+    /// [`Self::decode_available_chunks`] runs. Returns `processed = false` (a
+    /// no-op that advances nothing) when the same break conditions that end
+    /// that loop are met, so a caller can drive hops one at a time and inspect
+    /// each hop's emissions between steps. That single-step control is what the
+    /// final-flush early exit in `XasrIncrementalDecoder::finish` needs to stop
+    /// padding once the model has settled, without duplicating the chunk
+    /// geometry or the encoder/greedy plumbing. `decode_available_chunks` stays
+    /// the batch / steady-state entry point and preserves its exact semantics by
+    /// looping over this method.
+    pub(super) fn decode_next_chunk(
+        &mut self,
+        state: &mut XasrChunkedDecodeState,
+        features: &XasrFbankFeatures,
+        final_flush: bool,
+    ) -> Result<HopDecodeOutcome, String> {
+        let chunk_hop = self.metadata.decode_chunk_len;
+        let chunk_input_frames = chunk_hop
+            .checked_add(XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES)
+            .ok_or_else(|| "xasr chunk frame count overflows".to_string())?;
+
+        if state.feature_cursor >= features.n_frames {
+            return Ok(HopDecodeOutcome::skipped());
+        }
+        let remaining = features.n_frames - state.feature_cursor;
+        if !state.first_chunk && remaining <= XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES {
+            return Ok(HopDecodeOutcome::skipped());
+        }
+        if !final_flush {
+            let end_frame = state
+                .feature_cursor
+                .checked_add(chunk_input_frames)
+                .ok_or_else(|| "xasr chunk end frame overflows".to_string())?;
+            if end_frame > features.n_frames {
+                return Ok(HopDecodeOutcome::skipped());
+            }
+        }
+
+        let real_chunk_frames = if final_flush {
+            remaining.min(chunk_input_frames)
+        } else {
+            chunk_input_frames
+        };
+        let input = XasrEncoderFeatureInput::new(
+            chunk_input_frames,
+            features.n_mels,
+            feature_chunk_rows(
+                features,
+                state.feature_cursor,
+                real_chunk_frames,
+                chunk_input_frames,
+            )?,
+        )
+        .map_err(|e| e.to_string())?;
+        let chunk_profile = xasr_profile_start();
+        let chunk = self
+            .encoder
+            .encode_streaming_chunk_from_features(&input, state.encoder_state.as_ref())
+            .map_err(|e| e.to_string())?;
+        xasr_profile_log(
+            "encoder_chunk",
+            chunk_profile,
+            format_args!(
+                "chunk={} cursor={} real_frames={} padded_frames={} output_frames={}",
+                state.chunk_index,
+                state.feature_cursor,
+                real_chunk_frames,
+                chunk_input_frames,
+                chunk.output.frames
+            ),
+        );
+
+        // The chunk's emissions index encoder frames from the offset the
+        // stream had before this chunk's output was appended.
+        let chunk_frame_offset = state.encoder_frames;
+        state.encoder_frames = state
+            .encoder_frames
+            .checked_add(chunk.output.frames)
+            .ok_or_else(|| "xasr encoder frame count overflows".to_string())?;
+        let greedy_profile = xasr_profile_start();
+        let emitted = greedy_decode_frames_incremental(
+            &chunk.output.rows,
+            chunk.output.frames,
+            self.metadata.encoder_output_dim(),
+            &self.decoder,
+            &self.joiner,
+            self.metadata.blank_id,
+            DEFAULT_MAX_SYMBOLS_PER_FRAME,
+            &mut state.context,
+            &mut state.emitted,
+            &mut state.emitted_frames,
+            &mut state.emitted_probabilities,
+            chunk_frame_offset,
+        )?;
+        let greedy_elapsed =
+            greedy_profile.map_or(Duration::ZERO, |started_at| started_at.elapsed());
+        state.encoder_state = Some(chunk.state);
+        let advance = chunk_hop.min(remaining);
+        state.feature_cursor = state
+            .feature_cursor
+            .checked_add(advance)
+            .ok_or_else(|| "xasr chunk cursor overflows".to_string())?;
+        state.first_chunk = false;
+        state.chunk_index = state
+            .chunk_index
+            .checked_add(1)
+            .ok_or_else(|| "xasr chunk index overflows".to_string())?;
+
+        Ok(HopDecodeOutcome {
+            new_tokens: emitted,
+            processed: true,
+            greedy_elapsed,
+        })
     }
 
     pub(super) fn decode_text(&self, token_ids: &[u32]) -> Result<String, String> {
