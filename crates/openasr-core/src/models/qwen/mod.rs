@@ -1,5 +1,6 @@
 mod audio_encoder;
 mod batched_decode;
+pub(crate) mod capacity;
 mod decode_prompt;
 mod forced_aligner_align_text;
 mod forced_aligner_import;

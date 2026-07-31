@@ -719,6 +719,23 @@ fn conv_out_len(input: usize) -> usize {
     (input + 2 * QWEN3_AUDIO_CONV_PADDING - QWEN3_AUDIO_CONV_KERNEL) / QWEN3_AUDIO_CONV_STRIDE + 1
 }
 
+/// Post-encoder audio tokens this family splices into the decoder prompt for
+/// `mel_frames` input mel frames -- the exact row count
+/// `pack_mel_into_chunked_layout` produces (`num_chunks * chunk_output_frames`),
+/// exposed so `capacity` counts the same prompt audio tokens the decode path
+/// actually builds rather than a drifting approximation. Each
+/// `QWEN3_AUDIO_CHUNK_FRAMES`-frame chunk (a partial tail chunk is padded to a
+/// full one) passes through the three stride-2 conv stems, so it contributes
+/// `conv_out_len^3(chunk_frames)` rows; zero frames emit zero tokens.
+pub(crate) fn qwen3_audio_token_count_for_mel_frames(mel_frames: usize) -> usize {
+    if mel_frames == 0 {
+        return 0;
+    }
+    let num_chunks = mel_frames.div_ceil(QWEN3_AUDIO_CHUNK_FRAMES);
+    let chunk_output_frames = conv_out_len(conv_out_len(conv_out_len(QWEN3_AUDIO_CHUNK_FRAMES)));
+    num_chunks.saturating_mul(chunk_output_frames)
+}
+
 fn build_audio_positional_embedding(
     d_model: usize,
     positions: usize,
