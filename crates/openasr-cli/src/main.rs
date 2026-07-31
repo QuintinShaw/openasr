@@ -37,6 +37,7 @@ mod doctor_cli;
 mod live;
 mod model_pack_cli;
 mod native_segment_cli;
+mod panic_hook;
 mod parent_watchdog;
 mod progress;
 mod pull_cli;
@@ -196,6 +197,16 @@ fn migrate_model_store_once() {
 
 async fn run() -> Result<()> {
     let command = Cli::parse().command;
+    // Installed here, before anything else `openasr serve` does, so no
+    // startup panic (config/catalog loading, backend resolution, model-pack
+    // binding, a background task spawned during boot) escapes without a
+    // `daemon.log` line. Scoped to `Serve` only: this hook's payoff is
+    // specifically for the long-running server process operators diagnose
+    // from `daemon.log`, not one-shot CLI commands that already print their
+    // own error to the terminal that invoked them.
+    if matches!(command, Command::Serve { .. }) {
+        panic_hook::install();
+    }
     if command_reads_the_model_store(&command) {
         migrate_model_store_once();
     }
