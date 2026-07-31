@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -31,11 +32,14 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::thread_local_runtime_cache::{
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, with_thread_local_cached_mut_by_key,
+};
 
-use super::decoder_graph::DolphinDecoderConfig;
+use super::decoder_graph::{DolphinDecoderConfig, DolphinDecoderRescoreRuntime};
 use super::encoder_graph::{
-    DolphinEncoderConfig, DolphinEncoderOutput, DolphinNativeWeight, DolphinWeightProvider, encode,
-    minimum_subsample_input_frames,
+    DolphinEncoderConfig, DolphinEncoderOutput, DolphinEncoderRuntime, DolphinNativeWeight,
+    DolphinWeightProvider, encode, minimum_subsample_input_frames,
 };
 use super::frontend::{
     DolphinEspnetFrontend, DolphinFbankFrontend, apply_global_cmvn, espnet_min_samples_for_frames,
@@ -44,7 +48,9 @@ use super::frontend::{
 use super::hotword_context::{
     apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
 };
-use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
+use super::joint_decode::{
+    DolphinCtcHeadRuntime, DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode,
+};
 use super::language::{build_dolphin_decode_prefix, build_dolphin_multilingual_decode_prefix};
 use super::package_import::DolphinLanguageScheme;
 use super::runtime_contract::parse_dolphin_execution_metadata;
@@ -336,11 +342,78 @@ pub(crate) fn cached_dolphin_runtime_weights(
     Ok(weights)
 }
 
+/// Prepared per-`(pack, backend)` graph runtimes: the encoder, CTC head, and
+/// rescore decoder each keep their weights resident in a persistent
+/// WEIGHTS-usage arena (see the respective runtime types). Cached thread-local
+/// by `(PackContentKey, backend)` -- the sensevoice/moonshine prepared-runtime
+/// pattern -- so a warm request (or a streaming tick, which re-enters
+/// `execute()` per snapshot) pays zero weight re-upload: only the per-call
+/// audio features / encoder memory / token ids travel to the backend.
+/// Residency changes no computed value; every output stays golden-identical.
+pub(crate) struct DolphinPreparedRuntime {
+    backend: GgmlCpuGraphBackend,
+    encoder: DolphinEncoderRuntime,
+    ctc_head: DolphinCtcHeadRuntime,
+    rescore: DolphinDecoderRescoreRuntime,
+}
+
+type DolphinPreparedRuntimeCacheKey = (
+    crate::models::runtime_cache_coordinator::PackContentKey,
+    GgmlCpuGraphBackend,
+);
+
+thread_local! {
+    static DOLPHIN_PREPARED_RUNTIME_BY_KEY: RefCell<
+        BoundedRuntimeCache<DolphinPreparedRuntimeCacheKey, DolphinPreparedRuntime>,
+    > = RefCell::new(BoundedRuntimeCache::new());
+}
+
+/// Build the three prepared graph runtimes for one pack + backend. The
+/// encoder's resident position-table capacity is sized to the pack's own
+/// `encoder.max_ctx`; a longer utterance (multilingual scheme only, whose
+/// table is computed rather than baked) falls back to a one-shot runtime in
+/// [`run_dolphin_pipeline`] instead of failing.
+pub(crate) fn build_dolphin_prepared_runtime(
+    weights: &DolphinRuntimeWeights,
+    metadata: &GgufMetadata,
+    backend: GgmlCpuGraphBackend,
+) -> Result<DolphinPreparedRuntime, String> {
+    let language_scheme = parse_dolphin_language_scheme(metadata)?;
+    let execution_metadata = parse_dolphin_execution_metadata(metadata, weights)
+        .map_err(|error| format!("dolphin runtime metadata contract failed: {error}"))?;
+    let encoder_config =
+        DolphinEncoderConfig::from_execution_metadata(&execution_metadata, language_scheme);
+    let decoder_config = DolphinDecoderConfig::from_execution_metadata(&execution_metadata);
+    let encoder = DolphinEncoderRuntime::new(
+        &encoder_config,
+        weights,
+        backend,
+        encoder_config.max_positions,
+    )
+    .map_err(|error| format!("dolphin encoder runtime build failed: {error}"))?;
+    let ctc_head = DolphinCtcHeadRuntime::new(
+        weights,
+        decoder_config.d_model,
+        decoder_config.vocab_size,
+        backend,
+    )
+    .map_err(|error| format!("dolphin ctc head runtime build failed: {error}"))?;
+    let rescore = DolphinDecoderRescoreRuntime::new(&decoder_config, weights, backend)
+        .map_err(|error| format!("dolphin rescore runtime build failed: {error}"))?;
+    Ok(DolphinPreparedRuntime {
+        backend,
+        encoder,
+        ctc_head,
+        rescore,
+    })
+}
+
 /// The complete Dolphin transcribe pipeline over 16 kHz mono PCM (`samples` in
 /// `[-1, 1]`): fbank + CMVN -> encoder -> CTC/attention joint decode -> detokenize.
-/// Loads the pack's weights from `reader` each call (the uncached path the parity
-/// harness drives); the executor uses [`cached_dolphin_runtime_weights`] +
-/// [`run_dolphin_pipeline`] to reuse weights across requests.
+/// Loads the pack's weights from `reader` and builds fresh prepared runtimes
+/// each call (the uncached path the parity harness drives); the executor uses
+/// [`cached_dolphin_runtime_weights`] + the thread-local
+/// [`DolphinPreparedRuntime`] cache to reuse both across requests.
 pub(crate) fn transcribe_dolphin_pcm(
     reader: &GgufTensorDataReader,
     metadata: &GgufMetadata,
@@ -352,12 +425,13 @@ pub(crate) fn transcribe_dolphin_pcm(
 ) -> Result<DolphinPipelineOutput, String> {
     let weights = load_dolphin_runtime_weights_from_pack(reader)
         .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
+    let mut prepared = build_dolphin_prepared_runtime(&weights, metadata, backend)?;
     run_dolphin_pipeline(
+        &mut prepared,
         &weights,
         metadata,
         samples,
         ctc_weight,
-        backend,
         language,
         phrase_bias,
     )
@@ -396,17 +470,19 @@ fn parse_dolphin_language_scheme_value(
 }
 
 /// Run the fbank+CMVN -> encoder -> joint-decode -> detokenize pipeline over
-/// already-loaded `weights`. Split out from [`transcribe_dolphin_pcm`] so the
-/// executor can reuse pooled weights across requests without re-dequantizing.
+/// already-loaded `weights` and already-`prepared` graph runtimes. Split out
+/// from [`transcribe_dolphin_pcm`] so the executor can reuse both across
+/// requests without re-dequantizing or re-uploading.
 pub(crate) fn run_dolphin_pipeline(
+    prepared: &mut DolphinPreparedRuntime,
     weights: &DolphinRuntimeWeights,
     metadata: &GgufMetadata,
     samples: &[f32],
     ctc_weight: f32,
-    backend: GgmlCpuGraphBackend,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<DolphinPipelineOutput, String> {
+    let backend = prepared.backend;
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
         .ok_or_else(|| format!("dolphin pack is missing the '{TOKENIZER_TOKENS_KEY}' vocab"))?;
@@ -469,20 +545,30 @@ pub(crate) fn run_dolphin_pipeline(
 
     // Encoder (parity-verified for small.cn; shape-derived for every size;
     // `language_scheme` picks the rel-pos-attention flavor -- see
-    // `DolphinEncoderConfig`'s doc comment).
-    let encoder_config =
-        DolphinEncoderConfig::from_execution_metadata(&execution_metadata, language_scheme);
-    // Production transcription only ever reads `encoder.encoder_out` below;
-    // `after_subsample`/per-block taps exist solely for `#[cfg(test)]` parity,
-    // so they stay off here (P6: see `encoder_graph::encode`'s doc comment).
-    let encoder = encode(
-        &encoder_config,
-        weights,
-        &features.data,
-        features.n_frames,
-        backend,
-        false,
-    )
+    // `DolphinEncoderConfig`'s doc comment). The prepared runtime's weights
+    // are already backend-resident; only when an utterance outgrows its
+    // resident position table (multilingual scheme only, whose table is
+    // computed rather than baked -- see `DolphinEncoderRuntime`) does this
+    // fall back to a one-shot runtime sized for exactly this call, matching
+    // the pre-runtime per-call behavior. Production transcription only ever
+    // reads `encoder.encoder_out` below; `after_subsample`/per-block taps
+    // exist solely for `#[cfg(test)]` parity, so they stay off here (P6).
+    let encoder = if prepared.encoder.supports_input_frames(features.n_frames) {
+        prepared
+            .encoder
+            .encode(&features.data, features.n_frames, false)
+    } else {
+        let encoder_config =
+            DolphinEncoderConfig::from_execution_metadata(&execution_metadata, language_scheme);
+        encode(
+            &encoder_config,
+            weights,
+            &features.data,
+            features.n_frames,
+            backend,
+            false,
+        )
+    }
     .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
 
     // Hotword deep-biasing (native `context_module.*` fusion). Upstream's
@@ -514,8 +600,8 @@ pub(crate) fn run_dolphin_pipeline(
         _ => std::borrow::Cow::Borrowed(encoder.encoder_out.as_slice()),
     };
 
-    // CTC/attention joint decode.
-    let decoder_config = DolphinDecoderConfig::from_execution_metadata(&execution_metadata);
+    // CTC/attention joint decode over the prepared (weight-resident) CTC head
+    // and rescore runtimes.
     let decode_config = DolphinJointDecodeConfig {
         beam_size: DOLPHIN_BEAM_SIZE,
         ctc_weight,
@@ -524,13 +610,12 @@ pub(crate) fn run_dolphin_pipeline(
         blank_token_id,
     };
     let decoded = joint_decode(
-        &decoder_config,
-        weights,
+        &mut prepared.ctc_head,
+        &mut prepared.rescore,
         &encoder.encoder_out,
         &rescoring_encoder_out,
         encoder.frames,
         &decode_config,
-        backend,
     )
     .map_err(|error| format!("dolphin joint decode failed: {error}"))?;
 
@@ -617,16 +702,36 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         // ~0.4 s reload+dequant is paid once, later requests are compute-only.
         let weights =
             cached_dolphin_runtime_weights(&preflight.runtime_source, &reader).map_err(fail)?;
+        // Reuse the prepared graph runtimes (backend-resident encoder / CTC
+        // head / rescore decoder weights) across requests too, keyed by
+        // `(pack content id, backend)` in the shared thread-local runtime
+        // cache -- the sensevoice/moonshine pattern. A cold key builds them
+        // from the pooled weights; warm requests (and every streaming tick)
+        // skip the whole per-call weight re-upload.
+        let cache_key = (
+            crate::models::runtime_cache_coordinator::PackContentKey::for_runtime_source(
+                &preflight.runtime_source,
+            ),
+            backend,
+        );
         // Thread the request language into the decode prefix builder; an
         // unsupported code / missing region token fails closed here (typed).
-        let output = run_dolphin_pipeline(
-            &weights,
-            &preflight.metadata,
-            &request.prepared_audio.samples_f32,
-            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
-            backend,
-            request.request_options.language.as_deref(),
-            request.request_options.phrase_bias.as_ref(),
+        let output = with_thread_local_cached_mut_by_key(
+            &DOLPHIN_PREPARED_RUNTIME_BY_KEY,
+            cache_key,
+            DEFAULT_RUNTIME_CACHE_CAPACITY,
+            || build_dolphin_prepared_runtime(&weights, &preflight.metadata, backend),
+            |prepared| {
+                run_dolphin_pipeline(
+                    prepared,
+                    &weights,
+                    &preflight.metadata,
+                    &request.prepared_audio.samples_f32,
+                    DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+                    request.request_options.language.as_deref(),
+                    request.request_options.phrase_bias.as_ref(),
+                )
+            },
         )
         .map_err(fail)?;
 
@@ -1245,34 +1350,41 @@ mod tests {
             .max(1);
         let ctc_weight = DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT;
 
-        // Reuse == build the runtime pool once, reuse across runs (the pooled
-        // executor path). No-reuse == rebuild the pool every run (the cold
-        // per-request cost). Best-of-N wall time isolates the reuse delta.
-        let preloaded =
-            reuse.then(|| load_dolphin_runtime_weights_from_pack(&reader).expect("weights"));
+        // Reuse == build the weight pool + prepared graph runtimes once, reuse
+        // across runs (the cached executor path). No-reuse == rebuild both
+        // every run (the cold per-request cost). Best-of-N wall time isolates
+        // the reuse delta.
+        let mut preloaded = reuse.then(|| {
+            let weights = load_dolphin_runtime_weights_from_pack(&reader).expect("weights");
+            let prepared =
+                build_dolphin_prepared_runtime(&weights, &metadata, backend).expect("prepared");
+            (weights, prepared)
+        });
         let mut best = Duration::MAX;
         let mut text = String::new();
         for _ in 0..runs {
             let started = Instant::now();
-            let output = if let Some(weights) = preloaded.as_ref() {
+            let output = if let Some((weights, prepared)) = preloaded.as_mut() {
                 run_dolphin_pipeline(
+                    prepared,
                     weights,
                     &metadata,
                     &samples,
                     ctc_weight,
-                    backend,
                     Some("zh-sichuan"),
                     None,
                 )
             } else {
                 let weights =
                     load_dolphin_runtime_weights_from_pack(&reader).expect("weights reload");
+                let mut prepared = build_dolphin_prepared_runtime(&weights, &metadata, backend)
+                    .expect("prepared reload");
                 run_dolphin_pipeline(
+                    &mut prepared,
                     &weights,
                     &metadata,
                     &samples,
                     ctc_weight,
-                    backend,
                     Some("zh-sichuan"),
                     None,
                 )

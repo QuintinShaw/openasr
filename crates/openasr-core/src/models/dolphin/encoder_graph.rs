@@ -257,9 +257,10 @@ struct EmbedWeights<'a> {
     out_w: GgmlCpuTensor<'a>,
     out_b: GgmlCpuTensor<'a>,
     // `pos_emb` moved out of `EmbedWeights`: its scheme-dependent shape/source
-    // (a baked-table slice for `CnDialect`, a graph-build-time-computed
-    // rel-pos-v1 table for `Multilingual`) is built directly in `encode()`
-    // instead, see `dolphin_relative_positional_table`.
+    // (a baked-table view for `CnDialect`, a view of the runtime-computed
+    // rel-pos-v1 table for `Multilingual`) is built per call in
+    // [`DolphinEncoderRuntime::encode`] instead, see
+    // `dolphin_relative_positional_table`.
 }
 
 struct BlockWeights<'a> {
@@ -311,6 +312,135 @@ struct EncoderWeights<'a> {
     blocks: Vec<BlockWeights<'a>>,
     after_norm_w: GgmlCpuTensor<'a>,
     after_norm_b: GgmlCpuTensor<'a>,
+}
+
+/// Static (arena-resident) counterparts of [`EmbedWeights`] / [`BlockWeights`] /
+/// [`EncoderWeights`]: same shapes, but each field is a persistent
+/// [`GgmlStaticTensor`] handle instead of a per-graph transient borrow.
+/// `to_transient` reborrows every field into the current call's graph lifetime
+/// via [`GgmlStaticTensorArena::graph_tensor`], mirroring the sibling
+/// `decoder_graph::DecoderLayerStaticWeights` pattern exactly. This is what
+/// lets [`DolphinEncoderRuntime`] keep the whole encoder weight set resident
+/// in one backend buffer across calls instead of re-uploading it per encode.
+struct EmbedStaticWeights {
+    conv0_w: GgmlStaticTensor,
+    conv0_b: GgmlStaticTensor,
+    conv1_w: GgmlStaticTensor,
+    conv1_b: GgmlStaticTensor,
+    out_w: GgmlStaticTensor,
+    out_b: GgmlStaticTensor,
+}
+
+impl EmbedStaticWeights {
+    fn to_transient<'a>(&self, arena: &GgmlStaticTensorArena) -> EmbedWeights<'a> {
+        EmbedWeights {
+            conv0_w: arena.graph_tensor(self.conv0_w),
+            conv0_b: arena.graph_tensor(self.conv0_b),
+            conv1_w: arena.graph_tensor(self.conv1_w),
+            conv1_b: arena.graph_tensor(self.conv1_b),
+            out_w: arena.graph_tensor(self.out_w),
+            out_b: arena.graph_tensor(self.out_b),
+        }
+    }
+}
+
+struct BlockStaticWeights {
+    ff_macaron_norm_w: GgmlStaticTensor,
+    ff_macaron_norm_b: GgmlStaticTensor,
+    ff_macaron_w1_w: GgmlStaticTensor,
+    ff_macaron_w1_b: GgmlStaticTensor,
+    ff_macaron_w2_w: GgmlStaticTensor,
+    ff_macaron_w2_b: GgmlStaticTensor,
+    norm_mha_w: GgmlStaticTensor,
+    norm_mha_b: GgmlStaticTensor,
+    q_w: GgmlStaticTensor,
+    q_b: GgmlStaticTensor,
+    k_w: GgmlStaticTensor,
+    k_b: GgmlStaticTensor,
+    v_w: GgmlStaticTensor,
+    v_b: GgmlStaticTensor,
+    pos_w: GgmlStaticTensor,
+    pos_bias_u: GgmlStaticTensor,
+    pos_bias_v: GgmlStaticTensor,
+    out_w: GgmlStaticTensor,
+    out_b: GgmlStaticTensor,
+    norm_mlp_w: GgmlStaticTensor,
+    norm_mlp_b: GgmlStaticTensor,
+    cproj1_w: GgmlStaticTensor,
+    cproj1_b: GgmlStaticTensor,
+    csgu_norm_w: GgmlStaticTensor,
+    csgu_norm_b: GgmlStaticTensor,
+    csgu_conv_w: GgmlStaticTensor,
+    csgu_conv_b: GgmlStaticTensor,
+    cproj2_w: GgmlStaticTensor,
+    cproj2_b: GgmlStaticTensor,
+    fusion_conv_w: GgmlStaticTensor,
+    fusion_conv_b: GgmlStaticTensor,
+    merge_w: GgmlStaticTensor,
+    merge_b: GgmlStaticTensor,
+    norm_ff_w: GgmlStaticTensor,
+    norm_ff_b: GgmlStaticTensor,
+    ff_w1_w: GgmlStaticTensor,
+    ff_w1_b: GgmlStaticTensor,
+    ff_w2_w: GgmlStaticTensor,
+    ff_w2_b: GgmlStaticTensor,
+    norm_final_w: GgmlStaticTensor,
+    norm_final_b: GgmlStaticTensor,
+}
+
+impl BlockStaticWeights {
+    fn to_transient<'a>(&self, arena: &GgmlStaticTensorArena) -> BlockWeights<'a> {
+        BlockWeights {
+            ff_macaron_norm_w: arena.graph_tensor(self.ff_macaron_norm_w),
+            ff_macaron_norm_b: arena.graph_tensor(self.ff_macaron_norm_b),
+            ff_macaron_w1_w: arena.graph_tensor(self.ff_macaron_w1_w),
+            ff_macaron_w1_b: arena.graph_tensor(self.ff_macaron_w1_b),
+            ff_macaron_w2_w: arena.graph_tensor(self.ff_macaron_w2_w),
+            ff_macaron_w2_b: arena.graph_tensor(self.ff_macaron_w2_b),
+            norm_mha_w: arena.graph_tensor(self.norm_mha_w),
+            norm_mha_b: arena.graph_tensor(self.norm_mha_b),
+            q_w: arena.graph_tensor(self.q_w),
+            q_b: arena.graph_tensor(self.q_b),
+            k_w: arena.graph_tensor(self.k_w),
+            k_b: arena.graph_tensor(self.k_b),
+            v_w: arena.graph_tensor(self.v_w),
+            v_b: arena.graph_tensor(self.v_b),
+            pos_w: arena.graph_tensor(self.pos_w),
+            pos_bias_u: arena.graph_tensor(self.pos_bias_u),
+            pos_bias_v: arena.graph_tensor(self.pos_bias_v),
+            out_w: arena.graph_tensor(self.out_w),
+            out_b: arena.graph_tensor(self.out_b),
+            norm_mlp_w: arena.graph_tensor(self.norm_mlp_w),
+            norm_mlp_b: arena.graph_tensor(self.norm_mlp_b),
+            cproj1_w: arena.graph_tensor(self.cproj1_w),
+            cproj1_b: arena.graph_tensor(self.cproj1_b),
+            csgu_norm_w: arena.graph_tensor(self.csgu_norm_w),
+            csgu_norm_b: arena.graph_tensor(self.csgu_norm_b),
+            csgu_conv_w: arena.graph_tensor(self.csgu_conv_w),
+            csgu_conv_b: arena.graph_tensor(self.csgu_conv_b),
+            cproj2_w: arena.graph_tensor(self.cproj2_w),
+            cproj2_b: arena.graph_tensor(self.cproj2_b),
+            fusion_conv_w: arena.graph_tensor(self.fusion_conv_w),
+            fusion_conv_b: arena.graph_tensor(self.fusion_conv_b),
+            merge_w: arena.graph_tensor(self.merge_w),
+            merge_b: arena.graph_tensor(self.merge_b),
+            norm_ff_w: arena.graph_tensor(self.norm_ff_w),
+            norm_ff_b: arena.graph_tensor(self.norm_ff_b),
+            ff_w1_w: arena.graph_tensor(self.ff_w1_w),
+            ff_w1_b: arena.graph_tensor(self.ff_w1_b),
+            ff_w2_w: arena.graph_tensor(self.ff_w2_w),
+            ff_w2_b: arena.graph_tensor(self.ff_w2_b),
+            norm_final_w: arena.graph_tensor(self.norm_final_w),
+            norm_final_b: arena.graph_tensor(self.norm_final_b),
+        }
+    }
+}
+
+struct EncoderStaticWeights {
+    embed: EmbedStaticWeights,
+    blocks: Vec<BlockStaticWeights>,
+    after_norm_w: GgmlStaticTensor,
+    after_norm_b: GgmlStaticTensor,
 }
 
 /// Static-arena tensor count for [`GgmlCpuGraphConfig::metadata_context_bytes`].
@@ -382,18 +512,18 @@ impl<'p> WeightBuilder<'p> {
     }
 
     /// A 1-D weight (bias / norm gamma-beta / packed pos bias).
-    fn w1<'a>(
+    fn w1(
         &mut self,
         arena: &GgmlStaticTensorArena,
         name: &str,
         len: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinEncoderError> {
         let data = self.fetch(name, len)?;
         let handle = arena
             .new_tensor_1d_f32(len, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_1d"))?;
         self.uploads.push((handle, data, "dolphin_weight"));
-        Ok(arena.graph_tensor(handle))
+        Ok(handle)
     }
 
     /// A 2-D `.weight` matmul operand bound as ggml `[ne0=in, ne1=out]` for
@@ -405,30 +535,30 @@ impl<'p> WeightBuilder<'p> {
     /// the f32 bind. Both stored layouts (fp16's `[out, in]`, quant's reversed
     /// `[in, out]`) share the same in-innermost byte order, so uploading raw into
     /// the `[ne0=in, ne1=out]` arena tensor is order-preserving in either case.
-    fn w2<'a>(
+    fn w2(
         &mut self,
         arena: &GgmlStaticTensorArena,
         name: &str,
         ne0: usize,
         ne1: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinEncoderError> {
         if let Some(native) = self.provider.native_weight(name) {
             let handle = arena
                 .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_weight")
                 .map_err(ggml_err("weight_alloc_2d_native"))?;
             self.native_uploads
                 .push((handle, native.bytes, "dolphin_weight"));
-            return Ok(arena.graph_tensor(handle));
+            return Ok(handle);
         }
         let data = self.fetch(name, ne0 * ne1)?;
         let handle = arena
             .new_tensor_2d_f32(ne0, ne1, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_2d"))?;
         self.uploads.push((handle, data, "dolphin_weight"));
-        Ok(arena.graph_tensor(handle))
+        Ok(handle)
     }
 
-    fn w4<'a>(
+    fn w4(
         &mut self,
         arena: &GgmlStaticTensorArena,
         name: &str,
@@ -436,31 +566,33 @@ impl<'p> WeightBuilder<'p> {
         ne1: usize,
         ne2: usize,
         ne3: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinEncoderError> {
         let data = self.fetch(name, ne0 * ne1 * ne2 * ne3)?;
         let handle = arena
             .new_tensor_4d_f32(ne0, ne1, ne2, ne3, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_4d"))?;
         self.uploads.push((handle, data, "dolphin_weight"));
-        Ok(arena.graph_tensor(handle))
+        Ok(handle)
     }
 
-    /// The first `frames` rows of the `[1, max_len, d_model]` position table.
-    fn pos_slice<'a>(
+    /// The full `[1, max_len, d_model]` baked position table, uploaded once at
+    /// its baked length. Per-call encode takes a contiguous leading view of
+    /// the first `frames` rows (see [`DolphinEncoderRuntime::encode`]) instead
+    /// of this builder re-slicing and re-uploading a `frames`-sized copy every
+    /// call -- mirrors `decoder_graph::StaticWeightBuilder::pos_full`.
+    fn pos_full(
         &mut self,
         arena: &GgmlStaticTensorArena,
         name: &str,
         d_model: usize,
-        frames: usize,
         max_len: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinEncoderError> {
         let full = self.fetch(name, d_model * max_len)?;
-        let slice = &full[..d_model * frames];
         let handle = arena
-            .new_tensor_2d_f32(d_model, frames, "dolphin_weight")
+            .new_tensor_2d_f32(d_model, max_len, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_pos"))?;
-        self.uploads.push((handle, slice, "dolphin_weight"));
-        Ok(arena.graph_tensor(handle))
+        self.uploads.push((handle, full, "dolphin_weight"));
+        Ok(handle)
     }
 
     /// Upload every collected weight into the arena's backend buffer exactly
@@ -483,14 +615,14 @@ impl<'p> WeightBuilder<'p> {
     }
 }
 
-fn build_embed_weights<'a, 'p>(
+fn build_embed_weights(
     arena: &GgmlStaticTensorArena,
-    builder: &mut WeightBuilder<'p>,
+    builder: &mut WeightBuilder<'_>,
     config: &DolphinEncoderConfig,
-) -> Result<EmbedWeights<'a>, DolphinEncoderError> {
+) -> Result<EmbedStaticWeights, DolphinEncoderError> {
     let d = config.d_model;
     let flat = d * subsample_width(config.feature_dim);
-    Ok(EmbedWeights {
+    Ok(EmbedStaticWeights {
         conv0_w: builder.w4(arena, "encoder.embed.conv.0.weight", 3, 3, 1, d)?,
         conv0_b: builder.w4(arena, "encoder.embed.conv.0.bias", 1, 1, d, 1)?,
         conv1_w: builder.w4(arena, "encoder.embed.conv.2.weight", 3, 3, d, d)?,
@@ -529,12 +661,12 @@ fn dolphin_relative_positional_table(d_model: usize, frames: usize) -> Option<Ve
     Some(table)
 }
 
-fn build_block_weights<'a, 'p>(
+fn build_block_weights(
     arena: &GgmlStaticTensorArena,
-    builder: &mut WeightBuilder<'p>,
+    builder: &mut WeightBuilder<'_>,
     config: &DolphinEncoderConfig,
     index: usize,
-) -> Result<BlockWeights<'a>, DolphinEncoderError> {
+) -> Result<BlockStaticWeights, DolphinEncoderError> {
     let d = config.d_model;
     let ffn = config.ffn_units;
     let cg = config.cgmlp_units;
@@ -542,7 +674,7 @@ fn build_block_weights<'a, 'p>(
     let ck = config.cgmlp_kernel;
     let mk = config.merge_kernel;
     let p = |suffix: &str| format!("encoder.encoders.{index}.{suffix}");
-    Ok(BlockWeights {
+    Ok(BlockStaticWeights {
         ff_macaron_norm_w: builder.w1(arena, &p("norm_ff_macaron.weight"), d)?,
         ff_macaron_norm_b: builder.w1(arena, &p("norm_ff_macaron.bias"), d)?,
         ff_macaron_w1_w: builder.w2(arena, &p("feed_forward_macaron.w_1.weight"), d, ffn)?,
@@ -1059,21 +1191,364 @@ fn subsample<'a>(
     Ok((scaled, frames))
 }
 
-/// Build and run the full encoder graph on the CPU backend. Always returns
-/// `encoder_out`; when `capture_taps` is true it additionally materializes
-/// `after_subsample` and every per-block hidden state for the parity harness
-/// (see [`DolphinEncoderOutput`]).
+// Perf (P6): every per-block tap unconditionally `set_output` + f32-materialized
+// used to pin ~200MB+ of intermediate hidden state resident for the whole graph
+// (plus a host copy per block) on every production call, even though the
+// executor (`executor::run_dolphin_pipeline`) only ever reads `encoder_out` --
+// `blocks`/`after_subsample` exist solely for `#[cfg(test)]` parity
+// (`parity::dolphin_encoder_parity`). With `capture_taps: false` (the
+// production default), only `encoder_out` is declared an output, so gallocr's
+// liveness-based allocator is free to recycle each block's buffer as soon as
+// the next block stops reading it, exactly like every other tap-free encoder
+// in this codebase.
+
+/// Build-once/run-many Dolphin encoder runtime (perf: arena residency).
 ///
-/// Perf (P6): every per-block tap unconditionally `set_output` + f32-materialized
-/// used to pin ~200MB+ of intermediate hidden state resident for the whole graph
-/// (plus a host copy per block) on every production call, even though the
-/// executor (`executor::run_dolphin_pipeline`) only ever reads `encoder_out` --
-/// `blocks`/`after_subsample` exist solely for `#[cfg(test)]` parity
-/// (`parity::dolphin_encoder_parity`). With `capture_taps: false` (the
-/// production default via `executor::encode_dolphin_encoder_from_pack`), only
-/// `encoder_out` is declared an output, so gallocr's liveness-based allocator is
-/// free to recycle each block's buffer as soon as the next block stops reading
-/// it, exactly like every other tap-free encoder in this codebase.
+/// [`Self::new`] loads every encoder weight tensor plus the full
+/// relative-position table into a persistent [`GgmlStaticTensorArena`] (a
+/// `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` backend buffer) exactly once;
+/// [`Self::encode`] can then be called once per utterance / streaming tick
+/// without re-uploading any of it -- only the audio features are a per-call
+/// graph input. The pre-runtime `encode` rebuilt the runner + arena and
+/// re-uploaded the whole weight set on every call (~37 ms fixed cost on M1,
+/// up to 44% of a streaming tick), even though nothing but the features ever
+/// changes between calls. Mirrors [`super::decoder_graph::DolphinDecoderRescoreRuntime`]
+/// and the sibling `sensevoice::SenseVoiceEncoderGraph` prepared-runtime
+/// pattern. Weight placement and residency change no value the graph
+/// computes, so the encoder output stays golden-identical.
+///
+/// The position table is resident at full length and viewed per call:
+/// * `CnDialect`: the baked `[d_model, max_positions]` table, viewed at its
+///   first `frames` rows (a contiguous leading view -- byte-identical to the
+///   `frames`-sized slice the pre-runtime path uploaded per call).
+/// * `Multilingual`: the centered rel-pos-v1 table computed once for
+///   `pos_capacity_frames` (positions `+(cap-1) .. -(cap-1)`), viewed at the
+///   centered `2*frames-1` rows for this call's `frames`. Each row holds
+///   sin/cos of its absolute position only (independent of `frames`), so the
+///   view is bit-identical to the per-`frames` table the pre-runtime path
+///   computed fresh on every call (see `dolphin_relative_positional_table`).
+pub(crate) struct DolphinEncoderRuntime {
+    runner: GgmlCpuGraphRunner,
+    arena: GgmlStaticTensorArena,
+    config: DolphinEncoderConfig,
+    weights: EncoderStaticWeights,
+    pos_table: GgmlStaticTensor,
+    pos_capacity_frames: usize,
+}
+
+impl DolphinEncoderRuntime {
+    /// `pos_capacity_frames` is the largest post-subsample `frames` this
+    /// runtime's resident position table can serve (a [`Self::encode`] call
+    /// beyond it fails closed with a typed `Shape` error; the executor falls
+    /// back to a fresh one-shot runtime sized for that call). Only consulted
+    /// under [`DolphinLanguageScheme::Multilingual`], whose table is computed
+    /// rather than baked; `CnDialect`'s capacity is always the baked table's
+    /// own `max_positions` length.
+    ///
+    /// [`DolphinLanguageScheme::Multilingual`]: super::package_import::DolphinLanguageScheme::Multilingual
+    pub(crate) fn new(
+        config: &DolphinEncoderConfig,
+        provider: &dyn DolphinWeightProvider,
+        backend: GgmlCpuGraphBackend,
+        pos_capacity_frames: usize,
+    ) -> Result<Self, DolphinEncoderError> {
+        let graph_config = GgmlCpuGraphConfig {
+            context_bytes: 64 * 1024 * 1024,
+            graph_size: 16384,
+            n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+                backend,
+                crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+            ),
+            backend,
+            // Ggml's gallocr scheduler reuses buffer space across tensors whose
+            // lifetimes don't overlap instead of giving every non-view tensor its
+            // own allocation; on the CPU backend both allocators produce
+            // identical results, so unconditionally enabling it (like the
+            // sibling cohere/moonshine encoders) only bounds memory footprint on
+            // long audio, never the encoder's output.
+            use_scheduler: true,
+        };
+        let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
+        // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
+        // encoder weight here -- instead of the per-call transient graph leaves the
+        // pre-arena encoder used -- is what lets the ggml multi-backend scheduler
+        // offload the E-Branchformer's matmuls to an accelerator (see
+        // `WeightBuilder`). The arena is an owned value carrying a raw pointer
+        // into the runner's backend, so it and the per-call graphs (a
+        // `&mut runner` borrow) coexist; `runner` outlives it.
+        let arena = runner
+            .start_static_tensor_arena(dolphin_encoder_arena_context_bytes(config.num_blocks))
+            .map_err(ggml_err("static_tensor_arena"))?;
+
+        // Phase A: allocate every weight tensor in the arena (allocation must
+        // precede the arena's first upload, which freezes further creation).
+        let mut builder = WeightBuilder::new(provider);
+        let embed = build_embed_weights(&arena, &mut builder, config)?;
+        let mut blocks = Vec::with_capacity(config.num_blocks);
+        for index in 0..config.num_blocks {
+            blocks.push(build_block_weights(&arena, &mut builder, config, index)?);
+        }
+        let after_norm_w = builder.w1(&arena, "encoder.after_norm.weight", config.d_model)?;
+        let after_norm_b = builder.w1(&arena, "encoder.after_norm.bias", config.d_model)?;
+        let weights = EncoderStaticWeights {
+            embed,
+            blocks,
+            after_norm_w,
+            after_norm_b,
+        };
+
+        // The encoder's relative-position table at full resident length: the
+        // baked table for `CnDialect` (via the provider, like every other
+        // weight), or the centered table computed once up to
+        // `pos_capacity_frames` for `Multilingual` (never baked -- see the
+        // struct doc comment). The computed one is uploaded separately below
+        // since it is an owned buffer, not a provider-borrowed slice
+        // `WeightBuilder` can hold.
+        let is_multilingual = matches!(
+            config.language_scheme,
+            super::package_import::DolphinLanguageScheme::Multilingual
+        );
+        let mut computed_pos: Option<(GgmlStaticTensor, Vec<f32>)> = None;
+        let (pos_table, pos_capacity_frames) =
+            if is_multilingual {
+                let capacity = pos_capacity_frames.max(1);
+                let table = dolphin_relative_positional_table(config.d_model, capacity)
+                    .ok_or_else(|| DolphinEncoderError::Shape {
+                        reason: "relative position table size overflow".to_string(),
+                    })?;
+                let handle = arena
+                    .new_tensor_2d_f32(config.d_model, 2 * capacity - 1, "dolphin_rel_pos")
+                    .map_err(ggml_err("weight_alloc_relpos"))?;
+                computed_pos = Some((handle, table));
+                (handle, capacity)
+            } else {
+                let handle = builder.pos_full(
+                    &arena,
+                    "encoder.embed.pos_enc.pe",
+                    config.d_model,
+                    config.max_positions,
+                )?;
+                (handle, config.max_positions)
+            };
+
+        // Phase B: upload every weight (+ the computed rel-pos table) into the
+        // arena backend buffer exactly once. This freezes the arena.
+        let mut arena = arena;
+        builder.upload(&mut arena)?;
+        if let Some((handle, table)) = &computed_pos {
+            arena
+                .set_f32_slice(*handle, table, "dolphin_rel_pos")
+                .map_err(ggml_err("upload_rel_pos"))?;
+        }
+
+        Ok(Self {
+            runner,
+            arena,
+            config: *config,
+            weights,
+            pos_table,
+            pos_capacity_frames,
+        })
+    }
+
+    /// The largest post-subsample `frames` the resident position table can
+    /// serve (see [`Self::new`]).
+    pub(crate) fn pos_capacity_frames(&self) -> usize {
+        self.pos_capacity_frames
+    }
+
+    /// Whether a [`Self::encode`] call over `frames_in` raw feature frames
+    /// fits this runtime's resident position table. An input too short for
+    /// the subsampling stem reports `true` so `encode` produces its own
+    /// typed fail-closed error (rather than the caller misrouting it to the
+    /// one-shot fallback, which would fail identically anyway).
+    pub(crate) fn supports_input_frames(&self, frames_in: usize) -> bool {
+        match subsample_len(frames_in) {
+            Ok(frames) => frames <= self.pos_capacity_frames,
+            Err(_) => true,
+        }
+    }
+
+    /// Build and run one forward graph over already-resident weights. Always
+    /// returns `encoder_out`; when `capture_taps` is true it additionally
+    /// materializes `after_subsample` and every per-block hidden state for the
+    /// parity harness (see [`DolphinEncoderOutput`] and the free [`encode`]'s
+    /// P6 note).
+    pub(crate) fn encode(
+        &mut self,
+        features: &[f32],
+        frames_in: usize,
+        capture_taps: bool,
+    ) -> Result<DolphinEncoderOutput, DolphinEncoderError> {
+        let config = self.config;
+        let feat = config.feature_dim;
+        if features.len() != frames_in * feat {
+            return Err(DolphinEncoderError::Shape {
+                reason: format!(
+                    "features has {} values, expected {frames_in}x{feat}",
+                    features.len()
+                ),
+            });
+        }
+        // Reject a frames_in too short for the two-layer k3/s2 subsampling stem
+        // before any graph allocation: ggml's `conv_2d`/`im2col` asserts
+        // `OH > 0` and aborts the whole process on an under-sized input rather
+        // than returning a Rust error, so this must fail closed here first (see
+        // `subsample_len`). A streaming FINAL over a too-short trailing window
+        // is the reachable real-world trigger (short press-to-talk after idle
+        // unload); the streaming driver also skips the encode call entirely in
+        // that case (see `incremental_streaming_driver`), so this is defense in
+        // depth for any other caller.
+        let frames = subsample_len(frames_in)?;
+        if frames > self.pos_capacity_frames {
+            return Err(DolphinEncoderError::Shape {
+                reason: format!(
+                    "{frames} frames exceed the resident position-table capacity {}",
+                    self.pos_capacity_frames
+                ),
+            });
+        }
+
+        let arena = &self.arena;
+        let weights = EncoderWeights {
+            embed: self.weights.embed.to_transient(arena),
+            blocks: self
+                .weights
+                .blocks
+                .iter()
+                .map(|block| block.to_transient(arena))
+                .collect(),
+            after_norm_w: arena.graph_tensor(self.weights.after_norm_w),
+            after_norm_b: arena.graph_tensor(self.weights.after_norm_b),
+        };
+        let is_multilingual = matches!(
+            config.language_scheme,
+            super::package_import::DolphinLanguageScheme::Multilingual
+        );
+
+        // Phase C: build the per-call forward graph. Only the audio features
+        // are a genuine per-call graph input; every weight and the position
+        // table are already resident in the arena's backend buffer, and the
+        // per-call `pos_emb` is a contiguous view of the resident table (see
+        // the struct doc comment for why each scheme's view is byte-identical
+        // to the table the pre-runtime path uploaded per call).
+        let mut graph = self.runner.start_graph();
+        let row_stride = config.d_model * F32_BYTES;
+        let pos_emb = if is_multilingual {
+            let offset_rows = self.pos_capacity_frames - frames;
+            graph
+                .view_2d(
+                    arena.graph_tensor(self.pos_table),
+                    config.d_model,
+                    2 * frames - 1,
+                    row_stride,
+                    offset_rows * row_stride,
+                )
+                .map_err(ggml_err("pos_view"))?
+        } else {
+            graph
+                .view_2d(
+                    arena.graph_tensor(self.pos_table),
+                    config.d_model,
+                    frames,
+                    row_stride,
+                    0,
+                )
+                .map_err(ggml_err("pos_view"))?
+        };
+        let input = graph
+            .new_tensor_2d_f32(feat, frames_in, "dolphin_features")
+            .map_err(ggml_err("input_alloc"))?;
+
+        let (after_subsample, frames_check) =
+            subsample(&graph, input, &weights.embed, &config, frames_in)?;
+        if frames_check != frames {
+            return Err(DolphinEncoderError::Shape {
+                reason: format!("subsample produced {frames_check} frames, expected {frames}"),
+            });
+        }
+        let mut taps: Vec<GgmlCpuTensor> = Vec::with_capacity(if capture_taps {
+            config.num_blocks + 2
+        } else {
+            1
+        });
+        if capture_taps {
+            taps.push(after_subsample);
+        }
+        let mut hidden = after_subsample;
+        for block in &weights.blocks {
+            hidden = encoder_block(&mut graph, hidden, pos_emb, block, &config, frames)?;
+            if capture_taps {
+                taps.push(hidden);
+            }
+        }
+        let encoder_out = affine_ln(
+            &graph,
+            hidden,
+            config.layer_norm_epsilon,
+            weights.after_norm_w,
+            weights.after_norm_b,
+            "after_norm",
+        )?;
+        // encoder_out is always the last (and, when `!capture_taps`, only) tap.
+        taps.push(encoder_out);
+
+        for tap in &taps {
+            graph.set_output(*tap).map_err(ggml_err("set_output"))?;
+        }
+        // Only the audio-feature leaf is a fresh per-call graph tensor with no
+        // buffer of its own; the weights and position table are arena-resident
+        // (their backend buffer is already allocated), so -- like the decoder's
+        // arena path -- they need no `set_input`.
+        graph
+            .set_input(input)
+            .map_err(ggml_err("mark_input(features)"))?;
+        // Allocate the forward graph through the scheduler's gallocr for
+        // liveness-based buffer reuse before uploading inputs -- every tap above
+        // is already marked as an output, so gallocr keeps each one's buffer
+        // resident instead of recycling it once a later block stops reading it.
+        graph
+            .prepare_outputs_for_upload(&taps)
+            .map_err(ggml_err("prepare_outputs"))?;
+
+        // Phase D: upload the audio features, then compute.
+        graph
+            .set_f32_slice(input, features, "dolphin_features")
+            .map_err(ggml_err("upload_features"))?;
+
+        let expected = frames * config.d_model;
+        let output_specs: Vec<(GgmlCpuTensor, usize)> =
+            taps.iter().map(|tap| (*tap, expected)).collect();
+        let mut outputs = graph
+            .compute_outputs_f32(&output_specs)
+            .map_err(ggml_err("compute"))?;
+
+        let encoder_out = outputs.pop().expect("encoder_out tap");
+        let (after_subsample, blocks) = if capture_taps {
+            let blocks = outputs.split_off(1);
+            let after_subsample = outputs.pop().expect("after_subsample tap");
+            (after_subsample, blocks)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        Ok(DolphinEncoderOutput {
+            frames,
+            dim: config.d_model,
+            after_subsample,
+            blocks,
+            encoder_out,
+        })
+    }
+}
+
+/// One-shot convenience wrapper over [`DolphinEncoderRuntime`] for callers
+/// that only need a single encode (the `parity` dev harness and the
+/// encoder-from-pack regression tests). The production pipeline builds and
+/// caches the runtime directly (see `executor::DolphinPreparedRuntime`)
+/// instead of paying the weight upload per call. The multilingual one-shot
+/// runtime is sized exactly for this call's `frames`, matching the
+/// per-request table the pre-runtime path computed.
 pub(crate) fn encode(
     config: &DolphinEncoderConfig,
     provider: &dyn DolphinWeightProvider,
@@ -1091,193 +1566,34 @@ pub(crate) fn encode(
             ),
         });
     }
-    // Reject a frames_in too short for the two-layer k3/s2 subsampling stem
-    // before any graph/runner allocation: ggml's `conv_2d`/`im2col` asserts
-    // `OH > 0` and aborts the whole process on an under-sized input rather
-    // than returning a Rust error, so this must fail closed here first (see
-    // `subsample_len`). A streaming FINAL over a too-short trailing window is
-    // the reachable real-world trigger (short press-to-talk after idle
-    // unload); the streaming driver also skips the encode call entirely in
-    // that case (see `incremental_streaming_driver`), so this is defense in
-    // depth for any other caller.
+    // Fail closed on an under-sized input BEFORE any weight is looked up or a
+    // runner is allocated (see `DolphinEncoderRuntime::encode`'s matching
+    // check and `subsample_len`).
     let frames = subsample_len(frames_in)?;
+    let mut runtime = DolphinEncoderRuntime::new(config, provider, backend, frames)?;
+    runtime.encode(features, frames_in, capture_taps)
+}
 
-    let graph_config = GgmlCpuGraphConfig {
-        context_bytes: 64 * 1024 * 1024,
-        graph_size: 16384,
-        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
-            backend,
-            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
-        ),
-        backend,
-        // Ggml's gallocr scheduler reuses buffer space across tensors whose
-        // lifetimes don't overlap instead of giving every non-view tensor its
-        // own allocation; on the CPU backend both allocators produce
-        // identical results, so unconditionally enabling it (like the
-        // sibling cohere/moonshine encoders) only bounds memory footprint on
-        // long audio, never the encoder's output.
-        use_scheduler: true,
-    };
-    let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
-    // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
-    // encoder weight here -- instead of the per-call transient graph leaves the
-    // pre-arena encoder used -- is what lets the ggml multi-backend scheduler
-    // offload the E-Branchformer's matmuls to an accelerator (see
-    // `WeightBuilder`). Mirrors `decoder_graph::DolphinDecoderRescoreRuntime` and
-    // the sibling `sensevoice`/`cohere`/`moonshine` encoders. The arena is an
-    // owned value carrying a raw pointer into the runner's backend, so it and the
-    // per-call graph (a `&mut runner` borrow) coexist; `runner` outlives it.
-    let arena = runner
-        .start_static_tensor_arena(dolphin_encoder_arena_context_bytes(config.num_blocks))
-        .map_err(ggml_err("static_tensor_arena"))?;
-
-    // Phase A: allocate every weight tensor in the arena (allocation must precede
-    // the arena's first upload, which freezes further creation).
-    let mut builder = WeightBuilder::new(provider);
-    let embed = build_embed_weights(&arena, &mut builder, config)?;
-    let mut blocks = Vec::with_capacity(config.num_blocks);
-    for index in 0..config.num_blocks {
-        blocks.push(build_block_weights(&arena, &mut builder, config, index)?);
+/// Deterministic pseudo-random weight values for the synthetic tiny-model
+/// tests below (and `decoder_graph`'s): a per-name FNV seed mixed per index,
+/// mapped into `[-1, 1)`. Pure function of `(name, index)`, so every test run
+/// and every call site sees identical bytes.
+#[cfg(test)]
+pub(crate) fn synthetic_test_tensor(name: &str, len: usize) -> Vec<f32> {
+    let mut seed: u32 = 2166136261;
+    for byte in name.bytes() {
+        seed ^= byte as u32;
+        seed = seed.wrapping_mul(16777619);
     }
-    let after_norm_w = builder.w1(&arena, "encoder.after_norm.weight", config.d_model)?;
-    let after_norm_b = builder.w1(&arena, "encoder.after_norm.bias", config.d_model)?;
-    let weights = EncoderWeights {
-        embed,
-        blocks,
-        after_norm_w,
-        after_norm_b,
-    };
-
-    // The encoder's relative-position table: a baked-table slice for `CnDialect`
-    // (via the provider, like every other weight), or a table computed fresh for
-    // this request's `frames` for `Multilingual` (never baked -- see
-    // `dolphin_relative_positional_table`). Both live in the arena (constant for
-    // the whole call); the computed one is uploaded separately below since it is
-    // an owned buffer, not a provider-borrowed slice `WeightBuilder` can hold.
-    let is_multilingual = matches!(
-        config.language_scheme,
-        super::package_import::DolphinLanguageScheme::Multilingual
-    );
-    let mut computed_pos: Option<(GgmlStaticTensor, Vec<f32>)> = None;
-    let pos_emb = if is_multilingual {
-        let table = dolphin_relative_positional_table(config.d_model, frames).ok_or_else(|| {
-            DolphinEncoderError::Shape {
-                reason: "relative position table size overflow".to_string(),
-            }
-        })?;
-        let handle = arena
-            .new_tensor_2d_f32(config.d_model, 2 * frames - 1, "dolphin_rel_pos")
-            .map_err(ggml_err("weight_alloc_relpos"))?;
-        let tensor = arena.graph_tensor(handle);
-        computed_pos = Some((handle, table));
-        tensor
-    } else {
-        builder.pos_slice(
-            &arena,
-            "encoder.embed.pos_enc.pe",
-            config.d_model,
-            frames,
-            config.max_positions,
-        )?
-    };
-
-    // Phase B: upload every weight (+ the computed rel-pos table) into the arena
-    // backend buffer exactly once. This freezes the arena.
-    let mut arena = arena;
-    builder.upload(&mut arena)?;
-    if let Some((handle, table)) = &computed_pos {
-        arena
-            .set_f32_slice(*handle, table, "dolphin_rel_pos")
-            .map_err(ggml_err("upload_rel_pos"))?;
-    }
-
-    // Phase C: build the per-call forward graph. Only the audio features are a
-    // genuine per-call graph input; every weight and the position table are
-    // already resident in the arena's backend buffer.
-    let mut graph = runner.start_graph();
-    let input = graph
-        .new_tensor_2d_f32(feat, frames_in, "dolphin_features")
-        .map_err(ggml_err("input_alloc"))?;
-
-    let (after_subsample, frames_check) =
-        subsample(&graph, input, &weights.embed, config, frames_in)?;
-    if frames_check != frames {
-        return Err(DolphinEncoderError::Shape {
-            reason: format!("subsample produced {frames_check} frames, expected {frames}"),
-        });
-    }
-    let mut taps: Vec<GgmlCpuTensor> = Vec::with_capacity(if capture_taps {
-        config.num_blocks + 2
-    } else {
-        1
-    });
-    if capture_taps {
-        taps.push(after_subsample);
-    }
-    let mut hidden = after_subsample;
-    for block in &weights.blocks {
-        hidden = encoder_block(&mut graph, hidden, pos_emb, block, config, frames)?;
-        if capture_taps {
-            taps.push(hidden);
-        }
-    }
-    let encoder_out = affine_ln(
-        &graph,
-        hidden,
-        config.layer_norm_epsilon,
-        weights.after_norm_w,
-        weights.after_norm_b,
-        "after_norm",
-    )?;
-    // encoder_out is always the last (and, when `!capture_taps`, only) tap.
-    taps.push(encoder_out);
-
-    for tap in &taps {
-        graph.set_output(*tap).map_err(ggml_err("set_output"))?;
-    }
-    // Only the audio-feature leaf is a fresh per-call graph tensor with no buffer
-    // of its own; the weights and position table are arena-resident (their
-    // backend buffer is already allocated), so -- like the decoder's arena path
-    // -- they need no `set_input`.
-    graph
-        .set_input(input)
-        .map_err(ggml_err("mark_input(features)"))?;
-    // Allocate the forward graph through the scheduler's gallocr for
-    // liveness-based buffer reuse before uploading inputs -- every tap above
-    // is already marked as an output, so gallocr keeps each one's buffer
-    // resident instead of recycling it once a later block stops reading it.
-    graph
-        .prepare_outputs_for_upload(&taps)
-        .map_err(ggml_err("prepare_outputs"))?;
-
-    // Phase D: upload the audio features, then compute.
-    graph
-        .set_f32_slice(input, features, "dolphin_features")
-        .map_err(ggml_err("upload_features"))?;
-
-    let expected = frames * config.d_model;
-    let output_specs: Vec<(GgmlCpuTensor, usize)> =
-        taps.iter().map(|tap| (*tap, expected)).collect();
-    let mut outputs = graph
-        .compute_outputs_f32(&output_specs)
-        .map_err(ggml_err("compute"))?;
-
-    let encoder_out = outputs.pop().expect("encoder_out tap");
-    let (after_subsample, blocks) = if capture_taps {
-        let blocks = outputs.split_off(1);
-        let after_subsample = outputs.pop().expect("after_subsample tap");
-        (after_subsample, blocks)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    Ok(DolphinEncoderOutput {
-        frames,
-        dim: config.d_model,
-        after_subsample,
-        blocks,
-        encoder_out,
-    })
+    (0..len)
+        .map(|index| {
+            let mut x = seed ^ (index as u32).wrapping_mul(2654435761);
+            x ^= x >> 13;
+            x = x.wrapping_mul(1274126177);
+            x ^= x >> 16;
+            ((x % 2000) as f32 / 1000.0) - 1.0
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1376,5 +1692,186 @@ mod tests {
         let table = dolphin_relative_positional_table(3, 2).expect("table");
         assert_eq!(table.len(), (2 * 2 - 1) * 3);
         assert!(table.iter().all(|v| v.is_finite()));
+    }
+
+    /// A tiny but structurally complete encoder config (1 E-Branchformer
+    /// block, d_model 8) for the CPU residency-equivalence tests below.
+    fn tiny_config(
+        scheme: super::super::package_import::DolphinLanguageScheme,
+    ) -> DolphinEncoderConfig {
+        DolphinEncoderConfig {
+            d_model: 8,
+            attention_heads: 2,
+            head_dim: 4,
+            ffn_units: 16,
+            cgmlp_units: 16,
+            cgmlp_kernel: 3,
+            merge_kernel: 3,
+            num_blocks: 1,
+            feature_dim: 16,
+            max_positions: 8,
+            layer_norm_epsilon: 1e-5,
+            language_scheme: scheme,
+        }
+    }
+
+    /// Every encoder tensor name at its exact expected length, filled with
+    /// deterministic synthetic values.
+    fn synthetic_provider(config: &DolphinEncoderConfig) -> HashMap<String, Vec<f32>> {
+        let d = config.d_model;
+        let ffn = config.ffn_units;
+        let cg = config.cgmlp_units;
+        let cg_half = cg / 2;
+        let flat = d * subsample_width(config.feature_dim);
+        let mut map = HashMap::new();
+        let mut put = |name: String, len: usize| {
+            let values = synthetic_test_tensor(&name, len);
+            map.insert(name, values);
+        };
+        put("encoder.embed.conv.0.weight".into(), 3 * 3 * d);
+        put("encoder.embed.conv.0.bias".into(), d);
+        put("encoder.embed.conv.2.weight".into(), 3 * 3 * d * d);
+        put("encoder.embed.conv.2.bias".into(), d);
+        put("encoder.embed.out.0.weight".into(), flat * d);
+        put("encoder.embed.out.0.bias".into(), d);
+        for index in 0..config.num_blocks {
+            let p = |suffix: &str| format!("encoder.encoders.{index}.{suffix}");
+            put(p("norm_ff_macaron.weight"), d);
+            put(p("norm_ff_macaron.bias"), d);
+            put(p("feed_forward_macaron.w_1.weight"), d * ffn);
+            put(p("feed_forward_macaron.w_1.bias"), ffn);
+            put(p("feed_forward_macaron.w_2.weight"), ffn * d);
+            put(p("feed_forward_macaron.w_2.bias"), d);
+            put(p("norm_mha.weight"), d);
+            put(p("norm_mha.bias"), d);
+            for proj in ["linear_q", "linear_k", "linear_v", "linear_out"] {
+                put(p(&format!("attn.{proj}.weight")), d * d);
+                put(p(&format!("attn.{proj}.bias")), d);
+            }
+            put(p("attn.linear_pos.weight"), d * d);
+            put(p("attn.pos_bias_u"), d);
+            put(p("attn.pos_bias_v"), d);
+            put(p("norm_mlp.weight"), d);
+            put(p("norm_mlp.bias"), d);
+            put(p("cgmlp.channel_proj1.0.weight"), d * cg);
+            put(p("cgmlp.channel_proj1.0.bias"), cg);
+            put(p("cgmlp.csgu.norm.weight"), cg_half);
+            put(p("cgmlp.csgu.norm.bias"), cg_half);
+            put(p("cgmlp.csgu.conv.weight"), config.cgmlp_kernel * cg_half);
+            put(p("cgmlp.csgu.conv.bias"), cg_half);
+            put(p("cgmlp.channel_proj2.weight"), cg_half * d);
+            put(p("cgmlp.channel_proj2.bias"), d);
+            put(
+                p("depthwise_conv_fusion.weight"),
+                config.merge_kernel * 2 * d,
+            );
+            put(p("depthwise_conv_fusion.bias"), 2 * d);
+            put(p("merge_proj.weight"), 2 * d * d);
+            put(p("merge_proj.bias"), d);
+            put(p("norm_ff.weight"), d);
+            put(p("norm_ff.bias"), d);
+            put(p("feed_forward.w_1.weight"), d * ffn);
+            put(p("feed_forward.w_1.bias"), ffn);
+            put(p("feed_forward.w_2.weight"), ffn * d);
+            put(p("feed_forward.w_2.bias"), d);
+            put(p("norm_final.weight"), d);
+            put(p("norm_final.bias"), d);
+        }
+        put("encoder.after_norm.weight".into(), d);
+        put("encoder.after_norm.bias".into(), d);
+        if matches!(
+            config.language_scheme,
+            super::super::package_import::DolphinLanguageScheme::CnDialect
+        ) {
+            put("encoder.embed.pos_enc.pe".into(), d * config.max_positions);
+        }
+        map
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Residency equivalence (perf change must not change output): a cached
+    /// [`DolphinEncoderRuntime`] must produce bit-identical `encoder_out` on
+    /// repeated calls (arena reuse, no re-upload) AND bit-identical output to
+    /// the one-shot [`encode`] path, for both position-table schemes. The
+    /// multilingual case additionally pins the "view of a larger resident
+    /// centered table == exact per-`frames` table" equivalence: the runtime's
+    /// table is sized for `max_positions` (8 -> 15 rows) while the one-shot
+    /// builds the exact `frames`-sized table (3 -> 5 rows).
+    #[test]
+    fn encoder_runtime_reuse_is_bit_identical_to_one_shot_encode() {
+        use super::super::package_import::DolphinLanguageScheme;
+        for scheme in [
+            DolphinLanguageScheme::CnDialect,
+            DolphinLanguageScheme::Multilingual,
+        ] {
+            let config = tiny_config(scheme);
+            let provider = synthetic_provider(&config);
+            let frames_in = 15; // -> 3 subsampled frames, below max_positions 8
+            let features = synthetic_test_tensor("features", frames_in * config.feature_dim);
+
+            let one_shot = encode(
+                &config,
+                &provider,
+                &features,
+                frames_in,
+                GgmlCpuGraphBackend::Cpu,
+                false,
+            )
+            .expect("one-shot encode");
+
+            let mut runtime = DolphinEncoderRuntime::new(
+                &config,
+                &provider,
+                GgmlCpuGraphBackend::Cpu,
+                config.max_positions,
+            )
+            .expect("runtime");
+            let first = runtime
+                .encode(&features, frames_in, false)
+                .expect("runtime encode #1");
+            let second = runtime
+                .encode(&features, frames_in, false)
+                .expect("runtime encode #2");
+
+            assert_eq!(first.frames, one_shot.frames);
+            assert_eq!(
+                bits(&first.encoder_out),
+                bits(&one_shot.encoder_out),
+                "{scheme:?}: resident-runtime encode must be bit-identical to one-shot"
+            );
+            assert_eq!(
+                bits(&first.encoder_out),
+                bits(&second.encoder_out),
+                "{scheme:?}: repeated encode on the cached runtime must be bit-identical"
+            );
+        }
+    }
+
+    /// An utterance longer than the resident position table must fail closed
+    /// with a typed `Shape` error (the executor then falls back to a one-shot
+    /// runtime sized for that call), and `supports_input_frames` must report
+    /// the same boundary.
+    #[test]
+    fn encoder_runtime_rejects_frames_beyond_resident_pos_capacity() {
+        use super::super::package_import::DolphinLanguageScheme;
+        let config = tiny_config(DolphinLanguageScheme::Multilingual);
+        let provider = synthetic_provider(&config);
+        let mut runtime =
+            DolphinEncoderRuntime::new(&config, &provider, GgmlCpuGraphBackend::Cpu, 2)
+                .expect("runtime");
+        assert_eq!(runtime.pos_capacity_frames(), 2);
+        // 15 input frames subsample to 3 > capacity 2.
+        assert!(!runtime.supports_input_frames(15));
+        let features = synthetic_test_tensor("features", 15 * config.feature_dim);
+        let result = runtime.encode(&features, 15, false);
+        assert!(
+            matches!(result, Err(DolphinEncoderError::Shape { .. })),
+            "expected a typed Shape error, got {result:?}"
+        );
+        // Too-short input still reports supported so `encode` owns the error.
+        assert!(runtime.supports_input_frames(3));
     }
 }
