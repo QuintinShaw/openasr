@@ -1,0 +1,97 @@
+# CUDA-enabled image for NVIDIA GPUs (Turing/sm_75 and up -- RTX 20xx, GTX
+# 16xx, T4, and newer Ampere/Ada/Hopper cards).
+#
+# Why compile from source here instead of assembling the released
+# `openasr-<version>-linux-x86_64-cuda.tar.gz` binary (release-binaries.yml
+# does publish one): that release binary is compiled against
+# `openasr-core/build.rs`'s current default CUDA arch list, which does not
+# include sm_75 on `main` today, so it silently drops Turing cards ("no
+# kernel image available" at runtime) -- exactly the failure this image
+# exists to fix. Building in-image with an explicit OPENASR_CUDA_GPU_TARGETS
+# below decouples this image from that default and guarantees Turing support
+# regardless of upstream's current state. Once a released binary is built
+# with sm_75 included, switching this Dockerfile to "download + unpack the
+# release asset" becomes a valid, lighter-weight alternative -- revisit then.
+#
+# CUDA toolkit version (13.2.0) and base OS (Ubuntu 22.04) match the
+# `linux-x86_64-cuda` leg in .github/workflows/release-binaries.yml so the
+# build environment stays consistent with what CI already validates.
+
+ARG CUDA_VERSION=13.2.0
+ARG UBUNTU_CODENAME=ubuntu22.04
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU_CODENAME} AS builder
+
+ARG RUST_VERSION=1.95.0
+# CUDA architectures to generate device code for. Includes sm_75 (Turing:
+# RTX 20xx / GTX 16xx / T4 / 2080 Ti) alongside the upstream default
+# (Ampere/Ada/Hopper). See crates/openasr-core/build.rs's
+# `cuda_gpu_targets_from_raw` for why the floor sits at 75 (CUDA 13 dropped
+# Volta/Pascal/Maxwell device-code generation) and how this env var is read.
+ARG OPENASR_CUDA_GPU_TARGETS="75;80;86;89;90"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates build-essential cmake pkg-config git \
+        libasound2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}"
+
+WORKDIR /app
+COPY . .
+
+ENV OPENASR_CUDA_GPU_TARGETS=${OPENASR_CUDA_GPU_TARGETS}
+RUN cargo build --release -p openasr-cli --features cuda
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU_CODENAME} AS runtime
+
+# The "runtime" nvidia/cuda tag already ships libcudart/libcublas/etc (the
+# CUDA redistributable math libraries); it does not ship libcuda.so (the
+# driver), which the NVIDIA Container Toolkit mounts in from the host at
+# `docker run --gpus ...` time. libasound2/libgomp1 match the CPU Dockerfile
+# (ALSA + OpenMP runtime deps of the openasr binary).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libasound2 libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 openasr \
+    && mkdir -p /app /data \
+    && chown -R openasr:openasr /app /data
+
+WORKDIR /app
+COPY --from=builder /app/target/release/openasr /usr/local/bin/openasr
+COPY --from=builder /app/model-registry ./model-registry
+COPY scripts/docker-cuda-entrypoint.sh /usr/local/bin/docker-cuda-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-cuda-entrypoint.sh
+
+ENV OPENASR_HOME=/data
+# See the CPU Dockerfile for why this opt-in is safe: binding 0.0.0.0 inside
+# the container is the standard Docker exposure pattern (the operator
+# controls exposure via port-publish/orchestration); the server stays
+# fail-closed against non-loopback plaintext unless this is set. Front it
+# with TLS (or a TLS-terminating proxy) for untrusted networks.
+ENV OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1
+
+# NVIDIA Container Toolkit contract: request GPU capability + full visibility
+# by default (overridable by the operator via `--gpus`/`NVIDIA_VISIBLE_DEVICES`).
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 8080
+
+USER openasr
+
+# Fail-closed GPU gate: refuses to start (and to keep passing its healthcheck)
+# if the container cannot see a real GPU device, instead of silently falling
+# back to CPU. See scripts/docker-cuda-entrypoint.sh.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD /usr/local/bin/docker-cuda-entrypoint.sh --gpu-check-only || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-cuda-entrypoint.sh"]
+CMD ["serve", "--addr", "0.0.0.0:8080"]
