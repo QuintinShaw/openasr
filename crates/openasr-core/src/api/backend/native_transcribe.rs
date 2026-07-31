@@ -1,7 +1,11 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
@@ -290,7 +294,15 @@ fn publish_align_progress(id: Option<&str>) {
 struct DecodeProgress {
     id: Option<String>,
     total_samples: u64,
-    decoded_samples: u64,
+    // Atomic so the concurrent slice pipeline (see `run_concurrent_slice_pipeline`)
+    // can accumulate completed-slice shares from several worker threads at once
+    // without a lock. Reports remain monotonic and race-free: the
+    // progress-registry already clamps every published fraction upward
+    // (`ProgressRegistry::raise`), so overlapping in-flight windows from
+    // concurrent slices can never move the bar backward. Under the serial path
+    // (`decoded_samples` touched from one thread only) the observable sequence is
+    // byte-identical to the previous plain-`u64` field.
+    decoded_samples: AtomicU64,
     decode_ceil: f32,
 }
 
@@ -305,19 +317,24 @@ impl DecodeProgress {
         Self {
             id,
             total_samples,
-            decoded_samples: 0,
+            decoded_samples: AtomicU64::new(0),
             decode_ceil,
         }
     }
 
     /// Mark one slice decoded (or skipped as silent -- silence still consumes its
     /// share of the audio timeline), advancing the bar by that slice's sample share.
-    fn complete_slice(&mut self, slice_samples: u64) {
-        self.decoded_samples = self.decoded_samples.saturating_add(slice_samples);
+    /// `&self` (not `&mut self`) so concurrent slice workers can each fold their
+    /// completed slice's share in; `fetch_add` makes the accumulation atomic.
+    fn complete_slice(&self, slice_samples: u64) {
+        let decoded = self
+            .decoded_samples
+            .fetch_add(slice_samples, Ordering::Relaxed)
+            .saturating_add(slice_samples);
         let ratio = if self.total_samples == 0 {
             1.0
         } else {
-            (self.decoded_samples as f32 / self.total_samples as f32).clamp(0.0, 1.0)
+            (decoded as f32 / self.total_samples as f32).clamp(0.0, 1.0)
         };
         publish_progress(
             self.id.as_deref(),
@@ -334,7 +351,8 @@ impl DecodeProgress {
     /// slice's full share regardless of where token interpolation left off.
     fn slice_progress_window(&self, slice_samples: u64) -> SliceProgressWindow {
         let total = (self.total_samples.max(1)) as f32;
-        let start_ratio = (self.decoded_samples as f32 / total).clamp(0.0, 1.0);
+        let decoded = self.decoded_samples.load(Ordering::Relaxed);
+        let start_ratio = (decoded as f32 / total).clamp(0.0, 1.0);
         let span_ratio = (slice_samples as f32 / total).clamp(0.0, 1.0 - start_ratio);
         SliceProgressWindow {
             start_fraction: self.decode_ceil * start_ratio,
@@ -421,7 +439,7 @@ fn run_dispatch_once_with_progress(
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
     execution_context: &Arc<crate::RequestExecutionContext>,
-    decode_progress: &mut DecodeProgress,
+    decode_progress: &DecodeProgress,
     slice_samples: u64,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let window = decode_progress.slice_progress_window(slice_samples);
@@ -587,7 +605,7 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
     execution_context: &Arc<crate::RequestExecutionContext>,
-    decode_progress: &mut DecodeProgress,
+    decode_progress: &DecodeProgress,
     slice_samples: u64,
     slice_label: &str,
     tracker: &mut GpuAllocationFallbackTracker,
@@ -672,6 +690,404 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
             Ok((result, Some(fallback)))
         }
     }
+}
+
+/// Upper bound on concurrent long-audio slice workers. Kept small: the win is
+/// filling encode/decode GPU bubbles (2-4 in-flight slices saturate a single
+/// GPU's execution pipeline, the same admission-concurrency effect the server
+/// path already relies on), not unbounded fan-out, and every extra worker costs
+/// another resident decoder runtime + KV cache.
+const SLICE_PIPELINE_MAX_WIDTH: usize = 4;
+
+/// Memory head-room the concurrent slice pipeline always leaves free when
+/// deciding how many workers fit, so it never claims the last of available
+/// memory and pushes the host into swap thrash.
+const SLICE_PIPELINE_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Floor for the per-worker memory estimate when the runtime pack size cannot be
+/// stat'd, so the capacity gate never divides available memory by an
+/// unrealistically small number and over-admits workers.
+const SLICE_PIPELINE_PER_WORKER_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
+
+/// Requested concurrent slice-pipeline width from `OPENASR_SLICE_PIPELINE_WIDTH`.
+///
+/// Opt-in and conservative by default: unset, "0", "1", or an unparseable value
+/// all mean 1 -- the byte-identical serial + prompt-carry path. A value >= 2
+/// enables the carry-light concurrent path (subject to the capacity and
+/// slice-count gates in [`effective_slice_pipeline_width`]), clamped to
+/// [`SLICE_PIPELINE_MAX_WIDTH`]. Deliberately a runtime knob rather than a
+/// hard-coded default so the short-audio carry-vs-carry-light quality audit can
+/// pick the shipping default without a code change.
+fn slice_pipeline_requested_width() -> usize {
+    std::env::var("OPENASR_SLICE_PIPELINE_WIDTH")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, SLICE_PIPELINE_MAX_WIDTH)
+}
+
+/// Pure capacity gate for the concurrent slice pipeline: how many workers may
+/// run at once given `available_bytes` of head-room and a conservative
+/// `per_worker_bytes` estimate. Returns >= 1 and never exceeds `requested_width`
+/// or `decode_slice_count`. When nothing fits it falls back to 1 (serial), never
+/// 0 -- the gate can only ever reduce concurrency, so it cannot OOM the host.
+fn slice_pipeline_capped_width(
+    requested_width: usize,
+    decode_slice_count: usize,
+    available_bytes: Option<u64>,
+    per_worker_bytes: u64,
+    reserve_bytes: u64,
+) -> usize {
+    let ceiling = requested_width.min(decode_slice_count);
+    if ceiling <= 1 {
+        return 1;
+    }
+    // No memory probe on this host: honor the explicit opt-in rather than
+    // silently disabling it, matching the serve-batch VRAM-cap precedent
+    // (`serve_batch_vram_capped_max_batch` returns the request unchanged when no
+    // memory sample is available). The reserve plus the conservative per-worker
+    // estimate still bound the real risk.
+    let Some(available) = available_bytes else {
+        return ceiling;
+    };
+    if per_worker_bytes == 0 {
+        return ceiling;
+    }
+    let usable = available.saturating_sub(reserve_bytes);
+    let fits = (usable / per_worker_bytes).min(ceiling as u64) as usize;
+    fits.max(1)
+}
+
+/// Conservative per-worker memory estimate for the capacity gate: one runtime
+/// pack's on-disk size (with a floor). The mmapped weights are actually shared
+/// across workers, so charging each worker a whole pack over-estimates the true
+/// marginal cost (KV cache + compute buffers) and errs toward fewer workers --
+/// the safe direction for an OOM gate.
+fn slice_pipeline_per_worker_bytes(runtime_preflight: &GgmlAsrRuntimeSourcePreflight) -> u64 {
+    let pack_bytes = std::fs::metadata(runtime_preflight.runtime_source.path())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    pack_bytes.max(SLICE_PIPELINE_PER_WORKER_BYTES_FLOOR)
+}
+
+/// Concurrent-width decision wired to the live host: caps `requested_width` by
+/// swap-aware available memory ([`crate::host::host_available_memory_bytes`], the
+/// capacity source) against the conservative per-worker estimate, and by the
+/// slice count. Returns 1 (serial) whenever concurrency is not worth it or does
+/// not fit. `slices.len()` is an upper bound on decodable slices (some may be
+/// suppressed as silent at run time); the gate only ever caps downward, so the
+/// bound is safe.
+fn effective_slice_pipeline_width(
+    requested_width: usize,
+    slices: &[crate::longform::AudioSlice],
+    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+) -> usize {
+    if requested_width <= 1 || slices.len() <= 1 {
+        return 1;
+    }
+    slice_pipeline_capped_width(
+        requested_width,
+        slices.len(),
+        crate::host::host_available_memory_bytes(),
+        slice_pipeline_per_worker_bytes(runtime_preflight),
+        SLICE_PIPELINE_MEMORY_RESERVE_BYTES,
+    )
+}
+
+/// One slice's place in the concurrent pipeline: the slice itself, its sample
+/// weight for progress, and whether it was suppressed as silent (silence is
+/// decided once up front on the main thread, exactly as the serial loop does).
+struct SlicePlanItem {
+    slice: crate::longform::AudioSlice,
+    slice_samples: u64,
+    silent: bool,
+}
+
+/// A worker's decoded output for one slice, carried back to the main thread for
+/// in-order assembly. Deliberately owns only the plain data the ordered
+/// integration needs -- text, segments, truncation, GPU-fallback tag -- so
+/// nothing family-specific or non-`Send` crosses the thread boundary.
+struct DecodedSlice {
+    text: String,
+    segments: Vec<Segment>,
+    truncation: Option<DecodeTruncation>,
+    fallback: Option<SliceGpuFallback>,
+}
+
+/// Borrowed context for one concurrent long-audio slice-pipeline run. Grouped
+/// into a struct so the entry point stays one readable call instead of a
+/// twenty-argument function.
+struct ConcurrentSlicePipeline<'a> {
+    width: usize,
+    slices: Vec<crate::longform::AudioSlice>,
+    plan_audio: &'a [f32],
+    timeline: &'a crate::longform::TimelineMap,
+    dispatch: &'a GgmlAsrExecutionDispatch,
+    runtime_preflight: &'a GgmlAsrRuntimeSourcePreflight,
+    selected_family: &'a GgmlFamilyAdapterDescriptor,
+    request_options: &'a GgmlAsrExecutionOptions,
+    backend_preference: GgmlAsrBackendPreference,
+    execution_context: &'a Arc<crate::RequestExecutionContext>,
+    longform_options: &'a crate::LongFormOptions,
+    speaker_plan: SpeakerPlan,
+    decode_progress: &'a DecodeProgress,
+    assembler: &'a mut TranscriptAssembler,
+    ran_any_slice: &'a mut bool,
+    suppressed_slice_count: &'a mut usize,
+    degraded_slice_fallbacks: &'a mut Vec<(usize, SliceGpuFallback)>,
+    truncated_slices: &'a mut Vec<String>,
+    truncated_decodes: &'a mut Vec<TruncatedDecode>,
+    speaker_scope_starts: &'a mut Vec<f32>,
+}
+
+/// Long-audio slice pipeline: decode up to `width` slices concurrently and
+/// assemble their results in slice order.
+///
+/// This is the carry-light path (see module notes on `carry_prompt_mode`): the
+/// cross-slice prompt carry the serial loop threads between slices is a strict
+/// serial dependency, so the concurrent path drops it -- slice N+1 no longer
+/// waits on slice N's transcript. The output is otherwise assembled from the
+/// same per-slice results, in the same order, so it is byte-identical to the
+/// serial path except where a family's decode genuinely depended on the carried
+/// prompt.
+///
+/// The six correctness properties the concurrent path must preserve:
+/// 1. Ordered assembly: workers finish out of order, results are routed back by
+///    slice position and integrated strictly in slice order.
+/// 2. Cancel / pause: each worker gates on the shared control at every slice
+///    boundary (pause blocks it, cancel stops it), arms the ggml abort callback
+///    on its own thread for mid-graph cancel, and the shared greedy driver still
+///    polls cancel per token via the job-carried control.
+/// 3. Progress: `DecodeProgress` accumulates atomically and the registry clamps
+///    every report upward, so concurrent completions never move the bar back.
+/// 4. GPU-fallback tracker: each worker owns its own tracker, so one worker's
+///    fallback streak cannot corrupt another's backend choice.
+/// 5. Memory: `width` is already capacity-gated by the caller
+///    (`effective_slice_pipeline_width`).
+/// 6. Errors / truncation: a worker's error and truncated-slice facts are routed
+///    back and integrated in order; the first (lowest-index) error fails the run
+///    closed, exactly like the serial `?`.
+fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<(), BackendError> {
+    let ConcurrentSlicePipeline {
+        width,
+        slices,
+        plan_audio,
+        timeline,
+        dispatch,
+        runtime_preflight,
+        selected_family,
+        request_options,
+        backend_preference,
+        execution_context,
+        longform_options,
+        speaker_plan,
+        decode_progress,
+        assembler,
+        ran_any_slice,
+        suppressed_slice_count,
+        degraded_slice_fallbacks,
+        truncated_slices,
+        truncated_decodes,
+        speaker_scope_starts,
+    } = pipeline;
+
+    // Pre-scan on the main thread: decide silence once (identical predicate to
+    // the serial loop), fold each silent slice's share into progress up front,
+    // and record which positions actually need a decode worker.
+    let mut plan_items: Vec<SlicePlanItem> = Vec::with_capacity(slices.len());
+    let mut decode_positions: Vec<usize> = Vec::new();
+    for slice in slices {
+        let slice_samples = slice.duration_samples() as u64;
+        let relative_start = slice
+            .content_start_sample
+            .saturating_sub(slice.start_sample);
+        let relative_end = slice
+            .content_end_sample
+            .saturating_sub(slice.start_sample)
+            .min(slice.duration_samples());
+        let chunk = &plan_audio[slice.start_sample..slice.end_sample];
+        let silent = longform_options.suppress_silent_slices
+            && is_effectively_silent(
+                &chunk[relative_start..relative_end],
+                longform_options.energy_silence_threshold_db,
+            );
+        if silent {
+            decode_progress.complete_slice(slice_samples);
+        } else {
+            decode_positions.push(plan_items.len());
+        }
+        plan_items.push(SlicePlanItem {
+            slice,
+            slice_samples,
+            silent,
+        });
+    }
+
+    // Results routed back by slice position; silent positions stay `None`.
+    let mut results: Vec<Option<Result<DecodedSlice, BackendError>>> =
+        (0..plan_items.len()).map(|_| None).collect();
+
+    if !decode_positions.is_empty() {
+        let cursor = AtomicUsize::new(0);
+        // Set on cancel or the first worker error so peers stop pulling new work
+        // promptly instead of decoding slices whose result will be discarded.
+        let stop = AtomicBool::new(false);
+        let worker_count = width.min(decode_positions.len()).max(1);
+        let (result_tx, result_rx) = mpsc::channel::<(usize, Result<DecodedSlice, BackendError>)>();
+        let items = &plan_items;
+        let decode_positions_ref = &decode_positions;
+        let cursor_ref = &cursor;
+        let stop_ref = &stop;
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let result_tx = result_tx.clone();
+                scope.spawn(move || {
+                    // Arm this worker thread's ggml abort callback so a cancel
+                    // that arrives mid-graph aborts this worker's compute too;
+                    // between-step cancel is already covered by the shared
+                    // greedy driver's per-token poll of the job-carried control.
+                    let _abort_guard = execution_context.control.arm_for_native_decode();
+                    // Per-worker fallback tracker (property 4): the GPU-allocation
+                    // streak is meaningful only within one worker's own sequence
+                    // of slices, and sharing it across threads would be a data
+                    // race.
+                    let mut tracker = GpuAllocationFallbackTracker::default();
+                    loop {
+                        if stop_ref.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // Slice-boundary pause/cancel gate, mirroring the serial
+                        // loop: pause blocks this worker here; cancel stops it.
+                        if execution_context.control.wait_at_slice_boundary()
+                            == super::transcription_control::SliceBoundaryControl::Canceled
+                        {
+                            stop_ref.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        let next = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                        if next >= decode_positions_ref.len() {
+                            break;
+                        }
+                        let pos = decode_positions_ref[next];
+                        let item = &items[pos];
+                        // Carry-light: no cross-slice prompt carry in the
+                        // concurrent path (that is the serial dependency this
+                        // path trades away for overlap).
+                        let slice_options = request_options.clone();
+                        let chunk =
+                            plan_audio[item.slice.start_sample..item.slice.end_sample].to_vec();
+                        let outcome = run_dispatch_once_with_progress_and_gpu_fallback(
+                            dispatch,
+                            runtime_preflight,
+                            selected_family,
+                            chunk,
+                            slice_options,
+                            backend_preference,
+                            execution_context,
+                            decode_progress,
+                            item.slice_samples,
+                            &format!("concurrent-pos={pos}"),
+                            &mut tracker,
+                        )
+                        .map(|(result, fallback)| DecodedSlice {
+                            text: result.transcription.text,
+                            segments: result.transcription.segments,
+                            truncation: result.decode_truncation,
+                            fallback,
+                        });
+                        let is_err = outcome.is_err();
+                        if result_tx.send((pos, outcome)).is_err() {
+                            break;
+                        }
+                        if is_err {
+                            // First failure stops the pipeline (property 6):
+                            // peers stop pulling, and the main thread returns the
+                            // lowest-index error, matching the serial `?`.
+                            stop_ref.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                });
+            }
+            // Drop the main thread's spare sender so the receiver below ends once
+            // every worker has finished and dropped its clone.
+            drop(result_tx);
+            for (pos, outcome) in result_rx {
+                results[pos] = Some(outcome);
+            }
+        });
+    }
+
+    // Ordered integration on the main thread (property 1): replay the serial
+    // loop's post-decode bookkeeping in slice order, so `slice_index`, the
+    // provenance vectors, and the assembler see exactly the serial sequence.
+    // `slice_index` is bumped only on a decoded (non-silent) slice, exactly as
+    // the serial loop does, so the 1-based indices stamped into truncation and
+    // GPU-fallback provenance match byte-for-byte.
+    let mut slice_index = 0usize;
+    let mut first_error: Option<BackendError> = None;
+    for (position, item) in plan_items.into_iter().enumerate() {
+        if item.silent {
+            *suppressed_slice_count += 1;
+            assembler.push_slice_result(SliceTranscript {
+                slice: item.slice,
+                text: String::new(),
+                segments: Vec::new(),
+                time_domain: SegmentTimeDomain::AbsoluteOriginal,
+            });
+            continue;
+        }
+        match results[position].take() {
+            Some(Ok(decoded)) => {
+                slice_index += 1;
+                if let Some(fallback) = decoded.fallback {
+                    degraded_slice_fallbacks.push((slice_index, fallback));
+                }
+                if let Some(truncation) = decoded.truncation {
+                    truncated_slices
+                        .push(format_truncated_slice_provenance(slice_index, &truncation));
+                    truncated_decodes.push(TruncatedDecode {
+                        slice_index: Some(slice_index),
+                        truncation,
+                    });
+                }
+                *ran_any_slice = true;
+                if speaker_plan == SpeakerPlan::InDecoder {
+                    speaker_scope_starts.push(timeline.map_processed_to_original_seconds(
+                        item.slice.content_start_sample as f32 / 16_000.0,
+                    ));
+                }
+                assembler.push_slice_result(SliceTranscript {
+                    slice: item.slice,
+                    text: decoded.text,
+                    segments: decoded.segments,
+                    time_domain: SegmentTimeDomain::RelativeToSliceContent,
+                });
+            }
+            // Keep the first (lowest-index) error so the returned failure matches
+            // the serial `?`, which fails at the earliest bad slice.
+            Some(Err(err)) if first_error.is_none() => {
+                first_error = Some(err);
+            }
+            Some(Err(_)) => {}
+            None => {
+                // A decodable position with no result only happens when a worker
+                // stopped early (a peer error already set `first_error`, or a
+                // cancel, checked below). Nothing to integrate here.
+            }
+        }
+    }
+
+    // Cancel wins over a partial assembly (property 2 + 6): a cancel that raced
+    // the workers leaves some positions undecoded, so surface it as the typed
+    // cancel rather than a truncated transcript.
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// RAII cleanup for one native transcription's progress-registry entry:
@@ -1448,7 +1864,7 @@ fn run_native_transcription_impl(
                 .iter()
                 .map(|slice| slice.duration_samples() as u64)
                 .sum();
-            let mut decode_progress = DecodeProgress::begin(
+            let decode_progress = DecodeProgress::begin(
                 execution_context.request_id.clone(),
                 total_decode_samples,
                 with_align,
@@ -1481,139 +1897,175 @@ fn run_native_transcription_impl(
             // one whole-recording external pass has a single scope and leaves
             // this empty.
             let mut speaker_scope_starts: Vec<f32> = Vec::new();
-            for slice in plan.slices {
-                if execution_context.control.wait_at_slice_boundary()
-                    == super::transcription_control::SliceBoundaryControl::Canceled
-                {
-                    return Err(BackendError::TranscriptionCanceled);
-                }
-                let slice_samples = slice.duration_samples() as u64;
-                let relative_start = slice
-                    .content_start_sample
-                    .saturating_sub(slice.start_sample);
-                let relative_end = slice
-                    .content_end_sample
-                    .saturating_sub(slice.start_sample)
-                    .min(slice.duration_samples());
-                let chunk = plan_audio[slice.start_sample..slice.end_sample].to_vec();
-                if longform_options.suppress_silent_slices
-                    && is_effectively_silent(
-                        &chunk[relative_start..relative_end],
-                        longform_options.energy_silence_threshold_db,
-                    )
-                {
-                    suppressed_slice_count += 1;
+            // P1 long-audio slice pipeline: when opted in and it fits, decode K
+            // slices concurrently to overlap the encode/decode GPU bubbles (the
+            // admission-concurrency win, applied to one file's slices). Width 1
+            // -- the default -- runs the byte-identical serial + prompt-carry
+            // path in the `else` below.
+            let pipeline_width = effective_slice_pipeline_width(
+                slice_pipeline_requested_width(),
+                &plan.slices,
+                &runtime_preflight,
+            );
+            if pipeline_width > 1 {
+                run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
+                    width: pipeline_width,
+                    slices: plan.slices,
+                    plan_audio,
+                    timeline: &plan.timeline,
+                    dispatch,
+                    runtime_preflight: &runtime_preflight,
+                    selected_family: &selected_family,
+                    request_options: &request_options,
+                    backend_preference,
+                    execution_context: &execution_context,
+                    longform_options: &longform_options,
+                    speaker_plan,
+                    decode_progress: &decode_progress,
+                    assembler: &mut assembler,
+                    ran_any_slice: &mut ran_any_slice,
+                    suppressed_slice_count: &mut suppressed_slice_count,
+                    degraded_slice_fallbacks: &mut degraded_slice_fallbacks,
+                    truncated_slices: &mut truncated_slices,
+                    truncated_decodes: &mut truncated_decodes,
+                    speaker_scope_starts: &mut speaker_scope_starts,
+                })?;
+            } else {
+                for slice in plan.slices {
+                    if execution_context.control.wait_at_slice_boundary()
+                        == super::transcription_control::SliceBoundaryControl::Canceled
+                    {
+                        return Err(BackendError::TranscriptionCanceled);
+                    }
+                    let slice_samples = slice.duration_samples() as u64;
+                    let relative_start = slice
+                        .content_start_sample
+                        .saturating_sub(slice.start_sample);
+                    let relative_end = slice
+                        .content_end_sample
+                        .saturating_sub(slice.start_sample)
+                        .min(slice.duration_samples());
+                    let chunk = plan_audio[slice.start_sample..slice.end_sample].to_vec();
+                    if longform_options.suppress_silent_slices
+                        && is_effectively_silent(
+                            &chunk[relative_start..relative_end],
+                            longform_options.energy_silence_threshold_db,
+                        )
+                    {
+                        suppressed_slice_count += 1;
+                        assembler.push_slice_result(SliceTranscript {
+                            slice,
+                            text: String::new(),
+                            segments: Vec::new(),
+                            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+                        });
+                        decode_progress.complete_slice(slice_samples);
+                        continue;
+                    }
+                    let mut slice_options = request_options.clone();
+                    match carry_prompt_mode {
+                        LongformPromptCarryMode::Disabled => {}
+                        LongformPromptCarryMode::Text => {
+                            let trimmed = rolling_prompt.trim();
+                            if !trimmed.is_empty() {
+                                slice_options.prompt = Some(trimmed.to_string());
+                            }
+                        }
+                        LongformPromptCarryMode::TokenHistory => {
+                            if !rolling_prompt_token_ids.is_empty() {
+                                slice_options.prompt = None;
+                                slice_options.prompt_token_ids =
+                                    Some(rolling_prompt_token_ids.clone());
+                            }
+                        }
+                    }
+                    slice_index += 1;
+                    let slice_decode_started = Instant::now();
+                    let (result, slice_gpu_fallback) =
+                        run_dispatch_once_with_progress_and_gpu_fallback(
+                            dispatch,
+                            &runtime_preflight,
+                            &selected_family,
+                            chunk,
+                            slice_options,
+                            backend_preference,
+                            &execution_context,
+                            &decode_progress,
+                            slice_samples,
+                            &format!("index={slice_index}"),
+                            &mut gpu_fallback_tracker,
+                        )?;
+                    if let Some(fallback) = slice_gpu_fallback {
+                        degraded_slice_fallbacks.push((slice_index, fallback));
+                    }
+                    // OPENASR_TIMING=1 detail: per-longform-slice decode time.
+                    // Coarse by default (only the whole-request `inference` stage
+                    // is logged unconditionally) since a long recording can chunk
+                    // into many slices -- one line per slice would be noisy for
+                    // the always-on tier.
+                    crate::stage_timing::log_detail_event(
+                        "native_transcribe",
+                        format_args!(
+                            "stage=longform_slice_decode index={slice_index} samples={slice_samples} duration_ms={:.3}",
+                            slice_decode_started.elapsed().as_secs_f64() * 1000.0
+                        ),
+                    );
+                    // Destructure instead of `result.clone().into_transcription()`:
+                    // the fields are consumed below and nothing needs `result`
+                    // as a whole afterwards, so there is nothing left to clone.
+                    let GgmlAsrExecutionResult {
+                        transcription,
+                        carry_context,
+                        decode_truncation,
+                    } = result;
+                    if let Some(truncation) = decode_truncation {
+                        // A slice whose decode gave up partway is a degraded
+                        // result, not a normal one: the audio after this point is
+                        // absent from the transcript. Carried structurally on the
+                        // returned transcript (so every output format can see it)
+                        // AND summarized in the same provenance channel as the
+                        // other "this run did not behave like the naive default"
+                        // facts, rather than left as a log line the caller never
+                        // sees.
+                        truncated_slices
+                            .push(format_truncated_slice_provenance(slice_index, &truncation));
+                        truncated_decodes.push(TruncatedDecode {
+                            slice_index: Some(slice_index),
+                            truncation,
+                        });
+                    }
+                    ran_any_slice = true;
+                    match carry_prompt_mode {
+                        LongformPromptCarryMode::Disabled => {}
+                        LongformPromptCarryMode::Text => {
+                            if !transcription.text.trim().is_empty() {
+                                rolling_prompt = append_context_tail(
+                                    &rolling_prompt,
+                                    &transcription.text,
+                                    longform_options.max_context_chars,
+                                );
+                            }
+                        }
+                        LongformPromptCarryMode::TokenHistory => {
+                            if let Some(prompt_token_ids) =
+                                carry_context.and_then(|context| context.prompt_token_ids)
+                            {
+                                rolling_prompt_token_ids = prompt_token_ids;
+                            }
+                        }
+                    }
+                    if speaker_plan == SpeakerPlan::InDecoder {
+                        speaker_scope_starts.push(plan.timeline.map_processed_to_original_seconds(
+                            slice.content_start_sample as f32 / 16_000.0,
+                        ));
+                    }
                     assembler.push_slice_result(SliceTranscript {
                         slice,
-                        text: String::new(),
-                        segments: Vec::new(),
-                        time_domain: SegmentTimeDomain::AbsoluteOriginal,
-                    });
-                    decode_progress.complete_slice(slice_samples);
-                    continue;
-                }
-                let mut slice_options = request_options.clone();
-                match carry_prompt_mode {
-                    LongformPromptCarryMode::Disabled => {}
-                    LongformPromptCarryMode::Text => {
-                        let trimmed = rolling_prompt.trim();
-                        if !trimmed.is_empty() {
-                            slice_options.prompt = Some(trimmed.to_string());
-                        }
-                    }
-                    LongformPromptCarryMode::TokenHistory => {
-                        if !rolling_prompt_token_ids.is_empty() {
-                            slice_options.prompt = None;
-                            slice_options.prompt_token_ids = Some(rolling_prompt_token_ids.clone());
-                        }
-                    }
-                }
-                slice_index += 1;
-                let slice_decode_started = Instant::now();
-                let (result, slice_gpu_fallback) =
-                    run_dispatch_once_with_progress_and_gpu_fallback(
-                        dispatch,
-                        &runtime_preflight,
-                        &selected_family,
-                        chunk,
-                        slice_options,
-                        backend_preference,
-                        &execution_context,
-                        &mut decode_progress,
-                        slice_samples,
-                        &format!("index={slice_index}"),
-                        &mut gpu_fallback_tracker,
-                    )?;
-                if let Some(fallback) = slice_gpu_fallback {
-                    degraded_slice_fallbacks.push((slice_index, fallback));
-                }
-                // OPENASR_TIMING=1 detail: per-longform-slice decode time.
-                // Coarse by default (only the whole-request `inference` stage
-                // is logged unconditionally) since a long recording can chunk
-                // into many slices -- one line per slice would be noisy for
-                // the always-on tier.
-                crate::stage_timing::log_detail_event(
-                    "native_transcribe",
-                    format_args!(
-                        "stage=longform_slice_decode index={slice_index} samples={slice_samples} duration_ms={:.3}",
-                        slice_decode_started.elapsed().as_secs_f64() * 1000.0
-                    ),
-                );
-                // Destructure instead of `result.clone().into_transcription()`:
-                // the fields are consumed below and nothing needs `result`
-                // as a whole afterwards, so there is nothing left to clone.
-                let GgmlAsrExecutionResult {
-                    transcription,
-                    carry_context,
-                    decode_truncation,
-                } = result;
-                if let Some(truncation) = decode_truncation {
-                    // A slice whose decode gave up partway is a degraded
-                    // result, not a normal one: the audio after this point is
-                    // absent from the transcript. Carried structurally on the
-                    // returned transcript (so every output format can see it)
-                    // AND summarized in the same provenance channel as the
-                    // other "this run did not behave like the naive default"
-                    // facts, rather than left as a log line the caller never
-                    // sees.
-                    truncated_slices
-                        .push(format_truncated_slice_provenance(slice_index, &truncation));
-                    truncated_decodes.push(TruncatedDecode {
-                        slice_index: Some(slice_index),
-                        truncation,
+                        text: transcription.text,
+                        segments: transcription.segments,
+                        time_domain: SegmentTimeDomain::RelativeToSliceContent,
                     });
                 }
-                ran_any_slice = true;
-                match carry_prompt_mode {
-                    LongformPromptCarryMode::Disabled => {}
-                    LongformPromptCarryMode::Text => {
-                        if !transcription.text.trim().is_empty() {
-                            rolling_prompt = append_context_tail(
-                                &rolling_prompt,
-                                &transcription.text,
-                                longform_options.max_context_chars,
-                            );
-                        }
-                    }
-                    LongformPromptCarryMode::TokenHistory => {
-                        if let Some(prompt_token_ids) =
-                            carry_context.and_then(|context| context.prompt_token_ids)
-                        {
-                            rolling_prompt_token_ids = prompt_token_ids;
-                        }
-                    }
-                }
-                if speaker_plan == SpeakerPlan::InDecoder {
-                    speaker_scope_starts.push(plan.timeline.map_processed_to_original_seconds(
-                        slice.content_start_sample as f32 / 16_000.0,
-                    ));
-                }
-                assembler.push_slice_result(SliceTranscript {
-                    slice,
-                    text: transcription.text,
-                    segments: transcription.segments,
-                    time_domain: SegmentTimeDomain::RelativeToSliceContent,
-                });
             }
             // Decode done; the merge/resegment tail below runs uncounted otherwise,
             // which is where the bar used to sit frozen at the last slice count.
@@ -1742,7 +2194,7 @@ fn run_native_transcription_impl(
     // all, forcing the UI onto a pure time estimate that had no way to know
     // decode had actually finished (issue: short-audio progress bar).
     let single_pass_total_samples = prepared_audio.len() as u64;
-    let mut single_pass_decode_progress = DecodeProgress::begin(
+    let single_pass_decode_progress = DecodeProgress::begin(
         execution_context.request_id.clone(),
         single_pass_total_samples,
         request.word_timestamps_refine,
@@ -1761,7 +2213,7 @@ fn run_native_transcription_impl(
         request_options,
         backend_preference,
         &execution_context,
-        &mut single_pass_decode_progress,
+        &single_pass_decode_progress,
         single_pass_total_samples,
         "single-pass",
         &mut single_pass_gpu_fallback_tracker,
@@ -3643,7 +4095,7 @@ mod tests {
             let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
             // Decode phase, weighted by sample share; a run that will forced-align
             // reserves headroom above the decode ceiling.
-            let mut decode = DecodeProgress::begin(Some(id.to_string()), 1000, true);
+            let decode = DecodeProgress::begin(Some(id.to_string()), 1000, true);
             let start = native_transcription_progress_for_id(id).expect("run is active");
             assert_eq!(start.phase, NativeTranscriptionPhase::Decode);
             assert_eq!(start.fraction, 0.0);
@@ -3735,7 +4187,7 @@ mod tests {
     #[test]
     fn native_progress_detached_request_never_publishes() {
         let _handle = ProgressRegistryHandle::new(None);
-        let mut decode = DecodeProgress::begin(None, 1000, false);
+        let decode = DecodeProgress::begin(None, 1000, false);
         decode.complete_slice(500);
         publish_assemble_progress(None, false);
         publish_align_progress(None);
@@ -3954,7 +4406,7 @@ mod tests {
         // registry entry, so -- unlike the old global-slot design -- a unique
         // id here needs no lock or guard to stay isolated from every other
         // test.
-        let mut decode =
+        let decode =
             DecodeProgress::begin(Some("slice-window-back-to-back".to_string()), 1000, false);
         let first = decode.slice_progress_window(400);
         assert!((first.start_fraction - 0.0).abs() < 1e-6);
@@ -5540,7 +5992,7 @@ mod tests {
             "compute buffer allocation failed (backend: Vulkan0)",
         ));
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let mut decode_progress = DecodeProgress::begin(None, 1_000, false);
+        let decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         let (result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
@@ -5551,7 +6003,7 @@ mod tests {
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
             &uncancellable_execution_context_for_test(),
-            &mut decode_progress,
+            &decode_progress,
             1_000,
             "index=1",
             &mut tracker,
@@ -5582,7 +6034,7 @@ mod tests {
             calls: Mutex::new(0),
         });
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let mut decode_progress = DecodeProgress::begin(None, 1_000, false);
+        let decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         let error = run_dispatch_once_with_progress_and_gpu_fallback(
@@ -5593,7 +6045,7 @@ mod tests {
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
             &uncancellable_execution_context_for_test(),
-            &mut decode_progress,
+            &decode_progress,
             1_000,
             "index=1",
             &mut tracker,
@@ -5647,7 +6099,7 @@ mod tests {
         });
         let (dispatch, preflight, family) =
             gpu_fallback_test_fixture(dir.path(), cpu_executor.clone());
-        let mut decode_progress = DecodeProgress::begin(None, 1_000, false);
+        let decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         let error = run_dispatch_once_with_progress_and_gpu_fallback(
@@ -5658,7 +6110,7 @@ mod tests {
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::CpuOnly,
             &uncancellable_execution_context_for_test(),
-            &mut decode_progress,
+            &decode_progress,
             1_000,
             "index=1",
             &mut tracker,
@@ -5684,7 +6136,7 @@ mod tests {
             "compute buffer allocation failed (backend: Vulkan0)",
         ));
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let mut decode_progress = DecodeProgress::begin(None, 3_000, false);
+        let decode_progress = DecodeProgress::begin(None, 3_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         for slice_index in 1..=3 {
@@ -5696,7 +6148,7 @@ mod tests {
                 GgmlAsrExecutionOptions::default(),
                 GgmlAsrBackendPreference::Auto,
                 &uncancellable_execution_context_for_test(),
-                &mut decode_progress,
+                &decode_progress,
                 1_000,
                 &format!("index={slice_index}"),
                 &mut tracker,
@@ -5717,6 +6169,307 @@ mod tests {
                 GgmlAsrBackendPreference::CpuOnly,
                 GgmlAsrBackendPreference::CpuOnly,
             ]
+        );
+    }
+
+    // ---- P1 concurrent slice pipeline ----
+
+    #[test]
+    fn capacity_gate_caps_by_slice_count_and_never_returns_zero() {
+        // Plenty of memory: width is bounded only by the slice count.
+        assert_eq!(
+            slice_pipeline_capped_width(4, 2, Some(64 << 30), 1 << 20, 0),
+            2,
+            "cannot run more workers than there are slices"
+        );
+        // Tight memory: only one worker fits, and the gate floors at 1 (serial),
+        // never 0 -- it can only reduce concurrency, so it cannot OOM.
+        assert_eq!(
+            slice_pipeline_capped_width(4, 8, Some(1_200 << 20), 1 << 30, 512 << 20),
+            1,
+            "one worker's worth of head-room -> serial, never zero"
+        );
+        // Enough memory for exactly three workers.
+        assert_eq!(
+            slice_pipeline_capped_width(4, 8, Some((3 << 30) + (512 << 20)), 1 << 30, 512 << 20),
+            3
+        );
+        // No memory probe: honor the explicit opt-in (serve-batch precedent).
+        assert_eq!(
+            slice_pipeline_capped_width(3, 8, None, 1 << 30, 512 << 20),
+            3
+        );
+        // A zero per-worker estimate cannot divide; fall back to the ceiling.
+        assert_eq!(slice_pipeline_capped_width(3, 8, Some(1 << 30), 0, 0), 3);
+        // A width-1 request is always serial regardless of memory.
+        assert_eq!(
+            slice_pipeline_capped_width(1, 8, Some(64 << 30), 1 << 20, 0),
+            1
+        );
+    }
+
+    #[test]
+    fn requested_width_defaults_to_serial_and_clamps() {
+        // SAFETY: nextest runs each test in its own process, so mutating this
+        // process-global env var cannot race another test.
+        unsafe {
+            std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
+        }
+        assert_eq!(
+            slice_pipeline_requested_width(),
+            1,
+            "unset -> serial (conservative default)"
+        );
+        for (value, expected) in [
+            ("0", 1),
+            ("1", 1),
+            ("2", 2),
+            ("4", 4),
+            ("9", 4),
+            ("junk", 1),
+        ] {
+            unsafe {
+                std::env::set_var("OPENASR_SLICE_PIPELINE_WIDTH", value);
+            }
+            assert_eq!(
+                slice_pipeline_requested_width(),
+                expected,
+                "OPENASR_SLICE_PIPELINE_WIDTH={value}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
+        }
+    }
+
+    /// Deterministic executor for the concurrent-pipeline tests: echoes the
+    /// slice's audio marker (the constant its region is filled with, see
+    /// [`concurrent_pipeline_slices`]) back as its transcript text, so a test
+    /// can prove each slice's result is paired with the right slice and
+    /// assembled in slice order. Fails on a configured set of markers to
+    /// exercise error routing.
+    struct ConcurrentPipelineStubExecutor {
+        fail_markers: std::collections::BTreeSet<i32>,
+    }
+
+    impl ConcurrentPipelineStubExecutor {
+        fn echoing() -> Self {
+            Self {
+                fail_markers: std::collections::BTreeSet::new(),
+            }
+        }
+
+        fn failing_on(markers: &[i32]) -> Self {
+            Self {
+                fail_markers: markers.iter().copied().collect(),
+            }
+        }
+
+        fn marker_of(request: &GgmlAsrExecutionRequest) -> i32 {
+            request
+                .prepared_audio
+                .samples_f32
+                .first()
+                .copied()
+                .unwrap_or(0.0)
+                .round() as i32
+        }
+    }
+
+    impl GgmlAsrExecutor for ConcurrentPipelineStubExecutor {
+        fn executor_id(&self) -> &'static str {
+            "concurrent-pipeline-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            let marker = Self::marker_of(request);
+            if self.fail_markers.contains(&marker) {
+                return Err(GgmlAsrExecutionError::ExecutorFailed {
+                    executor_id: "concurrent-pipeline-stub",
+                    adapter_id: request.selected_family.adapter_id,
+                    reason: format!("stub failure marker={marker}"),
+                });
+            }
+            Ok(GgmlAsrExecutionResult {
+                transcription: Transcription {
+                    truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
+                    text: format!("w{marker}"),
+                    segments: Vec::new(),
+                    longform: None,
+                    language: None,
+                },
+                carry_context: None,
+                decode_truncation: None,
+            })
+        }
+    }
+
+    /// `count` back-to-back 1000-sample slices; slice `i`'s audio region is
+    /// filled with the constant `(i + 1)` so the stub echoes a per-slice marker.
+    fn concurrent_pipeline_slices(count: usize) -> (Vec<f32>, Vec<crate::longform::AudioSlice>) {
+        let slice_len = 1000usize;
+        let mut audio = vec![0.0f32; count * slice_len];
+        let mut slices = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = i * slice_len;
+            let end = start + slice_len;
+            for sample in &mut audio[start..end] {
+                *sample = (i + 1) as f32;
+            }
+            slices.push(crate::longform::AudioSlice {
+                index: i,
+                kind: AudioSliceKind::Fixed,
+                start_sample: start,
+                end_sample: end,
+                content_start_sample: start,
+                content_end_sample: end,
+            });
+        }
+        (audio, slices)
+    }
+
+    #[derive(Debug)]
+    struct ConcurrentPipelineOutcome {
+        assembled: Transcription,
+        ran_any_slice: bool,
+        suppressed: usize,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_concurrent_pipeline_for_test(
+        width: usize,
+        audio: &[f32],
+        slices: Vec<crate::longform::AudioSlice>,
+        executor: Arc<dyn GgmlAsrExecutor>,
+        execution_context: &Arc<crate::RequestExecutionContext>,
+        longform_options: &crate::LongFormOptions,
+        progress_id: Option<String>,
+    ) -> Result<ConcurrentPipelineOutcome, BackendError> {
+        let dir = tempfile::tempdir().unwrap();
+        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor);
+        let timeline = crate::longform::TimelineMap::identity();
+        let mut assembler =
+            TranscriptAssembler::new(timeline.clone(), SegmentMergePolicy::default());
+        let total: u64 = slices.iter().map(|s| s.duration_samples() as u64).sum();
+        let decode_progress = DecodeProgress::begin(progress_id, total, false);
+        let request_options = GgmlAsrExecutionOptions::default();
+        let mut ran_any_slice = false;
+        let mut suppressed = 0usize;
+        let mut degraded = Vec::new();
+        let mut truncated_slices = Vec::new();
+        let mut truncated_decodes = Vec::new();
+        let mut speaker_scope_starts = Vec::new();
+        run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
+            width,
+            slices,
+            plan_audio: audio,
+            timeline: &timeline,
+            dispatch: &dispatch,
+            runtime_preflight: &preflight,
+            selected_family: &family,
+            request_options: &request_options,
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context,
+            longform_options,
+            speaker_plan: SpeakerPlan::Off,
+            decode_progress: &decode_progress,
+            assembler: &mut assembler,
+            ran_any_slice: &mut ran_any_slice,
+            suppressed_slice_count: &mut suppressed,
+            degraded_slice_fallbacks: &mut degraded,
+            truncated_slices: &mut truncated_slices,
+            truncated_decodes: &mut truncated_decodes,
+            speaker_scope_starts: &mut speaker_scope_starts,
+        })?;
+        let (assembled, _stats) = assembler.into_parts();
+        Ok(ConcurrentPipelineOutcome {
+            assembled,
+            ran_any_slice,
+            suppressed,
+        })
+    }
+
+    #[test]
+    fn concurrent_pipeline_assembles_slices_in_order_and_reaches_progress_ceiling() {
+        let id = "concurrent-pipeline-ordered";
+        let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
+        let (audio, slices) = concurrent_pipeline_slices(6);
+        let outcome = run_concurrent_pipeline_for_test(
+            4,
+            &audio,
+            slices,
+            Arc::new(ConcurrentPipelineStubExecutor::echoing()),
+            &uncancellable_execution_context_for_test(),
+            &crate::LongFormOptions::default(),
+            Some(id.to_string()),
+        )
+        .expect("all slices decode successfully");
+        // Out-of-order worker completion, but each result is paired with its own
+        // slice and integrated in slice order (property 1).
+        assert_eq!(outcome.assembled.text, "w1 w2 w3 w4 w5 w6");
+        assert!(outcome.ran_any_slice);
+        assert_eq!(outcome.suppressed, 0);
+        // Progress accumulated atomically across workers and reached the decode
+        // ceiling (property 3); the registry clamp keeps it monotonic.
+        let progress = native_transcription_progress_for_id(id).expect("run published progress");
+        assert!(
+            (progress.fraction - DECODE_CEIL_NO_ALIGN).abs() < 1e-6,
+            "decode progress should reach the ceiling, got {}",
+            progress.fraction
+        );
+    }
+
+    #[test]
+    fn concurrent_pipeline_returns_the_lowest_index_worker_error_and_fails_closed() {
+        let (audio, slices) = concurrent_pipeline_slices(6);
+        // Slices with markers 2 and 4 fail; the lowest-index failure (marker 2,
+        // the second slice) is the one surfaced, matching the serial `?`.
+        let error = run_concurrent_pipeline_for_test(
+            4,
+            &audio,
+            slices,
+            Arc::new(ConcurrentPipelineStubExecutor::failing_on(&[2, 4])),
+            &uncancellable_execution_context_for_test(),
+            &crate::LongFormOptions::default(),
+            None,
+        )
+        .expect_err("a worker failure must fail the whole run closed");
+        assert!(
+            error.to_string().contains("marker=2"),
+            "the earliest (lowest-index) slice error must be returned: {error}"
+        );
+    }
+
+    #[test]
+    fn concurrent_pipeline_surfaces_cancel_without_decoding() {
+        let control = Arc::new(crate::api::backend::TranscriptionControl::new());
+        control.request_cancel();
+        let execution_context = Arc::new(crate::RequestExecutionContext::new(
+            None,
+            Arc::clone(&control),
+        ));
+        let (audio, slices) = concurrent_pipeline_slices(6);
+        let error = run_concurrent_pipeline_for_test(
+            4,
+            &audio,
+            slices,
+            Arc::new(ConcurrentPipelineStubExecutor::echoing()),
+            &execution_context,
+            &crate::LongFormOptions::default(),
+            None,
+        )
+        .expect_err("a pre-canceled run must stop at the slice-boundary gate");
+        assert!(
+            matches!(error, BackendError::TranscriptionCanceled),
+            "cancel must surface as the typed TranscriptionCanceled: {error}"
         );
     }
 }
