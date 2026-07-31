@@ -85,4 +85,18 @@ catalog_degraded: string | null,
  * the pre-0.1.25 contract, in which case a client should keep whatever
  * figure it last shipped with rather than treat the daemon as degraded.
  */
-voice_id_min_enrollment_speech_seconds: number, };
+voice_id_min_enrollment_speech_seconds: number, 
+/**
+ * The audio/video file extensions this daemon's decode pipeline
+ * recognizes as media input (`openasr_core::recognized_audio_extensions()`,
+ * lowercase, no leading dot). The single source of truth a UI's file
+ * pickers and drag-and-drop router should read instead of hand-copying a
+ * list that drifts from core -- so the desktop transcribe picker, the
+ * Voice ID enrollment picker, and the window drop router all agree with
+ * exactly what this build can decode. Not per-request state (a build
+ * constant), surfaced here because `/health` is the one contract every
+ * client already polls at startup. Additive: absent in the pre-0.1.26
+ * contract, in which case a client should fall back to the list it last
+ * shipped with rather than treat the daemon as degraded.
+ */
+recognized_audio_extensions: Array<string>, };

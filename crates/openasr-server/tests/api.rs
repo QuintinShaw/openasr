@@ -2762,14 +2762,22 @@ async fn health_returns_identity_json_without_instance_token() {
         parsed["model_resident"], true,
         "the mock backend has no runtime to unload, so it reads resident whenever bound"
     );
+    let recognized = parsed["recognized_audio_extensions"]
+        .as_array()
+        .expect("recognized_audio_extensions array");
+    assert!(
+        recognized.iter().any(|value| value == "wav"),
+        "recognized_audio_extensions mirrors core's recognized_audio_extensions() and must list wav"
+    );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        11,
+        12,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
          additive abandoned_worker_count debug field, the 0.1.16 additive \
-         catalog_degraded field, and the 0.1.25 additive \
-         voice_id_min_enrollment_speech_seconds field"
+         catalog_degraded field, the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field, and the 0.1.26 additive \
+         recognized_audio_extensions field"
     );
 }
 
@@ -2804,12 +2812,13 @@ async fn health_echoes_launch_instance_token_without_env() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        11,
+        12,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
          additive abandoned_worker_count debug field, the 0.1.16 additive \
-         catalog_degraded field, and the 0.1.25 additive \
-         voice_id_min_enrollment_speech_seconds field"
+         catalog_degraded field, the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field, and the 0.1.26 additive \
+         recognized_audio_extensions field"
     );
 }
 
@@ -2846,12 +2855,13 @@ async fn health_prefers_env_instance_token_over_launch_option() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        11,
+        12,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
          additive abandoned_worker_count debug field, the 0.1.16 additive \
-         catalog_degraded field, and the 0.1.25 additive \
-         voice_id_min_enrollment_speech_seconds field"
+         catalog_degraded field, the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field, and the 0.1.26 additive \
+         recognized_audio_extensions field"
     );
 }
 
