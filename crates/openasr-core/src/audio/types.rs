@@ -8,7 +8,9 @@ use crate::BackendKind;
 // `qta` is macOS QuickTime Player's audio recording extension -- a MOV
 // container (ffmpeg's `mov,mp4,m4a,3gp,3g2,mj2` demuxer probes and decodes it
 // like any other MOV/M4A file, no special handling needed beyond recognizing
-// the extension). `m4b` (audiobook) is the same ISO/MP4 container under a
+// the extension). `mov` itself (QuickTime movies with an audio track, e.g. a
+// screen recording) rides the exact same demuxer and needs the same nothing.
+// `m4b` (audiobook) is the same ISO/MP4 container under a
 // different extension -- symphonia's `isomp4` reader already lists it as a
 // recognized extension alongside `mp4`/`m4a` (see
 // `symphonia_format_isomp4::demuxer::IsoMp4Reader::query`), so no extra
@@ -34,8 +36,8 @@ use crate::BackendKind;
 // ffmpeg decodes both, so this only changes whether that fallback is ever
 // attempted, not whether every upload of one succeeds.
 pub(crate) const RECOGNIZED_EXTENSIONS: &[&str] = &[
-    "wav", "mp3", "mp4", "m4a", "m4b", "webm", "flac", "ogg", "opus", "qta", "aac", "aiff", "aif",
-    "aifc", "caf", "wma", "amr",
+    "wav", "mp3", "mp4", "m4a", "m4b", "mov", "webm", "flac", "ogg", "opus", "qta", "aac", "aiff",
+    "aif", "aifc", "caf", "wma", "amr",
 ];
 
 #[derive(Debug, Clone, PartialEq)]

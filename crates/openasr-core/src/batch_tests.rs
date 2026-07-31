@@ -104,8 +104,8 @@ fn no_supported_files_returns_friendly_error_with_supported_extensions() {
 
     assert!(error.contains("No supported audio or video files found in:"));
     assert!(error.contains(
-        "Supported extensions: wav, mp3, mp4, m4a, m4b, webm, flac, ogg, opus, qta, aac, aiff, \
-         aif, aifc, caf, wma, amr."
+        "Supported extensions: wav, mp3, mp4, m4a, m4b, mov, webm, flac, ogg, opus, qta, aac, \
+         aiff, aif, aifc, caf, wma, amr."
     ));
 }
 
