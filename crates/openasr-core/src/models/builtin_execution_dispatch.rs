@@ -14,6 +14,7 @@ use super::executor_component_registry::{
 };
 use super::firered_aed::executor::FireRedAedGgmlExecutor;
 use super::firered_llm::executor::FireRedLlmGgmlExecutor;
+use super::funasr_nano::executor::FunasrNanoGgmlExecutor;
 use super::ggml_asr_executor::GgmlAsrStreamingExecutor;
 use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
@@ -151,6 +152,9 @@ fn builtin_streaming_executor_for_architecture(
         }
         crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => {
             Some(Arc::new(FireRedLlmGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(FunasrNanoGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
         }
         crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => {
             Some(Arc::new(MimoAsrGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)

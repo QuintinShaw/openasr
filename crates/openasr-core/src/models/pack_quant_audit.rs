@@ -266,6 +266,12 @@ pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<Audi
         crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
             crate::models::firered_llm::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
         ),
+        // funasr-nano: SAN-M encoder (`enc.`/`tp.`) + transformer adaptor
+        // (`adaptor.`) are the audio-encoder half; the `blk.`/`token_embd`/
+        // `output*` tensors are the Qwen3 decoder (LLM), not an audio encoder.
+        crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::funasr_nano::tensor_names::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
         crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
             crate::models::moss_transcribe_diarize::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
         ),

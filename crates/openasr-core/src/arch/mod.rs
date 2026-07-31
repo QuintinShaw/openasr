@@ -22,8 +22,9 @@ use block_stack::{
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
-    FIRERED_LLM_HPARAM_SCHEMA, GRANITE_SPEECH_HPARAM_SCHEMA, MIMO_ASR_HPARAM_SCHEMA,
-    MOONSHINE_HPARAM_SCHEMA, MOSS_TD_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
+    FIRERED_LLM_HPARAM_SCHEMA, FUNASR_NANO_HPARAM_SCHEMA, GRANITE_SPEECH_HPARAM_SCHEMA,
+    MIMO_ASR_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA, MOSS_TD_HPARAM_SCHEMA,
+    PARAKEET_CTC_HPARAM_SCHEMA,
     PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
     QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA,
     WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
@@ -172,6 +173,22 @@ pub(crate) const FIRERED_LLM_TOKENIZER_ID: &str = "firered-llm.qwen2-bpe.v0";
 pub(crate) const FIRERED_LLM_DECODE_POLICY_ID: &str = "firered-llm.greedy.seq2seq.v0";
 pub(crate) const FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID: &str = "firered-llm.runtime-tensors.v0";
 pub(crate) const FIRERED_LLM_EXECUTOR_COMPONENT_ID: &str = "firered-llm.ggml-executor.v0";
+
+// funasr-nano (FunAudioLLM/Fun-ASR-Nano-2512: a FunASR SAN-M/DFSMN audio encoder
+// (50 enc + 20 tp blocks, LayerNorm eps 1e-5) + a 2-layer transformer adaptor
+// (512->2048->1024 MLP + 2 standard transformer blocks) + a stock Qwen3-0.6B
+// decoder (QK-norm, no attention bias, GQA, tied embeddings), Apache-2.0). The
+// release checkpoint carries no CTC decoder (a training-only branch), so decode
+// runs on a hand-written dedicated executor (block_stack: None) -- registered in
+// `BUILTIN_COMPONENT_DESCRIPTORS` / `BUILTIN_ARCHITECTURE_DESCRIPTORS` below.
+pub(crate) const FUNASR_NANO_GGML_ARCHITECTURE_ID: &str = "funasr-nano-sanm-adapter-qwen3";
+pub(crate) const FUNASR_NANO_GGML_ADAPTER_ID: &str = "ggml-family-funasr-nano-runtime-v1";
+pub(crate) const FUNASR_NANO_MODEL_FAMILY: &str = "funasr-nano";
+pub(crate) const FUNASR_NANO_AUDIO_FRONTEND_ID: &str = "funasr-nano.fbank80-lfr.16khz.mono.v0";
+pub(crate) const FUNASR_NANO_TOKENIZER_ID: &str = "funasr-nano.qwen3-bpe.v0";
+pub(crate) const FUNASR_NANO_DECODE_POLICY_ID: &str = "funasr-nano.greedy.seq2seq.v0";
+pub(crate) const FUNASR_NANO_RUNTIME_TENSOR_CONTRACT_ID: &str = "funasr-nano.runtime-tensors.v0";
+pub(crate) const FUNASR_NANO_EXECUTOR_COMPONENT_ID: &str = "funasr-nano.ggml-executor.v0";
 
 // mimo-asr (XiaomiMiMo/MiMo-V2.5-ASR + XiaomiMiMo/MiMo-Audio-Tokenizer: a 32L
 // rope audio-tokenizer encoder + RVQ encode + 6L bidirectional input-local
@@ -1286,6 +1303,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
     },
     OpenAsrComponentDescriptor {
         kind: OpenAsrComponentKind::AudioFrontend,
+        id: FUNASR_NANO_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: FUNASR_NANO_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: FUNASR_NANO_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: FUNASR_NANO_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: FUNASR_NANO_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
         id: MIMO_ASR_AUDIO_FRONTEND_ID,
     },
     OpenAsrComponentDescriptor {
@@ -2033,6 +2070,63 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
     },
     OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[FUNASR_NANO_GGML_ARCHITECTURE_ID, "funasr-nano"],
+        model_family: FUNASR_NANO_MODEL_FAMILY,
+        model_architecture: FUNASR_NANO_GGML_ARCHITECTURE_ID,
+        adapter_id: FUNASR_NANO_GGML_ADAPTER_ID,
+        // No language-selection prompt token and no decode-time detection: the
+        // stock Qwen3 BPE vocab covers Mandarin + English (Fun-ASR-Nano's
+        // trained ASR languages).
+        language_family_hint: LanguageFamilyHint::FixedMultilingual {
+            languages: &["zh", "en"],
+        },
+        audio_frontend_id: FUNASR_NANO_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: FUNASR_NANO_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: FUNASR_NANO_TOKENIZER_ID,
+        decode_policy_id: FUNASR_NANO_DECODE_POLICY_ID,
+        executor_component_id: FUNASR_NANO_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "funasr-nano",
+            supports_phrase_bias: false,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::ExternalTooling {
+                relative_path: "tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py",
+            },
+            reference_dumper_source: Some(
+                "tooling/publish-model/scripts/funasr_nano_reference_oracle.py",
+            ),
+        },
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
+        // GQA Qwen3 decoder whose prompt carries the adapted audio tokens, so
+        // the decoder KV context bounds audio length -- fully derivable from
+        // pack metadata (funasr.llm.n_layers / n_kv_heads / head_dim /
+        // max_positions are all required keys).
+        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
+            audio_bound: CapacityAudioBound::DecoderContext,
+        }),
+        // The stock Qwen3 ChatML decode emits ordinary punctuation, but no
+        // punctuation-suppression behavior has been separately characterized;
+        // leave unclaimed rather than assert a capability beyond the two golden
+        // clips.
+        emits_punctuation: None,
+        hparam_schema: FUNASR_NANO_HPARAM_SCHEMA,
+        // SAN-M encoder + Qwen3 decoder-only decode both stay on the dedicated
+        // executor (neither shape is a composer block kind), so no data-driven
+        // block-stack descriptor.
+        block_stack: None,
+        // SAN-M encoder is full self-attention over the whole chunk (quadratic
+        // in chunk length), plus the upstream's own ~40s HARD cap
+        // (`FunasrNanoGgmlExecutor` fails closed above it). 30s stays under both.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+        },
+    },
+    OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &[MIMO_ASR_GGML_ARCHITECTURE_ID],
         model_family: MIMO_ASR_MODEL_FAMILY,
         model_architecture: MIMO_ASR_GGML_ARCHITECTURE_ID,
@@ -2383,6 +2477,11 @@ mod tests {
                 None,
             ),
             (
+                FUNASR_NANO_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
                 MIMO_ASR_GGML_ARCHITECTURE_ID,
                 SpeakerSegmentationSource::External,
                 None,
@@ -2572,6 +2671,10 @@ mod tests {
                 derived(CapacityAudioBound::DecoderContext),
             ),
             (
+                FUNASR_NANO_GGML_ARCHITECTURE_ID,
+                derived(CapacityAudioBound::DecoderContext),
+            ),
+            (
                 MIMO_ASR_GGML_ARCHITECTURE_ID,
                 derived(CapacityAudioBound::DecoderContext),
             ),
@@ -2638,12 +2741,14 @@ mod tests {
                 );
             }
         }
-        // Guards the walk: the design review's taxonomy derives exactly five
-        // builtin families; a rename that stops matching would otherwise make
-        // this test vacuously pass.
+        // Guards the walk: the design review's taxonomy derives exactly six
+        // builtin families (qwen3-asr, cohere, firered-llm, mimo-asr,
+        // funasr-nano -- all DecoderContext-bound -- plus any future addition);
+        // a rename that stops matching would otherwise make this test vacuously
+        // pass.
         assert_eq!(
-            derived_count, 5,
-            "expected exactly five Derived builtin families"
+            derived_count, 6,
+            "expected exactly six Derived builtin families"
         );
     }
 
@@ -2700,6 +2805,7 @@ mod tests {
             (SENSEVOICE_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (FUNASR_NANO_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (MIMO_ASR_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             // Post-#212 quiet-window A/B: true accelerated Metal is faster
             // than CPU; Auto may select Metal (see descriptor note).
@@ -2857,6 +2963,12 @@ mod tests {
             ),
             (
                 FIRERED_LLM_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                },
+            ),
+            (
+                FUNASR_NANO_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                     max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },

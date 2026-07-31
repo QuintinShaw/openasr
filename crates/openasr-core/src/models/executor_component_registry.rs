@@ -8,8 +8,9 @@ use thiserror::Error;
 use crate::arch::{
     COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID, DOLPHIN_EXECUTOR_COMPONENT_ID,
     FIRERED_AED_EXECUTOR_COMPONENT_ID, FIRERED_LLM_EXECUTOR_COMPONENT_ID,
-    GRANITE_SPEECH_EXECUTOR_COMPONENT_ID, MIMO_ASR_EXECUTOR_COMPONENT_ID,
-    MOONSHINE_EXECUTOR_COMPONENT_ID, MOSS_TD_EXECUTOR_COMPONENT_ID, OpenAsrArchitectureRegistry,
+    FUNASR_NANO_EXECUTOR_COMPONENT_ID, GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
+    MIMO_ASR_EXECUTOR_COMPONENT_ID, MOONSHINE_EXECUTOR_COMPONENT_ID,
+    MOSS_TD_EXECUTOR_COMPONENT_ID, OpenAsrArchitectureRegistry,
     PARAKEET_CTC_EXECUTOR_COMPONENT_ID, PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
     QWEN3_ASR_EXECUTOR_COMPONENT_ID, SENSEVOICE_EXECUTOR_COMPONENT_ID,
     WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID, WHISPER_EXECUTOR_COMPONENT_ID,
@@ -20,6 +21,7 @@ use super::cohere::CohereTranscribeGgmlExecutor;
 use super::dolphin::executor::DolphinGgmlExecutor;
 use super::firered_aed::executor::FireRedAedGgmlExecutor;
 use super::firered_llm::executor::FireRedLlmGgmlExecutor;
+use super::funasr_nano::executor::FunasrNanoGgmlExecutor;
 use super::ggml_asr_executor::GgmlAsrExecutor;
 use super::granite_speech::executor::GraniteSpeechGgmlExecutor;
 use super::mimo_asr::executor::MimoAsrGgmlExecutor;
@@ -100,6 +102,7 @@ fn materialize_builtin_executor_component(
         SENSEVOICE_EXECUTOR_COMPONENT_ID => Some(Arc::new(SenseVoiceGgmlExecutor)),
         FIRERED_AED_EXECUTOR_COMPONENT_ID => Some(Arc::new(FireRedAedGgmlExecutor)),
         FIRERED_LLM_EXECUTOR_COMPONENT_ID => Some(Arc::new(FireRedLlmGgmlExecutor)),
+        FUNASR_NANO_EXECUTOR_COMPONENT_ID => Some(Arc::new(FunasrNanoGgmlExecutor)),
         MIMO_ASR_EXECUTOR_COMPONENT_ID => Some(Arc::new(MimoAsrGgmlExecutor)),
         MOSS_TD_EXECUTOR_COMPONENT_ID => Some(Arc::new(MossTdGgmlExecutor)),
         GRANITE_SPEECH_EXECUTOR_COMPONENT_ID => Some(Arc::new(GraniteSpeechGgmlExecutor)),

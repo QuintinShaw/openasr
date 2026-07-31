@@ -17,6 +17,7 @@ pub(crate) mod firered_llm;
 pub(crate) mod firered_punc;
 pub(crate) mod frame_sync_streaming_driver;
 pub(crate) mod frontend_component_registry;
+pub(crate) mod funasr_nano;
 pub mod ggml_asr_executor;
 pub(crate) mod ggml_composed_executor;
 pub mod ggml_family_adapter;

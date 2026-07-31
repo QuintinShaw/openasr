@@ -234,6 +234,15 @@ const FRONTEND_CAPACITY_REGISTRY: &[(&str, AudioFrontendCapacityBasis)] = &[
         },
     ),
     (
+        crate::arch::FUNASR_NANO_AUDIO_FRONTEND_ID,
+        AudioFrontendCapacityBasis::PackCarried {
+            provenance: "fbank+LFR frontend geometry (16kHz/160-hop 80-mel, LFR m=7/n=6) is a \
+                         FunASR architecture constant; the encoder feature dim and adaptor \
+                         downsample (1) are required pack metadata (funasr.enc.feature_dim / \
+                         funasr.adp.*), fail-closed at import",
+        },
+    ),
+    (
         crate::arch::MIMO_ASR_AUDIO_FRONTEND_ID,
         AudioFrontendCapacityBasis::PackCarried {
             provenance: "mel sample_rate/hop (mimo.mel.*) and tokenizer conv strides \

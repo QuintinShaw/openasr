@@ -292,6 +292,13 @@ pub fn firered_llm_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
         .ggml_family_adapter_descriptor()
 }
 
+pub fn funasr_nano_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID)
+        .expect("builtin funasr-nano architecture must exist")
+        .ggml_family_adapter_descriptor()
+}
+
 pub fn mimo_asr_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID)

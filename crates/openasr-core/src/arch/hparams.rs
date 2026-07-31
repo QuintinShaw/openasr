@@ -243,6 +243,34 @@ pub(crate) static FIRERED_LLM_HPARAM_SCHEMA: &[&str] = &[
     "firered_llm.llm.speech_token_id",
 ];
 
+// ── funasr-nano (FunAudioLLM/Fun-ASR-Nano-2512, SAN-M+Adapter+Qwen3) ─────────
+// Keys mirror `models::funasr_nano::runtime_contract`'s three parsers.
+pub(crate) static FUNASR_NANO_HPARAM_SCHEMA: &[&str] = &[
+    "funasr.enc.n_layers",
+    "funasr.enc.tp_blocks",
+    "funasr.enc.d_model",
+    "funasr.enc.n_heads",
+    "funasr.enc.head_dim",
+    "funasr.enc.ffn_dim",
+    "funasr.enc.fsmn_kernel",
+    "funasr.enc.feature_dim",
+    "funasr.adp.n_layers",
+    "funasr.adp.n_heads",
+    "funasr.adp.encoder_dim",
+    "funasr.adp.llm_dim",
+    "funasr.llm.n_layers",
+    "funasr.llm.d_model",
+    "funasr.llm.n_heads",
+    "funasr.llm.n_kv_heads",
+    "funasr.llm.head_dim",
+    "funasr.llm.ffn_dim",
+    "funasr.llm.vocab_size",
+    "funasr.llm.max_positions",
+    "funasr.llm.chatml_im_start_token_id",
+    "funasr.llm.chatml_im_end_token_id",
+    "funasr.llm.endoftext_token_id",
+];
+
 // Keys mirror `models::moss_transcribe_diarize::runtime_contract`'s three
 // parsers.
 pub(crate) static MOSS_TD_HPARAM_SCHEMA: &[&str] = &[

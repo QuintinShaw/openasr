@@ -986,6 +986,29 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                 )
             })
         }
+        crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID => {
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_encoder_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .and_then(|()| {
+                crate::models::funasr_nano::runtime_contract::parse_funasr_nano_adapter_metadata(
+                    &metadata,
+                )
+                .map(|_| ())
+            })
+            .and_then(|()| {
+                crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(
+                    &metadata,
+                )
+                .map(|_| ())
+            })
+            .map_err(|error| {
+                format!(
+                    "funasr-nano runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
         crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => {
             crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(&metadata)
                 .map(|_| ())

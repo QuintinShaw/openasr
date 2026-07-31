@@ -72,6 +72,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     SenseVoice,
     FireRedAed,
     FireRedLlm,
+    FunasrNano,
     MimoAsr,
     MossTd,
     GraniteSpeech,
@@ -88,6 +89,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::SenseVoice => "sensevoice",
             Self::FireRedAed => "firered-aed",
             Self::FireRedLlm => "firered-llm",
+            Self::FunasrNano => "funasr-nano",
             Self::MimoAsr => "mimo-asr",
             Self::MossTd => "moss-transcribe-diarize",
             Self::GraniteSpeech => "granite-speech",
@@ -257,6 +259,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         crate::arch::FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::FireRedLlm)
+        }
+        crate::arch::FUNASR_NANO_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::FunasrNano)
         }
         crate::arch::MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::MimoAsr)

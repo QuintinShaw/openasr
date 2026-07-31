@@ -227,6 +227,28 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
     },
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as
+        // firered-aed above): funasr-nano has no crate-root re-export. The eot
+        // token (ChatML `<|im_end|>`) is supplied per-request via
+        // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; the audio
+        // placeholder tokens only ever appear in the PROMPT (spliced in by the
+        // executor), never emitted by the LLM, so there is nothing else to
+        // strip -- Identity postprocess, same shape as firered-llm/moss.
+        decode_policy_id: crate::arch::FUNASR_NANO_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // Upstream ~40s hard cap means every chunk is a short, fresh ChatML
+        // turn -- the conservative longform profile is the structural fix for
+        // the #60 long-audio repetition failure mode, same reasoning as
+        // firered-llm/mimo-asr.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch` (same staging precedent as
         // firered-aed above): mimo-asr has no crate-root re-export.
         decode_policy_id: crate::arch::MIMO_ASR_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
