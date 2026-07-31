@@ -608,8 +608,11 @@ async fn parse_source_audio_multipart(
     }
     let source = source
         .ok_or_else(|| ApiError::BadRequest("Missing required form field: source_audio".into()))?;
-    let intervals = intervals
-        .ok_or_else(|| ApiError::BadRequest("Missing required form field: intervals".into()))?;
+    // `intervals` is optional: an omitted or empty selection means "enroll from
+    // the whole decoded source", the same clip semantics the wav-only
+    // enrollment path uses for an entire recording. A caller that wants a
+    // subset still sends explicit, validated ranges.
+    let intervals = intervals.unwrap_or_default();
     Ok((
         display_name,
         openasr_core::diarize::voice_id::ConsentRecord {
@@ -643,9 +646,6 @@ async fn extract_source_intervals(
     source: &UploadedVoiceIdSource,
     intervals: &[SourceInterval],
 ) -> Result<Vec<f32>, ApiError> {
-    if intervals.is_empty() {
-        return Err(ApiError::BadRequest("intervals must not be empty".into()));
-    }
     let source_path = source.path.to_path_buf();
     let intervals = intervals.to_vec();
     let backend = runtime.backend;
@@ -691,6 +691,13 @@ fn decode_and_slice_source_intervals(
         )
         .map_err(|error| ApiError::BadRequest(error.to_string()))?,
     };
+    // No interval selection means "use the whole decoded source" -- return it
+    // as-is (no per-clip fade), matching how the wav enrollment path hands the
+    // entire recording to the embedder. The too-short/quality floors are
+    // enforced downstream in the voice-id service, so this stays a pure slice.
+    if intervals.is_empty() {
+        return Ok(decoded);
+    }
     let duration = decoded.len() as f32 / 16_000.0;
     let mut output = Vec::new();
     let mut previous_end = 0.0_f32;
@@ -1336,6 +1343,30 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// Empty intervals mean "enroll from the whole decoded source": the
+    /// aggregator must return every decoded sample (here the full 1.0 s /
+    /// 16 000-sample `pcm16_wav`), not reject the request, so a client that has
+    /// no way to probe a non-wav clip's duration can still register it end to
+    /// end by simply omitting the selection.
+    #[tokio::test]
+    async fn source_audio_empty_intervals_use_the_whole_decoded_source() {
+        use std::io::Write;
+
+        let mut file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        file.write_all(&pcm16_wav()).unwrap();
+        let source = super::UploadedVoiceIdSource {
+            path: file.into_temp_path(),
+            fingerprint: super::UploadedWavFingerprint {
+                sha256: "test".into(),
+                bytes: 0,
+            },
+        };
+        let clips = super::extract_source_intervals(&native_test_runtime(), &source, &[])
+            .await
+            .expect("empty intervals must enroll from the whole decoded source");
+        assert_eq!(clips.len(), 16_000);
     }
 
     /// Builds and parses a `/v1/voice-id/persons/from-audio`-style multipart
