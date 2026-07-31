@@ -297,22 +297,34 @@ fn build_firered_decoder_arena_state(
     // skips fully `-inf`-masked KV blocks, but the partially masked boundary
     // block is still computed lane-by-lane, and `NaN + (-inf)` poisons the
     // softmax. Same convention as `allocate_zeroed_llm_resident_kv_arena`
-    // (the all-zero f16 bit pattern is 0.0). The rebuild-per-step path views
-    // only written rows, so this is invisible to it.
-    let self_kv_tensor_bytes = metadata
-        .head_dim
-        .checked_mul(metadata.decoder_pe_len)
-        .and_then(|value| value.checked_mul(metadata.n_heads))
-        .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
-        .ok_or(FireRedDecoderError::ShapeOverflow)?;
-    let self_kv_zero = vec![0_u8; self_kv_tensor_bytes];
-    for self_kv in &self_kv_layers {
-        arena
-            .set_bytes_slice(self_kv.key, &self_kv_zero, "firered_dec_self_k")
-            .map_err(|source| map_err("self_k_zero_fill", source))?;
-        arena
-            .set_bytes_slice(self_kv.value, &self_kv_zero, "firered_dec_self_v")
-            .map_err(|source| map_err("self_v_zero_fill", source))?;
+    // (the all-zero f16 bit pattern is 0.0).
+    //
+    // Gated to runners where the reusable decode graph can actually activate
+    // (`reusable_decode_graph_supported_for_runner` is a pure function of the
+    // runner's backend + scheduler config, fixed for the runner's lifetime):
+    // the rebuild-per-step path views only written rows, so on CPU /
+    // scheduler-on runners no unwritten row is ever read and the fill is pure
+    // waste -- worse than waste, actually, because touching every byte of the
+    // full `decoder_pe_len`-span cache commits all of its pages up front
+    // (hundreds of MB of peak RSS) where the untouched malloc'd CPU arena
+    // pages would otherwise stay uncommitted until the decode actually wrote
+    // them.
+    if reusable_decode_graph_supported_for_runner(runner) {
+        let self_kv_tensor_bytes = metadata
+            .head_dim
+            .checked_mul(metadata.decoder_pe_len)
+            .and_then(|value| value.checked_mul(metadata.n_heads))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or(FireRedDecoderError::ShapeOverflow)?;
+        let self_kv_zero = vec![0_u8; self_kv_tensor_bytes];
+        for self_kv in &self_kv_layers {
+            arena
+                .set_bytes_slice(self_kv.key, &self_kv_zero, "firered_dec_self_k")
+                .map_err(|source| map_err("self_k_zero_fill", source))?;
+            arena
+                .set_bytes_slice(self_kv.value, &self_kv_zero, "firered_dec_self_v")
+                .map_err(|source| map_err("self_v_zero_fill", source))?;
+        }
     }
 
     Ok(FireRedDecoderArenaState {
