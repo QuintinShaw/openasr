@@ -14,11 +14,16 @@
 //! Built on the shared incremental seq2seq decoder block
 //! ([`crate::nn::decoder::seq2seq_layer`]): pre-norm causal self-attention
 //! with an f16 KV cache, pre-norm cross-attention over cross-KV precomputed
-//! once from the encoder output, and a GELU feed-forward. Rebuilds a fresh
-//! graph every decode step regardless of backend (see [`super::graph_config`]
-//! for the dynamic CPU/Metal backend selection -- unlike cohere's serve-batch
-//! path, this never reuses a fixed-span-KV graph across tokens, so it carries
-//! none of the reused-graph caveats that motivate CPU-only fallback there).
+//! once from the encoder output, and a GELU feed-forward. On the
+//! single-backend GPU path (`nn::decoder::reusable_decode_graph_supported`:
+//! GPU-class backend, scheduler off -- the Metal default, see
+//! [`super::graph_config`]) the single-token incremental step runs through a
+//! build-once/re-run [`Seq2SeqReusableDecodeGraph`] (fixed-span self-KV via
+//! `set_rows` + an externally-uploaded attention mask, the cohere/moonshine
+//! pattern), eliminating the per-token graph rebuild; prefill and every CPU
+//! (or scheduler-on) step keep the rebuild-per-step path, which stays the
+//! correctness baseline (CPU direct execution mis-recomputes reused graphs
+//! with in-place KV writes -- a ggml-level limit, not a firered one).
 
 #![allow(dead_code)]
 
@@ -40,7 +45,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::nn::decoder::{
     CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights,
-    build_causal_mask_f16_bits, seq2seq_layer,
+    Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
+    reusable_decode_graph_supported_for_runner, seq2seq_layer,
 };
 use crate::nn::ffn::FeedForwardActivation;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -171,10 +177,19 @@ struct FireRedDecoderSelfKvLayer {
 /// `cross_frame_count` (actual, current-utterance) columns of the current
 /// capacity on every call.
 pub(crate) struct FireRedDecoderGraphRuntime {
+    // `reuse` holds raw pointers into `runner`, `arena`, and the weight
+    // context, so it must be declared first and dropped first (same drop-order
+    // contract as cohere's decoder runtime).
+    reuse: Option<Seq2SeqReusableDecodeGraph>,
     runner: GgmlCpuGraphRunner,
     _loaded: GgmlLoadedWeightContext,
     weights: FireRedDecoderWeights,
     metadata: FireRedAedExecutionMetadata,
+    /// The `no_alloc` metadata context size used for `runner`'s own graph
+    /// context; reused verbatim for `start_persistent_graph_session` in
+    /// [`Self::build_reusable_decode_graph`] so it does not have to be
+    /// recomputed from a hardcoded constant.
+    persistent_graph_context_bytes: usize,
     arena: GgmlStaticTensorArena,
     /// Shared zero bias for the two bias-free K projections (self-attn and
     /// cross-attn `w_ks`), length `d_model`.
@@ -191,6 +206,14 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     /// [`Self::compute_step_logits`]'s cross-attention view. `0` before the
     /// first populate call.
     cross_frame_count: usize,
+    /// The cross-frame-count [`Self::reuse`]'s persistent graph was last
+    /// built for (0 if never built). `compute_reused_incremental_step_logits`
+    /// compares this against the current [`Self::cross_frame_count`] and
+    /// rebuilds the (cheap, metadata-only) reusable graph whenever a
+    /// differently-sized chunk swaps in, since
+    /// [`Self::build_reusable_decode_graph`] bakes the cross-attention view's
+    /// frame count into the persistent graph's topology at build time.
+    reuse_cross_frame_count: usize,
     cached_positions: usize,
 }
 
@@ -268,6 +291,30 @@ fn build_firered_decoder_arena_state(
         )
         .map_err(|source| map_err("zero_bias_upload", source))?;
 
+    // Zero-fill the persistent self-KV tensors so the fixed-span reusable
+    // decode graph's masked (not-yet-written) rows never feed uninitialized
+    // f16 bit patterns (potentially NaN) into flash attention: the kernel
+    // skips fully `-inf`-masked KV blocks, but the partially masked boundary
+    // block is still computed lane-by-lane, and `NaN + (-inf)` poisons the
+    // softmax. Same convention as `allocate_zeroed_llm_resident_kv_arena`
+    // (the all-zero f16 bit pattern is 0.0). The rebuild-per-step path views
+    // only written rows, so this is invisible to it.
+    let self_kv_tensor_bytes = metadata
+        .head_dim
+        .checked_mul(metadata.decoder_pe_len)
+        .and_then(|value| value.checked_mul(metadata.n_heads))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
+        .ok_or(FireRedDecoderError::ShapeOverflow)?;
+    let self_kv_zero = vec![0_u8; self_kv_tensor_bytes];
+    for self_kv in &self_kv_layers {
+        arena
+            .set_bytes_slice(self_kv.key, &self_kv_zero, "firered_dec_self_k")
+            .map_err(|source| map_err("self_k_zero_fill", source))?;
+        arena
+            .set_bytes_slice(self_kv.value, &self_kv_zero, "firered_dec_self_v")
+            .map_err(|source| map_err("self_v_zero_fill", source))?;
+    }
+
     Ok(FireRedDecoderArenaState {
         arena,
         zero_bias,
@@ -283,8 +330,10 @@ impl FireRedDecoderGraphRuntime {
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedDecoderError> {
         let cross_capacity_frames = firered_decoder_cross_capacity_frames(&metadata);
-        let runner = GgmlCpuGraphRunner::new(firered_decoder_graph_config(backend))
-            .map_err(|source| map_err("runner_init", source))?;
+        let config = firered_decoder_graph_config(backend);
+        let persistent_graph_context_bytes = config.context_bytes;
+        let runner =
+            GgmlCpuGraphRunner::new(config).map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
             .load_gguf_weight_context(runtime_source)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
@@ -293,16 +342,19 @@ impl FireRedDecoderGraphRuntime {
             build_firered_decoder_arena_state(&runner, &metadata, cross_capacity_frames)?;
 
         Ok(Self {
+            reuse: None,
             runner,
             _loaded: loaded,
             weights,
             metadata,
+            persistent_graph_context_bytes,
             arena: arena_state.arena,
             zero_bias: arena_state.zero_bias,
             cross_layers: arena_state.cross_layers,
             self_kv_layers: arena_state.self_kv_layers,
             cross_capacity_frames,
             cross_frame_count: 0,
+            reuse_cross_frame_count: 0,
             cached_positions: 0,
         })
     }
@@ -336,6 +388,14 @@ impl FireRedDecoderGraphRuntime {
             .min(max_frames);
         let arena_state =
             build_firered_decoder_arena_state(&self.runner, &self.metadata, new_capacity)?;
+        // The persistent reuse graph holds raw pointers into the OLD arena's
+        // cross-KV/self-KV tensors, which this call is about to free -- the
+        // `reuse_cross_frame_count` mismatch-triggered rebuild alone is not
+        // enough (that logic assumes the arena itself is stable), so drop it
+        // unconditionally and let the next reusable step rebuild against the
+        // new arena instead of dereferencing freed memory.
+        self.reuse = None;
+        self.reuse_cross_frame_count = 0;
         self.arena = arena_state.arena;
         self.zero_bias = arena_state.zero_bias;
         self.cross_layers = arena_state.cross_layers;
@@ -470,10 +530,40 @@ impl FireRedDecoderGraphRuntime {
     /// Compute logits for the next token given the full token prefix so far
     /// (prompt + already-generated tokens). Incremental: after the first call
     /// (which may prefill more than one token), every subsequent call must
-    /// append exactly one new token.
+    /// append exactly one new token. On the single-backend GPU path a
+    /// single-token incremental step runs through the build-once/re-run
+    /// reusable decode graph ([`Self::compute_reused_incremental_step_logits`]);
+    /// everywhere else (prefill, CPU, scheduler-on) it rebuilds a fresh graph.
     pub(crate) fn compute_step_logits(
         &mut self,
         decoder_tokens: &[u32],
+    ) -> Result<Vec<f32>, FireRedDecoderError> {
+        self.compute_step_logits_impl(decoder_tokens, true)
+    }
+
+    /// Test-only bypass of the reusable-graph dispatch: always rebuild a
+    /// fresh graph for this step, so the reused-vs-rebuilt byte-identity test
+    /// can drive both paths on the same backend against the same inputs.
+    #[cfg(test)]
+    pub(crate) fn compute_step_logits_forcing_fresh_graph(
+        &mut self,
+        decoder_tokens: &[u32],
+    ) -> Result<Vec<f32>, FireRedDecoderError> {
+        self.compute_step_logits_impl(decoder_tokens, false)
+    }
+
+    /// Whether this step went (or will go) through the reusable decode graph
+    /// -- exposed so tests can assert the reuse path is actually live rather
+    /// than silently falling back to the rebuild path.
+    #[cfg(test)]
+    pub(crate) fn has_active_reuse_graph(&self) -> bool {
+        self.reuse.is_some()
+    }
+
+    fn compute_step_logits_impl(
+        &mut self,
+        decoder_tokens: &[u32],
+        allow_reuse: bool,
     ) -> Result<Vec<f32>, FireRedDecoderError> {
         let total_prefix_tokens = decoder_tokens.len();
         if total_prefix_tokens == 0 {
@@ -509,6 +599,13 @@ impl FireRedDecoderGraphRuntime {
         let total_token_count = position_offset
             .checked_add(token_count)
             .ok_or(FireRedDecoderError::ShapeOverflow)?;
+        if allow_reuse
+            && position_offset > 0
+            && token_count == 1
+            && self.supports_reusable_decode_graph()
+        {
+            return self.compute_reused_incremental_step_logits(decode_tokens[0], position_offset);
+        }
         let d_model = self.metadata.d_model;
         let heads = self.metadata.n_heads;
         let head_dim = self.metadata.head_dim;
@@ -697,6 +794,267 @@ impl FireRedDecoderGraphRuntime {
             })?;
         self.cached_positions = total_token_count;
         Ok(output)
+    }
+
+    /// Reused decode graphs with in-place resident KV are only correct on the
+    /// single-backend GPU path (see `nn::decoder::reusable_decode_graph_supported`);
+    /// everywhere else the rebuild-per-step path above stays authoritative.
+    fn supports_reusable_decode_graph(&self) -> bool {
+        reusable_decode_graph_supported_for_runner(&self.runner)
+    }
+
+    /// Single-token incremental step through the build-once/re-run persistent
+    /// graph: refresh the token/row/position inputs and the fixed-span
+    /// attention mask, then recompute -- no graph construction, no
+    /// reallocation (the cohere/moonshine reuse pattern). Must produce
+    /// byte-identical logits to the rebuild path for the same step; the
+    /// masked (`-inf`) tail of the fixed `decoder_pe_len`-span self-KV view
+    /// contributes exactly zero attention weight, and the underlying
+    /// arithmetic per valid position is unchanged.
+    fn compute_reused_incremental_step_logits(
+        &mut self,
+        token_id: u32,
+        position: usize,
+    ) -> Result<Vec<f32>, FireRedDecoderError> {
+        let max_positions = self.metadata.decoder_pe_len;
+        if position >= max_positions {
+            return Err(FireRedDecoderError::InvalidInput {
+                reason: format!("decoder position {position} exceeds max context {max_positions}"),
+            });
+        }
+        let token_id_i32 =
+            i32::try_from(token_id).map_err(|_| FireRedDecoderError::InvalidInput {
+                reason: format!("token id {token_id} does not fit i32"),
+            })?;
+        let position_i32 =
+            i32::try_from(position).map_err(|_| FireRedDecoderError::InvalidInput {
+                reason: format!("decoder position {position} does not fit i32"),
+            })?;
+        let total_tokens = position
+            .checked_add(1)
+            .ok_or(FireRedDecoderError::ShapeOverflow)?;
+        // A cross-frame-count change also forces a rebuild:
+        // `build_reusable_decode_graph` bakes the current `cross_frame_count`
+        // into the persistent graph's cross-attention view topology, so a
+        // graph built for a different (earlier) chunk's frame count would
+        // silently attend over the wrong span for this one.
+        let needs_build = self
+            .reuse
+            .as_ref()
+            .map(|reuse| {
+                reuse.is_poisoned()
+                    || reuse.max_positions != max_positions
+                    || reuse.n_seq != 1
+                    || self.reuse_cross_frame_count != self.cross_frame_count
+            })
+            .unwrap_or(true);
+        if needs_build {
+            self.build_reusable_decode_graph()?;
+        }
+
+        let reuse = self
+            .reuse
+            .as_mut()
+            .expect("firered reusable decode graph built above");
+        let token_tensor = reuse.token_id;
+        let row_index = reuse.row_index;
+        let position_tensor = reuse.position;
+        let attention_mask = reuse.attention_mask;
+        let logits = reuse.logits;
+        let graph = reuse.builder();
+
+        graph
+            .set_i32_slice(token_tensor, &[token_id_i32], "firered_reuse_token")
+            .map_err(|source| map_err("reuse_token_upload", source))?;
+        graph
+            .set_i32_slice(row_index, &[position_i32], "firered_reuse_row")
+            .map_err(|source| map_err("reuse_row_upload", source))?;
+        graph
+            .set_i32_slice(position_tensor, &[position_i32], "firered_reuse_position")
+            .map_err(|source| map_err("reuse_position_upload", source))?;
+        let mask_bits = build_fixed_kv_attention_mask_bits(max_positions, total_tokens)
+            .map_err(|source| map_err("reuse_self_mask", source))?;
+        graph
+            .set_f16_bits_slice(attention_mask, &mask_bits, "firered_reuse_self_mask")
+            .map_err(|source| map_err("reuse_self_mask_upload", source))?;
+
+        let output = graph
+            .compute_output_f32(logits, self.metadata.vocab_size)
+            .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
+                reason: error.to_string(),
+            })?;
+        self.cached_positions = total_tokens;
+        Ok(output)
+    }
+
+    /// Build the persistent single-token decode graph: the same op sequence as
+    /// one `token_count == 1` step of the rebuild path, except the self-KV
+    /// write goes through `set_rows` on a runtime row-index input (so the
+    /// write slot can move per step without rebuilding) and self-attention
+    /// reads the full fixed `decoder_pe_len` span under an externally-uploaded
+    /// `-inf` tail mask (so the graph shape is constant across steps). The
+    /// current `cross_frame_count` is baked into the cross-attention views;
+    /// `compute_reused_incremental_step_logits` rebuilds on mismatch.
+    fn build_reusable_decode_graph(&mut self) -> Result<(), FireRedDecoderError> {
+        let d_model = self.metadata.d_model;
+        let heads = self.metadata.n_heads;
+        let head_dim = self.metadata.head_dim;
+        let max_positions = self.metadata.decoder_pe_len;
+        let cross_frame_count = self.cross_frame_count;
+
+        let mut session = self
+            .runner
+            .start_persistent_graph_session(self.persistent_graph_context_bytes)
+            .map_err(|source| map_err("reuse_session", source))?;
+        let graph = session.builder();
+        let token_id = graph
+            .new_tensor_1d_i32(1, "firered_reuse_token")
+            .map_err(|source| map_err("reuse_token_alloc", source))?;
+        let row_index = graph
+            .new_tensor_1d_i32(1, "firered_reuse_row")
+            .map_err(|source| map_err("reuse_row_alloc", source))?;
+        let position = graph
+            .new_tensor_1d_i32(1, "firered_reuse_position")
+            .map_err(|source| map_err("reuse_position_alloc", source))?;
+        let attention_mask = graph
+            .new_tensor_3d_f16(max_positions, 1, 1, "firered_reuse_self_mask")
+            .map_err(|source| map_err("reuse_self_mask_alloc", source))?;
+        graph
+            .set_input(token_id)
+            .map_err(|source| map_err("reuse_token_input", source))?;
+        graph
+            .set_input(row_index)
+            .map_err(|source| map_err("reuse_row_input", source))?;
+        graph
+            .set_input(position)
+            .map_err(|source| map_err("reuse_position_input", source))?;
+        graph
+            .set_input(attention_mask)
+            .map_err(|source| map_err("reuse_self_mask_input", source))?;
+
+        let token_state = graph
+            .get_rows(self.weights.token_embedding.as_graph_tensor(), token_id)
+            .map_err(|source| map_err("reuse_embed_get_rows", source))?;
+        let scaled_token_state = graph
+            .scale(token_state, (d_model as f32).sqrt())
+            .map_err(|source| map_err("reuse_embed_xscale", source))?;
+        let position_state = graph
+            .get_rows(self.weights.positional_encoding.as_graph_tensor(), position)
+            .map_err(|source| map_err("reuse_position_get_rows", source))?;
+        let mut state = graph
+            .add(scaled_token_state, position_state)
+            .map_err(|source| map_err("reuse_embed_add_pos", source))?;
+
+        let zero_bias_tensor = self.arena.graph_tensor(self.zero_bias);
+        for (layer, (cross, self_kv)) in self
+            .weights
+            .layers
+            .iter()
+            .zip(self.cross_layers.iter().zip(&self.self_kv_layers))
+        {
+            let config = Seq2SeqLayerConfig {
+                hidden: d_model,
+                attention_heads: heads,
+                head_dim,
+                token_count: 1,
+                n_seq: 1,
+                // Fixed span: attend over the whole self-KV capacity; the
+                // per-step mask upload marks positions past the current
+                // prefix as `-inf`.
+                total_token_count: max_positions,
+                position_offset: 0,
+                layer_norm_epsilon: FIRERED_DECODER_LAYER_NORM_EPSILON,
+                ffn_activation: FeedForwardActivation::Gelu,
+                self_kv_max_positions: max_positions,
+                cross_frame_count,
+                cross_hidden_size: d_model,
+            };
+            let weights = Seq2SeqLayerWeights {
+                self_attn_norm_weight: layer.self_attn_norm_weight.as_graph_tensor(),
+                self_attn_norm_bias: layer.self_attn_norm_bias.as_graph_tensor(),
+                self_attn_q_weight: layer.self_attn_q_weight.as_graph_tensor(),
+                self_attn_q_bias: layer.self_attn_q_bias.as_graph_tensor(),
+                self_attn_k_weight: layer.self_attn_k_weight.as_graph_tensor(),
+                self_attn_k_bias: zero_bias_tensor,
+                self_attn_v_weight: layer.self_attn_v_weight.as_graph_tensor(),
+                self_attn_v_bias: layer.self_attn_v_bias.as_graph_tensor(),
+                self_attn_o_weight: layer.self_attn_out_weight.as_graph_tensor(),
+                self_attn_o_bias: layer.self_attn_out_bias.as_graph_tensor(),
+                cross_attn_norm_weight: layer.cross_attn_norm_weight.as_graph_tensor(),
+                cross_attn_norm_bias: layer.cross_attn_norm_bias.as_graph_tensor(),
+                cross_attn_q_weight: layer.cross_attn_q_weight.as_graph_tensor(),
+                cross_attn_q_bias: layer.cross_attn_q_bias.as_graph_tensor(),
+                cross_attn_o_weight: layer.cross_attn_out_weight.as_graph_tensor(),
+                cross_attn_o_bias: layer.cross_attn_out_bias.as_graph_tensor(),
+                ffn_norm_weight: layer.ffn_norm_weight.as_graph_tensor(),
+                ffn_norm_bias: layer.ffn_norm_bias.as_graph_tensor(),
+                ffn_up_weight: layer.ffn_up_weight.as_graph_tensor(),
+                ffn_up_bias: layer.ffn_up_bias.as_graph_tensor(),
+                ffn_down_weight: layer.ffn_down_weight.as_graph_tensor(),
+                ffn_down_bias: layer.ffn_down_bias.as_graph_tensor(),
+            };
+            let self_kv_handle = SelfKvHandle {
+                key: self.arena.graph_tensor(self_kv.key),
+                value: self.arena.graph_tensor(self_kv.value),
+                row_indices: Some(row_index),
+                attention_mask: Some(attention_mask),
+            };
+            let cross_kv_handle = CrossKvHandle {
+                key: self.arena.graph_tensor(cross.key),
+                value: self.arena.graph_tensor(cross.value),
+            };
+            let block = seq2seq_layer(
+                graph,
+                state,
+                config,
+                weights,
+                self_kv_handle,
+                cross_kv_handle,
+                map_err,
+            )?;
+            debug_assert!(
+                block.deferred_self_mask.is_none(),
+                "single-token reuse steps never emit a deferred per-layer mask"
+            );
+            state = block.output;
+        }
+
+        state = apply_affine_layer_norm(
+            graph,
+            state,
+            FIRERED_DECODER_LAYER_NORM_EPSILON,
+            self.weights.out_norm_weight.as_graph_tensor(),
+            self.weights.out_norm_bias.as_graph_tensor(),
+            AffineLayerNormSteps {
+                norm: "reuse_decoder_out_norm",
+                scale: "reuse_decoder_out_norm",
+                bias: "reuse_decoder_out_norm",
+            },
+            map_err,
+        )?;
+        let last_state = view_last_token_state(graph, state, d_model, 1)?;
+        let logits = graph
+            .mul_mat(self.weights.out_proj_weight.as_graph_tensor(), last_state)
+            .map_err(|source| map_err("reuse_output_proj", source))?;
+        graph
+            .set_output(logits)
+            .map_err(|source| map_err("reuse_set_output", source))?;
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(|source| map_err("reuse_prepare_outputs", source))?;
+
+        self.reuse = Some(Seq2SeqReusableDecodeGraph::new_with_borrowed_kv_arena(
+            session,
+            max_positions,
+            1,
+            token_id,
+            row_index,
+            position,
+            attention_mask,
+            logits,
+        ));
+        self.reuse_cross_frame_count = cross_frame_count;
+        Ok(())
     }
 }
 

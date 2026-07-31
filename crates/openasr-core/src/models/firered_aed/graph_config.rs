@@ -26,6 +26,8 @@
 //! enforced in `executor.rs`).
 
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
+#[cfg(test)]
+use crate::models::graph_runtime_config::configure_model_runtime_graph_config;
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
     gpu_stage_enabled_for_backend, has_explicit_thread_override,
@@ -39,11 +41,19 @@ const OPENASR_FIRERED_ENABLE_DECODER_METAL: &str = "OPENASR_FIRERED_ENABLE_DECOD
 const OPENASR_FIRERED_ENABLE_ENCODER_GPU: &str = "OPENASR_FIRERED_ENABLE_ENCODER_GPU";
 const OPENASR_FIRERED_ENABLE_DECODER_GPU: &str = "OPENASR_FIRERED_ENABLE_DECODER_GPU";
 
-pub(crate) fn firered_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+/// Shared base for both stages: everything except the Metal scheduler
+/// default, which the encoder and decoder set independently (see
+/// [`firered_encoder_graph_config`] / [`firered_decoder_graph_config`]) --
+/// the same encoder/decoder split moonshine's `graph_config` uses for the
+/// same reason (decode-graph reuse).
+fn firered_runtime_graph_config_with_scheduler_default(
+    backend: GgmlCpuGraphBackend,
+    default_use_scheduler_when_unset: Option<bool>,
+) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
         GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
-            default_use_scheduler_when_unset: Some(true),
+            default_use_scheduler_when_unset,
             default_n_threads_when_unset: Some(1),
         },
     )
@@ -54,7 +64,12 @@ pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
     // `GgmlCpuGraphConfig::metadata_context_bytes`); previously a flat
     // hardcoded 512 MiB per cached encoder runtime (see the thread-local
     // cache in `executor.rs`).
-    let mut config = firered_runtime_graph_config(backend);
+    //
+    // The encoder keeps the scheduler on for Metal: the conformer forward
+    // graph was built and parity-verified under multi-backend scheduling and
+    // has not been re-verified with the scheduler off. Only the decoder's
+    // `use_scheduler` default changed (see `firered_decoder_graph_config`).
+    let mut config = firered_runtime_graph_config_with_scheduler_default(backend, Some(true));
     config.graph_size = config.graph_size.max(FIRERED_ENCODER_GRAPH_SIZE);
     config.context_bytes = config
         .context_bytes
@@ -74,11 +89,27 @@ pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
     config
 }
 
+/// Decode-graph reuse (`nn::decoder::reusable_decode_graph_supported`) only
+/// activates when the backend is GPU-class *and* the scheduler is off (a
+/// multi-backend scheduler's `sched_alloc_graph` drops the per-token inputs
+/// a reused, in-place-KV graph depends on). The decoder previously inherited
+/// the encoder's `default_use_scheduler_when_unset: Some(true)`, which would
+/// keep the reusable incremental-step graph in `decoder_graph` permanently
+/// disabled on Metal and force a full graph rebuild every decode token
+/// (measured at ~21% of the per-token decode step on l-v2 q4_k). Leaving
+/// this `None` keeps the base default (scheduler-off on GPU-class backends,
+/// see `configure_model_graph_config`), exactly mirroring moonshine's
+/// decoder-tier fix. This is a pure backend/scheduling choice: output must
+/// stay byte-identical (pinned by the reused-vs-fresh logits test in
+/// `decoder_graph` and the firered golden tests), since it does not change
+/// which arithmetic runs, only whether the graph is rebuilt per token.
+/// `OPENASR_GGML_USE_SCHEDULER=1` remains the explicit escape hatch (it also
+/// disables reuse, restoring the rebuild-per-token path).
 pub(crate) fn firered_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     // See the matching comment in `firered_encoder_graph_config`: this is a
     // `no_alloc` metadata pool sized from the actual node count, not the real
     // tensor bytes (those live in the arena's own backend buffer).
-    let mut config = firered_runtime_graph_config(backend);
+    let mut config = firered_runtime_graph_config_with_scheduler_default(backend, None);
     config.graph_size = config.graph_size.max(FIRERED_DECODER_GRAPH_SIZE);
     config.context_bytes = config
         .context_bytes
@@ -118,9 +149,86 @@ fn firered_decoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
     )
 }
 
+/// Test-only mirror of [`firered_runtime_graph_config_with_scheduler_default`]
+/// with the env/TLS reads replaced by explicit flags, so the scheduler-default
+/// pins below stay deterministic regardless of the test environment (same
+/// pattern as `whisper::graph_config` / `qwen::graph_config`).
+#[cfg(test)]
+fn firered_runtime_graph_config_with_explicit_overrides(
+    base: GgmlCpuGraphConfig,
+    has_explicit_scheduler_override: bool,
+    has_explicit_thread_override: bool,
+    default_use_scheduler_when_unset: Option<bool>,
+) -> GgmlCpuGraphConfig {
+    configure_model_runtime_graph_config(
+        base,
+        has_explicit_scheduler_override,
+        has_explicit_thread_override,
+        ModelMetalRuntimeOverrides {
+            default_use_scheduler_when_unset,
+            default_n_threads_when_unset: Some(1),
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metal_base(use_scheduler: bool) -> GgmlCpuGraphConfig {
+        GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Metal,
+            use_scheduler,
+            ..GgmlCpuGraphConfig::conservative_default()
+        }
+    }
+
+    /// Pin the decoder tier's Metal scheduler default to OFF: decode-graph
+    /// reuse (`nn::decoder::reusable_decode_graph_supported`) requires
+    /// `gpu_class && !scheduler`, so a scheduler-on default here would turn
+    /// the reusable incremental decode graph back into dead code (the exact
+    /// regression moonshine had before commit 879677ac).
+    #[test]
+    fn decoder_metal_scheduler_default_stays_off_for_decode_graph_reuse() {
+        let config = firered_runtime_graph_config_with_explicit_overrides(
+            metal_base(false),
+            false,
+            false,
+            None,
+        );
+        assert!(
+            !config.use_scheduler,
+            "firered decoder tier must default the Metal scheduler off so the reusable \
+             incremental decode graph stays reachable"
+        );
+    }
+
+    /// The encoder tier keeps the scheduler-on Metal default it was
+    /// parity-verified under.
+    #[test]
+    fn encoder_metal_scheduler_default_stays_on() {
+        let config = firered_runtime_graph_config_with_explicit_overrides(
+            metal_base(false),
+            false,
+            false,
+            Some(true),
+        );
+        assert!(config.use_scheduler);
+    }
+
+    /// An explicit `OPENASR_GGML_USE_SCHEDULER` override must keep winning on
+    /// the decoder tier (it is the escape hatch that restores the
+    /// rebuild-per-token decode path).
+    #[test]
+    fn decoder_metal_explicit_scheduler_override_still_wins() {
+        let config = firered_runtime_graph_config_with_explicit_overrides(
+            metal_base(true),
+            true,
+            false,
+            None,
+        );
+        assert!(config.use_scheduler);
+    }
 
     #[test]
     fn encoder_gpu_defaults_to_unified_gpu_lane() {
