@@ -2,6 +2,15 @@ mod atomic_file;
 mod backends_manifest_security;
 mod catalog_security;
 mod catalog_series;
+// This module exists in the compiled library only to host a regression test:
+// the actual CUDA-arch-target logic runs at build-script time, not at
+// runtime, and `build.rs` gets its own copy via `include!` (see
+// `cuda_targets.rs`'s doc comment) since a build script cannot depend on the
+// crate it configures. Gating the whole module on `cfg(test)` keeps a plain
+// (non-test) build free of otherwise-dead-code warnings for functions this
+// crate's runtime never calls.
+#[cfg(test)]
+mod cuda_targets;
 mod http;
 
 // Module visibility is scoped to the actual external API surface. Modules that
