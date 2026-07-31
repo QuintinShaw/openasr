@@ -91,6 +91,15 @@ pub(crate) struct MimoLlmDecoderRuntime {
     metadata: MimoLlmMetadata,
 }
 
+/// Prefill output for the shared greedy driver's step 0: the host logits row
+/// for the first generated token, or (on the fused Metal/GPU lane) a device
+/// argmax hint with no host row. Mirrors
+/// `moss_transcribe_diarize::llm_decoder::MossTdPrefillOutput`.
+pub(crate) struct MimoLlmPrefillOutput {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) greedy_token_hint: Option<u32>,
+}
+
 impl MimoLlmDecoderRuntime {
     pub(crate) fn new(
         runtime_source: &crate::GgmlRuntimeSource,
@@ -102,17 +111,6 @@ impl MimoLlmDecoderRuntime {
                 reason: error.to_string(),
             })?;
         let projections = load_layer_projections(&reader, &metadata)?;
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_source),
-                metadata.rms_norm_epsilon,
-                None,
-                backend,
-            )
-            .map_err(|error| MimoLlmDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
             runtime_source,
@@ -126,6 +124,24 @@ impl MimoLlmDecoderRuntime {
         .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
             reason: error.to_string(),
         })?;
+        // Keep the output projection in the same static arena as the resident
+        // decoder graph so Metal/GPU decode can return a device-side top-1
+        // token per step instead of building a separate full-vocab logits
+        // graph and reading the whole row back to the host -- mirrors
+        // `moss_transcribe_diarize::llm_decoder`'s identical wiring (mimo's
+        // registered policy has no suppression or phrase bias, so the shared
+        // driver can always honor the hint).
+        let whole_decoder =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
+                &projections,
+                Some(runtime_source),
+                metadata.rms_norm_epsilon,
+                logits_head.fused_top1_spec(),
+                backend,
+            )
+            .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?;
         let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
             &reader,
             TOKEN_EMBD_WEIGHT,
@@ -192,7 +208,7 @@ impl MimoLlmDecoderRuntime {
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    ) -> Result<Vec<f32>, MimoLlmDecoderError> {
+    ) -> Result<MimoLlmPrefillOutput, MimoLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
         if let Some(final_hidden) = self
             .whole_decoder
@@ -207,12 +223,28 @@ impl MimoLlmDecoderRuntime {
                 reason: error.to_string(),
             })?
         {
-            return self
+            if let Some(token_id) = self
+                .whole_decoder
+                .fused_logits_top1_from_hidden(&final_hidden)
+                .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?
+            {
+                return Ok(MimoLlmPrefillOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
+            let logits = self
                 .logits_head
                 .compute_logits_for_last_hidden(&final_hidden)
                 .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
-                });
+                })?;
+            return Ok(MimoLlmPrefillOutput {
+                logits,
+                greedy_token_hint: None,
+            });
         }
         let step = self
             .whole_decoder
@@ -225,11 +257,16 @@ impl MimoLlmDecoderRuntime {
                 reason: error.to_string(),
             })?;
         let final_hidden = self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?;
-        self.logits_head
+        let logits = self
+            .logits_head
             .compute_logits_for_last_hidden(&final_hidden)
             .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
-            })
+            })?;
+        Ok(MimoLlmPrefillOutput {
+            logits,
+            greedy_token_hint: None,
+        })
     }
 
     pub(crate) fn decode_step(
@@ -266,6 +303,42 @@ impl MimoLlmDecoderRuntime {
             .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
+    }
+
+    /// On the resident Metal/GPU reuse graph, return the decoder's device-side
+    /// argmax directly. mimo-asr's registered policy has no suppression or
+    /// phrase bias, so the shared greedy driver can safely consume this as a
+    /// validated `greedy_token_hint`; CPU and any non-reuse backend fall back
+    /// to the full host logits path above. Mirrors
+    /// `moss_transcribe_diarize::llm_decoder::decode_step_reused_top1`.
+    pub(crate) fn decode_step_reused_top1(
+        &mut self,
+        token_id: u32,
+        cache_position: usize,
+        layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+    ) -> Result<Option<u32>, MimoLlmDecoderError> {
+        if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
+            return Ok(None);
+        }
+        let max_positions = layer_kv_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .ok_or_else(|| MimoLlmDecoderError::KvCacheFailed {
+                reason: "mimo-asr backbone has no layer KV caches".to_string(),
+            })?;
+        let hidden = self.gather_token_embedding(token_id)?;
+        let step = self
+            .whole_decoder
+            .run_step_reused_batched_top1(
+                &hidden,
+                &[cache_position],
+                self.metadata.rope_theta,
+                max_positions,
+            )
+            .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?;
+        Ok(Some(step.token_id))
     }
 
     fn write_prefill_outputs(

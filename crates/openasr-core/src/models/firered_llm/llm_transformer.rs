@@ -117,6 +117,15 @@ pub(crate) struct FireRedLlmDecoderRuntime {
     metadata: FireRedLlmDecoderMetadata,
 }
 
+/// Prefill output for the shared greedy driver's step 0: the host logits row
+/// for the first generated token, or (on the fused Metal/GPU lane) a device
+/// argmax hint with no host row. Mirrors
+/// `moss_transcribe_diarize::llm_decoder::MossTdPrefillOutput`.
+pub(crate) struct FireRedLlmPrefillOutput {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) greedy_token_hint: Option<u32>,
+}
+
 impl FireRedLlmDecoderRuntime {
     pub(crate) fn new(
         runtime_source: &crate::GgmlRuntimeSource,
@@ -126,17 +135,6 @@ impl FireRedLlmDecoderRuntime {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(map_tensor_read_error)?;
         let projections = load_qwen2_layer_projections(&reader, &metadata)?;
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_source),
-                FIRERED_LLM_RMS_NORM_EPSILON,
-                None,
-                backend,
-            )
-            .map_err(|error| FireRedLlmDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
             runtime_source,
@@ -150,6 +148,24 @@ impl FireRedLlmDecoderRuntime {
         .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
             reason: error.to_string(),
         })?;
+        // Keep the output projection in the same static arena as the resident
+        // decoder graph so Metal/GPU decode can return a device-side top-1
+        // token per step instead of building a separate full-vocab logits
+        // graph and reading the whole row back to the host -- mirrors
+        // `moss_transcribe_diarize::llm_decoder`'s identical wiring
+        // (firered-llm's registered policy has no suppression or phrase bias,
+        // so the shared driver can always honor the hint).
+        let whole_decoder =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
+                &projections,
+                Some(runtime_source),
+                FIRERED_LLM_RMS_NORM_EPSILON,
+                logits_head.fused_top1_spec(),
+                backend,
+            )
+            .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?;
         let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
             &reader,
             LLM_TOKEN_EMBD_WEIGHT,
@@ -247,7 +263,7 @@ impl FireRedLlmDecoderRuntime {
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    ) -> Result<Vec<f32>, FireRedLlmDecoderError> {
+    ) -> Result<FireRedLlmPrefillOutput, FireRedLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
         if let Some(final_hidden) = self
             .whole_decoder
@@ -262,12 +278,28 @@ impl FireRedLlmDecoderRuntime {
                 reason: error.to_string(),
             })?
         {
-            return self
+            if let Some(token_id) = self
+                .whole_decoder
+                .fused_logits_top1_from_hidden(&final_hidden)
+                .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?
+            {
+                return Ok(FireRedLlmPrefillOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
+            let logits = self
                 .logits_head
                 .compute_logits_for_last_hidden(&final_hidden)
                 .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
-                });
+                })?;
+            return Ok(FireRedLlmPrefillOutput {
+                logits,
+                greedy_token_hint: None,
+            });
         }
         let step = self
             .whole_decoder
@@ -280,11 +312,16 @@ impl FireRedLlmDecoderRuntime {
                 reason: error.to_string(),
             })?;
         let final_hidden = self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?;
-        self.logits_head
+        let logits = self
+            .logits_head
             .compute_logits_for_last_hidden(&final_hidden)
             .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
-            })
+            })?;
+        Ok(FireRedLlmPrefillOutput {
+            logits,
+            greedy_token_hint: None,
+        })
     }
 
     /// Run one incremental decode step for `token_id` at `cache_position`
@@ -324,6 +361,42 @@ impl FireRedLlmDecoderRuntime {
             .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
+    }
+
+    /// On the resident Metal/GPU reuse graph, return the decoder's device-side
+    /// argmax directly. firered-llm's registered policy has no suppression or
+    /// phrase bias, so the shared greedy driver can safely consume this as a
+    /// validated `greedy_token_hint`; CPU and any non-reuse backend fall back
+    /// to the full host logits path above. Mirrors
+    /// `moss_transcribe_diarize::llm_decoder::decode_step_reused_top1`.
+    pub(crate) fn decode_step_reused_top1(
+        &mut self,
+        token_id: u32,
+        cache_position: usize,
+        layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+    ) -> Result<Option<u32>, FireRedLlmDecoderError> {
+        if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
+            return Ok(None);
+        }
+        let max_positions = layer_kv_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .ok_or_else(|| FireRedLlmDecoderError::KvCacheFailed {
+                reason: "firered-llm decoder has no layer KV caches".to_string(),
+            })?;
+        let hidden = self.gather_token_embedding(token_id)?;
+        let step = self
+            .whole_decoder
+            .run_step_reused_batched_top1(
+                &hidden,
+                &[cache_position],
+                FIRERED_LLM_ROPE_THETA,
+                max_positions,
+            )
+            .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?;
+        Ok(Some(step.token_id))
     }
 
     fn write_prefill_outputs(

@@ -132,15 +132,15 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
         if let Some(prompt_embeddings) = self.prompt_embeddings.take() {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
-            let logits = self
+            let prefill = self
                 .decoder
                 .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits,
-                greedy_token_hint: None,
+                logits: prefill.logits,
+                greedy_token_hint: prefill.greedy_token_hint,
             });
         }
         let last_token = input.generated_tokens.last().copied().ok_or_else(|| {
@@ -155,6 +155,18 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
             .ok_or_else(|| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: "mimo-asr decode cache position underflowed".to_string(),
             })?;
+        if let Some(token_id) = self
+            .decoder
+            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?
+        {
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(token_id),
+            });
+        }
         let logits = self
             .decoder
             .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
