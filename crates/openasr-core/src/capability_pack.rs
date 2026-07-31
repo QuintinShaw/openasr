@@ -104,6 +104,15 @@ pub(crate) fn is_gguf_capability_pack(path: &Path) -> bool {
 /// Legacy fallback: the first pack under a `models/*` directory whose *name*
 /// contains the hint. Superseded by [`installed_capability_pack`] and kept only
 /// until a home has been through `migrate_legacy_model_store`.
+///
+/// Retirement condition (not yet met, so do not delete this on a timer alone):
+/// safe to remove once every process that resolves a capability pack -- not
+/// just the CLI's `migrate_model_store_once` -- unconditionally runs
+/// `migrate_legacy_model_store` before the first resolution, so no home can
+/// reach here with an unconverted legacy layout. Today only the CLI does
+/// that; `openasr serve` and an embedding host do not. Deleting this before
+/// that gap closes would silently reintroduce the exact Voice-ID-goes-quiet
+/// failure mode this module's header doc describes, for those callers.
 fn find_pack(root: &Path, dir_substr: &str) -> Option<PathBuf> {
     let mut model_dirs: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
