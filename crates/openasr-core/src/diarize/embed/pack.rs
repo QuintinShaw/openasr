@@ -84,6 +84,15 @@ pub fn embedder_pack_installed() -> bool {
 /// cache: capability reporting re-probes the filesystem on every ask, so a
 /// daemon that saw a diarize request before the pack was installed has to pick
 /// the pack up on the next request, not after a restart.
+///
+/// That "no restart needed" behavior covers only the not-installed -> installed
+/// transition, not installed -> *replaced*: once `SHARED_EMBEDDER` has served one
+/// successful load, `OnceLock` keeps that same embedder (and its
+/// `pack_fingerprint`) for the rest of the process's life. Reinstalling,
+/// repacking, or swapping in a different `redimnet2-b6-cn` object on disk after
+/// the first successful resolve is invisible until the process restarts -- a
+/// long-lived `openasr serve` daemon needs an explicit restart to pick up a
+/// replaced pack; the CLI's one-shot-per-invocation lifetime never hits this.
 pub fn shared_embedder() -> Option<&'static dyn SpeakerEmbedder> {
     shared_embedder_state().map(|state| state.embedder.as_ref())
 }
