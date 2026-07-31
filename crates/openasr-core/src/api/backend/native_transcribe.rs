@@ -6472,4 +6472,398 @@ mod tests {
             "cancel must surface as the typed TranscriptionCanceled: {error}"
         );
     }
+
+    /// Deterministic executor that echoes each slice's marker as BOTH its text
+    /// (`w{marker}`) and a single segment at a fixed slice-relative time, so a
+    /// test proves the concurrent path's ordered *segment* assembly and
+    /// per-slice time-domain remap -- not just the flat text -- matches the
+    /// serial path. Like [`ConcurrentPipelineStubExecutor`] it reads nothing
+    /// but the audio marker, so it is completely insensitive to the request
+    /// prompt / cross-slice carry: the ONLY variable it can react to is which
+    /// slice it was handed.
+    struct SegmentEchoStubExecutor;
+
+    impl GgmlAsrExecutor for SegmentEchoStubExecutor {
+        fn executor_id(&self) -> &'static str {
+            "segment-echo-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            let marker = ConcurrentPipelineStubExecutor::marker_of(request);
+            Ok(GgmlAsrExecutionResult {
+                transcription: Transcription {
+                    truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
+                    text: format!("w{marker}"),
+                    segments: vec![segment(0.10, 0.20, &format!("w{marker}"))],
+                    longform: None,
+                    language: None,
+                },
+                carry_context: None,
+                decode_truncation: None,
+            })
+        }
+    }
+
+    /// Concurrency-vs-serial equivalence with a carry-insensitive deterministic
+    /// backend (supplement 1, mock tier): running the SAME slices through the
+    /// real assembly code path at width 1 (a single worker pulling slices in
+    /// order == the serial reference) and at widths 2/3/4 (workers finishing
+    /// out of order) must produce a BYTE-IDENTICAL assembled transcription --
+    /// text AND segments AND their remapped timings. Because the stub reads
+    /// only the audio marker and ignores the prompt/carry entirely, the sole
+    /// difference between the width-1 and width-N runs is concurrency itself,
+    /// so equality isolates and proves that concurrency alone does not change
+    /// the output (the carry variable that separates the production serial and
+    /// carry-light paths is held constant here at "no carry").
+    #[test]
+    fn concurrent_pipeline_output_is_byte_identical_across_widths() {
+        let (audio, slices) = concurrent_pipeline_slices(7);
+        let run = |width: usize| {
+            run_concurrent_pipeline_for_test(
+                width,
+                &audio,
+                slices.clone(),
+                Arc::new(SegmentEchoStubExecutor),
+                &uncancellable_execution_context_for_test(),
+                &crate::LongFormOptions::default(),
+                None,
+            )
+            .expect("all slices decode")
+        };
+
+        // Width 1 == single worker, strictly serial slice order: the reference.
+        let serial = run(1);
+        assert_eq!(
+            serial.assembled.text, "w1 w2 w3 w4 w5 w6 w7",
+            "serial (width=1) reference text"
+        );
+        assert_eq!(
+            serial.assembled.segments.len(),
+            7,
+            "one segment per decoded slice survives assembly"
+        );
+        assert!(serial.ran_any_slice);
+        assert_eq!(serial.suppressed, 0);
+
+        for width in [2usize, 3, 4] {
+            let concurrent = run(width);
+            assert_eq!(
+                concurrent.assembled, serial.assembled,
+                "width={width} concurrent output must be byte-identical to the \
+                 serial (width=1) reference: text, segments, and remapped timings"
+            );
+            assert_eq!(concurrent.suppressed, serial.suppressed);
+            assert_eq!(concurrent.ran_any_slice, serial.ran_any_slice);
+        }
+    }
+
+    /// Same equivalence, but with a suppressed silent slice in the middle: the
+    /// concurrent path decides silence once up front on the main thread and
+    /// leaves that position empty, then integrates in slice order. Width 1 and
+    /// width 4 must agree byte-for-byte on both the assembled transcript and
+    /// the suppressed-slice count, proving the concurrent silence bookkeeping
+    /// matches the serial loop's.
+    #[test]
+    fn concurrent_pipeline_silent_slice_handling_matches_across_widths() {
+        let (mut audio, slices) = concurrent_pipeline_slices(6);
+        // Zero slice index 2's audio region so it reads as silence (marker 0),
+        // while every other slice keeps its distinct non-zero marker.
+        for sample in &mut audio[2 * 1000..3 * 1000] {
+            *sample = 0.0;
+        }
+        let longform = crate::LongFormOptions {
+            suppress_silent_slices: true,
+            ..crate::LongFormOptions::default()
+        };
+        let run = |width: usize| {
+            run_concurrent_pipeline_for_test(
+                width,
+                &audio,
+                slices.clone(),
+                Arc::new(SegmentEchoStubExecutor),
+                &uncancellable_execution_context_for_test(),
+                &longform,
+                None,
+            )
+            .expect("non-silent slices decode")
+        };
+
+        let serial = run(1);
+        // Slice index 2 is suppressed; the rest echo their markers in order.
+        assert_eq!(serial.assembled.text, "w1 w2 w4 w5 w6");
+        assert_eq!(serial.suppressed, 1);
+
+        let concurrent = run(4);
+        assert_eq!(
+            concurrent.assembled, serial.assembled,
+            "concurrent silent-slice suppression must be byte-identical to serial"
+        );
+        assert_eq!(concurrent.suppressed, serial.suppressed);
+    }
+
+    /// Shared handshake between a blocking test executor and the test thread:
+    /// counts how many decodes have entered `execute` (so the test can wait
+    /// until a worker is genuinely mid-decode before flipping a control) and
+    /// lets the test release those blocked decodes. Used only to construct
+    /// deterministic in-flight timings for the cancel / pause tests.
+    struct DecodeGate {
+        entered: Mutex<usize>,
+        entered_cv: std::sync::Condvar,
+        release: Mutex<bool>,
+        release_cv: std::sync::Condvar,
+    }
+
+    impl DecodeGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Mutex::new(0),
+                entered_cv: std::sync::Condvar::new(),
+                release: Mutex::new(false),
+                release_cv: std::sync::Condvar::new(),
+            })
+        }
+
+        fn mark_entered(&self) {
+            *self.entered.lock().unwrap() += 1;
+            self.entered_cv.notify_all();
+        }
+
+        fn wait_entered_at_least(&self, count: usize) {
+            let mut entered = self.entered.lock().unwrap();
+            while *entered < count {
+                entered = self.entered_cv.wait(entered).unwrap();
+            }
+        }
+
+        fn release_all(&self) {
+            *self.release.lock().unwrap() = true;
+            self.release_cv.notify_all();
+        }
+
+        fn wait_for_release(&self) {
+            let mut released = self.release.lock().unwrap();
+            while !*released {
+                released = self.release_cv.wait(released).unwrap();
+            }
+        }
+    }
+
+    /// Executor that parks inside `execute` (a worker genuinely mid-decode)
+    /// until the test releases it, then echoes the slice marker. Lets the
+    /// pause/resume test place a worker in-flight before pausing.
+    struct PauseGateExecutor {
+        gate: Arc<DecodeGate>,
+    }
+
+    impl GgmlAsrExecutor for PauseGateExecutor {
+        fn executor_id(&self) -> &'static str {
+            "pause-gate-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            let marker = ConcurrentPipelineStubExecutor::marker_of(request);
+            self.gate.mark_entered();
+            self.gate.wait_for_release();
+            Ok(GgmlAsrExecutionResult {
+                transcription: Transcription {
+                    truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
+                    text: format!("w{marker}"),
+                    segments: Vec::new(),
+                    longform: None,
+                    language: None,
+                },
+                carry_context: None,
+                decode_truncation: None,
+            })
+        }
+    }
+
+    /// Executor that simulates a real ggml graph observing a mid-compute
+    /// cancel: it blocks inside `execute` (past the slice-boundary gate, i.e.
+    /// genuinely in-flight) and spins on the per-worker abort flag the pipeline
+    /// arms via `arm_for_native_decode`, exactly the flag a real ggml
+    /// abort_callback reads. When the cancel trips it returns an aborted error,
+    /// as an aborted graph would. A 30s safety valve keeps a regression from
+    /// hanging the suite forever.
+    struct CancelGateExecutor {
+        gate: Arc<DecodeGate>,
+    }
+
+    impl GgmlAsrExecutor for CancelGateExecutor {
+        fn executor_id(&self) -> &'static str {
+            "cancel-gate-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            self.gate.mark_entered();
+            let started = Instant::now();
+            loop {
+                if crate::ggml_runtime::thread_job_cancel_requested() {
+                    return Err(GgmlAsrExecutionError::ExecutorFailed {
+                        executor_id: "cancel-gate-stub",
+                        adapter_id: request.selected_family.adapter_id,
+                        reason: "aborted mid-flight by cancel".to_string(),
+                    });
+                }
+                if started.elapsed() > std::time::Duration::from_secs(30) {
+                    return Err(GgmlAsrExecutionError::ExecutorFailed {
+                        executor_id: "cancel-gate-stub",
+                        adapter_id: request.selected_family.adapter_id,
+                        reason: "cancel never observed within 30s (test safety valve)".to_string(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// Run the concurrent pipeline on a scratch thread and hand its result back
+    /// through a channel so the caller can bound the wait -- a hang (deadlock,
+    /// lost worker, dropped channel) surfaces as a test failure instead of a
+    /// frozen suite.
+    fn spawn_pipeline_bounded(
+        width: usize,
+        audio: Vec<f32>,
+        slices: Vec<crate::longform::AudioSlice>,
+        executor: Arc<dyn GgmlAsrExecutor>,
+        execution_context: Arc<crate::RequestExecutionContext>,
+        longform: crate::LongFormOptions,
+    ) -> mpsc::Receiver<Result<ConcurrentPipelineOutcome, BackendError>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = run_concurrent_pipeline_for_test(
+                width,
+                &audio,
+                slices,
+                executor,
+                &execution_context,
+                &longform,
+                None,
+            );
+            // Receiver may already be gone if the test timed out; ignore.
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+
+    /// Supplement 2, mid-flight cancel: a cancel that arrives while workers are
+    /// genuinely inside a decode (past the slice-boundary gate) must abort the
+    /// in-flight workers promptly, converge every worker, and surface the typed
+    /// `TranscriptionCanceled` -- without hanging or panicking a channel. The
+    /// existing cancel test only covers a cancel observed *before* any decode
+    /// starts (at the boundary gate); this covers the in-flight/abort path.
+    #[test]
+    fn concurrent_pipeline_mid_flight_cancel_aborts_in_flight_workers() {
+        let control = Arc::new(crate::api::backend::TranscriptionControl::new());
+        let execution_context = Arc::new(crate::RequestExecutionContext::new(
+            None,
+            Arc::clone(&control),
+        ));
+        let gate = DecodeGate::new();
+        let (audio, slices) = concurrent_pipeline_slices(4);
+
+        let rx = spawn_pipeline_bounded(
+            2,
+            audio,
+            slices,
+            Arc::new(CancelGateExecutor {
+                gate: Arc::clone(&gate),
+            }),
+            Arc::clone(&execution_context),
+            crate::LongFormOptions::default(),
+        );
+
+        // Wait until at least one worker is genuinely mid-decode, then cancel.
+        gate.wait_entered_at_least(1);
+        control.request_cancel();
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("mid-flight cancel must not hang the pipeline");
+        let error = outcome.expect_err("a canceled run must fail closed");
+        assert!(
+            matches!(error, BackendError::TranscriptionCanceled),
+            "mid-flight cancel must surface as the typed TranscriptionCanceled: {error}"
+        );
+    }
+
+    /// Supplement 2, pause/resume: a pause requested while the pipeline is
+    /// running must park every worker at a slice boundary (the whole run
+    /// suspends, no deadlock and no further slices decoded), and a later resume
+    /// must let it run to completion with the correct in-order output. Pause
+    /// was previously uncovered.
+    #[test]
+    fn concurrent_pipeline_pause_parks_workers_then_resume_completes() {
+        let control = Arc::new(crate::api::backend::TranscriptionControl::new());
+        let execution_context = Arc::new(crate::RequestExecutionContext::new(
+            None,
+            Arc::clone(&control),
+        ));
+        let gate = DecodeGate::new();
+        let (audio, slices) = concurrent_pipeline_slices(4);
+
+        let rx = spawn_pipeline_bounded(
+            2,
+            audio,
+            slices,
+            Arc::new(PauseGateExecutor {
+                gate: Arc::clone(&gate),
+            }),
+            Arc::clone(&execution_context),
+            crate::LongFormOptions::default(),
+        );
+
+        // A worker is mid-decode of its first slice. Request the pause now, then
+        // release the in-flight decode(s): each worker finishes its current
+        // slice, loops back to the boundary, and parks on the pending pause
+        // instead of pulling the remaining slices.
+        gate.wait_entered_at_least(1);
+        control.request_pause();
+        gate.release_all();
+
+        // The run must NOT complete while paused: with width 2 at most two
+        // slices could have been in flight, so slices remain and the workers are
+        // parked at the boundary.
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(300)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the pipeline must stay parked while paused, not complete"
+        );
+
+        // Resume: parked workers wake, drain the remaining slices, and the run
+        // completes with the byte-identical in-order transcript.
+        control.request_resume();
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("resume must let the paused pipeline finish, not hang")
+            .expect("a resumed run completes successfully");
+        assert_eq!(outcome.assembled.text, "w1 w2 w3 w4");
+        assert!(outcome.ran_any_slice);
+        assert_eq!(outcome.suppressed, 0);
+    }
 }
