@@ -143,29 +143,70 @@ pub(crate) struct NativeStreamingWorkerHandle {
 ///   Being per-attach rather than a single per-worker flag is the core
 ///   structural fix (BLOCKER 1): abandoning one attach can no longer poison a
 ///   healthy queued sibling on the same worker thread.
+/// - `permit`: this attach's model-capacity admission permit (limit-1 per
+///   model identity). Held here rather than as a bare local on the worker
+///   thread's stack so that when a decode watchdog abandons a wedged worker it
+///   can reclaim the permit immediately, instead of waiting on an OS thread
+///   stuck in an uninterruptible decode that will never drop its stack local
+///   (and would otherwise leak the admission slot, locking every later attach
+///   for the same identity out at limit-1 until the daemon restarts). The
+///   `Mutex<Option<...>>` is a single-owner hand-off: whichever of the worker
+///   thread (normal finish) and `abandon` (watchdog / same-key preemption)
+///   calls `take_permit` first gets `Some` and drops it, releasing the slot
+///   exactly once; the loser gets `None`, so a late-returning wedged decode can
+///   never double-release the slot nor touch a permit a fresh session has since
+///   acquired. Nothing else takes the permit -- the owning WS's own disconnect
+///   paths (`join` / `detach_cancel`) deliberately leave it with the worker so
+///   a merely-disconnected transport cannot release capacity while the model is
+///   still executing.
 pub(crate) struct AttachToken {
     pub(crate) cancel_requested: Arc<AtomicBool>,
     pub(crate) activity: crate::idle_activity::SharedNativeActivityGuard,
     pub(crate) abandoned: AtomicBool,
+    pub(crate) permit: Mutex<Option<ModelSessionPermit>>,
 }
 
 impl AttachToken {
-    fn new(activity: crate::idle_activity::SharedNativeActivityGuard) -> Arc<Self> {
+    fn new(
+        activity: crate::idle_activity::SharedNativeActivityGuard,
+        permit: Option<ModelSessionPermit>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             activity,
             abandoned: AtomicBool::new(false),
+            permit: Mutex::new(permit),
         })
     }
 
+    /// Take this attach's model-capacity permit out of the token, if it is
+    /// still here. Returns it so the caller drops it where it chooses; dropping
+    /// the returned permit is what actually releases the admission slot.
+    /// Idempotent by construction -- the `Option::take` under the mutex hands
+    /// the permit to exactly one caller, so whichever of the worker thread
+    /// (normal completion) and `abandon` (watchdog / same-key preemption)
+    /// reaches it first frees the slot once and the loser gets `None`; never a
+    /// double-release, even if a wedged decode thread returns long after the
+    /// watchdog reclaimed its permit.
+    fn take_permit(&self) -> Option<ModelSessionPermit> {
+        self.permit
+            .lock()
+            .expect("native streaming attach permit mutex poisoned")
+            .take()
+    }
+
     /// Abandon this one attach: mark it (so the worker stops servicing it and a
-    /// late warm-up stays inert) and force-release its `idle_unload` guard (so
-    /// a stuck, uninterruptible decode thread stops pinning the reaper).
-    /// Idempotent -- the guard release is idempotent and the flag is a
-    /// monotonic set.
+    /// late warm-up stays inert), force-release its `idle_unload` guard (so a
+    /// stuck, uninterruptible decode thread stops pinning the reaper), and
+    /// reclaim its model-capacity permit (so that same stuck thread stops
+    /// pinning the admission slot). Idempotent -- the guard release is
+    /// idempotent, the flag is a monotonic set, and `take_permit` releases the
+    /// slot at most once no matter how many triggers fire or how late the
+    /// wedged thread eventually returns.
     fn abandon(&self) {
         self.abandoned.store(true, Ordering::Release);
         self.activity.release();
+        drop(self.take_permit());
     }
 }
 
@@ -364,19 +405,21 @@ pub(crate) enum NativeStreamingWorkerMessage {
         outcomes: mpsc::Sender<NativeStreamingOutcome>,
         finalize_requested: Arc<AtomicBool>,
         /// This attach's supervision token (cancel flag, `idle_unload` guard,
-        /// per-attach `abandoned` flag -- see [`AttachToken`]). Carried by
-        /// value so, if this message is never received (the `mpsc::Sender::send`
-        /// error path returns the whole message), the token -- and the guard
-        /// inside it -- drops on the sender side and the activity count still
-        /// retires. Once the worker thread receives it, the worker records it
-        /// as the current occupant (`begin_occupant`) and drives the session
-        /// against it; the WS session and any external supervisor hold their
-        /// own clones of the same `Arc<AttachToken>`.
+        /// per-attach `abandoned` flag, and this attach's model-capacity permit
+        /// -- see [`AttachToken`]). Carried by value so, if this message is
+        /// never received (the `mpsc::Sender::send` error path returns the whole
+        /// message), the token -- and the guard and permit inside it -- drop on
+        /// the sender side and both the activity count and the admission slot
+        /// still retire. Once the worker thread receives it, the worker records
+        /// it as the current occupant (`begin_occupant`) and drives the session
+        /// against it, then reclaims the permit (`take_permit`) once the session
+        /// has actually returned; the WS session and any external supervisor
+        /// hold their own clones of the same `Arc<AttachToken>`. The worker
+        /// effectively owns the permit until this attached session returns,
+        /// including after the WS transport has disconnected, so a detached
+        /// blocking decode cannot be overlapped -- only a decode watchdog or a
+        /// same-key preemption may reclaim it earlier, via `AttachToken::abandon`.
         token: Arc<AttachToken>,
-        /// The model-capacity permit. The worker owns it until this attached
-        /// session has actually returned, including after the WS transport has
-        /// disconnected, so a detached blocking decode cannot be overlapped.
-        model_session_permit: Option<ModelSessionPermit>,
     },
 }
 
@@ -433,13 +476,14 @@ impl NativeStreamingDecodeWorker {
         // as the worker's current occupant here -- the worker thread does that
         // itself when it actually begins processing this attach, so a queued
         // attach never stomps the occupant record of the one still running.
-        let token = AttachToken::new(worker.activity);
-        // On success the worker thread owns retiring the guard (once, after it
-        // finishes this session, or earlier if a watchdog/preemption trigger
-        // releases it first -- release is idempotent). On failure `send` hands
-        // the whole message -- token included -- back in its `Err`; we release
-        // this attach's guard explicitly so the activity count retires without
-        // waiting on the token clones to all drop.
+        let token = AttachToken::new(worker.activity, model_session_permit);
+        // On success the worker thread owns retiring the guard and the permit
+        // (once, after it finishes this session, or earlier if a
+        // watchdog/preemption trigger releases them first -- both releases are
+        // idempotent). On failure `send` hands the whole message -- token
+        // included -- back in its `Err`; we release this attach's guard and
+        // reclaim its permit explicitly so the activity count and the admission
+        // slot retire now, without waiting on the token clones to all drop.
         if let Err(send_error) = worker
             .sender
             .send(NativeStreamingWorkerMessage::Attach {
@@ -448,12 +492,12 @@ impl NativeStreamingDecodeWorker {
                 outcomes: outcome_tx,
                 finalize_requested: Arc::clone(&finalize_requested),
                 token: Arc::clone(&token),
-                model_session_permit,
             })
             .await
         {
             drop(send_error);
             token.activity.release();
+            drop(token.take_permit());
             worker.state.release();
             return Err("native streaming worker stopped before session attach".to_string());
         }
@@ -803,16 +847,17 @@ pub(crate) fn spawn_native_streaming_worker(
                         outcomes,
                         finalize_requested,
                         token,
-                        model_session_permit,
                     } => {
-                        // Keep the capacity permit owned by this worker thread
-                        // until `run_native_streaming_session_on_worker` returns.
-                        // A disconnected WS cannot release it early.
-                        let _model_session_permit = model_session_permit;
                         // Record this attach as the current occupant only now,
                         // as the thread actually begins driving it -- so
                         // external supervisors always act on the attach that
                         // holds the thread, never one still queued behind it.
+                        // This attach's model-capacity permit lives in `token`
+                        // and stays owned effectively by this worker thread
+                        // until `run_native_streaming_session_on_worker`
+                        // returns; a disconnected WS cannot release it early
+                        // (only a decode watchdog / same-key preemption may, via
+                        // `AttachToken::abandon`).
                         state.begin_occupant(Arc::clone(&token));
                         run_native_streaming_session_on_worker(
                             session,
@@ -822,16 +867,21 @@ pub(crate) fn spawn_native_streaming_worker(
                             &token,
                         );
                         // Clear the occupant record first, then retire the
-                        // per-key acquire count and this attach's activity
-                        // guard. `token.activity.release()` (rather than
-                        // relying on `Drop`) makes the enter/exit pairing
-                        // unconditional and is idempotent -- a no-op if a
-                        // decode watchdog, same-key preemption, or the owning
-                        // WS's own disconnect path already released this same
-                        // guard while this call was stuck.
+                        // per-key acquire count, this attach's activity guard,
+                        // and its model-capacity permit.
+                        // `token.activity.release()` and `token.take_permit()`
+                        // (rather than relying on `Drop`) make the enter/exit
+                        // and acquire/release pairings unconditional and are
+                        // idempotent -- each is a no-op if a decode watchdog,
+                        // same-key preemption, or the owning WS's own disconnect
+                        // path already released this same guard / reclaimed this
+                        // permit while this call was stuck. This is what keeps a
+                        // late-returning wedged decode from double-releasing the
+                        // admission slot.
                         state.clear_occupant();
                         state.release();
                         token.activity.release();
+                        drop(token.take_permit());
                     }
                 }
             }

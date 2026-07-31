@@ -1477,6 +1477,100 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
     release_sender.send(()).expect("release blocked decode");
 }
 
+#[tokio::test]
+async fn watchdog_abandon_reclaims_admission_permit_and_late_return_does_not_double_release() {
+    // The decode watchdog must reclaim a wedged worker's model-capacity permit
+    // when it abandons it -- otherwise a decode stuck in an uninterruptible
+    // Metal call (which never drops the worker thread's permit) leaks the
+    // admission slot, and every later attach for the same identity is rejected
+    // at limit-1 until the daemon restarts. Reclaiming must also be safe against
+    // the wedged thread finally returning long afterwards: the token's
+    // single-owner `take_permit` hand-off guarantees the slot is released
+    // exactly once, never double-released onto whatever fresh session took over.
+    let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap());
+    let model_identity = "native:test-permit-reclaim@pack".to_string();
+    let permit = supervisor
+        .try_acquire(model_identity.clone())
+        .expect("first attach acquires the single model slot");
+    assert!(
+        supervisor.try_acquire(model_identity.clone()).is_err(),
+        "limit-1 admission must reject a second concurrent session for the same identity"
+    );
+
+    let key = test_native_streaming_worker_key("watchdog-permit-reclaim");
+    let (started_sender, started_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let worker = NativeStreamingDecodeWorker::attach_admitted(
+        key,
+        Box::new(BlockingCancelableNativeSession {
+            session_id: "watchdog-permit-reclaim".to_string(),
+            started: started_sender,
+            release: Arc::new(Mutex::new(release_receiver)),
+        }),
+        Some(permit),
+    )
+    .await
+    .expect("attach must succeed");
+
+    // Drive the worker into a wedged decode that still owns the permit: the stub
+    // blocks inside push_audio until released, exactly like a Metal decode that
+    // never completes.
+    worker
+        .commands
+        .send(NativeStreamingCommandEnvelope {
+            kind: NativeStreamingCommandKind::PushAudio,
+            command: NativeStreamingCommand::PushAudio(frame(1, 0, 1)),
+        })
+        .await
+        .expect("worker must accept the command");
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocked decode started");
+    assert!(
+        supervisor.try_acquire(model_identity.clone()).is_err(),
+        "a wedged worker must still hold its admission permit"
+    );
+
+    // Decode watchdog fires: evict the wedged worker and reclaim its permit,
+    // even though the OS thread is still stuck inside push_audio.
+    abandon_stuck_native_streaming_worker(&worker.key, &worker.state, "test-permit-reclaim");
+    let reclaimed = supervisor
+        .try_acquire(model_identity.clone())
+        .expect("the watchdog must reclaim the wedged worker's admission permit");
+    assert!(
+        supervisor.try_acquire(model_identity.clone()).is_err(),
+        "the reclaimed slot is now held by the fresh session; admission stays at limit-1"
+    );
+
+    // Let the wedged thread finally return, long after the watchdog reclaimed
+    // its permit. Dropping the worker closes its channels so the thread exits
+    // its loop once push_audio returns; the per-key acquire count dropping to
+    // zero is the deterministic signal that the thread ran its late cleanup
+    // (which calls `take_permit` again -- and must find `None`).
+    let state = worker.state.clone();
+    drop(worker);
+    release_sender.send(()).expect("release the blocked decode");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state.active_or_attaching.load(Ordering::Acquire) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned worker thread must eventually return after release"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        supervisor.try_acquire(model_identity.clone()).is_err(),
+        "a late-returning wedged decode must not double-release the admission slot \
+         the fresh session now holds"
+    );
+
+    drop(reclaimed);
+    assert!(
+        supervisor.try_acquire(model_identity).is_ok(),
+        "releasing the fresh session's permit frees the single slot exactly once"
+    );
+}
+
 #[test]
 fn abandoned_worker_warm_up_does_not_mark_model_resident() {
     // Regression test for the "late write-back after abandonment" hazard
@@ -2566,6 +2660,7 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
         cancel_requested: Arc::new(AtomicBool::new(false)),
         activity,
         abandoned: AtomicBool::new(false),
+        permit: Mutex::new(None),
     });
     let send_result = sender
         .send(NativeStreamingWorkerMessage::Attach {
@@ -2576,7 +2671,6 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
             outcomes: outcome_tx,
             finalize_requested: Arc::new(AtomicBool::new(false)),
             token,
-            model_session_permit: None,
         })
         .await;
     assert!(
