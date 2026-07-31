@@ -145,9 +145,9 @@ fn encode_qwen_audio_embeddings_cached(
 
 const QWEN3_EXECUTOR_ID: &str = "qwen3-asr-ggml-executor-v1";
 const QWEN3_STREAMING_EXECUTOR_ID: &str = "qwen3-asr-ggml-snapshot-streaming-executor-v1";
-const QWEN3_DECODE_MIN_GENERATED_TOKENS: usize = 128;
-const QWEN3_DECODE_TOKENS_PER_AUDIO_SECOND: usize = 12;
-const QWEN3_DECODE_TOKEN_BUDGET_MARGIN: usize = 32;
+pub(crate) const QWEN3_DECODE_MIN_GENERATED_TOKENS: usize = 128;
+pub(crate) const QWEN3_DECODE_TOKENS_PER_AUDIO_SECOND: usize = 12;
+pub(crate) const QWEN3_DECODE_TOKEN_BUDGET_MARGIN: usize = 32;
 const QWEN3_DECODE_PROFILE_ENV: &str = "OPENASR_QWEN_DECODE_PROFILE";
 
 fn qwen_decode_profile_enabled() -> bool {

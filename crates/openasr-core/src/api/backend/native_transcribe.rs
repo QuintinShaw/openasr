@@ -1209,9 +1209,9 @@ fn run_native_transcription_impl(
     // by CLI and server -- both funnel through this function -- and runs
     // before `resolve_native_longform_policy` / dispatch, i.e. before the
     // real graph build, not in the server route layer (which the CLI never
-    // goes through). Currently only wired for moss-transcribe-diarize; other
-    // native families fall through to "allow" until their frontend audio-
-    // token rate is derived (see `moss_native_capacity_admission_facts`).
+    // goes through). Wired per family via `native_capacity_admission_facts`
+    // (moss-transcribe-diarize, qwen3-asr); families without a wired deriver
+    // fall through to "allow".
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
     // The backend this request will actually dispatch on, resolved the same
     // way `resolved_runtime_for_request` further down resolves it (explicit
@@ -2149,17 +2149,11 @@ fn apply_speaker_turns(
     transcription
 }
 
-/// This request's decoder KV admission facts for
-/// `moss-transcribe-diarize` -- the only family whose frontend audio-token
-/// rate is actually derived and pinned today (see `crate::capacity`'s
-/// frontend registry doc comment: the other four `Derived` families,
-/// qwen3-asr, firered-llm, mimo-asr, cohere-transcribe, still only carry a
-/// `PackCarried` provenance placeholder, not a computed rate). `None` means
-/// this family stays admission-unchecked this round -- opt-in, matching
-/// `CapacityModelDeclaration`'s own philosophy, not an oversight; wiring a
-/// family here without a real derived rate would either guess (risking a
-/// false rejection) or check nothing, so it is left for that family's own
-/// frontend-geometry follow-up.
+/// This request's decoder KV admission facts for `moss-transcribe-diarize`,
+/// assembled from the loaded pack's decoder + adaptor metadata. `None` leaves
+/// the request admission-unchecked (fail open). See
+/// [`native_capacity_admission_facts`] for how the per-family derivers are
+/// dispatched and which families are wired.
 fn moss_native_capacity_admission_facts(
     metadata: &crate::ggml_runtime::GgufMetadata,
     audio_duration_seconds: f32,
@@ -2224,18 +2218,82 @@ fn moss_native_capacity_admission_facts(
     Some((geometry, spec, required_positions))
 }
 
+/// This request's decoder KV admission facts for `qwen3-asr`, assembled from
+/// the loaded pack's LLM decoder metadata (`crate::models::qwen::capacity`).
+/// qwen3's audio-token rate IS derivable from pack metadata (the mel
+/// hop/sample-rate plus the fixed 3x stride-2 conv stem), so unlike the other
+/// still-`PackCarried` `Derived` families it is wired here. `None` (a pack
+/// whose qwen metadata does not parse) leaves the request admission-unchecked
+/// (fail open). The KV element-type policy is resolved from the SAME
+/// `resolve_qwen_family_production_kv_cache_policy(backend, head_dim)` the real
+/// decoder allocates against, so admission's spec matches the runtime's (q8_0
+/// on CPU/Metal with native GQA at head_dim 128, not the worst-case DEFAULT).
+fn qwen3_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<(
+    crate::capacity::KvGeometry,
+    crate::nn::decoder::LlmKvCacheSpec,
+    usize,
+)> {
+    let execution_metadata =
+        crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(metadata).ok()?;
+    let geometry = crate::models::qwen::capacity::qwen3_kv_geometry(&execution_metadata);
+    let required_positions = crate::models::qwen::capacity::qwen3_admission_required_positions(
+        &execution_metadata,
+        audio_duration_seconds,
+    );
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    Some((geometry, spec, required_positions))
+}
+
+/// The per-family KV admission facts deriver for `model_architecture`, or
+/// `None` when this architecture has no wired deriver (fail open -- left
+/// admission-unchecked, exactly as before this check existed). Each wired arm
+/// derives `(KvGeometry, kv-cache spec, required decoder positions)` from the
+/// loaded pack; a new family opts in by adding an arm plus its own family-level
+/// `capacity` deriver, keeping the model-agnostic admission machinery
+/// (`crate::capacity`) free of family geometry.
+///
+/// Wired today: moss-transcribe-diarize and qwen3-asr. The remaining `Derived`
+/// families (firered-llm, mimo-asr, cohere-transcribe) still carry only a
+/// `PackCarried` frontend-rate placeholder in `crate::capacity`'s registry and
+/// stay unchecked until their audio-token rate is derived.
+fn native_capacity_admission_facts(
+    model_architecture: &str,
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<(
+    crate::capacity::KvGeometry,
+    crate::nn::decoder::LlmKvCacheSpec,
+    usize,
+)> {
+    if model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
+        moss_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
+    } else if model_architecture == crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID {
+        qwen3_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
+    } else {
+        None
+    }
+}
+
 /// Reject this request before building its decode graph if its decoder KV
 /// footprint plainly does not fit this host's memory budget -- a pack whose
 /// KV cache plus weights exceed the host memory budget, the root cause class
 /// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
-/// of an actionable error. Only wired for moss-transcribe-diarize today (see
-/// `moss_native_capacity_admission_facts`); qwen3-asr and the other native
-/// families are left unchecked until their frontend audio-token rate is
-/// derived. Fails OPEN whenever the answer is uncertain rather than
-/// definite -- an unresolvable family, unprobeable host RAM, or an unreadable
-/// pack file all fall through to "allow" (`crate::capacity`'s invariant:
-/// refuse only when certain it will not fit; the worst case is then no worse
-/// than today's raw ggml error).
+/// of an actionable error (issue #159 on CPU). Wired per family through
+/// [`native_capacity_admission_facts`] (moss-transcribe-diarize, qwen3-asr);
+/// families without a wired deriver stay unchecked. Fails OPEN whenever the
+/// answer is uncertain rather than definite -- an unresolvable family,
+/// unprobeable host RAM, or an unreadable pack file all fall through to
+/// "allow" (`crate::capacity`'s invariant: refuse only when certain it will
+/// not fit; the worst case is then no worse than today's raw ggml error).
 fn enforce_native_host_memory_admission(
     model_architecture: &str,
     metadata: &crate::ggml_runtime::GgufMetadata,
@@ -2243,12 +2301,12 @@ fn enforce_native_host_memory_admission(
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<(), BackendError> {
-    if model_architecture != crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
-        return Ok(());
-    }
-    let Some((geometry, spec, required_positions)) =
-        moss_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
-    else {
+    let Some((geometry, spec, required_positions)) = native_capacity_admission_facts(
+        model_architecture,
+        metadata,
+        audio_duration_seconds,
+        backend,
+    ) else {
         return Ok(());
     };
     let Some(host_total_memory_bytes) = crate::host::host_total_memory_bytes() else {
@@ -3437,13 +3495,14 @@ mod tests {
     /// A family this round has not wired (its frontend audio-token rate is
     /// still an unresolved `PackCarried` placeholder, see
     /// `crate::capacity`'s frontend registry) must return `None`, not guess --
-    /// opt-in, not a blanket check.
+    /// opt-in, not a blanket check. firered-llm stands in for the still-unwired
+    /// `Derived` families (firered-llm / mimo-asr / cohere-transcribe).
     #[test]
     fn enforce_native_host_memory_admission_skips_unwired_families() {
         let metadata = moss_shipped_pack_metadata_for_test();
         assert!(
             enforce_native_host_memory_admission(
-                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
                 &metadata,
                 Path::new("/nonexistent/does-not-matter.oasr"),
                 3600.0,
@@ -3451,6 +3510,131 @@ mod tests {
             )
             .is_ok(),
             "an unwired family must be allowed through unconditionally, not guessed at"
+        );
+    }
+
+    /// Synthetic GGUF metadata carrying the real 1.7B qwen3-asr checkpoint's
+    /// shape (the same values `qwen::capacity`'s reference fixture and
+    /// `runtime_contract`'s tests use), so the admission dispatch reads real
+    /// pack metadata through `parse_qwen3_execution_metadata` deterministically
+    /// and without a pack file.
+    fn qwen3_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+        use crate::models::qwen::runtime_contract::*;
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
+            V::String(QWEN3_ARCHITECTURE_VALUE.to_string()),
+        );
+        for (key, value) in [
+            (QWEN3_SAMPLE_RATE_KEY, 16_000u64),
+            (QWEN3_MELS_COUNT_KEY, 128),
+            (QWEN3_N_FFT_KEY, 400),
+            (QWEN3_WIN_LENGTH_KEY, 400),
+            (QWEN3_HOP_LENGTH_KEY, 160),
+            (QWEN3_AUDIO_LAYERS_KEY, 18),
+            (QWEN3_AUDIO_D_MODEL_KEY, 1280),
+            (QWEN3_AUDIO_HEADS_KEY, 20),
+            (QWEN3_LLM_LAYERS_KEY, 28),
+            (QWEN3_LLM_D_MODEL_KEY, 2048),
+            (QWEN3_LLM_HEADS_KEY, 16),
+            (QWEN3_LLM_KV_HEADS_KEY, 8),
+            (QWEN3_LLM_HEAD_DIM_KEY, 128),
+            (QWEN3_LLM_VOCAB_SIZE_KEY, 152_064),
+            (QWEN3_LLM_MAX_POSITIONS_KEY, 40_960),
+            (QWEN3_AUDIO_START_TOKEN_ID_KEY, 151_647),
+            (QWEN3_AUDIO_END_TOKEN_ID_KEY, 151_648),
+            (QWEN3_AUDIO_PAD_TOKEN_ID_KEY, 151_649),
+            (QWEN3_EOS_TOKEN_ID_KEY, 151_645),
+            (QWEN3_PAD_TOKEN_ID_KEY, 151_643),
+        ] {
+            values.insert(key.to_string(), V::U64(value));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// qwen3-asr is now wired: the dispatch derives real facts from pack
+    /// metadata (KV geometry off the LLM decoder keys, spec from the same
+    /// resolver the decoder allocates against -- Q8_0 on CPU at head_dim 128).
+    #[test]
+    fn qwen3_capacity_admission_facts_derive_from_pack_metadata() {
+        let metadata = qwen3_shipped_pack_metadata_for_test();
+        let (geometry, spec, positions) = native_capacity_admission_facts(
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            &metadata,
+            30.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("qwen3-shaped metadata must derive admission facts");
+        assert_eq!(
+            geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 28,
+                kv_heads: 8,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        // Cross-checked against the family deriver directly (not a magic number).
+        assert_eq!(
+            positions,
+            crate::models::qwen::capacity::qwen3_admission_required_positions(
+                &crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(&metadata)
+                    .expect("parses"),
+                30.0,
+            )
+        );
+    }
+
+    /// The gap this fix closes for qwen3: a pack whose weights plus decode KV
+    /// plainly exceed a small host's budget is refused with a typed,
+    /// actionable `NativeInsufficientHostMemory` error BEFORE the graph build,
+    /// not left to surface as an opaque ggml allocation failure (issue #159).
+    #[test]
+    fn enforce_native_host_memory_admission_rejects_oversized_qwen3_on_tiny_host() {
+        let metadata = qwen3_shipped_pack_metadata_for_test();
+        let (geometry, spec, positions) = native_capacity_admission_facts(
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            &metadata,
+            30.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("qwen3-shaped metadata must derive admission facts");
+        // The real shipped qwen3-asr-1.7b fp16 pack is ~4.7 GiB; on a 2 GiB
+        // host the pack alone plainly overflows RAM + (unprobeable) swap.
+        let pack_bytes_on_disk: u64 = 4_704_801_920;
+        let tiny_host_bytes: u64 = 2 * 1024 * 1024 * 1024;
+        let rejection = crate::capacity::evaluate_host_memory_admission(
+            &geometry,
+            spec,
+            positions,
+            pack_bytes_on_disk,
+            tiny_host_bytes,
+            crate::capacity::MemoryAdmissionDomain::UnifiedMemory { swap_bytes: 0 },
+        )
+        .expect_err("a 4.7 GiB pack cannot fit a 2 GiB host");
+        let message = rejection.user_message();
+        assert!(message.contains("needs about"), "{message}");
+        assert!(message.contains("Try a smaller quantization"), "{message}");
+        assert!(
+            message.contains("core.native.capacity.admission:reject"),
+            "{message}"
+        );
+
+        // A comfortable host (64 GiB) admits the identical request.
+        let roomy_host_bytes: u64 = 64 * 1024 * 1024 * 1024;
+        assert!(
+            crate::capacity::evaluate_host_memory_admission(
+                &geometry,
+                spec,
+                positions,
+                pack_bytes_on_disk,
+                roomy_host_bytes,
+                crate::capacity::MemoryAdmissionDomain::UnifiedMemory { swap_bytes: 0 },
+            )
+            .is_ok(),
+            "the same qwen3 request must be admitted on a 64 GiB host"
         );
     }
 
