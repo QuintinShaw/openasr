@@ -286,6 +286,7 @@ mod tests {
             &|text| text,
             &mut |_step, _token, _eot| {},
             &mut |_step, _logits| {},
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("greedy decode");
 
@@ -431,6 +432,7 @@ mod tests {
             &|text| text,
             &mut |_step, _token, _eot| {},
             &mut |_step, _logits| {},
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("greedy decode");
 

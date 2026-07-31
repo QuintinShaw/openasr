@@ -269,6 +269,17 @@ pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<Audi
         crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
             crate::models::moss_transcribe_diarize::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
         ),
+        // granite-speech's acoustic path is the Conformer CTC encoder
+        // (`encoder.*`) plus the Q-Former window projector (`projector.*`);
+        // both must stay at/above the Q8_0 floor for encode fidelity, while
+        // the Granite decoder-only LLM (`language_model.*`) legitimately keeps
+        // the full requested rung. The importer ships fp16 today (see
+        // `granite_speech::package_import`), so no real pack carries a
+        // block-quant tensor here yet -- this rule floors the acoustic half of
+        // any future quantized pack rather than shipping a decode cliff.
+        crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(&["encoder.", "projector."])
+        }
         // MiMo's external converter quantizes ONLY the Qwen2 backbone; the
         // whole audio side (tokenizer encoder, input-local layers, speech
         // embeddings) stays f16/f32 for encode fidelity. Unlike the families

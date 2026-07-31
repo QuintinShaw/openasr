@@ -455,8 +455,8 @@ pub(crate) mod source_tree_audit {
         // Guards the walk itself: a rename that stops matching the driver call
         // would otherwise make this test vacuously pass.
         assert_eq!(
-            checked, 8,
-            "expected the 8 SharedSeq2SeqGreedy ASR families to be found by this walk"
+            checked, 9,
+            "expected the 9 SharedSeq2SeqGreedy ASR families to be found by this walk"
         );
     }
 

@@ -24,10 +24,9 @@ use hparams::{
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
     FIRERED_LLM_HPARAM_SCHEMA, GRANITE_SPEECH_HPARAM_SCHEMA, MIMO_ASR_HPARAM_SCHEMA,
     MOONSHINE_HPARAM_SCHEMA, MOSS_TD_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
-    PARAKEET_TDT_HPARAM_SCHEMA,
-    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
-    QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA,
-    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
+    PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
+    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA,
+    WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -2579,6 +2578,12 @@ mod tests {
             (
                 MOSS_TD_GGML_ARCHITECTURE_ID,
                 derived(CapacityAudioBound::DecoderContext),
+            ),
+            (
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+                CapacityModelDeclaration::BoundedElsewhere {
+                    by: "shared-window slice; no decoder max-position pack key to derive from",
+                },
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();

@@ -40,17 +40,19 @@ use super::runtime_contract::{
 use super::runtime_provider::load_tensors_from_oasr_pack;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::{GgmlCpuGraphConfig, read_gguf_metadata};
+use crate::ggml_runtime::read_gguf_metadata;
+use crate::models::decode_policy_component_registry::{
+    BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
+    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+};
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
     GgmlAsrPreparedAudio,
 };
-use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError,
-    run_seq2seq_greedy_decode_loop_with_adapter_v0,
-};
+use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
+use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
 
-use crate::arch::GRANITE_SPEECH_GGML_ADAPTER_ID;
+use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_ID};
 
 const GRANITE_SPEECH_EXECUTOR_ID: &str = "granite-speech-ggml-executor-v1";
 const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
@@ -81,6 +83,27 @@ enum GraniteSpeechGgmlExecutorError {
     PromptFailed { reason: String },
     #[error("granite-speech ggml executor decode failed: {reason}")]
     DecodeFailed { reason: String },
+}
+
+/// No-op phrase-bias shim: granite-speech applies keyword biasing through its
+/// own prompt convention (the `Keywords:` suffix assembled above), never the
+/// shared decode-time logit-boost path, so the registry-routed greedy loop is
+/// handed a token source that contributes nothing -- mirrors
+/// `mimo_asr::executor::NoPhraseBiasTokenSource`.
+struct NoPhraseBiasTokenSource;
+impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
+    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
+        Ok(None)
+    }
+}
+impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
+
+fn map_registry_error(
+    error: BuiltinDecodePolicyComponentRegistryError,
+) -> Seq2SeqGreedyDecodeError {
+    Seq2SeqGreedyDecodeError::DecoderStepFailed {
+        reason: error.to_string(),
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -115,7 +138,7 @@ impl GraniteSpeechGgmlExecutor {
             }
         })?;
 
-        let backend = GgmlCpuGraphConfig::resolve_runtime_backend();
+        let backend = request.resolved_runtime.backend();
 
         let metadata = read_gguf_metadata(pack_path).map_err(|error| {
             GraniteSpeechGgmlExecutorError::MetadataFailed {
@@ -216,15 +239,18 @@ impl GraniteSpeechGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        let decode_config = Seq2SeqGreedyDecodeConfig {
+        // Greedy decode rides the one shared driver via the decode-policy
+        // registry (AGENTS.md single-driver invariant): the registered
+        // `GRANITE_SPEECH_DECODE_POLICY_ID` descriptor supplies the
+        // stop-token / suppression / postprocess policy, this executor only
+        // hands over the config inputs, the step executor, and the token
+        // decoder. Keyword biasing is done in the prompt above, so the token
+        // source contributes nothing and `phrase_bias` stays `None`.
+        let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: prompt_token_ids,
             eot_token_id: GRANITE_SPEECH_EOT_TOKEN_ID,
-            stop_token_ids: vec![],
             vocab_size: decoder_config.vocab_size,
             max_generated_tokens: GRANITE_SPEECH_MAX_GENERATED_TOKENS,
-            suppress_first_step_token_ids: vec![],
-            suppress_token_ids: vec![],
-            phrase_biases: vec![],
         };
         let mut step_executor = GraniteSpeechAudioDecodeStepExecutor::new(
             decoder_config,
@@ -240,15 +266,17 @@ impl GraniteSpeechGgmlExecutor {
                     }
                 })
             };
-        let result = run_seq2seq_greedy_decode_loop_with_adapter_v0(
+        let result = run_builtin_seq2seq_decode_policy(
+            GRANITE_SPEECH_DECODE_POLICY_ID,
             &decode_config,
+            &NoPhraseBiasTokenSource,
+            None,
             &mut step_executor,
             &decode_text_token_ids,
-            |error| error,
-            |error| error,
-            &|text| text,
-            &mut |_step, _token, _eot| {},
-            &mut |_step, _logits| {},
+            |error: Seq2SeqGreedyDecodeError| error,
+            |error: Seq2SeqGreedyDecodeError| error,
+            map_registry_error,
+            &request.execution_context.control,
         )
         .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
             reason: error.to_string(),
@@ -258,6 +286,8 @@ impl GraniteSpeechGgmlExecutor {
             / request.prepared_audio.sample_rate_hz.max(1) as f32;
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
                 text: result.text.clone(),
                 segments: vec![Segment {
                     start: 0.0,
@@ -265,13 +295,18 @@ impl GraniteSpeechGgmlExecutor {
                     text: result.text,
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
                 longform: None,
                 language: None,
             },
             carry_context: None,
+            // No intra-decode timestamps -- the single segment spans the whole
+            // buffer -- so the cut point has no honest second to name, same as
+            // mimo-asr / firered-aed.
+            decode_truncation: result.stop_reason.into_decode_truncation(None),
         })
     }
 }
