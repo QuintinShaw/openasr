@@ -16,6 +16,7 @@
 //! - The Conformer encoder graph ([`encoder_graph`]), the KV-cached decoder
 //!   ([`decoder_graph`]), and the dedicated [`executor`] complete the stage.
 
+pub(crate) mod capacity;
 pub(crate) mod decoder_graph;
 pub(crate) mod decoder_weights;
 pub(crate) mod encoder_graph;

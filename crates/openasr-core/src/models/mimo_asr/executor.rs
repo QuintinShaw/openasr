@@ -61,8 +61,8 @@ const MIMO_ASR_STREAMING_EXECUTOR_ID: &str = "mimo-asr-ggml-snapshot-streaming-e
 /// = 30 * sampling_rate`); this executor instead fails closed above that same
 /// bound and leaves multi-chunk orchestration to the shared longform slicer
 /// (mirrors `firered_llm`'s upstream-hard-cap precedent).
-const MIMO_ASR_MAX_INPUT_SECONDS: f32 = 30.0;
-const MIMO_ASR_MAX_GENERATED_TOKENS: usize = 512;
+pub(crate) const MIMO_ASR_MAX_INPUT_SECONDS: f32 = 30.0;
+pub(crate) const MIMO_ASR_MAX_GENERATED_TOKENS: usize = 512;
 
 #[derive(Debug, Error)]
 enum MimoAsrExecutorError {

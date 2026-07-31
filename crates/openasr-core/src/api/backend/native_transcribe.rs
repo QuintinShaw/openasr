@@ -1209,9 +1209,12 @@ fn run_native_transcription_impl(
     // by CLI and server -- both funnel through this function -- and runs
     // before `resolve_native_longform_policy` / dispatch, i.e. before the
     // real graph build, not in the server route layer (which the CLI never
-    // goes through). Wired per family via `native_capacity_admission_facts`
-    // (moss-transcribe-diarize, qwen3-asr); families without a wired deriver
-    // fall through to "allow".
+    // goes through). Wired per family via `native_capacity_admission_facts`;
+    // families without a wired deriver fall through to "allow". A request
+    // whose speaker plan runs the external attribution pass is additionally
+    // charged that pass's co-resident embedder footprint
+    // (`external_speaker_attribution_admission_bytes`) -- the pass this very
+    // check must run ahead of.
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
     // The backend this request will actually dispatch on, resolved the same
     // way `resolved_runtime_for_request` further down resolves it (explicit
@@ -1235,6 +1238,7 @@ fn run_native_transcription_impl(
         runtime_source.path(),
         audio_duration_seconds,
         admission_backend,
+        external_speaker_attribution_admission_bytes(speaker_plan),
     )?;
 
     // Compute speaker turns up front (independent of the transcript) so they can
@@ -2149,6 +2153,24 @@ fn apply_speaker_turns(
     transcription
 }
 
+/// One family's decoder-KV admission facts, derived from the loaded pack by
+/// the per-family dispatch ([`native_capacity_admission_facts`]) and consumed
+/// by [`enforce_native_host_memory_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeKvAdmissionFacts {
+    geometry: crate::capacity::KvGeometry,
+    spec: crate::nn::decoder::LlmKvCacheSpec,
+    /// Decoder positions charged through the shared positional KV model
+    /// (`crate::capacity::kv_bytes_at_positions`).
+    required_positions: usize,
+    /// Exact resident bytes of decode state the family allocates at fixed
+    /// per-pack ceilings outside the positional model (the AED families'
+    /// full-span f16 self-KV arenas; see `cohere::capacity` /
+    /// `firered_aed::capacity`). Zero for the Qwen-shaped LLM families, whose
+    /// entire decode KV state is positional.
+    fixed_decode_state_bytes: u64,
+}
+
 /// This request's decoder KV admission facts for `moss-transcribe-diarize`,
 /// assembled from the loaded pack's decoder + adaptor metadata. `None` leaves
 /// the request admission-unchecked (fail open). See
@@ -2158,11 +2180,7 @@ fn moss_native_capacity_admission_facts(
     metadata: &crate::ggml_runtime::GgufMetadata,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<(
-    crate::capacity::KvGeometry,
-    crate::nn::decoder::LlmKvCacheSpec,
-    usize,
-)> {
+) -> Option<NativeKvAdmissionFacts> {
     let decoder =
         crate::models::moss_transcribe_diarize::runtime_contract::parse_decoder_metadata(metadata)
             .ok()?;
@@ -2215,7 +2233,12 @@ fn moss_native_capacity_admission_facts(
         geometry.head_dim,
     )
     .to_spec();
-    Some((geometry, spec, required_positions))
+    Some(NativeKvAdmissionFacts {
+        geometry,
+        spec,
+        required_positions,
+        fixed_decode_state_bytes: 0,
+    })
 }
 
 /// This request's decoder KV admission facts for `qwen3-asr`, assembled from
@@ -2232,11 +2255,7 @@ fn qwen3_native_capacity_admission_facts(
     metadata: &crate::ggml_runtime::GgufMetadata,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<(
-    crate::capacity::KvGeometry,
-    crate::nn::decoder::LlmKvCacheSpec,
-    usize,
-)> {
+) -> Option<NativeKvAdmissionFacts> {
     let execution_metadata =
         crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(metadata).ok()?;
     let geometry = crate::models::qwen::capacity::qwen3_kv_geometry(&execution_metadata);
@@ -2249,37 +2268,201 @@ fn qwen3_native_capacity_admission_facts(
         geometry.head_dim,
     )
     .to_spec();
-    Some((geometry, spec, required_positions))
+    Some(NativeKvAdmissionFacts {
+        geometry,
+        spec,
+        required_positions,
+        fixed_decode_state_bytes: 0,
+    })
+}
+
+/// This request's decoder KV admission facts for `firered-llm`, assembled
+/// from the loaded pack's Qwen2 decoder + adapter metadata
+/// (`crate::models::firered_llm::capacity`). `None` (a pack whose firered-llm
+/// metadata does not parse) leaves the request admission-unchecked (fail
+/// open). The KV element-type policy is resolved from the SAME
+/// `resolve_qwen_family_production_kv_cache_policy(backend, head_dim)` the
+/// real decoder allocates against
+/// (`Qwen3AsrLlmWholeDecoderGraphExecutor` construction).
+fn firered_llm_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<NativeKvAdmissionFacts> {
+    let decoder =
+        crate::models::firered_llm::runtime_contract::parse_firered_llm_decoder_metadata(metadata)
+            .ok()?;
+    let adapter =
+        crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(metadata)
+            .ok()?;
+    let geometry = crate::models::firered_llm::capacity::firered_llm_kv_geometry(&decoder);
+    let required_positions =
+        crate::models::firered_llm::capacity::firered_llm_admission_required_positions(
+            &adapter,
+            audio_duration_seconds,
+        );
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    Some(NativeKvAdmissionFacts {
+        geometry,
+        spec,
+        required_positions,
+        fixed_decode_state_bytes: 0,
+    })
+}
+
+/// This request's decoder KV admission facts for `mimo-asr`, assembled from
+/// the loaded pack's Qwen2 backbone + mel/tokenizer/input-local metadata
+/// (`crate::models::mimo_asr::capacity`). `None` (a pack whose mimo metadata
+/// does not parse) leaves the request admission-unchecked (fail open). Spec
+/// resolution matches the real decoder's constructor, as for the other
+/// Qwen-shaped families.
+fn mimo_asr_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<NativeKvAdmissionFacts> {
+    let llm = crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(metadata).ok()?;
+    let mel = crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(metadata).ok()?;
+    let audiotok =
+        crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(metadata).ok()?;
+    let inlocal =
+        crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(metadata).ok()?;
+    let geometry = crate::models::mimo_asr::capacity::mimo_asr_kv_geometry(&llm);
+    let required_positions =
+        crate::models::mimo_asr::capacity::mimo_asr_admission_required_positions(
+            &mel,
+            &audiotok,
+            &inlocal,
+            audio_duration_seconds,
+        );
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    Some(NativeKvAdmissionFacts {
+        geometry,
+        spec,
+        required_positions,
+        fixed_decode_state_bytes: 0,
+    })
+}
+
+/// This request's decoder KV admission facts for `cohere-transcribe`
+/// (`crate::models::cohere::capacity`): the fixed per-pack allocations the
+/// AED decoder runtime makes at construction -- chunk-cap cross-KV frames
+/// through the positional model, the full-context f16 self-KV arena as exact
+/// fixed bytes. Request-independent (see the capacity module's doc), and
+/// backend-independent (the arena element types do not vary by backend).
+/// `None` (unparseable cohere metadata) leaves the request
+/// admission-unchecked (fail open).
+fn cohere_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+) -> Option<NativeKvAdmissionFacts> {
+    let execution_metadata =
+        crate::models::cohere::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            metadata,
+        )
+        .ok()?;
+    Some(NativeKvAdmissionFacts {
+        geometry: crate::models::cohere::capacity::cohere_kv_geometry(&execution_metadata),
+        spec: crate::models::cohere::capacity::COHERE_ADMISSION_KV_SPEC,
+        required_positions: crate::models::cohere::capacity::cohere_admission_required_positions(
+            &execution_metadata,
+        ),
+        fixed_decode_state_bytes:
+            crate::models::cohere::capacity::cohere_admission_fixed_self_kv_bytes(
+                &execution_metadata,
+            ),
+    })
+}
+
+/// This request's decoder KV admission facts for `firered-aed`
+/// (`crate::models::firered_aed::capacity`): same fixed-allocation shape as
+/// cohere-transcribe -- chunk-cap cross-KV frames through the positional
+/// model, the full `decoder_pe_len` f16 self-KV arena as exact fixed bytes.
+/// `None` (unparseable firered-aed metadata) leaves the request
+/// admission-unchecked (fail open).
+fn firered_aed_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+) -> Option<NativeKvAdmissionFacts> {
+    let execution_metadata =
+        crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
+            metadata,
+        )
+        .ok()?;
+    Some(NativeKvAdmissionFacts {
+        geometry: crate::models::firered_aed::capacity::firered_aed_kv_geometry(
+            &execution_metadata,
+        ),
+        spec: crate::models::firered_aed::capacity::FIRERED_AED_ADMISSION_KV_SPEC,
+        required_positions:
+            crate::models::firered_aed::capacity::firered_aed_admission_required_positions(
+                &execution_metadata,
+            ),
+        fixed_decode_state_bytes:
+            crate::models::firered_aed::capacity::firered_aed_admission_fixed_self_kv_bytes(
+                &execution_metadata,
+            ),
+    })
 }
 
 /// The per-family KV admission facts deriver for `model_architecture`, or
 /// `None` when this architecture has no wired deriver (fail open -- left
 /// admission-unchecked, exactly as before this check existed). Each wired arm
-/// derives `(KvGeometry, kv-cache spec, required decoder positions)` from the
-/// loaded pack; a new family opts in by adding an arm plus its own family-level
-/// `capacity` deriver, keeping the model-agnostic admission machinery
-/// (`crate::capacity`) free of family geometry.
+/// derives its [`NativeKvAdmissionFacts`] from the loaded pack; a new family
+/// opts in by adding an arm plus its own family-level `capacity` deriver,
+/// keeping the model-agnostic admission machinery (`crate::capacity`) free of
+/// family geometry.
 ///
-/// Wired today: moss-transcribe-diarize and qwen3-asr. The remaining `Derived`
-/// families (firered-llm, mimo-asr, cohere-transcribe) still carry only a
-/// `PackCarried` frontend-rate placeholder in `crate::capacity`'s registry and
-/// stay unchecked until their audio-token rate is derived.
+/// Wired today: every `Derived`-capacity family (moss-transcribe-diarize,
+/// qwen3-asr, firered-llm, mimo-asr, cohere-transcribe) plus firered-aed
+/// (whose fixed-ceiling decoder arenas are large enough to matter even
+/// though its audio bound lives elsewhere). Families that keep no
+/// per-request decoder KV state worth charging (CTC/transducer shapes, the
+/// small `BoundedElsewhere` decoders) stay unchecked.
 fn native_capacity_admission_facts(
     model_architecture: &str,
     metadata: &crate::ggml_runtime::GgufMetadata,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<(
-    crate::capacity::KvGeometry,
-    crate::nn::decoder::LlmKvCacheSpec,
-    usize,
-)> {
+) -> Option<NativeKvAdmissionFacts> {
     if model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
         moss_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
     } else if model_architecture == crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID {
         qwen3_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
+    } else if model_architecture == crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID {
+        firered_llm_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
+    } else if model_architecture == crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID {
+        mimo_asr_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
+    } else if model_architecture == crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID {
+        cohere_native_capacity_admission_facts(metadata)
+    } else if model_architecture == crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID {
+        firered_aed_native_capacity_admission_facts(metadata)
     } else {
         None
+    }
+}
+
+/// The auxiliary resident bytes this request's speaker plan adds to the
+/// admission charge: the VAD + speaker-embedder attribution pass
+/// (`compute_speaker_attribution`) runs right after admission for the
+/// `External` plan only, so only that plan is charged
+/// (`crate::diarize::embed::speaker_attribution_admission_bytes`'s
+/// conservative pack-size-based estimate). `Off` and `InDecoder` requests
+/// never run that pass and must not be made stricter by it. (The `InDecoder`
+/// plan's later voice-id naming stage can also touch the embedder; its
+/// working set is bounded by the same figure but is deliberately not charged
+/// -- degrading naming is that stage's own documented fallback, never an
+/// admission failure.)
+fn external_speaker_attribution_admission_bytes(speaker_plan: SpeakerPlan) -> u64 {
+    match speaker_plan {
+        SpeakerPlan::External => crate::diarize::embed::speaker_attribution_admission_bytes(),
+        SpeakerPlan::Off | SpeakerPlan::InDecoder => 0,
     }
 }
 
@@ -2288,20 +2471,25 @@ fn native_capacity_admission_facts(
 /// KV cache plus weights exceed the host memory budget, the root cause class
 /// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
 /// of an actionable error (issue #159 on CPU). Wired per family through
-/// [`native_capacity_admission_facts`] (moss-transcribe-diarize, qwen3-asr);
-/// families without a wired deriver stay unchecked. Fails OPEN whenever the
-/// answer is uncertain rather than definite -- an unresolvable family,
-/// unprobeable host RAM, or an unreadable pack file all fall through to
-/// "allow" (`crate::capacity`'s invariant: refuse only when certain it will
-/// not fit; the worst case is then no worse than today's raw ggml error).
+/// [`native_capacity_admission_facts`]; families without a wired deriver stay
+/// unchecked. `external_speaker_attribution_bytes` is the extra resident
+/// charge for a request that will run the VAD + speaker-embedder attribution
+/// pass right after admission
+/// ([`external_speaker_attribution_admission_bytes`]; `0` for every other
+/// request). Fails OPEN whenever the answer is uncertain rather than
+/// definite -- an unresolvable family, unprobeable host RAM, or an
+/// unreadable pack file all fall through to "allow" (`crate::capacity`'s
+/// invariant: refuse only when certain it will not fit; the worst case is
+/// then no worse than today's raw ggml error).
 fn enforce_native_host_memory_admission(
     model_architecture: &str,
     metadata: &crate::ggml_runtime::GgufMetadata,
     pack_path: &Path,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    external_speaker_attribution_bytes: u64,
 ) -> Result<(), BackendError> {
-    let Some((geometry, spec, required_positions)) = native_capacity_admission_facts(
+    let Some(facts) = native_capacity_admission_facts(
         model_architecture,
         metadata,
         audio_duration_seconds,
@@ -2316,10 +2504,13 @@ fn enforce_native_host_memory_admission(
         return Ok(());
     };
     if let Err(rejection) = crate::capacity::evaluate_host_memory_admission(
-        &geometry,
-        spec,
-        required_positions,
+        &facts.geometry,
+        facts.spec,
+        facts.required_positions,
         pack_metadata.len(),
+        facts
+            .fixed_decode_state_bytes
+            .saturating_add(external_speaker_attribution_bytes),
         host_total_memory_bytes,
         host_memory_admission_domain_for_backend(backend),
     ) {
@@ -3354,18 +3545,18 @@ mod tests {
         let backend = crate::ggml_runtime::GgmlCpuGraphBackend::Cpu;
 
         // A short recording costs far fewer positions than the ceiling.
-        let (short_geometry, short_spec, short_positions) =
-            moss_native_capacity_admission_facts(&metadata, 11.04, backend)
-                .expect("shipped-shaped metadata must derive admission facts");
+        let short = moss_native_capacity_admission_facts(&metadata, 11.04, backend)
+            .expect("shipped-shaped metadata must derive admission facts");
         assert_eq!(
-            short_geometry,
+            short.geometry,
             crate::capacity::KvGeometry {
                 n_layers: 28,
                 kv_heads: 8,
                 head_dim: 128,
             }
         );
-        assert_eq!(short_spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(short.spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(short.fixed_decode_state_bytes, 0);
         // Cross-check against the same derivation function, called directly
         // on the fixture the capacity module's own regression anchors use --
         // not a hand-computed magic number.
@@ -3374,17 +3565,19 @@ mod tests {
                 &crate::models::moss_transcribe_diarize::capacity::shipped_pack_decoder_fixture(),
                 crate::models::moss_transcribe_diarize::capacity::SHIPPED_MERGE_SIZE,
             );
-        assert_eq!(short_positions, derivation.required_positions_for_chunks(1));
+        assert_eq!(
+            short.required_positions,
+            derivation.required_positions_for_chunks(1)
+        );
 
         // A multi-hour recording is clamped at the 300s integral window (10
         // chunks -> 7806 positions, the same number
         // `required_positions_walks_the_moss_window_from_both_sides` pins in
         // `crate::capacity`'s own tests) rather than judged by its full length.
-        let (_, _, long_positions) =
-            moss_native_capacity_admission_facts(&metadata, 3600.0, backend)
-                .expect("shipped-shaped metadata must derive admission facts");
-        assert_eq!(long_positions, 7806);
-        assert!(short_positions < long_positions);
+        let long = moss_native_capacity_admission_facts(&metadata, 3600.0, backend)
+            .expect("shipped-shaped metadata must derive admission facts");
+        assert_eq!(long.required_positions, 7806);
+        assert!(short.required_positions < long.required_positions);
     }
 
     /// A discrete GPU backend must stay on `DEFAULT`: phase-1 Q8_0 KV is
@@ -3394,13 +3587,13 @@ mod tests {
     #[test]
     fn moss_capacity_admission_facts_stay_default_on_discrete_gpu_backend() {
         let metadata = moss_shipped_pack_metadata_for_test();
-        let (_, spec, _) = moss_native_capacity_admission_facts(
+        let facts = moss_native_capacity_admission_facts(
             &metadata,
             11.04,
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
         )
         .expect("shipped-shaped metadata must derive admission facts");
-        assert_eq!(spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
+        assert_eq!(facts.spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
     }
 
     /// The false-reject regression this fix closes: at the real Q8_0 spec a
@@ -3415,18 +3608,25 @@ mod tests {
         // Derive both specs' facts from the same production dispatch real
         // requests go through, at the two backends that produce each spec,
         // rather than hand-typing geometry/positions here.
-        let (geometry, q8_spec, required_positions) = moss_native_capacity_admission_facts(
+        let q8_facts = moss_native_capacity_admission_facts(
             &metadata,
             3600.0,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("shipped-shaped metadata must derive admission facts");
-        let (_, default_spec, default_positions) = moss_native_capacity_admission_facts(
+        let default_facts = moss_native_capacity_admission_facts(
             &metadata,
             3600.0,
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
         )
         .expect("shipped-shaped metadata must derive admission facts");
+        let (geometry, q8_spec, required_positions) = (
+            q8_facts.geometry,
+            q8_facts.spec,
+            q8_facts.required_positions,
+        );
+        let (default_spec, default_positions) =
+            (default_facts.spec, default_facts.required_positions);
         assert_eq!(q8_spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
         assert_eq!(default_spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
         assert_eq!(required_positions, default_positions);
@@ -3472,6 +3672,7 @@ mod tests {
                 crate::nn::decoder::LlmKvCacheSpec::Q8_0,
                 required_positions,
                 pack_bytes_on_disk,
+                0,
                 host_total_memory_bytes,
                 crate::capacity::MemoryAdmissionDomain::DiscreteVram,
             )
@@ -3484,6 +3685,7 @@ mod tests {
                 crate::nn::decoder::LlmKvCacheSpec::DEFAULT,
                 required_positions,
                 pack_bytes_on_disk,
+                0,
                 host_total_memory_bytes,
                 crate::capacity::MemoryAdmissionDomain::DiscreteVram,
             )
@@ -3492,25 +3694,32 @@ mod tests {
         );
     }
 
-    /// A family this round has not wired (its frontend audio-token rate is
-    /// still an unresolved `PackCarried` placeholder, see
-    /// `crate::capacity`'s frontend registry) must return `None`, not guess --
-    /// opt-in, not a blanket check. firered-llm stands in for the still-unwired
-    /// `Derived` families (firered-llm / mimo-asr / cohere-transcribe).
+    /// A family without a wired deriver must be allowed through
+    /// unconditionally, not guessed at -- opt-in, not a blanket check
+    /// (whisper's fixed 30s window keeps its decode state small enough that
+    /// no deriver is wired). And a WIRED family whose pack metadata does not
+    /// parse must equally fall through to "allow" (fail open), never refuse
+    /// on a guess -- firered-llm against moss-shaped metadata exercises that.
     #[test]
     fn enforce_native_host_memory_admission_skips_unwired_families() {
         let metadata = moss_shipped_pack_metadata_for_test();
-        assert!(
-            enforce_native_host_memory_admission(
-                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
-                &metadata,
-                Path::new("/nonexistent/does-not-matter.oasr"),
-                3600.0,
-                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-            )
-            .is_ok(),
-            "an unwired family must be allowed through unconditionally, not guessed at"
-        );
+        for architecture in [
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+        ] {
+            assert!(
+                enforce_native_host_memory_admission(
+                    architecture,
+                    &metadata,
+                    Path::new("/nonexistent/does-not-matter.oasr"),
+                    3600.0,
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                    0,
+                )
+                .is_ok(),
+                "'{architecture}' must be allowed through unconditionally, not guessed at"
+            );
+        }
     }
 
     /// Synthetic GGUF metadata carrying the real 1.7B qwen3-asr checkpoint's
@@ -3560,7 +3769,7 @@ mod tests {
     #[test]
     fn qwen3_capacity_admission_facts_derive_from_pack_metadata() {
         let metadata = qwen3_shipped_pack_metadata_for_test();
-        let (geometry, spec, positions) = native_capacity_admission_facts(
+        let facts = native_capacity_admission_facts(
             crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             &metadata,
             30.0,
@@ -3568,17 +3777,18 @@ mod tests {
         )
         .expect("qwen3-shaped metadata must derive admission facts");
         assert_eq!(
-            geometry,
+            facts.geometry,
             crate::capacity::KvGeometry {
                 n_layers: 28,
                 kv_heads: 8,
                 head_dim: 128,
             }
         );
-        assert_eq!(spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(facts.spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(facts.fixed_decode_state_bytes, 0);
         // Cross-checked against the family deriver directly (not a magic number).
         assert_eq!(
-            positions,
+            facts.required_positions,
             crate::models::qwen::capacity::qwen3_admission_required_positions(
                 &crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(&metadata)
                     .expect("parses"),
@@ -3594,13 +3804,14 @@ mod tests {
     #[test]
     fn enforce_native_host_memory_admission_rejects_oversized_qwen3_on_tiny_host() {
         let metadata = qwen3_shipped_pack_metadata_for_test();
-        let (geometry, spec, positions) = native_capacity_admission_facts(
+        let facts = native_capacity_admission_facts(
             crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             &metadata,
             30.0,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("qwen3-shaped metadata must derive admission facts");
+        let (geometry, spec, positions) = (facts.geometry, facts.spec, facts.required_positions);
         // The real shipped qwen3-asr-1.7b fp16 pack is ~4.7 GiB; on a 2 GiB
         // host the pack alone plainly overflows RAM + (unprobeable) swap.
         let pack_bytes_on_disk: u64 = 4_704_801_920;
@@ -3610,6 +3821,7 @@ mod tests {
             spec,
             positions,
             pack_bytes_on_disk,
+            0,
             tiny_host_bytes,
             crate::capacity::MemoryAdmissionDomain::UnifiedMemory { swap_bytes: 0 },
         )
@@ -3630,11 +3842,446 @@ mod tests {
                 spec,
                 positions,
                 pack_bytes_on_disk,
+                0,
                 roomy_host_bytes,
                 crate::capacity::MemoryAdmissionDomain::UnifiedMemory { swap_bytes: 0 },
             )
             .is_ok(),
             "the same qwen3 request must be admitted on a 64 GiB host"
+        );
+    }
+
+    /// Synthetic GGUF metadata carrying the real FireRedASR2-LLM checkpoint's
+    /// decoder + adapter facts (the same values `firered_llm::runtime_contract`'s
+    /// own fixture parses), so the admission dispatch reads real pack metadata
+    /// deterministically and without a pack file. Encoder keys are omitted on
+    /// purpose: the admission deriver only parses the decoder + adapter
+    /// subset.
+    fn firered_llm_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+        use crate::models::firered_llm::runtime_contract::*;
+
+        let mut values = std::collections::BTreeMap::new();
+        for (key, value) in [
+            (FIRERED_LLM_ADAPTER_DOWNSAMPLE_RATE_KEY, 2u64),
+            (FIRERED_LLM_ADAPTER_LLM_DIM_KEY, 3584),
+            (FIRERED_LLM_LLM_N_LAYERS_KEY, 28),
+            (FIRERED_LLM_LLM_D_MODEL_KEY, 3584),
+            (FIRERED_LLM_LLM_N_HEADS_KEY, 28),
+            (FIRERED_LLM_LLM_N_KV_HEADS_KEY, 4),
+            (FIRERED_LLM_LLM_HEAD_DIM_KEY, 128),
+            (FIRERED_LLM_LLM_FFN_DIM_KEY, 18_944),
+            (FIRERED_LLM_LLM_VOCAB_SIZE_KEY, 152_064),
+            (FIRERED_LLM_LLM_MAX_POSITIONS_KEY, 32_768),
+            (FIRERED_LLM_CHATML_IM_START_TOKEN_ID_KEY, 151_644),
+            (FIRERED_LLM_CHATML_IM_END_TOKEN_ID_KEY, 151_645),
+            (FIRERED_LLM_ENDOFTEXT_TOKEN_ID_KEY, 151_643),
+            (FIRERED_LLM_SPEECH_TOKEN_ID_KEY, 151_646),
+        ] {
+            values.insert(key.to_string(), V::U64(value));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// firered-llm is now wired: geometry off the pack's Qwen2 decoder keys,
+    /// spec from the same resolver the real decoder allocates against (Q8_0
+    /// on CPU at head_dim 128), positions cross-checked against the family
+    /// deriver, and the single-decode clamp holding for a multi-hour file.
+    #[test]
+    fn firered_llm_capacity_admission_facts_derive_from_pack_metadata() {
+        let metadata = firered_llm_shipped_pack_metadata_for_test();
+        let facts = native_capacity_admission_facts(
+            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            &metadata,
+            40.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("firered-llm-shaped metadata must derive admission facts");
+        assert_eq!(
+            facts.geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 28,
+                kv_heads: 4,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(facts.spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(facts.fixed_decode_state_bytes, 0);
+        let adapter =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(
+                &metadata,
+            )
+            .expect("parses");
+        assert_eq!(
+            facts.required_positions,
+            crate::models::firered_llm::capacity::firered_llm_admission_required_positions(
+                &adapter, 40.0,
+            )
+        );
+        // A multi-hour recording clamps to the 40s single-decode window.
+        let at_hour = native_capacity_admission_facts(
+            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            &metadata,
+            3600.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("facts");
+        assert_eq!(at_hour, facts);
+    }
+
+    /// Synthetic GGUF metadata carrying the real MiMo-Audio checkpoint's
+    /// facts (the same values `mimo_asr::runtime_contract`'s own fixture
+    /// parses), value-typed exactly as the converter bakes them (u32 scalars,
+    /// f32 hparams, bool flags, the u32 codebook-size array).
+    fn mimo_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+
+        let mut values = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("mimo.llm.block_count", 36u32),
+            ("mimo.llm.embedding_length", 4096),
+            ("mimo.llm.feed_forward_length", 11_008),
+            ("mimo.llm.attention.head_count", 32),
+            ("mimo.llm.attention.head_count_kv", 8),
+            ("mimo.llm.attention.key_length", 128),
+            ("mimo.llm.vocab_size", 151_680),
+            ("mimo.llm.context_length", 8192),
+            ("mimo.audio.channels", 8),
+            ("mimo.audio.group_size", 4),
+            ("mimo.inlocal.block_count", 6),
+            ("mimo.inlocal.embedding_length", 1024),
+            ("mimo.inlocal.attention.head_count", 64),
+            ("mimo.inlocal.attention.head_dim", 16),
+            ("mimo.inlocal.feed_forward_length", 4096),
+            ("mimo.tok.block_count", 32),
+            ("mimo.tok.embedding_length", 1280),
+            ("mimo.tok.attention.head_count", 20),
+            ("mimo.tok.feed_forward_length", 5120),
+            ("mimo.tok.encoder.skip_layer_id", 3),
+            ("mimo.tok.conv.kernel_size", 3),
+            ("mimo.tok.conv1.stride", 1),
+            ("mimo.tok.conv2.stride", 2),
+            ("mimo.tok.down_sample.stride", 2),
+            ("mimo.tok.rvq.num_quantizers_packed", 8),
+            ("mimo.mel.sample_rate", 24_000),
+            ("mimo.mel.n_fft", 960),
+            ("mimo.mel.hop_length", 240),
+            ("mimo.mel.win_length", 960),
+            ("mimo.mel.n_mels", 128),
+            ("mimo.special.eos_id", 151_643),
+            ("mimo.special.im_start_id", 151_644),
+            ("mimo.special.im_end_id", 151_645),
+            ("mimo.special.sosp_id", 151_665),
+            ("mimo.special.eosp_id", 151_666),
+            ("mimo.special.empty_id", 151_667),
+            ("mimo.special.eot_id", 151_672),
+            ("mimo.special.eostm_id", 151_671),
+        ] {
+            values.insert(key.to_string(), V::U32(value));
+        }
+        for (key, value) in [
+            ("mimo.llm.attention.layer_norm_rms_epsilon", 1e-6f32),
+            ("mimo.llm.rope.freq_base", 640_000.0),
+            ("mimo.inlocal.rope.freq_base", 640_000.0),
+            ("mimo.tok.rope.freq_base", 10_000.0),
+            ("mimo.mel.log_clip", 1e-7),
+        ] {
+            values.insert(key.to_string(), V::F32(value));
+        }
+        for (key, value) in [
+            ("mimo.llm.attention.qkv_bias", true),
+            ("mimo.llm.attention.qk_norm", false),
+            ("mimo.inlocal.full_attention", true),
+        ] {
+            values.insert(key.to_string(), V::Bool(value));
+        }
+        values.insert(
+            "mimo.tok.rvq.codebook_sizes".to_string(),
+            V::U32Array(vec![1024, 1024, 128, 128, 128, 128, 128, 128]),
+        );
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// mimo-asr is now wired: geometry off the pack's Qwen2 backbone keys,
+    /// spec from the shared resolver (Q8_0 on CPU at head_dim 128), positions
+    /// cross-checked against the family deriver, and the single-decode clamp
+    /// holding for a multi-hour file.
+    #[test]
+    fn mimo_asr_capacity_admission_facts_derive_from_pack_metadata() {
+        let metadata = mimo_shipped_pack_metadata_for_test();
+        let facts = native_capacity_admission_facts(
+            crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID,
+            &metadata,
+            30.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("mimo-shaped metadata must derive admission facts");
+        assert_eq!(
+            facts.geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 36,
+                kv_heads: 8,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(facts.spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(facts.fixed_decode_state_bytes, 0);
+        let mel = crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(&metadata)
+            .expect("parses");
+        let audiotok =
+            crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(&metadata)
+                .expect("parses");
+        let inlocal =
+            crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(&metadata)
+                .expect("parses");
+        assert_eq!(
+            facts.required_positions,
+            crate::models::mimo_asr::capacity::mimo_asr_admission_required_positions(
+                &mel, &audiotok, &inlocal, 30.0,
+            )
+        );
+        let at_hour = native_capacity_admission_facts(
+            crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID,
+            &metadata,
+            3600.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("facts");
+        assert_eq!(at_hour, facts);
+    }
+
+    /// Synthetic GGUF metadata carrying the real cohere-transcribe
+    /// checkpoint's facts (the same values `cohere::runtime_contract`'s
+    /// `base_metadata` fixture parses).
+    fn cohere_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::arch::hparams::*;
+        use crate::ggml_runtime::GgufMetadataValue as V;
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
+            V::String(COHERE_TRANSCRIBE_ARCHITECTURE_VALUE.to_string()),
+        );
+        for (key, value) in [
+            (COHERE_TRANSCRIBE_VOCAB_SIZE_KEY, 50_000u64),
+            (COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY, 48),
+            (COHERE_TRANSCRIBE_ENCODER_D_MODEL_KEY, 1280),
+            (COHERE_TRANSCRIBE_ENCODER_HEADS_KEY, 8),
+            (COHERE_TRANSCRIBE_ENCODER_HEAD_DIM_KEY, 160),
+            (COHERE_TRANSCRIBE_ENCODER_FFN_DIM_KEY, 5120),
+            (COHERE_TRANSCRIBE_ENCODER_CONV_KERNEL_KEY, 9),
+            (COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, 8),
+            (COHERE_TRANSCRIBE_DECODER_D_MODEL_KEY, 1024),
+            (COHERE_TRANSCRIBE_DECODER_HEADS_KEY, 8),
+            (COHERE_TRANSCRIBE_DECODER_HEAD_DIM_KEY, 128),
+            (COHERE_TRANSCRIBE_DECODER_FFN_DIM_KEY, 4096),
+            (COHERE_TRANSCRIBE_DECODER_MAX_CONTEXT_KEY, 1024),
+            (COHERE_TRANSCRIBE_DECODER_START_TOKEN_ID_KEY, 13_764),
+            (COHERE_TRANSCRIBE_AUDIO_SAMPLE_RATE_KEY, 16_000),
+            (COHERE_TRANSCRIBE_AUDIO_MELS_COUNT_KEY, 128),
+            (COHERE_TRANSCRIBE_AUDIO_N_FFT_KEY, 512),
+            (COHERE_TRANSCRIBE_AUDIO_HOP_LENGTH_KEY, 160),
+            (COHERE_TRANSCRIBE_AUDIO_WIN_LENGTH_KEY, 400),
+        ] {
+            values.insert(key.to_string(), V::U64(value));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// Synthetic GGUF metadata carrying the real FireRedASR-AED-L
+    /// checkpoint's facts (the same values `firered_aed::runtime_contract`'s
+    /// own fixture parses, decoder PE span 5000).
+    fn firered_aed_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+        use crate::models::firered_aed::runtime_contract::*;
+
+        let mut values = std::collections::BTreeMap::new();
+        for (key, value) in [
+            (FIRERED_ENCODER_N_LAYERS_KEY, 16u64),
+            (FIRERED_ENCODER_D_MODEL_KEY, 1280),
+            (FIRERED_ENCODER_N_HEADS_KEY, 20),
+            (FIRERED_ENCODER_HEAD_DIM_KEY, 64),
+            (FIRERED_ENCODER_FFN_DIM_KEY, 5120),
+            (FIRERED_ENCODER_CONV_KERNEL_KEY, 33),
+            (FIRERED_ENCODER_SUBSAMPLE_CHANNELS_KEY, 32),
+            (FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY, 608),
+            (FIRERED_ENCODER_FEATURE_DIM_KEY, 80),
+            (FIRERED_ENCODER_PE_LEN_KEY, 9999),
+            (FIRERED_DECODER_N_LAYERS_KEY, 16),
+            (FIRERED_DECODER_FFN_DIM_KEY, 5120),
+            (FIRERED_DECODER_PE_LEN_KEY, 5000),
+            (FIRERED_VOCAB_SIZE_KEY, 7832),
+            (FIRERED_SOS_TOKEN_ID_KEY, 3),
+            (FIRERED_EOS_TOKEN_ID_KEY, 4),
+            (FIRERED_PAD_TOKEN_ID_KEY, 2),
+        ] {
+            values.insert(key.to_string(), V::U64(value));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// The two AED families charge their decoder state as the fixed per-pack
+    /// allocations the runtime actually makes at construction: chunk-cap
+    /// cross-KV frames through the positional model, the full-span f16
+    /// self-KV arena as exact fixed bytes -- request-independent, so a
+    /// multi-hour file derives the identical facts as a short clip.
+    #[test]
+    fn aed_families_charge_fixed_decode_state_and_chunk_cap_cross_kv() {
+        let cohere_metadata = cohere_shipped_pack_metadata_for_test();
+        let cohere = native_capacity_admission_facts(
+            crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            &cohere_metadata,
+            5.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("cohere-shaped metadata must derive admission facts");
+        assert_eq!(
+            cohere.geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 8,
+                kv_heads: 8,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(
+            cohere.spec,
+            crate::models::cohere::capacity::COHERE_ADMISSION_KV_SPEC
+        );
+        // The f16 self-KV arena at the full 1024-position context: 32 MiB.
+        assert_eq!(cohere.fixed_decode_state_bytes, 8 * 2 * 8 * 1024 * 128 * 2);
+        assert!(cohere.required_positions > 0);
+        assert_eq!(
+            native_capacity_admission_facts(
+                crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                &cohere_metadata,
+                3600.0,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            ),
+            Some(cohere)
+        );
+
+        let aed_metadata = firered_aed_shipped_pack_metadata_for_test();
+        let aed = native_capacity_admission_facts(
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            &aed_metadata,
+            5.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("firered-aed-shaped metadata must derive admission facts");
+        assert_eq!(
+            aed.geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 16,
+                kv_heads: 20,
+                head_dim: 64,
+            }
+        );
+        assert_eq!(
+            aed.spec,
+            crate::models::firered_aed::capacity::FIRERED_AED_ADMISSION_KV_SPEC
+        );
+        // The f16 self-KV arena at the full 5000-position PE span: ~390 MiB.
+        assert_eq!(aed.fixed_decode_state_bytes, 16 * 2 * 20 * 5000 * 64 * 2);
+        assert!(aed.required_positions > 0);
+        assert_eq!(
+            native_capacity_admission_facts(
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+                &aed_metadata,
+                3600.0,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            ),
+            Some(aed)
+        );
+    }
+
+    /// The gap this round closes for every newly wired family: a pack whose
+    /// on-disk bytes plainly exceed any host budget is refused with the
+    /// typed, actionable `NativeInsufficientHostMemory` error BEFORE the
+    /// graph build -- through the real `enforce_native_host_memory_admission`
+    /// entry a request goes through, against a real (sparse) pack file --
+    /// while a small pack with the identical metadata is admitted.
+    #[test]
+    fn enforce_native_host_memory_admission_rejects_each_new_family_on_an_oversized_pack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized = dir.path().join("oversized.oasr");
+        let file = std::fs::File::create(&oversized).expect("create sparse pack");
+        // 1 PiB sparse: larger than any host's RAM + swap, no disk cost.
+        file.set_len(1 << 50).expect("sparse set_len");
+        drop(file);
+        let modest = dir.path().join("modest.oasr");
+        std::fs::write(&modest, vec![0u8; 4096]).expect("write modest pack");
+
+        let cases: [(&str, crate::ggml_runtime::GgufMetadata); 4] = [
+            (
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+                firered_llm_shipped_pack_metadata_for_test(),
+            ),
+            (
+                crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID,
+                mimo_shipped_pack_metadata_for_test(),
+            ),
+            (
+                crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                cohere_shipped_pack_metadata_for_test(),
+            ),
+            (
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+                firered_aed_shipped_pack_metadata_for_test(),
+            ),
+        ];
+        for (architecture, metadata) in &cases {
+            let error = enforce_native_host_memory_admission(
+                architecture,
+                metadata,
+                &oversized,
+                30.0,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                0,
+            )
+            .expect_err("a 1 PiB pack cannot fit any host");
+            match error {
+                BackendError::NativeInsufficientHostMemory { reason } => {
+                    assert!(
+                        reason.contains("core.native.capacity.admission:reject"),
+                        "'{architecture}' rejection must carry the provenance trailer: {reason}"
+                    );
+                    assert!(
+                        reason.contains("Try a smaller quantization"),
+                        "'{architecture}' rejection must stay actionable: {reason}"
+                    );
+                }
+                other => panic!("'{architecture}' must reject typed, got {other:?}"),
+            }
+            enforce_native_host_memory_admission(
+                architecture,
+                metadata,
+                &modest,
+                30.0,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                0,
+            )
+            .unwrap_or_else(|error| {
+                panic!("'{architecture}' must admit a modest pack on this host: {error:?}")
+            });
+        }
+    }
+
+    /// Only a request whose speaker plan actually runs the external VAD +
+    /// speaker-embedder pass is charged its co-resident footprint; `Off` and
+    /// `InDecoder` requests must never be made stricter by it.
+    #[test]
+    fn external_speaker_attribution_bytes_charged_only_for_the_external_plan() {
+        assert_eq!(
+            external_speaker_attribution_admission_bytes(SpeakerPlan::Off),
+            0
+        );
+        assert_eq!(
+            external_speaker_attribution_admission_bytes(SpeakerPlan::InDecoder),
+            0
+        );
+        assert_eq!(
+            external_speaker_attribution_admission_bytes(SpeakerPlan::External),
+            crate::diarize::embed::speaker_attribution_admission_bytes()
         );
     }
 

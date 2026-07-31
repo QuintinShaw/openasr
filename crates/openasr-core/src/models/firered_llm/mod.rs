@@ -21,6 +21,7 @@
 //!   -- a pack produced by this importer is runnable by `openasr transcribe`.
 
 mod adapter_graph;
+pub(crate) mod capacity;
 mod decode_prompt;
 pub(crate) mod executor;
 mod llm_transformer;

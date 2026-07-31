@@ -609,7 +609,9 @@ fn cohere_mel_frames_for_seconds(
 /// (`kv_init`: reserve at a known max, never reallocate per step) -- see
 /// `GgmlCpuStepBufferPool`'s doc in `ggml_runtime/cpu_graph.rs` for the
 /// sibling citation and `ACKNOWLEDGMENTS.md`.
-fn cohere_decoder_cross_capacity_frames(metadata: CohereTranscribeExecutionMetadata) -> usize {
+pub(crate) fn cohere_decoder_cross_capacity_frames(
+    metadata: CohereTranscribeExecutionMetadata,
+) -> usize {
     let chunk_seconds = crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS
         + COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS;
     let mel_frames = cohere_mel_frames_for_seconds(chunk_seconds, metadata);
