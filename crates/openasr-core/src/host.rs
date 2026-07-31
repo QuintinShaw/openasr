@@ -79,6 +79,70 @@ pub fn host_total_memory_bytes() -> Option<u64> {
     }
 }
 
+/// Best-effort total swap (paging) space of the host in bytes, or `None` on a
+/// platform without a probe. Used only to widen the host-memory admission
+/// budget on unified-memory hosts (CPU / Apple-Silicon Metal), where the OS
+/// can page colder pages out to make room for a large decode: admission adds
+/// this to physical RAM so a request that overflows RAM but fits RAM+swap is
+/// allowed to run (slower) instead of refused. Fails safe: any probe failure
+/// returns `None`, which the admission side treats as zero swap -- reverting
+/// to the RAM-only budget, conservative but never wrong in the unsafe
+/// direction. Never used for a discrete GPU's VRAM budget, which cannot swap.
+pub fn host_total_swap_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // `vm.swapusage` writes a `struct xsw_usage`; `xsu_total` is the total
+        // configured swap in bytes (dynamically grown by macOS as needed, so
+        // this reflects the current swap file total, which is what a decode
+        // about to page out can actually draw on).
+        let mut usage: libc::xsw_usage = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::xsw_usage>();
+        // SAFETY: vm.swapusage fills a caller-owned `xsw_usage`; `size` is set
+        // to its width and passed as the buffer capacity, per the sysctl API.
+        let ret = unsafe {
+            libc::sysctlbyname(
+                c"vm.swapusage".as_ptr(),
+                (&mut usage as *mut libc::xsw_usage).cast::<libc::c_void>(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (ret == 0).then_some(usage.xsu_total)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix("SwapTotal:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+                .map(|kb| kb.saturating_mul(1024))
+        })
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        // Windows has no single "swap size" field; the page file is the swap
+        // analog. `ullTotalPageFile` is the system commit limit (physical RAM
+        // plus all page files), so the page-file (swap) size is that minus
+        // physical RAM. `saturating_sub` guards the (rare, transient) case
+        // where the reported commit limit dips below physical RAM.
+        // SAFETY: same contract as `host_total_memory_bytes`'s Windows arm.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some(status.ullTotalPageFile.saturating_sub(status.ullTotalPhys))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
 /// A quant-recommendation profile budgeting ~75% of host RAM (mirroring the
 /// desktop install picker). Empty (no budget) when RAM cannot be probed, which
 /// makes `recommend_catalog_quant` fall back to the catalog default.
@@ -440,6 +504,24 @@ mod tests {
                     "available ({available}) must not exceed total ({total})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn host_total_swap_is_plausible_on_supported_platforms() {
+        // Best-effort: a probe may legitimately return `None` (unsupported
+        // platform, a locked-down sandbox, or a host with swap disabled that
+        // reports nothing), and zero swap is valid (swap turned off). The only
+        // hard requirement is that when a total RAM figure is also available,
+        // the probed swap does not read as an implausible multiple of RAM,
+        // which would signal a units/field mistake in the probe.
+        if let Some(swap) = host_total_swap_bytes()
+            && let Some(total) = host_total_memory_bytes()
+        {
+            assert!(
+                swap <= total.saturating_mul(64),
+                "implausible swap ({swap}) vs total RAM ({total}) -- likely a units bug"
+            );
         }
     }
 

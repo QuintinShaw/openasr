@@ -2263,12 +2263,35 @@ fn enforce_native_host_memory_admission(
         required_positions,
         pack_metadata.len(),
         host_total_memory_bytes,
+        host_memory_admission_domain_for_backend(backend),
     ) {
         return Err(BackendError::NativeInsufficientHostMemory {
             reason: rejection.user_message(),
         });
     }
     Ok(())
+}
+
+/// Classify the resolved dispatch backend into the memory pool its resident
+/// decode state draws from, so admission budgets against the right ceiling.
+/// CPU and Apple-Silicon `Metal` are unified memory (host RAM, swap-backed);
+/// only the discrete `Gpu` lane (CUDA/HIP/Vulkan) has dedicated VRAM that
+/// cannot page. Metal must NOT land in the discrete bucket -- doing so would
+/// hard-reject Macs that a swap-backed budget would admit.
+fn host_memory_admission_domain_for_backend(
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> crate::capacity::MemoryAdmissionDomain {
+    match backend {
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        | crate::ggml_runtime::GgmlCpuGraphBackend::Metal => {
+            crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
+                swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
+            }
+        }
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => {
+            crate::capacity::MemoryAdmissionDomain::DiscreteVram
+        }
+    }
 }
 
 fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch {
@@ -3381,6 +3404,10 @@ mod tests {
             "fixture host must not admit the overstated (DEFAULT) footprint"
         );
 
+        // The fixture host is sized against the 75% budget (`budget_bytes`
+        // above); exercise the admission through the domain whose budget is
+        // that same 75% figure so the accept/reject split stays about the spec
+        // (Q8_0 vs DEFAULT), not about the swap-aware budget.
         assert!(
             crate::capacity::evaluate_host_memory_admission(
                 &geometry,
@@ -3388,6 +3415,7 @@ mod tests {
                 required_positions,
                 pack_bytes_on_disk,
                 host_total_memory_bytes,
+                crate::capacity::MemoryAdmissionDomain::DiscreteVram,
             )
             .is_ok(),
             "the real Q8_0 footprint must be admitted"
@@ -3399,6 +3427,7 @@ mod tests {
                 required_positions,
                 pack_bytes_on_disk,
                 host_total_memory_bytes,
+                crate::capacity::MemoryAdmissionDomain::DiscreteVram,
             )
             .is_err(),
             "the overstated DEFAULT footprint would have been falsely rejected on this host"

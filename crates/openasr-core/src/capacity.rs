@@ -447,6 +447,43 @@ pub(crate) fn derive_integral_seconds(derivation: &IntegralWindowDerivation) -> 
     largest_fitting.map(|chunks| chunks as f32 * derivation.chunk_seconds)
 }
 
+/// The physical memory pool a request's decode state draws from -- the fact
+/// that decides whether the OS can page it out under pressure, and thus how
+/// [`evaluate_host_memory_admission`] forms its budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryAdmissionDomain {
+    /// CPU or Apple-Silicon Metal. Decode state lives in host RAM -- on Metal
+    /// the unified-memory pool is the SAME physical RAM the mmap'd pack sits
+    /// in, not a separate VRAM space -- which every supported OS backs with
+    /// swap. The budget is total RAM plus total swap, so a request that
+    /// overflows RAM but still fits RAM+swap is admitted silently: the OS
+    /// pages colder pages out and the decode runs (slower) instead of being
+    /// refused (the reject-not-degrade line moves to "cannot fit even with
+    /// swap"). `swap_bytes` is the probed total swap
+    /// (`crate::host::host_total_swap_bytes`), zero when unprobeable, which
+    /// reverts to a RAM-only budget -- conservative, never unsafe. Metal
+    /// belongs HERE, never with discrete GPUs: Apple Silicon has no separate
+    /// VRAM to overflow, so classifying it as a "GPU backend" and hard-
+    /// rejecting it would wrongly refuse every Mac.
+    UnifiedMemory { swap_bytes: u64 },
+    /// A discrete GPU whose resident decode state lives in dedicated VRAM
+    /// (`GgmlCpuGraphBackend::Gpu` -- the CUDA/HIP/Vulkan discrete lane, never
+    /// Metal). VRAM cannot be paged to swap, so an over-budget request is a
+    /// hard failure with no "run it slower" fallback; swap is never added.
+    ///
+    /// NOTE (device-aware accounting, still partial): a true VRAM budget is
+    /// not yet plumbed to this function, so the discrete path still charges the
+    /// KV and pack bytes against a fraction of HOST RAM
+    /// (`host_memory_budget_bytes`) as a conservative stand-in. That is
+    /// conservative-to-a-fault (it can refuse a request that a large VRAM
+    /// would actually hold) but never unsafe, and no family that runs
+    /// meaningfully large on a discrete GPU is wired to this check today
+    /// (moss-transcribe-diarize, the only wired family, runs CPU/Metal and
+    /// stays small). Wiring a real per-device VRAM budget here is the
+    /// remaining follow-up.
+    DiscreteVram,
+}
+
 /// A family's decoder KV footprint for THIS request clearly does not fit this
 /// host's memory budget -- the reject-not-degrade admission outcome (design
 /// review 2026-07-27, point A: refuse rather than silently reslice/requant,
@@ -460,11 +497,16 @@ pub(crate) struct HostMemoryCapacityRejection {
     /// KV bytes at `required_positions` plus the pack's own on-disk bytes --
     /// the two quantities [`evaluate_host_memory_admission`] actually knows.
     pub needed_bytes: u64,
-    /// `host_total_memory_bytes * 3/4` (`crate::host::host_memory_budget_bytes`).
+    /// The budget `needed_bytes` was compared against: total RAM + swap on a
+    /// unified-memory host, `host_total_memory_bytes * 3/4` on the discrete
+    /// (no-swap) path (see [`MemoryAdmissionDomain`]).
     pub budget_bytes: u64,
     pub host_total_memory_bytes: u64,
     pub pack_bytes_on_disk: u64,
     pub required_positions: usize,
+    /// Which memory pool the budget was formed from -- so the message can name
+    /// RAM+swap vs VRAM correctly and the trailer records the classification.
+    pub domain: MemoryAdmissionDomain,
 }
 
 impl HostMemoryCapacityRejection {
@@ -473,11 +515,17 @@ impl HostMemoryCapacityRejection {
     /// elsewhere in this crate -- the full arithmetic a bug report needs,
     /// in one line.
     pub(crate) fn provenance(&self) -> String {
+        let (domain, swap_bytes) = match self.domain {
+            MemoryAdmissionDomain::UnifiedMemory { swap_bytes } => ("unified", swap_bytes),
+            MemoryAdmissionDomain::DiscreteVram => ("discrete_vram", 0),
+        };
         format!(
-            "core.native.capacity.admission:reject,needed_bytes={},budget_bytes={},host_total_memory_bytes={},pack_bytes_on_disk={},required_positions={}",
+            "core.native.capacity.admission:reject,domain={},needed_bytes={},budget_bytes={},host_total_memory_bytes={},swap_bytes={},pack_bytes_on_disk={},required_positions={}",
+            domain,
             self.needed_bytes,
             self.budget_bytes,
             self.host_total_memory_bytes,
+            swap_bytes,
             self.pack_bytes_on_disk,
             self.required_positions,
         )
@@ -490,19 +538,33 @@ impl HostMemoryCapacityRejection {
     /// pack-does-not-fit-this-host's-budget message already uses.
     pub(crate) fn user_message(&self) -> String {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let needed_gib = self.needed_bytes as f64 / GIB;
+        let budget_gib = self.budget_bytes as f64 / GIB;
+        let host_gib = self.host_total_memory_bytes as f64 / GIB;
+        let headline = match self.domain {
+            MemoryAdmissionDomain::UnifiedMemory { swap_bytes } => format!(
+                "This request needs about {needed_gib:.1} GiB (the model pack plus its decode \
+                 context for {positions} decoder positions), but this host's admission budget is \
+                 only {budget_gib:.1} GiB ({host_gib:.1} GiB RAM + {swap_gib:.1} GiB swap). It \
+                 does not fit even after paging to swap.",
+                positions = self.required_positions,
+                swap_gib = swap_bytes as f64 / GIB,
+            ),
+            MemoryAdmissionDomain::DiscreteVram => format!(
+                "This request needs about {needed_gib:.1} GiB (the model pack plus its decode \
+                 context for {positions} decoder positions), but this discrete GPU's admission \
+                 budget is only {budget_gib:.1} GiB. GPU VRAM cannot page to swap, so it cannot \
+                 be run slower to fit.",
+                positions = self.required_positions,
+            ),
+        };
         format!(
-            "This request needs about {needed_gib:.1} GiB (the model pack plus its decode \
-             context for {positions} decoder positions), but this host's admission budget is \
-             only {budget_gib:.1} GiB ({host_gib:.1} GiB total RAM x 75%).\n\
+            "{headline}\n\
              Try a smaller quantization (q8_0 or q4_k instead of fp16), a smaller model, or \
              close other memory-heavy applications and retry.\n\
              The request was rejected before building the decode graph, instead of failing \
              later with an opaque ggml allocation error.\n\
              {provenance}",
-            needed_gib = self.needed_bytes as f64 / GIB,
-            positions = self.required_positions,
-            budget_gib = self.budget_bytes as f64 / GIB,
-            host_gib = self.host_total_memory_bytes as f64 / GIB,
             provenance = self.provenance(),
         )
     }
@@ -510,47 +572,55 @@ impl HostMemoryCapacityRejection {
 
 /// Evaluate whether `required_positions` decoder positions at `spec` for
 /// `geometry`, alongside `pack_bytes_on_disk` already resident from the
-/// mmap'd pack file, fit this host's memory budget
-/// (`crate::host::host_memory_budget_bytes`: 75% of total RAM, never
-/// `host_available_memory_bytes` -- see this module's invariants and
-/// `host_available_memory_bytes`'s own doc comment forbidding admission use).
+/// mmap'd pack file, fit this host's memory budget for the given `domain`.
+/// The budget is never `host_available_memory_bytes` (see this module's
+/// invariants and that probe's own doc forbidding admission use).
+///
+/// The budget is `domain`-aware (see [`MemoryAdmissionDomain`]):
+///
+/// - **Unified memory (CPU / Apple-Silicon Metal):** budget = total RAM +
+///   total swap. A machine with swap must not refuse a decode just because it
+///   overflows physical RAM -- the OS pages colder pages out and runs it
+///   (slower). The reject-not-degrade line therefore moves to "cannot fit even
+///   with all of swap" (`needed > RAM + swap`); a request in the band above
+///   RAM but within RAM+swap is admitted silently, with no prompt. This
+///   deliberately spends the old 25% RAM headroom (the 75% budget) that used
+///   to cover the un-modeled encoder/mel/compute working set: on a host with
+///   swap that working set pages out too, and the point of this path is to let
+///   a large decode run rather than be refused. When swap is unprobeable the
+///   domain carries zero, reverting to a RAM-only budget (conservative).
+/// - **Discrete VRAM (CUDA/HIP/Vulkan):** budget = 75% of host RAM, no swap
+///   added (VRAM cannot page). This is a conservative stand-in until a real
+///   per-device VRAM budget is plumbed here; see [`MemoryAdmissionDomain`].
 ///
 /// Fails OPEN on a degenerate geometry (`kv_bytes_at_positions` erring):
 /// geometry validity is enforced elsewhere (pack import), not here, and
 /// "uncertain" always resolves to "allow" per invariant 1 -- refusing only
-/// when certain it will not fit. Deliberately omits any reserve for encoder
-/// activations / mel / compute graph beyond the two quantities exactly known
-/// here: inventing a family-general "working set" constant with no measured
-/// figure to draw from would either be large enough to risk rejecting a
-/// request that would actually fit (the one outcome invariant 1 forbids) or
-/// small enough not to matter, so the 25% of total memory the 75% budget
-/// already sets aside is left to cover it instead of a second guessed number.
-///
-/// Assumes unified memory: `needed_bytes` sums KV cache and pack bytes as if
-/// both draw from the same host RAM pool the mmap'd pack resides in and the
-/// budget bounds. On a host with a discrete GPU, resident decoder state can
-/// instead live in VRAM (a separate budget this function does not see) while
-/// the mmap'd pack's pages stay reclaimable host-side, so this arithmetic is
-/// conservative-to-a-fault there rather than wrong in the unsafe direction --
-/// but it has not been exercised against a discrete-GPU host yet (moss-
-/// transcribe-diarize, the only family wired to this check so far, stays
-/// small enough that it does not matter in practice). Before wiring a family
-/// that runs meaningfully large on a discrete GPU (e.g. qwen3-asr at fp16,
-/// ~4.7 GiB), this needs device-aware accounting: a separate VRAM budget for
-/// resident state, and the pack's on-disk bytes should not be charged against
-/// host RAM at their full mmap size once they are known to be reclaimable.
+/// when certain it will not fit.
 pub(crate) fn evaluate_host_memory_admission(
     geometry: &KvGeometry,
     spec: LlmKvCacheSpec,
     required_positions: usize,
     pack_bytes_on_disk: u64,
     host_total_memory_bytes: u64,
+    domain: MemoryAdmissionDomain,
 ) -> Result<(), HostMemoryCapacityRejection> {
     let Ok(kv_bytes) = kv_bytes_at_positions(geometry, spec, required_positions) else {
         return Ok(());
     };
     let needed_bytes = kv_bytes.total().saturating_add(pack_bytes_on_disk);
-    let budget_bytes = crate::host::host_memory_budget_bytes(host_total_memory_bytes);
+    let budget_bytes = match domain {
+        // Unified memory can page to swap, so the physical ceiling a decode can
+        // draw on is RAM + swap -- not the 75% RAM budget the discrete path and
+        // the quant recommender use.
+        MemoryAdmissionDomain::UnifiedMemory { swap_bytes } => {
+            host_total_memory_bytes.saturating_add(swap_bytes)
+        }
+        // VRAM cannot swap; keep the conservative host-RAM stand-in budget.
+        MemoryAdmissionDomain::DiscreteVram => {
+            crate::host::host_memory_budget_bytes(host_total_memory_bytes)
+        }
+    };
     if needed_bytes <= budget_bytes {
         return Ok(());
     }
@@ -560,6 +630,7 @@ pub(crate) fn evaluate_host_memory_admission(
         host_total_memory_bytes,
         pack_bytes_on_disk,
         required_positions,
+        domain,
     })
 }
 
@@ -765,17 +836,23 @@ mod tests {
         assert_eq!(derive_integral_seconds(&derivation), Some(300.0));
     }
 
-    /// The pack-alone-does-not-fit shape: a multi-gigabyte pack on a host
-    /// whose budget cannot possibly hold it, independent of how many KV
-    /// positions the request needs -- the pack bytes alone (qwen3-asr-1.7b's
-    /// real shipped fp16 size, used here only as a realistic oversized-pack
-    /// figure; this admission check does not run for qwen3-asr yet) already
-    /// exceed a 1 GiB host's 75% budget. Reproduces the scenario with an
-    /// injected test-constructed budget rather than a real 16 GiB machine.
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn unified(swap_bytes: u64) -> MemoryAdmissionDomain {
+        MemoryAdmissionDomain::UnifiedMemory { swap_bytes }
+    }
+
+    /// The pack-alone-does-not-fit shape: a multi-gigabyte pack on a host whose
+    /// budget cannot possibly hold it, independent of how many KV positions the
+    /// request needs -- the pack bytes alone (qwen3-asr-1.7b's real shipped
+    /// fp16 size, used here only as a realistic oversized-pack figure; this
+    /// admission check does not run for qwen3-asr yet) already exceed a 1 GiB
+    /// host's RAM even before adding any swap. Also pins the swap-unprobeable
+    /// fallback: with zero swap the unified budget is exactly total RAM.
     #[test]
     fn host_memory_admission_rejects_a_pack_that_plainly_does_not_fit_a_tiny_host() {
         let geometry = moss_geometry();
-        let tiny_host_total_memory_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB
+        let tiny_host_total_memory_bytes: u64 = GIB; // 1 GiB
         let oversized_pack_bytes_on_disk: u64 = 4_704_801_920; // qwen3-asr-1.7b fp16 .oasr
         let rejection = evaluate_host_memory_admission(
             &geometry,
@@ -783,22 +860,25 @@ mod tests {
             512,
             oversized_pack_bytes_on_disk,
             tiny_host_total_memory_bytes,
+            unified(0),
         )
-        .expect_err("a multi-GiB pack cannot fit a 1 GiB host's budget");
-        assert_eq!(
-            rejection.budget_bytes,
-            crate::host::host_memory_budget_bytes(tiny_host_total_memory_bytes)
-        );
+        .expect_err("a multi-GiB pack cannot fit a 1 GiB host, swap unprobeable");
+        // Swap unprobeable (0) -> the unified budget is exactly total RAM, the
+        // conservative RAM-only fallback.
+        assert_eq!(rejection.budget_bytes, tiny_host_total_memory_bytes);
         assert!(rejection.needed_bytes > rejection.budget_bytes);
 
         let message = rejection.user_message();
         assert!(message.contains("needs about"), "{message}");
         assert!(message.contains("admission budget is only"), "{message}");
+        assert!(message.contains("RAM +"), "{message}");
         assert!(message.contains("Try a smaller quantization"), "{message}");
         assert!(
             message.contains("core.native.capacity.admission:reject"),
             "{message}"
         );
+        assert!(message.contains("domain=unified"), "{message}");
+        assert!(message.contains("swap_bytes=0"), "{message}");
         assert!(
             message.contains(&format!("needed_bytes={}", rejection.needed_bytes)),
             "{message}"
@@ -809,6 +889,112 @@ mod tests {
         );
     }
 
+    /// The swap-aware admission the whole change exists for: a request that
+    /// overflows physical RAM but still fits RAM + swap is admitted silently,
+    /// while the SAME request on a swapless host (swap = 0) is rejected -- so
+    /// it is swap, not some other slack, that lets it through.
+    #[test]
+    fn host_memory_admission_admits_the_over_ram_swap_band_and_only_because_of_swap() {
+        let geometry = moss_geometry();
+        let host_ram: u64 = 4 * GIB;
+        let pack_bytes: u64 = 4 * GIB;
+        let required_positions = 3000; // ~0.96 GiB of DEFAULT KV
+        // needed = pack + KV ~= 4.96 GiB: above 4 GiB RAM, below 8 GiB RAM+swap.
+        evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            required_positions,
+            pack_bytes,
+            host_ram,
+            unified(4 * GIB),
+        )
+        .expect("a request that overflows RAM but fits RAM+swap must be admitted silently");
+
+        evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            required_positions,
+            pack_bytes,
+            host_ram,
+            unified(0),
+        )
+        .expect_err("the same request on a swapless host must be rejected");
+    }
+
+    /// Reject only when it does not fit even after paging: needed > RAM + swap.
+    /// The message names both RAM and swap and the swap-exhausted phrasing.
+    #[test]
+    fn host_memory_admission_rejects_when_over_ram_plus_swap() {
+        let geometry = moss_geometry();
+        let host_ram: u64 = 4 * GIB;
+        let swap: u64 = GIB; // budget = 5 GiB
+        let pack_bytes: u64 = 5 * GIB;
+        let rejection = evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            512,
+            pack_bytes,
+            host_ram,
+            unified(swap),
+        )
+        .expect_err("pack alone (5 GiB) plus KV exceeds the 5 GiB RAM+swap budget");
+        assert_eq!(rejection.budget_bytes, host_ram + swap);
+        let message = rejection.user_message();
+        assert!(message.contains("RAM +"), "{message}");
+        assert!(message.contains("swap"), "{message}");
+        assert!(
+            message.contains("does not fit even after paging to swap"),
+            "{message}"
+        );
+        assert!(message.contains("domain=unified"), "{message}");
+        assert!(message.contains(&format!("swap_bytes={swap}")), "{message}");
+    }
+
+    /// Discrete VRAM cannot page: swap never enters its budget, and the
+    /// rejection message says so. A budget that would trivially admit the same
+    /// request as unified-with-swap still rejects here.
+    #[test]
+    fn host_memory_admission_discrete_vram_never_uses_swap() {
+        let geometry = moss_geometry();
+        let host_ram: u64 = 8 * GIB; // 75% budget = 6 GiB
+        let pack_bytes: u64 = 5 * GIB;
+        // 8192 DEFAULT positions ~= 2.6 GiB KV -> needed ~= 7.6 GiB > 6 GiB.
+        let rejection = evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            8192,
+            pack_bytes,
+            host_ram,
+            MemoryAdmissionDomain::DiscreteVram,
+        )
+        .expect_err("VRAM budget (75% of host RAM stand-in) cannot hold this request");
+        // No swap term -- budget is the 75% RAM stand-in, unchanged by swap.
+        assert_eq!(
+            rejection.budget_bytes,
+            crate::host::host_memory_budget_bytes(host_ram)
+        );
+        let message = rejection.user_message();
+        assert!(
+            message.contains("GPU VRAM cannot page to swap"),
+            "{message}"
+        );
+        assert!(message.contains("domain=discrete_vram"), "{message}");
+        assert!(message.contains("swap_bytes=0"), "{message}");
+
+        // The identical footprint on a unified host WITH ample swap is admitted
+        // -- proving the discrete path's refusal is the no-swap rule, not the
+        // footprint itself.
+        evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            8192,
+            pack_bytes,
+            host_ram,
+            unified(8 * GIB),
+        )
+        .expect("the same footprint fits a unified host with 8 GiB of swap");
+    }
+
     /// Reverse case: the family's own worst-case ceiling (8192 positions,
     /// `DEFAULT` policy) plus a modest pack size must still fit the repo's own
     /// 8 GiB min-spec floor -- the same fact
@@ -816,7 +1002,7 @@ mod tests {
     /// `moss_transcribe_diarize::capacity` already pins, exercised here
     /// through the admission function a real request calls rather than the
     /// raw KV arithmetic. Currently-working combos on a min-spec machine must
-    /// stay working.
+    /// stay working -- even with zero swap.
     #[test]
     fn host_memory_admission_allows_the_shipped_worst_case_on_a_min_spec_host() {
         let geometry = moss_geometry();
@@ -827,6 +1013,7 @@ mod tests {
             8192,
             modest_pack_bytes_on_disk,
             crate::host::MIN_SPEC_TOTAL_MEMORY_BYTES,
+            unified(0),
         )
         .expect(
             "the shipped worst-case ceiling plus a modest pack must fit the 8 GiB min-spec budget",
@@ -845,8 +1032,15 @@ mod tests {
             head_dim: 128,
         };
         assert!(
-            evaluate_host_memory_admission(&degenerate, LlmKvCacheSpec::DEFAULT, 8192, 0, 1024)
-                .is_ok()
+            evaluate_host_memory_admission(
+                &degenerate,
+                LlmKvCacheSpec::DEFAULT,
+                8192,
+                0,
+                1024,
+                unified(0),
+            )
+            .is_ok()
         );
     }
 }
