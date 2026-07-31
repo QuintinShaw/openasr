@@ -45,7 +45,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    PackContentKey, current_unload_generation, take_generation_tagged,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey, current_unload_generation,
+    take_generation_tagged, with_thread_local_cached_mut_by_key,
 };
 
 use super::adapter_graph::FunasrNanoAdapterGraph;
@@ -70,15 +71,31 @@ const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
 /// at `<|im_end|>` well before this in practice.
 const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
 
-type FunasrNanoDecoderCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+type FunasrNanoRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+
+/// Resident encoder-side runtime: the SAN-M encoder graph + transformer
+/// adaptor with their weights already uploaded to (or bound zero-copy in)
+/// backend memory. Cached per (pack content id, backend) below -- the
+/// sensevoice `SenseVoicePreparedRuntime` / dolphin prepared-runtime pattern
+/// -- so a repeat request rebuilds only the transient forward graph and
+/// uploads only the utterance features instead of re-loading and re-uploading
+/// every encoder + adaptor weight. Idle unload flows through the central
+/// `bump_unload_generation` epoch that `BoundedRuntimeCache` syncs to.
+struct FunasrNanoEncoderAdapterRuntime {
+    encoder: FunasrNanoEncoderGraph,
+    adapter: FunasrNanoAdapterGraph,
+}
 
 thread_local! {
-    static FUNASR_NANO_DECODER_BY_KEY: RefCell<HashMap<FunasrNanoDecoderCacheKey, (u64, FunasrNanoDecoderRuntime)>> =
+    static FUNASR_NANO_DECODER_BY_KEY: RefCell<HashMap<FunasrNanoRuntimeCacheKey, (u64, FunasrNanoDecoderRuntime)>> =
         RefCell::new(HashMap::new());
+    static FUNASR_NANO_ENCODER_ADAPTER_BY_KEY: RefCell<
+        BoundedRuntimeCache<FunasrNanoRuntimeCacheKey, FunasrNanoEncoderAdapterRuntime>,
+    > = RefCell::new(BoundedRuntimeCache::new());
 }
 
 fn take_cached_decoder_runtime(
-    key: &FunasrNanoDecoderCacheKey,
+    key: &FunasrNanoRuntimeCacheKey,
     unload_generation: u64,
 ) -> Option<FunasrNanoDecoderRuntime> {
     FUNASR_NANO_DECODER_BY_KEY
@@ -86,7 +103,7 @@ fn take_cached_decoder_runtime(
 }
 
 fn store_cached_decoder_runtime(
-    key: FunasrNanoDecoderCacheKey,
+    key: FunasrNanoRuntimeCacheKey,
     unload_generation: u64,
     decoder: FunasrNanoDecoderRuntime,
 ) {
@@ -308,7 +325,7 @@ impl FunasrNanoGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        let decoder_cache_key: FunasrNanoDecoderCacheKey =
+        let decoder_cache_key: FunasrNanoRuntimeCacheKey =
             (PackContentKey::for_runtime_source(runtime_source), backend);
         let unload_generation = current_unload_generation();
         let mut decoder = match take_cached_decoder_runtime(&decoder_cache_key, unload_generation) {
@@ -358,12 +375,15 @@ impl FunasrNanoGgmlExecutor {
     }
 }
 
-/// Build the (fresh) SAN-M encoder + transformer adaptor for this pack+backend,
-/// run them over the prepared encoder input, and return the leading `n_aud`
-/// audio-token rows (low-frame-rate truncation) plus that count. The encoder
-/// and adaptor are lightweight relative to the resident Qwen3 decoder, so
-/// (mirroring `firered_llm`'s single-shot encoder/adapter) they are built per
-/// request rather than cached.
+/// Run the resident SAN-M encoder + transformer adaptor for this pack+backend
+/// over the prepared encoder input, and return the leading `n_aud` audio-token
+/// rows (low-frame-rate truncation) plus that count. The encoder + adaptor
+/// runtime comes out of the per-(pack content id, backend) thread-local cache
+/// ([`FunasrNanoEncoderAdapterRuntime`]); only the transient forward graph and
+/// the utterance features are per-request. Output is bit-identical to a fresh
+/// build: residency changes where the weights live, never the forward math
+/// (pinned by the `cached_encoder_adapter_matches_fresh_build_bit_for_bit`
+/// golden test below).
 #[allow(clippy::too_many_arguments)]
 fn run_encoder_and_adapter(
     runtime_source: &crate::GgmlRuntimeSource,
@@ -374,39 +394,53 @@ fn run_encoder_and_adapter(
     feature_dim: usize,
     backend: GgmlCpuGraphBackend,
 ) -> Result<(Vec<f32>, usize), FunasrNanoExecutorError> {
-    let mut encoder = FunasrNanoEncoderGraph::new(runtime_source, encoder_metadata, backend)
-        .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
-            reason: error.to_string(),
-        })?;
-    let encoder_output = encoder
-        .encode(encoder_input, n_frames, feature_dim)
-        .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
-            reason: error.to_string(),
-        })?;
+    let key: FunasrNanoRuntimeCacheKey =
+        (PackContentKey::for_runtime_source(runtime_source), backend);
+    with_thread_local_cached_mut_by_key(
+        &FUNASR_NANO_ENCODER_ADAPTER_BY_KEY,
+        key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
+        || {
+            let encoder = FunasrNanoEncoderGraph::new(runtime_source, encoder_metadata, backend)
+                .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
+            let adapter = FunasrNanoAdapterGraph::new(runtime_source, adapter_metadata, backend)
+                .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
+                    reason: error.to_string(),
+                })?;
+            Ok(FunasrNanoEncoderAdapterRuntime { encoder, adapter })
+        },
+        |runtime| {
+            let encoder_output = runtime
+                .encoder
+                .encode(encoder_input, n_frames, feature_dim)
+                .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
+            let (adapter_rows, adapter_frames) = runtime
+                .adapter
+                .run(
+                    &encoder_output.rows,
+                    encoder_output.frame_count,
+                    encoder_output.d_model,
+                )
+                .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
+                    reason: error.to_string(),
+                })?;
 
-    let mut adapter = FunasrNanoAdapterGraph::new(runtime_source, adapter_metadata, backend)
-        .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
-            reason: error.to_string(),
-        })?;
-    let (adapter_rows, adapter_frames) = adapter
-        .run(
-            &encoder_output.rows,
-            encoder_output.frame_count,
-            encoder_output.d_model,
-        )
-        .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
-            reason: error.to_string(),
-        })?;
-
-    let n_aud = funasr_nano_audio_token_count(encoder_output.frame_count).min(adapter_frames);
-    if n_aud == 0 {
-        return Err(FunasrNanoExecutorError::AdapterFailed {
-            reason: "no audio tokens produced".to_string(),
-        });
-    }
-    let llm_dim = adapter_metadata.llm_dim;
-    let speech_rows = adapter_rows[..n_aud * llm_dim].to_vec();
-    Ok((speech_rows, n_aud))
+            let n_aud =
+                funasr_nano_audio_token_count(encoder_output.frame_count).min(adapter_frames);
+            if n_aud == 0 {
+                return Err(FunasrNanoExecutorError::AdapterFailed {
+                    reason: "no audio tokens produced".to_string(),
+                });
+            }
+            let llm_dim = adapter_metadata.llm_dim;
+            let speech_rows = adapter_rows[..n_aud * llm_dim].to_vec();
+            Ok((speech_rows, n_aud))
+        },
+    )
 }
 
 fn decode_with_decoder(
@@ -643,8 +677,7 @@ mod tests {
 
             // End-to-end greedy decode from the reference-derived audio rows.
             let n_aud = funasr_nano_audio_token_count(n_frames);
-            let speech_rows =
-                speech_rows_full[..n_aud * adapter_metadata.llm_dim].to_vec();
+            let speech_rows = speech_rows_full[..n_aud * adapter_metadata.llm_dim].to_vec();
             let decode_prompt =
                 build_funasr_nano_decode_prompt(&tokenizer, n_aud).expect("decode prompt");
             let mut decoder = FunasrNanoDecoderRuntime::new(
@@ -669,6 +702,94 @@ mod tests {
                 expected_text,
                 "[{tag}] transcript mismatch"
             );
+        }
+    }
+
+    /// Residency must not change output: the resident cached encoder+adaptor
+    /// path (`run_encoder_and_adapter` -- cache miss on the first call, then
+    /// hits at both a different and a previously seen frame count) must
+    /// produce bit-for-bit the same audio-token rows as a freshly built
+    /// one-shot encoder + adaptor over the same reference LFR features
+    /// (the dolphin prepared-runtime bit-identity pinning pattern).
+    #[test]
+    #[ignore = "requires OPENASR_FUNASR_NANO_GOLDEN_DIR + the ~1.97GB dev-only \
+                OPENASR_FUNASR_NANO_PACK fp16 .oasr; pins bit-identity of the resident \
+                cached encoder+adaptor runtime vs a fresh one-shot build"]
+    fn cached_encoder_adapter_matches_fresh_build_bit_for_bit() {
+        let (Some(dir), Some(pack)) = (golden_dir(), pack_path()) else {
+            eprintln!("skipping: set OPENASR_FUNASR_NANO_GOLDEN_DIR and OPENASR_FUNASR_NANO_PACK");
+            return;
+        };
+        let _generation_guard =
+            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
+        let encoder_metadata =
+            parse_funasr_nano_encoder_metadata(&gguf_metadata).expect("encoder metadata");
+        let adapter_metadata =
+            parse_funasr_nano_adapter_metadata(&gguf_metadata).expect("adapter metadata");
+
+        // en = cache miss (build + insert), zh = cache hit at a different
+        // frame count, en again = cache hit at a previously seen frame count.
+        for tag in ["en", "zh", "en"] {
+            let lfr = read_f32(&dir.join(format!("lfr_{tag}.bin")));
+            let encoder_input = build_sensevoice_encoder_input(
+                &[],
+                &lfr,
+                encoder_metadata.feature_dim,
+                encoder_metadata.d_model,
+            )
+            .expect("encoder input");
+
+            // Fresh one-shot reference: a brand-new encoder + adaptor per call.
+            let mut encoder = FunasrNanoEncoderGraph::new(
+                &runtime_source,
+                encoder_metadata,
+                GgmlCpuGraphBackend::Cpu,
+            )
+            .expect("fresh encoder");
+            let out = encoder
+                .encode(
+                    &encoder_input.data,
+                    encoder_input.n_frames,
+                    encoder_input.feature_dim,
+                )
+                .expect("fresh encode");
+            let mut adapter = FunasrNanoAdapterGraph::new(
+                &runtime_source,
+                adapter_metadata,
+                GgmlCpuGraphBackend::Cpu,
+            )
+            .expect("fresh adapter");
+            let (full_rows, adapter_frames) = adapter
+                .run(&out.rows, out.frame_count, out.d_model)
+                .expect("fresh adapter run");
+            let fresh_n_aud = funasr_nano_audio_token_count(out.frame_count).min(adapter_frames);
+            let fresh_rows = &full_rows[..fresh_n_aud * adapter_metadata.llm_dim];
+
+            // Resident cached path (what execute_inner runs).
+            let (cached_rows, cached_n_aud) = run_encoder_and_adapter(
+                &runtime_source,
+                encoder_metadata,
+                adapter_metadata,
+                &encoder_input.data,
+                encoder_input.n_frames,
+                encoder_input.feature_dim,
+                GgmlCpuGraphBackend::Cpu,
+            )
+            .expect("cached encoder+adapter");
+
+            assert_eq!(cached_n_aud, fresh_n_aud, "[{tag}] audio token count");
+            assert_eq!(cached_rows.len(), fresh_rows.len(), "[{tag}] row length");
+            for (index, (cached, fresh)) in cached_rows.iter().zip(fresh_rows).enumerate() {
+                assert_eq!(
+                    cached.to_bits(),
+                    fresh.to_bits(),
+                    "[{tag}] audio-token value {index} differs: cached {cached} vs fresh {fresh}"
+                );
+            }
+            eprintln!("[{tag}] cached == fresh bit-for-bit ({cached_n_aud} audio tokens)");
         }
     }
 }
