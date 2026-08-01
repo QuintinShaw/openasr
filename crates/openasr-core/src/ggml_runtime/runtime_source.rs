@@ -310,6 +310,15 @@ impl GgmlRuntimeSource {
     pub(crate) fn backing_mmap(&self) -> Arc<Mmap> {
         Arc::clone(&self.mmap)
     }
+
+    /// Process-local identity of the already-open mapping. Clones of this
+    /// runtime source retain the same `Arc<Mmap>` and therefore the same value;
+    /// a separately admitted file gets a distinct value even at the same path.
+    /// This is suitable for ephemeral weak caches that must not force the
+    /// potentially expensive full-file `content_id()` hash.
+    pub(crate) fn backing_mmap_identity(&self) -> usize {
+        Arc::as_ptr(&self.mmap) as usize
+    }
 }
 
 #[derive(Debug, Error)]
