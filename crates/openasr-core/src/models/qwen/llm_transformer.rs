@@ -1072,9 +1072,12 @@ fn allocate_decode_layer_tensors(
             reason: "decode layer q/kv head ratio mismatch",
         });
     }
-    // Bias forces the split (non-fused) QKV path (see `nn::decoder::LlmLayerWeights`'
-    // doc comment) -- never build a fused-QKV synthetic tensor when bias is present.
-    let allow_fused_qkv = !has_qkv_bias;
+    // QKV bias no longer forces the split path: the fused `[q|k|v]` matmul
+    // produces the same per-projection columns, and the bias is added on the
+    // (ggml-contiguous) per-projection view/copy downstream in `nn::decoder`
+    // -- identical arithmetic to the split path, so Qwen2-shaped packs (bias,
+    // e.g. funasr/mimo) get the single-matmul decode speedup too.
+    let allow_fused_qkv = true;
 
     let attn_norm = arena.new_tensor_2d_f32(d_model, 1, "qwen_llm_decode_attn_norm_weight")?;
     let q_norm = has_qk_norm

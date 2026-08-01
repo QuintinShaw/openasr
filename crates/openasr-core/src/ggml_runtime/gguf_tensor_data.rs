@@ -620,6 +620,73 @@ pub struct GgufHostTensorPayload<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Byte length of one quantized/typed ggml row of `ne0` elements, or `None` on
+/// overflow. Mirrors `ggml_row_size` so callers can slice a stored quantized
+/// tensor into per-row spans without re-opening the reader.
+pub(crate) fn ggml_row_size_bytes(ggml_type: i32, ne0: usize) -> Option<usize> {
+    let ne0_i64 = i64::try_from(ne0).ok()?;
+    Some(unsafe { ffi::ggml_row_size(ggml_type, ne0_i64) })
+}
+
+/// Dequantize one typed/quantized ggml row -- `row_bytes` must be exactly
+/// `ggml_row_size(ggml_type, ne0)` long -- into `ne0` f32 values appended to
+/// `out`. This is the lazy-gather primitive that lets a quantized
+/// token-embedding table dequantize only the rows a decode step touches instead
+/// of materializing the whole `[d_model, vocab]` table to f32.
+pub(crate) fn dequantize_ggml_row_to_f32(
+    ggml_type: i32,
+    row_bytes: &[u8],
+    ne0: usize,
+    out: &mut Vec<f32>,
+) -> Result<(), GgufQuantizedRowDequantizeError> {
+    let ne0_i64 =
+        i64::try_from(ne0).map_err(|_| GgufQuantizedRowDequantizeError::Ne0Overflow { ne0 })?;
+    let row_size = unsafe { ffi::ggml_row_size(ggml_type, ne0_i64) };
+    if row_bytes.len() != row_size {
+        return Err(GgufQuantizedRowDequantizeError::RowLengthMismatch {
+            ggml_type,
+            expected: row_size,
+            actual: row_bytes.len(),
+        });
+    }
+    let traits_ptr = unsafe { ffi::ggml_get_type_traits(ggml_type) };
+    if traits_ptr.is_null() {
+        return Err(GgufQuantizedRowDequantizeError::UnsupportedType { ggml_type });
+    }
+    let to_float = unsafe { (*traits_ptr).to_float }
+        .ok_or(GgufQuantizedRowDequantizeError::UnsupportedType { ggml_type })?;
+    let start = out.len();
+    out.resize(start + ne0, 0.0_f32);
+    // SAFETY: `row_bytes.len() == ggml_row_size(ggml_type, ne0)` (checked above)
+    // and `out[start..]` holds exactly `ne0` freshly-zeroed f32 slots, matching
+    // the `(src, dst, ne0)` contract of ggml's `to_float` trait.
+    unsafe {
+        to_float(
+            row_bytes.as_ptr().cast::<std::ffi::c_void>(),
+            out[start..].as_mut_ptr(),
+            ne0_i64,
+        );
+    }
+    Ok(())
+}
+
+/// Failure dequantizing a single ggml row via [`dequantize_ggml_row_to_f32`].
+#[derive(Debug, Error)]
+pub(crate) enum GgufQuantizedRowDequantizeError {
+    #[error(
+        "quantized row dequantize length mismatch for ggml_type {ggml_type}: row is {actual} bytes, expected {expected}"
+    )]
+    RowLengthMismatch {
+        ggml_type: i32,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("quantized row dequantize ne0 {ne0} does not fit i64")]
+    Ne0Overflow { ne0: usize },
+    #[error("ggml_type {ggml_type} has no to_float trait for row dequantize")]
+    UnsupportedType { ggml_type: i32 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufWeightTensorElementType {
     F32,
