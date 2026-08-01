@@ -910,6 +910,12 @@ fn main() {
             .join("src/ggml-metal/ggml-metal-impl.h")
             .display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        source_dir
+            .join("src/ggml-metal/ggml-metal.metal")
+            .display()
+    );
     if is_macos {
         println!(
             "cargo:rerun-if-changed={}",

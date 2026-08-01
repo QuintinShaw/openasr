@@ -7075,7 +7075,7 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 2);
@@ -7083,14 +7083,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_scheduler_cancel_flips_at_a_mid_graph_checkpoint() {
+    fn metal_scheduler_cancel_at_a_scheduler_boundary_reports_native_capability() {
         use std::sync::atomic::Ordering;
 
         let probe = AbortAfterPolls {
             polls: std::sync::atomic::AtomicUsize::new(0),
-            // Scheduler pre-allocation, post-allocation, split entry,
-            // post-input phase, and backend pre-start are polls 1..=5. Poll 6
-            // is after the first synchronized 32-node Metal graph view.
+            // Scheduler allocation, split, and input-transfer boundaries own
+            // the first six polls. This cancellation fires before the split is
+            // submitted; NATIVE still records that every scheduled backend can
+            // enforce the same callback if cancellation arrives during compute.
             abort_after: 6,
         };
         let (mode, status, output) = compute_add_chain_with_callback(
@@ -7103,7 +7104,7 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 6);
@@ -7111,7 +7112,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_segmented_cancel_false_completes_all_graph_views() {
+    fn metal_native_cancel_false_completes_the_graph() {
         let probe = AbortAfterPolls {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: usize::MAX,
@@ -7127,7 +7128,7 @@ mod tests {
                 Some(abort_after_polls),
                 (&probe as *const AbortAfterPolls).cast_mut().cast(),
             );
-            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
             assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
             assert_eq!(output, Some(96.0));
         }
