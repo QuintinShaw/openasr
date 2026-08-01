@@ -1,0 +1,52 @@
+# Host-f32 weight-loader site inventory (keep-quantized gate K1 SSOT)
+#
+# Every source file under crates/openasr-core/src/models/ that calls one of the
+# reader's host-f32 materialization helpers -- host_tensor_f32_copy_dequantized_by_name,
+# host_tensor_f32_copy_by_name, host_tensor_f32_copy_by_id -- MUST be listed here
+# (path relative to crates/openasr-core/src/models/). The K1 gate
+# (models::resident_runtime_audit) locks the on-disk set of such files against
+# this inventory: adding a NEW host-f32 loader site (a new file that materializes
+# any tensor to a host Vec<f32>) fails the gate until the site is added here.
+#
+# Adding a line is a certification, reviewed at that point, that the site loads
+# ONLY tensors that legitimately stay f32/f16 per the keep-quantized runtime
+# contract in docs/MODEL_ONBOARDING.md ("What stays f32/f16"): 1-D norm/bias
+# vectors, convolution kernels, get_rows token/decoder embeddings, positional /
+# rotary tables, CMVN vectors, and small classifier/adaptor heads. It MUST NOT be
+# used to load a rank-2 `mul_mat` weight matrix to f32 -- those bind natively via
+# weight_tensor_payload_by_name + new_matmul_weight_2d_typed (reference: qwen
+# llm_transformer/logits_head; dolphin executor's insert_pool_tensor classifies
+# per tensor). A host-f32 bulk weight is the load-time-dequant pitfall the
+# contract forbids: it flattens RAM/RTF across quants.
+#
+# Lines are sorted; one path per line; '#' comments and blank lines ignored.
+
+cohere/frontend.rs
+cohere/weights.rs
+diarize_pack_import.rs
+dolphin/executor.rs
+fastconformer/weights.rs
+firered_aed/encoder_graph.rs
+firered_aed/executor.rs
+firered_llm/adapter_graph.rs
+firered_llm/executor.rs
+firered_punc/weights.rs
+mimo_asr/audio_tokenizer_graph.rs
+mimo_asr/input_local_graph.rs
+mimo_asr/mel_frontend.rs
+mimo_asr/rvq.rs
+moonshine/weights.rs
+moss_transcribe_diarize/adaptor_graph.rs
+moss_transcribe_diarize/encoder_graph.rs
+moss_transcribe_diarize/package_import.rs
+qwen/audio_encoder.rs
+qwen/frontend.rs
+qwen/llm_transformer.rs
+qwen/logits_head.rs
+qwen/token_embedding.rs
+sensevoice/encoder_weights.rs
+wav2vec2_ctc/encoder_weights.rs
+whisper/ggml_decoder_weights.rs
+whisper/ggml_encoder_weights.rs
+xasr_zipformer/encoder_graph.rs
+xasr_zipformer/weights.rs

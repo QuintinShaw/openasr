@@ -167,6 +167,16 @@ impl MimoLlmDecoderRuntime {
             .collect()
     }
 
+    /// Releases the CPU per-token grow-to-fit step buffer before this decoder
+    /// goes back into the cross-request resident cache, so it stays scoped to
+    /// one utterance instead of living on indefinitely with the cached
+    /// decoder. A no-op on Metal/GPU or when no CPU step ever ran. Mirrors
+    /// `firered_llm::llm_transformer::FireRedLlmDecoderRuntime::
+    /// release_session_scoped_buffers` (both drive the same shared executor).
+    pub(crate) fn release_session_scoped_buffers(&mut self) {
+        self.whole_decoder.release_session_scoped_buffers();
+    }
+
     pub(crate) fn gather_token_embedding(
         &self,
         token_id: u32,
