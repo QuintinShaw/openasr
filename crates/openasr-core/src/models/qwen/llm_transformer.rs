@@ -1526,10 +1526,19 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     }
 
     /// Like [`new`] but with an optional LoRA adapter injected into the decoder
-    /// graph.  Uses [`DEFAULT_RMS_NORM_EPSILON`] and no fused logits head.
+    /// graph.  Uses [`DEFAULT_RMS_NORM_EPSILON`].
+    ///
+    /// The fused logits head stays correct alongside an active adapter: LoRA
+    /// slots only ever attach to the per-layer projections
+    /// (`allocate_layer_lora_slots` -- q/k/v/o and the FFN gate/up/down), never
+    /// to the output-norm/lm-head stage, and the host
+    /// [`super::logits_head::Qwen3AsrLlmLogitsHead`] the spec is derived from
+    /// is likewise loaded from the base pack only -- both selection paths see
+    /// the identical head weights whether or not an adapter is active.
     pub(crate) fn new_with_lora(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
         runtime_source: Option<&GgmlRuntimeSource>,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
@@ -1537,7 +1546,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             projections,
             runtime_source,
             DEFAULT_RMS_NORM_EPSILON,
-            None,
+            fused_logits_head,
             adapter,
             backend,
         )
@@ -5339,6 +5348,117 @@ mod tests {
         let token_id = validate_fused_top1_token_id(reversed_top1[0], spec.vocab_size)
             .expect("top1 should map to a valid token");
         assert_eq!(token_id, 1);
+    }
+
+    /// Pin the correctness contract every fused-top1 family (moss, and now
+    /// qwen/mimo/firered-llm) rides: the device-graph argmax must select the
+    /// exact token a host full-vocab logits row would (RMSNorm -> norm-weight
+    /// mul -> [d_model x vocab] projection -> first-max argmax), across many
+    /// deterministic pseudo-random hidden rows. The host reference below is
+    /// computed independently in-test, mirroring
+    /// `logits_head::Qwen3AsrLlmLogitsHead`'s `VocabHidden` fallback math.
+    #[test]
+    fn fused_logits_top1_matches_host_logits_argmax_over_many_hiddens() {
+        const D_MODEL: usize = 8;
+        const VOCAB: usize = 17;
+        fn deterministic_f32_vec(seed: u64, len: usize) -> Vec<f32> {
+            let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = ((state >> 40) as u32 & 0x00FF_FFFF) as f32 / 16_777_216.0;
+                out.push(unit * 2.0 - 1.0);
+            }
+            out
+        }
+        let output_weight_values = deterministic_f32_vec(0xF0_5ED0, D_MODEL * VOCAB);
+        let output_norm_weight = deterministic_f32_vec(0x00BA_D001, D_MODEL);
+        let output_weight_bytes = output_weight_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let config = GgmlCpuGraphConfig::default();
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(config.context_bytes)
+            .expect("static arena should allocate");
+        let dims = Qwen3AsrLlmDecodeDims {
+            d_model: D_MODEL,
+            q_width: D_MODEL,
+            k_width: D_MODEL,
+            v_width: D_MODEL,
+            head_dim: D_MODEL,
+            q_heads: 1,
+            kv_heads: 1,
+        };
+        let spec = Qwen3AsrLlmFusedLogitsHeadSpec {
+            d_model: D_MODEL,
+            vocab_size: VOCAB,
+            rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+            output_norm_weight: &output_norm_weight,
+            output_weight_tensor_name: "synthetic.output.weight",
+            output_weight_ggml_type: GGML_TYPE_F32,
+            output_weight_dims: &[D_MODEL, VOCAB],
+            output_weight_bytes: &output_weight_bytes,
+        };
+        let handles = allocate_fused_logits_head_tensors(&mut arena, None, dims, &spec)
+            .expect("fused logits handles should allocate");
+        upload_fused_logits_head_weights(&mut arena, &handles, &spec)
+            .expect("fused logits weights should upload");
+
+        for case in 0..32u64 {
+            let hidden = deterministic_f32_vec(0x41D_0000 + case, D_MODEL);
+
+            // Independent host reference: RMSNorm + norm-weight mul +
+            // [d_model, vocab] matvec + first-max argmax.
+            let mut sum_squares = 0.0_f32;
+            for value in &hidden {
+                sum_squares += value * value;
+            }
+            let inv_rms = (sum_squares / D_MODEL as f32 + DEFAULT_RMS_NORM_EPSILON)
+                .sqrt()
+                .recip();
+            let mut host_best_token = 0usize;
+            let mut host_best_logit = f32::NEG_INFINITY;
+            for vocab_index in 0..VOCAB {
+                let row = &output_weight_values[vocab_index * D_MODEL..(vocab_index + 1) * D_MODEL];
+                let mut logit = 0.0_f32;
+                for hidden_index in 0..D_MODEL {
+                    logit += hidden[hidden_index]
+                        * inv_rms
+                        * output_norm_weight[hidden_index]
+                        * row[hidden_index];
+                }
+                if logit > host_best_logit {
+                    host_best_logit = logit;
+                    host_best_token = vocab_index;
+                }
+            }
+
+            let mut graph = runner.start_graph();
+            let state = graph
+                .new_tensor_2d_f32(D_MODEL, 1, "synthetic_state")
+                .expect("state tensor should allocate");
+            graph.set_input(state).expect("state should be input");
+            let top1 = build_fused_logits_top1(&arena, &handles, &mut graph, state, 1)
+                .expect("fused top1 should build");
+            graph.set_output(top1).expect("top1 should be output");
+            graph
+                .set_f32_slice(state, &hidden, "synthetic_state")
+                .expect("state should upload");
+            let reversed_top1 = graph
+                .compute_output_i32(top1, 1)
+                .expect("fused top1 should compute");
+            let fused_token = validate_fused_top1_token_id(reversed_top1[0], VOCAB)
+                .expect("top1 should map to a valid token");
+            assert_eq!(
+                fused_token as usize, host_best_token,
+                "fused device argmax diverged from host full-vocab argmax for case {case}"
+            );
+        }
     }
 
     #[test]

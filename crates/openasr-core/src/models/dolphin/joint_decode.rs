@@ -18,11 +18,10 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    GgmlStaticTensor, GgmlStaticTensorArena,
 };
 
-use super::decoder_graph::{
-    DolphinDecoderConfig, DolphinDecoderError, DolphinDecoderRescoreRuntime,
-};
+use super::decoder_graph::{DolphinDecoderError, DolphinDecoderRescoreRuntime};
 use super::encoder_graph::DolphinWeightProvider;
 use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
@@ -97,14 +96,14 @@ pub(crate) struct DolphinJointDecodeResult {
 /// `decode()` (which computes `ctc_logprobs` before `apply_deep_biasing` replaces
 /// `encoder_out`).
 pub(crate) fn joint_decode(
-    decoder_config: &DolphinDecoderConfig,
-    provider: &dyn DolphinWeightProvider,
+    ctc_head: &mut DolphinCtcHeadRuntime,
+    rescore: &mut DolphinDecoderRescoreRuntime,
     encoder_out: &[f32],
     rescoring_encoder_out: &[f32],
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
-    backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinJointDecodeResult, DolphinJointDecodeError> {
+    let decoder_config = *rescore.config();
     let vocab = decoder_config.vocab_size;
     let d_model = decoder_config.d_model;
     if frames == 0 || encoder_out.len() != frames * d_model {
@@ -123,8 +122,7 @@ pub(crate) fn joint_decode(
             ),
         });
     }
-    let ctc_log_probs =
-        compute_ctc_log_probs(provider, encoder_out, frames, d_model, vocab, backend)?;
+    let ctc_log_probs = ctc_head.compute_log_probs(encoder_out, frames)?;
     let blank = decode_config.blank_token_id as usize;
     if blank >= vocab {
         return Err(DolphinJointDecodeError::Shape {
@@ -144,13 +142,11 @@ pub(crate) fn joint_decode(
     }
 
     let scored_nbest = attention_rescore(
-        decoder_config,
-        provider,
+        rescore,
         rescoring_encoder_out,
         frames,
         decode_config,
         &nbest,
-        backend,
     )?;
     let best_token_ids = scored_nbest
         .first()
@@ -192,115 +188,157 @@ fn dolphin_ctc_head_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphCo
     }
 }
 
-/// `ctc.ctc_lo(encoder_out)` -> `log_softmax`, returned row-major `[frames, vocab]`
-/// (vocab innermost). The linear runs in the CPU ggml graph (like the encoder);
-/// the softmax is a cheap Rust pass.
-fn compute_ctc_log_probs(
-    provider: &dyn DolphinWeightProvider,
-    encoder_out: &[f32],
-    frames: usize,
+/// Build-once/run-many CTC head runtime: `ctc.ctc_lo` weight + bias resident
+/// in a persistent WEIGHTS-usage arena, one small projection graph per call.
+/// The executor caches this per `(pack, backend)` alongside the encoder and
+/// rescore runtimes (see `executor::DolphinPreparedRuntime`), so warm calls
+/// skip the per-utterance weight re-upload the pre-runtime path paid.
+pub(crate) struct DolphinCtcHeadRuntime {
+    runner: GgmlCpuGraphRunner,
+    arena: GgmlStaticTensorArena,
+    weight: GgmlStaticTensor,
+    bias: GgmlStaticTensor,
     d_model: usize,
     vocab: usize,
-    backend: GgmlCpuGraphBackend,
-) -> Result<Vec<f32>, DolphinJointDecodeError> {
-    let native_weight = provider.native_weight("ctc.ctc_lo.weight");
-    let weight = if native_weight.is_some() {
-        None
-    } else {
-        Some(fetch(provider, "ctc.ctc_lo.weight", vocab * d_model)?)
-    };
-    let bias = fetch(provider, "ctc.ctc_lo.bias", vocab)?;
+}
 
-    let graph_config = dolphin_ctc_head_graph_config(backend);
-    let ggml = |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
-    let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
+impl DolphinCtcHeadRuntime {
+    pub(crate) fn new(
+        provider: &dyn DolphinWeightProvider,
+        d_model: usize,
+        vocab: usize,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, DolphinJointDecodeError> {
+        let native_weight = provider.native_weight("ctc.ctc_lo.weight");
+        let weight = if native_weight.is_some() {
+            None
+        } else {
+            Some(fetch(provider, "ctc.ctc_lo.weight", vocab * d_model)?)
+        };
+        let bias = fetch(provider, "ctc.ctc_lo.bias", vocab)?;
 
-    // Persistent weight arena (a WEIGHTS-usage backend buffer): the CTC head's
-    // `ctc.ctc_lo.weight` matmul operand + bias live here so the ggml
-    // multi-backend scheduler can offload the projection to an accelerator, the
-    // same reason the encoder/decoder weights are arena-resident. Binding them as
-    // per-call transient graph leaves (the pre-arena path) pinned this matmul to
-    // the CPU even under an explicit Metal backend. Only `encoder_out` is a
-    // genuine per-call graph input. Weight placement changes no computed value,
-    // so the CTC log-probs stay golden-identical.
-    let arena = runner
-        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(2))
-        .map_err(ggml("static_tensor_arena"))?;
+        let graph_config = dolphin_ctc_head_graph_config(backend);
+        let ggml =
+            |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
+        let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
 
-    // Weight `[vocab, d_model]` binds as ggml `[ne0=d_model, ne1=vocab]` so
-    // `mul_mat(weight, enc)` projects each frame to the vocab logits. When the
-    // provider keeps it quantized/f16, it binds at the stored ggml type and the
-    // raw block bytes are uploaded verbatim (stays quantized in the buffer);
-    // otherwise it binds f32.
-    let weight_handle = match native_weight {
-        Some(native) => arena
-            .new_matmul_weight_2d_typed(d_model, vocab, native.ggml_type, "dolphin_ctc_weight")
-            .map_err(ggml("weight_alloc_native"))?,
-        None => arena
-            .new_tensor_2d_f32(d_model, vocab, "dolphin_ctc_weight")
-            .map_err(ggml("weight_alloc"))?,
-    };
-    let bias_handle = arena
-        .new_tensor_1d_f32(vocab, "dolphin_ctc_bias")
-        .map_err(ggml("bias_alloc"))?;
+        // Persistent weight arena (a WEIGHTS-usage backend buffer): the CTC
+        // head's `ctc.ctc_lo.weight` matmul operand + bias live here so the ggml
+        // multi-backend scheduler can offload the projection to an accelerator,
+        // the same reason the encoder/decoder weights are arena-resident.
+        // Binding them as per-call transient graph leaves (the pre-arena path)
+        // pinned this matmul to the CPU even under an explicit Metal backend.
+        // Only `encoder_out` is a genuine per-call graph input. Weight placement
+        // changes no computed value, so the CTC log-probs stay golden-identical.
+        let arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(2))
+            .map_err(ggml("static_tensor_arena"))?;
 
-    // Upload the weight + bias into the arena backend buffer exactly once (the
-    // first upload freezes further tensor creation).
-    let mut arena = arena;
-    match (native_weight, weight) {
-        (Some(native), _) => arena
-            .set_bytes_slice(weight_handle, native.bytes, "dolphin_ctc_weight")
-            .map_err(ggml("upload_weight_native"))?,
-        (None, Some(weight)) => arena
-            .set_f32_slice(weight_handle, weight, "dolphin_ctc_weight")
-            .map_err(ggml("upload_weight"))?,
-        (None, None) => unreachable!("ctc weight is fetched f32 when not native"),
+        // Weight `[vocab, d_model]` binds as ggml `[ne0=d_model, ne1=vocab]` so
+        // `mul_mat(weight, enc)` projects each frame to the vocab logits. When
+        // the provider keeps it quantized/f16, it binds at the stored ggml type
+        // and the raw block bytes are uploaded verbatim (stays quantized in the
+        // buffer); otherwise it binds f32.
+        let weight_handle = match native_weight {
+            Some(native) => arena
+                .new_matmul_weight_2d_typed(d_model, vocab, native.ggml_type, "dolphin_ctc_weight")
+                .map_err(ggml("weight_alloc_native"))?,
+            None => arena
+                .new_tensor_2d_f32(d_model, vocab, "dolphin_ctc_weight")
+                .map_err(ggml("weight_alloc"))?,
+        };
+        let bias_handle = arena
+            .new_tensor_1d_f32(vocab, "dolphin_ctc_bias")
+            .map_err(ggml("bias_alloc"))?;
+
+        // Upload the weight + bias into the arena backend buffer exactly once
+        // (the first upload freezes further tensor creation).
+        let mut arena = arena;
+        match (native_weight, weight) {
+            (Some(native), _) => arena
+                .set_bytes_slice(weight_handle, native.bytes, "dolphin_ctc_weight")
+                .map_err(ggml("upload_weight_native"))?,
+            (None, Some(weight)) => arena
+                .set_f32_slice(weight_handle, weight, "dolphin_ctc_weight")
+                .map_err(ggml("upload_weight"))?,
+            (None, None) => unreachable!("ctc weight is fetched f32 when not native"),
+        }
+        arena
+            .set_f32_slice(bias_handle, bias, "dolphin_ctc_bias")
+            .map_err(ggml("upload_bias"))?;
+
+        Ok(Self {
+            runner,
+            arena,
+            weight: weight_handle,
+            bias: bias_handle,
+            d_model,
+            vocab,
+        })
     }
-    arena
-        .set_f32_slice(bias_handle, bias, "dolphin_ctc_bias")
-        .map_err(ggml("upload_bias"))?;
 
-    let mut graph = runner.start_graph();
-    let encoder_tensor = graph
-        .new_tensor_2d_f32(d_model, frames, "dolphin_ctc_encoder_out")
-        .map_err(ggml("encoder_alloc"))?;
-    let weight_tensor = arena.graph_tensor(weight_handle);
-    let bias_tensor = arena.graph_tensor(bias_handle);
+    /// `ctc.ctc_lo(encoder_out)` -> `log_softmax`, returned row-major
+    /// `[frames, vocab]` (vocab innermost). The linear runs in the ggml graph
+    /// (like the encoder); the softmax is a cheap Rust pass.
+    pub(crate) fn compute_log_probs(
+        &mut self,
+        encoder_out: &[f32],
+        frames: usize,
+    ) -> Result<Vec<f32>, DolphinJointDecodeError> {
+        let (d_model, vocab) = (self.d_model, self.vocab);
+        if frames == 0 || encoder_out.len() != frames * d_model {
+            return Err(DolphinJointDecodeError::Shape {
+                reason: format!(
+                    "encoder_out has {} values, expected {frames}x{d_model}",
+                    encoder_out.len()
+                ),
+            });
+        }
+        let ggml =
+            |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
+        let arena = &self.arena;
+        let mut graph = self.runner.start_graph();
+        let encoder_tensor = graph
+            .new_tensor_2d_f32(d_model, frames, "dolphin_ctc_encoder_out")
+            .map_err(ggml("encoder_alloc"))?;
+        let weight_tensor = arena.graph_tensor(self.weight);
+        let bias_tensor = arena.graph_tensor(self.bias);
 
-    let logits = graph
-        .mul_mat(weight_tensor, encoder_tensor)
-        .map_err(ggml("ctc_mul_mat"))?;
-    let logits = graph
-        .add(logits, bias_tensor)
-        .map_err(ggml("ctc_bias_add"))?;
-    graph.set_output(logits).map_err(ggml("set_output"))?;
-    // Only `encoder_out` is a fresh per-call graph leaf with no buffer of its
-    // own; the weight + bias are arena-resident (backend buffer already
-    // allocated), so -- like the encoder/decoder arena paths -- they need no
-    // `set_input`.
-    graph
-        .set_input(encoder_tensor)
-        .map_err(ggml("mark_input(encoder_out)"))?;
-    // Allocate the forward graph through the scheduler's gallocr for
-    // liveness-based buffer reuse before uploading inputs (mirrors the
-    // encoder/decoder graphs).
-    graph
-        .prepare_outputs_for_upload(&[logits])
-        .map_err(ggml("prepare_outputs"))?;
+        let logits = graph
+            .mul_mat(weight_tensor, encoder_tensor)
+            .map_err(ggml("ctc_mul_mat"))?;
+        let logits = graph
+            .add(logits, bias_tensor)
+            .map_err(ggml("ctc_bias_add"))?;
+        graph.set_output(logits).map_err(ggml("set_output"))?;
+        // Only `encoder_out` is a fresh per-call graph leaf with no buffer of
+        // its own; the weight + bias are arena-resident (backend buffer already
+        // allocated), so -- like the encoder/decoder arena paths -- they need
+        // no `set_input`.
+        graph
+            .set_input(encoder_tensor)
+            .map_err(ggml("mark_input(encoder_out)"))?;
+        // Allocate the forward graph through the scheduler's gallocr for
+        // liveness-based buffer reuse before uploading inputs (mirrors the
+        // encoder/decoder graphs).
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(ggml("prepare_outputs"))?;
 
-    graph
-        .set_f32_slice(encoder_tensor, encoder_out, "dolphin_ctc_encoder_out")
-        .map_err(ggml("upload_encoder"))?;
+        graph
+            .set_f32_slice(encoder_tensor, encoder_out, "dolphin_ctc_encoder_out")
+            .map_err(ggml("upload_encoder"))?;
 
-    let mut logits = graph
-        .compute_output_f32(logits, frames * vocab)
-        .map_err(ggml("compute"))?;
+        let mut logits = graph
+            .compute_output_f32(logits, frames * vocab)
+            .map_err(ggml("compute"))?;
 
-    // In-place log_softmax over each frame's vocab row.
-    for row in logits.chunks_exact_mut(vocab) {
-        log_softmax_in_place(row);
+        // In-place log_softmax over each frame's vocab row.
+        for row in logits.chunks_exact_mut(vocab) {
+            log_softmax_in_place(row);
+        }
+        Ok(logits)
     }
-    Ok(logits)
 }
 
 fn fetch<'p>(
@@ -464,13 +502,11 @@ fn top_k_indices(row: &[f32], k: usize) -> Vec<usize> {
 /// position log-probs are a per-hypothesis constant and are excluded; the score is
 /// the sum of `log P(hyp[k] | prompt, hyp[<k])` plus `log P(eos | prompt, hyp)`.
 fn attention_rescore(
-    decoder_config: &DolphinDecoderConfig,
-    provider: &dyn DolphinWeightProvider,
+    runtime: &mut DolphinDecoderRescoreRuntime,
     encoder_out: &[f32],
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
     nbest: &[(Vec<u32>, f32)],
-    backend: GgmlCpuGraphBackend,
 ) -> Result<Vec<DolphinScoredHypothesis>, DolphinJointDecodeError> {
     let prompt = &decode_config.prompt_prefix;
     let prompt_len = prompt.len();
@@ -479,30 +515,35 @@ fn attention_rescore(
             reason: "prompt prefix must be non-empty".to_string(),
         });
     }
-    let vocab = decoder_config.vocab_size;
+    let vocab = runtime.config().vocab_size;
     let eos = decode_config.eos_token_id as usize;
 
-    // Build-once/run-many (P5): every hypothesis below teacher-forces the same
-    // decoder weights over the same encoder_out, differing only in the token
-    // sequence, so the ~200 decoder weight tensors + the encoder memory are
-    // loaded into the runtime's persistent arena exactly once here rather than
-    // rebuilt and re-uploaded per hypothesis (up to DOLPHIN_BEAM_SIZE times).
-    let mut runtime =
-        DolphinDecoderRescoreRuntime::new(decoder_config, provider, encoder_out, frames, backend)?;
+    // The whole n-best is teacher-forced in ONE fused graph per utterance: the
+    // decoder weights are already resident in the (executor-cached) runtime's
+    // arena, the encoder memory is uploaded once, and the per-layer cross K/V
+    // projections over it are computed once and shared by every hypothesis
+    // chain (see `DolphinDecoderRescoreRuntime::decode_nbest_prompt_logits`).
+    // An empty hypothesis teacher-forces the bare prompt: its score is just
+    // log P(eos | prompt), read from the same fused call.
+    let sequences: Vec<Vec<u32>> = nbest
+        .iter()
+        .map(|(tokens, _)| {
+            let mut sequence = Vec::with_capacity(prompt_len + tokens.len());
+            sequence.extend_from_slice(prompt);
+            sequence.extend_from_slice(tokens);
+            sequence
+        })
+        .collect();
+    let nbest_logits = runtime.decode_nbest_prompt_logits(encoder_out, frames, &sequences)?;
 
     let mut scored = Vec::with_capacity(nbest.len());
-    for (tokens, ctc_score) in nbest {
+    for ((tokens, ctc_score), logits) in nbest.iter().zip(&nbest_logits) {
         let attention_score = if tokens.is_empty() {
             // Empty hypothesis: score is just log P(eos | prompt).
-            let logits = runtime.decode_prompt_logits(prompt)?;
             let mut row = logits.last_token_logits().to_vec();
             log_softmax_in_place(&mut row);
             row[eos]
         } else {
-            let mut sequence = Vec::with_capacity(prompt_len + tokens.len());
-            sequence.extend_from_slice(prompt);
-            sequence.extend_from_slice(tokens);
-            let logits = runtime.decode_prompt_logits(&sequence)?;
             score_hypothesis(&logits.logits, vocab, prompt_len, tokens, eos)
         };
         let combined = attention_score + decode_config.ctc_weight * *ctc_score;

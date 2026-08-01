@@ -575,9 +575,17 @@ impl Qwen3AsrGgmlExecutor {
                 decoder
             }
             None => {
+                // The fused spec is `None` for packs whose output weight is not
+                // directly loadable in the `[hidden, vocab]` layout; the decoder
+                // then reports `supports_fused_top1() == false` and every step
+                // stays on the host logits path -- fail-closed, never a wrong
+                // token. LoRA never targets the lm-head stage (see
+                // `new_with_lora`'s doc comment), so the fused head is safe to
+                // keep alongside an active adapter.
                 let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_lora(
                     &layer_attention_projections,
                     Some(runtime_source),
+                    logits_head.fused_top1_spec(),
                     adapter.as_deref(),
                     backend,
                 )
@@ -622,6 +630,13 @@ impl Qwen3AsrGgmlExecutor {
             whole_decoder,
             cache_prompt_tokens: 1,
             consumed_prefill_step: false,
+            fused_top1_hint_allowed: qwen_fused_top1_hint_allowed(
+                request.request_options.word_timestamps,
+                request
+                    .request_options
+                    .word_timestamps_forced_for_diarization,
+                request.request_options.phrase_bias.is_some(),
+            ),
             control: Arc::clone(&request.execution_context.control),
         };
         let decode_text_token_ids = |token_ids: &[u32]| {
@@ -1016,6 +1031,46 @@ impl LayerCountResolver for Qwen3AsrLayerCountResolver {
     }
 }
 
+/// Whether this request may take the fused device-side top-1 (hint-only) lane.
+///
+/// Hint-only steps report `probability: 0.0` and never materialize a host
+/// logit row, so they are only taken when nothing about the request consumes
+/// that row:
+///
+/// - USER-REQUESTED `word_timestamps` feeds `generated_probabilities` into
+///   the emitted per-word confidences, so a zeroed probability would change
+///   the output. The CLI transcribe path, however, force-enables
+///   `word_timestamps` for EVERY non-whisper family purely to obtain word
+///   anchors for cue segmentation / diarization turn-splitting and then
+///   strips the words from the result (`word_timestamps_forced_for_diarization`
+///   marks exactly that case). Word anchor TIMES are index-positional
+///   (`seq2seq_word_timestamps_from_generated_tokens` never reads
+///   probabilities for timing) and the cue splitter emits `confidence: None`,
+///   so on the forced-and-stripped lane the probabilities are invisible to
+///   the output and the fused lane stays byte-identical.
+/// - A phrase-bias request makes the shared driver require the full row to
+///   apply biases (a hint-only step would fail closed on `EmptyStepLogits`).
+///
+/// Both gates are decided per request; the fused head stays resident in the
+/// whole-decoder arena either way so a cached decoder serves both kinds of
+/// request.
+fn qwen_fused_top1_hint_allowed(
+    word_timestamps: bool,
+    word_timestamps_forced_for_diarization: bool,
+    has_phrase_bias: bool,
+) -> bool {
+    (!word_timestamps || word_timestamps_forced_for_diarization) && !has_phrase_bias
+}
+
+/// Prefill output for the shared greedy driver's step 0: the host logits row
+/// for the first generated token, or (on the fused Metal/GPU lane) a device
+/// argmax hint with no host row -- mirrors
+/// `moss_transcribe_diarize::llm_decoder::MossTdPrefillOutput`.
+struct Qwen3AsrPrefillStepOutput {
+    logits: Vec<f32>,
+    greedy_token_hint: Option<u32>,
+}
+
 struct Qwen3AsrPrefillOnlyGreedyStepExecutor {
     metadata: Qwen3AsrExecutionMetadata,
     prefill_input: super::llm_prefill::Qwen3AsrLlmPrefillInput,
@@ -1025,6 +1080,9 @@ struct Qwen3AsrPrefillOnlyGreedyStepExecutor {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     cache_prompt_tokens: usize,
     consumed_prefill_step: bool,
+    /// See [`qwen_fused_top1_hint_allowed`]. `true` only for requests that
+    /// never consume a host logit row (no word timestamps, no phrase bias).
+    fused_top1_hint_allowed: bool,
     /// Explicit cancel/pause/resume control for this decode -- never a
     /// thread-local. See [`crate::RequestExecutionContext`].
     control: Arc<crate::api::backend::TranscriptionControl>,
@@ -1043,7 +1101,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
             // Preserve typed cancel from the prefill chunk loop so the shared
             // greedy driver (and dispatch_error_to_backend) see Canceled, not a
             // generic DecoderStepFailed.
-            let logits = self.prefill_prompt_and_compute_last_logits().map_err(|error| {
+            let prefill = self.prefill_prompt_and_compute_last_logits().map_err(|error| {
                 match error {
                     Qwen3AsrGreedyDecodeError::Canceled => {
                         crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::Canceled
@@ -1055,8 +1113,8 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
             })?;
             self.consumed_prefill_step = true;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits,
-                greedy_token_hint: None,
+                logits: prefill.logits,
+                greedy_token_hint: prefill.greedy_token_hint,
             });
         }
 
@@ -1077,6 +1135,19 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     reason: "qwen3-asr decode cache position underflowed".to_string(),
                 }
             })?;
+        if let Some(token_id) = self
+            .decode_step_reused_top1(input.generated_tokens, cache_position)
+            .map_err(|error| {
+                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                    reason: error.to_string(),
+                }
+            })?
+        {
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(token_id),
+            });
+        }
         let mut hidden = self
             .gather_last_generated_token_hidden(input.generated_tokens)
             .map_err(|error| {
@@ -1130,9 +1201,44 @@ fn map_prefill_graph_error(error: GgmlCpuGraphError) -> Qwen3AsrGreedyDecodeErro
 }
 
 impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
+    /// On the resident Metal/GPU reuse graph, return the decoder's device-side
+    /// argmax for the next token directly (zero host logits materialization,
+    /// zero full-vocab readback), or `None` to stay on the host logits path --
+    /// mirrors `moss_transcribe_diarize::llm_decoder::decode_step_reused_top1`.
+    /// Gated on [`Self::fused_top1_hint_allowed`] because qwen (unlike moss)
+    /// serves requests that consume the host row (word timestamps, phrase
+    /// bias); those keep the byte-identical host path.
+    fn decode_step_reused_top1(
+        &mut self,
+        generated_tokens: &[u32],
+        cache_position: usize,
+    ) -> Result<Option<u32>, Qwen3AsrGreedyDecodeError> {
+        if !self.fused_top1_hint_allowed
+            || !self.whole_decoder.supports_graph_reuse()
+            || !self.whole_decoder.supports_fused_top1()
+        {
+            return Ok(None);
+        }
+        let max_positions = self
+            .layer_kv_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .ok_or_else(|| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: "qwen3-asr decoder has no layer KV caches".to_string(),
+            })?;
+        let hidden = self.gather_last_generated_token_hidden(generated_tokens)?;
+        let step = self
+            .whole_decoder
+            .run_step_reused_batched_top1(&hidden, &[cache_position], 1_000_000.0, max_positions)
+            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?;
+        Ok(Some(step.token_id))
+    }
+
     fn prefill_prompt_and_compute_last_logits(
         &mut self,
-    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
+    ) -> Result<Qwen3AsrPrefillStepOutput, Qwen3AsrGreedyDecodeError> {
         let profile_started_at = qwen_decode_profile_start();
         let token_count = self.prefill_input.token_count;
         if token_count == 0 {
@@ -1169,6 +1275,23 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         {
             self.cache_prompt_tokens = token_count;
             qwen_decode_profile_log_opt("prefill_prompt_resident_bulk", resident_started_at);
+            // Fused device argmax for the first generated token too (mirrors
+            // moss's prefill): only when this request never needs the host
+            // row, same gate as the per-token decode steps.
+            if self.fused_top1_hint_allowed
+                && let Some(token_id) = self
+                    .whole_decoder
+                    .fused_logits_top1_from_hidden(&final_hidden)
+                    .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                        reason: error.to_string(),
+                    })?
+            {
+                qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
+                return Ok(Qwen3AsrPrefillStepOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
             let result = self
                 .logits_head
                 .compute_logits_for_last_hidden(&final_hidden)
@@ -1176,7 +1299,10 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     reason: error.to_string(),
                 });
             qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
-            return result;
+            return result.map(|logits| Qwen3AsrPrefillStepOutput {
+                logits,
+                greedy_token_hint: None,
+            });
         }
         let Some(chunk_size) = self
             .whole_decoder
@@ -1188,11 +1314,17 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
             // over the historical serial launch storm.
             let result = self.prefill_prompt_bulk_host_and_compute_last_logits();
             qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
-            return result;
+            return result.map(|logits| Qwen3AsrPrefillStepOutput {
+                logits,
+                greedy_token_hint: None,
+            });
         };
         let result = self.prefill_prompt_chunked_and_compute_last_logits(chunk_size);
         qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
-        result
+        result.map(|logits| Qwen3AsrPrefillStepOutput {
+            logits,
+            greedy_token_hint: None,
+        })
     }
 
     fn prefill_prompt_bulk_host_and_compute_last_logits(
@@ -1600,6 +1732,30 @@ mod tests {
 
     fn qwen_metadata() -> BTreeMap<String, String> {
         qwen_metadata_with_llm_layers(2)
+    }
+
+    /// The fused hint-only lane must never serve a request that consumes the
+    /// host logit row: USER-REQUESTED word timestamps feed per-token
+    /// probabilities into the emitted word confidences, and phrase bias needs
+    /// the full row for the driver to apply biases (a hint-only step would
+    /// fail closed). Word timestamps that were only force-enabled for cue
+    /// segmentation / diarization anchors (and are stripped from the result)
+    /// never surface a probability, so that lane stays fused-eligible --
+    /// otherwise the standard CLI transcribe path (which always forces them
+    /// for non-whisper families) would never take the fused lane at all.
+    #[test]
+    fn fused_top1_hint_gate_rejects_row_consuming_requests() {
+        // Plain request: fused allowed.
+        assert!(qwen_fused_top1_hint_allowed(false, false, false));
+        // Forced-and-stripped word anchors (the standard CLI transcribe
+        // shape): probabilities are invisible, fused stays allowed.
+        assert!(qwen_fused_top1_hint_allowed(true, true, false));
+        // User-requested word timestamps: confidences are emitted, host row
+        // required.
+        assert!(!qwen_fused_top1_hint_allowed(true, false, false));
+        // Phrase bias always requires the host row.
+        assert!(!qwen_fused_top1_hint_allowed(false, false, true));
+        assert!(!qwen_fused_top1_hint_allowed(true, true, true));
     }
 
     fn add_audio_layer_shapes(spec: TinyGgufFixtureSpec, layer_idx: usize) -> TinyGgufFixtureSpec {

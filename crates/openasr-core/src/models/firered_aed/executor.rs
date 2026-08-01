@@ -455,6 +455,180 @@ mod tests {
         assert_eq!(text, GOLDEN_ZH_TEXT);
     }
 
+    /// Proof that the Metal reusable single-token decode graph is
+    /// output-preserving: drive a full greedy decode twice against the same
+    /// encoder output -- one runtime on the default path (which must take the
+    /// persistent reuse graph for every incremental step) and one runtime
+    /// forced onto the rebuild-per-step path -- and require the logits of
+    /// every step to match BIT FOR BIT, not just the argmax token. Skips
+    /// (with a message) when the dev pack is absent or Metal is unavailable;
+    /// on Metal it also asserts the reuse graph actually engaged, so this
+    /// cannot silently pass by both sides falling back to the same path.
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack and a Metal device; see module docs"]
+    fn metal_reused_decode_graph_logits_match_rebuilt_graph_bit_for_bit() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            jfk_wav_path(),
+            "firered-aed reuse-parity test",
+            "firered-aed reuse-parity test",
+        )
+        .expect("load jfk.wav");
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: firered_aed_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
+            request_options: Default::default(),
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
+        };
+        let preflight = request
+            .resolve_runtime_source_preflight()
+            .expect("resolve runtime source preflight");
+        let metadata = parse_firered_aed_execution_metadata(&preflight.metadata)
+            .expect("parse execution metadata");
+
+        // Frontend + CMVN + CPU encoder: one shared encoder output feeds both
+        // decoder runtimes, so any divergence below is decode-path-only.
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+            .expect("build runtime tensor reader");
+        let feature_dim_shape = [metadata.feature_dim as u64];
+        let neg_mean = reader
+            .host_tensor_f32_copy_dequantized_by_name(CMVN_NEG_MEAN_TENSOR, &feature_dim_shape)
+            .expect("cmvn neg_mean");
+        let inv_stddev = reader
+            .host_tensor_f32_copy_dequantized_by_name(CMVN_INV_STDDEV_TENSOR, &feature_dim_shape)
+            .expect("cmvn inv_stddev");
+        let frontend = FireRedFbankFrontend::new();
+        let mut features = frontend.compute(&samples).expect("fbank features");
+        apply_cmvn(&mut features.data, features.n_mels, &neg_mean, &inv_stddev)
+            .expect("apply cmvn");
+        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
+            &preflight.runtime_source,
+            metadata,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build cpu encoder runtime");
+        let encoder_output = encoder_runtime
+            .encode(&features.data, features.n_frames)
+            .expect("encode");
+
+        // Two sequential passes over the SAME prefix sequence (the fresh
+        // pass's own greedy argmax drives both), so only one 2+ GiB Metal
+        // weight upload is resident at a time. Divergence cannot hide in the
+        // replay: every reused-pass step is asserted bitwise against the
+        // recorded fresh-pass logits for the identical prefix.
+        let max_steps = 256usize;
+        let mut fresh_runtime = match FireRedDecoderGraphRuntime::new(
+            &preflight.runtime_source,
+            metadata,
+            GgmlCpuGraphBackend::Metal,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("skipping: Metal decoder runtime unavailable: {error}");
+                return;
+            }
+        };
+        fresh_runtime
+            .populate_cross_attention_cache(&encoder_output.rows, encoder_output.frame_count)
+            .expect("populate cross cache (fresh runtime)");
+        let mut prefix = vec![metadata.sos_token_id];
+        let mut fresh_logits_by_step = Vec::new();
+        for _ in 0..max_steps {
+            let fresh_logits = fresh_runtime
+                .compute_step_logits_forcing_fresh_graph(&prefix)
+                .expect("fresh-path step logits");
+            let next = fresh_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index as u32)
+                .expect("non-empty logits");
+            fresh_logits_by_step.push(fresh_logits);
+            if next == metadata.eos_token_id {
+                break;
+            }
+            prefix.push(next);
+        }
+        assert!(
+            !fresh_runtime.has_active_reuse_graph(),
+            "the forced-fresh runtime must never have built a reuse graph"
+        );
+        drop(fresh_runtime);
+        let generated = prefix.len() - 1;
+        assert!(
+            generated >= 8,
+            "expected a non-trivial greedy decode to exercise many incremental steps, got {generated} tokens"
+        );
+
+        let mut reused_runtime = FireRedDecoderGraphRuntime::new(
+            &preflight.runtime_source,
+            metadata,
+            GgmlCpuGraphBackend::Metal,
+        )
+        .expect("build Metal decoder runtime (reused pass)");
+        reused_runtime
+            .populate_cross_attention_cache(&encoder_output.rows, encoder_output.frame_count)
+            .expect("populate cross cache (reused runtime)");
+        for (step, fresh_logits) in fresh_logits_by_step.iter().enumerate() {
+            let step_prefix = &prefix[..(step + 1).min(prefix.len())];
+            let reused_logits = reused_runtime
+                .compute_step_logits(step_prefix)
+                .expect("reused-path step logits");
+            assert_eq!(
+                reused_logits.len(),
+                fresh_logits.len(),
+                "step {step}: logits length mismatch"
+            );
+            for (index, (reused, fresh)) in
+                reused_logits.iter().zip(fresh_logits.iter()).enumerate()
+            {
+                assert_eq!(
+                    reused.to_bits(),
+                    fresh.to_bits(),
+                    "step {step}: logit {index} differs bitwise: reused={reused} fresh={fresh}"
+                );
+            }
+        }
+        assert!(
+            reused_runtime.has_active_reuse_graph(),
+            "the default-path Metal runtime must have engaged the persistent reuse graph"
+        );
+        // Transcript-level goldenness of the whole Metal decode path
+        // (scheduler-off + reuse graph): the greedy token sequence both paths
+        // agreed on must detokenize to the same reference transcript the CPU
+        // golden test pins.
+        let tokenizer = FireRedTokenizer::new(
+            preflight
+                .metadata
+                .get_string_array(TOKENIZER_TOKENS_KEY)
+                .expect("pack missing tokenizer.ggml.tokens")
+                .to_vec(),
+        );
+        let text = tokenizer
+            .decode(&prefix[1..])
+            .expect("detokenize greedy tokens")
+            .trim()
+            .to_string();
+        assert_eq!(
+            text, GOLDEN_JFK_TEXT,
+            "Metal reused-graph transcript must match the reference golden"
+        );
+        eprintln!("firered-aed reuse parity: {generated} incremental steps bit-identical on Metal");
+    }
+
     /// Demonstrates the thread-local encoder/decoder runtime cache: the
     /// second same-thread transcription of the same pack must be
     /// meaningfully faster than the first, because it skips re-loading the

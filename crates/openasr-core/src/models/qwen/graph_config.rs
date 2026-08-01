@@ -6,18 +6,18 @@ use crate::models::graph_runtime_config::{
     has_explicit_thread_override,
 };
 
-/// qwen is NOT gated (`AutoGpuPolicy::AllBackends`, see `arch::mod`) as of
-/// this audit. The measured 1.71x Metal slowdown at qwen's recommended 1.7B
-/// @ q8_0 config looks like a fixed `size x quant` platform trade-off rather
-/// than a qwen-specific code bug -- mimo/firered-llm share this exact decode
-/// driver (fused logits head, on-device argmax, persistent reused decode
-/// graph, scheduler-off) and measure clearly *faster* on Metal at their 8B @
-/// q4_k config -- but that read is not yet confirmed by a dedicated
-/// follow-up investigation, so it is deliberately left un-gated rather than
-/// baking an unconfirmed platform verdict into the default. If a follow-up
-/// study confirms the trade-off (or finds an actual fix), flipping qwen to
-/// `AutoGpuPolicy::ExceptMetal` here and in its `arch::mod` descriptor is a
-/// one-line change (the `AutoGpuPolicy` gate machinery already exists, see
+/// qwen is NOT gated (`AutoGpuPolicy::AllBackends`, see `arch::mod`), and
+/// that is the *measured-correct* default: a 2026-07 re-measurement across
+/// the full `size x quant` matrix (0.6b/1.7b x q4_k/q8_0/fp16, M1, warm
+/// compute medians) has Metal *faster* than CPU everywhere -- 1.7x-2.4x,
+/// e.g. 1.7b @ q8_0 RTF 0.327 (CPU) vs 0.180 (Metal) on an 11s clip and
+/// 0.387 vs 0.159 on a 69s clip. An early 2026-07-04 measurement of the same
+/// 1.7b @ q8_0 config had Metal 1.71x *slower*; that slowdown was an
+/// artifact of the pre-rework decode path and no longer reproduces after the
+/// decode changes (persistent reused decode graph, resident KV arena,
+/// batched resident prefill seeding). Do not re-gate Metal off that stale
+/// number. Should a future platform regression appear, the `AutoGpuPolicy`
+/// gate machinery already exists (see
 /// `xasr_zipformer::graph_config::encoder_gpu_enabled` for the pattern).
 pub(crate) fn qwen_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(

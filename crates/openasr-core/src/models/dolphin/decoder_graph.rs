@@ -143,23 +143,26 @@ impl DolphinDecoderOutput {
 
 // --- persistent weight arena -------------------------------------------------
 //
-// Perf (P5, see joint_decode::attention_rescore): attention-rescoring calls this
-// decoder once per CTC n-best hypothesis (up to DOLPHIN_BEAM_SIZE). Only the
-// token ids / causal mask / sequence length actually differ across those calls
-// -- the ~200 decoder weight tensors and the encoder memory are identical for
-// every hypothesis of one utterance. Rebuilding a fresh graph AND re-uploading
-// every weight per hypothesis (the pre-P5 behavior) paid that upload cost
-// `beam_size` times over for no reason. This mirrors the firered_aed decoder's
-// `GgmlStaticTensorArena`-backed persistent weights (`decoder_weights.rs` /
-// `decoder_graph.rs`): weights (+ the encoder memory) are declared and uploaded
-// ONCE into a static arena by [`DolphinDecoderRescoreRuntime::new`]; each
-// [`DolphinDecoderRescoreRuntime::decode_prompt_logits`] call then only builds
-// the small per-hypothesis graph (token embed lookup, absolute-position view,
-// causal mask, the stacked layers, output projection) referencing those
-// already-resident static tensors -- no weight re-upload, no encoder-memory
-// re-upload. The forward math (`decoder_layer`/`linear`/`affine_ln`/etc. below)
-// is untouched, so this is a pure execution-strategy change: same graph, same
-// numbers, golden-identical output.
+// Perf (P5, then extended -- see joint_decode::attention_rescore):
+// attention-rescoring teacher-forces up to DOLPHIN_BEAM_SIZE CTC n-best
+// hypotheses against the same decoder weights and the same encoder memory;
+// only the token ids / causal masks / sequence lengths differ. This mirrors
+// the firered_aed decoder's `GgmlStaticTensorArena`-backed persistent weights
+// (`decoder_weights.rs` / `decoder_graph.rs`): the ~200 weight tensors are
+// declared and uploaded ONCE into a static arena by
+// [`DolphinDecoderRescoreRuntime::new`], and the runtime itself is cached per
+// `(pack, backend)` by the executor, so later utterances skip the upload
+// entirely (the pre-cache behavior rebuilt runner + arena and re-uploaded
+// every weight per utterance). Each
+// [`DolphinDecoderRescoreRuntime::decode_nbest_prompt_logits`] call then
+// builds ONE fused per-utterance graph: the encoder memory is a transient
+// input uploaded once, the per-layer cross-attention K/V projections over it
+// are shared graph nodes computed once, and every hypothesis contributes only
+// its small chain (token embed lookup, absolute-position view, causal mask,
+// stacked layers, output projection) referencing the resident weights and the
+// shared K/V nodes. The forward math (`decoder_layer`/`linear`/`affine_ln`/
+// etc. below) is untouched, so this is a pure execution-strategy change: same
+// ops, same numbers, golden-identical output.
 
 type Upload<'p> = (GgmlStaticTensor, &'p [f32], &'static str);
 /// Pending native (quantized / f16) weight upload: `(tensor, raw-bytes,
@@ -448,7 +451,9 @@ fn build_layer_static_weights(
 /// per layer, 13 `(weight, bias)`-style pairs (norm1/self_q/self_k/self_v/
 /// self_o/norm2/src_q/src_k/src_v/src_o/norm3/ff_w1/ff_w2) = 26 tensors, plus
 /// the fixed token embedding, full position table, after_norm (2), output
-/// weight and output bias, plus one encoder-memory tensor.
+/// weight and output bias. The encoder memory is no longer arena-resident --
+/// it is a per-call transient graph input of [`DolphinDecoderRescoreRuntime::
+/// decode_nbest_prompt_logits`], uploaded once per utterance.
 const DOLPHIN_DECODER_ARENA_TENSORS_PER_LAYER: usize = 26;
 const DOLPHIN_DECODER_ARENA_FIXED_TENSORS: usize = 6;
 
@@ -558,16 +563,45 @@ fn attention<'a>(
     )
 }
 
+/// One layer's cross-attention K/V heads, projected from the encoder memory.
+/// These depend only on the encoder output (identical for every hypothesis of
+/// one utterance), so [`DolphinDecoderRescoreRuntime::decode_nbest_prompt_logits`]
+/// computes them once per utterance as shared graph nodes and every
+/// per-hypothesis chain consumes the same nodes -- the exact ops (same inputs,
+/// same order) each per-hypothesis graph used to run redundantly, so the
+/// values are unchanged; they are just no longer recomputed `beam_size` times.
+#[derive(Clone, Copy)]
+struct CrossAttentionHeads<'a> {
+    k_heads: GgmlCpuTensor<'a>,
+    v_heads: GgmlCpuTensor<'a>,
+}
+
+fn build_cross_attention_heads<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    encoder_out: GgmlCpuTensor<'a>,
+    weights: &DecoderLayerWeights<'a>,
+    config: &DolphinDecoderConfig,
+    frames: usize,
+) -> Result<CrossAttentionHeads<'a>, DolphinDecoderError> {
+    let hd = config.head_dim;
+    let heads = config.attention_heads;
+    let k = linear(graph, &weights.src_k, encoder_out, "cross_attn_k")?;
+    let v = linear(graph, &weights.src_v, encoder_out, "cross_attn_v")?;
+    Ok(CrossAttentionHeads {
+        k_heads: reshape_heads(graph, k, hd, heads, frames)?,
+        v_heads: reshape_heads(graph, v, hd, heads, frames)?,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decoder_layer<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
-    encoder_out: GgmlCpuTensor<'a>,
+    cross: CrossAttentionHeads<'a>,
     causal_mask: GgmlCpuTensor<'a>,
     weights: &DecoderLayerWeights<'a>,
     config: &DolphinDecoderConfig,
     tokens: usize,
-    frames: usize,
 ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
     let eps = config.layer_norm_epsilon;
     let hd = config.head_dim;
@@ -586,15 +620,12 @@ fn decoder_layer<'a>(
     let self_out = linear(graph, &weights.self_o, context, "self_attn_out")?;
     let x = graph.add(input, self_out).map_err(map)?;
 
-    // Cross-attention sub-block: residual + src_attn(norm2(x)) over encoder_out.
+    // Cross-attention sub-block: residual + src_attn(norm2(x)) over the
+    // shared, per-utterance K/V heads (see [`CrossAttentionHeads`]).
     let cross_norm = affine_ln(graph, x, eps, &weights.norm2, "cross_attn_norm")?;
     let q = linear(graph, &weights.src_q, cross_norm, "cross_attn_q")?;
-    let k = linear(graph, &weights.src_k, encoder_out, "cross_attn_k")?;
-    let v = linear(graph, &weights.src_v, encoder_out, "cross_attn_v")?;
     let q = reshape_heads(graph, q, hd, heads, tokens)?;
-    let k = reshape_heads(graph, k, hd, heads, frames)?;
-    let v = reshape_heads(graph, v, hd, heads, frames)?;
-    let context = attention(graph, q, k, v, None, config, tokens)?;
+    let context = attention(graph, q, cross.k_heads, cross.v_heads, None, config, tokens)?;
     let cross_out = linear(graph, &weights.src_o, context, "cross_attn_out")?;
     let x = graph.add(x, cross_out).map_err(map)?;
 
@@ -649,11 +680,12 @@ fn dolphin_decoder_runner_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphCo
     }
 }
 
-/// Build-once/run-many Dolphin decoder runtime for one utterance's rescoring
-/// pass (P5). [`Self::new`] loads every decoder weight tensor plus the
-/// encoder's memory into a persistent [`GgmlStaticTensorArena`] exactly once;
-/// [`Self::decode_prompt_logits`] can then be called once per CTC n-best
-/// hypothesis without re-uploading either. Owns a dedicated
+/// Build-once/run-many Dolphin decoder runtime for attention rescoring.
+/// [`Self::new`] loads every decoder weight tensor into a persistent
+/// [`GgmlStaticTensorArena`] exactly once; the runtime is then reusable
+/// across utterances (the executor caches it per `(pack, backend)`), and
+/// [`Self::decode_nbest_prompt_logits`] teacher-forces a whole CTC n-best in
+/// a single fused graph per utterance. Owns a dedicated
 /// [`GgmlCpuGraphRunner`] (rather than sharing the caller's) so the arena's
 /// backend buffer and the per-call transient graphs agree on the same backend
 /// instance.
@@ -661,41 +693,24 @@ pub(crate) struct DolphinDecoderRescoreRuntime {
     runner: GgmlCpuGraphRunner,
     arena: GgmlStaticTensorArena,
     config: DolphinDecoderConfig,
-    frames: usize,
     weights: DecoderStaticWeights,
-    encoder_mem: GgmlStaticTensor,
 }
 
 impl DolphinDecoderRescoreRuntime {
-    /// `encoder_out` is the frame-major `[frames, d_model]` encoder output
-    /// (d_model innermost), matching the golden `encoder_out` fixture layout;
-    /// it is uploaded once here and shared by every subsequent
-    /// [`Self::decode_prompt_logits`] call on this runtime.
     pub(crate) fn new(
         config: &DolphinDecoderConfig,
         provider: &dyn DolphinWeightProvider,
-        encoder_out: &[f32],
-        frames: usize,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, DolphinDecoderError> {
         let d = config.d_model;
-        if frames == 0 || encoder_out.len() != frames * d {
-            return Err(DolphinDecoderError::Shape {
-                reason: format!(
-                    "encoder_out has {} values, expected {frames}x{d}",
-                    encoder_out.len()
-                ),
-            });
-        }
-
         let runner = GgmlCpuGraphRunner::new(dolphin_decoder_runner_config(backend))
             .map_err(ggml_err("runner_init"))?;
         let arena = runner
             .start_static_tensor_arena(dolphin_decoder_arena_context_bytes(config.num_layers))
             .map_err(ggml_err("static_tensor_arena"))?;
 
-        // Phase A: create every weight + encoder-memory tensor (must precede
-        // the arena's first buffer alloc, which freezes further creation).
+        // Phase A: create every weight tensor (must precede the arena's first
+        // buffer alloc, which freezes further creation).
         let mut builder = StaticWeightBuilder::new(provider);
         let token_embed =
             builder.w2_embedding(&arena, "decoder.embed.0.weight", d, config.vocab_size)?;
@@ -714,11 +729,8 @@ impl DolphinDecoderRescoreRuntime {
         let output_weight =
             builder.w2(&arena, "decoder.output_layer.weight", d, config.vocab_size)?;
         let output_bias = builder.w1(&arena, "decoder.output_layer.bias", config.vocab_size)?;
-        let encoder_mem = arena
-            .new_tensor_2d_f32(d, frames, "dolphin_dec_encoder_out")
-            .map_err(ggml_err("encoder_mem_alloc"))?;
 
-        // Phase B: upload every weight + the encoder memory exactly once.
+        // Phase B: upload every weight exactly once.
         let mut arena = arena;
         for (tensor, data, name) in &builder.uploads {
             arena
@@ -730,15 +742,11 @@ impl DolphinDecoderRescoreRuntime {
                 .set_bytes_slice(*tensor, bytes, name)
                 .map_err(ggml_err("upload_weight_native"))?;
         }
-        arena
-            .set_f32_slice(encoder_mem, encoder_out, "dolphin_dec_encoder_out")
-            .map_err(ggml_err("upload_encoder"))?;
 
         Ok(Self {
             runner,
             arena,
             config: *config,
-            frames,
             weights: DecoderStaticWeights {
                 token_embed,
                 pos_emb_full,
@@ -747,152 +755,228 @@ impl DolphinDecoderRescoreRuntime {
                 output_weight,
                 output_bias,
             },
-            encoder_mem,
         })
     }
 
-    /// Run the decoder over one teacher-forced prompt prefix and return the
-    /// per-position logits. Only token ids, the causal mask, and the absolute-
-    /// position view depend on `prompt_tokens`; every weight and the encoder
-    /// memory are the already-resident arena tensors from [`Self::new`].
-    pub(crate) fn decode_prompt_logits(
+    pub(crate) fn config(&self) -> &DolphinDecoderConfig {
+        &self.config
+    }
+
+    /// Teacher-force every prompt of one utterance's n-best in a single fused
+    /// graph and return each prompt's per-position logits (index-aligned with
+    /// `prompts`).
+    ///
+    /// `encoder_out` is the frame-major `[frames, d_model]` encoder output
+    /// (d_model innermost), uploaded once per call as a transient graph input
+    /// and shared by every prompt chain. Per decoder layer the cross-attention
+    /// K/V heads are projected from it once as shared graph nodes (they do not
+    /// depend on the prompt -- see [`CrossAttentionHeads`]); each prompt then
+    /// contributes its own chain (token embed, absolute-position view, causal
+    /// mask, self-attention, FFN, output projection) referencing those shared
+    /// nodes. Compared to the previous one-graph-per-hypothesis loop this
+    /// removes `beam_size - 1` redundant cross-K/V projections (the dominant
+    /// FLOPs: `frames >> tokens`) and `beam_size - 1` graph build + dispatch +
+    /// readback round-trips, while running the exact same ops on the exact
+    /// same values per prompt -- the logits are unchanged.
+    pub(crate) fn decode_nbest_prompt_logits(
         &mut self,
-        prompt_tokens: &[u32],
-    ) -> Result<DolphinDecoderOutput, DolphinDecoderError> {
+        encoder_out: &[f32],
+        frames: usize,
+        prompts: &[Vec<u32>],
+    ) -> Result<Vec<DolphinDecoderOutput>, DolphinDecoderError> {
         let config = &self.config;
         let d = config.d_model;
-        let tokens = prompt_tokens.len();
-        if tokens == 0 {
-            return Err(DolphinDecoderError::Shape {
-                reason: "prompt must contain at least one token".to_string(),
-            });
-        }
-        if tokens > config.max_positions {
+        if frames == 0 || encoder_out.len() != frames * d {
             return Err(DolphinDecoderError::Shape {
                 reason: format!(
-                    "prompt length {tokens} exceeds position table {}",
-                    config.max_positions
+                    "encoder_out has {} values, expected {frames}x{d}",
+                    encoder_out.len()
                 ),
             });
         }
-        if let Some(bad) = prompt_tokens
-            .iter()
-            .find(|&&t| t as usize >= config.vocab_size)
-        {
-            return Err(DolphinDecoderError::Shape {
-                reason: format!(
-                    "prompt token {bad} out of vocab range {}",
-                    config.vocab_size
-                ),
-            });
+        if prompts.is_empty() {
+            return Ok(Vec::new());
+        }
+        for prompt_tokens in prompts {
+            let tokens = prompt_tokens.len();
+            if tokens == 0 {
+                return Err(DolphinDecoderError::Shape {
+                    reason: "prompt must contain at least one token".to_string(),
+                });
+            }
+            if tokens > config.max_positions {
+                return Err(DolphinDecoderError::Shape {
+                    reason: format!(
+                        "prompt length {tokens} exceeds position table {}",
+                        config.max_positions
+                    ),
+                });
+            }
+            if let Some(bad) = prompt_tokens
+                .iter()
+                .find(|&&t| t as usize >= config.vocab_size)
+            {
+                return Err(DolphinDecoderError::Shape {
+                    reason: format!(
+                        "prompt token {bad} out of vocab range {}",
+                        config.vocab_size
+                    ),
+                });
+            }
         }
 
         let arena = &self.arena;
         let mut graph = self.runner.start_graph();
 
-        // Input tensors: token ids (i32) and the causal mask (f32) -- the only
-        // two things that actually differ per call. Weights and the encoder
-        // memory are arena-resident (real backend buffer already allocated),
-        // so unlike the transient inputs below they need no `set_input`.
-        let token_ids = graph
-            .new_tensor_1d_i32(tokens, "dolphin_dec_tokens")
-            .map_err(ggml_err("input_alloc_tokens"))?;
-        let causal_mask = graph
-            .new_tensor_2d_f32(tokens, tokens, "dolphin_dec_causal_mask")
-            .map_err(ggml_err("input_alloc_mask"))?;
+        // Transient inputs: the encoder memory (one per utterance) plus each
+        // prompt's token ids (i32) and causal mask (f32). Weights are
+        // arena-resident (real backend buffer already allocated), so unlike
+        // the transient inputs they need no `set_input`.
+        let encoder_mem = graph
+            .new_tensor_2d_f32(d, frames, "dolphin_dec_encoder_out")
+            .map_err(ggml_err("input_alloc_encoder"))?;
 
-        // Embedding: token_embed(ids) * sqrt(d_model) + absolute positional
-        // encoding, the latter a contiguous leading view (rows `0..tokens`) of
-        // the arena's full position table -- no re-upload, no re-slice.
-        let token_state = graph
-            .get_rows(arena.graph_tensor(self.weights.token_embed), token_ids)
-            .map_err(ggml_err("embed_get_rows"))?;
-        let scaled = graph
-            .scale(token_state, (d as f32).sqrt())
-            .map_err(ggml_err("embed_xscale"))?;
-        let row_stride = d * std::mem::size_of::<f32>();
-        let pos_view = graph
-            .view_2d(
-                arena.graph_tensor(self.weights.pos_emb_full),
-                d,
-                tokens,
-                row_stride,
-                0,
-            )
-            .map_err(ggml_err("embed_pos_view"))?;
-        let mut hidden = graph.add(scaled, pos_view).map_err(ggml_err("embed_pos"))?;
-        let encoder_mem = arena.graph_tensor(self.encoder_mem);
-        for layer in &self.weights.layers {
-            let layer = layer.to_transient(arena);
-            hidden = decoder_layer(
-                &mut graph,
-                hidden,
+        // Shared per-layer cross-attention K/V heads, projected once from the
+        // encoder memory and consumed by every prompt chain below.
+        let layer_transients: Vec<DecoderLayerWeights<'_>> = self
+            .weights
+            .layers
+            .iter()
+            .map(|layer| layer.to_transient(arena))
+            .collect();
+        let mut cross_heads = Vec::with_capacity(layer_transients.len());
+        for layer in &layer_transients {
+            cross_heads.push(build_cross_attention_heads(
+                &graph,
                 encoder_mem,
-                causal_mask,
-                &layer,
+                layer,
                 config,
-                tokens,
-                self.frames,
-            )?;
+                frames,
+            )?);
         }
+
         let after_norm = self.weights.after_norm.to_transient(arena);
-        let normed = affine_ln(
-            &graph,
-            hidden,
-            config.layer_norm_epsilon,
-            &after_norm,
-            "after_norm",
-        )?;
-        let logits = graph
-            .mul_mat(arena.graph_tensor(self.weights.output_weight), normed)
-            .map_err(ggml_err("output_layer"))?;
-        let logits = graph
-            .add(logits, arena.graph_tensor(self.weights.output_bias))
-            .map_err(ggml_err("output_layer_bias"))?;
-        graph.set_output(logits).map_err(ggml_err("set_output"))?;
+        let row_stride = d * std::mem::size_of::<f32>();
+        let mut prompt_inputs = Vec::with_capacity(prompts.len());
+        let mut logits_outputs = Vec::with_capacity(prompts.len());
+        for prompt_tokens in prompts {
+            let tokens = prompt_tokens.len();
+            let token_ids = graph
+                .new_tensor_1d_i32(tokens, "dolphin_dec_tokens")
+                .map_err(ggml_err("input_alloc_tokens"))?;
+            let causal_mask = graph
+                .new_tensor_2d_f32(tokens, tokens, "dolphin_dec_causal_mask")
+                .map_err(ggml_err("input_alloc_mask"))?;
+
+            // Embedding: token_embed(ids) * sqrt(d_model) + absolute positional
+            // encoding, the latter a contiguous leading view (rows `0..tokens`)
+            // of the arena's full position table -- no re-upload, no re-slice.
+            let token_state = graph
+                .get_rows(arena.graph_tensor(self.weights.token_embed), token_ids)
+                .map_err(ggml_err("embed_get_rows"))?;
+            let scaled = graph
+                .scale(token_state, (d as f32).sqrt())
+                .map_err(ggml_err("embed_xscale"))?;
+            let pos_view = graph
+                .view_2d(
+                    arena.graph_tensor(self.weights.pos_emb_full),
+                    d,
+                    tokens,
+                    row_stride,
+                    0,
+                )
+                .map_err(ggml_err("embed_pos_view"))?;
+            let mut hidden = graph.add(scaled, pos_view).map_err(ggml_err("embed_pos"))?;
+            for (layer, cross) in layer_transients.iter().zip(&cross_heads) {
+                hidden = decoder_layer(
+                    &mut graph,
+                    hidden,
+                    *cross,
+                    causal_mask,
+                    layer,
+                    config,
+                    tokens,
+                )?;
+            }
+            let normed = affine_ln(
+                &graph,
+                hidden,
+                config.layer_norm_epsilon,
+                &after_norm,
+                "after_norm",
+            )?;
+            let logits = graph
+                .mul_mat(arena.graph_tensor(self.weights.output_weight), normed)
+                .map_err(ggml_err("output_layer"))?;
+            let logits = graph
+                .add(logits, arena.graph_tensor(self.weights.output_bias))
+                .map_err(ggml_err("output_layer_bias"))?;
+            graph.set_output(logits).map_err(ggml_err("set_output"))?;
+            prompt_inputs.push((token_ids, causal_mask));
+            logits_outputs.push(logits);
+        }
+
         graph
-            .set_input(token_ids)
-            .map_err(ggml_err("mark_input(tokens)"))?;
-        graph
-            .set_input(causal_mask)
-            .map_err(ggml_err("mark_input(causal_mask)"))?;
+            .set_input(encoder_mem)
+            .map_err(ggml_err("mark_input(encoder_out)"))?;
+        for (token_ids, causal_mask) in &prompt_inputs {
+            graph
+                .set_input(*token_ids)
+                .map_err(ggml_err("mark_input(tokens)"))?;
+            graph
+                .set_input(*causal_mask)
+                .map_err(ggml_err("mark_input(causal_mask)"))?;
+        }
         // Allocate the forward graph through the scheduler's gallocr for
         // liveness-based buffer reuse before uploading inputs (mirrors the
-        // encoder above and the sibling cohere/moonshine decoders).
+        // encoder and the sibling cohere/moonshine decoders).
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .prepare_outputs_for_upload(&logits_outputs)
             .map_err(ggml_err("prepare_outputs"))?;
 
-        let token_ids_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         graph
-            .set_i32_slice(token_ids, &token_ids_i32, "dolphin_dec_tokens")
-            .map_err(ggml_err("upload_tokens"))?;
-        graph
-            .set_f32_slice(
-                causal_mask,
-                &build_causal_mask(tokens),
-                "dolphin_dec_causal_mask",
-            )
-            .map_err(ggml_err("upload_mask"))?;
+            .set_f32_slice(encoder_mem, encoder_out, "dolphin_dec_encoder_out")
+            .map_err(ggml_err("upload_encoder"))?;
+        for (prompt_tokens, (token_ids, causal_mask)) in prompts.iter().zip(&prompt_inputs) {
+            let token_ids_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
+            graph
+                .set_i32_slice(*token_ids, &token_ids_i32, "dolphin_dec_tokens")
+                .map_err(ggml_err("upload_tokens"))?;
+            graph
+                .set_f32_slice(
+                    *causal_mask,
+                    &build_causal_mask(prompt_tokens.len()),
+                    "dolphin_dec_causal_mask",
+                )
+                .map_err(ggml_err("upload_mask"))?;
+        }
 
-        let expected = tokens * config.vocab_size;
-        let logits = graph
-            .compute_output_f32(logits, expected)
+        let output_specs: Vec<(GgmlCpuTensor, usize)> = logits_outputs
+            .iter()
+            .zip(prompts)
+            .map(|(logits, prompt_tokens)| (*logits, prompt_tokens.len() * config.vocab_size))
+            .collect();
+        let outputs = graph
+            .compute_outputs_f32(&output_specs)
             .map_err(ggml_err("compute"))?;
 
-        Ok(DolphinDecoderOutput {
-            token_count: tokens,
-            vocab_size: config.vocab_size,
-            logits,
-        })
+        Ok(outputs
+            .into_iter()
+            .zip(prompts)
+            .map(|(logits, prompt_tokens)| DolphinDecoderOutput {
+                token_count: prompt_tokens.len(),
+                vocab_size: config.vocab_size,
+                logits,
+            })
+            .collect())
     }
 }
 
 /// One-shot convenience wrapper over [`DolphinDecoderRescoreRuntime`] for
 /// callers that only need a single prompt's logits (the `parity` dev
-/// harness). Attention-rescoring builds and reuses the runtime directly
-/// across its whole CTC n-best (see `joint_decode::attention_rescore`) instead
-/// of calling this per hypothesis.
+/// harness). Attention-rescoring reuses the executor-cached runtime and
+/// scores its whole CTC n-best in one fused call (see
+/// `joint_decode::attention_rescore`) instead of calling this per hypothesis.
 pub(crate) fn decode_prompt_logits(
     config: &DolphinDecoderConfig,
     provider: &dyn DolphinWeightProvider,
@@ -901,6 +985,174 @@ pub(crate) fn decode_prompt_logits(
     prompt_tokens: &[u32],
     backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinDecoderOutput, DolphinDecoderError> {
-    DolphinDecoderRescoreRuntime::new(config, provider, encoder_out, frames, backend)?
-        .decode_prompt_logits(prompt_tokens)
+    let mut outputs = DolphinDecoderRescoreRuntime::new(config, provider, backend)?
+        .decode_nbest_prompt_logits(encoder_out, frames, &[prompt_tokens.to_vec()])?;
+    Ok(outputs.pop().expect("single prompt yields single output"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::encoder_graph::synthetic_test_tensor;
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A tiny but structurally complete decoder config (2 layers, d_model 8)
+    /// for the CPU fused-rescore equivalence tests below.
+    fn tiny_config() -> DolphinDecoderConfig {
+        DolphinDecoderConfig {
+            d_model: 8,
+            attention_heads: 2,
+            head_dim: 4,
+            ffn_units: 16,
+            num_layers: 2,
+            vocab_size: 12,
+            max_positions: 16,
+            layer_norm_epsilon: 1e-5,
+        }
+    }
+
+    /// Every decoder tensor name at its exact expected length, filled with
+    /// deterministic synthetic values.
+    fn synthetic_provider(config: &DolphinDecoderConfig) -> HashMap<String, Vec<f32>> {
+        let d = config.d_model;
+        let ffn = config.ffn_units;
+        let vocab = config.vocab_size;
+        let mut map = HashMap::new();
+        let mut put = |name: String, len: usize| {
+            let values = synthetic_test_tensor(&name, len);
+            map.insert(name, values);
+        };
+        put("decoder.embed.0.weight".into(), d * vocab);
+        put("decoder.embed.1.pe".into(), d * config.max_positions);
+        for index in 0..config.num_layers {
+            let p = |suffix: &str| format!("decoder.decoders.{index}.{suffix}");
+            for norm in ["norm1", "norm2", "norm3"] {
+                put(p(&format!("{norm}.weight")), d);
+                put(p(&format!("{norm}.bias")), d);
+            }
+            for attn in ["self_attn", "src_attn"] {
+                for proj in ["linear_q", "linear_k", "linear_v", "linear_out"] {
+                    put(p(&format!("{attn}.{proj}.weight")), d * d);
+                    put(p(&format!("{attn}.{proj}.bias")), d);
+                }
+            }
+            put(p("feed_forward.w_1.weight"), d * ffn);
+            put(p("feed_forward.w_1.bias"), ffn);
+            put(p("feed_forward.w_2.weight"), ffn * d);
+            put(p("feed_forward.w_2.bias"), d);
+        }
+        put("decoder.after_norm.weight".into(), d);
+        put("decoder.after_norm.bias".into(), d);
+        put("decoder.output_layer.weight".into(), d * vocab);
+        put("decoder.output_layer.bias".into(), vocab);
+        map
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// The fused-rescore invariant the perf change rests on: teacher-forcing a
+    /// whole n-best in ONE fused graph (shared encoder memory upload, shared
+    /// per-layer cross-K/V nodes) must produce bit-identical per-prompt logits
+    /// to decoding each prompt independently in its own graph -- scores and
+    /// hypothesis selection cannot move. Also pins runtime reuse: a second
+    /// fused call on the same (weight-resident) runtime is bit-identical, and
+    /// batch composition does not leak between prompts (a different n-best
+    /// containing the same prompt yields the same logits for it).
+    #[test]
+    fn fused_nbest_logits_match_independent_per_prompt_decode_bit_for_bit() {
+        let config = tiny_config();
+        let provider = synthetic_provider(&config);
+        let frames = 5;
+        let encoder_out = synthetic_test_tensor("encoder_out", frames * config.d_model);
+        // Distinct lengths on purpose: the fused graph must keep each prompt's
+        // own causal mask / position view / logits shape.
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![2, 5, 10, 4, 9],
+            vec![2, 5, 10],
+            vec![2, 5, 10, 4, 9, 1, 7, 3],
+            vec![11],
+        ];
+
+        let mut runtime =
+            DolphinDecoderRescoreRuntime::new(&config, &provider, GgmlCpuGraphBackend::Cpu)
+                .expect("runtime");
+        let fused = runtime
+            .decode_nbest_prompt_logits(&encoder_out, frames, &prompts)
+            .expect("fused decode");
+        assert_eq!(fused.len(), prompts.len());
+
+        for (prompt, fused_output) in prompts.iter().zip(&fused) {
+            assert_eq!(fused_output.token_count, prompt.len());
+            let single = decode_prompt_logits(
+                &config,
+                &provider,
+                &encoder_out,
+                frames,
+                prompt,
+                GgmlCpuGraphBackend::Cpu,
+            )
+            .expect("single decode");
+            assert_eq!(
+                bits(&fused_output.logits),
+                bits(&single.logits),
+                "fused n-best logits diverged from the independent decode for prompt {prompt:?}"
+            );
+        }
+
+        // Runtime reuse: the second fused call re-uploads nothing but inputs.
+        let again = runtime
+            .decode_nbest_prompt_logits(&encoder_out, frames, &prompts)
+            .expect("fused decode #2");
+        for (first, second) in fused.iter().zip(&again) {
+            assert_eq!(bits(&first.logits), bits(&second.logits));
+        }
+
+        // Batch-composition independence: the same prompt inside a different
+        // n-best must score identically.
+        let subset = vec![prompts[1].clone()];
+        let alone = runtime
+            .decode_nbest_prompt_logits(&encoder_out, frames, &subset)
+            .expect("subset decode");
+        assert_eq!(bits(&alone[0].logits), bits(&fused[1].logits));
+    }
+
+    /// Fail-closed validation of the fused entry point: empty prompt, over-long
+    /// prompt, out-of-vocab token, and a mismatched encoder buffer must all be
+    /// typed errors (never a partial compute), and an empty n-best is a no-op.
+    #[test]
+    fn fused_nbest_validates_prompts_and_encoder_shape() {
+        let config = tiny_config();
+        let provider = synthetic_provider(&config);
+        let frames = 4;
+        let encoder_out = synthetic_test_tensor("encoder_out", frames * config.d_model);
+        let mut runtime =
+            DolphinDecoderRescoreRuntime::new(&config, &provider, GgmlCpuGraphBackend::Cpu)
+                .expect("runtime");
+
+        assert!(
+            runtime
+                .decode_nbest_prompt_logits(&encoder_out, frames, &[])
+                .expect("empty n-best")
+                .is_empty()
+        );
+        for bad in [
+            vec![],                            // empty prompt
+            vec![1; config.max_positions + 1], // beyond position table
+            vec![config.vocab_size as u32],    // out of vocab
+        ] {
+            let result = runtime.decode_nbest_prompt_logits(
+                &encoder_out,
+                frames,
+                std::slice::from_ref(&bad),
+            );
+            assert!(
+                matches!(result, Err(DolphinDecoderError::Shape { .. })),
+                "prompt {bad:?} must fail closed, got {result:?}"
+            );
+        }
+        let result = runtime.decode_nbest_prompt_logits(&encoder_out, frames - 1, &[vec![1]]);
+        assert!(matches!(result, Err(DolphinDecoderError::Shape { .. })));
+    }
 }
