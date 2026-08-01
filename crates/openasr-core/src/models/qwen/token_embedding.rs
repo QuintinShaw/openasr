@@ -3,11 +3,14 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgufTensorDataReadError, GgufTensorDataReader, dequantize_ggml_row_to_f32, ggml_row_size_bytes,
+};
 use crate::nn::half::f16_bits_to_f32;
 
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::TOKEN_EMBD_WEIGHT as TOKEN_EMBEDDING_TENSOR_NAME;
+const GGML_TYPE_F32: i32 = 0;
 const GGML_TYPE_F16: i32 = 1;
 
 #[derive(Debug, Clone)]
@@ -24,6 +27,16 @@ enum TokenEmbeddingStorage {
     // Layouts use raw F16 bits to avoid eager full-table f32 materialization.
     F16Token(Vec<u16>),
     F16Hidden(Vec<u16>),
+    // Quantized, token-major ([d_model, vocab], so each ggml row is one token's
+    // embedding). The raw quantized bytes are kept and a gathered token's single
+    // row is dequantized on demand, so a large quantized vocab table is never
+    // materialized as a full f32 buffer (the dominant load-time RSS + latency
+    // cost the F16 layouts already avoid).
+    QuantizedToken {
+        data: Vec<u8>,
+        ggml_type: i32,
+        row_size: usize,
+    },
 }
 
 impl Qwen3AsrTokenEmbeddingTable {
@@ -65,6 +78,29 @@ impl Qwen3AsrTokenEmbeddingTable {
                             .and_then(|base| base.checked_add(token_index))
                             .ok_or(Qwen3AsrTokenEmbeddingError::GatherOverflow)?;
                         out.push(f16_bits_to_f32(values[src]));
+                    }
+                }
+                TokenEmbeddingStorage::QuantizedToken {
+                    data,
+                    ggml_type,
+                    row_size,
+                } => {
+                    let start = token_index
+                        .checked_mul(*row_size)
+                        .ok_or(Qwen3AsrTokenEmbeddingError::GatherOverflow)?;
+                    let end = start
+                        .checked_add(*row_size)
+                        .ok_or(Qwen3AsrTokenEmbeddingError::GatherOverflow)?;
+                    let row_bytes = data
+                        .get(start..end)
+                        .ok_or(Qwen3AsrTokenEmbeddingError::GatherOverflow)?;
+                    let row_start = out.len();
+                    dequantize_ggml_row_to_f32(*ggml_type, row_bytes, self.d_model, &mut out)
+                        .map_err(|error| Qwen3AsrTokenEmbeddingError::TensorReadFailed {
+                            reason: error.to_string(),
+                        })?;
+                    if out[row_start..].iter().any(|value| !value.is_finite()) {
+                        return Err(Qwen3AsrTokenEmbeddingError::NonFiniteValues);
                     }
                 }
             }
@@ -151,7 +187,8 @@ pub(crate) fn load_token_embedding_table_from_reader_with_tensor_name(
         });
     }
 
-    let storage = if tensor.ggml_type == GGML_TYPE_F16 {
+    let ggml_type = tensor.ggml_type;
+    let storage = if ggml_type == GGML_TYPE_F16 {
         let values = reader
             .host_tensor_f16_bits_copy_by_name(tensor_name, &dims)
             .map_err(map_tensor_read_error)?;
@@ -159,6 +196,35 @@ pub(crate) fn load_token_embedding_table_from_reader_with_tensor_name(
             TokenEmbeddingStorage::F16Token(values)
         } else {
             TokenEmbeddingStorage::F16Hidden(values)
+        }
+    } else if ggml_type != GGML_TYPE_F32 && output_major_vocab_layout {
+        // Token-major quantized table: each ggml row (ne0 == d_model) is one
+        // token, so keep the compact quantized bytes and dequantize a single
+        // row per gathered token instead of blowing the whole vocab table up to
+        // f32 at load. Non-token-major quantized layouts (rare) fall through to
+        // the f32 path below, which handles the transpose.
+        let row_size = ggml_row_size_bytes(ggml_type, d_model)
+            .ok_or(Qwen3AsrTokenEmbeddingError::GatherOverflow)?;
+        let expected_len = row_size
+            .checked_mul(vocab_size)
+            .ok_or(Qwen3AsrTokenEmbeddingError::GatherOverflow)?;
+        let data = reader
+            .host_tensor_bytes_copy_by_name(tensor_name)
+            .map_err(map_tensor_read_error)?;
+        if data.len() != expected_len {
+            return Err(Qwen3AsrTokenEmbeddingError::InvalidTensorShape {
+                tensor_name,
+                shape: render_shape(&dims),
+                reason: format!(
+                    "quantized token-embedding payload is {} bytes, expected {expected_len}",
+                    data.len()
+                ),
+            });
+        }
+        TokenEmbeddingStorage::QuantizedToken {
+            data,
+            ggml_type,
+            row_size,
         }
     } else {
         let values = reader
@@ -357,6 +423,49 @@ mod tests {
             .map(f16_bits_to_f32)
             .collect();
         assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn token_embedding_quantized_token_major_gather_matches_full_dequant() {
+        use crate::ggml_runtime::{GgmlKvElementType, dequantize_q8_0_rows};
+
+        // q8_0 block size is 32, so d_model must be a multiple of 32.
+        let d_model = 64usize;
+        let vocab_size = 5usize;
+        let mut values = Vec::with_capacity(d_model * vocab_size);
+        for token in 0..vocab_size {
+            for hidden in 0..d_model {
+                values.push(((token * 7 + hidden) as f32) * 0.013 - 0.4);
+            }
+        }
+        let data = GgmlKvElementType::Q8_0
+            .quantize_rows_from_f32(&values, d_model, vocab_size)
+            .expect("quantize q8_0 token rows");
+        let row_size = data.len() / vocab_size;
+        let reference =
+            dequantize_q8_0_rows(&data, d_model, vocab_size).expect("reference dequant");
+
+        let table = Qwen3AsrTokenEmbeddingTable {
+            d_model,
+            vocab_size,
+            storage: TokenEmbeddingStorage::QuantizedToken {
+                data,
+                ggml_type: 8, // GGML_TYPE_Q8_0
+                row_size,
+            },
+        };
+
+        let order = [3usize, 0, 4];
+        let token_ids: Vec<u32> = order.iter().map(|&t| t as u32).collect();
+        let gathered = table.gather_rows(&token_ids).expect("gather");
+        assert_eq!(gathered.len(), order.len() * d_model);
+        // Per-row lazy dequant must be byte-identical to dequantizing the whole
+        // table up front (same ggml `to_float` trait), just without the f32 blow-up.
+        for (out_idx, &token) in order.iter().enumerate() {
+            let gathered_row = &gathered[out_idx * d_model..(out_idx + 1) * d_model];
+            let reference_row = &reference[token * d_model..(token + 1) * d_model];
+            assert_eq!(gathered_row, reference_row, "token {token} row must match");
+        }
     }
 
     #[test]

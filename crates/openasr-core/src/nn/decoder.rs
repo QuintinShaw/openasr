@@ -1180,14 +1180,14 @@ pub(crate) struct LlmLoraSlot<'a> {
 /// LLM family applies QK-norm (Qwen3 does; Qwen2 does not) -- `None` skips the
 /// RMS-norm step entirely rather than normalizing against a substitute weight.
 /// `q_bias`/`k_bias`/`v_bias` are `Option` for the mirror-image reason (Qwen2
-/// has per-projection attention biases; Qwen3 does not). A bias is only ever
-/// applied against the SPLIT-path (non-fused) q/k/v projection output, so a
-/// consumer that wants bias support must also leave `qkv_weight` `None`
-/// (matching the LoRA convention above) -- this keeps every bias-add operating
-/// on a contiguous `mul_mat` output, never a strided fused-QKV view. Consumers
-/// that leave `q_norm_weight`/`k_norm_weight` `Some` and every bias `None`
-/// (Qwen3's shape) produce a byte-identical graph to the pre-parameterization
-/// code path.
+/// has per-projection attention biases; Qwen3 does not). Bias is compatible with
+/// EITHER path: the fused `[q|k|v]` slice a bias adds onto is a single-token
+/// `view_2d` (ne1 == 1, so ggml-contiguous) on the decode step and an explicit
+/// `cont` copy on prefill, so every bias-add still operates on ggml-contiguous
+/// data, never a strided view -- byte-identical to adding the bias on the split
+/// `mul_mat` output. Consumers that leave `q_norm_weight`/`k_norm_weight` `Some`
+/// and every bias `None` (Qwen3's shape) produce a byte-identical graph to the
+/// pre-parameterization code path.
 #[derive(Clone, Copy)]
 pub(crate) struct LlmLayerWeights<'a> {
     pub attn_norm_weight: GgmlCpuTensor<'a>,
@@ -1689,16 +1689,6 @@ where
         RMS_NORM_STEPS,
         map_err,
     )?;
-    let any_qkv_bias =
-        weights.q_bias.is_some() || weights.k_bias.is_some() || weights.v_bias.is_some();
-    if any_qkv_bias && weights.qkv_weight.is_some() {
-        return Err(map_err(
-            "llm_qkv_bias_requires_split_path",
-            GgmlCpuGraphError::UnsupportedInputs {
-                reason: "qkv bias requires the split (non-fused) QKV projection path",
-            },
-        ));
-    }
     let (q, k, v) = build_projected_qkv(
         graph,
         normed,
@@ -3371,6 +3361,9 @@ mod tests {
         use_native_gqa: bool,
         use_flash_attention: bool,
         use_fused_qkv: bool,
+        /// Attach per-projection q/k/v attention biases (Qwen2 shape). Exercises
+        /// the bias-add against both the fused-QKV slice and the split output.
+        use_bias: bool,
     }
 
     /// Single-layer GQA (q_heads=2, kv_heads=1) stack runner used to pin the
@@ -3448,6 +3441,27 @@ mod tests {
         let ffn = graph
             .new_tensor_2d_f32(D_MODEL, D_MODEL, "ffn")
             .expect("ffn weight");
+        let (q_bias, k_bias, v_bias) = if options.use_bias {
+            (
+                Some(
+                    graph
+                        .new_tensor_2d_f32(Q_WIDTH, 1, "q_bias")
+                        .expect("q bias"),
+                ),
+                Some(
+                    graph
+                        .new_tensor_2d_f32(KV_WIDTH, 1, "k_bias")
+                        .expect("k bias"),
+                ),
+                Some(
+                    graph
+                        .new_tensor_2d_f32(KV_WIDTH, 1, "v_bias")
+                        .expect("v bias"),
+                ),
+            )
+        } else {
+            (None, None, None)
+        };
         let mut inputs = vec![
             state,
             row_indices_tensor,
@@ -3463,6 +3477,9 @@ mod tests {
         ];
         if let Some(qkv) = qkv {
             inputs.push(qkv);
+        }
+        for bias in [q_bias, k_bias, v_bias].into_iter().flatten() {
+            inputs.push(bias);
         }
         for input in inputs {
             graph
@@ -3506,9 +3523,9 @@ mod tests {
                 q_weight: q,
                 k_weight: k,
                 v_weight: v,
-                q_bias: None,
-                k_bias: None,
-                v_bias: None,
+                q_bias,
+                k_bias,
+                v_bias,
                 q_norm_weight: Some(head_norm),
                 k_norm_weight: Some(head_norm),
                 output_weight: output,
@@ -3580,6 +3597,21 @@ mod tests {
         graph
             .set_f32_slice(v, &v_weight, "v")
             .expect("v weight upload");
+        if let Some(q_bias) = q_bias {
+            graph
+                .set_f32_slice(q_bias, &weight(Q_WIDTH, 0.6), "q_bias")
+                .expect("q bias upload");
+        }
+        if let Some(k_bias) = k_bias {
+            graph
+                .set_f32_slice(k_bias, &weight(KV_WIDTH, 0.7), "k_bias")
+                .expect("k bias upload");
+        }
+        if let Some(v_bias) = v_bias {
+            graph
+                .set_f32_slice(v_bias, &weight(KV_WIDTH, 0.8), "v_bias")
+                .expect("v bias upload");
+        }
         graph
             .set_f32_slice(output, &weight(D_MODEL * Q_WIDTH, 0.4), "output")
             .expect("output weight upload");
@@ -3618,6 +3650,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         let expanded = compute_gqa_llm_state(
@@ -3630,6 +3663,7 @@ mod tests {
                 use_native_gqa: false,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         assert_f32_slices_close(&expanded, &native, 1.0e-4);
@@ -3647,6 +3681,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         let expanded = compute_gqa_llm_state(
@@ -3659,6 +3694,7 @@ mod tests {
                 use_native_gqa: false,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         assert_f32_slices_close(&expanded, &native, 1.0e-4);
@@ -3679,6 +3715,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         let naive = compute_gqa_llm_state(
@@ -3691,6 +3728,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: false,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         assert_f32_slices_close(&naive, &flash, 1.0e-4);
@@ -3706,6 +3744,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         let naive = compute_gqa_llm_state(
@@ -3718,6 +3757,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: false,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         assert_f32_slices_close(&naive, &flash, 1.0e-4);
@@ -3738,6 +3778,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         let fused = compute_gqa_llm_state(
@@ -3750,6 +3791,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: true,
+                use_bias: false,
             },
         );
         assert_f32_slices_close(&fused, &split, 1.0e-4);
@@ -3766,6 +3808,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: false,
+                use_bias: false,
             },
         );
         let fused = compute_gqa_llm_state(
@@ -3778,6 +3821,77 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 use_fused_qkv: true,
+                use_bias: false,
+            },
+        );
+        assert_f32_slices_close(&fused, &split, 1.0e-4);
+    }
+
+    #[test]
+    fn llm_decoder_stack_fused_qkv_with_bias_matches_split_projection() {
+        // Qwen2-shaped packs (funasr/mimo) carry per-projection q/k/v biases.
+        // The fused [q|k|v] matmul followed by a bias-add on each contiguous
+        // slice must match the split-path projection + bias exactly, so bias no
+        // longer forces the slower split path.
+        //
+        // Decode shape (single token): the fused slices are single-row views
+        // (ne1 == 1, ggml-contiguous), the bias-add sensitive case.
+        let state = [0.25, -0.75, 0.5, 1.25];
+        let split = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+                use_bias: true,
+            },
+        );
+        let fused = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: true,
+                use_bias: true,
+            },
+        );
+        assert_f32_slices_close(&fused, &split, 1.0e-4);
+
+        // Prefill shape (multiple tokens): the fused slices are `cont`-copied
+        // before the bias-add.
+        let state = [0.25, -0.75, 0.5, 1.25, 1.0, 0.125, -0.5, 0.75];
+        let split = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+                use_bias: true,
+            },
+        );
+        let fused = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: true,
+                use_bias: true,
             },
         );
         assert_f32_slices_close(&fused, &split, 1.0e-4);
