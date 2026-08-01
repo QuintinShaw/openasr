@@ -709,21 +709,45 @@ const SLICE_PIPELINE_MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 /// unrealistically small number and over-admits workers.
 const SLICE_PIPELINE_PER_WORKER_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 
-/// Requested concurrent slice-pipeline width from `OPENASR_SLICE_PIPELINE_WIDTH`.
+/// Explicit slice-pipeline width override from `OPENASR_SLICE_PIPELINE_WIDTH`.
 ///
-/// Opt-in and conservative by default: unset, "0", "1", or an unparseable value
-/// all mean 1 -- the byte-identical serial + prompt-carry path. A value >= 2
-/// enables the carry-light concurrent path (subject to the capacity and
-/// slice-count gates in [`effective_slice_pipeline_width`]), clamped to
-/// [`SLICE_PIPELINE_MAX_WIDTH`]. Deliberately a runtime knob rather than a
-/// hard-coded default so the short-audio carry-vs-carry-light quality audit can
-/// pick the shipping default without a code change.
-fn slice_pipeline_requested_width() -> usize {
+/// `None` when the variable is unset or unparseable -- the carry-gated default
+/// in [`slice_pipeline_requested_width`] then decides. A parsed value is
+/// clamped to `1..=`[`SLICE_PIPELINE_MAX_WIDTH`], so "0" and "1" both mean an
+/// explicit serial pin. The override wins in both directions: it can force the
+/// concurrent path onto a carry-active run (accepting the carry-light quality
+/// cost) and force serial onto a carry-disabled run.
+fn slice_pipeline_explicit_width() -> Option<usize> {
     std::env::var("OPENASR_SLICE_PIPELINE_WIDTH")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, SLICE_PIPELINE_MAX_WIDTH)
+        .map(|value| value.clamp(1, SLICE_PIPELINE_MAX_WIDTH))
+}
+
+/// Requested concurrent slice-pipeline width for one run, gated on that run's
+/// normalized effective prompt-carry state ([`longform_prompt_carry_mode`],
+/// which already folds the request option and the family's decode policy
+/// together -- deliberately not a per-family list).
+///
+/// - Carry `Disabled`: the serial loop threads no cross-slice prompt anyway,
+///   so the carry-light concurrent path is transcript-equivalent (proven
+///   byte-identical by `concurrent_slice_pipeline_equivalence`). Default to
+///   [`SLICE_PIPELINE_MAX_WIDTH`] and let the capacity and slice-count gates
+///   in [`effective_slice_pipeline_width`] pick what actually fits.
+/// - Carry active (`Text` / `TokenHistory`): the concurrent path would drop
+///   the carry and change the transcript (the short-audio audit measured
+///   whole-clause deletions), so the default stays 1 -- the byte-identical
+///   serial + prompt-carry path. Only an explicit
+///   `OPENASR_SLICE_PIPELINE_WIDTH>=2` overrides that, and the run then
+///   records the dropped carry in its provenance.
+fn slice_pipeline_requested_width(carry_prompt_mode: LongformPromptCarryMode) -> usize {
+    if let Some(explicit) = slice_pipeline_explicit_width() {
+        return explicit;
+    }
+    match carry_prompt_mode {
+        LongformPromptCarryMode::Disabled => SLICE_PIPELINE_MAX_WIDTH,
+        LongformPromptCarryMode::Text | LongformPromptCarryMode::TokenHistory => 1,
+    }
 }
 
 /// Pure capacity gate for the concurrent slice pipeline: how many workers may
@@ -742,7 +766,7 @@ fn slice_pipeline_capped_width(
     if ceiling <= 1 {
         return 1;
     }
-    // No memory probe on this host: honor the explicit opt-in rather than
+    // No memory probe on this host: honor the requested width rather than
     // silently disabling it, matching the serve-batch VRAM-cap precedent
     // (`serve_batch_vram_capped_max_batch` returns the request unchanged when no
     // memory sample is available). The reserve plus the conservative per-worker
@@ -1901,17 +1925,32 @@ fn run_native_transcription_impl(
             // one whole-recording external pass has a single scope and leaves
             // this empty.
             let mut speaker_scope_starts: Vec<f32> = Vec::new();
-            // P1 long-audio slice pipeline: when opted in and it fits, decode K
-            // slices concurrently to overlap the encode/decode GPU bubbles (the
-            // admission-concurrency win, applied to one file's slices). Width 1
-            // -- the default -- runs the byte-identical serial + prompt-carry
-            // path in the `else` below.
+            // P1 long-audio slice pipeline: decode K slices concurrently to
+            // overlap the encode/decode GPU bubbles (the admission-concurrency
+            // win, applied to one file's slices). The default is gated on this
+            // run's effective prompt-carry state (see
+            // `slice_pipeline_requested_width`): a carry-disabled run goes
+            // concurrent up to the capacity gate, a carry-active run stays on
+            // the byte-identical serial + prompt-carry path in the `else`
+            // below unless `OPENASR_SLICE_PIPELINE_WIDTH` overrides.
             let pipeline_width = effective_slice_pipeline_width(
-                slice_pipeline_requested_width(),
+                slice_pipeline_requested_width(carry_prompt_mode),
                 &plan.slices,
                 &runtime_preflight,
             );
             if pipeline_width > 1 {
+                let carry_note = if carry_prompt_mode == LongformPromptCarryMode::Disabled {
+                    "carry=disabled"
+                } else {
+                    // Explicit escape hatch on a carry-active run: the
+                    // concurrent path is carry-light, so the cross-slice
+                    // prompt carry this run would otherwise thread is dropped
+                    // -- an accepted quality cost, recorded for diagnosis.
+                    "carry=dropped-by-explicit-width"
+                };
+                longform_provenance.push(format!(
+                    "core.native.longform.slice-pipeline:width={pipeline_width},{carry_note}"
+                ));
                 run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
                     width: pipeline_width,
                     slices: plan.slices,
@@ -7040,34 +7079,91 @@ mod tests {
     }
 
     #[test]
-    fn requested_width_defaults_to_serial_and_clamps() {
+    fn requested_width_default_is_gated_on_the_run_carry_state() {
         // SAFETY: nextest runs each test in its own process, so mutating this
         // process-global env var cannot race another test.
         unsafe {
             std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
         }
+        // Carry disabled: concurrent is transcript-equivalent, so the default
+        // requests the maximum and lets the capacity gate pick K.
         assert_eq!(
-            slice_pipeline_requested_width(),
-            1,
-            "unset -> serial (conservative default)"
+            slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
+            SLICE_PIPELINE_MAX_WIDTH,
+            "carry-disabled run defaults to the concurrent pipeline"
         );
-        for (value, expected) in [
-            ("0", 1),
-            ("1", 1),
-            ("2", 2),
-            ("4", 4),
-            ("9", 4),
-            ("junk", 1),
-        ] {
+        // ... which still flows through the capacity gate: plenty of memory
+        // admits the full width, tight memory caps it back to serial.
+        assert_eq!(
+            slice_pipeline_capped_width(
+                slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
+                8,
+                Some(64 << 30),
+                1 << 20,
+                0,
+            ),
+            SLICE_PIPELINE_MAX_WIDTH,
+        );
+        assert_eq!(
+            slice_pipeline_capped_width(
+                slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
+                8,
+                Some(1_200 << 20),
+                1 << 30,
+                512 << 20,
+            ),
+            1,
+        );
+        // Carry active: the concurrent path would drop the carry, so the
+        // default stays on the byte-identical serial + prompt-carry path.
+        assert_eq!(
+            slice_pipeline_requested_width(LongformPromptCarryMode::Text),
+            1,
+            "text-carry run defaults to serial"
+        );
+        assert_eq!(
+            slice_pipeline_requested_width(LongformPromptCarryMode::TokenHistory),
+            1,
+            "token-history-carry run defaults to serial"
+        );
+    }
+
+    #[test]
+    fn requested_width_env_overrides_both_directions_and_clamps() {
+        // Explicit widths override the carry-gated default in both directions:
+        // ">=2" forces the carry-light concurrent path onto a carry-active
+        // run, and "0"/"1" pin a carry-disabled run to serial.
+        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 4), ("9", 4)] {
+            // SAFETY: nextest runs each test in its own process, so mutating
+            // this process-global env var cannot race another test.
             unsafe {
                 std::env::set_var("OPENASR_SLICE_PIPELINE_WIDTH", value);
             }
-            assert_eq!(
-                slice_pipeline_requested_width(),
-                expected,
-                "OPENASR_SLICE_PIPELINE_WIDTH={value}"
-            );
+            for carry_mode in [
+                LongformPromptCarryMode::Disabled,
+                LongformPromptCarryMode::Text,
+                LongformPromptCarryMode::TokenHistory,
+            ] {
+                assert_eq!(
+                    slice_pipeline_requested_width(carry_mode),
+                    expected,
+                    "OPENASR_SLICE_PIPELINE_WIDTH={value} carry={carry_mode:?}"
+                );
+            }
         }
+        // An unparseable value is not an explicit choice: fall back to the
+        // carry-gated default rather than guessing a width.
+        unsafe {
+            std::env::set_var("OPENASR_SLICE_PIPELINE_WIDTH", "junk");
+        }
+        assert_eq!(
+            slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
+            SLICE_PIPELINE_MAX_WIDTH,
+        );
+        assert_eq!(
+            slice_pipeline_requested_width(LongformPromptCarryMode::TokenHistory),
+            1,
+        );
         unsafe {
             std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
         }
