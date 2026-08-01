@@ -33,21 +33,28 @@
 //! the bit. This is proven in-repo by
 //! `granite_incremental_decode_matches_full_recompute_bit_exact`.
 //!
-//! Weights are uploaded once into a persistent `GraniteDecoderWeightArena`; only
-//! the tiny per-step inputs (one embedding, one position, the K/V history views)
-//! live in the reset-per-step graph context.
+//! Weights are held for the session's whole lifetime -- either uploaded once
+//! into a persistent f32 `GraniteDecoderWeightArena` (the `new` path, used by
+//! the synthetic bit-exact test and any host-`HashMap` provider) or bound
+//! zero-copy, keep-quantized, from the mmap'd `.oasr` pack via
+//! `GraniteDecoderLoadedWeights` (the `new_keep_quantized` path the runtime
+//! executor uses, so a 2B decoder stays ~its packed size resident instead of a
+//! ~8 GB f32 dequant + upload). Only the tiny per-step inputs (one embedding,
+//! one position, the K/V history views) live in the reset-per-step graph
+//! context.
 
 #![allow(dead_code)]
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
-    GgmlRopeExtParams,
+    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlRuntimeSource,
 };
 
 use super::decoder_graph::{
-    GraniteDecoderWeightArena, GraniteSpeechDecoderConfig, GraniteSpeechDecoderError,
-    GraniteSpeechDecoderWeightProvider, embed_token_row, granite_post_attention,
-    granite_pre_attention, linear, rms_norm,
+    GraniteDecoderLoadedWeights, GraniteDecoderWeightArena, GraniteDecoderWeights,
+    GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, GraniteSpeechDecoderWeightProvider,
+    embed_token_row, granite_post_attention, granite_pre_attention, linear, rms_norm,
+    weight_in_major,
 };
 
 fn map_ggml(stage: &'static str) -> impl Fn(GgmlCpuGraphError) -> GraniteSpeechDecoderError + Copy {
@@ -67,7 +74,13 @@ pub(crate) struct GraniteSpeechDecodeSession<'p> {
     config: GraniteSpeechDecoderConfig,
     provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     runner: GgmlCpuGraphRunner,
-    weights: GraniteDecoderWeightArena,
+    weights: GraniteDecoderWeights,
+    /// Kept alive so the keep-quantized `weights`' zero-copy handles (raw
+    /// pointers into this context's mmap-backed backend buffer) stay valid for
+    /// the session's lifetime. `None` on the f32-arena path (the arena owns its
+    /// own storage inside `weights`). Declared after `weights` so `weights`
+    /// drops first.
+    _loaded: Option<GgmlLoadedWeightContext>,
     /// `k_history[layer][kv_head]` is that head's `[seq, head_dim]` (row-major)
     /// key rows, appended token by token; concatenating the `kv_heads` inner
     /// buffers yields the `[head_dim, seq, kv_heads]` (kv-head-major) layout the
@@ -98,17 +111,72 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
         let runner =
             GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
         let weights = GraniteDecoderWeightArena::load(&runner, &config, provider)?;
+        Ok(Self::assemble(
+            config,
+            provider,
+            runner,
+            GraniteDecoderWeights::Arena(weights),
+            None,
+        ))
+    }
+
+    /// Keep-quantized session: bind every decoder weight zero-copy from `source`'s
+    /// mmap'd `.oasr` pack (native q8_0/q4_k/f16/f32) instead of dequantizing the
+    /// whole 2-B decoder to an f32 host copy + arena upload. `provider` supplies
+    /// only the token-embedding rows (`embed_token_row`); the projection/norm/
+    /// lm_head weights come from the pack. The loaded weight context is built on
+    /// this session's own runner so the graph and the weights share one
+    /// backend/device (the same single-runner invariant `firered_aed` relies on).
+    pub(crate) fn new_keep_quantized(
+        config: GraniteSpeechDecoderConfig,
+        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        source: &GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GraniteSpeechDecoderError> {
+        let graph_config = GgmlCpuGraphConfig {
+            context_bytes: 256 * 1024 * 1024,
+            graph_size: 32768,
+            n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+                backend,
+                crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+            ),
+            backend,
+            use_scheduler: true,
+        };
+        let runner =
+            GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
+        let loaded = runner
+            .load_gguf_weight_context(source)
+            .map_err(map_ggml("session_load_gguf_weight_context"))?;
+        let weights = GraniteDecoderLoadedWeights::load(&loaded, &config)?;
+        Ok(Self::assemble(
+            config,
+            provider,
+            runner,
+            GraniteDecoderWeights::Loaded(weights),
+            Some(loaded),
+        ))
+    }
+
+    fn assemble(
+        config: GraniteSpeechDecoderConfig,
+        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        runner: GgmlCpuGraphRunner,
+        weights: GraniteDecoderWeights,
+        loaded: Option<GgmlLoadedWeightContext>,
+    ) -> Self {
         let num_layers = config.num_layers;
-        Ok(Self {
+        Self {
             config,
             provider,
             runner,
             weights,
+            _loaded: loaded,
             k_history: vec![Vec::new(); num_layers],
             v_history: vec![Vec::new(); num_layers],
             seq_len: 0,
             prefilled: false,
-        })
+        }
     }
 
     pub(crate) fn is_prefilled(&self) -> bool {
@@ -254,7 +322,7 @@ fn flatten_history(
 /// kv_heads]` K and V tensors.
 fn run_prefill_graph(
     runner: &mut GgmlCpuGraphRunner,
-    weights: &GraniteDecoderWeightArena,
+    weights: &GraniteDecoderWeights,
     config: &GraniteSpeechDecoderConfig,
     embeddings: &[f32],
     n_tokens: usize,
@@ -329,7 +397,14 @@ fn run_prefill_graph(
         config.rms_norm_eps,
         weights.final_norm_weight(),
     )?;
-    let logits_raw = linear(&graph, weights.lm_head_weight(), hidden_out, "lm_head")?;
+    let lm_head_w = weight_in_major(
+        &graph,
+        weights.lm_head_weight(),
+        config.hidden_size,
+        config.vocab_size,
+        "lm_head_reshape",
+    )?;
+    let logits_raw = linear(&graph, lm_head_w, hidden_out, "lm_head")?;
     let logits = graph
         .scale(logits_raw, 1.0 / config.logits_scaling)
         .map_err(map_ggml("session_prefill_logits_scale"))?;
@@ -412,7 +487,7 @@ fn run_prefill_graph(
 #[allow(clippy::too_many_arguments)]
 fn run_decode_step_graph(
     runner: &mut GgmlCpuGraphRunner,
-    weights: &GraniteDecoderWeightArena,
+    weights: &GraniteDecoderWeights,
     config: &GraniteSpeechDecoderConfig,
     embed_row: &[f32],
     seq_len: usize,
@@ -506,7 +581,14 @@ fn run_decode_step_graph(
         config.rms_norm_eps,
         weights.final_norm_weight(),
     )?;
-    let logits_raw = linear(&graph, weights.lm_head_weight(), hidden_out, "lm_head")?;
+    let lm_head_w = weight_in_major(
+        &graph,
+        weights.lm_head_weight(),
+        config.hidden_size,
+        config.vocab_size,
+        "lm_head_reshape",
+    )?;
+    let logits_raw = linear(&graph, lm_head_w, hidden_out, "lm_head")?;
     let logits = graph
         .scale(logits_raw, 1.0 / config.logits_scaling)
         .map_err(map_ggml("session_step_logits_scale"))?;

@@ -196,12 +196,19 @@ impl GraniteSpeechGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        let decoder_weights =
-            load_tensors_from_oasr_pack(pack_path, "language_model.").map_err(|error| {
-                GraniteSpeechGgmlExecutorError::DecodeFailed {
+        // Keep-quantized decoder: the projection/norm/lm_head weights are bound
+        // zero-copy from the mmap'd pack inside the decode session (see
+        // `decode_session::new_keep_quantized`), so the executor only needs the
+        // token-embedding table on the host -- for the prompt's text-token
+        // embeddings and each generated token's per-step embedding lookup
+        // (`embed_token_row`). Loading only that one F16 table (dequantized to
+        // f32) instead of the whole 2-B decoder is what drops the per-request
+        // host footprint from ~8 GB to <1 GB.
+        let embed_weights =
+            load_tensors_from_oasr_pack(pack_path, "language_model.model.embed_tokens.weight")
+                .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
 
         let tokenizer = GraniteSpeechTokenizer::from_gguf_metadata(&metadata).map_err(|error| {
             GraniteSpeechGgmlExecutorError::TokenizerFailed {
@@ -229,7 +236,7 @@ impl GraniteSpeechGgmlExecutor {
         let prompt_text = format!("USER: {GRANITE_SPEECH_AUDIO_TOKEN}{question}\n ASSISTANT:");
         let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
             &decoder_config,
-            &decoder_weights,
+            &embed_weights,
             &tokenizer,
             &prompt_text,
             &projector_output.projected,
@@ -252,9 +259,10 @@ impl GraniteSpeechGgmlExecutor {
             vocab_size: decoder_config.vocab_size,
             max_generated_tokens: GRANITE_SPEECH_MAX_GENERATED_TOKENS,
         };
-        let mut step_executor = GraniteSpeechAudioDecodeStepExecutor::new(
+        let mut step_executor = GraniteSpeechAudioDecodeStepExecutor::new_keep_quantized(
             decoder_config,
-            &decoder_weights,
+            &embed_weights,
+            &preflight.runtime_source,
             backend,
             prompt_embeddings,
         );

@@ -5,16 +5,17 @@
 //! in the parity harness -- this module gives them a second, production data
 //! source without touching their code at all).
 //!
-//! Not a zero-copy bind (every other family's prepared-runtime loader binds
-//! its weight tensors directly against the mmap'd GGUF reader inside graph
-//! construction); this materializes the requested tensors into a host
-//! `HashMap` up front instead. That is a real, intentional tradeoff for this
-//! pass -- it reuses the already-validated encoder/projector/decoder code
-//! unchanged, at the cost of one extra host copy of the pack's tensors at
-//! load time (this is a 2B model; `fp16` tensors dequantized to f32 is a few
-//! GB, well within a 16GB dev machine) -- matching this family's other
-//! explicitly-noted "correct now, optimize when the shared mechanism is
-//! ready" tradeoffs (see `decode_executor.rs`'s O(n^2) prefill note).
+//! Not a zero-copy bind (it materializes the requested tensors into a host
+//! `HashMap`, dequantized to f32, up front). The **decoder** no longer uses this
+//! path: its projection/norm/lm_head weights are bound zero-copy, keep-quantized,
+//! from the mmap'd pack inside `decode_session::new_keep_quantized` (native
+//! q8_0/q4_k/f16/f32, no host f32 copy), so a 2B decoder stays ~its packed size
+//! resident instead of the ~8 GB an all-f32 dequant + upload cost. The executor
+//! now calls this loader only for (a) the **encoder** and **projector** (still
+//! the host-f32 arena path -- their keep-quantized migration, complicated by the
+//! encoder's host-folded BatchNorm / rel-pos-emb, is a further follow-up), and
+//! (b) the decoder's **token-embedding table alone** (used on the host by
+//! `embed_token_row` for the prompt + per-step embedding lookup).
 
 #![allow(dead_code)]
 

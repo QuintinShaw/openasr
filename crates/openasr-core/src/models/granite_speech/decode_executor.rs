@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlRuntimeSource};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
@@ -148,6 +148,10 @@ pub(crate) struct GraniteSpeechAudioDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
     provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     backend: GgmlCpuGraphBackend,
+    /// `Some` selects the keep-quantized session (decoder weights bound
+    /// zero-copy from this mmap'd `.oasr` pack); `None` uses the f32-arena
+    /// session built from `provider` (the safetensors/`HashMap` test path).
+    source: Option<&'p GgmlRuntimeSource>,
     initial_prompt_embeddings: Vec<f32>,
     session: Option<GraniteSpeechDecodeSession<'p>>,
     prompt_len: usize,
@@ -164,6 +168,29 @@ impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
             config,
             provider,
             backend,
+            source: None,
+            initial_prompt_embeddings,
+            session: None,
+            prompt_len: 0,
+        }
+    }
+
+    /// Keep-quantized variant: the prefilled session binds the decoder's
+    /// projection/norm/lm_head weights zero-copy from `source`'s pack; `provider`
+    /// supplies only the token-embedding rows (`embed_token_row`) for the
+    /// per-step generated token.
+    pub(crate) fn new_keep_quantized(
+        config: GraniteSpeechDecoderConfig,
+        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        source: &'p GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+        initial_prompt_embeddings: Vec<f32>,
+    ) -> Self {
+        Self {
+            config,
+            provider,
+            backend,
+            source: Some(source),
             initial_prompt_embeddings,
             session: None,
             prompt_len: 0,
@@ -190,8 +217,16 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
 
         // First call: prefill the audio-spliced prompt embeddings into a fresh
         // session (never re-derived from the token ids -- see the struct doc).
-        let mut session = GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend)
-            .map_err(map_step_error(input.step_index, "audio"))?;
+        let mut session = match self.source {
+            Some(source) => GraniteSpeechDecodeSession::new_keep_quantized(
+                self.config,
+                self.provider,
+                source,
+                self.backend,
+            ),
+            None => GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend),
+        }
+        .map_err(map_step_error(input.step_index, "audio"))?;
         let logits = session
             .prefill(
                 &self.initial_prompt_embeddings,

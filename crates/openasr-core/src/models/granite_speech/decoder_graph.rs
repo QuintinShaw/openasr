@@ -50,7 +50,8 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::nn::norm::{RmsNormSteps, apply_rms_norm};
 
@@ -251,6 +252,32 @@ pub(crate) fn linear<'a>(
     graph.mul_mat(weight, input).map_err(ggml_err(stage))
 }
 
+/// Reinterpret a 2-D weight to ggml `[in, out]` order (the `mul_mat` operand
+/// layout, `weight.ne0 == input.ne0 == in_dim`) with a pure metadata reshape.
+///
+/// A weight already stored `[in, out]` -- the quantized q8_0/q4_k packs and the
+/// f32 static-arena path (which allocates the tensor `[in, out]` explicitly) --
+/// reshapes to its own shape: a byte-for-byte view, so it stays bit-exact
+/// (proven by `granite_incremental_decode_matches_full_recompute_bit_exact`,
+/// which runs the arena path). A weight stored transposed as `[out, in]` -- the
+/// f16 converter's torch-order layout (`package_import` writes each rank>=2
+/// tensor's HF `[out, in]` shape verbatim) -- is reinterpreted to `[in, out]`;
+/// its row-major flat buffer is byte-identical to the operand the arena path
+/// materialized by uploading that same flat f32 into an explicitly
+/// `[in, out]`-shaped tensor, so keep-quantized binding is correct regardless of
+/// which dim convention a given pack was written with (no per-pack branch).
+pub(crate) fn weight_in_major<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    weight: GgmlCpuTensor<'a>,
+    in_dim: usize,
+    out_dim: usize,
+    stage: &'static str,
+) -> Result<GgmlCpuTensor<'a>, GraniteSpeechDecoderError> {
+    graph
+        .reshape_2d(weight, in_dim, out_dim)
+        .map_err(ggml_err(stage))
+}
+
 pub(crate) fn rms_norm<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
@@ -308,9 +335,15 @@ pub(crate) fn granite_pre_attention<'a>(
     let kv_heads = config.num_kv_heads;
 
     let normed = rms_norm(graph, hidden, config.rms_norm_eps, weights.attn_norm_w)?;
-    let q = linear(graph, weights.q_w, normed, "q_proj")?;
-    let k = linear(graph, weights.k_w, normed, "k_proj")?;
-    let v = linear(graph, weights.v_w, normed, "v_proj")?;
+    let hidden_size = config.hidden_size;
+    let q_width = q_heads * head_dim;
+    let kv_width = kv_heads * head_dim;
+    let q_w = weight_in_major(graph, weights.q_w, hidden_size, q_width, "q_proj_reshape")?;
+    let k_w = weight_in_major(graph, weights.k_w, hidden_size, kv_width, "k_proj_reshape")?;
+    let v_w = weight_in_major(graph, weights.v_w, hidden_size, kv_width, "v_proj_reshape")?;
+    let q = linear(graph, q_w, normed, "q_proj")?;
+    let k = linear(graph, k_w, normed, "k_proj")?;
+    let v = linear(graph, v_w, normed, "v_proj")?;
 
     let q = graph
         .reshape_3d(q, head_dim, q_heads, n_tokens)
@@ -366,18 +399,36 @@ pub(crate) fn granite_post_attention<'a>(
         .map_err(map)?;
     let attended = graph.reshape_2d(attended, q_width, n_tokens).map_err(map)?;
 
-    let attn_out = linear(graph, weights.o_w, attended, "o_proj")?;
+    let hidden_size = config.hidden_size;
+    let inter = config.intermediate_size;
+    let o_w = weight_in_major(graph, weights.o_w, q_width, hidden_size, "o_proj_reshape")?;
+    let attn_out = linear(graph, o_w, attended, "o_proj")?;
     let attn_out = graph
         .scale(attn_out, config.residual_multiplier)
         .map_err(map)?;
     let hidden = graph.add(hidden, attn_out).map_err(map)?;
 
     let ffn_normed = rms_norm(graph, hidden, config.rms_norm_eps, weights.ffn_norm_w)?;
-    let gate = linear(graph, weights.gate_w, ffn_normed, "gate_proj")?;
+    let gate_w = weight_in_major(
+        graph,
+        weights.gate_w,
+        hidden_size,
+        inter,
+        "gate_proj_reshape",
+    )?;
+    let gate = linear(graph, gate_w, ffn_normed, "gate_proj")?;
     let gate = graph.silu(gate).map_err(map)?;
-    let up = linear(graph, weights.up_w, ffn_normed, "up_proj")?;
+    let up_w = weight_in_major(graph, weights.up_w, hidden_size, inter, "up_proj_reshape")?;
+    let up = linear(graph, up_w, ffn_normed, "up_proj")?;
     let gated = graph.mul(gate, up).map_err(map)?;
-    let ffn_out = linear(graph, weights.down_w, gated, "down_proj")?;
+    let down_w = weight_in_major(
+        graph,
+        weights.down_w,
+        inter,
+        hidden_size,
+        "down_proj_reshape",
+    )?;
+    let ffn_out = linear(graph, down_w, gated, "down_proj")?;
     let ffn_out = graph
         .scale(ffn_out, config.residual_multiplier)
         .map_err(map)?;
@@ -601,7 +652,14 @@ pub(crate) fn prefill_logits_from_embeddings(
         )?;
     }
     let hidden_out = rms_norm(&graph, hidden, config.rms_norm_eps, weights.final_norm_w)?;
-    let logits_raw = linear(&graph, weights.lm_head_w, hidden_out, "lm_head")?;
+    let lm_head_w = weight_in_major(
+        &graph,
+        weights.lm_head_w,
+        config.hidden_size,
+        config.vocab_size,
+        "lm_head_reshape",
+    )?;
+    let logits_raw = linear(&graph, lm_head_w, hidden_out, "lm_head")?;
     let logits = graph
         .scale(logits_raw, 1.0 / config.logits_scaling)
         .map_err(ggml_err("logits_scale"))?;
@@ -780,6 +838,133 @@ impl GraniteDecoderWeightArena {
 
     pub(crate) fn lm_head_weight<'a>(&self) -> GgmlCpuTensor<'a> {
         self.arena.graph_tensor(self.lm_head)
+    }
+}
+
+/// Per-layer weight handles bound zero-copy from the mmap'd `.oasr` pack (the
+/// keep-quantized twin of [`GraniteLayerWeightHandles`], which lives in an
+/// f32-uploaded static arena).
+struct GraniteLayerLoadedHandles {
+    attn_norm: GgmlLoadedTensor,
+    q: GgmlLoadedTensor,
+    k: GgmlLoadedTensor,
+    v: GgmlLoadedTensor,
+    o: GgmlLoadedTensor,
+    ffn_norm: GgmlLoadedTensor,
+    gate: GgmlLoadedTensor,
+    up: GgmlLoadedTensor,
+    down: GgmlLoadedTensor,
+}
+
+/// The keep-quantized decoder weights: every 2-D projection, the two per-layer
+/// RMSNorm scales, the final norm, and the lm_head are bound zero-copy from the
+/// pack's own already-resident (mmap'd, native q8_0/q4_k/f16/f32) tensor -- no
+/// host dequant-to-f32 and no static-arena upload, exactly the shape
+/// `firered_aed`/`cohere`/... already use. A q8_0 2-B decoder therefore stays
+/// ~2.5 GB resident (its packed size) instead of the ~8 GB an f32 dequant +
+/// arena upload cost. `mul_mat` consumes whatever `mul_mat`-compatible type the
+/// pack stores each projection in, unchanged.
+pub(crate) struct GraniteDecoderLoadedWeights {
+    layers: Vec<GraniteLayerLoadedHandles>,
+    final_norm: GgmlLoadedTensor,
+    lm_head: GgmlLoadedTensor,
+}
+
+fn loaded_tensor(
+    loaded: &GgmlLoadedWeightContext,
+    name: &str,
+) -> Result<GgmlLoadedTensor, GraniteSpeechDecoderError> {
+    loaded
+        .tensor(name)
+        .ok_or_else(|| GraniteSpeechDecoderError::MissingWeight {
+            name: name.to_string(),
+        })
+}
+
+impl GraniteDecoderLoadedWeights {
+    /// Bind every decoder weight by its on-disk name (the converter stores the
+    /// `language_model.*` tensors under their verbatim HF names, so these match
+    /// the f32-arena path's `WeightBuilder` names exactly).
+    pub(crate) fn load(
+        loaded: &GgmlLoadedWeightContext,
+        config: &GraniteSpeechDecoderConfig,
+    ) -> Result<Self, GraniteSpeechDecoderError> {
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for index in 0..config.num_layers {
+            let p = |suffix: &str| format!("language_model.model.layers.{index}.{suffix}");
+            layers.push(GraniteLayerLoadedHandles {
+                attn_norm: loaded_tensor(loaded, &p("input_layernorm.weight"))?,
+                q: loaded_tensor(loaded, &p("self_attn.q_proj.weight"))?,
+                k: loaded_tensor(loaded, &p("self_attn.k_proj.weight"))?,
+                v: loaded_tensor(loaded, &p("self_attn.v_proj.weight"))?,
+                o: loaded_tensor(loaded, &p("self_attn.o_proj.weight"))?,
+                ffn_norm: loaded_tensor(loaded, &p("post_attention_layernorm.weight"))?,
+                gate: loaded_tensor(loaded, &p("mlp.gate_proj.weight"))?,
+                up: loaded_tensor(loaded, &p("mlp.up_proj.weight"))?,
+                down: loaded_tensor(loaded, &p("mlp.down_proj.weight"))?,
+            });
+        }
+        Ok(Self {
+            layers,
+            final_norm: loaded_tensor(loaded, "language_model.model.norm.weight")?,
+            lm_head: loaded_tensor(loaded, "language_model.lm_head.weight")?,
+        })
+    }
+
+    fn layer_weights<'a>(&self, index: usize) -> DecoderLayerWeights<'a> {
+        let h = &self.layers[index];
+        DecoderLayerWeights {
+            attn_norm_w: h.attn_norm.as_graph_tensor(),
+            q_w: h.q.as_graph_tensor(),
+            k_w: h.k.as_graph_tensor(),
+            v_w: h.v.as_graph_tensor(),
+            o_w: h.o.as_graph_tensor(),
+            ffn_norm_w: h.ffn_norm.as_graph_tensor(),
+            gate_w: h.gate.as_graph_tensor(),
+            up_w: h.up.as_graph_tensor(),
+            down_w: h.down.as_graph_tensor(),
+        }
+    }
+
+    fn final_norm_weight<'a>(&self) -> GgmlCpuTensor<'a> {
+        self.final_norm.as_graph_tensor()
+    }
+
+    fn lm_head_weight<'a>(&self) -> GgmlCpuTensor<'a> {
+        self.lm_head.as_graph_tensor()
+    }
+}
+
+/// The decoder weight residency backing a [`GraniteSpeechDecodeSession`]: either
+/// the legacy f32 static-arena upload (used by the synthetic bit-exact test and
+/// any host-`HashMap` provider) or the keep-quantized zero-copy bind from the
+/// mmap'd pack. The session's forward code is identical for both -- it only ever
+/// asks for `layer_weights`/`final_norm_weight`/`lm_head_weight`.
+pub(crate) enum GraniteDecoderWeights {
+    Arena(GraniteDecoderWeightArena),
+    Loaded(GraniteDecoderLoadedWeights),
+}
+
+impl GraniteDecoderWeights {
+    pub(crate) fn layer_weights<'a>(&self, index: usize) -> DecoderLayerWeights<'a> {
+        match self {
+            Self::Arena(arena) => arena.layer_weights(index),
+            Self::Loaded(loaded) => loaded.layer_weights(index),
+        }
+    }
+
+    pub(crate) fn final_norm_weight<'a>(&self) -> GgmlCpuTensor<'a> {
+        match self {
+            Self::Arena(arena) => arena.final_norm_weight(),
+            Self::Loaded(loaded) => loaded.final_norm_weight(),
+        }
+    }
+
+    pub(crate) fn lm_head_weight<'a>(&self) -> GgmlCpuTensor<'a> {
+        match self {
+            Self::Arena(arena) => arena.lm_head_weight(),
+            Self::Loaded(loaded) => loaded.lm_head_weight(),
+        }
     }
 }
 
