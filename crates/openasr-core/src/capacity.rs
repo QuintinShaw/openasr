@@ -494,8 +494,9 @@ pub(crate) enum MemoryAdmissionDomain {
 /// reverse-engineered by a test asserting on message text alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostMemoryCapacityRejection {
-    /// KV bytes at `required_positions` plus the pack's own on-disk bytes --
-    /// the two quantities [`evaluate_host_memory_admission`] actually knows.
+    /// KV bytes at `required_positions` plus the pack's own on-disk bytes plus
+    /// `auxiliary_resident_bytes` -- the quantities
+    /// [`evaluate_host_memory_admission`] actually knows.
     pub needed_bytes: u64,
     /// The budget `needed_bytes` was compared against: total RAM + swap on a
     /// unified-memory host, `host_total_memory_bytes * 3/4` on the discrete
@@ -503,6 +504,13 @@ pub(crate) struct HostMemoryCapacityRejection {
     pub budget_bytes: u64,
     pub host_total_memory_bytes: u64,
     pub pack_bytes_on_disk: u64,
+    /// Resident decode-state bytes charged beyond the positional KV model and
+    /// the pack file: fixed-size arena caches an AED-family decoder allocates
+    /// at its full ceiling regardless of the request, and co-resident
+    /// auxiliary models a request is known to load (the VAD +
+    /// speaker-embedder attribution pass). Zero for families/requests with
+    /// neither.
+    pub auxiliary_resident_bytes: u64,
     pub required_positions: usize,
     /// Which memory pool the budget was formed from -- so the message can name
     /// RAM+swap vs VRAM correctly and the trailer records the classification.
@@ -520,13 +528,14 @@ impl HostMemoryCapacityRejection {
             MemoryAdmissionDomain::DiscreteVram => ("discrete_vram", 0),
         };
         format!(
-            "core.native.capacity.admission:reject,domain={},needed_bytes={},budget_bytes={},host_total_memory_bytes={},swap_bytes={},pack_bytes_on_disk={},required_positions={}",
+            "core.native.capacity.admission:reject,domain={},needed_bytes={},budget_bytes={},host_total_memory_bytes={},swap_bytes={},pack_bytes_on_disk={},auxiliary_resident_bytes={},required_positions={}",
             domain,
             self.needed_bytes,
             self.budget_bytes,
             self.host_total_memory_bytes,
             swap_bytes,
             self.pack_bytes_on_disk,
+            self.auxiliary_resident_bytes,
             self.required_positions,
         )
     }
@@ -572,7 +581,11 @@ impl HostMemoryCapacityRejection {
 
 /// Evaluate whether `required_positions` decoder positions at `spec` for
 /// `geometry`, alongside `pack_bytes_on_disk` already resident from the
-/// mmap'd pack file, fit this host's memory budget for the given `domain`.
+/// mmap'd pack file and `auxiliary_resident_bytes` of additional
+/// request-known resident state (fixed-ceiling AED arena caches, the
+/// speaker-embedder attribution pass -- see
+/// [`HostMemoryCapacityRejection::auxiliary_resident_bytes`]), fit this
+/// host's memory budget for the given `domain`.
 /// The budget is never `host_available_memory_bytes` (see this module's
 /// invariants and that probe's own doc forbidding admission use).
 ///
@@ -602,13 +615,17 @@ pub(crate) fn evaluate_host_memory_admission(
     spec: LlmKvCacheSpec,
     required_positions: usize,
     pack_bytes_on_disk: u64,
+    auxiliary_resident_bytes: u64,
     host_total_memory_bytes: u64,
     domain: MemoryAdmissionDomain,
 ) -> Result<(), HostMemoryCapacityRejection> {
     let Ok(kv_bytes) = kv_bytes_at_positions(geometry, spec, required_positions) else {
         return Ok(());
     };
-    let needed_bytes = kv_bytes.total().saturating_add(pack_bytes_on_disk);
+    let needed_bytes = kv_bytes
+        .total()
+        .saturating_add(pack_bytes_on_disk)
+        .saturating_add(auxiliary_resident_bytes);
     let budget_bytes = match domain {
         // Unified memory can page to swap, so the physical ceiling a decode can
         // draw on is RAM + swap -- not the 75% RAM budget the discrete path and
@@ -629,6 +646,7 @@ pub(crate) fn evaluate_host_memory_admission(
         budget_bytes,
         host_total_memory_bytes,
         pack_bytes_on_disk,
+        auxiliary_resident_bytes,
         required_positions,
         domain,
     })
@@ -859,6 +877,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             512,
             oversized_pack_bytes_on_disk,
+            0,
             tiny_host_total_memory_bytes,
             unified(0),
         )
@@ -905,6 +924,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             required_positions,
             pack_bytes,
+            0,
             host_ram,
             unified(4 * GIB),
         )
@@ -915,6 +935,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             required_positions,
             pack_bytes,
+            0,
             host_ram,
             unified(0),
         )
@@ -934,6 +955,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             512,
             pack_bytes,
+            0,
             host_ram,
             unified(swap),
         )
@@ -950,6 +972,47 @@ mod tests {
         assert!(message.contains(&format!("swap_bytes={swap}")), "{message}");
     }
 
+    /// Auxiliary resident bytes (fixed AED arena state, the co-resident
+    /// speaker-embedder pass) are charged into the same needed-vs-budget
+    /// comparison: a request that fits without them and overflows with them
+    /// must be rejected, and the rejection must carry the figure in both the
+    /// struct and the provenance trailer.
+    #[test]
+    fn host_memory_admission_charges_auxiliary_resident_bytes() {
+        let geometry = moss_geometry();
+        let host_ram: u64 = 4 * GIB;
+        let pack_bytes: u64 = 3 * GIB + GIB / 2;
+        // 512 DEFAULT positions ~= 168 MiB of KV: pack + KV fits 4 GiB...
+        evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            512,
+            pack_bytes,
+            0,
+            host_ram,
+            unified(0),
+        )
+        .expect("without auxiliary bytes the request fits");
+        // ...and one added GiB of auxiliary resident state tips it over.
+        let auxiliary: u64 = GIB;
+        let rejection = evaluate_host_memory_admission(
+            &geometry,
+            LlmKvCacheSpec::DEFAULT,
+            512,
+            pack_bytes,
+            auxiliary,
+            host_ram,
+            unified(0),
+        )
+        .expect_err("the auxiliary charge must tip the same request over the budget");
+        assert_eq!(rejection.auxiliary_resident_bytes, auxiliary);
+        let message = rejection.user_message();
+        assert!(
+            message.contains(&format!("auxiliary_resident_bytes={auxiliary}")),
+            "{message}"
+        );
+    }
+
     /// Discrete VRAM cannot page: swap never enters its budget, and the
     /// rejection message says so. A budget that would trivially admit the same
     /// request as unified-with-swap still rejects here.
@@ -964,6 +1027,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             8192,
             pack_bytes,
+            0,
             host_ram,
             MemoryAdmissionDomain::DiscreteVram,
         )
@@ -989,6 +1053,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             8192,
             pack_bytes,
+            0,
             host_ram,
             unified(8 * GIB),
         )
@@ -1012,6 +1077,7 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
             8192,
             modest_pack_bytes_on_disk,
+            0,
             crate::host::MIN_SPEC_TOTAL_MEMORY_BYTES,
             unified(0),
         )
@@ -1036,6 +1102,7 @@ mod tests {
                 &degenerate,
                 LlmKvCacheSpec::DEFAULT,
                 8192,
+                0,
                 0,
                 1024,
                 unified(0),

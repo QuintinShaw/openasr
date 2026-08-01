@@ -13,6 +13,7 @@ pub(crate) mod weights;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use pack::speaker_attribution_admission_bytes;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderIdentity,

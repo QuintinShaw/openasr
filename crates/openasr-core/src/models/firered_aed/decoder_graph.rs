@@ -134,7 +134,9 @@ fn firered_mel_frames_for_seconds(duration_seconds: f32) -> usize {
 /// (`kv_init`: reserve at a known max, never reallocate per step) -- see
 /// `GgmlCpuStepBufferPool`'s doc in `ggml_runtime/cpu_graph.rs` for the
 /// sibling citation and `ACKNOWLEDGMENTS.md`.
-fn firered_decoder_cross_capacity_frames(metadata: &FireRedAedExecutionMetadata) -> usize {
+pub(crate) fn firered_decoder_cross_capacity_frames(
+    metadata: &FireRedAedExecutionMetadata,
+) -> usize {
     let chunk_seconds = crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS
         + FIRERED_DECODER_CROSS_CAPACITY_MARGIN_SECONDS;
     let mel_frames = firered_mel_frames_for_seconds(chunk_seconds);

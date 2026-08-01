@@ -140,11 +140,11 @@ const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
 /// running an out-of-distribution multi-minute prefill; longer audio is the
 /// longform slicing orchestrator's job (see `FIRERED_LLM_DECODE_POLICY_ID`'s
 /// `ConservativeSeq2SeqV1` longform profile registration).
-const FIRERED_LLM_MAX_INPUT_SECONDS: f32 = 40.0;
+pub(crate) const FIRERED_LLM_MAX_INPUT_SECONDS: f32 = 40.0;
 /// Generous upper bound on generated tokens per utterance -- greedy decode
 /// stops at `<|im_end|>` well before this in practice; this is only the
 /// fail-closed backstop against a runaway (non-terminating) decode.
-const FIRERED_LLM_MAX_GENERATED_TOKENS: usize = 512;
+pub(crate) const FIRERED_LLM_MAX_GENERATED_TOKENS: usize = 512;
 
 #[derive(Debug, Error)]
 enum FireRedLlmExecutorError {

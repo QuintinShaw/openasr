@@ -13,6 +13,7 @@
 //! decode-policy registration, and the dedicated executor.
 
 mod audio_tokenizer_graph;
+pub(crate) mod capacity;
 mod decode_prompt;
 pub(crate) mod executor;
 mod input_local_graph;

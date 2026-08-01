@@ -77,6 +77,37 @@ pub fn embedder_pack_installed() -> bool {
     redimnet_pack_path().is_some()
 }
 
+/// Conservative multiplier from the embedder pack's on-disk bytes to the
+/// resident memory the speaker-attribution pass is charged at admission time:
+/// the pack's (fp16) weights are dequantized/uploaded as working f32 state by
+/// the ggml graph (up to 2x the file), plus frontend/activation working
+/// buffers and the VAD model. 4x the ~27 MiB shipped pack is ~110 MiB -- a
+/// deliberate upper bound that still sits far below any realistic admission
+/// budget (min-spec is 8 GiB), so it cannot introduce a new false-reject band
+/// on its own; it only tips requests that were already within that margin of
+/// the ceiling.
+const SPEAKER_ATTRIBUTION_ADMISSION_PACK_MULTIPLIER: u64 = 4;
+
+/// Resident bytes the host-memory admission check charges for the VAD +
+/// speaker-embedder attribution pass (`compute_speaker_attribution`) a
+/// diarize-routed request runs right after admission: a conservative multiple
+/// of the resolved embedder pack's on-disk size (see
+/// [`SPEAKER_ATTRIBUTION_ADMISSION_PACK_MULTIPLIER`]). `0` when no pack
+/// resolves or it cannot be stat'ed -- "uncertain" resolves to "allow", the
+/// admission side's fail-open invariant (and a request without the pack fails
+/// closed on its own `DiarizationNotSupported` gate before admission anyway).
+pub(crate) fn speaker_attribution_admission_bytes() -> u64 {
+    let Some(path) = redimnet_pack_path() else {
+        return 0;
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return 0;
+    };
+    metadata
+        .len()
+        .saturating_mul(SPEAKER_ATTRIBUTION_ADMISSION_PACK_MULTIPLIER)
+}
+
 /// The process-wide active ReDimNet2-B6 embedder, or `None` if the pack is not
 /// installed.
 ///
@@ -174,6 +205,29 @@ mod tests {
     fn redimnet_pack_env_name_is_stable() {
         assert_eq!(REDIMNET_PACK_ENV, "OPENASR_REDIMNET_PACK");
         assert_eq!(REDIMNET_INSTALLED_MODEL_ID_HINT, "redimnet");
+    }
+
+    /// The admission estimate is the resolved pack's on-disk size times the
+    /// conservative multiplier -- pinned against the env-override resolution
+    /// path (nextest's per-test process isolation makes the env mutation
+    /// safe), with an empty `OPENASR_HOME` so no installed pack can shadow
+    /// the override or make the no-pack half nondeterministic.
+    #[test]
+    fn speaker_attribution_admission_bytes_scale_the_resolved_pack_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
+
+        // No pack anywhere: uncertain resolves to zero (fail open).
+        unsafe { std::env::remove_var(REDIMNET_PACK_ENV) };
+        assert_eq!(speaker_attribution_admission_bytes(), 0);
+
+        let pack = dir.path().join("redimnet-fixture.oasr");
+        std::fs::write(&pack, vec![0u8; 1000]).expect("write fixture pack");
+        unsafe { std::env::set_var(REDIMNET_PACK_ENV, &pack) };
+        assert_eq!(
+            speaker_attribution_admission_bytes(),
+            1000 * SPEAKER_ATTRIBUTION_ADMISSION_PACK_MULTIPLIER
+        );
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
