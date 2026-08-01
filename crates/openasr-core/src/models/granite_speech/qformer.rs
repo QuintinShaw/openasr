@@ -32,7 +32,8 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlRuntimeSource, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReader,
 };
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
@@ -48,6 +49,8 @@ pub(crate) enum GraniteSpeechProjectorError {
         expected: usize,
         actual: usize,
     },
+    #[error("granite-speech projector weight '{name}' could not be read: {reason}")]
+    WeightRead { name: String, reason: String },
     #[error("granite-speech projector GGML backend failed at {stage}: {source}")]
     Ggml {
         stage: &'static str,
@@ -93,6 +96,89 @@ impl GraniteSpeechProjectorConfig {
 
     fn head_dim(&self) -> usize {
         self.encoder_hidden_size / self.num_attention_heads
+    }
+}
+
+fn projector_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    GgmlCpuGraphConfig {
+        context_bytes: 128 * 1024 * 1024,
+        graph_size: 8192,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+        ),
+        backend,
+        use_scheduler: true,
+    }
+}
+
+/// Request-invariant Q-Former state. Native matrix weights remain mmap-bound;
+/// the checkpoint's tiny f16 learned query is converted to resident f32 once
+/// because the affine LayerNorm graph consumes f32 operands.
+pub(crate) struct GraniteSpeechProjectorRuntime {
+    runner: GgmlCpuGraphRunner,
+    loaded: GgmlLoadedWeightContext,
+    query_arena: GgmlStaticTensorArena,
+    query: GgmlStaticTensor,
+}
+
+impl GraniteSpeechProjectorRuntime {
+    pub(crate) fn new(
+        source: &GgmlRuntimeSource,
+        config: &GraniteSpeechProjectorConfig,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GraniteSpeechProjectorError> {
+        let graph_config = projector_graph_config(backend);
+        let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
+        let loaded = runner
+            .load_gguf_weight_context(source)
+            .map_err(ggml_err("load_gguf_weight_context"))?;
+        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
+            GraniteSpeechProjectorError::WeightRead {
+                name: "projector.query".to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        let num_queries = config.num_queries();
+        let values = reader
+            .host_tensor_f32_copy_dequantized_by_name(
+                "projector.query",
+                &[1, num_queries as u64, config.encoder_hidden_size as u64],
+            )
+            .map_err(|error| GraniteSpeechProjectorError::WeightRead {
+                name: "projector.query".to_string(),
+                reason: error.to_string(),
+            })?;
+        let mut query_arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(8))
+            .map_err(ggml_err("query_static_tensor_arena"))?;
+        let query = query_arena
+            .new_tensor_2d_f32(
+                config.encoder_hidden_size,
+                num_queries,
+                "granite_speech_projector_query",
+            )
+            .map_err(ggml_err("query_alloc"))?;
+        query_arena
+            .set_f32_slice(query, &values, "granite_speech_projector_query")
+            .map_err(ggml_err("query_upload"))?;
+        Ok(Self {
+            runner,
+            loaded,
+            query_arena,
+            query,
+        })
+    }
+
+    pub(crate) fn project(
+        &mut self,
+        config: &GraniteSpeechProjectorConfig,
+        encoder_out: &[f32],
+        frames: usize,
+    ) -> Result<GraniteSpeechProjectorOutput, GraniteSpeechProjectorError> {
+        let weights =
+            build_loaded_projector_weights(&self.loaded, &self.query_arena, self.query, config)?;
+        run_projector_graph(&mut self.runner, config, &weights, encoder_out, frames)
     }
 }
 
@@ -250,6 +336,80 @@ fn build_layer_weights<'a, 'p>(
         ffn_down_b: builder.w1(arena, &p("output_query.dense.bias"), d)?,
         ffn_out_norm_w: builder.w1(arena, &p("output_query.LayerNorm.weight"), d)?,
         ffn_out_norm_b: builder.w1(arena, &p("output_query.LayerNorm.bias"), d)?,
+    })
+}
+
+fn packed_projector_tensor_name(name: &str) -> String {
+    const LONG_PREFIX: &str = "projector.qformer.encoder.layer.";
+    match name.strip_prefix(LONG_PREFIX) {
+        Some(rest) => format!("projector.qf.{rest}"),
+        None => name.to_string(),
+    }
+}
+
+fn loaded_tensor<'a>(
+    loaded: &GgmlLoadedWeightContext,
+    name: &str,
+) -> Result<GgmlCpuTensor<'a>, GraniteSpeechProjectorError> {
+    let packed_name = packed_projector_tensor_name(name);
+    loaded
+        .tensor(&packed_name)
+        .map(GgmlLoadedTensor::as_graph_tensor)
+        .ok_or(GraniteSpeechProjectorError::MissingWeight { name: packed_name })
+}
+
+fn build_loaded_layer_weights<'a>(
+    loaded: &GgmlLoadedWeightContext,
+    index: usize,
+) -> Result<QformerLayerWeights<'a>, GraniteSpeechProjectorError> {
+    let p = |suffix: &str| format!("projector.qformer.encoder.layer.{index}.{suffix}");
+    Ok(QformerLayerWeights {
+        self_q_w: loaded_tensor(loaded, &p("attention.attention.query.weight"))?,
+        self_q_b: loaded_tensor(loaded, &p("attention.attention.query.bias"))?,
+        self_k_w: loaded_tensor(loaded, &p("attention.attention.key.weight"))?,
+        self_k_b: loaded_tensor(loaded, &p("attention.attention.key.bias"))?,
+        self_v_w: loaded_tensor(loaded, &p("attention.attention.value.weight"))?,
+        self_v_b: loaded_tensor(loaded, &p("attention.attention.value.bias"))?,
+        self_out_w: loaded_tensor(loaded, &p("attention.output.dense.weight"))?,
+        self_out_b: loaded_tensor(loaded, &p("attention.output.dense.bias"))?,
+        self_out_norm_w: loaded_tensor(loaded, &p("attention.output.LayerNorm.weight"))?,
+        self_out_norm_b: loaded_tensor(loaded, &p("attention.output.LayerNorm.bias"))?,
+        cross_q_w: loaded_tensor(loaded, &p("crossattention.attention.query.weight"))?,
+        cross_q_b: loaded_tensor(loaded, &p("crossattention.attention.query.bias"))?,
+        cross_k_w: loaded_tensor(loaded, &p("crossattention.attention.key.weight"))?,
+        cross_k_b: loaded_tensor(loaded, &p("crossattention.attention.key.bias"))?,
+        cross_v_w: loaded_tensor(loaded, &p("crossattention.attention.value.weight"))?,
+        cross_v_b: loaded_tensor(loaded, &p("crossattention.attention.value.bias"))?,
+        cross_out_w: loaded_tensor(loaded, &p("crossattention.output.dense.weight"))?,
+        cross_out_b: loaded_tensor(loaded, &p("crossattention.output.dense.bias"))?,
+        cross_out_norm_w: loaded_tensor(loaded, &p("crossattention.output.LayerNorm.weight"))?,
+        cross_out_norm_b: loaded_tensor(loaded, &p("crossattention.output.LayerNorm.bias"))?,
+        ffn_up_w: loaded_tensor(loaded, &p("intermediate_query.dense.weight"))?,
+        ffn_up_b: loaded_tensor(loaded, &p("intermediate_query.dense.bias"))?,
+        ffn_down_w: loaded_tensor(loaded, &p("output_query.dense.weight"))?,
+        ffn_down_b: loaded_tensor(loaded, &p("output_query.dense.bias"))?,
+        ffn_out_norm_w: loaded_tensor(loaded, &p("output_query.LayerNorm.weight"))?,
+        ffn_out_norm_b: loaded_tensor(loaded, &p("output_query.LayerNorm.bias"))?,
+    })
+}
+
+fn build_loaded_projector_weights<'a>(
+    loaded: &GgmlLoadedWeightContext,
+    query_arena: &GgmlStaticTensorArena,
+    query: GgmlStaticTensor,
+    config: &GraniteSpeechProjectorConfig,
+) -> Result<ProjectorWeights<'a>, GraniteSpeechProjectorError> {
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for index in 0..config.num_hidden_layers {
+        layers.push(build_loaded_layer_weights(loaded, index)?);
+    }
+    Ok(ProjectorWeights {
+        query: query_arena.graph_tensor(query),
+        qformer_layernorm_w: loaded_tensor(loaded, "projector.qformer.layernorm.weight")?,
+        qformer_layernorm_b: loaded_tensor(loaded, "projector.qformer.layernorm.bias")?,
+        layers,
+        linear_w: loaded_tensor(loaded, "projector.linear.weight")?,
+        linear_b: loaded_tensor(loaded, "projector.linear.bias")?,
     })
 }
 
@@ -478,37 +638,14 @@ pub(crate) fn project(
     backend: GgmlCpuGraphBackend,
 ) -> Result<GraniteSpeechProjectorOutput, GraniteSpeechProjectorError> {
     let d_model = config.encoder_hidden_size;
-    if encoder_out.len() != frames * d_model {
-        return Err(GraniteSpeechProjectorError::Shape {
-            reason: format!(
-                "encoder_out has {} values, expected {frames}x{d_model}",
-                encoder_out.len()
-            ),
-        });
-    }
-    let window_size = config.window_size;
     let num_queries = config.num_queries();
-    let nblocks = frames.div_ceil(window_size);
-    let padded_len = nblocks * window_size;
-    let pad_amount = padded_len - frames;
-
-    let graph_config = GgmlCpuGraphConfig {
-        context_bytes: 128 * 1024 * 1024,
-        graph_size: 8192,
-        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
-            backend,
-            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
-        ),
-        backend,
-        use_scheduler: true,
-    };
+    let graph_config = projector_graph_config(backend);
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let tensor_count = 32 + 48 * config.num_hidden_layers;
     let arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(tensor_count);
     let arena = runner
         .start_static_tensor_arena(arena_bytes)
         .map_err(ggml_err("static_tensor_arena"))?;
-
     let mut builder = WeightBuilder::new(provider);
     let query = builder.w2(&arena, "projector.query", d_model, num_queries)?;
     let qformer_layernorm_w = builder.w1(&arena, "projector.qformer.layernorm.weight", d_model)?;
@@ -524,26 +661,8 @@ pub(crate) fn project(
         config.llm_hidden_size,
     )?;
     let linear_b = builder.w1(&arena, "projector.linear.bias", config.llm_hidden_size)?;
-
-    let zero_pad_handle = if pad_amount > 0 {
-        Some(
-            arena
-                .new_tensor_2d_f32(d_model, pad_amount, "granite_speech_proj_zero_pad")
-                .map_err(ggml_err("weight_alloc_zero_pad"))?,
-        )
-    } else {
-        None
-    };
-
     let mut arena = arena;
     builder.upload(&mut arena)?;
-    if let Some(handle) = zero_pad_handle {
-        let zeros = vec![0.0f32; d_model * pad_amount];
-        arena
-            .set_f32_slice(handle, &zeros, "granite_speech_proj_zero_pad")
-            .map_err(ggml_err("upload_zero_pad"))?;
-    }
-
     let weights = ProjectorWeights {
         query,
         qformer_layernorm_w,
@@ -552,12 +671,56 @@ pub(crate) fn project(
         linear_w,
         linear_b,
     };
+    run_projector_graph(&mut runner, config, &weights, encoder_out, frames)
+}
+
+fn run_projector_graph<'a>(
+    runner: &'a mut GgmlCpuGraphRunner,
+    config: &GraniteSpeechProjectorConfig,
+    weights: &ProjectorWeights<'a>,
+    encoder_out: &[f32],
+    frames: usize,
+) -> Result<GraniteSpeechProjectorOutput, GraniteSpeechProjectorError> {
+    let d_model = config.encoder_hidden_size;
+    if encoder_out.len() != frames * d_model {
+        return Err(GraniteSpeechProjectorError::Shape {
+            reason: format!(
+                "encoder_out has {} values, expected {frames}x{d_model}",
+                encoder_out.len()
+            ),
+        });
+    }
+    let window_size = config.window_size;
+    let num_queries = config.num_queries();
+    let nblocks = frames.div_ceil(window_size);
+    let padded_len = nblocks * window_size;
+    let pad_amount = padded_len - frames;
+
+    let dynamic_arena = runner
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(8))
+        .map_err(ggml_err("dynamic_static_tensor_arena"))?;
+    let zero_pad_handle = if pad_amount > 0 {
+        Some(
+            dynamic_arena
+                .new_tensor_2d_f32(d_model, pad_amount, "granite_speech_proj_zero_pad")
+                .map_err(ggml_err("weight_alloc_zero_pad"))?,
+        )
+    } else {
+        None
+    };
+    let mut dynamic_arena = dynamic_arena;
+    if let Some(handle) = zero_pad_handle {
+        let zeros = vec![0.0f32; d_model * pad_amount];
+        dynamic_arena
+            .set_f32_slice(handle, &zeros, "granite_speech_proj_zero_pad")
+            .map_err(ggml_err("upload_zero_pad"))?;
+    }
 
     let mut graph = runner.start_graph();
     let input = graph
         .new_tensor_2d_f32(d_model, frames, "granite_speech_proj_encoder_out")
         .map_err(ggml_err("input_alloc"))?;
-    let zero_pad = zero_pad_handle.map(|h| arena.graph_tensor(h));
+    let zero_pad = zero_pad_handle.map(|h| dynamic_arena.graph_tensor(h));
 
     let padded = match zero_pad {
         Some(pad) => graph

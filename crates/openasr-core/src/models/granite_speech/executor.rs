@@ -38,21 +38,23 @@ use thiserror::Error;
 use super::decode_executor::GraniteSpeechResidentAudioDecodeStepExecutor;
 use super::decode_session::GraniteSpeechDecodeSession;
 use super::decoder_graph::GraniteSpeechDecoderConfig;
+use super::encoder_graph::{GraniteSpeechEncoderConfig, GraniteSpeechEncoderRuntime};
 use super::prompt::{GRANITE_SPEECH_AUDIO_TOKEN, build_audio_prompt_embeddings};
+use super::qformer::{GraniteSpeechProjectorConfig, GraniteSpeechProjectorRuntime};
 use super::runtime_contract::{
     parse_decoder_metadata, parse_encoder_metadata, parse_projector_metadata,
 };
 use super::runtime_provider::load_tensors_from_oasr_pack;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlRuntimeSource, read_gguf_metadata};
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrPreparedAudio,
+    GgmlAsrPreparedAudio, GgmlAsrRuntimeSourcePreflight,
 };
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
@@ -90,6 +92,12 @@ use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_I
 /// thread-local cache; it doubles as the `GraniteSpeechDecoderWeightProvider`
 /// for prompt assembly and each generated token's per-step embedding lookup.
 struct GraniteSpeechPreparedRuntime {
+    encoder_config: GraniteSpeechEncoderConfig,
+    projector_config: GraniteSpeechProjectorConfig,
+    decoder_config: GraniteSpeechDecoderConfig,
+    tokenizer: GraniteSpeechTokenizer,
+    encoder: GraniteSpeechEncoderRuntime,
+    projector: GraniteSpeechProjectorRuntime,
     session: GraniteSpeechDecodeSession,
     embed_table: HashMap<String, Vec<f32>>,
 }
@@ -99,10 +107,31 @@ impl GraniteSpeechPreparedRuntime {
     /// given `(pack, backend)`. This is the whole ~4.2s cost the resident cache
     /// exists to pay exactly once instead of per request.
     fn build(
-        source: &GgmlRuntimeSource,
-        decoder_config: GraniteSpeechDecoderConfig,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechGgmlExecutorError> {
+        let metadata = &preflight.metadata;
+        let encoder_config = parse_encoder_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let projector_config = parse_projector_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_config = parse_decoder_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let tokenizer = GraniteSpeechTokenizer::from_gguf_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::TokenizerFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let source = &preflight.runtime_source;
         let pack_path = source.path();
         // Only the decoder's token-embedding table on the host (dequantized to
         // f32) -- the projection/norm/lm_head weights are bound zero-copy inside
@@ -112,12 +141,27 @@ impl GraniteSpeechPreparedRuntime {
                 .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
                     reason: error.to_string(),
                 })?;
+        let encoder = GraniteSpeechEncoderRuntime::new(source, &encoder_config, backend).map_err(
+            |error| GraniteSpeechGgmlExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            },
+        )?;
+        let projector = GraniteSpeechProjectorRuntime::new(source, &projector_config, backend)
+            .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
+                reason: error.to_string(),
+            })?;
         let session =
             GraniteSpeechDecodeSession::new_keep_quantized(decoder_config, source, backend)
                 .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
                     reason: error.to_string(),
                 })?;
         Ok(Self {
+            encoder_config,
+            projector_config,
+            decoder_config,
+            tokenizer,
+            encoder,
+            projector,
             session,
             embed_table,
         })
@@ -240,8 +284,6 @@ impl GraniteSpeechGgmlExecutor {
                     reason: error.to_string(),
                 },
             )?;
-        let pack_path = preflight.runtime_source.path();
-
         let samples = downmix_prepared_audio(&request.prepared_audio);
         let frontend = super::frontend::GraniteSpeechMelFrontend::new();
         let (features, frames) = frontend.extract(&samples).map_err(|error| {
@@ -249,68 +291,7 @@ impl GraniteSpeechGgmlExecutor {
                 reason: error.to_string(),
             }
         })?;
-
         let backend = request.resolved_runtime.backend();
-
-        let metadata = read_gguf_metadata(pack_path).map_err(|error| {
-            GraniteSpeechGgmlExecutorError::MetadataFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        let encoder_config = parse_encoder_metadata(&metadata).map_err(|error| {
-            GraniteSpeechGgmlExecutorError::MetadataFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        let projector_config = parse_projector_metadata(&metadata).map_err(|error| {
-            GraniteSpeechGgmlExecutorError::MetadataFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        let decoder_config = parse_decoder_metadata(&metadata).map_err(|error| {
-            GraniteSpeechGgmlExecutorError::MetadataFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        let encoder_weights =
-            load_tensors_from_oasr_pack(pack_path, "encoder.").map_err(|error| {
-                GraniteSpeechGgmlExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                }
-            })?;
-        let encoder_output = super::encoder_graph::encode(
-            &encoder_config,
-            &encoder_weights,
-            &features,
-            frames,
-            backend,
-            false,
-        )
-        .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
-            reason: error.to_string(),
-        })?;
-        let projector_weights =
-            load_tensors_from_oasr_pack(pack_path, "projector.").map_err(|error| {
-                GraniteSpeechGgmlExecutorError::ProjectorFailed {
-                    reason: error.to_string(),
-                }
-            })?;
-        let projector_output = super::qformer::project(
-            &projector_config,
-            &projector_weights,
-            &encoder_output.encoder_out,
-            encoder_output.frames,
-            backend,
-        )
-        .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
-            reason: error.to_string(),
-        })?;
-        let tokenizer = GraniteSpeechTokenizer::from_gguf_metadata(&metadata).map_err(|error| {
-            GraniteSpeechGgmlExecutorError::TokenizerFailed {
-                reason: error.to_string(),
-            }
-        })?;
-
         // KWB (keyword-list biasing): the model's own documented prompt
         // convention -- "transcribe the speech to text. Keywords: <kw1>,
         // <kw2>, ..." -- not a decode-time logit bias (see the family's
@@ -329,7 +310,6 @@ impl GraniteSpeechGgmlExecutor {
             _ => GRANITE_SPEECH_DEFAULT_QUESTION.to_string(),
         };
         let prompt_text = format!("USER: {GRANITE_SPEECH_AUDIO_TOKEN}{question}\n ASSISTANT:");
-
         // Cross-request resident runtime: the keep-quantized decode session
         // (runner + mmap'd loaded weight context + zero-copy decoder weights)
         // and the decoder embedding table are per-request-invariant for a given
@@ -348,16 +328,28 @@ impl GraniteSpeechGgmlExecutor {
         let unload_generation = current_unload_generation();
         let mut prepared = match take_cached_prepared_runtime(&cache_key, unload_generation) {
             Some(prepared) => prepared,
-            None => GraniteSpeechPreparedRuntime::build(
-                &preflight.runtime_source,
-                decoder_config,
-                backend,
-            )?,
+            None => GraniteSpeechPreparedRuntime::build(&preflight, backend)?,
         };
+        let encoder_output = prepared
+            .encoder
+            .encode(&prepared.encoder_config, &features, frames, false)
+            .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })?;
+        let projector_output = prepared
+            .projector
+            .project(
+                &prepared.projector_config,
+                &encoder_output.encoder_out,
+                encoder_output.frames,
+            )
+            .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
+                reason: error.to_string(),
+            })?;
         let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
-            &decoder_config,
+            &prepared.decoder_config,
             &prepared.embed_table,
-            &tokenizer,
+            &prepared.tokenizer,
             &prompt_text,
             &projector_output.projected,
             projector_output.tokens,
@@ -365,7 +357,6 @@ impl GraniteSpeechGgmlExecutor {
         .map_err(|error| GraniteSpeechGgmlExecutorError::PromptFailed {
             reason: error.to_string(),
         })?;
-
         // Greedy decode rides the one shared driver via the decode-policy
         // registry (AGENTS.md single-driver invariant): the registered
         // `GRANITE_SPEECH_DECODE_POLICY_ID` descriptor supplies the
@@ -376,16 +367,17 @@ impl GraniteSpeechGgmlExecutor {
         let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: prompt_token_ids,
             eot_token_id: GRANITE_SPEECH_EOT_TOKEN_ID,
-            vocab_size: decoder_config.vocab_size,
+            vocab_size: prepared.decoder_config.vocab_size,
             max_generated_tokens: GRANITE_SPEECH_MAX_GENERATED_TOKENS,
         };
         let decode_text_token_ids =
             |token_ids: &[u32]| -> Result<String, Seq2SeqGreedyDecodeError> {
-                tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
-                    Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                prepared
+                    .tokenizer
+                    .decode_text_token_ids(token_ids)
+                    .map_err(|error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
                         reason: error.to_string(),
-                    }
-                })
+                    })
             };
         // Disjoint field borrows of the resident runtime: `&mut session` for the
         // decode graph and `&embed_table` for the per-step token embeds are
@@ -420,7 +412,6 @@ impl GraniteSpeechGgmlExecutor {
             decode_result.map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
                 reason: error.to_string(),
             })?;
-
         let audio_duration_seconds = request.prepared_audio.samples_f32.len() as f32
             / request.prepared_audio.sample_rate_hz.max(1) as f32;
         Ok(GgmlAsrExecutionResult {

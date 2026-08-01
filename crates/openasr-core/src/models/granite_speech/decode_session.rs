@@ -78,6 +78,7 @@ use crate::ggml_runtime::{
 };
 use crate::nn::decoder::{
     LlmKvCacheSpec, LlmResidentKvArena, allocate_zeroed_llm_resident_kv_arena,
+    build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits, last_token_hidden_view,
     reusable_decode_graph_supported_for_runner,
 };
 
@@ -108,6 +109,30 @@ const GRANITE_RESIDENT_KV_SPEC: LlmKvCacheSpec = LlmKvCacheSpec {
 /// ggml metadata-context budget for both the session runner and the reused
 /// persistent decode graph. Holds tensor structs + names, not compute buffers.
 const GRANITE_DECODE_GRAPH_CONTEXT_BYTES: usize = 256 * 1024 * 1024;
+
+fn decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    GgmlCpuGraphConfig {
+        context_bytes: GRANITE_DECODE_GRAPH_CONTEXT_BYTES,
+        graph_size: 32768,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+        ),
+        backend,
+        // Scheduler off on the single-backend GPU path so the in-place
+        // resident-KV reuse graph is legal. CPU keeps the scheduler and the
+        // growing-KV host decode path.
+        use_scheduler: !backend.is_gpu_class(),
+    }
+}
+
+const fn resident_flash_attention_enabled(backend: GgmlCpuGraphBackend) -> bool {
+    // The resident path has a measured, transcript-equivalent win on Metal.
+    // Keep the generic CUDA/HIP/Vulkan lane on its established naive path
+    // until each backend's wide-prefill flash kernel has its own correctness
+    // and performance evidence.
+    matches!(backend, GgmlCpuGraphBackend::Metal)
+}
 
 /// Additive self-attention mask for the fixed-span reuse graph: `0.0` for every
 /// key column `<= position` (the prompt + generated-so-far + the just-written
@@ -198,6 +223,7 @@ struct GraniteReusableDecodeGraph {
     /// The fixed self-KV span this persistent graph was built for; a mismatch
     /// against the session's current `resident_capacity` forces a rebuild.
     max_positions: usize,
+    use_flash_attention: bool,
     embed: GgmlCpuTensor<'static>,
     row_index: GgmlCpuTensor<'static>,
     position: GgmlCpuTensor<'static>,
@@ -214,21 +240,7 @@ impl GraniteSpeechDecodeSession {
         provider: &dyn GraniteSpeechDecoderWeightProvider,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
-        let graph_config = GgmlCpuGraphConfig {
-            context_bytes: GRANITE_DECODE_GRAPH_CONTEXT_BYTES,
-            graph_size: 32768,
-            n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
-                backend,
-                crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
-            ),
-            backend,
-            // Scheduler off on the single-backend GPU path so the in-place
-            // resident-KV reuse graph is legal (the multi-backend scheduler
-            // drops refreshed per-token inputs / relocates in-place KV writes;
-            // see `nn::decoder::reusable_decode_graph_supported`). CPU keeps the
-            // scheduler and the growing-KV host decode path.
-            use_scheduler: !backend.is_gpu_class(),
-        };
+        let graph_config = decoder_graph_config(backend);
         let runner =
             GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
         let weights = GraniteDecoderWeightArena::load(&runner, &config, provider)?;
@@ -245,31 +257,14 @@ impl GraniteSpeechDecodeSession {
     /// whole 2-B decoder to an f32 host copy + arena upload. The projection/norm/
     /// lm_head weights come from the pack; the token-embedding rows are supplied
     /// by the `provider` passed to `decode_step`. The loaded weight context is
-    /// built on this session's own runner so the graph and the weights share one
-    /// backend/device (the same single-runner invariant `firered_aed` relies on),
-    /// and both are held for the session's whole lifetime -- which is why the
-    /// resident cache stores the runner and the loaded context together as one
-    /// unit and never mixes a loaded context with a different runner.
+    /// loaded context and this session's runner use the same thread-cached
+    /// backend/device, and both are held for the session's whole lifetime.
     pub(crate) fn new_keep_quantized(
         config: GraniteSpeechDecoderConfig,
         source: &GgmlRuntimeSource,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
-        let graph_config = GgmlCpuGraphConfig {
-            context_bytes: GRANITE_DECODE_GRAPH_CONTEXT_BYTES,
-            graph_size: 32768,
-            n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
-                backend,
-                crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
-            ),
-            backend,
-            // Scheduler off on the single-backend GPU path so the in-place
-            // resident-KV reuse graph is legal (the multi-backend scheduler
-            // drops refreshed per-token inputs / relocates in-place KV writes;
-            // see `nn::decoder::reusable_decode_graph_supported`). CPU keeps the
-            // scheduler and the growing-KV host decode path.
-            use_scheduler: !backend.is_gpu_class(),
-        };
+        let graph_config = decoder_graph_config(backend);
         let runner =
             GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
         let loaded = runner
@@ -554,7 +549,21 @@ impl GraniteSpeechDecodeSession {
             i32::try_from(position).map_err(|_| GraniteSpeechDecoderError::Shape {
                 reason: format!("granite decode position {position} does not fit i32"),
             })?;
-        let mask_values = fixed_span_tail_mask(max_positions, position);
+        let use_flash_attention = self
+            .reuse
+            .as_ref()
+            .expect("granite reusable decode graph built above")
+            .use_flash_attention;
+        let mask_values =
+            (!use_flash_attention).then(|| fixed_span_tail_mask(max_positions, position));
+        let mask_bits = if use_flash_attention {
+            Some(
+                build_fixed_kv_attention_mask_bits(max_positions, position + 1)
+                    .map_err(map_ggml("reuse_build_flash_mask"))?,
+            )
+        } else {
+            None
+        };
 
         let reuse = self
             .reuse
@@ -576,9 +585,21 @@ impl GraniteSpeechDecodeSession {
         graph
             .set_i32_slice(position_tensor, &[position_i32], "granite_reuse_position")
             .map_err(map_ggml("reuse_upload_position"))?;
-        graph
-            .set_f32_slice(mask, &mask_values, "granite_reuse_mask")
-            .map_err(map_ggml("reuse_upload_mask"))?;
+        if let Some(mask_bits) = mask_bits {
+            graph
+                .set_f16_bits_slice(mask, &mask_bits, "granite_reuse_mask")
+                .map_err(map_ggml("reuse_upload_flash_mask"))?;
+        } else {
+            graph
+                .set_f32_slice(
+                    mask,
+                    mask_values
+                        .as_deref()
+                        .expect("naive Granite reuse mask values"),
+                    "granite_reuse_mask",
+                )
+                .map_err(map_ggml("reuse_upload_mask"))?;
+        }
         let output = graph
             .compute_output_f32(logits, vocab_size)
             .map_err(map_ggml("reuse_compute"))?;
@@ -601,6 +622,7 @@ impl GraniteSpeechDecodeSession {
         let head_dim = config.head_dim;
         let hidden_size = config.hidden_size;
         let max_positions = self.resident_capacity;
+        let use_flash_attention = resident_flash_attention_enabled(self.runner.backend_kind());
         let resident_kv = self
             .resident_kv
             .as_ref()
@@ -634,9 +656,15 @@ impl GraniteSpeechDecodeSession {
         let position = graph
             .new_tensor_1d_i32(1, "granite_reuse_position")
             .map_err(map_ggml("reuse_position_alloc"))?;
-        let mask = graph
-            .new_tensor_2d_f32(max_positions, 1, "granite_reuse_mask")
-            .map_err(map_ggml("reuse_mask_alloc"))?;
+        let mask = if use_flash_attention {
+            graph
+                .new_tensor_2d_f16(max_positions, 1, "granite_reuse_mask")
+                .map_err(map_ggml("reuse_flash_mask_alloc"))?
+        } else {
+            graph
+                .new_tensor_2d_f32(max_positions, 1, "granite_reuse_mask")
+                .map_err(map_ggml("reuse_mask_alloc"))?
+        };
         graph
             .set_input(embed)
             .map_err(map_ggml("reuse_embed_input"))?;
@@ -667,23 +695,45 @@ impl GraniteSpeechDecodeSession {
             let v_full = graph
                 .set_rows(arena_v, pre.v_perm, row_index)
                 .map_err(map_ggml("reuse_v_set_rows"))?;
-            let scores = graph
-                .mul_mat(k_full, pre.q_perm)
-                .map_err(map_ggml("reuse_scores"))?;
-            let probs = graph
-                .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
-                .map_err(map_ggml("reuse_softmax"))?;
-            let v_t = graph
-                .cont(
-                    graph
-                        .transpose(v_full)
-                        .map_err(map_ggml("reuse_v_transpose"))?,
-                )
-                .map_err(map_ggml("reuse_v_cont"))?;
-            let attended = graph
-                .mul_mat(v_t, probs)
-                .map_err(map_ggml("reuse_attended"))?;
-            hidden = granite_post_attention(graph, hidden, attended, &layer_weights, &config, 1)?;
+            let attended = if use_flash_attention {
+                graph
+                    .flash_attn_ext(
+                        pre.q_perm,
+                        k_full,
+                        v_full,
+                        Some(mask),
+                        config.attention_multiplier,
+                        0.0,
+                        0.0,
+                    )
+                    .map_err(map_ggml("reuse_flash_attn"))?
+            } else {
+                let scores = graph
+                    .mul_mat(k_full, pre.q_perm)
+                    .map_err(map_ggml("reuse_scores"))?;
+                let probs = graph
+                    .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
+                    .map_err(map_ggml("reuse_softmax"))?;
+                let v_t = graph
+                    .cont(
+                        graph
+                            .transpose(v_full)
+                            .map_err(map_ggml("reuse_v_transpose"))?,
+                    )
+                    .map_err(map_ggml("reuse_v_cont"))?;
+                graph
+                    .mul_mat(v_t, probs)
+                    .map_err(map_ggml("reuse_attended"))?
+            };
+            hidden = granite_post_attention(
+                graph,
+                hidden,
+                attended,
+                &layer_weights,
+                &config,
+                1,
+                use_flash_attention,
+            )?;
         }
 
         let hidden_out = rms_norm(
@@ -713,6 +763,7 @@ impl GraniteSpeechDecodeSession {
         self.reuse = Some(GraniteReusableDecodeGraph {
             session,
             max_positions,
+            use_flash_attention,
             embed,
             row_index,
             position,
@@ -809,6 +860,7 @@ fn run_prefill_graph(
             &layer_weights,
             config,
             n_tokens,
+            false,
         )?;
     }
 
@@ -825,7 +877,9 @@ fn run_prefill_graph(
         config.vocab_size,
         "lm_head_reshape",
     )?;
-    let logits_raw = linear(&graph, lm_head_w, hidden_out, "lm_head")?;
+    let logits_input = last_token_hidden_view(&graph, hidden_out, hidden_size, n_tokens)
+        .map_err(map_ggml("session_prefill_last_hidden"))?;
+    let logits_raw = linear(&graph, lm_head_w, logits_input, "lm_head")?;
     let logits = graph
         .scale(logits_raw, 1.0 / config.logits_scaling)
         .map_err(map_ggml("session_prefill_logits_scale"))?;
@@ -878,7 +932,7 @@ fn run_prefill_graph(
         .map_err(map_ggml("session_prefill_upload_mask"))?;
 
     let mut request: Vec<_> = Vec::with_capacity(1 + kv_taps.len() * 2);
-    request.push((logits, n_tokens * vocab_size));
+    request.push((logits, vocab_size));
     for (k_tap, v_tap) in &kv_taps {
         request.push((*k_tap, n_tokens * kv_width));
         request.push((*v_tap, n_tokens * kv_width));
@@ -888,9 +942,7 @@ fn run_prefill_graph(
         .map_err(map_ggml("session_prefill_compute"))?;
 
     let mut iter = results.into_iter();
-    let logits_full = iter.next().expect("prefill logits tap");
-    let last_start = (n_tokens - 1) * vocab_size;
-    let last_logits = logits_full[last_start..last_start + vocab_size].to_vec();
+    let last_logits = iter.next().expect("prefill logits tap");
 
     let mut per_layer_kv = Vec::with_capacity(config.num_layers);
     for _ in 0..config.num_layers {
@@ -919,6 +971,7 @@ fn run_prefill_graph_seeding_resident(
     let head_dim = config.head_dim;
     let hidden_size = config.hidden_size;
     let vocab_size = config.vocab_size;
+    let use_flash_attention = resident_flash_attention_enabled(runner.backend_kind());
 
     let mut graph = runner.start_graph();
 
@@ -928,9 +981,15 @@ fn run_prefill_graph_seeding_resident(
     let positions = graph
         .new_tensor_1d_i32(n_tokens, "granite_seed_prefill_positions")
         .map_err(map_ggml("seed_prefill_positions_alloc"))?;
-    let mask = graph
-        .new_tensor_2d_f32(n_tokens, n_tokens, "granite_seed_prefill_mask")
-        .map_err(map_ggml("seed_prefill_mask_alloc"))?;
+    let mask = if use_flash_attention {
+        graph
+            .new_tensor_2d_f16(n_tokens, n_tokens, "granite_seed_prefill_mask")
+            .map_err(map_ggml("seed_prefill_flash_mask_alloc"))?
+    } else {
+        graph
+            .new_tensor_2d_f32(n_tokens, n_tokens, "granite_seed_prefill_mask")
+            .map_err(map_ggml("seed_prefill_mask_alloc"))?
+    };
     let seed_indices = graph
         .new_tensor_1d_i32(n_tokens, "granite_seed_prefill_rows")
         .map_err(map_ggml("seed_prefill_rows_alloc"))?;
@@ -969,22 +1028,36 @@ fn run_prefill_graph_seeding_resident(
             .add_side_effect_root(v_seed)
             .map_err(map_ggml("seed_prefill_v_root"))?;
 
-        let scores = graph
-            .mul_mat(pre.k_perm, pre.q_perm)
-            .map_err(map_ggml("seed_prefill_scores"))?;
-        let probs = graph
-            .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
-            .map_err(map_ggml("seed_prefill_softmax"))?;
-        let v_t = graph
-            .cont(
-                graph
-                    .transpose(pre.v_perm)
-                    .map_err(map_ggml("seed_prefill_v_transpose"))?,
-            )
-            .map_err(map_ggml("seed_prefill_v_cont"))?;
-        let attended = graph
-            .mul_mat(v_t, probs)
-            .map_err(map_ggml("seed_prefill_attended"))?;
+        let attended = if use_flash_attention {
+            graph
+                .flash_attn_ext(
+                    pre.q_perm,
+                    pre.k_perm,
+                    pre.v_perm,
+                    Some(mask),
+                    config.attention_multiplier,
+                    0.0,
+                    0.0,
+                )
+                .map_err(map_ggml("seed_prefill_flash_attn"))?
+        } else {
+            let scores = graph
+                .mul_mat(pre.k_perm, pre.q_perm)
+                .map_err(map_ggml("seed_prefill_scores"))?;
+            let probs = graph
+                .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
+                .map_err(map_ggml("seed_prefill_softmax"))?;
+            let v_t = graph
+                .cont(
+                    graph
+                        .transpose(pre.v_perm)
+                        .map_err(map_ggml("seed_prefill_v_transpose"))?,
+                )
+                .map_err(map_ggml("seed_prefill_v_cont"))?;
+            graph
+                .mul_mat(v_t, probs)
+                .map_err(map_ggml("seed_prefill_attended"))?
+        };
         hidden = granite_post_attention(
             &mut graph,
             hidden,
@@ -992,6 +1065,7 @@ fn run_prefill_graph_seeding_resident(
             &layer_weights,
             config,
             n_tokens,
+            use_flash_attention,
         )?;
     }
 
@@ -1008,7 +1082,9 @@ fn run_prefill_graph_seeding_resident(
         config.vocab_size,
         "seed_lm_head_reshape",
     )?;
-    let logits_raw = linear(&graph, lm_head_w, hidden_out, "seed_lm_head")?;
+    let logits_input = last_token_hidden_view(&graph, hidden_out, hidden_size, n_tokens)
+        .map_err(map_ggml("seed_prefill_last_hidden"))?;
+    let logits_raw = linear(&graph, lm_head_w, logits_input, "seed_lm_head")?;
     let logits = graph
         .scale(logits_raw, 1.0 / config.logits_scaling)
         .map_err(map_ggml("seed_prefill_logits_scale"))?;
@@ -1039,19 +1115,29 @@ fn run_prefill_graph_seeding_resident(
     graph
         .set_i32_slice(positions, &position_ids, "granite_seed_prefill_positions")
         .map_err(map_ggml("seed_prefill_upload_positions"))?;
-    let mask_values = super::decoder_graph::causal_mask(n_tokens);
-    graph
-        .set_f32_slice(mask, &mask_values, "granite_seed_prefill_mask")
-        .map_err(map_ggml("seed_prefill_upload_mask"))?;
+    if use_flash_attention {
+        let mask_bits = build_causal_mask_f16_bits(
+            n_tokens,
+            "granite_seed_prefill_flash_mask",
+            |stage, source| GraniteSpeechDecoderError::Ggml { stage, source },
+        )?;
+        graph
+            .set_f16_bits_slice(mask, &mask_bits, "granite_seed_prefill_mask")
+            .map_err(map_ggml("seed_prefill_upload_flash_mask"))?;
+    } else {
+        let mask_values = super::decoder_graph::causal_mask(n_tokens);
+        graph
+            .set_f32_slice(mask, &mask_values, "granite_seed_prefill_mask")
+            .map_err(map_ggml("seed_prefill_upload_mask"))?;
+    }
     // Rows 0..n_tokens: the prompt's K/V seeds the arena's leading span.
     graph
         .set_i32_slice(seed_indices, &position_ids, "granite_seed_prefill_rows")
         .map_err(map_ggml("seed_prefill_upload_rows"))?;
-    let logits_full = graph
-        .compute_output_f32(logits, n_tokens * vocab_size)
+    let logits_output = graph
+        .compute_output_f32(logits, vocab_size)
         .map_err(map_ggml("seed_prefill_compute"))?;
-    let last_start = (n_tokens - 1) * vocab_size;
-    Ok(logits_full[last_start..last_start + vocab_size].to_vec())
+    Ok(logits_output)
 }
 
 /// One incremental single-token step. `k_hist_bufs[layer]` / `v_hist_bufs[layer]`
@@ -1146,7 +1232,15 @@ fn run_decode_step_graph(
         let attended = graph
             .mul_mat(v_t, probs)
             .map_err(map_ggml("session_step_attended"))?;
-        hidden = granite_post_attention(&mut graph, hidden, attended, &layer_weights, config, 1)?;
+        hidden = granite_post_attention(
+            &mut graph,
+            hidden,
+            attended,
+            &layer_weights,
+            config,
+            1,
+            false,
+        )?;
     }
 
     let hidden_out = rms_norm(

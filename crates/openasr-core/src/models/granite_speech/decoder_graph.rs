@@ -316,7 +316,7 @@ pub(crate) struct GranitePreAttention<'a> {
 }
 
 /// The pre-attention half of a Granite decoder layer: `rms_norm -> q/k/v proj
-/// -> reshape-to-heads -> RoPE(q,k) -> permute+cont to query-major`. Shared,
+/// -> reshape-to-heads -> RoPE(q,k) -> row-contiguous query-major views`. Shared,
 /// byte-for-byte, by the one-shot prefill (`decoder_layer`) and the incremental
 /// decode step, so a cached K/V produced here is provably identical to the K/V
 /// a full recompute would produce at the same position.
@@ -361,15 +361,21 @@ pub(crate) fn granite_pre_attention<'a>(
     // -> [head_dim, n_tokens, heads] (query-major) for the batched mul_mat
     // attention below; GQA broadcast relies on kv_heads dividing q_heads
     // (native ggml mul_mat batch broadcast, no repeat_kv materialization).
-    let q_perm = graph
-        .cont(graph.permute(q, 0, 2, 1, 3).map_err(map)?)
-        .map_err(map)?;
-    let k_perm = graph
-        .cont(graph.permute(k, 0, 2, 1, 3).map_err(map)?)
-        .map_err(map)?;
-    let v_perm = graph
-        .cont(graph.permute(v, 0, 2, 1, 3).map_err(map)?)
-        .map_err(map)?;
+    let q_perm = graph.permute(q, 0, 2, 1, 3).map_err(map)?;
+    let k_perm = graph.permute(k, 0, 2, 1, 3).map_err(map)?;
+    let v_perm = graph.permute(v, 0, 2, 1, 3).map_err(map)?;
+    let (q_perm, k_perm, v_perm) = if graph.backend_kind() == GgmlCpuGraphBackend::Metal {
+        (q_perm, k_perm, v_perm)
+    } else {
+        // Preserve the established CPU/generic-GPU reduction and cache layout.
+        // The strided row-view optimization is measured and transcript-gated
+        // only on Metal's Flash Attention path.
+        (
+            graph.cont(q_perm).map_err(map)?,
+            graph.cont(k_perm).map_err(map)?,
+            graph.cont(v_perm).map_err(map)?,
+        )
+    };
 
     Ok(GranitePreAttention {
         q_perm,
@@ -380,9 +386,10 @@ pub(crate) fn granite_pre_attention<'a>(
 
 /// The post-attention half of a Granite decoder layer: fold the attention
 /// context back to `[q_width, n_tokens]`, o-project + residual-scale into the
-/// residual stream, then the SwiGLU MLP + residual-scale. `attended` is the raw
-/// attention output `[head_dim, n_q, q_heads]`. Shared byte-for-byte by prefill
-/// and incremental decode (see `granite_pre_attention`).
+/// residual stream, then the SwiGLU MLP + residual-scale. Naive attention
+/// returns `[head_dim, n_q, q_heads]` and needs a materializing layout merge;
+/// `flash_attn_ext` already returns a reshape-compatible `[head_dim, q_heads,
+/// n_q]` tensor. Shared by prefill and incremental decode.
 pub(crate) fn granite_post_attention<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     hidden: GgmlCpuTensor<'a>,
@@ -390,13 +397,18 @@ pub(crate) fn granite_post_attention<'a>(
     weights: &DecoderLayerWeights<'a>,
     config: &GraniteSpeechDecoderConfig,
     n_tokens: usize,
+    flash_attention_output: bool,
 ) -> Result<GgmlCpuTensor<'a>, GraniteSpeechDecoderError> {
     let map = ggml_err("decoder_layer");
     let q_width = config.num_heads * config.head_dim;
 
-    let attended = graph
-        .cont(graph.permute(attended, 0, 2, 1, 3).map_err(map)?)
-        .map_err(map)?;
+    let attended = if !flash_attention_output {
+        graph
+            .cont(graph.permute(attended, 0, 2, 1, 3).map_err(map)?)
+            .map_err(map)?
+    } else {
+        attended
+    };
     let attended = graph.reshape_2d(attended, q_width, n_tokens).map_err(map)?;
 
     let hidden_size = config.hidden_size;
@@ -458,7 +470,7 @@ fn decoder_layer<'a>(
         .map_err(map)?;
     let attended = graph.mul_mat(v_t, probs).map_err(map)?;
 
-    granite_post_attention(graph, hidden, attended, weights, config, n_tokens)
+    granite_post_attention(graph, hidden, attended, weights, config, n_tokens, false)
 }
 
 pub(crate) struct GraniteSpeechDecoderPrefillOutput {

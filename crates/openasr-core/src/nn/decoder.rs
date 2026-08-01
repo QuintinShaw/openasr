@@ -50,6 +50,36 @@ pub(crate) fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRu
     reusable_decode_graph_supported(runner.backend_kind(), runner.uses_scheduler())
 }
 
+/// Return a zero-copy `[hidden_size, 1]` view of the final token in a
+/// contiguous `[hidden_size, n_tokens]` f32 decoder hidden-state tensor.
+/// Autoregressive prefill needs only this position for next-token logits;
+/// applying a vocabulary head to every prompt position is wasted work unless
+/// a caller explicitly needs per-position logits.
+pub(crate) fn last_token_hidden_view<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    hidden: GgmlCpuTensor<'a>,
+    hidden_size: usize,
+    n_tokens: usize,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    if hidden_size == 0 || n_tokens == 0 {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "last-token hidden view requires non-zero dimensions",
+        });
+    }
+    let row_bytes = hidden_size.checked_mul(std::mem::size_of::<f32>()).ok_or(
+        GgmlCpuGraphError::UnsupportedInputs {
+            reason: "last-token hidden row byte width overflows usize",
+        },
+    )?;
+    let offset =
+        (n_tokens - 1)
+            .checked_mul(row_bytes)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "last-token hidden byte offset overflows usize",
+            })?;
+    graph.view_2d(hidden, hidden_size, 1, row_bytes, offset)
+}
+
 /// Opt-out for production Q8 KV on Qwen-shaped whole-decoder stacks.
 ///
 /// When truthy (`1`/`true`/`yes`/`on`), keep host-F32 / resident-F16 even on

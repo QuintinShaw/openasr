@@ -41,7 +41,8 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlRuntimeSource, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReader,
 };
 use crate::nn::ffn::{
     FeedForwardActivation, FeedForwardResidualSteps, apply_feed_forward_residual,
@@ -60,6 +61,8 @@ pub(crate) enum GraniteSpeechEncoderError {
         expected: usize,
         actual: usize,
     },
+    #[error("granite-speech encoder weight '{name}' could not be read: {reason}")]
+    WeightRead { name: String, reason: String },
     #[error("granite-speech encoder GGML backend failed at {stage}: {source}")]
     Ggml {
         stage: &'static str,
@@ -121,6 +124,120 @@ impl GraniteSpeechEncoderConfig {
 
     fn conv_inner_dim(&self) -> usize {
         self.hidden_dim * self.conv_expansion_factor
+    }
+}
+
+fn encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    GgmlCpuGraphConfig {
+        context_bytes: 256 * 1024 * 1024,
+        graph_size: 16384,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+        ),
+        backend,
+        use_scheduler: true,
+    }
+}
+
+/// Request-invariant Granite encoder state. Large matrix weights stay in their
+/// native GGUF type and are bound from the pack mapping once; only the small
+/// derived BatchNorm affine tensors are materialized as resident f32 values.
+/// Per-audio graphs remain shape-specific and are rebuilt on this runner.
+pub(crate) struct GraniteSpeechEncoderRuntime {
+    runner: GgmlCpuGraphRunner,
+    loaded: GgmlLoadedWeightContext,
+    bn_arena: GgmlStaticTensorArena,
+    bn_affines: Vec<(GgmlStaticTensor, GgmlStaticTensor)>,
+}
+
+impl GraniteSpeechEncoderRuntime {
+    pub(crate) fn new(
+        source: &GgmlRuntimeSource,
+        config: &GraniteSpeechEncoderConfig,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GraniteSpeechEncoderError> {
+        let graph_config = encoder_graph_config(backend);
+        let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
+        let loaded = runner
+            .load_gguf_weight_context(source)
+            .map_err(ggml_err("load_gguf_weight_context"))?;
+        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
+            GraniteSpeechEncoderError::WeightRead {
+                name: "encoder.*".to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        let arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(2 * config.num_layers + 16);
+        let mut bn_arena = runner
+            .start_static_tensor_arena(arena_bytes)
+            .map_err(ggml_err("batch_norm_static_tensor_arena"))?;
+        let conv_inner = config.conv_inner_dim();
+        let expected_shape = [conv_inner as u64];
+        let mut bn_affines = Vec::with_capacity(config.num_layers);
+        let mut uploads = Vec::with_capacity(2 * config.num_layers);
+        for index in 0..config.num_layers {
+            let prefix = format!("encoder.layers.{index}.conv.batch_norm");
+            let read = |suffix: &str| -> Result<Vec<f32>, GraniteSpeechEncoderError> {
+                let name = format!("{prefix}.{suffix}");
+                reader
+                    .host_tensor_f32_copy_dequantized_by_name(&name, &expected_shape)
+                    .map_err(|error| GraniteSpeechEncoderError::WeightRead {
+                        name,
+                        reason: error.to_string(),
+                    })
+            };
+            let gamma = read("weight")?;
+            let beta = read("bias")?;
+            let running_mean = read("running_mean")?;
+            let running_var = read("running_var")?;
+            let (scale, bias) = fold_batch_norm(
+                &gamma,
+                &beta,
+                &running_mean,
+                &running_var,
+                config.batch_norm_eps,
+            );
+            let scale_handle = bn_arena
+                .new_tensor_1d_f32(conv_inner, "granite_speech_bn_scale")
+                .map_err(ggml_err("batch_norm_scale_alloc"))?;
+            let bias_handle = bn_arena
+                .new_tensor_1d_f32(conv_inner, "granite_speech_bn_bias")
+                .map_err(ggml_err("batch_norm_bias_alloc"))?;
+            bn_affines.push((scale_handle, bias_handle));
+            uploads.push((scale_handle, scale, "granite_speech_bn_scale"));
+            uploads.push((bias_handle, bias, "granite_speech_bn_bias"));
+        }
+        for (handle, values, name) in uploads {
+            bn_arena
+                .set_f32_slice(handle, &values, name)
+                .map_err(ggml_err("batch_norm_upload"))?;
+        }
+        Ok(Self {
+            runner,
+            loaded,
+            bn_arena,
+            bn_affines,
+        })
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        config: &GraniteSpeechEncoderConfig,
+        features: &[f32],
+        frames_in: usize,
+        capture_mid_tap: bool,
+    ) -> Result<GraniteSpeechEncoderOutput, GraniteSpeechEncoderError> {
+        let weights =
+            build_loaded_encoder_weights(&self.loaded, &self.bn_arena, &self.bn_affines, config)?;
+        run_encoder_graph(
+            &mut self.runner,
+            config,
+            &weights,
+            features,
+            frames_in,
+            capture_mid_tap,
+        )
     }
 }
 
@@ -388,6 +505,89 @@ fn build_layer_weights<'a, 'p>(
     })
 }
 
+fn loaded_tensor<'a>(
+    loaded: &GgmlLoadedWeightContext,
+    name: &str,
+) -> Result<GgmlCpuTensor<'a>, GraniteSpeechEncoderError> {
+    loaded
+        .tensor(name)
+        .map(GgmlLoadedTensor::as_graph_tensor)
+        .ok_or_else(|| GraniteSpeechEncoderError::MissingWeight {
+            name: name.to_string(),
+        })
+}
+
+fn build_loaded_layer_weights<'a>(
+    loaded: &GgmlLoadedWeightContext,
+    bn_arena: &GgmlStaticTensorArena,
+    bn_affine: (GgmlStaticTensor, GgmlStaticTensor),
+    index: usize,
+) -> Result<ConformerLayerWeights<'a>, GraniteSpeechEncoderError> {
+    let p = |suffix: &str| format!("encoder.layers.{index}.{suffix}");
+    Ok(ConformerLayerWeights {
+        ff1_norm_w: loaded_tensor(loaded, &p("ff1.pre_norm.weight"))?,
+        ff1_norm_b: loaded_tensor(loaded, &p("ff1.pre_norm.bias"))?,
+        ff1_up_w: loaded_tensor(loaded, &p("ff1.up_proj.weight"))?,
+        ff1_up_b: loaded_tensor(loaded, &p("ff1.up_proj.bias"))?,
+        ff1_down_w: loaded_tensor(loaded, &p("ff1.down_proj.weight"))?,
+        ff1_down_b: loaded_tensor(loaded, &p("ff1.down_proj.bias"))?,
+        attn_norm_w: loaded_tensor(loaded, &p("attn.pre_norm.weight"))?,
+        attn_norm_b: loaded_tensor(loaded, &p("attn.pre_norm.bias"))?,
+        attn_to_q_w: loaded_tensor(loaded, &p("attn.to_q.weight"))?,
+        attn_to_kv_w: loaded_tensor(loaded, &p("attn.to_kv.weight"))?,
+        attn_to_out_w: loaded_tensor(loaded, &p("attn.to_out.weight"))?,
+        attn_to_out_b: loaded_tensor(loaded, &p("attn.to_out.bias"))?,
+        attn_rel_pos_emb_w: loaded_tensor(loaded, &p("attn.rel_pos_emb.weight"))?,
+        conv_norm_w: loaded_tensor(loaded, &p("conv.norm.weight"))?,
+        conv_norm_b: loaded_tensor(loaded, &p("conv.norm.bias"))?,
+        conv_up_w: loaded_tensor(loaded, &p("conv.up_conv.weight"))?,
+        conv_up_b: loaded_tensor(loaded, &p("conv.up_conv.bias"))?,
+        conv_dw_w: loaded_tensor(loaded, &p("conv.depth_conv.conv.weight"))?,
+        conv_bn_scale: bn_arena.graph_tensor(bn_affine.0),
+        conv_bn_bias: bn_arena.graph_tensor(bn_affine.1),
+        conv_down_w: loaded_tensor(loaded, &p("conv.down_conv.weight"))?,
+        conv_down_b: loaded_tensor(loaded, &p("conv.down_conv.bias"))?,
+        ff2_norm_w: loaded_tensor(loaded, &p("ff2.pre_norm.weight"))?,
+        ff2_norm_b: loaded_tensor(loaded, &p("ff2.pre_norm.bias"))?,
+        ff2_up_w: loaded_tensor(loaded, &p("ff2.up_proj.weight"))?,
+        ff2_up_b: loaded_tensor(loaded, &p("ff2.up_proj.bias"))?,
+        ff2_down_w: loaded_tensor(loaded, &p("ff2.down_proj.weight"))?,
+        ff2_down_b: loaded_tensor(loaded, &p("ff2.down_proj.bias"))?,
+        post_norm_w: loaded_tensor(loaded, &p("post_norm.weight"))?,
+        post_norm_b: loaded_tensor(loaded, &p("post_norm.bias"))?,
+    })
+}
+
+fn build_loaded_encoder_weights<'a>(
+    loaded: &GgmlLoadedWeightContext,
+    bn_arena: &GgmlStaticTensorArena,
+    bn_affines: &[(GgmlStaticTensor, GgmlStaticTensor)],
+    config: &GraniteSpeechEncoderConfig,
+) -> Result<EncoderWeights<'a>, GraniteSpeechEncoderError> {
+    if bn_affines.len() != config.num_layers {
+        return Err(GraniteSpeechEncoderError::Shape {
+            reason: format!(
+                "resident BatchNorm layer count is {}, expected {}",
+                bn_affines.len(),
+                config.num_layers
+            ),
+        });
+    }
+    let mut layers = Vec::with_capacity(config.num_layers);
+    for (index, affine) in bn_affines.iter().copied().enumerate() {
+        layers.push(build_loaded_layer_weights(loaded, bn_arena, affine, index)?);
+    }
+    Ok(EncoderWeights {
+        input_linear_w: loaded_tensor(loaded, "encoder.input_linear.weight")?,
+        input_linear_b: loaded_tensor(loaded, "encoder.input_linear.bias")?,
+        layers,
+        ctc_out_w: loaded_tensor(loaded, "encoder.out.weight")?,
+        ctc_out_b: loaded_tensor(loaded, "encoder.out.bias")?,
+        ctc_out_mid_w: loaded_tensor(loaded, "encoder.out_mid.weight")?,
+        ctc_out_mid_b: loaded_tensor(loaded, "encoder.out_mid.bias")?,
+    })
+}
+
 fn affine_ln<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
@@ -533,9 +733,19 @@ fn block_attention<'a>(
     // Shaw's relative-position embedding: one learned `dim_head` vector per
     // (query, key) clamped-distance pair, contracted against the (unpermuted)
     // query vector for that query position. See `attn_dists` doc comment.
-    let pos_emb = graph
-        .get_rows(weights.attn_rel_pos_emb_w, attn_dists)
+    // The pack preserves the source tensor's `[dim_head, n_pos]` row-major
+    // bytes but GGUF records its logical extents as `[n_pos, dim_head]`.
+    // Reinterpret the contiguous storage to the graph's `[dim_head, n_pos]`
+    // convention before row lookup. This is a no-op for the f32 parity path,
+    // whose arena tensor already has that shape.
+    let rel_pos_emb = graph
+        .reshape_2d(
+            weights.attn_rel_pos_emb_w,
+            d_head,
+            2 * config.max_pos_emb + 1,
+        )
         .map_err(map)?;
+    let pos_emb = graph.get_rows(rel_pos_emb, attn_dists).map_err(map)?;
     let pos_emb = graph
         .reshape_3d(pos_emb, d_head, context_size, context_size)
         .map_err(map)?;
@@ -631,8 +841,14 @@ fn conv_module<'a>(
     let as_4d = graph
         .reshape_4d(transposed, frames, 1, conv_inner, 1)
         .map_err(map)?;
+    // As with the relative-position table, the pack preserves the source
+    // `[channels, 1, kernel]` extent order while the direct ggml depthwise op
+    // consumes `[kernel, 1, 1, channels]`; contiguous bytes are identical.
+    let conv_dw_w = graph
+        .reshape_4d(weights.conv_dw_w, kernel, 1, 1, conv_inner)
+        .map_err(map)?;
     let conv = graph
-        .depthwise_conv_2d(weights.conv_dw_w, as_4d, 1, 1, padding, 0, 1, 1)
+        .depthwise_conv_2d(conv_dw_w, as_4d, 1, 1, padding, 0, 1, 1)
         .map_err(map)?;
     let conv = graph.permute(conv, 1, 2, 0, 3).map_err(map)?;
     let conv = graph.cont(conv).map_err(map)?;
@@ -763,43 +979,13 @@ pub(crate) fn encode(
     capture_mid_tap: bool,
 ) -> Result<GraniteSpeechEncoderOutput, GraniteSpeechEncoderError> {
     let input_dim = config.input_dim;
-    if features.len() != frames_in * input_dim {
-        return Err(GraniteSpeechEncoderError::Shape {
-            reason: format!(
-                "features has {} values, expected {frames_in}x{input_dim}",
-                features.len()
-            ),
-        });
-    }
-    if frames_in == 0 {
-        return Err(GraniteSpeechEncoderError::Shape {
-            reason: "frames_in must be > 0".to_string(),
-        });
-    }
-
-    let context_size = config.context_size;
-    let num_blocks = frames_in.div_ceil(context_size);
-    let padded_len = num_blocks * context_size;
-    let remainder = frames_in % context_size;
-    let pad_amount = padded_len - frames_in;
-
-    let graph_config = GgmlCpuGraphConfig {
-        context_bytes: 256 * 1024 * 1024,
-        graph_size: 16384,
-        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
-            backend,
-            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
-        ),
-        backend,
-        use_scheduler: true,
-    };
+    let graph_config = encoder_graph_config(backend);
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let tensor_count = 64 + 96 * config.num_layers;
     let arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(tensor_count);
     let arena = runner
         .start_static_tensor_arena(arena_bytes)
         .map_err(ggml_err("static_tensor_arena"))?;
-
     let mut builder = WeightBuilder::new(provider);
     let input_linear_w = builder.w2(
         &arena,
@@ -826,20 +1012,68 @@ pub(crate) fn encode(
         config.hidden_dim,
     )?;
     let ctc_out_mid_b = builder.w1(&arena, "encoder.out_mid.bias", config.hidden_dim)?;
+    let mut arena = arena;
+    builder.upload(&mut arena)?;
+    let weights = EncoderWeights {
+        input_linear_w,
+        input_linear_b,
+        layers,
+        ctc_out_w,
+        ctc_out_b,
+        ctc_out_mid_w,
+        ctc_out_mid_b,
+    };
+    run_encoder_graph(
+        &mut runner,
+        config,
+        &weights,
+        features,
+        frames_in,
+        capture_mid_tap,
+    )
+}
 
+fn run_encoder_graph<'a>(
+    runner: &'a mut GgmlCpuGraphRunner,
+    config: &GraniteSpeechEncoderConfig,
+    weights: &EncoderWeights<'a>,
+    features: &[f32],
+    frames_in: usize,
+    capture_mid_tap: bool,
+) -> Result<GraniteSpeechEncoderOutput, GraniteSpeechEncoderError> {
+    let input_dim = config.input_dim;
+    if features.len() != frames_in * input_dim {
+        return Err(GraniteSpeechEncoderError::Shape {
+            reason: format!(
+                "features has {} values, expected {frames_in}x{input_dim}",
+                features.len()
+            ),
+        });
+    }
+    if frames_in == 0 {
+        return Err(GraniteSpeechEncoderError::Shape {
+            reason: "frames_in must be > 0".to_string(),
+        });
+    }
+
+    let context_size = config.context_size;
+    let num_blocks = frames_in.div_ceil(context_size);
+    let padded_len = num_blocks * context_size;
+    let remainder = frames_in % context_size;
+    let pad_amount = padded_len - frames_in;
+
+    let dynamic_arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(16);
+    let dynamic_arena = runner
+        .start_static_tensor_arena(dynamic_arena_bytes)
+        .map_err(ggml_err("dynamic_static_tensor_arena"))?;
     let attn_dists_table = attention_dists_table(context_size, config.max_pos_emb);
-    let attn_dists_handle = arena
+    let attn_dists_handle = dynamic_arena
         .new_tensor_1d_i32(context_size * context_size, "granite_speech_attn_dists")
         .map_err(ggml_err("weight_alloc_attn_dists"))?;
-
-    let mask_table = if remainder > 0 {
-        Some(last_block_mask(context_size, remainder))
-    } else {
-        None
-    };
+    let mask_table = (remainder > 0).then(|| last_block_mask(context_size, remainder));
     let mask_handle = if mask_table.is_some() {
         Some(
-            arena
+            dynamic_arena
                 .new_tensor_4d_f32(
                     context_size,
                     context_size,
@@ -852,20 +1086,17 @@ pub(crate) fn encode(
     } else {
         None
     };
-
     let zero_pad_handle = if pad_amount > 0 {
         Some(
-            arena
+            dynamic_arena
                 .new_tensor_2d_f32(config.hidden_dim, pad_amount, "granite_speech_zero_pad")
                 .map_err(ggml_err("weight_alloc_zero_pad"))?,
         )
     } else {
         None
     };
-
-    let mut arena = arena;
-    builder.upload(&mut arena)?;
-    arena
+    let mut dynamic_arena = dynamic_arena;
+    dynamic_arena
         .set_i32_slice(
             attn_dists_handle,
             &attn_dists_table,
@@ -873,40 +1104,28 @@ pub(crate) fn encode(
         )
         .map_err(ggml_err("upload_attn_dists"))?;
     if let (Some(handle), Some(table)) = (mask_handle, &mask_table) {
-        // Broadcast the last-block mask across every non-final block plane too
-        // (they need no masking, so an all-zero plane is written for them).
         let mut full = vec![0.0f32; context_size * context_size * num_blocks];
         let last_block_start = (num_blocks - 1) * context_size * context_size;
         full[last_block_start..last_block_start + context_size * context_size]
             .copy_from_slice(table);
-        arena
+        dynamic_arena
             .set_f32_slice(handle, &full, "granite_speech_attn_mask")
             .map_err(ggml_err("upload_attn_mask"))?;
     }
     if let Some(handle) = zero_pad_handle {
         let zeros = vec![0.0f32; config.hidden_dim * pad_amount];
-        arena
+        dynamic_arena
             .set_f32_slice(handle, &zeros, "granite_speech_zero_pad")
             .map_err(ggml_err("upload_zero_pad"))?;
     }
-
-    let weights = EncoderWeights {
-        input_linear_w,
-        input_linear_b,
-        layers,
-        ctc_out_w,
-        ctc_out_b,
-        ctc_out_mid_w,
-        ctc_out_mid_b,
-    };
 
     let mut graph = runner.start_graph();
     let input = graph
         .new_tensor_2d_f32(input_dim, frames_in, "granite_speech_features")
         .map_err(ggml_err("input_alloc"))?;
-    let attn_dists = arena.graph_tensor(attn_dists_handle);
-    let attn_mask = mask_handle.map(|h| arena.graph_tensor(h));
-    let zero_pad = zero_pad_handle.map(|h| arena.graph_tensor(h));
+    let attn_dists = dynamic_arena.graph_tensor(attn_dists_handle);
+    let attn_mask = mask_handle.map(|h| dynamic_arena.graph_tensor(h));
+    let zero_pad = zero_pad_handle.map(|h| dynamic_arena.graph_tensor(h));
 
     let mut hidden = linear(
         &graph,
@@ -917,6 +1136,12 @@ pub(crate) fn encode(
     )?;
 
     let mid_tap_layer = config.num_layers / 2;
+    // `encoder.out_mid.weight` is stored with source extents
+    // `[hidden_dim, output_dim]`; the original f32 builder intentionally
+    // reinterpreted its flat bytes as ggml `[output_dim, hidden_dim]`.
+    let ctc_out_mid_w = graph
+        .reshape_2d(weights.ctc_out_mid_w, config.output_dim, config.hidden_dim)
+        .map_err(ggml_err("ctc_out_mid_weight_reshape"))?;
     let mut mid_tap: Option<GgmlCpuTensor> = None;
     for (index, layer) in weights.layers.iter().enumerate() {
         hidden = conformer_block(
@@ -937,7 +1162,7 @@ pub(crate) fn encode(
             let mid = graph.soft_max(mid).map_err(ggml_err("ctc_softmax"))?;
             let mid = linear(
                 &graph,
-                weights.ctc_out_mid_w,
+                ctc_out_mid_w,
                 mid,
                 weights.ctc_out_mid_b,
                 "ctc_out_mid",
