@@ -70,9 +70,8 @@ type ForwardGraphOutput = (Vec<f32>, Vec<(Vec<f32>, Vec<f32>)>);
 /// single-token step at a time. Construct with [`new`](Self::new), seed with
 /// [`prefill`](Self::prefill), then call [`decode_step`](Self::decode_step) once
 /// per generated token.
-pub(crate) struct GraniteSpeechDecodeSession<'p> {
+pub(crate) struct GraniteSpeechDecodeSession {
     config: GraniteSpeechDecoderConfig,
-    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     runner: GgmlCpuGraphRunner,
     weights: GraniteDecoderWeights,
     /// Kept alive so the keep-quantized `weights`' zero-copy handles (raw
@@ -80,6 +79,13 @@ pub(crate) struct GraniteSpeechDecodeSession<'p> {
     /// the session's lifetime. `None` on the f32-arena path (the arena owns its
     /// own storage inside `weights`). Declared after `weights` so `weights`
     /// drops first.
+    ///
+    /// The session holds NO borrow of the weight provider: `new`/`new_keep_quantized`
+    /// consult it transiently (arena upload / not at all), and `decode_step`
+    /// takes the provider as a call argument. That keeps the whole session
+    /// owned (no lifetime), so a keep-quantized instance -- runner plus the
+    /// mmap'd loaded context plus its zero-copy bound weights -- can live in
+    /// the cross-request resident cache (`executor::GraniteSpeechPreparedRuntime`).
     _loaded: Option<GgmlLoadedWeightContext>,
     /// `k_history[layer][kv_head]` is that head's `[seq, head_dim]` (row-major)
     /// key rows, appended token by token; concatenating the `kv_heads` inner
@@ -91,11 +97,13 @@ pub(crate) struct GraniteSpeechDecodeSession<'p> {
     prefilled: bool,
 }
 
-impl<'p> GraniteSpeechDecodeSession<'p> {
+impl GraniteSpeechDecodeSession {
     /// Build the runner and upload every decoder weight once. No prefill yet.
+    /// `provider` is consulted transiently here (to fill the f32 arena) and is
+    /// not retained; `decode_step` takes it again per call for the token embed.
     pub(crate) fn new(
         config: GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        provider: &dyn GraniteSpeechDecoderWeightProvider,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = GgmlCpuGraphConfig {
@@ -113,7 +121,6 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
         let weights = GraniteDecoderWeightArena::load(&runner, &config, provider)?;
         Ok(Self::assemble(
             config,
-            provider,
             runner,
             GraniteDecoderWeights::Arena(weights),
             None,
@@ -122,14 +129,16 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
 
     /// Keep-quantized session: bind every decoder weight zero-copy from `source`'s
     /// mmap'd `.oasr` pack (native q8_0/q4_k/f16/f32) instead of dequantizing the
-    /// whole 2-B decoder to an f32 host copy + arena upload. `provider` supplies
-    /// only the token-embedding rows (`embed_token_row`); the projection/norm/
-    /// lm_head weights come from the pack. The loaded weight context is built on
-    /// this session's own runner so the graph and the weights share one
-    /// backend/device (the same single-runner invariant `firered_aed` relies on).
+    /// whole 2-B decoder to an f32 host copy + arena upload. The projection/norm/
+    /// lm_head weights come from the pack; the token-embedding rows are supplied
+    /// by the `provider` passed to `decode_step`. The loaded weight context is
+    /// built on this session's own runner so the graph and the weights share one
+    /// backend/device (the same single-runner invariant `firered_aed` relies on),
+    /// and both are held for the session's whole lifetime -- which is why the
+    /// resident cache stores the runner and the loaded context together as one
+    /// unit and never mixes a loaded context with a different runner.
     pub(crate) fn new_keep_quantized(
         config: GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
         source: &GgmlRuntimeSource,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
@@ -151,7 +160,6 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
         let weights = GraniteDecoderLoadedWeights::load(&loaded, &config)?;
         Ok(Self::assemble(
             config,
-            provider,
             runner,
             GraniteDecoderWeights::Loaded(weights),
             Some(loaded),
@@ -160,7 +168,6 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
 
     fn assemble(
         config: GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
         runner: GgmlCpuGraphRunner,
         weights: GraniteDecoderWeights,
         loaded: Option<GgmlLoadedWeightContext>,
@@ -168,7 +175,6 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
         let num_layers = config.num_layers;
         Self {
             config,
-            provider,
             runner,
             weights,
             _loaded: loaded,
@@ -177,6 +183,23 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
             seq_len: 0,
             prefilled: false,
         }
+    }
+
+    /// Release this decode's per-request session-scoped buffers -- the grown
+    /// per-token K/V history and the prefill flag -- so the resident session
+    /// can be reused clean for the next request. Mirrors the
+    /// `release_session_scoped_buffers` reset firered/mimo do on their resident
+    /// decoder runtimes before returning them to the cross-request cache: the
+    /// heavy resident state (the runner, the mmap'd loaded weight context, and
+    /// its zero-copy bound `weights`) is untouched -- only the K/V buffers that
+    /// grew with this utterance are dropped and `prefilled` cleared, so the
+    /// next request re-prefills from scratch on the same resident weights.
+    pub(crate) fn release_session_scoped_buffers(&mut self) {
+        let num_layers = self.config.num_layers;
+        self.k_history = vec![Vec::new(); num_layers];
+        self.v_history = vec![Vec::new(); num_layers];
+        self.seq_len = 0;
+        self.prefilled = false;
     }
 
     pub(crate) fn is_prefilled(&self) -> bool {
@@ -253,13 +276,14 @@ impl<'p> GraniteSpeechDecodeSession<'p> {
     pub(crate) fn decode_step(
         &mut self,
         new_token_id: u32,
+        provider: &dyn GraniteSpeechDecoderWeightProvider,
     ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
         if !self.prefilled {
             return Err(GraniteSpeechDecoderError::Shape {
                 reason: "granite decode session must be prefilled before decode_step".to_string(),
             });
         }
-        let embed_row = embed_token_row(&self.config, self.provider, new_token_id)?.to_vec();
+        let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
 
         let head_dim = self.config.head_dim;
         let kv_heads = self.config.num_kv_heads;
@@ -852,7 +876,9 @@ mod tests {
             let token = argmax(&next_logits);
             generated.push(token);
 
-            let inc = session.decode_step(token).expect("incremental decode step");
+            let inc = session
+                .decode_step(token, &weights)
+                .expect("incremental decode step");
 
             let mut sequence = prompt.clone();
             sequence.extend_from_slice(&generated);
@@ -913,7 +939,9 @@ mod tests {
         for step in 0..steps {
             let token = argmax(&logits) % config.vocab_size as u32;
             let start = Instant::now();
-            logits = session.decode_step(token).expect("incremental step");
+            logits = session
+                .decode_step(token, &weights)
+                .expect("incremental step");
             let elapsed = start.elapsed();
             incremental_total += elapsed;
             if step == 0 {

@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlRuntimeSource};
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
@@ -47,7 +47,7 @@ fn map_step_error(
 /// covers the prompt), then exactly one new token per step. Fails closed rather
 /// than silently returning stale logits if that invariant is ever violated.
 fn incremental_new_token(
-    session: &GraniteSpeechDecodeSession<'_>,
+    session: &GraniteSpeechDecodeSession,
     prompt_len: usize,
     input: &Seq2SeqGreedyDecodeStepInput<'_>,
 ) -> Result<u32, Seq2SeqGreedyDecodeError> {
@@ -76,7 +76,7 @@ pub(crate) struct GraniteSpeechDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
     provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     backend: GgmlCpuGraphBackend,
-    session: Option<GraniteSpeechDecodeSession<'p>>,
+    session: Option<GraniteSpeechDecodeSession>,
     prompt_len: usize,
 }
 
@@ -105,7 +105,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
         if let Some(session) = self.session.as_mut() {
             let new_token = incremental_new_token(session, self.prompt_len, &input)?;
             let logits = session
-                .decode_step(new_token)
+                .decode_step(new_token, self.provider)
                 .map_err(map_step_error(input.step_index, "text"))?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits,
@@ -148,16 +148,17 @@ pub(crate) struct GraniteSpeechAudioDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
     provider: &'p dyn GraniteSpeechDecoderWeightProvider,
     backend: GgmlCpuGraphBackend,
-    /// `Some` selects the keep-quantized session (decoder weights bound
-    /// zero-copy from this mmap'd `.oasr` pack); `None` uses the f32-arena
-    /// session built from `provider` (the safetensors/`HashMap` test path).
-    source: Option<&'p GgmlRuntimeSource>,
     initial_prompt_embeddings: Vec<f32>,
-    session: Option<GraniteSpeechDecodeSession<'p>>,
+    session: Option<GraniteSpeechDecodeSession>,
     prompt_len: usize,
 }
 
 impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
+    /// f32-arena audio-prompt step executor: builds a fresh session from
+    /// `provider` (the safetensors/`HashMap` test path) on the first step. The
+    /// runtime keep-quantized path is served by
+    /// [`GraniteSpeechResidentAudioDecodeStepExecutor`] against a cross-request
+    /// resident session instead.
     pub(crate) fn new(
         config: GraniteSpeechDecoderConfig,
         provider: &'p dyn GraniteSpeechDecoderWeightProvider,
@@ -168,29 +169,6 @@ impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
             config,
             provider,
             backend,
-            source: None,
-            initial_prompt_embeddings,
-            session: None,
-            prompt_len: 0,
-        }
-    }
-
-    /// Keep-quantized variant: the prefilled session binds the decoder's
-    /// projection/norm/lm_head weights zero-copy from `source`'s pack; `provider`
-    /// supplies only the token-embedding rows (`embed_token_row`) for the
-    /// per-step generated token.
-    pub(crate) fn new_keep_quantized(
-        config: GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
-        source: &'p GgmlRuntimeSource,
-        backend: GgmlCpuGraphBackend,
-        initial_prompt_embeddings: Vec<f32>,
-    ) -> Self {
-        Self {
-            config,
-            provider,
-            backend,
-            source: Some(source),
             initial_prompt_embeddings,
             session: None,
             prompt_len: 0,
@@ -207,7 +185,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
         if let Some(session) = self.session.as_mut() {
             let new_token = incremental_new_token(session, self.prompt_len, &input)?;
             let logits = session
-                .decode_step(new_token)
+                .decode_step(new_token, self.provider)
                 .map_err(map_step_error(input.step_index, "audio"))?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits,
@@ -217,16 +195,8 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
 
         // First call: prefill the audio-spliced prompt embeddings into a fresh
         // session (never re-derived from the token ids -- see the struct doc).
-        let mut session = match self.source {
-            Some(source) => GraniteSpeechDecodeSession::new_keep_quantized(
-                self.config,
-                self.provider,
-                source,
-                self.backend,
-            ),
-            None => GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend),
-        }
-        .map_err(map_step_error(input.step_index, "audio"))?;
+        let mut session = GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend)
+            .map_err(map_step_error(input.step_index, "audio"))?;
         let logits = session
             .prefill(
                 &self.initial_prompt_embeddings,
@@ -235,6 +205,79 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
             .map_err(map_step_error(input.step_index, "audio"))?;
         self.prompt_len = input.initial_prompt_tokens.len();
         self.session = Some(session);
+        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+            logits,
+            greedy_token_hint: None,
+        })
+    }
+}
+
+/// Keep-quantized audio-prompt step executor that drives a **cross-request
+/// resident** [`GraniteSpeechDecodeSession`] (owned by
+/// `executor::GraniteSpeechPreparedRuntime`, taken from the thread-local
+/// resident cache) instead of building one per request. The session's heavy
+/// state -- the graph runner, the mmap'd loaded weight context, and its
+/// zero-copy bound decoder weights -- is already built and reused; this
+/// executor only prefills the per-request audio-spliced prompt on the first
+/// step (the session was released to `prefilled = false` with empty K/V before
+/// being cached, so `prefill` starts clean) and advances the KV cache one token
+/// per subsequent step. `provider` is the resident embedding table, borrowed
+/// disjointly from the same prepared runtime as `session` (a `&mut` on
+/// `session`, a `&` on the embedding table -- distinct fields, both live at
+/// once). Mirrors firered/mimo's resident-decoder step drivers.
+pub(crate) struct GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
+    session: &'s mut GraniteSpeechDecodeSession,
+    provider: &'s dyn GraniteSpeechDecoderWeightProvider,
+    initial_prompt_embeddings: Vec<f32>,
+    prompt_len: usize,
+    prefilled: bool,
+}
+
+impl<'s> GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
+    pub(crate) fn new(
+        session: &'s mut GraniteSpeechDecodeSession,
+        provider: &'s dyn GraniteSpeechDecoderWeightProvider,
+        initial_prompt_embeddings: Vec<f32>,
+    ) -> Self {
+        Self {
+            session,
+            provider,
+            initial_prompt_embeddings,
+            prompt_len: 0,
+            prefilled: false,
+        }
+    }
+}
+
+impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExecutor<'_> {
+    fn decode_step_logits(
+        &mut self,
+        input: Seq2SeqGreedyDecodeStepInput<'_>,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
+        // Steps after the first advance the resident session by one token.
+        if self.prefilled {
+            let new_token = incremental_new_token(self.session, self.prompt_len, &input)?;
+            let logits = self
+                .session
+                .decode_step(new_token, self.provider)
+                .map_err(map_step_error(input.step_index, "audio"))?;
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits,
+                greedy_token_hint: None,
+            });
+        }
+
+        // First call: prefill the audio-spliced prompt embeddings into the
+        // resident (released, so empty-K/V) session.
+        let logits = self
+            .session
+            .prefill(
+                &self.initial_prompt_embeddings,
+                input.initial_prompt_tokens.len(),
+            )
+            .map_err(map_step_error(input.step_index, "audio"))?;
+        self.prompt_len = input.initial_prompt_tokens.len();
+        self.prefilled = true;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits,
             greedy_token_hint: None,
