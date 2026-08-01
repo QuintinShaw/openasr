@@ -219,6 +219,70 @@ RTF per quant) and read down the columns:
 When RAM is flat *and* RTF is flat across quants, treat it as a keep-quantized
 regression and audit the weights loader, not the pack.
 
+### CI gate (K1) — enforced at integration, not after publishing
+
+The RAM-ordering self-check above is a *post-publish* human read of the model
+card. It is now backstopped by a **hard CI gate** that fails at integration time,
+before any pack is built:
+
+- `models::resident_runtime_audit::k1_host_f32_loader_sites_match_inventory` locks
+  the set of source files that materialize a tensor to a host `Vec<f32>` (the
+  reader's `host_tensor_f32_copy*` helpers) against the committed inventory
+  `docs/model-audits/host_f32_loader_sites.txt`. **Adding a new host-f32 loader
+  site turns CI red** until the file is listed there.
+- Listing a file is a reviewed certification that it loads **only** the sanctioned
+  f32/f16 tensors above (norms, biases, conv kernels, `get_rows` embeddings,
+  positional/rotary tables, CMVN vectors). **Loading a rank-2 `mul_mat` weight to
+  host f32 is forbidden** — bind it natively through the seam
+  (`weight_tensor_payload_by_name` + `new_matmul_weight_2d_typed`; see
+  `dolphin::executor::insert_pool_tensor`, which classifies each tensor). So the
+  load-time-dequant pitfall now shows up as a red gate a reviewer must clear, not
+  as a flat model-card column someone has to notice.
+
+This complements the pack-header quant floor (`models::pack_quant_audit`, which
+fails closed on a sub-Q8 encoder), which checks the *pack*; K1 checks the *loader*.
+
+## Runtime contract: keep the prepared runtime resident
+
+**Hard requirement.** A family's executor MUST NOT rebuild its heavy graph
+runtime (encoder / decoder / adapter graphs, device-uploaded weights, embedding
+and logits tables) **on every request**. Build it once per `(pack content id,
+backend)` and keep it **resident**, reusing it across requests; only the
+per-request, audio-dependent work (frontend, encode, prompt, decode) runs each
+call. A per-request `Runtime::new()` on the hot path re-pays the full
+weight-upload + graph-construction cost (seconds for an 8B-class decoder) to
+re-derive state that never changes between requests against the same pack — this
+is what mimo-asr did before its `MimoAsrPreparedRuntime` cache, and what granite
+did before it was caught.
+
+**The seam** (keep the built runtime alive; take it out, use it, put it back):
+
+- Cache the prepared runtime in a thread-local generation-tagged map keyed by
+  `(PackContentKey, backend)` (`models::thread_local_runtime_cache`:
+  `take_generation_tagged` / store), the shared `PreparedRuntimeCache`, or a
+  content-id-keyed process weights pool (dolphin). Tag entries with
+  `current_unload_generation()` so the central idle-unload clock can evict the
+  resident runtime under memory pressure.
+- **Reference families:** `firered_llm` (resident decoder), `mimo_asr` (whole
+  resident encoder + input-local + decoder pipeline), `dolphin` (process weights
+  pool). All AED / autoregressive families and all encoder families already do
+  this.
+
+### CI gate (K2) — every ggml-executor family is checked
+
+- `models::resident_runtime_audit::k2_every_ggml_executor_family_is_classified`
+  locks the set of `models/<family>/{executor,ggml_executor}.rs` files against the
+  `GGML_EXECUTOR_FAMILY_GATES` table. **A new family's executor added without a
+  table entry turns CI red**, so a new AED family (e.g. a future granite / funasr
+  executor) cannot land unclassified.
+- `k2_resident_families_reference_a_resident_cache` then requires every family
+  classified `Resident` to reference a resident-cache primitive in its own module.
+  A one-shot family that genuinely should rebuild per request must be explicitly
+  `Exempt("<reason>")` — reviewed, not silent.
+- Per-family byte-identity of a **cache hit vs a fresh build** is proved by that
+  family's own dev-pack e2e test (`resident_*_cache_reuse_across_consecutive_calls_stays_byte_identical`),
+  which the static K2 gate backstops.
+
 ## Honest gap list — what still blocks true zero-code onboarding
 
 1. **Step-executor construction is irreducibly per-family** and is not closeable

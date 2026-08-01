@@ -12,12 +12,16 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use thiserror::Error;
 
 use crate::NativeAsrError;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::MIMO_ASR_DECODE_POLICY_ID;
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
@@ -35,24 +39,30 @@ use crate::models::qwen::{
 };
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+};
+use crate::models::thread_local_runtime_cache::{
+    PackContentKey, current_unload_generation, take_generation_tagged,
 };
 
 use super::audio_tokenizer_graph::MimoAudiotokEncoderRuntime;
 use super::decode_prompt::build_mimo_asr_decode_prompt;
 use super::input_local_graph::{
-    MimoInputLocalRuntime, load_speech_embedding_tables_from_reader, sum_speech_embeddings,
+    MimoInputLocalRuntime, MimoSpeechEmbeddingTables, load_speech_embedding_tables_from_reader,
+    sum_speech_embeddings,
 };
 use super::llm_transformer::MimoLlmDecoderRuntime;
 use super::mel_frontend::{
-    load_mimo_mel_frontend_plan_from_reader, mimo_mel_features_from_samples, resample_mono,
+    MimoMelFrontendPlan, load_mimo_mel_frontend_plan_from_reader, mimo_mel_features_from_samples,
+    resample_mono,
 };
 use super::runtime_contract::{
-    parse_mimo_audiotok_metadata, parse_mimo_inlocal_metadata, parse_mimo_llm_metadata,
-    parse_mimo_mel_metadata, parse_mimo_special_tokens,
+    MimoInlocalMetadata, MimoLlmMetadata, parse_mimo_audiotok_metadata,
+    parse_mimo_inlocal_metadata, parse_mimo_llm_metadata, parse_mimo_mel_metadata,
+    parse_mimo_special_tokens,
 };
-use super::rvq::{encode_rvq_codes, load_mimo_rvq_codebooks_from_reader};
+use super::rvq::{MimoRvqCodebooks, encode_rvq_codes, load_mimo_rvq_codebooks_from_reader};
 use super::tokenizer::MimoAsrTokenizer;
 
 const MIMO_ASR_EXECUTOR_ID: &str = "mimo-asr-ggml-executor-v1";
@@ -99,6 +109,74 @@ enum MimoAsrExecutorError {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MimoAsrGgmlExecutor;
+
+/// Everything mimo-asr materializes from a pack that does NOT depend on the
+/// per-request audio: all three graph runtimes (audio-tokenizer encoder,
+/// input-local transformer, 36L Qwen2 backbone decoder), their
+/// device-uploaded / arena-resident weights, plus the immutable derived data
+/// read once from the pack (RVQ codebooks, the 8 speech-embedding tables, the
+/// mel front-end plan, the tokenizer, and the two metadata groups the
+/// per-request path still consults). Before this cache, mimo-asr was the only
+/// family that rebuilt this ENTIRE set on every `execute()` -- three
+/// `Runtime::new()` calls plus a full re-read of the pack's codebooks/tables
+/// -- purely to re-derive state that never changes between requests against
+/// the same pack. Mirrors `firered_llm`'s resident-decoder cache (`FireRedLlm
+/// DecoderRuntime` there is one stage; here the whole prepared pipeline is
+/// resident because all three mimo stages are equally per-request-invariant).
+struct MimoAsrPreparedRuntime {
+    encoder_runtime: MimoAudiotokEncoderRuntime,
+    inlocal_runtime: MimoInputLocalRuntime,
+    decoder: MimoLlmDecoderRuntime,
+    tokenizer: MimoAsrTokenizer,
+    codebooks: MimoRvqCodebooks,
+    speech_embedding_tables: MimoSpeechEmbeddingTables,
+    mel_plan: MimoMelFrontendPlan,
+    llm_metadata: MimoLlmMetadata,
+    inlocal_metadata: MimoInlocalMetadata,
+}
+
+/// Resident prepared-runtime cache keyed by (pack content id, backend), the
+/// same design + idle-unload-generation tagging `firered_llm` uses for its
+/// resident decoder (see that module's `FIRERED_LLM_DECODER_BY_KEY` doc). The
+/// pack half is a [`PackContentKey`] from the request's already-open source,
+/// so an in-place `.oasr` replacement at the same path resolves a different id
+/// and the next lookup rebuilds instead of reusing runtimes built from the old
+/// bytes. Entries are tagged with the idle-unload generation they were built
+/// under: `take_generation_tagged` discards any prepared runtime built before
+/// the last idle unload (the reaper cannot reach this worker thread's TLS from
+/// its own thread), so the resident ~8B pipeline stays evictable under memory
+/// pressure through the shared central unload clock -- no bespoke policy.
+///
+/// A plain `HashMap` (not the bounded LRU): the key does not explode per audio
+/// chunk (one entry is built and reused across a whole longform run for a given
+/// pack/backend), so there is no unbounded-growth hazard to bound.
+type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+
+thread_local! {
+    static MIMO_ASR_PREPARED_BY_KEY: RefCell<
+        HashMap<MimoAsrPreparedRuntimeCacheKey, (u64, MimoAsrPreparedRuntime)>,
+    > = RefCell::new(HashMap::new());
+}
+
+fn take_cached_prepared_runtime(
+    key: &MimoAsrPreparedRuntimeCacheKey,
+    unload_generation: u64,
+) -> Option<MimoAsrPreparedRuntime> {
+    MIMO_ASR_PREPARED_BY_KEY
+        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
+}
+
+fn store_cached_prepared_runtime(
+    key: MimoAsrPreparedRuntimeCacheKey,
+    unload_generation: u64,
+    prepared: MimoAsrPreparedRuntime,
+) {
+    MIMO_ASR_PREPARED_BY_KEY.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(key, (unload_generation, prepared));
+    });
+}
 
 /// No-op phrase-bias shim: mimo-asr's decode policy never consults these (no
 /// phrase bias, single config-supplied eot token) -- mirrors
@@ -180,24 +258,17 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
     }
 }
 
-impl MimoAsrGgmlExecutor {
-    fn execute_inner(
-        &self,
-        request: &GgmlAsrExecutionRequest,
-    ) -> Result<GgmlAsrExecutionResult, MimoAsrExecutorError> {
-        let expected_adapter = crate::arch::MIMO_ASR_GGML_ADAPTER_ID;
-        if request.selected_family.adapter_id != expected_adapter {
-            return Err(MimoAsrExecutorError::AdapterMismatch {
-                expected: expected_adapter,
-                found: request.selected_family.adapter_id.to_string(),
-            });
-        }
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| MimoAsrExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
-
+impl MimoAsrPreparedRuntime {
+    /// Materializes every per-request-invariant piece of the mimo-asr pipeline
+    /// from an already-resolved preflight: the three graph runtimes and their
+    /// resident weights, plus the RVQ codebooks, speech-embedding tables, mel
+    /// plan, tokenizer, and the two metadata groups the request path consults.
+    /// This is the whole cost the resident cache exists to pay exactly once per
+    /// (pack, backend).
+    fn build(
+        preflight: &crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, MimoAsrExecutorError> {
         let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata).map_err(|error| {
             MimoAsrExecutorError::RuntimeContractViolation {
                 reason: error.to_string(),
@@ -232,17 +303,7 @@ impl MimoAsrGgmlExecutor {
             }
         })?;
 
-        let samples = &request.prepared_audio.samples_f32;
-        let audio_duration_seconds =
-            samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
-        if audio_duration_seconds > MIMO_ASR_MAX_INPUT_SECONDS {
-            return Err(MimoAsrExecutorError::AudioTooLong {
-                seconds: audio_duration_seconds,
-                limit: MIMO_ASR_MAX_INPUT_SECONDS,
-            });
-        }
-
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
             MimoAsrExecutorError::EncoderFailed {
                 reason: error.to_string(),
             }
@@ -254,38 +315,13 @@ impl MimoAsrGgmlExecutor {
                     reason: error.to_string(),
                 }
             })?;
-        // The OpenASR pipeline delivers 16kHz mono to every executor, but
-        // MiMo's audio tokenizer (and its baked mel filterbank/window) is
-        // trained at 24kHz -- resample up before the mel front-end, matching
-        // the reference `preprocess_input`'s own resample-to-tokenizer-rate.
-        let input_rate = request.prepared_audio.sample_rate_hz;
-        let target_rate = mel_plan.sample_rate_hz as u32;
-        let resampled = resample_mono(samples, input_rate, target_rate).ok_or(
-            MimoAsrExecutorError::MelFrontendFailed {
-                reason: format!("failed to resample {input_rate}Hz -> {target_rate}Hz"),
-            },
-        )?;
-        let mel_features =
-            mimo_mel_features_from_samples(&resampled, &mel_plan).map_err(|error| {
-                MimoAsrExecutorError::MelFrontendFailed {
-                    reason: error.to_string(),
-                }
-            })?;
 
         let runtime_source = &preflight.runtime_source;
-        let mut encoder_runtime = MimoAudiotokEncoderRuntime::new(
-            runtime_source,
-            audiotok_metadata.clone(),
-            request.resolved_runtime.backend(),
-        )
-        .map_err(|error| MimoAsrExecutorError::EncoderFailed {
-            reason: error.to_string(),
-        })?;
-        let encoder_output = encoder_runtime.encode(&mel_features).map_err(|error| {
-            MimoAsrExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            }
-        })?;
+        let encoder_runtime =
+            MimoAudiotokEncoderRuntime::new(runtime_source, audiotok_metadata.clone(), backend)
+                .map_err(|error| MimoAsrExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
 
         let codebooks =
             load_mimo_rvq_codebooks_from_reader(&reader, &audiotok_metadata).map_err(|error| {
@@ -293,26 +329,6 @@ impl MimoAsrGgmlExecutor {
                     reason: error.to_string(),
                 }
             })?;
-        let mut codes =
-            encode_rvq_codes(&codebooks, &encoder_output.rows, encoder_output.frame_count)
-                .map_err(|error| MimoAsrExecutorError::RvqFailed {
-                    reason: error.to_string(),
-                })?;
-
-        // Truncate to the nearest group_size multiple (drop up to
-        // group_size-1 trailing 25Hz frames = well under 200ms of audio) --
-        // the reference asserts exact divisibility rather than padding.
-        let group_size = inlocal_metadata.group_size;
-        let usable_frames = (codes.len() / group_size) * group_size;
-        codes.truncate(usable_frames);
-        if usable_frames == 0 {
-            return Err(MimoAsrExecutorError::RvqFailed {
-                reason: format!(
-                    "audio too short: {} RVQ frames produced, need at least {group_size}",
-                    codes.len()
-                ),
-            });
-        }
 
         // `mimo.speech.vocab_size` (LLM-side embedding table sizes) is each
         // RVQ codebook's size +1 (a trailing zeroemb padding row); `mimo.speech.
@@ -327,7 +343,7 @@ impl MimoAsrGgmlExecutor {
             .map(|size| size + 1)
             .collect();
         let zeroemb_idx: Vec<u32> = audiotok_metadata.codebook_sizes.clone();
-        let tables = load_speech_embedding_tables_from_reader(
+        let speech_embedding_tables = load_speech_embedding_tables_from_reader(
             &reader,
             inlocal_metadata.d_model,
             &speech_vocab_sizes,
@@ -336,38 +352,203 @@ impl MimoAsrGgmlExecutor {
         .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
             reason: error.to_string(),
         })?;
-        let summed = sum_speech_embeddings(&tables, &codes);
 
-        let mut inlocal_runtime = MimoInputLocalRuntime::new(
-            runtime_source,
+        let inlocal_runtime = MimoInputLocalRuntime::new(runtime_source, inlocal_metadata, backend)
+            .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
+                reason: error.to_string(),
+            })?;
+
+        let decoder =
+            MimoLlmDecoderRuntime::new(runtime_source, llm_metadata, backend).map_err(|error| {
+                MimoAsrExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+
+        Ok(Self {
+            encoder_runtime,
+            inlocal_runtime,
+            decoder,
+            tokenizer,
+            codebooks,
+            speech_embedding_tables,
+            mel_plan,
+            llm_metadata,
             inlocal_metadata,
-            request.resolved_runtime.backend(),
+        })
+    }
+}
+
+impl MimoAsrGgmlExecutor {
+    fn execute_inner(
+        &self,
+        request: &GgmlAsrExecutionRequest,
+    ) -> Result<GgmlAsrExecutionResult, MimoAsrExecutorError> {
+        let expected_adapter = crate::arch::MIMO_ASR_GGML_ADAPTER_ID;
+        if request.selected_family.adapter_id != expected_adapter {
+            return Err(MimoAsrExecutorError::AdapterMismatch {
+                expected: expected_adapter,
+                found: request.selected_family.adapter_id.to_string(),
+            });
+        }
+        let preflight = request
+            .resolve_runtime_source_preflight()
+            .map_err(|error| MimoAsrExecutorError::RuntimePreflightFailed {
+                reason: error.to_string(),
+            })?;
+
+        let samples = &request.prepared_audio.samples_f32;
+        let audio_duration_seconds =
+            samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
+        if audio_duration_seconds > MIMO_ASR_MAX_INPUT_SECONDS {
+            return Err(MimoAsrExecutorError::AudioTooLong {
+                seconds: audio_duration_seconds,
+                limit: MIMO_ASR_MAX_INPUT_SECONDS,
+            });
+        }
+
+        // Take the resident prepared runtime out of this thread's cache (or
+        // build it once on a cold miss). Sampled before the take and reused for
+        // the store-back below: if the idle-unload reaper bumps the generation
+        // while this decode is in flight, the runtime goes back tagged with the
+        // pre-unload generation and the *next* take discards it, so an unload is
+        // never lost to an overlapping decode (mirrors `firered_llm`).
+        let backend = request.resolved_runtime.backend();
+        let cache_key: MimoAsrPreparedRuntimeCacheKey = (
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
+            backend,
+        );
+        let unload_generation = current_unload_generation();
+        let mut prepared = match take_cached_prepared_runtime(&cache_key, unload_generation) {
+            Some(prepared) => prepared,
+            None => MimoAsrPreparedRuntime::build(&preflight, backend)?,
+        };
+
+        let result = self.transcribe_with_prepared(&mut prepared, request, samples);
+
+        // Return the resident runtime to the cache for the next chunk /
+        // execute() regardless of decode outcome (the session-scoped buffer
+        // release below already discarded any state a partial compute poisoned;
+        // uploaded weights and the arena/graph handles remain valid).
+        prepared.decoder.release_session_scoped_buffers();
+        store_cached_prepared_runtime(cache_key, unload_generation, prepared);
+
+        let result = result?;
+        let text = strip_mimo_language_tags(&result.text);
+        let transcription = Transcription {
+            truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
+            segments: vec![Segment {
+                start: 0.0,
+                end: audio_duration_seconds.max(0.0),
+                text: text.clone(),
+                speaker: None,
+                speaker_label: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words: Vec::new(),
+            }],
+            text,
+            longform: None,
+            language: None,
+        };
+        Ok(GgmlAsrExecutionResult {
+            transcription,
+            carry_context: None,
+            // No intra-decode timestamps -- the single segment spans the whole
+            // buffer -- so the cut point has no honest second to name. See
+            // `DecodeTruncation::transcript_covers_up_to_seconds`.
+            decode_truncation: result.stop_reason.into_decode_truncation(None),
+        })
+    }
+
+    /// The per-request path: everything that depends on the audio input, run
+    /// against an already-built resident [`MimoAsrPreparedRuntime`]. Nothing
+    /// here reads the pack or constructs a graph runtime -- it only feeds this
+    /// utterance's samples through the resident encoder / input-local / decoder
+    /// graphs and returns the greedy decode result. Fields are borrowed
+    /// disjointly (`&mut` encoder, then `&mut` input-local, then `&mut` decoder
+    /// alongside `&` tokenizer) so the resident runtime is reused in place.
+    fn transcribe_with_prepared(
+        &self,
+        prepared: &mut MimoAsrPreparedRuntime,
+        request: &GgmlAsrExecutionRequest,
+        samples: &[f32],
+    ) -> Result<Seq2SeqGreedyDecodeResult, MimoAsrExecutorError> {
+        // The OpenASR pipeline delivers 16kHz mono to every executor, but
+        // MiMo's audio tokenizer (and its baked mel filterbank/window) is
+        // trained at 24kHz -- resample up before the mel front-end, matching
+        // the reference `preprocess_input`'s own resample-to-tokenizer-rate.
+        let input_rate = request.prepared_audio.sample_rate_hz;
+        let target_rate = prepared.mel_plan.sample_rate_hz as u32;
+        let resampled = resample_mono(samples, input_rate, target_rate).ok_or(
+            MimoAsrExecutorError::MelFrontendFailed {
+                reason: format!("failed to resample {input_rate}Hz -> {target_rate}Hz"),
+            },
+        )?;
+        let mel_features =
+            mimo_mel_features_from_samples(&resampled, &prepared.mel_plan).map_err(|error| {
+                MimoAsrExecutorError::MelFrontendFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+
+        let encoder_output = prepared
+            .encoder_runtime
+            .encode(&mel_features)
+            .map_err(|error| MimoAsrExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })?;
+
+        let mut codes = encode_rvq_codes(
+            &prepared.codebooks,
+            &encoder_output.rows,
+            encoder_output.frame_count,
         )
-        .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
+        .map_err(|error| MimoAsrExecutorError::RvqFailed {
             reason: error.to_string(),
         })?;
-        let speech_rows = inlocal_runtime
-            .run(&summed, usable_frames, llm_metadata.d_model)
+
+        // Truncate to the nearest group_size multiple (drop up to
+        // group_size-1 trailing 25Hz frames = well under 200ms of audio) --
+        // the reference asserts exact divisibility rather than padding.
+        let group_size = prepared.inlocal_metadata.group_size;
+        let usable_frames = (codes.len() / group_size) * group_size;
+        codes.truncate(usable_frames);
+        if usable_frames == 0 {
+            return Err(MimoAsrExecutorError::RvqFailed {
+                reason: format!(
+                    "audio too short: {} RVQ frames produced, need at least {group_size}",
+                    codes.len()
+                ),
+            });
+        }
+
+        let summed = sum_speech_embeddings(&prepared.speech_embedding_tables, &codes);
+
+        let llm_d_model = prepared.llm_metadata.d_model;
+        let speech_rows = prepared
+            .inlocal_runtime
+            .run(&summed, usable_frames, llm_d_model)
             .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
                 reason: error.to_string(),
             })?;
         let audio_group_count = usable_frames / group_size;
 
+        // Disjoint field borrows: `&mut decoder` for the decode graph and
+        // `&tokenizer` for prompt/text decoding are distinct fields of the
+        // same resident runtime, so both are live at once without conflict.
+        let tokenizer = &prepared.tokenizer;
+        let llm_metadata = prepared.llm_metadata;
+        let decoder = &mut prepared.decoder;
+
         let decode_prompt =
-            build_mimo_asr_decode_prompt(&tokenizer, audio_group_count).map_err(|error| {
+            build_mimo_asr_decode_prompt(tokenizer, audio_group_count).map_err(|error| {
                 MimoAsrExecutorError::DecodePromptFailed {
                     reason: error.to_string(),
                 }
             })?;
 
-        let mut decoder = MimoLlmDecoderRuntime::new(
-            runtime_source,
-            llm_metadata,
-            request.resolved_runtime.backend(),
-        )
-        .map_err(|error| MimoAsrExecutorError::DecoderFailed {
-            reason: error.to_string(),
-        })?;
         let mut token_rows =
             Vec::with_capacity(decode_prompt.token_ids.len() * llm_metadata.d_model);
         for &token_id in &decode_prompt.token_ids {
@@ -397,7 +578,7 @@ impl MimoAsrGgmlExecutor {
                 .saturating_add(MIMO_ASR_MAX_GENERATED_TOKENS),
         );
         let mut step_executor = MimoAsrGreedyStepExecutor {
-            decoder: &mut decoder,
+            decoder,
             layer_kv_caches,
             prompt_embeddings: Some(prompt_embeddings),
             cache_prompt_tokens: 0,
@@ -409,7 +590,7 @@ impl MimoAsrGgmlExecutor {
             vocab_size: llm_metadata.vocab_size,
             max_generated_tokens: MIMO_ASR_MAX_GENERATED_TOKENS,
         };
-        let result = run_builtin_seq2seq_decode_policy(
+        run_builtin_seq2seq_decode_policy(
             MIMO_ASR_DECODE_POLICY_ID,
             &config,
             &NoPhraseBiasTokenSource,
@@ -429,33 +610,6 @@ impl MimoAsrGgmlExecutor {
         )
         .map_err(|error| MimoAsrExecutorError::GreedyDecodeFailed {
             reason: error.to_string(),
-        })?;
-
-        let text = strip_mimo_language_tags(&result.text);
-        let transcription = Transcription {
-            truncated_decodes: Vec::new(),
-            unnamed_speakers: Vec::new(),
-            segments: vec![Segment {
-                start: 0.0,
-                end: audio_duration_seconds.max(0.0),
-                text: text.clone(),
-                speaker: None,
-                speaker_label: None,
-                speaker_person_id: None,
-                speaker_snapshot_label: None,
-                words: Vec::new(),
-            }],
-            text,
-            longform: None,
-            language: None,
-        };
-        Ok(GgmlAsrExecutionResult {
-            transcription,
-            carry_context: None,
-            // No intra-decode timestamps -- the single segment spans the whole
-            // buffer -- so the cut point has no honest second to name. See
-            // `DecodeTruncation::transcript_covers_up_to_seconds`.
-            decode_truncation: result.stop_reason.into_decode_truncation(None),
         })
     }
 }
@@ -718,5 +872,32 @@ mod tests {
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+    }
+
+    /// Resident prepared-runtime cache regression: `execute()` twice in a row on
+    /// the same thread (same pack + backend) must hit the thread-local
+    /// `MIMO_ASR_PREPARED_BY_KEY` cache on the second call and still produce a
+    /// transcript byte-identical to the first call (a cold cache-miss build) and
+    /// to the dedicated single-call golden above -- the resident encoder /
+    /// input-local / decoder carry no per-request state across calls that could
+    /// leak into a later transcript. This is the mimo mirror of firered-llm's
+    /// `resident_decoder_cache_reuse_across_consecutive_calls_stays_byte_identical`.
+    /// Run with `OPENASR_GGML_BACKEND=cpu` for the deterministic reference decode.
+    #[test]
+    #[ignore = "requires the private ~9.6GB dev-only mimo-v2.5-asr-q8_0.oasr pack; \
+                OPENASR_GGML_BACKEND=cpu recommended (see the single-call goldens)"]
+    fn resident_prepared_runtime_reuse_across_consecutive_calls_stays_byte_identical() {
+        let Some((first_text, _, _)) = transcribe_with_dev_pack(jfk_wav_path()) else {
+            return;
+        };
+        let Some((second_text, _, _)) = transcribe_with_dev_pack(jfk_wav_path()) else {
+            return;
+        };
+        assert_eq!(first_text, GOLDEN_JFK_TEXT);
+        assert_eq!(
+            second_text, GOLDEN_JFK_TEXT,
+            "second execute() (a resident prepared-runtime cache hit) must match the first \
+             (cache-miss/build) call byte-for-byte"
+        );
     }
 }

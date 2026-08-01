@@ -46,6 +46,8 @@ pub(crate) mod phrase_bias_decode;
 pub(crate) mod prepared_runtime_cache;
 pub(crate) mod pyannote;
 pub mod qwen;
+#[cfg(test)]
+mod resident_runtime_audit;
 pub(crate) mod runtime_asset_bootstrap;
 pub(crate) mod runtime_cache_coordinator;
 pub(crate) mod runtime_component_bootstrap;
