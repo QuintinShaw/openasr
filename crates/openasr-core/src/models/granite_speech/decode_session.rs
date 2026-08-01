@@ -42,12 +42,43 @@
 //! ~8 GB f32 dequant + upload). Only the tiny per-step inputs (one embedding,
 //! one position, the K/V history views) live in the reset-per-step graph
 //! context.
+//!
+//! ## Metal reuse path (device-resident KV + build-once decode graph)
+//!
+//! The description above is the CPU / scheduler-on path: it keeps the K/V in
+//! host `Vec<f32>` buffers and rebuilds the 40-layer step graph every token,
+//! re-uploading the whole history each step. On the single-backend GPU path
+//! (`reusable_decode_graph_supported_for_runner`: gpu-class backend + scheduler
+//! off) that host round-trip is the dominant decode cost, so this module also
+//! provides the resident path taken there:
+//!
+//! - The K/V lives in a device-resident fixed-span arena (`resident_kv`,
+//!   `[head_dim, resident_capacity, kv_heads]` f32 per layer). `prefill` seeds
+//!   rows `0..n_tokens` in place from the prefill graph (`set_rows`), never
+//!   copying K/V to the host; each `decode_step` writes only the one new row.
+//! - A single persistent single-token decode graph is built once
+//!   (`build_reusable_decode_graph`) and re-run per step -- no 40-layer rebuild.
+//!   It reads the full fixed span under an externally uploaded additive `-inf`
+//!   tail mask, so its shape is constant across steps.
+//!
+//! Both mirror the firered-aed / qwen resident-decode machinery while keeping
+//! Granite's forked attention numerics. This path is NOT bit-identical to the
+//! CPU reference (ggml's Metal reduction order differs from the CPU
+//! `vec_dot` -- by design); the bit-exact gate
+//! `granite_incremental_decode_matches_full_recompute_bit_exact` covers the CPU
+//! path it does not touch, and end-to-end transcript equality validates the
+//! Metal path.
 
 #![allow(dead_code)]
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
-    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlRuntimeSource,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlKvElementType, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlRuntimeSource,
+};
+use crate::nn::decoder::{
+    LlmKvCacheSpec, LlmResidentKvArena, allocate_zeroed_llm_resident_kv_arena,
+    reusable_decode_graph_supported_for_runner,
 };
 
 use super::decoder_graph::{
@@ -56,6 +87,42 @@ use super::decoder_graph::{
     embed_token_row, granite_post_attention, granite_pre_attention, linear, rms_norm,
     weight_in_major,
 };
+
+/// Headroom (in tokens) reserved above the prompt length when sizing the
+/// resident KV arena's fixed span, so the whole greedy decode
+/// (`GRANITE_SPEECH_MAX_GENERATED_TOKENS` new tokens after the prompt) fits
+/// without ever overrunning the arena. Kept in sync with the executor's
+/// `max_generated_tokens`; a larger value only reserves more (masked-until-used)
+/// span, never changes results.
+const GRANITE_RESIDENT_DECODE_HEADROOM: usize = 256;
+
+/// f32 resident KV element type for the Metal reuse path. f32 (not f16) keeps
+/// the cached K/V rounding-free, so the only numerical difference from the CPU
+/// growing-KV reference is ggml's backend reduction order (by design; the
+/// bit-exact gate covers the CPU path). Both host + resident are f32.
+const GRANITE_RESIDENT_KV_SPEC: LlmKvCacheSpec = LlmKvCacheSpec {
+    host: GgmlKvElementType::F32,
+    resident: GgmlKvElementType::F32,
+};
+
+/// ggml metadata-context budget for both the session runner and the reused
+/// persistent decode graph. Holds tensor structs + names, not compute buffers.
+const GRANITE_DECODE_GRAPH_CONTEXT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Additive self-attention mask for the fixed-span reuse graph: `0.0` for every
+/// key column `<= position` (the prompt + generated-so-far + the just-written
+/// new token) and `f32::MIN` for the never-yet-written / future tail. Added
+/// after the `attention_multiplier` scale in `soft_max_ext`, exactly as the
+/// growing path's causal mask, so masked columns underflow to `0.0` and the
+/// surviving softmax terms match the growing-KV attention over `position + 1`
+/// keys.
+fn fixed_span_tail_mask(max_positions: usize, position: usize) -> Vec<f32> {
+    let mut mask = vec![0.0f32; max_positions];
+    for slot in mask.iter_mut().skip(position + 1) {
+        *slot = f32::MIN;
+    }
+    mask
+}
 
 fn map_ggml(stage: &'static str) -> impl Fn(GgmlCpuGraphError) -> GraniteSpeechDecoderError + Copy {
     move |source| GraniteSpeechDecoderError::Ggml { stage, source }
@@ -71,6 +138,13 @@ type ForwardGraphOutput = (Vec<f32>, Vec<(Vec<f32>, Vec<f32>)>);
 /// [`prefill`](Self::prefill), then call [`decode_step`](Self::decode_step) once
 /// per generated token.
 pub(crate) struct GraniteSpeechDecodeSession {
+    /// Build-once/re-run single-token decode graph for the Metal reuse path
+    /// (`None` until the first reused step builds it, and on CPU / scheduler-on
+    /// runners where the growing-KV host path stays authoritative). Declared
+    /// FIRST so it drops first: its persistent graph holds raw pointers into
+    /// `runner`, `weights`/`_loaded`, and the `resident_kv` arena, all declared
+    /// below and therefore dropped after it.
+    reuse: Option<GraniteReusableDecodeGraph>,
     config: GraniteSpeechDecoderConfig,
     runner: GgmlCpuGraphRunner,
     weights: GraniteDecoderWeights,
@@ -95,6 +169,40 @@ pub(crate) struct GraniteSpeechDecodeSession {
     v_history: Vec<Vec<Vec<f32>>>,
     seq_len: usize,
     prefilled: bool,
+    /// Device-resident, per-layer fixed-span `[head_dim, resident_capacity,
+    /// kv_heads]` f32 K/V arena for the Metal reuse path. Seeded once per
+    /// request by `prefill` (rows `0..n_tokens` via `set_rows`) and extended one
+    /// row per `decode_step`, so the K/V history never round-trips to the host.
+    /// `None` on CPU / scheduler-on runners (which keep `k_history`/`v_history`).
+    /// Declared after `reuse` so the reuse graph (which points into this arena)
+    /// drops first.
+    resident_kv: Option<LlmResidentKvArena>,
+    /// Allocated column count (`max_positions`) of every `resident_kv` tensor.
+    /// The fixed span the reuse graph attends over and bakes into its topology;
+    /// grown (never shrunk) when a later request's `prompt + headroom` exceeds
+    /// it. `0` before the first resident allocation.
+    resident_capacity: usize,
+}
+
+/// Build-once/re-run persistent single-token Granite decode graph plus its
+/// per-step runtime inputs. The op sequence is exactly one `n_tokens == 1` step
+/// of the growing-KV path, except the new token's K/V is written into the
+/// resident arena via `set_rows` on a runtime `row_index` input and
+/// self-attention reads the full fixed `resident_capacity` span under an
+/// externally uploaded additive `-inf` tail mask, so the graph shape stays
+/// constant across steps. The owning [`GraniteSpeechDecodeSession`] declares
+/// this object before its resident arena and runner, so `session` drops before
+/// every allocation its graph tensors point into.
+struct GraniteReusableDecodeGraph {
+    session: GgmlPersistentGraphSession,
+    /// The fixed self-KV span this persistent graph was built for; a mismatch
+    /// against the session's current `resident_capacity` forces a rebuild.
+    max_positions: usize,
+    embed: GgmlCpuTensor<'static>,
+    row_index: GgmlCpuTensor<'static>,
+    position: GgmlCpuTensor<'static>,
+    mask: GgmlCpuTensor<'static>,
+    logits: GgmlCpuTensor<'static>,
 }
 
 impl GraniteSpeechDecodeSession {
@@ -107,14 +215,19 @@ impl GraniteSpeechDecodeSession {
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = GgmlCpuGraphConfig {
-            context_bytes: 256 * 1024 * 1024,
+            context_bytes: GRANITE_DECODE_GRAPH_CONTEXT_BYTES,
             graph_size: 32768,
             n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
                 backend,
                 crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
             ),
             backend,
-            use_scheduler: true,
+            // Scheduler off on the single-backend GPU path so the in-place
+            // resident-KV reuse graph is legal (the multi-backend scheduler
+            // drops refreshed per-token inputs / relocates in-place KV writes;
+            // see `nn::decoder::reusable_decode_graph_supported`). CPU keeps the
+            // scheduler and the growing-KV host decode path.
+            use_scheduler: !backend.is_gpu_class(),
         };
         let runner =
             GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
@@ -143,14 +256,19 @@ impl GraniteSpeechDecodeSession {
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = GgmlCpuGraphConfig {
-            context_bytes: 256 * 1024 * 1024,
+            context_bytes: GRANITE_DECODE_GRAPH_CONTEXT_BYTES,
             graph_size: 32768,
             n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
                 backend,
                 crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
             ),
             backend,
-            use_scheduler: true,
+            // Scheduler off on the single-backend GPU path so the in-place
+            // resident-KV reuse graph is legal (the multi-backend scheduler
+            // drops refreshed per-token inputs / relocates in-place KV writes;
+            // see `nn::decoder::reusable_decode_graph_supported`). CPU keeps the
+            // scheduler and the growing-KV host decode path.
+            use_scheduler: !backend.is_gpu_class(),
         };
         let runner =
             GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
@@ -174,6 +292,7 @@ impl GraniteSpeechDecodeSession {
     ) -> Self {
         let num_layers = config.num_layers;
         Self {
+            reuse: None,
             config,
             runner,
             weights,
@@ -182,18 +301,26 @@ impl GraniteSpeechDecodeSession {
             v_history: vec![Vec::new(); num_layers],
             seq_len: 0,
             prefilled: false,
+            resident_kv: None,
+            resident_capacity: 0,
         }
     }
 
-    /// Release this decode's per-request session-scoped buffers -- the grown
-    /// per-token K/V history and the prefill flag -- so the resident session
-    /// can be reused clean for the next request. Mirrors the
-    /// `release_session_scoped_buffers` reset firered/mimo do on their resident
-    /// decoder runtimes before returning them to the cross-request cache: the
-    /// heavy resident state (the runner, the mmap'd loaded weight context, and
-    /// its zero-copy bound `weights`) is untouched -- only the K/V buffers that
-    /// grew with this utterance are dropped and `prefilled` cleared, so the
-    /// next request re-prefills from scratch on the same resident weights.
+    /// Whether this session's runner can run the in-place resident-KV reuse path
+    /// (single-backend GPU, scheduler off). CPU / scheduler-on runners fall back
+    /// to the growing-KV host path, which the bit-exact gate covers.
+    fn reuse_supported(&self) -> bool {
+        reusable_decode_graph_supported_for_runner(&self.runner)
+    }
+
+    /// Reset this decode's request-visible state before the prepared runtime
+    /// re-enters the cross-request cache. On the CPU / scheduler path the grown
+    /// host K/V vectors are released. On the GPU reuse path the fixed-capacity
+    /// resident K/V arena and persistent graph deliberately remain allocated;
+    /// the next prefill overwrites every newly visible prompt row, each decode
+    /// step overwrites its own row, and the fixed-span mask keeps all remaining
+    /// stale rows invisible. In both cases clearing `seq_len` and `prefilled`
+    /// makes a new prefill mandatory before another step can execute.
     pub(crate) fn release_session_scoped_buffers(&mut self) {
         let num_layers = self.config.num_layers;
         self.k_history = vec![Vec::new(); num_layers];
@@ -241,6 +368,30 @@ impl GraniteSpeechDecodeSession {
             });
         }
 
+        if self.reuse_supported() {
+            // Metal reuse path: seed the resident KV arena directly from the
+            // prefill graph (rows `0..n_tokens` via `set_rows`), no host copy.
+            let required = n_tokens
+                .checked_add(GRANITE_RESIDENT_DECODE_HEADROOM)
+                .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+                    reason: "granite resident KV span overflow".to_string(),
+                })?;
+            self.ensure_resident_arena(required)?;
+            let last_logits = run_prefill_graph_seeding_resident(
+                &mut self.runner,
+                &self.weights,
+                &self.config,
+                self.resident_kv
+                    .as_ref()
+                    .expect("resident arena allocated above"),
+                embeddings,
+                n_tokens,
+            )?;
+            self.seq_len = n_tokens;
+            self.prefilled = true;
+            return Ok(last_logits);
+        }
+
         let (last_logits, per_layer_kv) = run_prefill_graph(
             &mut self.runner,
             &self.weights,
@@ -283,6 +434,14 @@ impl GraniteSpeechDecodeSession {
                 reason: "granite decode session must be prefilled before decode_step".to_string(),
             });
         }
+
+        if self.reuse_supported() {
+            // Metal reuse path: one persistent single-token step against the
+            // resident KV arena (write the new row via `set_rows`, attend the
+            // fixed span). No graph rebuild, no host K/V round-trip.
+            return self.decode_step_reused(new_token_id, provider);
+        }
+
         let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
 
         let head_dim = self.config.head_dim;
@@ -323,6 +482,244 @@ impl GraniteSpeechDecodeSession {
         }
         self.seq_len += 1;
         Ok(logits)
+    }
+
+    /// Ensure the resident KV arena has at least `required` columns of fixed
+    /// span, (re)allocating (and zero-filling) it when absent or too small.
+    /// Growing invalidates the reuse graph (whose baked-in tensors point into
+    /// the old arena buffer), so drop it; the next reused step rebuilds against
+    /// the new arena. Never shrinks -- a smaller later request reuses the wider
+    /// span (its tail simply stays masked).
+    fn ensure_resident_arena(&mut self, required: usize) -> Result<(), GraniteSpeechDecoderError> {
+        if self.resident_kv.is_some() && self.resident_capacity >= required {
+            return Ok(());
+        }
+        // Drop the reuse graph before freeing the old arena it points into.
+        self.reuse = None;
+        self.resident_kv = None;
+        let num_layers = self.config.num_layers;
+        // Two KV tensors per layer plus a small fixed spare for the arena's
+        // metadata pool (tensor structs + names).
+        let context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(num_layers * 2 + 16);
+        let arena = allocate_zeroed_llm_resident_kv_arena(
+            &self.runner,
+            context_bytes,
+            num_layers,
+            self.config.head_dim,
+            required,
+            self.config.num_kv_heads,
+            1,
+            "granite_resident_kv",
+            GRANITE_RESIDENT_KV_SPEC,
+        )
+        .map_err(map_ggml("resident_kv_arena_alloc"))?;
+        self.resident_kv = Some(arena);
+        self.resident_capacity = required;
+        Ok(())
+    }
+
+    /// One incremental single-token step on the Metal reuse path: build the
+    /// persistent graph on first use (or after a capacity change / poison),
+    /// refresh the per-step token / row-index / position / tail-mask inputs, and
+    /// re-run -- no graph construction, no reallocation, and the new K/V is
+    /// written in place into the resident arena (`set_rows`) instead of round-
+    /// tripping to the host. The new token occupies row `self.seq_len`.
+    fn decode_step_reused(
+        &mut self,
+        new_token_id: u32,
+        provider: &dyn GraniteSpeechDecoderWeightProvider,
+    ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+        let position = self.seq_len;
+        let max_positions = self.resident_capacity;
+        if position >= max_positions {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: format!(
+                    "granite decode position {position} exceeds resident KV span {max_positions}"
+                ),
+            });
+        }
+        let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
+
+        let needs_build = self
+            .reuse
+            .as_ref()
+            .map(|reuse| reuse.session.is_poisoned() || reuse.max_positions != max_positions)
+            .unwrap_or(true);
+        if needs_build {
+            self.build_reusable_decode_graph()?;
+        }
+
+        let vocab_size = self.config.vocab_size;
+        let position_i32 =
+            i32::try_from(position).map_err(|_| GraniteSpeechDecoderError::Shape {
+                reason: format!("granite decode position {position} does not fit i32"),
+            })?;
+        let mask_values = fixed_span_tail_mask(max_positions, position);
+
+        let reuse = self
+            .reuse
+            .as_mut()
+            .expect("granite reusable decode graph built above");
+        let embed = reuse.embed;
+        let row_index = reuse.row_index;
+        let position_tensor = reuse.position;
+        let mask = reuse.mask;
+        let logits = reuse.logits;
+        let graph = reuse.session.builder();
+
+        graph
+            .set_f32_slice(embed, &embed_row, "granite_reuse_embed")
+            .map_err(map_ggml("reuse_upload_embed"))?;
+        graph
+            .set_i32_slice(row_index, &[position_i32], "granite_reuse_row")
+            .map_err(map_ggml("reuse_upload_row"))?;
+        graph
+            .set_i32_slice(position_tensor, &[position_i32], "granite_reuse_position")
+            .map_err(map_ggml("reuse_upload_position"))?;
+        graph
+            .set_f32_slice(mask, &mask_values, "granite_reuse_mask")
+            .map_err(map_ggml("reuse_upload_mask"))?;
+        let output = graph
+            .compute_output_f32(logits, vocab_size)
+            .map_err(map_ggml("reuse_compute"))?;
+        self.seq_len = position + 1;
+        Ok(output)
+    }
+
+    /// Build the persistent single-token decode graph against the current
+    /// resident arena and `resident_capacity` span. Mirrors firered-aed's
+    /// `build_reusable_decode_graph`, but keeps Granite's forked
+    /// `granite_pre_attention` / `granite_post_attention` numerics (all four
+    /// Granite scalars: `attention_multiplier`, `residual_multiplier`,
+    /// `embedding_multiplier`, `logits_scaling`). The new token's K/V is written
+    /// into the arena via `set_rows(arena, k/v, row_index)`; self-attention then
+    /// reads the whole fixed span, with the per-step additive `-inf` tail mask
+    /// zeroing every not-yet-written (or masked-future) column so the result is
+    /// numerically the growing-KV attention over exactly `position + 1` keys.
+    fn build_reusable_decode_graph(&mut self) -> Result<(), GraniteSpeechDecoderError> {
+        let config = self.config;
+        let head_dim = config.head_dim;
+        let hidden_size = config.hidden_size;
+        let max_positions = self.resident_capacity;
+        let resident_kv = self
+            .resident_kv
+            .as_ref()
+            .expect("resident arena present before building reuse graph");
+        // Fixed RoPE params: `qwen_neox` uses `ext_factor = 0`, so `n_ctx_orig`
+        // never enters the rotation -- baking `max_positions` here is bit-for-bit
+        // identical to the growing path's per-step `seq_len + 1`.
+        let rope = GgmlRopeExtParams::qwen_neox(head_dim, max_positions, config.rope_theta)
+            .map_err(map_ggml("reuse_rope_params"))?;
+
+        // Snapshot the resident arena's graph tensors as `'static` for the
+        // persistent session (the arena outlives the reuse graph by field order).
+        let kv_tensors: Vec<(GgmlCpuTensor<'static>, GgmlCpuTensor<'static>)> =
+            resident_kv.graph_tensors();
+
+        // Same metadata-context budget the session runner itself uses (see
+        // `GRANITE_DECODE_GRAPH_CONTEXT_BYTES`): ample for the single-token
+        // graph's ~20-op-per-layer tensor structs.
+        let mut session = self
+            .runner
+            .start_persistent_graph_session(GRANITE_DECODE_GRAPH_CONTEXT_BYTES)
+            .map_err(map_ggml("reuse_session_start"))?;
+        let graph = session.builder();
+
+        let embed = graph
+            .new_tensor_2d_f32(hidden_size, 1, "granite_reuse_embed")
+            .map_err(map_ggml("reuse_embed_alloc"))?;
+        let row_index = graph
+            .new_tensor_1d_i32(1, "granite_reuse_row")
+            .map_err(map_ggml("reuse_row_alloc"))?;
+        let position = graph
+            .new_tensor_1d_i32(1, "granite_reuse_position")
+            .map_err(map_ggml("reuse_position_alloc"))?;
+        let mask = graph
+            .new_tensor_2d_f32(max_positions, 1, "granite_reuse_mask")
+            .map_err(map_ggml("reuse_mask_alloc"))?;
+        graph
+            .set_input(embed)
+            .map_err(map_ggml("reuse_embed_input"))?;
+        graph
+            .set_input(row_index)
+            .map_err(map_ggml("reuse_row_input"))?;
+        graph
+            .set_input(position)
+            .map_err(map_ggml("reuse_position_input"))?;
+        graph
+            .set_input(mask)
+            .map_err(map_ggml("reuse_mask_input"))?;
+
+        let mut hidden = graph
+            .scale(embed, config.embedding_multiplier)
+            .map_err(map_ggml("reuse_embed_scale"))?;
+
+        for (index, (arena_k, arena_v)) in kv_tensors.iter().copied().enumerate() {
+            let layer_weights = self.weights.layer_weights(index);
+            let pre =
+                granite_pre_attention(graph, hidden, position, &layer_weights, &config, 1, rope)?;
+            // Write this token's K/V into row `row_index` of the resident arena;
+            // the returned handles are the full `[head_dim, max_positions,
+            // kv_heads]` span (with the new row now live) that attention reads.
+            let k_full = graph
+                .set_rows(arena_k, pre.k_perm, row_index)
+                .map_err(map_ggml("reuse_k_set_rows"))?;
+            let v_full = graph
+                .set_rows(arena_v, pre.v_perm, row_index)
+                .map_err(map_ggml("reuse_v_set_rows"))?;
+            let scores = graph
+                .mul_mat(k_full, pre.q_perm)
+                .map_err(map_ggml("reuse_scores"))?;
+            let probs = graph
+                .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
+                .map_err(map_ggml("reuse_softmax"))?;
+            let v_t = graph
+                .cont(
+                    graph
+                        .transpose(v_full)
+                        .map_err(map_ggml("reuse_v_transpose"))?,
+                )
+                .map_err(map_ggml("reuse_v_cont"))?;
+            let attended = graph
+                .mul_mat(v_t, probs)
+                .map_err(map_ggml("reuse_attended"))?;
+            hidden = granite_post_attention(graph, hidden, attended, &layer_weights, &config, 1)?;
+        }
+
+        let hidden_out = rms_norm(
+            graph,
+            hidden,
+            config.rms_norm_eps,
+            self.weights.final_norm_weight(),
+        )?;
+        let lm_head_w = weight_in_major(
+            graph,
+            self.weights.lm_head_weight(),
+            config.hidden_size,
+            config.vocab_size,
+            "reuse_lm_head_reshape",
+        )?;
+        let logits_raw = linear(graph, lm_head_w, hidden_out, "reuse_lm_head")?;
+        let logits = graph
+            .scale(logits_raw, 1.0 / config.logits_scaling)
+            .map_err(map_ggml("reuse_logits_scale"))?;
+        graph
+            .set_output(logits)
+            .map_err(map_ggml("reuse_set_output"))?;
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(map_ggml("reuse_prepare_outputs"))?;
+
+        self.reuse = Some(GraniteReusableDecodeGraph {
+            session,
+            max_positions,
+            embed,
+            row_index,
+            position,
+            mask,
+            logits,
+        });
+        Ok(())
     }
 }
 
@@ -502,6 +899,159 @@ fn run_prefill_graph(
         per_layer_kv.push((k, v));
     }
     Ok((last_logits, per_layer_kv))
+}
+
+/// One-shot causal prefill that ALSO seeds the device-resident KV arena
+/// (`set_rows` writing rows `0..n_tokens` of every layer's K/V in place), used
+/// on the Metal reuse path. Same batched causal forward as `run_prefill_graph`
+/// (byte-for-byte the same attention op sequence), but the per-layer K/V is
+/// written straight into the resident arena instead of tapped back to the host,
+/// so prefill also avoids the O(n) K/V readback. Returns only the last-position
+/// logits row.
+fn run_prefill_graph_seeding_resident(
+    runner: &mut GgmlCpuGraphRunner,
+    weights: &GraniteDecoderWeights,
+    config: &GraniteSpeechDecoderConfig,
+    resident_kv: &LlmResidentKvArena,
+    embeddings: &[f32],
+    n_tokens: usize,
+) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+    let head_dim = config.head_dim;
+    let hidden_size = config.hidden_size;
+    let vocab_size = config.vocab_size;
+
+    let mut graph = runner.start_graph();
+
+    let embed_tensor = graph
+        .new_tensor_2d_f32(hidden_size, n_tokens, "granite_seed_prefill_embeds")
+        .map_err(map_ggml("seed_prefill_input_alloc"))?;
+    let positions = graph
+        .new_tensor_1d_i32(n_tokens, "granite_seed_prefill_positions")
+        .map_err(map_ggml("seed_prefill_positions_alloc"))?;
+    let mask = graph
+        .new_tensor_2d_f32(n_tokens, n_tokens, "granite_seed_prefill_mask")
+        .map_err(map_ggml("seed_prefill_mask_alloc"))?;
+    let seed_indices = graph
+        .new_tensor_1d_i32(n_tokens, "granite_seed_prefill_rows")
+        .map_err(map_ggml("seed_prefill_rows_alloc"))?;
+
+    let kv_tensors = resident_kv.graph_tensors();
+
+    let mut hidden = graph
+        .scale(embed_tensor, config.embedding_multiplier)
+        .map_err(map_ggml("seed_prefill_embed_scale"))?;
+    let rope = GgmlRopeExtParams::qwen_neox(head_dim, n_tokens, config.rope_theta)
+        .map_err(map_ggml("seed_prefill_rope_params"))?;
+
+    for (index, (arena_k, arena_v)) in kv_tensors.iter().copied().enumerate() {
+        let layer_weights = weights.layer_weights(index);
+        let pre = granite_pre_attention(
+            &mut graph,
+            hidden,
+            positions,
+            &layer_weights,
+            config,
+            n_tokens,
+            rope,
+        )?;
+        // Seed rows 0..n_tokens of the resident arena (side effects), then run
+        // the ordinary batched causal attention over this prompt's own K/V.
+        let k_seed = graph
+            .set_rows(arena_k, pre.k_perm, seed_indices)
+            .map_err(map_ggml("seed_prefill_k_set_rows"))?;
+        graph
+            .add_side_effect_root(k_seed)
+            .map_err(map_ggml("seed_prefill_k_root"))?;
+        let v_seed = graph
+            .set_rows(arena_v, pre.v_perm, seed_indices)
+            .map_err(map_ggml("seed_prefill_v_set_rows"))?;
+        graph
+            .add_side_effect_root(v_seed)
+            .map_err(map_ggml("seed_prefill_v_root"))?;
+
+        let scores = graph
+            .mul_mat(pre.k_perm, pre.q_perm)
+            .map_err(map_ggml("seed_prefill_scores"))?;
+        let probs = graph
+            .soft_max_ext(scores, Some(mask), config.attention_multiplier, 0.0)
+            .map_err(map_ggml("seed_prefill_softmax"))?;
+        let v_t = graph
+            .cont(
+                graph
+                    .transpose(pre.v_perm)
+                    .map_err(map_ggml("seed_prefill_v_transpose"))?,
+            )
+            .map_err(map_ggml("seed_prefill_v_cont"))?;
+        let attended = graph
+            .mul_mat(v_t, probs)
+            .map_err(map_ggml("seed_prefill_attended"))?;
+        hidden = granite_post_attention(
+            &mut graph,
+            hidden,
+            attended,
+            &layer_weights,
+            config,
+            n_tokens,
+        )?;
+    }
+
+    let hidden_out = rms_norm(
+        &graph,
+        hidden,
+        config.rms_norm_eps,
+        weights.final_norm_weight(),
+    )?;
+    let lm_head_w = weight_in_major(
+        &graph,
+        weights.lm_head_weight(),
+        config.hidden_size,
+        config.vocab_size,
+        "seed_lm_head_reshape",
+    )?;
+    let logits_raw = linear(&graph, lm_head_w, hidden_out, "seed_lm_head")?;
+    let logits = graph
+        .scale(logits_raw, 1.0 / config.logits_scaling)
+        .map_err(map_ggml("seed_prefill_logits_scale"))?;
+
+    graph
+        .set_output(logits)
+        .map_err(map_ggml("seed_prefill_set_output_logits"))?;
+    graph
+        .set_input(embed_tensor)
+        .map_err(map_ggml("seed_prefill_mark_input_embeds"))?;
+    graph
+        .set_input(positions)
+        .map_err(map_ggml("seed_prefill_mark_input_positions"))?;
+    graph
+        .set_input(mask)
+        .map_err(map_ggml("seed_prefill_mark_input_mask"))?;
+    graph
+        .set_input(seed_indices)
+        .map_err(map_ggml("seed_prefill_mark_input_rows"))?;
+
+    graph
+        .prepare_outputs_for_upload(&[logits])
+        .map_err(map_ggml("seed_prefill_prepare_outputs"))?;
+    graph
+        .set_f32_slice(embed_tensor, embeddings, "granite_seed_prefill_embeds")
+        .map_err(map_ggml("seed_prefill_upload_embeds"))?;
+    let position_ids: Vec<i32> = (0..n_tokens as i32).collect();
+    graph
+        .set_i32_slice(positions, &position_ids, "granite_seed_prefill_positions")
+        .map_err(map_ggml("seed_prefill_upload_positions"))?;
+    let mask_values = super::decoder_graph::causal_mask(n_tokens);
+    graph
+        .set_f32_slice(mask, &mask_values, "granite_seed_prefill_mask")
+        .map_err(map_ggml("seed_prefill_upload_mask"))?;
+    // Rows 0..n_tokens: the prompt's K/V seeds the arena's leading span.
+    graph
+        .set_i32_slice(seed_indices, &position_ids, "granite_seed_prefill_rows")
+        .map_err(map_ggml("seed_prefill_upload_rows"))?;
+    let logits_full = graph
+        .compute_output_f32(logits, n_tokens * vocab_size)
+        .map_err(map_ggml("seed_prefill_compute"))?;
+    let last_start = (n_tokens - 1) * vocab_size;
+    Ok(logits_full[last_start..last_start + vocab_size].to_vec())
 }
 
 /// One incremental single-token step. `k_hist_bufs[layer]` / `v_hist_bufs[layer]`
@@ -837,6 +1387,16 @@ mod tests {
                 "step {step}: logit[{i}] differs (incremental {a} vs recompute {b})"
             );
         }
+    }
+
+    #[test]
+    fn fixed_span_tail_mask_exposes_only_cached_prefix() {
+        assert_eq!(
+            fixed_span_tail_mask(4, 0),
+            vec![0.0, f32::MIN, f32::MIN, f32::MIN]
+        );
+        assert_eq!(fixed_span_tail_mask(4, 2), vec![0.0, 0.0, 0.0, f32::MIN]);
+        assert_eq!(fixed_span_tail_mask(4, 3), vec![0.0; 4]);
     }
 
     /// The load-bearing correctness gate: the incremental KV-cache session must

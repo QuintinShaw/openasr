@@ -79,9 +79,11 @@ use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_I
 /// one unit (`GraniteSpeechDecodeSession::new_keep_quantized`), and this struct
 /// moves that whole session in and out of the cache without ever separating the
 /// runner from its loaded context or re-binding weights onto a different runner.
-/// The per-request K/V history is released
-/// (`release_session_scoped_buffers`) before the session re-enters the cache,
-/// so only the per-request-invariant resident state is carried across requests.
+/// Before the session re-enters the cache, `release_session_scoped_buffers`
+/// releases CPU host K/V and logically resets the GPU path. The GPU's fixed
+/// resident K/V arena and persistent graph stay allocated across requests;
+/// subsequent prefill/steps overwrite every visible row and mask the stale
+/// tail.
 ///
 /// The embedding table is OWNED here (not a borrow of the request's transient
 /// load) so the resident session carries no lifetime and can live in the
@@ -270,7 +272,6 @@ impl GraniteSpeechGgmlExecutor {
                 reason: error.to_string(),
             }
         })?;
-
         let encoder_weights =
             load_tensors_from_oasr_pack(pack_path, "encoder.").map_err(|error| {
                 GraniteSpeechGgmlExecutorError::EncoderFailed {
@@ -288,7 +289,6 @@ impl GraniteSpeechGgmlExecutor {
         .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
             reason: error.to_string(),
         })?;
-
         let projector_weights =
             load_tensors_from_oasr_pack(pack_path, "projector.").map_err(|error| {
                 GraniteSpeechGgmlExecutorError::ProjectorFailed {
@@ -305,7 +305,6 @@ impl GraniteSpeechGgmlExecutor {
         .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
             reason: error.to_string(),
         })?;
-
         let tokenizer = GraniteSpeechTokenizer::from_gguf_metadata(&metadata).map_err(|error| {
             GraniteSpeechGgmlExecutorError::TokenizerFailed {
                 reason: error.to_string(),
@@ -355,7 +354,6 @@ impl GraniteSpeechGgmlExecutor {
                 backend,
             )?,
         };
-
         let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
             &decoder_config,
             &prepared.embed_table,
@@ -409,14 +407,13 @@ impl GraniteSpeechGgmlExecutor {
             map_registry_error,
             &request.execution_context.control,
         );
-        // Release this decode's per-request K/V buffers before the resident
-        // session re-enters the cache (mirrors firered/mimo's
-        // release_session_scoped_buffers): the heavy runner + loaded weights
-        // stay resident, only the grown KV history is dropped -- regardless of
-        // decode outcome, since a partial compute only poisons that per-request
-        // state, not the uploaded weights. `step_executor`'s borrows of
-        // `prepared` end here under NLL, so `prepared` is free to move into the
-        // cache.
+        // Reset request-visible decode state before the session re-enters the
+        // cache. CPU host K/V is released; GPU resident K/V and its reusable
+        // graph remain allocated but become unreachable until the next prefill
+        // overwrites the visible prefix (the fixed mask hides every stale tail
+        // row). This applies regardless of decode outcome. `step_executor`'s
+        // borrows of `prepared` end here under NLL, so `prepared` is free to
+        // move into the cache.
         prepared.session.release_session_scoped_buffers();
         store_cached_prepared_runtime(cache_key, unload_generation, prepared);
         let result =
@@ -576,10 +573,15 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
     }
 
-    /// Runs one full `execute()` against `pack_path` on the CPU (deterministic)
-    /// backend and returns the transcript. Skips (returns `None`) when the pack
-    /// is absent.
-    fn transcribe_with_pack(pack_path: PathBuf, wav_path: PathBuf) -> Option<String> {
+    const JFK_REFERENCE_TRANSCRIPT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country";
+
+    /// Runs one full `execute()` against `pack_path` on the requested backend and
+    /// returns the transcript. Skips (returns `None`) when the pack is absent.
+    fn transcribe_with_pack(
+        pack_path: PathBuf,
+        wav_path: PathBuf,
+        backend_preference: GgmlAsrBackendPreference,
+    ) -> Option<String> {
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return None;
@@ -591,13 +593,24 @@ mod tests {
         )
         .expect("load wav fixture");
 
-        let backend_preference = GgmlAsrBackendPreference::CpuOnly;
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             backend_preference.request_backend_override(),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
                 crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
             ),
         );
+        if backend_preference == GgmlAsrBackendPreference::Accelerated {
+            assert!(
+                resolved_runtime.backend().is_gpu_class(),
+                "accelerated Granite acceptance must resolve to a GPU-class backend"
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                resolved_runtime.backend(),
+                crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+                "macOS Granite Metal acceptance must not silently run another backend"
+            );
+        }
         let request = GgmlAsrExecutionRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
@@ -626,9 +639,10 @@ mod tests {
     /// `GRANITE_SPEECH_PREPARED_BY_KEY` cache on the second call and still
     /// produce a byte-identical transcript to the first (cache-miss/build)
     /// call. This is the load-bearing correctness gate for the resident cache:
-    /// the second decode reuses a session whose per-request K/V history was
-    /// released before it re-entered the cache, so any leak of prior-request
-    /// state into the reused session would diverge the two transcripts here.
+    /// the second decode reuses a logically reset session. CPU host K/V was
+    /// released; GPU resident K/V remained allocated but must be overwritten
+    /// or masked. Any visible leak of prior-request state would diverge the two
+    /// transcripts here.
     ///
     /// Transcript-vs-reference correctness (that the decode produces the RIGHT
     /// text) is covered separately by the llama.cpp-reference goldens in
@@ -637,16 +651,60 @@ mod tests {
     /// the resident cache adds, which those do not exercise.
     #[test]
     #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
+                OPENASR_GRANITE_SPEECH_PACK and a Metal-capable host; skips when unset"]
+    fn metal_resident_reusable_graph_matches_reference_cold_and_warm() {
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
+        let Some(first_text) = transcribe_with_pack(
+            pack_path.clone(),
+            jfk_wav_path(),
+            GgmlAsrBackendPreference::Accelerated,
+        ) else {
+            return;
+        };
+        let second_text = transcribe_with_pack(
+            pack_path,
+            jfk_wav_path(),
+            GgmlAsrBackendPreference::Accelerated,
+        )
+        .expect("warm Metal transcribe");
+
+        // Metal and CPU use different parallel reduction orders, so their f32
+        // logits are not expected to be bit-identical. The load-bearing external
+        // equivalence is the greedy token sequence rendered as the known JFK
+        // reference transcript, for both the cold graph build and the warm reuse.
+        assert_eq!(
+            first_text, JFK_REFERENCE_TRANSCRIPT,
+            "cold Metal transcript"
+        );
+        assert_eq!(
+            second_text, JFK_REFERENCE_TRANSCRIPT,
+            "warm Metal transcript"
+        );
+        assert_eq!(
+            first_text, second_text,
+            "warm resident graph reuse must preserve the cold greedy transcript"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
                 OPENASR_GRANITE_SPEECH_PACK; skips silently when unset"]
     fn resident_prepared_runtime_reuse_across_consecutive_calls_stays_byte_identical() {
         let Some(pack_path) = dev_pack_path() else {
             return;
         };
-        let Some(first_text) = transcribe_with_pack(pack_path.clone(), jfk_wav_path()) else {
+        let Some(first_text) = transcribe_with_pack(
+            pack_path.clone(),
+            jfk_wav_path(),
+            GgmlAsrBackendPreference::CpuOnly,
+        ) else {
             return;
         };
         let second_text =
-            transcribe_with_pack(pack_path, jfk_wav_path()).expect("second transcribe");
+            transcribe_with_pack(pack_path, jfk_wav_path(), GgmlAsrBackendPreference::CpuOnly)
+                .expect("second transcribe");
         assert!(
             !first_text.trim().is_empty(),
             "first (cache-miss/build) transcript must be non-empty"
