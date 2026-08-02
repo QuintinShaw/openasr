@@ -383,6 +383,34 @@ pub fn enumerate_compute_devices_from_ggml(
         .collect()
 }
 
+/// Conservative admission budget for the exact device behind `route`.
+///
+/// ggml reports both the currently free bytes and the physical total.  We
+/// admit against the smaller of current free memory and 75% of total memory:
+/// the former prevents a request from ignoring other resident workloads, and
+/// the latter preserves headroom for backend-owned scratch allocations that
+/// are not represented by the model working-set estimate.  A missing or zero
+/// memory report is deliberately `None`; discrete-GPU callers must fail
+/// closed or choose a CPU route rather than substitute host RAM for VRAM.
+pub(crate) fn discrete_vram_admission_budget_for_route(
+    route: &ResolvedExecutionRoute,
+    devices: &[GgmlBackendDevice],
+) -> Option<u64> {
+    let inventory = enumerate_compute_devices_from_ggml(devices);
+    let wanted = route.cache_key();
+    let matched = inventory
+        .iter()
+        .find(|device| device.to_resolved_route().cache_key() == wanted)?;
+    let device = devices.get(matched.registry_ordinal)?;
+    let memory = device.memory?;
+    let free = u64::try_from(memory.free_bytes).ok()?;
+    let total = u64::try_from(memory.total_bytes).ok()?;
+    if free == 0 || total == 0 {
+        return None;
+    }
+    Some(free.min(total.saturating_mul(3) / 4))
+}
+
 fn enumerated_from_ggml_device(
     registry_ordinal: usize,
     device: &GgmlBackendDevice,

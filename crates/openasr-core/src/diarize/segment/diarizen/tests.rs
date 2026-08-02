@@ -128,7 +128,7 @@ fn median_filter_uses_scipy_reflect_edges() {
 
 #[test]
 fn postprocess_preserves_frame_geometry() {
-    let output = postprocess_logits(&vec![0.0; 2 * POWERSET_CLASSES], 2);
+    let output = postprocess_logits(&[0.0; 2 * POWERSET_CLASSES], 2);
     assert_eq!(output.0.len(), 2);
     assert_eq!(output.1.len(), 2 * LOCAL_SPEAKERS);
 }
@@ -152,8 +152,7 @@ fn native_graph_matches_external_pytorch_golden() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let golden = external_path("OPENASR_DIARIZEN_GOLDEN");
     DiariZenSegmenter::probe_oasr(&pack).expect("strict pack probe");
-    let segmenter = DiariZenSegmenter::from_test_geometry(&pack, 16_000)
-        .expect("construct test-geometry runtime");
+    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production adapter");
     let waveform = npy_f32(&golden, "waveform");
     assert!(matches!(
         segmenter.infer_window(&waveform, super::config::SAMPLE_RATE_HZ),
@@ -169,8 +168,14 @@ fn native_graph_matches_external_pytorch_golden() {
         ),
         Err(DiariZenSegmenterError::UnsupportedSampleRate { actual: 8_000 })
     ));
-    let mut runtime = segmenter.runtime.lock().expect("runtime lock");
-    let trace = runtime.0.infer_trace(&waveform).expect("native trace");
+    let mut runtime = DiariZenRuntime::new(
+        &pack,
+        16_000,
+        true,
+        Some(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu),
+    )
+    .expect("construct test-geometry runtime");
+    let trace = runtime.infer_trace(&waveform).expect("native trace");
 
     for (name, actual) in &trace {
         if *name == "weighted_layer_sum_raw" {
@@ -255,6 +260,63 @@ fn native_fp16_exact_window_benchmark() {
 }
 
 #[test]
+#[ignore = "requires OPENASR_DIARIZEN_PACK; validates failed-compute recovery"]
+fn native_runtime_rebuilds_only_the_poisoned_graph_after_abort() {
+    let _test_guard = diarizen_runtime_test_lock();
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
+    let samples = synthetic_exact_window();
+
+    install_worker_graph_compute_abort();
+    let error = segmenter
+        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+        .expect_err("injected abort must fail this inference");
+    assert!(error.is_canceled());
+
+    let recovered = segmenter
+        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+        .expect("the same resident weights must rebuild a clean graph");
+    assert_eq!(
+        recovered.logits.len(),
+        recovered.frame_count * POWERSET_CLASSES
+    );
+}
+
+#[test]
+#[ignore = "requires OPENASR_DIARIZEN_PACK; validates terminal-backend eviction"]
+fn native_runtime_rebuilds_the_runner_after_device_loss_without_retrying_request() {
+    let _test_guard = diarizen_runtime_test_lock();
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
+    let samples = synthetic_exact_window();
+
+    install_worker_graph_compute_device_lost();
+    let error = segmenter
+        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+        .expect_err("device loss must fail this request without retry");
+    assert!(matches!(
+        error,
+        DiariZenSegmenterError::Graph {
+            source: crate::ggml_runtime::GgmlCpuGraphError::DeviceLost,
+            ..
+        }
+    ));
+    assert_eq!(
+        diarizen_worker_runtime_entry_count(),
+        0,
+        "a terminal backend handle must be evicted on its owner worker"
+    );
+
+    let recovered = segmenter
+        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+        .expect("the next request builds a fresh runner");
+    assert_eq!(
+        recovered.logits.len(),
+        recovered.frame_count * POWERSET_CLASSES
+    );
+}
+
+#[test]
 #[ignore = "requires OPENASR_DIARIZEN_PACK; native release benchmark"]
 fn native_fp16_sixty_second_window_throughput_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
@@ -273,8 +335,8 @@ fn native_fp16_sixty_second_window_throughput_benchmark() {
         0
     };
     let has_tail = recording_samples < super::config::WINDOW_SAMPLES
-        || (recording_samples - super::config::WINDOW_SAMPLES) % super::config::WINDOW_STEP_SAMPLES
-            > 0;
+        || !(recording_samples - super::config::WINDOW_SAMPLES)
+            .is_multiple_of(super::config::WINDOW_STEP_SAMPLES);
     let windows = complete + usize::from(has_tail);
     assert_eq!(windows, 29);
 

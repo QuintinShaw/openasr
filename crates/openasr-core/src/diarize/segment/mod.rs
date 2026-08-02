@@ -17,8 +17,11 @@ pub use diarizen::{
     DIARIZEN_GGML_ARCHITECTURE_ID, DiariZenSegmenter, DiariZenSegmenterError, DiariZenWindowOutput,
     diarizen_pack_installed, load_diarizen_segmenter, shared_diarizen_segmenter,
 };
-pub use pack::{SEGMENTER_PACK_ID, segmenter_pack_installed, shared_segmenter};
-pub(crate) use pack::{SelectedSegmenter, resolve_segmenter};
+pub use pack::{DIARIZEN_PACK_ID, SEGMENTER_PACK_ID, segmenter_pack_installed, shared_segmenter};
+pub(crate) use pack::{
+    PreparedSelectedSegmenter, SegmenterExecutionKey, SegmenterProvider, SegmenterRuntimeInput,
+    SelectedSegmenter, prepare_segmenter, unload_idle_segmenter_caches,
+};
 
 use pyannet::{NUM_CLASSES, PyannetModel};
 use thiserror::Error;
@@ -57,20 +60,87 @@ pub enum SegmentError {
 /// Global clock used by aggregated local-speaker counts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ActivityFrameClock {
-    pub start_s: f64,
-    pub duration_s: f64,
-    pub step_s: f64,
+    start_samples: u64,
+    duration_samples: u32,
+    step_samples: u32,
+    sample_rate_hz: u32,
 }
 
 impl ActivityFrameClock {
+    pub(crate) const fn new(
+        start_samples: u64,
+        duration_samples: u32,
+        step_samples: u32,
+        sample_rate_hz: u32,
+    ) -> Self {
+        Self {
+            start_samples,
+            duration_samples,
+            step_samples,
+            sample_rate_hz,
+        }
+    }
+
+    pub(crate) fn duration_s(self) -> f64 {
+        self.duration_samples as f64 / self.sample_rate_hz as f64
+    }
+
     pub(crate) fn midpoint_s(self, frame: usize) -> f64 {
-        self.start_s + frame as f64 * self.step_s + self.duration_s * 0.5
+        self.midpoint_samples_x2(frame) as f64 / (2.0 * self.sample_rate_hz as f64)
     }
 
     pub(crate) fn closest_frame(self, timestamp_s: f64) -> usize {
-        ((timestamp_s - self.start_s - self.duration_s * 0.5) / self.step_s)
+        ((timestamp_s - self.midpoint_s(0))
+            / (self.step_samples as f64 / self.sample_rate_hz as f64))
             .round_ties_even()
             .max(0.0) as usize
+    }
+
+    pub(crate) fn closest_frame_for_window_start(self, start_sample: usize) -> usize {
+        let target = (start_sample as u128)
+            .saturating_mul(2)
+            .saturating_add(self.duration_samples as u128);
+        self.closest_frame_to_samples_x2(target)
+    }
+
+    fn midpoint_samples_x2(self, frame: usize) -> u128 {
+        (self.start_samples as u128)
+            .saturating_mul(2)
+            .saturating_add(self.duration_samples as u128)
+            .saturating_add(
+                (frame as u128)
+                    .saturating_mul(self.step_samples as u128)
+                    .saturating_mul(2),
+            )
+    }
+
+    fn closest_frame_to_samples_x2(self, target: u128) -> usize {
+        let first = self.midpoint_samples_x2(0);
+        if target <= first {
+            return 0;
+        }
+        let step_x2 = (self.step_samples as u128) * 2;
+        let delta = target - first;
+        let quotient = delta / step_x2;
+        let remainder = delta % step_x2;
+        let rounded = match (remainder * 2).cmp(&step_x2) {
+            std::cmp::Ordering::Less => quotient,
+            std::cmp::Ordering::Greater => quotient + 1,
+            std::cmp::Ordering::Equal if quotient % 2 == 1 => quotient + 1,
+            std::cmp::Ordering::Equal => quotient,
+        };
+        rounded.min(usize::MAX as u128) as usize
+    }
+
+    fn frame_count_for_samples(self, samples: usize) -> usize {
+        let audio_end_x2 = (samples as u128).saturating_mul(2);
+        let first = self.midpoint_samples_x2(0);
+        if audio_end_x2 < first {
+            0
+        } else {
+            let count = (audio_end_x2 - first) / ((self.step_samples as u128) * 2) + 1;
+            count.min(usize::MAX as u128) as usize
+        }
     }
 }
 
@@ -78,7 +148,7 @@ impl ActivityFrameClock {
 /// window-local speaker slots; bit `n` means local slot `n` is active.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LocalActivityWindow {
-    pub start_s: f64,
+    pub start_sample: usize,
     pub frame_activity: Vec<u8>,
 }
 
@@ -226,21 +296,13 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
 
         let window_samples = (self.protocol.window_s * sample_rate_hz as f64) as usize;
         let step_samples = (self.protocol.step_s * sample_rate_hz as f64).round() as usize;
-        let complete_windows = if samples.len() >= window_samples {
-            1 + (samples.len() - window_samples) / step_samples
-        } else {
-            0
-        };
-        let has_last = samples.len() < window_samples
-            || !(samples.len() - window_samples).is_multiple_of(step_samples);
-        let total_windows = complete_windows + usize::from(has_last);
-        let mut windows = Vec::with_capacity(total_windows);
+        let starts = sliding_window_starts(samples.len(), window_samples, step_samples);
+        let mut windows = Vec::with_capacity(starts.len());
 
-        for index in 0..total_windows {
+        for start in starts {
             if canceled() {
                 return Err(SegmentError::Canceled);
             }
-            let start = index * step_samples;
             let end = (start + window_samples).min(samples.len());
             let activity = if end - start == window_samples {
                 self.infer_window(&samples[start..end])?
@@ -250,20 +312,19 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
                 self.infer_window(&padded)?
             };
             windows.push(LocalActivityWindow {
-                start_s: start as f64 / sample_rate_hz as f64,
+                start_sample: start,
                 frame_activity: activity,
             });
         }
 
         let frame_clock = activity_frame_clock();
-        let audio_duration_s = samples.len() as f64 / sample_rate_hz as f64;
         for window in &mut windows {
-            window.frame_activity.truncate(frame_count_for_duration(
-                frame_clock,
-                (audio_duration_s - window.start_s).max(0.0),
-            ));
+            window.frame_activity.truncate(
+                frame_clock
+                    .frame_count_for_samples(samples.len().saturating_sub(window.start_sample)),
+            );
         }
-        let speaker_count = aggregate_speaker_count(&windows, frame_clock, audio_duration_s);
+        let speaker_count = aggregate_speaker_count(&windows, frame_clock, samples.len());
         Ok(LocalActivity {
             frame_clock,
             windows,
@@ -273,27 +334,162 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
     }
 }
 
-fn activity_frame_clock() -> ActivityFrameClock {
-    ActivityFrameClock {
-        start_s: 0.0,
-        duration_s: FRAME_DURATION_SAMPLES / SAMPLE_RATE_HZ as f64,
-        step_s: FRAME_STEP_SAMPLES / SAMPLE_RATE_HZ as f64,
+impl LocalActivitySegmenter for diarizen::DiariZenSegmenter {
+    fn segment_local_activity(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<LocalActivity, SegmentError> {
+        segment_diarizen_local_activity(samples, sample_rate_hz, canceled, |window| {
+            self.infer_window(window, sample_rate_hz)
+                .map_err(diarizen_error_to_segment)
+        })
     }
+}
+
+fn diarizen_error_to_segment(error: diarizen::DiariZenSegmenterError) -> SegmentError {
+    if error.is_canceled() {
+        SegmentError::Canceled
+    } else {
+        SegmentError::Inference(error.to_string())
+    }
+}
+
+fn segment_diarizen_local_activity(
+    samples: &[f32],
+    sample_rate_hz: u32,
+    canceled: &dyn Fn() -> bool,
+    mut infer_window: impl FnMut(&[f32]) -> Result<diarizen::DiariZenWindowOutput, SegmentError>,
+) -> Result<LocalActivity, SegmentError> {
+    use diarizen::{
+        DIARIZEN_FRAME_DURATION_SAMPLES, DIARIZEN_FRAME_STEP_SAMPLES, DIARIZEN_LOCAL_SPEAKERS,
+        DIARIZEN_SAMPLE_RATE_HZ, DIARIZEN_WINDOW_SAMPLES, DIARIZEN_WINDOW_STEP_SAMPLES,
+    };
+
+    if sample_rate_hz != DIARIZEN_SAMPLE_RATE_HZ {
+        return Err(SegmentError::UnsupportedSampleRate(sample_rate_hz));
+    }
+    let frame_clock = ActivityFrameClock::new(
+        0,
+        DIARIZEN_FRAME_DURATION_SAMPLES,
+        DIARIZEN_FRAME_STEP_SAMPLES,
+        DIARIZEN_SAMPLE_RATE_HZ,
+    );
+    if samples.is_empty() {
+        return Ok(LocalActivity {
+            frame_clock,
+            windows: Vec::new(),
+            local_speaker_slots: DIARIZEN_LOCAL_SPEAKERS as u8,
+            speaker_count: Vec::new(),
+        });
+    }
+
+    let starts = sliding_window_starts(
+        samples.len(),
+        DIARIZEN_WINDOW_SAMPLES,
+        DIARIZEN_WINDOW_STEP_SAMPLES,
+    );
+    let mut windows = Vec::with_capacity(starts.len());
+    for start in starts {
+        if canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let end = (start + DIARIZEN_WINDOW_SAMPLES).min(samples.len());
+        let output = if end - start == DIARIZEN_WINDOW_SAMPLES {
+            infer_window(&samples[start..end])?
+        } else {
+            let mut padded = vec![0.0f32; DIARIZEN_WINDOW_SAMPLES];
+            padded[..end - start].copy_from_slice(&samples[start..end]);
+            infer_window(&padded)?
+        };
+        if canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        if output.activity.len() != output.frame_count * DIARIZEN_LOCAL_SPEAKERS {
+            return Err(SegmentError::Inference(format!(
+                "DiariZen activity shape mismatch: {} values for {} frames x {} speakers",
+                output.activity.len(),
+                output.frame_count,
+                DIARIZEN_LOCAL_SPEAKERS
+            )));
+        }
+        let frame_activity = output
+            .activity
+            .chunks_exact(DIARIZEN_LOCAL_SPEAKERS)
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .fold(0u8, |mask, (speaker, &active)| {
+                        mask | (u8::from(active != 0) << speaker)
+                    })
+            })
+            .collect();
+        windows.push(LocalActivityWindow {
+            start_sample: start,
+            frame_activity,
+        });
+    }
+
+    for window in &mut windows {
+        window.frame_activity.truncate(
+            frame_clock.frame_count_for_samples(samples.len().saturating_sub(window.start_sample)),
+        );
+    }
+    let speaker_count = aggregate_speaker_count(&windows, frame_clock, samples.len());
+    Ok(LocalActivity {
+        frame_clock,
+        windows,
+        local_speaker_slots: DIARIZEN_LOCAL_SPEAKERS as u8,
+        speaker_count,
+    })
+}
+
+fn sliding_window_starts(
+    sample_count: usize,
+    window_samples: usize,
+    step_samples: usize,
+) -> Vec<usize> {
+    debug_assert!(window_samples > 0);
+    debug_assert!(step_samples > 0);
+    if sample_count == 0 {
+        return Vec::new();
+    }
+    let complete_windows = if sample_count >= window_samples {
+        1 + (sample_count - window_samples) / step_samples
+    } else {
+        0
+    };
+    let has_last = sample_count < window_samples
+        || !(sample_count - window_samples).is_multiple_of(step_samples);
+    let total_windows = complete_windows + usize::from(has_last);
+    (0..total_windows)
+        .map(|index| index * step_samples)
+        .collect()
+}
+
+fn activity_frame_clock() -> ActivityFrameClock {
+    ActivityFrameClock::new(
+        0,
+        FRAME_DURATION_SAMPLES as u32,
+        FRAME_STEP_SAMPLES as u32,
+        SAMPLE_RATE_HZ,
+    )
 }
 
 fn aggregate_speaker_count(
     windows: &[LocalActivityWindow],
     frame_clock: ActivityFrameClock,
-    audio_duration_s: f64,
+    audio_samples: usize,
 ) -> Vec<u8> {
     let Some(first) = windows.first() else {
         return Vec::new();
     };
-    let frame_count = frame_count_for_duration(frame_clock, audio_duration_s);
+    let frame_count = frame_clock.frame_count_for_samples(audio_samples);
     let mut sums = vec![0.0f32; frame_count];
     let mut observations = vec![0u16; frame_count];
     for window in windows {
-        let start = frame_clock.closest_frame(window.start_s + frame_clock.duration_s * 0.5);
+        let start = frame_clock.closest_frame_for_window_start(window.start_sample);
         for (offset, &activity) in window.frame_activity.iter().enumerate() {
             let index = start + offset;
             if index >= frame_count {
@@ -318,14 +514,6 @@ fn aggregate_speaker_count(
             }
         })
         .collect()
-}
-
-fn frame_count_for_duration(clock: ActivityFrameClock, duration_s: f64) -> usize {
-    if duration_s < clock.duration_s * 0.5 {
-        0
-    } else {
-        ((duration_s - clock.duration_s * 0.5) / clock.step_s).floor() as usize + 1
-    }
 }
 
 fn decode_activity(logp: &[f32], frames: usize) -> Vec<u8> {
@@ -407,32 +595,24 @@ mod decode_tests {
 
     #[test]
     fn count_aggregation_rounds_overlapping_windows() {
-        let clock = ActivityFrameClock {
-            start_s: 0.0,
-            duration_s: 1.0,
-            step_s: 1.0,
-        };
+        let clock = ActivityFrameClock::new(0, 1, 1, 1);
         let windows = vec![
             LocalActivityWindow {
-                start_s: 0.0,
+                start_sample: 0,
                 frame_activity: vec![0b01, 0b11],
             },
             LocalActivityWindow {
-                start_s: 1.0,
+                start_sample: 1,
                 frame_activity: vec![0b01, 0b01],
             },
         ];
-        assert_eq!(aggregate_speaker_count(&windows, clock, 3.0), vec![1, 2, 1]);
+        assert_eq!(aggregate_speaker_count(&windows, clock, 3), vec![1, 2, 1]);
     }
 
     #[test]
     fn valid_regions_are_activity_only() {
         let activity = LocalActivity {
-            frame_clock: ActivityFrameClock {
-                start_s: 0.0,
-                duration_s: 0.2,
-                step_s: 0.1,
-            },
+            frame_clock: ActivityFrameClock::new(0, 2, 1, 10),
             windows: Vec::new(),
             local_speaker_slots: 3,
             speaker_count: vec![0, 1, 1, 0],
@@ -447,5 +627,130 @@ mod decode_tests {
         assert_eq!(regions.len(), 1);
         assert!((regions[0].start_s - 0.3).abs() < 1.0e-9);
         assert_eq!(regions[0].end_s, 0.35);
+    }
+
+    #[test]
+    fn frame_count_uses_exact_sample_boundaries() {
+        let diarizen = ActivityFrameClock::new(0, 400, 320, 16_000);
+        assert_eq!(diarizen.frame_count_for_samples(199), 0);
+        assert_eq!(diarizen.frame_count_for_samples(200), 1);
+        assert_eq!(diarizen.frame_count_for_samples(519), 1);
+        assert_eq!(diarizen.frame_count_for_samples(520), 2);
+        assert_eq!(diarizen.frame_count_for_samples(839), 2);
+        assert_eq!(diarizen.frame_count_for_samples(840), 3);
+
+        let pyannote = activity_frame_clock();
+        assert_eq!(pyannote.frame_count_for_samples(455), 0);
+        assert_eq!(pyannote.frame_count_for_samples(456), 1);
+    }
+
+    #[test]
+    fn diarizen_adapter_uses_official_geometry_and_four_slot_masks() {
+        let samples = vec![0.0f32; diarizen::DIARIZEN_WINDOW_SAMPLES];
+        let activity = segment_diarizen_local_activity(&samples, 16_000, &|| false, |window| {
+            assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
+            Ok(diarizen::DiariZenWindowOutput {
+                frame_count: 4,
+                logits: Vec::new(),
+                powerset_class: Vec::new(),
+                activity: vec![
+                    1, 0, 0, 0, // local 0
+                    0, 1, 0, 1, // local 1 + 3 overlap
+                    0, 0, 1, 0, // local 2
+                    0, 0, 0, 0,
+                ],
+            })
+        })
+        .expect("adapter");
+
+        assert_eq!(activity.frame_clock.midpoint_s(0), 0.0125);
+        assert_eq!(activity.frame_clock.midpoint_s(1), 0.0325);
+        assert_eq!(activity.local_speaker_slots, 4);
+        assert_eq!(activity.windows.len(), 1);
+        assert_eq!(
+            activity.windows[0].frame_activity,
+            vec![0b0001, 0b1010, 0b0100, 0]
+        );
+    }
+
+    #[test]
+    fn diarizen_adapter_pads_and_truncates_the_orphan_window() {
+        let samples = vec![1.0f32; 17 * 16_000];
+        let mut calls = 0;
+        let activity = segment_diarizen_local_activity(&samples, 16_000, &|| false, |window| {
+            calls += 1;
+            assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
+            if calls == 2 {
+                assert_eq!(window[15 * 16_000 + 6_399], 1.0);
+                assert_eq!(window[15 * 16_000 + 6_400], 0.0);
+                assert_eq!(window[diarizen::DIARIZEN_WINDOW_SAMPLES - 1], 0.0);
+            }
+            Ok(diarizen::DiariZenWindowOutput {
+                frame_count: 799,
+                logits: Vec::new(),
+                powerset_class: Vec::new(),
+                activity: vec![0; 799 * diarizen::DIARIZEN_LOCAL_SPEAKERS],
+            })
+        })
+        .expect("adapter");
+
+        assert_eq!(calls, 2);
+        assert_eq!(activity.windows[0].start_sample, 0);
+        assert_eq!(
+            activity.windows[1].start_sample,
+            diarizen::DIARIZEN_WINDOW_STEP_SAMPLES
+        );
+        assert_eq!(activity.windows[0].frame_activity.len(), 799);
+        assert_eq!(activity.windows[1].frame_activity.len(), 770);
+    }
+
+    #[test]
+    fn diarizen_adapter_empty_and_cancellation_are_explicit() {
+        let empty = segment_diarizen_local_activity(&[], 16_000, &|| false, |_| {
+            panic!("empty audio must not run inference")
+        })
+        .expect("empty");
+        assert!(empty.windows.is_empty());
+        assert_eq!(empty.local_speaker_slots, 4);
+
+        let calls = std::cell::Cell::new(0);
+        let error = segment_diarizen_local_activity(
+            &vec![0.0f32; 17 * 16_000],
+            16_000,
+            &|| calls.get() > 0,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(diarizen::DiariZenWindowOutput {
+                    frame_count: 1,
+                    logits: Vec::new(),
+                    powerset_class: Vec::new(),
+                    activity: vec![0; diarizen::DIARIZEN_LOCAL_SPEAKERS],
+                })
+            },
+        )
+        .expect_err("cancel after first window");
+        assert!(matches!(error, SegmentError::Canceled));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn diarizen_mid_graph_cancel_stays_typed() {
+        let error = diarizen::DiariZenSegmenterError::Graph {
+            step: "test",
+            source: crate::ggml_runtime::GgmlCpuGraphError::Aborted,
+        };
+        assert!(matches!(
+            diarizen_error_to_segment(error),
+            SegmentError::Canceled
+        ));
+    }
+
+    #[test]
+    fn sliding_window_geometry_does_not_duplicate_exact_tail() {
+        assert_eq!(sliding_window_starts(0, 160, 16), Vec::<usize>::new());
+        assert_eq!(sliding_window_starts(159, 160, 16), vec![0]);
+        assert_eq!(sliding_window_starts(160, 160, 16), vec![0]);
+        assert_eq!(sliding_window_starts(176, 160, 16), vec![0, 16]);
+        assert_eq!(sliding_window_starts(177, 160, 16), vec![0, 16, 32]);
     }
 }

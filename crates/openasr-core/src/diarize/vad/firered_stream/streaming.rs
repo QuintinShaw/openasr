@@ -39,12 +39,16 @@ impl FireRedStreamingVad {
     /// Build a streaming detector over the shared model, or `None` if the
     /// vendored weights are unavailable.
     pub fn shared() -> Option<Self> {
-        super::shared_model().map(|model| Self {
+        super::shared_model().map(Self::from_model)
+    }
+
+    pub(super) fn from_model(model: &'static FireRedStreamVadModel) -> Self {
+        Self {
             model,
             cache: FireRedStreamVadCache::new(),
             raw_buffer: Vec::with_capacity(FRAME_LENGTH * 2),
             last_prob: 0.0,
-        })
+        }
     }
 
     /// Feed one frame of 16 kHz mono 16-bit PCM and return the current speech
@@ -54,14 +58,28 @@ impl FireRedStreamingVad {
     /// cache. `10ms` granularity (`FRAME_SHIFT_MS`) is well within the
     /// endpointer's hysteresis tolerance.
     pub fn accept_frame(&mut self, samples: &[i16]) -> f32 {
-        self.raw_buffer
-            .extend(samples.iter().map(|sample| *sample as f32 / 32_768.0));
+        let float_samples = samples
+            .iter()
+            .map(|sample| *sample as f32 / 32_768.0)
+            .collect::<Vec<_>>();
+        let _ = self.accept_f32_chunk(&float_samples);
+        self.last_prob
+    }
+
+    /// Feed an offline/native f32 chunk and return every newly completed
+    /// 10 ms probability. This is the same state machine as realtime
+    /// `accept_frame`, exposed to the file-diarization provider so long
+    /// recordings can be processed in bounded chunks with cancellation
+    /// checkpoints between them instead of one uninterruptible whole-file
+    /// fbank/DFSMN call.
+    pub(super) fn accept_f32_chunk(&mut self, samples: &[f32]) -> Vec<f32> {
+        self.raw_buffer.extend_from_slice(samples);
         if self.raw_buffer.len() < FRAME_LENGTH {
-            return self.last_prob;
+            return Vec::new();
         }
         let (features, n_frames) = self.model.cmvn_features(&self.raw_buffer);
         if n_frames == 0 {
-            return self.last_prob;
+            return Vec::new();
         }
         let probs = self
             .model
@@ -76,7 +94,7 @@ impl FireRedStreamingVad {
         let frame_shift_samples = (16_000u64 * FRAME_SHIFT_MS as u64 / 1000) as usize;
         let consumed = n_frames * frame_shift_samples;
         self.raw_buffer.drain(..consumed);
-        self.last_prob
+        probs
     }
 
     /// Most recent probability without feeding new audio.

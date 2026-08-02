@@ -1242,6 +1242,15 @@ fn run_native_transcription_fallible(
     // below: `publish_align_progress` after that call still needs this
     // request's transcription id.
     let execution_context = Arc::clone(&request.execution_context);
+    // The synchronous core entry owns every auxiliary and decoder graph run,
+    // so it also owns publication of this request's ggml abort flag. Server
+    // callers may already have armed the same control outside spawn_blocking;
+    // the guard is intentionally nestable and restores that outer publication.
+    // Direct core/CLI callers now receive the identical mid-graph cancel path.
+    let _abort_callback_guard = execution_context.control.arm_for_native_decode();
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     // Spans the whole run (decode + assembly inside impl, then the punctuation
     // and forced-align post-processes below) so this request's progress-registry
     // entry is removed on every exit and the align phase advances the same
@@ -1284,6 +1293,9 @@ fn run_native_transcription_fallible(
     // being disjoint from it, which is called out in both log lines' names.
     let inference_started = Instant::now();
     let transcription = run_native_transcription_impl(request)?;
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     crate::stage_timing::log_stage(
         "native_transcribe",
         "inference",
@@ -1312,7 +1324,11 @@ fn run_native_transcription_fallible(
         "postprocess",
         postprocess_started.elapsed(),
     );
-    result
+    if execution_context.is_canceled() {
+        Err(BackendError::TranscriptionCanceled)
+    } else {
+        result
+    }
 }
 
 /// Whether the punctuation-restoration stage should attempt to run: the
@@ -1589,32 +1605,46 @@ fn run_native_transcription_impl(
         ),
         request.phrase_bias.as_ref(),
     )?;
+    // Resolve and install the request's hardware route before any auxiliary
+    // Voice ID model is preflighted. DiariZen constructs a resident ggml graph
+    // during preflight, so installing this only at decoder dispatch would let
+    // the first request permanently choose the auxiliary model's device.
+    let backend_preference = execution_target_backend_preference(request.execution_target)?;
+    let request_backend_preference = backend_preference.request_backend_override();
+    let _backend_guard = install_request_backend_override(request_backend_preference.clone());
+    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
+        selected_family.model_architecture,
+    );
+    let resolved_runtime_for_request = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        request_backend_preference.clone(),
+        auto_gpu_policy,
+    );
     // Resolve the one segmentation source for this request. Exactly one runs:
     // the family's own decode, or the external segment/embed/cluster pass --
     // never both, so nothing can overwrite the other's labels downstream.
     let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
-    // Freeze the exact ReDim pack snapshot for the full request. The external
-    // clusterer and the shared identity stage must never observe different
-    // embedding spaces if a pack is replaced while a long transcription is
-    // running.
-    let voice_id_embedder = if speaker_plan == SpeakerPlan::Off {
+    // Freeze lightweight, already-open pack snapshots before audio decode, but
+    // do not parse/dequantize weights or construct an auxiliary graph yet. The
+    // held mappings are materialized only after audio preparation and memory
+    // admission, so a malformed input or known-impossible request never pays
+    // the auxiliary model working set and path replacement cannot change the
+    // bytes admitted for this request.
+    let voice_id_embedder_plan = if speaker_plan == SpeakerPlan::Off {
         None
     } else {
-        Some(crate::diarize::embed::shared_embedder().ok_or(
-            BackendError::VoiceIdIdentityFailed(
-                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
-            ),
-        )?)
-    };
-    let external_diarizer = if speaker_plan == SpeakerPlan::External {
         Some(
-            crate::diarize::external::ExternalDiarizer::preflight(
-                request.voice_id_segmenter,
-                Arc::clone(
-                    voice_id_embedder
-                        .as_ref()
-                        .expect("external Voice ID preflight resolved its embedder"),
+            crate::diarize::embed::prepare_shared_embedder_snapshot().ok_or(
+                BackendError::VoiceIdIdentityFailed(
+                    crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
                 ),
+            )?,
+        )
+    };
+    let external_diarizer_plan = if speaker_plan == SpeakerPlan::External {
+        Some(
+            crate::diarize::external::PreparedExternalDiarizer::prepare(
+                request.voice_id_segmenter,
+                request_backend_preference.clone(),
             )
             .map_err(external_diarization_error_to_backend)?,
         )
@@ -1655,6 +1685,14 @@ fn run_native_transcription_impl(
         "audio_prep",
         audio_prep_started.elapsed(),
     );
+    // Empty-but-valid PCM must reach the ASR family's established empty-input
+    // behavior without first materializing Voice ID. No acoustic evidence can
+    // produce a speaker label, so its effective speaker plan is off.
+    let speaker_plan = if prepared_audio.is_empty() {
+        SpeakerPlan::Off
+    } else {
+        speaker_plan
+    };
 
     // Reject before any decode graph gets built -- and before
     // `compute_speaker_attribution` below, which loads the segmenter and
@@ -1672,33 +1710,64 @@ fn run_native_transcription_impl(
     // goes through). Wired per family via `native_capacity_admission_facts`;
     // families without a wired deriver fall through to "allow". A request
     // whose speaker plan enables Voice ID is additionally charged the shared
-    // embedder's co-resident footprint (`voice_id_embedder_admission_bytes`)
-    // -- the acoustic-identity pass this very check must run ahead of.
+    // Voice ID stack's co-resident footprint (`voice_id_admission_bytes`). The
+    // lightweight snapshots above are still unmaterialized at this gate.
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
-    // The backend this request will actually dispatch on, resolved the same
-    // way `resolved_runtime_for_request` further down resolves it (explicit
-    // request preference + this family's Auto-mode GPU gate) -- admission
-    // needs the real backend because the KV-cache element-type policy
-    // (`resolve_qwen_family_production_kv_cache_policy`) depends on it, and
-    // guessing would risk exactly the false rejection this check must not
-    // produce. Recomputed here rather than threaded down from below: at this
-    // point nothing has installed the request's backend override yet, and
-    // this resolution is pure (no side effect) and cheap enough to redo.
-    let admission_backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        execution_target_backend_preference(request.execution_target)?.request_backend_override(),
-        crate::arch::family_auto_gpu_policy_for_model_architecture(
-            selected_family.model_architecture,
-        ),
-    )
-    .backend();
+    // Admission uses the exact same already-resolved decoder backend as
+    // provenance and dispatch. Auxiliary models report their own backend
+    // separately because Auto may legitimately place DiariZen on a GPU even
+    // when this ASR family gates its own Auto path to CPU.
+    let admission_backend = resolved_runtime_for_request.backend();
     enforce_native_host_memory_admission(
         selected_family.model_architecture,
         &runtime_preflight.metadata,
-        runtime_source.path(),
+        runtime_source.byte_len(),
         audio_duration_seconds,
         admission_backend,
-        voice_id_embedder_admission_bytes(speaker_plan),
+        voice_id_auxiliary_admission(
+            speaker_plan,
+            voice_id_embedder_plan
+                .as_ref()
+                .map_or(0, |embedder| embedder.admission_bytes()),
+            external_diarizer_plan.as_ref().map(|diarizer| {
+                (
+                    diarizer.segmenter_admission_bytes(),
+                    diarizer.segmenter_admission_backend(),
+                    diarizer.segmenter_discrete_vram_budget_bytes(),
+                )
+            }),
+        ),
+        minimum_discrete_vram_budget_for_preference(
+            admission_backend,
+            request_backend_preference.as_ref(),
+        ),
     )?;
+
+    let voice_id_embedder = if speaker_plan == SpeakerPlan::Off {
+        None
+    } else {
+        let embedder = voice_id_embedder_plan
+            .expect("enabled Voice ID prepared an embedder snapshot")
+            .materialize()
+            .ok_or(BackendError::VoiceIdIdentityFailed(
+                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
+            ))?;
+        Some(embedder)
+    };
+    let external_diarizer = if speaker_plan == SpeakerPlan::External {
+        Some(
+            external_diarizer_plan
+                .expect("external Voice ID prepared a segmenter snapshot")
+                .materialize(Arc::clone(
+                    voice_id_embedder
+                        .as_ref()
+                        .expect("external Voice ID materialized its embedder"),
+                ))
+                .map_err(external_diarization_error_to_backend)?,
+        )
+    } else {
+        None
+    };
 
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
@@ -1775,33 +1844,6 @@ fn run_native_transcription_impl(
     // the two mutually exclusive, and this is where that decision reaches the
     // family executor.
     request_options.in_decoder_speakers = speaker_plan == SpeakerPlan::InDecoder;
-    let backend_preference = execution_target_backend_preference(request.execution_target)?;
-    // Installed for the whole transcribe call: not consulted by the
-    // provenance label or the longform multichunk-metal probe below (those
-    // resolve from the explicit `backend_preference` value directly, via
-    // `resolved_runtime_for_request` a few lines down), but still the
-    // pre-existing, unrelated per-request-override channel some family
-    // internals legitimately read mid-decode (e.g. firered_llm's RAM-fit
-    // override check, `graph_runtime_config`'s `gpu_stage_enabled_for_backend`).
-    let _backend_guard =
-        install_request_backend_override(backend_preference.request_backend_override());
-    // This family's Auto-mode GPU capability, so the provenance backend label
-    // below resolves through the same family-aware gate the family's own
-    // executor used.
-    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
-        selected_family.model_architecture,
-    );
-    // Resolved once here, from the explicit `backend_preference` value above
-    // (never a thread-local read), for everything in this function that
-    // needs it before dispatch runs: the longform multichunk-metal probe and
-    // the provenance label. `run_dispatch_once` below resolves its own copy
-    // the same way, from its own (possibly GPU-fallback-adjusted)
-    // `backend_preference` parameter -- see its doc comment for why this
-    // can't just be threaded down as the same precomputed value.
-    let resolved_runtime_for_request = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        backend_preference.request_backend_override(),
-        auto_gpu_policy,
-    );
     // Per-request diagnostics line (source/model/quant/backend/audio shape) --
     // logged once here, after model resolution and audio prep have both
     // succeeded and the backend label is resolvable, and before decode
@@ -2401,7 +2443,8 @@ fn finalize_native_transcription(
                 crate::diarize::voice_id::name_speakers_across_scopes_with_embedder(
                     embedder,
                     &mut scopes,
-                )?;
+                )
+                .map_err(speaker_identity_error_to_backend)?;
         }
         SpeakerPlan::External => {
             // External segmentation has already been normalized to the same
@@ -2416,7 +2459,8 @@ fn finalize_native_transcription(
                     embedder,
                     &mut transcription.segments,
                     prepared_audio,
-                )?;
+                )
+                .map_err(speaker_identity_error_to_backend)?;
         }
         SpeakerPlan::Off => {
             transcription.unnamed_speakers.clear();
@@ -2570,6 +2614,17 @@ fn external_diarization_error_to_backend(
         error => BackendError::ExternalDiarizationFailed {
             reason: error.to_string(),
         },
+    }
+}
+
+fn speaker_identity_error_to_backend(
+    error: crate::diarize::voice_id::SpeakerIdentityError,
+) -> BackendError {
+    match error {
+        crate::diarize::voice_id::SpeakerIdentityError::Canceled => {
+            BackendError::TranscriptionCanceled
+        }
+        error => BackendError::VoiceIdIdentityFailed(error),
     }
 }
 
@@ -2966,20 +3021,41 @@ fn native_capacity_admission_facts(
     }
 }
 
-/// The auxiliary resident bytes this request's speaker plan adds to the
-/// admission charge. Every explicit Voice ID request runs the shared ReDim
-/// acoustic-identity stage, so both native-speaker and external-speaker plans
-/// are charged
-/// (`crate::diarize::embed::speaker_attribution_admission_bytes`'s
-/// conservative pack-size-based estimate). The external segmenter adds a
-/// small second pack, but ReDim is the dominant shared resident charge.
-fn voice_id_embedder_admission_bytes(speaker_plan: SpeakerPlan) -> u64 {
-    match speaker_plan {
-        SpeakerPlan::InDecoder | SpeakerPlan::External => {
-            crate::diarize::embed::speaker_attribution_admission_bytes()
-        }
-        SpeakerPlan::Off => 0,
+/// Auxiliary resident bytes for the exact preflighted Voice ID plan, split by
+/// physical memory pool. ReDim and segmentation-3.0 are CPU/unified-memory;
+/// DiariZen follows its independently resolved request backend and therefore
+/// occupies discrete VRAM only on the generic CUDA/HIP/Vulkan lane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VoiceIdAuxiliaryAdmission {
+    unified_bytes: u64,
+    discrete_bytes: u64,
+    discrete_vram_budget_bytes: Option<u64>,
+}
+
+fn voice_id_auxiliary_admission(
+    speaker_plan: SpeakerPlan,
+    embedder_bytes: u64,
+    selected_segmenter: Option<(u64, crate::ggml_runtime::GgmlCpuGraphBackend, Option<u64>)>,
+) -> VoiceIdAuxiliaryAdmission {
+    if speaker_plan == SpeakerPlan::Off {
+        return VoiceIdAuxiliaryAdmission::default();
     }
+    let mut admission = VoiceIdAuxiliaryAdmission {
+        unified_bytes: embedder_bytes,
+        discrete_bytes: 0,
+        discrete_vram_budget_bytes: None,
+    };
+    if speaker_plan == SpeakerPlan::External
+        && let Some((bytes, backend, discrete_vram_budget_bytes)) = selected_segmenter
+    {
+        if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Gpu) {
+            admission.discrete_bytes = admission.discrete_bytes.saturating_add(bytes);
+            admission.discrete_vram_budget_bytes = discrete_vram_budget_bytes;
+        } else {
+            admission.unified_bytes = admission.unified_bytes.saturating_add(bytes);
+        }
+    }
+    admission
 }
 
 /// Reject this request before building its decode graph if its decoder KV
@@ -2988,9 +3064,10 @@ fn voice_id_embedder_admission_bytes(speaker_plan: SpeakerPlan) -> u64 {
 /// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
 /// of an actionable error (issue #159 on CPU). Wired per family through
 /// [`native_capacity_admission_facts`]; families without a wired deriver stay
-/// unchecked. `voice_id_embedder_bytes` is the extra resident
-/// charge for a request that will run the shared Voice ID embedder
-/// ([`voice_id_embedder_admission_bytes`]; `0` when Voice ID is off). Fails
+/// unchecked. `voice_id_auxiliary` is the extra resident
+/// charge for a request that will run the shared Voice ID stack
+/// ([`voice_id_auxiliary_admission`]; both domains are `0` when Voice ID is
+/// off). Fails
 /// OPEN whenever the answer is uncertain rather than
 /// definite -- an unresolvable family, unprobeable host RAM, or an
 /// unreadable pack file all fall through to "allow" (`crate::capacity`'s
@@ -2999,36 +3076,135 @@ fn voice_id_embedder_admission_bytes(speaker_plan: SpeakerPlan) -> u64 {
 fn enforce_native_host_memory_admission(
     model_architecture: &str,
     metadata: &crate::ggml_runtime::GgufMetadata,
-    pack_path: &Path,
+    pack_bytes: u64,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    voice_id_embedder_bytes: u64,
+    voice_id_auxiliary: VoiceIdAuxiliaryAdmission,
+    decoder_discrete_vram_budget_bytes: Option<u64>,
 ) -> Result<(), BackendError> {
-    let Some(facts) = native_capacity_admission_facts(
+    let facts = native_capacity_admission_facts(
         model_architecture,
         metadata,
         audio_duration_seconds,
         backend,
-    ) else {
-        return Ok(());
+    );
+    let host_total_memory_bytes = crate::host::host_total_memory_bytes();
+    let unified_domain = crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
+        swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
     };
-    let Some(host_total_memory_bytes) = crate::host::host_total_memory_bytes() else {
-        return Ok(());
+    let domain = match backend {
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        | crate::ggml_runtime::GgmlCpuGraphBackend::Metal => unified_domain,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => {
+            let decoder_budget = facts
+                .is_some()
+                .then_some(decoder_discrete_vram_budget_bytes)
+                .flatten()
+                .filter(|budget| *budget > 0);
+            let auxiliary_budget = (voice_id_auxiliary.discrete_bytes > 0)
+                .then_some(voice_id_auxiliary.discrete_vram_budget_bytes)
+                .flatten()
+                .filter(|budget| *budget > 0);
+            let budget = match (facts.is_some(), voice_id_auxiliary.discrete_bytes > 0) {
+                (true, true) => match (decoder_budget, auxiliary_budget) {
+                    (Some(decoder), Some(auxiliary)) => decoder.min(auxiliary),
+                    _ => {
+                        return Err(BackendError::NativeInsufficientHostMemory {
+                            reason: missing_discrete_vram_budget_message(
+                                "the selected ASR or Voice ID GPU route",
+                            ),
+                        });
+                    }
+                },
+                (true, false) => {
+                    decoder_budget.ok_or_else(|| BackendError::NativeInsufficientHostMemory {
+                        reason: missing_discrete_vram_budget_message("the selected ASR GPU route"),
+                    })?
+                }
+                (false, true) => {
+                    auxiliary_budget.ok_or_else(|| BackendError::NativeInsufficientHostMemory {
+                        reason: missing_discrete_vram_budget_message(
+                            "the selected Voice ID segmentation GPU route",
+                        ),
+                    })?
+                }
+                (false, false) => 0,
+            };
+            crate::capacity::MemoryAdmissionDomain::DiscreteVram {
+                budget_bytes: budget,
+            }
+        }
     };
-    let Ok(pack_metadata) = std::fs::metadata(pack_path) else {
-        return Ok(());
+    let (auxiliary_in_decode_domain, auxiliary_in_other_domain, other_domain) = match domain {
+        crate::capacity::MemoryAdmissionDomain::DiscreteVram { .. } => (
+            voice_id_auxiliary.discrete_bytes,
+            voice_id_auxiliary.unified_bytes,
+            unified_domain,
+        ),
+        crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. } => (
+            voice_id_auxiliary.unified_bytes,
+            voice_id_auxiliary.discrete_bytes,
+            crate::capacity::MemoryAdmissionDomain::DiscreteVram {
+                budget_bytes: if voice_id_auxiliary.discrete_bytes > 0 {
+                    voice_id_auxiliary
+                        .discrete_vram_budget_bytes
+                        .filter(|budget| *budget > 0)
+                        .ok_or_else(|| BackendError::NativeInsufficientHostMemory {
+                            reason: missing_discrete_vram_budget_message(
+                                "the selected Voice ID segmentation GPU route",
+                            ),
+                        })?
+                } else {
+                    0
+                },
+            },
+        ),
     };
-    if let Err(rejection) = crate::capacity::evaluate_host_memory_admission(
-        &facts.geometry,
-        facts.spec,
-        facts.required_positions,
-        pack_metadata.len(),
-        facts
-            .fixed_decode_state_bytes
-            .saturating_add(voice_id_embedder_bytes),
-        host_total_memory_bytes,
-        host_memory_admission_domain_for_backend(backend),
-    ) {
+    let evaluation = if matches!(
+        domain,
+        crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. }
+    ) && host_total_memory_bytes.is_none()
+    {
+        Ok(())
+    } else if let Some(facts) = facts {
+        crate::capacity::evaluate_host_memory_admission(
+            &facts.geometry,
+            facts.spec,
+            facts.required_positions,
+            pack_bytes,
+            facts
+                .fixed_decode_state_bytes
+                .saturating_add(auxiliary_in_decode_domain),
+            host_total_memory_bytes.unwrap_or(0),
+            domain,
+        )
+    } else if auxiliary_in_decode_domain > 0 {
+        crate::capacity::evaluate_static_host_memory_admission(
+            pack_bytes,
+            auxiliary_in_decode_domain,
+            host_total_memory_bytes.unwrap_or(0),
+            domain,
+        )
+    } else {
+        Ok(())
+    };
+    if let Err(rejection) = evaluation {
+        return Err(BackendError::NativeInsufficientHostMemory {
+            reason: rejection.user_message(),
+        });
+    }
+    if auxiliary_in_other_domain > 0
+        && !(matches!(
+            other_domain,
+            crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. }
+        ) && host_total_memory_bytes.is_none())
+        && let Err(rejection) = crate::capacity::evaluate_static_host_memory_admission(
+            0,
+            auxiliary_in_other_domain,
+            host_total_memory_bytes.unwrap_or(0),
+            other_domain,
+        )
+    {
         return Err(BackendError::NativeInsufficientHostMemory {
             reason: rejection.user_message(),
         });
@@ -3036,26 +3212,44 @@ fn enforce_native_host_memory_admission(
     Ok(())
 }
 
-/// Classify the resolved dispatch backend into the memory pool its resident
-/// decode state draws from, so admission budgets against the right ceiling.
-/// CPU and Apple-Silicon `Metal` are unified memory (host RAM, swap-backed);
-/// only the discrete `Gpu` lane (CUDA/HIP/Vulkan) has dedicated VRAM that
-/// cannot page. Metal must NOT land in the discrete bucket -- doing so would
-/// hard-reject Macs that a swap-backed budget would admit.
-fn host_memory_admission_domain_for_backend(
+fn missing_discrete_vram_budget_message(route: &str) -> String {
+    format!(
+        "OpenASR could not read the current VRAM capacity for {route}, so it cannot safely admit this request before allocating GPU graphs. Retry on CPU, or update the GPU driver/runtime so ggml reports free and total device memory. The request was rejected before model materialization."
+    )
+}
+
+/// Minimum safe budget across every actual discrete route that an
+/// Auto/Accelerated graph may try. Keeping the whole fallback set here means
+/// a failed GPU initialization cannot move the request onto a smaller card
+/// after admission. Exact requests naturally contain one candidate.
+fn minimum_discrete_vram_budget_for_preference(
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> crate::capacity::MemoryAdmissionDomain {
-    match backend {
-        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
-        | crate::ggml_runtime::GgmlCpuGraphBackend::Metal => {
-            crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
-                swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
-            }
-        }
-        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => {
-            crate::capacity::MemoryAdmissionDomain::DiscreteVram
-        }
+    preference: Option<&crate::ggml_runtime::RequestBackendPreference>,
+) -> Option<u64> {
+    if backend != crate::ggml_runtime::GgmlCpuGraphBackend::Gpu {
+        return None;
     }
+    let devices = crate::ggml_runtime::ggml_available_devices();
+    let inventory = crate::device::execution_route::enumerate_compute_devices_from_ggml(&devices);
+    let routes = match preference {
+        Some(crate::ggml_runtime::RequestBackendPreference::Exact(route)) => vec![route.clone()],
+        Some(crate::ggml_runtime::RequestBackendPreference::Accelerated) | None => {
+            crate::device::execution_route::ranked_preferred_accelerated_devices(&inventory)
+                .into_iter()
+                .map(|device| device.to_resolved_route())
+                .collect()
+        }
+        Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly) => Vec::new(),
+    };
+    routes
+        .iter()
+        .map(|route| {
+            crate::device::execution_route::discrete_vram_admission_budget_for_route(
+                route, &devices,
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|budgets| budgets.into_iter().min())
 }
 
 fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch {
@@ -4189,7 +4383,7 @@ mod tests {
                 pack_bytes_on_disk,
                 0,
                 host_total_memory_bytes,
-                crate::capacity::MemoryAdmissionDomain::DiscreteVram,
+                crate::capacity::MemoryAdmissionDomain::DiscreteVram { budget_bytes },
             )
             .is_ok(),
             "the real Q8_0 footprint must be admitted"
@@ -4202,7 +4396,7 @@ mod tests {
                 pack_bytes_on_disk,
                 0,
                 host_total_memory_bytes,
-                crate::capacity::MemoryAdmissionDomain::DiscreteVram,
+                crate::capacity::MemoryAdmissionDomain::DiscreteVram { budget_bytes },
             )
             .is_err(),
             "the overstated DEFAULT footprint would have been falsely rejected on this host"
@@ -4226,10 +4420,11 @@ mod tests {
                 enforce_native_host_memory_admission(
                     architecture,
                     &metadata,
-                    Path::new("/nonexistent/does-not-matter.oasr"),
+                    0,
                     3600.0,
                     crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-                    0,
+                    VoiceIdAuxiliaryAdmission::default(),
+                    None,
                 )
                 .is_ok(),
                 "'{architecture}' must be allowed through unconditionally, not guessed at"
@@ -4861,17 +5056,6 @@ mod tests {
     /// while a small pack with the identical metadata is admitted.
     #[test]
     fn enforce_native_host_memory_admission_rejects_each_new_family_on_an_oversized_pack() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let oversized = dir.path().join("oversized.oasr");
-        let file = std::fs::File::create(&oversized).expect("create sparse pack");
-        // 1 TiB sparse: larger than any host's RAM + swap, no disk cost.
-        // Stay under common Linux CI/FS sparse-file caps (1 PiB trips
-        // FileTooLarge on some runners).
-        file.set_len(1 << 40).expect("sparse set_len");
-        drop(file);
-        let modest = dir.path().join("modest.oasr");
-        std::fs::write(&modest, vec![0u8; 4096]).expect("write modest pack");
-
         let cases: [(&str, crate::ggml_runtime::GgufMetadata); 6] = [
             (
                 crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
@@ -4902,10 +5086,11 @@ mod tests {
             let error = enforce_native_host_memory_admission(
                 architecture,
                 metadata,
-                &oversized,
+                1 << 40,
                 30.0,
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-                0,
+                VoiceIdAuxiliaryAdmission::default(),
+                None,
             )
             .expect_err("a 1 TiB pack cannot fit any host");
             match error {
@@ -4924,10 +5109,11 @@ mod tests {
             enforce_native_host_memory_admission(
                 architecture,
                 metadata,
-                &modest,
+                4096,
                 30.0,
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-                0,
+                VoiceIdAuxiliaryAdmission::default(),
+                None,
             )
             .unwrap_or_else(|error| {
                 panic!("'{architecture}' must admit a modest pack on this host: {error:?}")
@@ -4938,15 +5124,54 @@ mod tests {
     /// Both segmentation sources converge on the same ReDim identity stage,
     /// so every explicit Voice ID request is charged its resident footprint.
     #[test]
-    fn voice_id_embedder_bytes_charged_for_both_segmentation_sources() {
-        assert_eq!(voice_id_embedder_admission_bytes(SpeakerPlan::Off), 0);
+    fn voice_id_bytes_charge_embedder_and_selected_external_segmenter() {
         assert_eq!(
-            voice_id_embedder_admission_bytes(SpeakerPlan::InDecoder),
-            crate::diarize::embed::speaker_attribution_admission_bytes()
+            voice_id_auxiliary_admission(
+                SpeakerPlan::Off,
+                456,
+                Some((
+                    123,
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+                    Some(900),
+                )),
+            ),
+            VoiceIdAuxiliaryAdmission::default()
         );
         assert_eq!(
-            voice_id_embedder_admission_bytes(SpeakerPlan::External),
-            crate::diarize::embed::speaker_attribution_admission_bytes()
+            voice_id_auxiliary_admission(SpeakerPlan::InDecoder, 456, None),
+            VoiceIdAuxiliaryAdmission {
+                unified_bytes: 456,
+                discrete_bytes: 0,
+                discrete_vram_budget_bytes: None,
+            }
+        );
+        assert_eq!(
+            voice_id_auxiliary_admission(
+                SpeakerPlan::External,
+                456,
+                Some((123, crate::ggml_runtime::GgmlCpuGraphBackend::Metal, None,)),
+            ),
+            VoiceIdAuxiliaryAdmission {
+                unified_bytes: 579,
+                discrete_bytes: 0,
+                discrete_vram_budget_bytes: None,
+            }
+        );
+        assert_eq!(
+            voice_id_auxiliary_admission(
+                SpeakerPlan::External,
+                456,
+                Some((
+                    123,
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+                    Some(900),
+                )),
+            ),
+            VoiceIdAuxiliaryAdmission {
+                unified_bytes: 456,
+                discrete_bytes: 123,
+                discrete_vram_budget_bytes: Some(900),
+            }
         );
     }
 

@@ -14,9 +14,12 @@ use super::clustering::AutomaticClusterer;
 use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
 use super::embed::{EmbedError, SpeakerEmbedder};
 use super::pipeline::Diarization;
-use super::segment::{ActivityFrameClock, LocalActivity, SegmentError, SelectedSegmenter};
+use super::segment::{
+    ActivityFrameClock, LocalActivity, PreparedSelectedSegmenter, SegmentError, SegmenterProvider,
+    SegmenterRuntimeInput, SelectedSegmenter,
+};
 use crate::config::VoiceIdSegmenterPreference;
-use crate::longform::LongFormVadProvider;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, RequestBackendPreference};
 
 const SAMPLE_RATE_HZ: u32 = 16_000;
 const EMBEDDING_WINDOW_S: f64 = 1.5;
@@ -36,6 +39,53 @@ pub enum ExternalDiarizationError {
     UnsupportedSampleRate(u32),
     #[error("external Voice ID was canceled")]
     Canceled,
+    #[error("external Voice ID execution route could not be resolved: {0}")]
+    ExecutionRoute(#[from] crate::device::execution_route::ExecutionRouteError),
+}
+
+/// Lightweight request plan. It pins the selected provider, pack mappings,
+/// actual execution-route candidates, and admission estimate, but owns no
+/// parsed/dequantized weights, runner, VAD, or graph.
+pub(crate) struct PreparedExternalDiarizer {
+    segmenter: PreparedSelectedSegmenter,
+}
+
+impl PreparedExternalDiarizer {
+    pub(crate) fn prepare(
+        preference: VoiceIdSegmenterPreference,
+        backend_preference: Option<RequestBackendPreference>,
+    ) -> Result<Self, ExternalDiarizationError> {
+        let runtime_input = SegmenterRuntimeInput::resolve(backend_preference)?;
+        let segmenter = super::segment::prepare_segmenter(preference, runtime_input)?;
+        Ok(Self { segmenter })
+    }
+
+    pub(crate) fn segmenter_admission_bytes(&self) -> u64 {
+        self.segmenter.admission_bytes()
+    }
+
+    pub(crate) fn segmenter_admission_backend(&self) -> GgmlCpuGraphBackend {
+        self.segmenter.admission_backend()
+    }
+
+    pub(crate) fn segmenter_discrete_vram_budget_bytes(&self) -> Option<u64> {
+        self.segmenter.discrete_vram_budget_bytes()
+    }
+
+    pub(crate) fn materialize(
+        self,
+        embedder: Arc<dyn SpeakerEmbedder>,
+    ) -> Result<ExternalDiarizer, ExternalDiarizationError> {
+        let segmenter = self.segmenter.materialize()?;
+        let vad = super::vad::FireRedStreamVadProvider::shared()
+            .ok_or(ExternalDiarizationError::VadUnavailable)?;
+        Ok(ExternalDiarizer {
+            segmenter,
+            embedder,
+            vad,
+            clusterer: AutomaticClusterer,
+        })
+    }
 }
 
 /// One preflighted recording-level pipeline. The chosen segmenter adapter is
@@ -49,23 +99,8 @@ pub(crate) struct ExternalDiarizer {
 }
 
 impl ExternalDiarizer {
-    pub(crate) fn preflight(
-        preference: VoiceIdSegmenterPreference,
-        embedder: Arc<dyn SpeakerEmbedder>,
-    ) -> Result<Self, ExternalDiarizationError> {
-        let segmenter = super::segment::resolve_segmenter(preference)?;
-        let vad = super::vad::FireRedStreamVadProvider::shared()
-            .ok_or(ExternalDiarizationError::VadUnavailable)?;
-        Ok(Self {
-            segmenter,
-            embedder,
-            vad,
-            clusterer: AutomaticClusterer,
-        })
-    }
-
-    pub(crate) fn selected_segmenter(&self) -> VoiceIdSegmenterPreference {
-        self.segmenter.preference
+    pub(crate) fn selected_segmenter(&self) -> SegmenterProvider {
+        self.segmenter.provider
     }
 
     pub(crate) fn diarize(
@@ -86,7 +121,7 @@ impl ExternalDiarizer {
                 .adapter
                 .segment_local_activity(samples, sample_rate_hz, canceled)?;
         cancel_checkpoint(canceled)?;
-        let vad_regions = self.vad_regions(samples, sample_rate_hz)?;
+        let vad_regions = self.vad_regions(samples, sample_rate_hz, canceled)?;
         let activity_regions = activity.valid_regions(samples.len() as f64 / sample_rate_hz as f64);
         let speech = union_regions(vad_regions.into_iter().chain(activity_regions));
         let chunks = embedding_chunks(&speech);
@@ -125,9 +160,15 @@ impl ExternalDiarizer {
         &self,
         samples: &[f32],
         sample_rate_hz: u32,
+        canceled: &dyn Fn() -> bool,
     ) -> Result<Vec<TimeRange>, ExternalDiarizationError> {
         self.vad
-            .compute_speech_slices(samples, sample_rate_hz, &crate::LongFormOptions::default())
+            .compute_speech_slices_cancellable(
+                samples,
+                sample_rate_hz,
+                &crate::LongFormOptions::default(),
+                canceled,
+            )
             .map(|slices| {
                 slices
                     .into_iter()
@@ -139,7 +180,10 @@ impl ExternalDiarizer {
                     })
                     .collect()
             })
-            .map_err(ExternalDiarizationError::Vad)
+            .map_err(|error| match error {
+                super::vad::FireRedStreamVadError::Canceled => ExternalDiarizationError::Canceled,
+                other => ExternalDiarizationError::Vad(other.to_string()),
+            })
     }
 }
 
@@ -212,6 +256,13 @@ fn embed_chunks(
         .collect();
     let borrowed: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();
     let results = embedder.embed_batch(&borrowed, sample_rate_hz);
+    if results.len() != chunks.len() {
+        return Err(ExternalDiarizationError::Embedding(format!(
+            "embedder returned {} results for {} diarization windows",
+            results.len(),
+            chunks.len()
+        )));
+    }
     cancel_checkpoint(canceled)?;
     let mut successful_chunks = Vec::new();
     let mut embeddings = Vec::new();
@@ -222,6 +273,7 @@ fn embed_chunks(
                 embeddings.push(embedding);
             }
             Err(EmbedError::TooShort) => {}
+            Err(EmbedError::Canceled) => return Err(ExternalDiarizationError::Canceled),
             Err(error) => {
                 return Err(ExternalDiarizationError::Embedding(error.to_string()));
             }
@@ -283,11 +335,11 @@ fn reconstruct_global_turns(
     for cluster in clusters {
         let start = activity
             .frame_clock
-            .closest_frame(cluster.range.start_s + activity.frame_clock.duration_s * 0.5)
+            .closest_frame(cluster.range.start_s + activity.frame_clock.duration_s() * 0.5)
             .min(frames);
         let end = activity
             .frame_clock
-            .closest_frame(cluster.range.end_s + activity.frame_clock.duration_s * 0.5)
+            .closest_frame(cluster.range.end_s + activity.frame_clock.duration_s() * 0.5)
             .min(frames);
         for frame in start..end {
             cluster_frames[frame * speaker_count + cluster.speaker.0 as usize] = 1;
@@ -298,7 +350,7 @@ fn reconstruct_global_turns(
     for window in &activity.windows {
         let start = activity
             .frame_clock
-            .closest_frame(window.start_s + activity.frame_clock.duration_s * 0.5);
+            .closest_frame_for_window_start(window.start_sample);
         if start >= frames {
             continue;
         }
@@ -516,12 +568,54 @@ mod tests {
     use super::*;
     use crate::diarize::segment::LocalActivityWindow;
 
-    fn clock() -> ActivityFrameClock {
-        ActivityFrameClock {
-            start_s: 0.0,
-            duration_s: 0.2,
-            step_s: 0.1,
+    #[derive(serde::Deserialize)]
+    struct NativeDiarizationFixture {
+        id: String,
+        wav: std::path::PathBuf,
+    }
+
+    struct CanceledEmbedder;
+
+    impl SpeakerEmbedder for CanceledEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, EmbedError> {
+            Err(EmbedError::Canceled)
         }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    struct ShortBatchEmbedder;
+
+    impl SpeakerEmbedder for ShortBatchEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, EmbedError> {
+            unreachable!("the batch seam is overridden")
+        }
+
+        fn embed_batch(
+            &self,
+            _clips: &[&[f32]],
+            _sample_rate_hz: u32,
+        ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+            Vec::new()
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    fn clock() -> ActivityFrameClock {
+        ActivityFrameClock::new(0, 2, 1, 10)
     }
 
     #[test]
@@ -559,6 +653,36 @@ mod tests {
     }
 
     #[test]
+    fn redim_batch_cancel_is_not_stringified() {
+        let error = embed_chunks(
+            &CanceledEmbedder,
+            &vec![0.0; 24_000],
+            16_000,
+            &[TimeRange::new(0.0, 1.5)],
+            &|| false,
+        )
+        .expect_err("embedding cancellation must stop external diarization");
+        assert!(matches!(error, ExternalDiarizationError::Canceled));
+    }
+
+    #[test]
+    fn malformed_embedder_batch_length_fails_closed() {
+        let error = embed_chunks(
+            &ShortBatchEmbedder,
+            &vec![0.0; 24_000],
+            16_000,
+            &[TimeRange::new(0.0, 1.5)],
+            &|| false,
+        )
+        .expect_err("a short batch result must not silently drop a window");
+        assert!(matches!(
+            error,
+            ExternalDiarizationError::Embedding(reason)
+                if reason.contains("0 results for 1 diarization windows")
+        ));
+    }
+
+    #[test]
     fn hungarian_alignment_is_maximum_and_deterministic() {
         let scores = vec![vec![8, 1, 0], vec![1, 7, 2], vec![0, 2, 6]];
         assert_eq!(hungarian_maximize(&scores), vec![(0, 0), (1, 1), (2, 2)]);
@@ -570,7 +694,7 @@ mod tests {
         let activity = LocalActivity {
             frame_clock: clock(),
             windows: vec![LocalActivityWindow {
-                start_s: 0.0,
+                start_sample: 0,
                 frame_activity: vec![0b01, 0b11, 0b10, 0],
             }],
             local_speaker_slots: 3,
@@ -604,7 +728,7 @@ mod tests {
         let activity = LocalActivity {
             frame_clock: clock(),
             windows: vec![LocalActivityWindow {
-                start_s: 0.0,
+                start_sample: 0,
                 frame_activity: vec![0b0001, 0b0010, 0b0100, 0b1000],
             }],
             local_speaker_slots: 4,
@@ -623,5 +747,145 @@ mod tests {
             turns.iter().any(|turn| turn.speaker == SpeakerId(3)),
             "the fourth DiariZen-local slot must survive Hungarian alignment"
         );
+    }
+
+    /// Exact, ASR-independent acceptance seam for the locked diarization
+    /// corpus. Unlike `OPENASR_DIARIZE_DEBUG`, this runs the same production
+    /// recording-level module directly and writes full-precision raw turns.
+    /// The caller owns fixture/output paths so every large or private asset can
+    /// stay under one disposable research root.
+    #[test]
+    #[ignore = "requires OPENASR_NATIVE_DIARIZATION_FIXTURES/OUTPUT plus local model packs"]
+    fn native_locked_fixture_manifest_emits_exact_rttm() {
+        use std::fmt::Write as _;
+
+        let manifest = std::env::var_os("OPENASR_NATIVE_DIARIZATION_FIXTURES")
+            .map(std::path::PathBuf::from)
+            .expect("OPENASR_NATIVE_DIARIZATION_FIXTURES must point to fixtures.json");
+        let output = std::env::var_os("OPENASR_NATIVE_DIARIZATION_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .expect("OPENASR_NATIVE_DIARIZATION_OUTPUT must name a disposable run directory");
+        let provider = std::env::var("OPENASR_NATIVE_DIARIZATION_PROVIDER")
+            .expect("OPENASR_NATIVE_DIARIZATION_PROVIDER must be segmentation_3_0 or diarizen");
+        let (preference, expected_provider) = match provider.as_str() {
+            "segmentation_3_0" => (
+                VoiceIdSegmenterPreference::Segmentation3_0,
+                SegmenterProvider::Segmentation3_0,
+            ),
+            "diarizen" => (
+                VoiceIdSegmenterPreference::Auto,
+                SegmenterProvider::DiariZen,
+            ),
+            other => panic!("unsupported native diarization provider '{other}'"),
+        };
+        let backend = std::env::var("OPENASR_NATIVE_DIARIZATION_BACKEND")
+            .unwrap_or_else(|_| "cpu".to_string());
+        let backend_preference = match backend.as_str() {
+            "cpu" => Some(RequestBackendPreference::CpuOnly),
+            "accelerated" => Some(RequestBackendPreference::Accelerated),
+            other => panic!("unsupported native diarization backend '{other}'"),
+        };
+        let expected_backend = SegmenterRuntimeInput::resolve(backend_preference.clone())
+            .expect("resolve exact acceptance backend")
+            .backend();
+        let manifest_root = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("fixtures.json must live under <research-root>/scripts");
+        let fixtures: Vec<NativeDiarizationFixture> = serde_json::from_slice(
+            &std::fs::read(&manifest).expect("read native diarization fixture manifest"),
+        )
+        .expect("parse native diarization fixture manifest");
+
+        let _backend_guard =
+            crate::ggml_runtime::install_request_backend_override(backend_preference.clone());
+        let embedder_plan = crate::diarize::embed::prepare_shared_embedder_snapshot()
+            .expect("OPENASR_REDIMNET_PACK must resolve to a valid ReDimNet2-B6 pack");
+        let diarizer_plan = PreparedExternalDiarizer::prepare(preference, backend_preference)
+            .expect("prepare native external diarizer");
+        assert_eq!(
+            diarizer_plan.segmenter_admission_backend(),
+            expected_backend,
+            "the exact acceptance harness must use the requested backend"
+        );
+        let embedder_bytes = embedder_plan.admission_bytes();
+        let segmenter_bytes = diarizer_plan.segmenter_admission_bytes();
+        if let Some(total_memory) = crate::host::host_total_memory_bytes() {
+            crate::capacity::evaluate_static_host_memory_admission(
+                0,
+                embedder_bytes.saturating_add(if expected_backend != GgmlCpuGraphBackend::Gpu {
+                    segmenter_bytes
+                } else {
+                    0
+                }),
+                total_memory,
+                crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
+                    swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
+                },
+            )
+            .expect("native diarization fixture run must pass production-shaped admission");
+        }
+        if expected_backend == GgmlCpuGraphBackend::Gpu {
+            let budget = diarizer_plan
+                .segmenter_discrete_vram_budget_bytes()
+                .filter(|budget| *budget > 0)
+                .expect("the exact GPU route must report a VRAM admission budget");
+            crate::capacity::evaluate_static_host_memory_admission(
+                0,
+                segmenter_bytes,
+                0,
+                crate::capacity::MemoryAdmissionDomain::DiscreteVram {
+                    budget_bytes: budget,
+                },
+            )
+            .expect("native diarization GPU fixture run must pass VRAM admission");
+        }
+        let embedder = embedder_plan
+            .materialize()
+            .expect("materialize exact ReDimNet snapshot after admission");
+        let diarizer = diarizer_plan
+            .materialize(embedder)
+            .expect("materialize exact segmentation snapshot after admission");
+        assert_eq!(diarizer.selected_segmenter(), expected_provider);
+
+        std::fs::create_dir_all(&output).expect("create native diarization output directory");
+        for fixture in fixtures {
+            eprintln!(
+                "NATIVE_DIARIZATION_FIXTURE provider={provider} backend={backend} id={} stage=start",
+                fixture.id
+            );
+            let wav = manifest_root.join(&fixture.wav);
+            let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                &wav,
+                "native diarization acceptance",
+                "native diarization acceptance",
+            )
+            .unwrap_or_else(|error| panic!("load fixture '{}': {error}", wav.display()));
+            let diarization = diarizer
+                .diarize(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
+                .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
+            let mut rttm = String::new();
+            for turn in diarization.turns {
+                let duration = turn.range.duration_s();
+                if duration <= 0.0 {
+                    continue;
+                }
+                writeln!(
+                    rttm,
+                    "SPEAKER {} 1 {:.9} {:.9} <NA> <NA> {} <NA> <NA>",
+                    fixture.id,
+                    turn.range.start_s,
+                    duration,
+                    turn.speaker.label()
+                )
+                .expect("write RTTM line");
+            }
+            std::fs::write(output.join(format!("{}.rttm", fixture.id)), rttm)
+                .expect("write native diarization RTTM");
+            eprintln!(
+                "NATIVE_DIARIZATION_FIXTURE provider={provider} backend={backend} id={} stage=done",
+                fixture.id
+            );
+        }
     }
 }

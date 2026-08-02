@@ -1378,6 +1378,29 @@ impl GgmlCpuGraphRunner {
         })
     }
 
+    /// Changes the CPU thread budget of an already-resident runner without
+    /// rebuilding its graph or re-uploading static weights. Scheduler CPU
+    /// fallbacks and tunable BLAS backends receive the same value. Some system
+    /// accelerators (notably Apple Accelerate) expose no thread-count control;
+    /// those backends intentionally remain best-effort and must be benchmarked
+    /// when choosing a caller's outer parallelism.
+    pub(crate) fn reconfigure_cpu_thread_count(
+        &mut self,
+        n_threads: usize,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if matches!(self.backend_kind, GgmlCpuGraphBackend::Cpu) {
+            self.backend.set_n_threads(n_threads)?;
+        }
+        if let Some(cpu) = self._scheduler_cpu_fallback.as_mut() {
+            cpu.set_n_threads(n_threads)?;
+        }
+        #[cfg(target_os = "macos")]
+        for accelerator in &mut self._scheduler_accel_backends {
+            accelerator.set_n_threads_if_supported(n_threads)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn backend_kind(&self) -> GgmlCpuGraphBackend {
         self.backend_kind
     }
@@ -5626,6 +5649,21 @@ fn take_test_graph_compute_status_override() -> Option<c_int> {
 #[cfg(test)]
 pub(crate) fn install_test_graph_compute_status_override(status: c_int) {
     TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_graph_compute_abort() {
+    install_test_graph_compute_status_override(ffi::GGML_STATUS_ABORTED);
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_graph_compute_device_lost() {
+    install_test_graph_compute_status_override(ffi::GGML_STATUS_DEVICE_LOST);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_graph_compute_status_override() {
+    TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take());
 }
 
 #[cfg(test)]

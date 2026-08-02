@@ -3,13 +3,67 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use super::{DiariZenSegmenter, DiariZenSegmenterError};
+use crate::diarize::segment::{SegmenterExecutionKey, SegmenterRuntimeInput};
+use crate::ggml_runtime::request_backend_override;
 use crate::models::thread_local_runtime_cache::PackContentKey;
 
 const PACK_ENV: &str = "OPENASR_DIARIZEN_PACK";
-const INSTALLED_MODEL_ID_HINT: &str = "diarizen";
+const INSTALLED_MODEL_ID_HINT: &str = "diarizen-base-s80";
 
-static ACTIVE_DIARIZEN: LazyLock<Mutex<Option<(PackContentKey, Arc<DiariZenSegmenter>)>>> =
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiariZenRuntimeKey {
+    pack: PackContentKey,
+    execution: Vec<SegmenterExecutionKey>,
+}
+
+static ACTIVE_DIARIZEN: LazyLock<Mutex<Option<(DiariZenRuntimeKey, Arc<DiariZenSegmenter>, u64)>>> =
     LazyLock::new(|| Mutex::new(None));
+
+pub(crate) struct PreparedDiariZenSegmenter {
+    key: DiariZenRuntimeKey,
+    source: crate::ggml_runtime::GgmlRuntimeSource,
+    runtime_input: SegmenterRuntimeInput,
+    pack_bytes: u64,
+}
+
+impl PreparedDiariZenSegmenter {
+    pub(crate) const fn pack_bytes(&self) -> u64 {
+        self.pack_bytes
+    }
+
+    pub(crate) fn minimum_vram_budget_bytes(&self) -> Option<u64> {
+        self.runtime_input.minimum_vram_budget_bytes()
+    }
+
+    pub(crate) fn materialize(self) -> Result<Arc<DiariZenSegmenter>, DiariZenSegmenterError> {
+        if let Ok(cache) = ACTIVE_DIARIZEN.lock()
+            && let Some((cached_key, segmenter, _)) = cache.as_ref()
+            && cached_key == &self.key
+        {
+            return Ok(Arc::clone(segmenter));
+        }
+
+        let immutable_source = self
+            .source
+            .immutable_snapshot_matching_content_id(&self.key.pack.pack_content_id)
+            .map_err(|error| DiariZenSegmenterError::PackSource(error.to_string()))?;
+
+        let built = Arc::new(DiariZenSegmenter::from_runtime_source(
+            &immutable_source,
+            self.runtime_input,
+        )?);
+        let Ok(mut cache) = ACTIVE_DIARIZEN.lock() else {
+            return Ok(built);
+        };
+        if let Some((cached_key, segmenter, _)) = cache.as_ref()
+            && cached_key == &self.key
+        {
+            return Ok(Arc::clone(segmenter));
+        }
+        *cache = Some((self.key, Arc::clone(&built), self.pack_bytes));
+        Ok(built)
+    }
+}
 
 /// Snapshot of the currently resolved DiariZen pack. Every call opens the
 /// current path and derives an identity from that exact mapping. Equal content
@@ -38,6 +92,19 @@ pub fn diarizen_pack_installed() -> bool {
 /// `Err`, clears the active cache, and must not be treated as an absent pack
 /// by the selection layer.
 pub fn load_diarizen_segmenter() -> Result<Option<Arc<DiariZenSegmenter>>, DiariZenSegmenterError> {
+    let runtime_input = SegmenterRuntimeInput::resolve(request_backend_override())?;
+    prepare_diarizen_segmenter_snapshot(runtime_input)?
+        .map(PreparedDiariZenSegmenter::materialize)
+        .transpose()
+}
+
+/// Lightweight, TOCTOU-safe pack snapshot for request admission. Metadata and
+/// the tensor contract are checked now, but no weights, runner, or graph are
+/// materialized until [`PreparedDiariZenSegmenter::materialize`] after audio
+/// preparation and memory admission.
+pub(crate) fn prepare_diarizen_segmenter_snapshot(
+    runtime_input: SegmenterRuntimeInput,
+) -> Result<Option<PreparedDiariZenSegmenter>, DiariZenSegmenterError> {
     let Some(path) = diarizen_pack_path() else {
         clear_active_segmenter();
         return Ok(None);
@@ -49,33 +116,18 @@ pub fn load_diarizen_segmenter() -> Result<Option<Arc<DiariZenSegmenter>>, Diari
             return Err(DiariZenSegmenterError::PackSource(error.to_string()));
         }
     };
-    let key = PackContentKey::for_runtime_source(&source);
-    if let Ok(cache) = ACTIVE_DIARIZEN.lock()
-        && let Some((cached_key, segmenter)) = cache.as_ref()
-        && cached_key == &key
-    {
-        return Ok(Some(Arc::clone(segmenter)));
-    }
-
-    // Build outside the cache mutex. Loading/dequantizing and graph creation
-    // are expensive; inference must never wait while this lock is held.
-    let built = match DiariZenSegmenter::from_runtime_source(&source) {
-        Ok(segmenter) => Arc::new(segmenter),
-        Err(error) => {
-            clear_active_segmenter();
-            return Err(error);
-        }
+    DiariZenSegmenter::probe_runtime_source(&source).inspect_err(|_| clear_active_segmenter())?;
+    let key = DiariZenRuntimeKey {
+        pack: PackContentKey::for_runtime_source(&source),
+        execution: runtime_input.execution_keys(),
     };
-    let Ok(mut cache) = ACTIVE_DIARIZEN.lock() else {
-        return Ok(Some(built));
-    };
-    if let Some((cached_key, segmenter)) = cache.as_ref()
-        && cached_key == &key
-    {
-        return Ok(Some(Arc::clone(segmenter)));
-    }
-    *cache = Some((key, Arc::clone(&built)));
-    Ok(Some(built))
+    let pack_bytes = source.byte_len();
+    Ok(Some(PreparedDiariZenSegmenter {
+        key,
+        source,
+        runtime_input,
+        pack_bytes,
+    }))
 }
 
 fn clear_active_segmenter() {
@@ -84,9 +136,20 @@ fn clear_active_segmenter() {
     }
 }
 
+pub(crate) fn unload_idle_diarizen_cache() {
+    clear_active_segmenter();
+    super::unload_idle_worker_runtimes();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_pack_identity_is_exact_and_stable() {
+        assert_eq!(PACK_ENV, "OPENASR_DIARIZEN_PACK");
+        assert_eq!(INSTALLED_MODEL_ID_HINT, "diarizen-base-s80");
+    }
 
     #[test]
     fn runtime_content_identity_tracks_same_path_replacement_and_deletion() {
@@ -111,24 +174,35 @@ mod tests {
     #[test]
     fn typed_loader_distinguishes_absent_from_present_broken_pack() {
         let dir = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            std::env::set_var("OPENASR_HOME", dir.path());
-            std::env::remove_var(PACK_ENV);
-        }
-        assert!(!diarizen_pack_installed());
-        assert!(
-            load_diarizen_segmenter()
-                .expect("an absent optional pack is not an error")
-                .is_none()
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_HOME", Some(dir.path().as_os_str().to_os_string())),
+                (PACK_ENV, None),
+            ],
+            || {
+                assert!(!diarizen_pack_installed());
+                assert!(
+                    load_diarizen_segmenter()
+                        .expect("an absent optional pack is not an error")
+                        .is_none()
+                );
+            },
         );
 
         let broken = dir.path().join("diarizen-broken.oasr");
         std::fs::write(&broken, b"GGUFbroken-installed-diarizen-pack").expect("write broken pack");
-        unsafe { std::env::set_var(PACK_ENV, &broken) };
-        assert!(diarizen_pack_installed());
-        assert!(
-            load_diarizen_segmenter().is_err(),
-            "a broken present pack must fail instead of looking absent"
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_HOME", Some(dir.path().as_os_str().to_os_string())),
+                (PACK_ENV, Some(broken.as_os_str().to_os_string())),
+            ],
+            || {
+                assert!(diarizen_pack_installed());
+                assert!(
+                    load_diarizen_segmenter().is_err(),
+                    "a broken present pack must fail instead of looking absent"
+                );
+            },
         );
     }
 }

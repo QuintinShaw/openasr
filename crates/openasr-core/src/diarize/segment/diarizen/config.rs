@@ -6,7 +6,8 @@ use super::DiariZenSegmenterError;
 
 pub const ARCHITECTURE_ID: &str = "diarizen-wavlm-conformer-segmentation";
 pub(super) const FAMILY_ID: &str = "diarizen-segmentation";
-pub(super) const MODEL_ID: &str = "diarizen-wavlm-base-s80-md";
+pub(super) const MODEL_ID: &str = "diarizen-base-s80";
+pub(super) const UPSTREAM_MODEL_ID: &str = "BUT-FIT/diarizen-wavlm-base-s80-md";
 pub(super) const PINNED_REVISION: &str = "a9857fc34908197fb5336d9d0562f291834a04b2";
 pub(super) const TENSOR_SCHEMA: &str = "compact-v1";
 
@@ -116,6 +117,7 @@ pub(super) fn validate_metadata(metadata: &GgufMetadata) -> Result<(), DiariZenS
     expect_string(metadata, "openasr.model.family", FAMILY_ID)?;
     expect_string(metadata, "openasr.model.architecture", ARCHITECTURE_ID)?;
     expect_string(metadata, "openasr.model.id", MODEL_ID)?;
+    expect_string(metadata, "diarizen.upstream_model_id", UPSTREAM_MODEL_ID)?;
     expect_string(metadata, "diarizen.upstream_revision", PINNED_REVISION)?;
     expect_string(metadata, "diarizen.tensor_schema", TENSOR_SCHEMA)?;
     expect_u32(metadata, "diarizen.sample_rate", SAMPLE_RATE_HZ)?;

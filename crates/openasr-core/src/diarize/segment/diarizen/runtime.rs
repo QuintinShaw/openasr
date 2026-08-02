@@ -1,10 +1,13 @@
+#[cfg(test)]
 use std::path::Path;
 
+#[cfg(test)]
+use crate::ggml_runtime::validate_ggml_runtime_source_path;
 use crate::ggml_runtime::{
     AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession,
     GgmlRuntimeSource, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReader,
-    read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path,
+    read_gguf_metadata_from_runtime_source,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -77,19 +80,28 @@ struct TraceTensor {
 /// nodes pointing into both arenas and into the runner backend, so it must be
 /// dropped before those owners.
 pub(super) struct DiariZenRuntime {
-    session: GgmlPersistentGraphSession,
+    graph: Option<DiariZenPersistentGraph>,
+    static_handles: StaticHandles,
+    layer_sum: Vec<f32>,
+    positional_conv_element_width: usize,
+    trace: bool,
+    samples: usize,
+    frames: usize,
     _static_arena: GgmlStaticTensorArena,
     _loaded_weights: GgmlLoadedWeightContext,
     _runner: GgmlCpuGraphRunner,
+}
+
+struct DiariZenPersistentGraph {
+    session: GgmlPersistentGraphSession,
     pcm: GgmlCpuTensor<'static>,
     logits: GgmlCpuTensor<'static>,
     #[cfg_attr(not(test), allow(dead_code))]
     traces: Vec<TraceTensor>,
-    samples: usize,
-    frames: usize,
 }
 
 impl DiariZenRuntime {
+    #[cfg(test)]
     pub(super) fn new(
         path: &Path,
         samples: usize,
@@ -178,11 +190,8 @@ impl DiariZenRuntime {
             }
         };
 
-        let mut session = runner
-            .start_persistent_graph_session(GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE))
-            .map_err(graph_error("create_persistent_graph"))?;
-        let (pcm, logits, traces) = build_graph(
-            session.builder(),
+        let graph = build_persistent_graph(
+            &mut runner,
             &loaded_weights,
             &static_arena,
             static_handles,
@@ -193,34 +202,40 @@ impl DiariZenRuntime {
             trace,
         )?;
 
-        let mut outputs = traces.iter().map(|tap| tap.tensor).collect::<Vec<_>>();
-        outputs.push(logits);
-        session
-            .builder()
-            .set_input(pcm)
-            .map_err(graph_error("mark_pcm_input"))?;
-        for output in &outputs {
-            session
-                .builder()
-                .set_output(*output)
-                .map_err(graph_error("mark_graph_output"))?;
-        }
-        session
-            .builder()
-            .prepare_outputs_for_upload(&outputs)
-            .map_err(graph_error("prepare_persistent_graph"))?;
-
         Ok(Self {
-            session,
+            graph: Some(graph),
+            static_handles,
+            layer_sum,
+            positional_conv_element_width,
+            trace,
+            samples,
+            frames,
             _static_arena: static_arena,
             _loaded_weights: loaded_weights,
             _runner: runner,
-            pcm,
-            logits,
-            traces,
-            samples,
-            frames,
         })
+    }
+
+    fn ensure_healthy_graph(&mut self) -> Result<(), DiariZenSegmenterError> {
+        let must_rebuild = self
+            .graph
+            .as_ref()
+            .is_none_or(|graph| graph.session.is_poisoned());
+        if must_rebuild {
+            self.graph = None;
+            self.graph = Some(build_persistent_graph(
+                &mut self._runner,
+                &self._loaded_weights,
+                &self._static_arena,
+                self.static_handles,
+                &self.layer_sum,
+                self.positional_conv_element_width,
+                self.samples,
+                self.frames,
+                self.trace,
+            )?);
+        }
+        Ok(())
     }
 
     pub(super) fn infer(
@@ -233,14 +248,17 @@ impl DiariZenRuntime {
                 actual: samples.len(),
             });
         }
-        self.session
-            .builder()
-            .set_f32_slice(self.pcm, samples, "diarizen_pcm")
-            .map_err(graph_error("upload_pcm"))?;
-        let logits = self
+        self.ensure_healthy_graph()?;
+        let graph = self.graph.as_mut().expect("healthy graph ensured");
+        graph
             .session
             .builder()
-            .compute_output_f32(self.logits, self.frames * POWERSET_CLASSES)
+            .set_f32_slice(graph.pcm, samples, "diarizen_pcm")
+            .map_err(graph_error("upload_pcm"))?;
+        let logits = graph
+            .session
+            .builder()
+            .compute_output_f32(graph.logits, self.frames * POWERSET_CLASSES)
             .map_err(graph_error("compute_logits"))?;
         let (powerset_class, activity) = postprocess_logits(&logits, self.frames);
         Ok(DiariZenWindowOutput {
@@ -262,22 +280,25 @@ impl DiariZenRuntime {
                 actual: samples.len(),
             });
         }
-        self.session
+        self.ensure_healthy_graph()?;
+        let graph = self.graph.as_mut().expect("healthy graph ensured");
+        graph
+            .session
             .builder()
-            .set_f32_slice(self.pcm, samples, "diarizen_pcm")
+            .set_f32_slice(graph.pcm, samples, "diarizen_pcm")
             .map_err(graph_error("upload_pcm_trace"))?;
-        let mut specs = self
+        let mut specs = graph
             .traces
             .iter()
             .map(|tap| (tap.tensor, tap.len))
             .collect::<Vec<_>>();
-        specs.push((self.logits, self.frames * POWERSET_CLASSES));
-        let values = self
+        specs.push((graph.logits, self.frames * POWERSET_CLASSES));
+        let values = graph
             .session
             .builder()
             .compute_outputs_f32(&specs)
             .map_err(graph_error("compute_trace"))?;
-        let mut named = self
+        let mut named = graph
             .traces
             .iter()
             .zip(values.iter())
@@ -286,6 +307,57 @@ impl DiariZenRuntime {
         named.push(("logits", values.last().cloned().unwrap_or_default()));
         Ok(named)
     }
+}
+
+fn build_persistent_graph(
+    runner: &mut GgmlCpuGraphRunner,
+    loaded_weights: &GgmlLoadedWeightContext,
+    static_arena: &GgmlStaticTensorArena,
+    static_handles: StaticHandles,
+    layer_sum: &[f32],
+    positional_conv_element_width: usize,
+    samples: usize,
+    frames: usize,
+    trace: bool,
+) -> Result<DiariZenPersistentGraph, DiariZenSegmenterError> {
+    let mut session = runner
+        .start_persistent_graph_session(GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE))
+        .map_err(graph_error("create_persistent_graph"))?;
+    let (pcm, logits, traces) = build_graph(
+        session.builder(),
+        loaded_weights,
+        static_arena,
+        static_handles,
+        layer_sum,
+        positional_conv_element_width,
+        samples,
+        frames,
+        trace,
+    )?;
+
+    let mut outputs = traces.iter().map(|tap| tap.tensor).collect::<Vec<_>>();
+    outputs.push(logits);
+    session
+        .builder()
+        .set_input(pcm)
+        .map_err(graph_error("mark_pcm_input"))?;
+    for output in &outputs {
+        session
+            .builder()
+            .set_output(*output)
+            .map_err(graph_error("mark_graph_output"))?;
+    }
+    session
+        .builder()
+        .prepare_outputs_for_upload(&outputs)
+        .map_err(graph_error("prepare_persistent_graph"))?;
+
+    Ok(DiariZenPersistentGraph {
+        session,
+        pcm,
+        logits,
+        traces,
+    })
 }
 
 fn build_static_handles(

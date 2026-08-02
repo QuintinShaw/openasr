@@ -10,25 +10,107 @@ mod pack;
 mod runtime;
 mod weights;
 
+use std::cell::RefCell;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use thiserror::Error;
 
 use crate::diarize::contract::{SpeakerId, SpeakerTurn, TimeRange};
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgufTensorDataReader,
-    read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path,
+    GgmlCpuGraphError, GgufTensorDataReader, read_gguf_metadata_from_runtime_source,
+    validate_ggml_runtime_source_path,
+};
+use crate::models::thread_local_runtime_cache::{
+    BoundedRuntimeCache, PackContentKey, with_thread_local_cached_mut_by_key,
 };
 
 pub use config::ARCHITECTURE_ID as DIARIZEN_GGML_ARCHITECTURE_ID;
+pub(crate) use pack::{
+    PreparedDiariZenSegmenter, prepare_diarizen_segmenter_snapshot, unload_idle_diarizen_cache,
+};
 pub use pack::{diarizen_pack_installed, load_diarizen_segmenter, shared_diarizen_segmenter};
+
+pub(crate) const DIARIZEN_SAMPLE_RATE_HZ: u32 = config::SAMPLE_RATE_HZ;
+pub(crate) const DIARIZEN_WINDOW_SAMPLES: usize = config::WINDOW_SAMPLES;
+pub(crate) const DIARIZEN_WINDOW_STEP_SAMPLES: usize = config::WINDOW_STEP_SAMPLES;
+pub(crate) const DIARIZEN_FRAME_DURATION_SAMPLES: u32 = 400;
+pub(crate) const DIARIZEN_FRAME_STEP_SAMPLES: u32 = config::FRAME_STRIDE_SAMPLES as u32;
+pub(crate) const DIARIZEN_LOCAL_SPEAKERS: usize = config::LOCAL_SPEAKERS;
 
 use config::{
     FRAME_STRIDE_SAMPLES, LOCAL_SPEAKERS, POWERSET_CLASSES, SAMPLE_RATE_HZ, WINDOW_SAMPLES,
 };
 use runtime::DiariZenRuntime;
 use weights::validate_tensor_contract;
+
+const DIARIZEN_RUNTIME_CACHE_CAPACITY: usize = 1;
+static DIARIZEN_WORKER_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiariZenWorkerRuntimeKey {
+    pack: PackContentKey,
+    execution: super::SegmenterExecutionKey,
+}
+
+thread_local! {
+    static DIARIZEN_RUNTIME_BY_KEY: RefCell<
+        BoundedRuntimeCache<DiariZenWorkerRuntimeKey, DiariZenRuntime>
+    > = RefCell::new(BoundedRuntimeCache::new());
+}
+
+fn diarizen_worker_pool() -> &'static Result<rayon::ThreadPool, String> {
+    DIARIZEN_WORKER_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "openasr-diarizen-0".to_string())
+            .build()
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn clear_current_thread_runtime_cache() {
+    DIARIZEN_RUNTIME_BY_KEY.with(|cache| cache.borrow_mut().clear_for_idle_unload());
+}
+
+pub(crate) fn unload_idle_worker_runtimes() {
+    if let Some(Ok(pool)) = DIARIZEN_WORKER_POOL.get() {
+        pool.broadcast(|_| clear_current_thread_runtime_cache());
+    }
+}
+
+#[cfg(test)]
+fn diarizen_worker_runtime_entry_count() -> usize {
+    let Some(Ok(pool)) = DIARIZEN_WORKER_POOL.get() else {
+        return 0;
+    };
+    pool.broadcast(|_| DIARIZEN_RUNTIME_BY_KEY.with(|cache| cache.borrow().len()))
+        .into_iter()
+        .sum()
+}
+
+#[cfg(test)]
+fn install_worker_graph_compute_abort() {
+    let pool = diarizen_worker_pool()
+        .as_ref()
+        .expect("DiariZen test worker pool");
+    pool.broadcast(|_| crate::ggml_runtime::install_test_graph_compute_abort());
+}
+
+#[cfg(test)]
+fn install_worker_graph_compute_device_lost() {
+    let pool = diarizen_worker_pool()
+        .as_ref()
+        .expect("DiariZen test worker pool");
+    pool.broadcast(|_| crate::ggml_runtime::install_test_graph_compute_device_lost());
+}
+
+#[cfg(test)]
+fn diarizen_runtime_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug, Error)]
 pub enum DiariZenSegmenterError {
@@ -73,8 +155,10 @@ pub enum DiariZenSegmenterError {
     UnsupportedSampleRate { actual: u32 },
     #[error("DiariZen requires exactly {expected} samples per window, got {actual}")]
     WindowSize { expected: usize, actual: usize },
-    #[error("DiariZen runtime mutex is poisoned")]
-    RuntimePoisoned,
+    #[error("DiariZen worker pool could not be created: {0}")]
+    WorkerPool(String),
+    #[error("DiariZen execution route could not be resolved: {0}")]
+    ExecutionRoute(#[from] crate::device::execution_route::ExecutionRouteError),
     #[error("DiariZen graph step '{step}' failed: {source}")]
     Graph {
         step: &'static str,
@@ -86,6 +170,36 @@ pub enum DiariZenSegmenterError {
 impl DiariZenSegmenterError {
     fn graph(step: &'static str, source: GgmlCpuGraphError) -> Self {
         Self::Graph { step, source }
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        matches!(
+            self,
+            Self::Graph {
+                source: GgmlCpuGraphError::Aborted | GgmlCpuGraphError::Canceled,
+                ..
+            }
+        )
+    }
+
+    fn is_terminal_backend_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Graph {
+                source: GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned,
+                ..
+            }
+        )
+    }
+
+    fn is_route_initialization_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Graph {
+                source: GgmlCpuGraphError::ExecutionRoute(_),
+                ..
+            }
+        )
     }
 }
 
@@ -100,40 +214,34 @@ pub struct DiariZenWindowOutput {
     pub activity: Vec<u8>,
 }
 
-/// Native, resident DiariZen Base-s80 segmenter.
+/// Native DiariZen Base-s80 adapter. Only the immutable mapped source and a
+/// request-resolved execution plan cross threads. Native runners remain in the
+/// dedicated worker's TLS, alongside the backend cache that owns their raw
+/// handles; no `unsafe Send` bridge is needed.
 pub struct DiariZenSegmenter {
-    runtime: Mutex<SendableRuntime>,
+    source: crate::ggml_runtime::GgmlRuntimeSource,
+    pack_key: PackContentKey,
+    runtime_input: super::SegmenterRuntimeInput,
 }
-
-struct SendableRuntime(DiariZenRuntime);
-
-// GGML runtime handles are not thread-affine, but contain Rc-backed owners and
-// raw backend pointers. Moving them between threads is safe only while access
-// remains exclusive; the enclosing Mutex provides exactly that ownership
-// boundary and no handle escapes a locked call.
-unsafe impl Send for SendableRuntime {}
 
 impl DiariZenSegmenter {
     pub fn from_oasr(path: &Path) -> Result<Self, DiariZenSegmenterError> {
-        Self::from_oasr_with_backend(path, None)
+        let source = validate_ggml_runtime_source_path(path)
+            .map_err(|error| DiariZenSegmenterError::PackSource(error.to_string()))?;
+        let runtime_input =
+            super::SegmenterRuntimeInput::resolve(crate::ggml_runtime::request_backend_override())?;
+        Self::from_runtime_source(&source, runtime_input)
     }
 
-    fn from_runtime_source(
+    pub(super) fn from_runtime_source(
         source: &crate::ggml_runtime::GgmlRuntimeSource,
+        runtime_input: super::SegmenterRuntimeInput,
     ) -> Result<Self, DiariZenSegmenterError> {
-        let runtime = DiariZenRuntime::from_runtime_source(source, WINDOW_SAMPLES, false, None)?;
+        Self::probe_runtime_source(source)?;
         Ok(Self {
-            runtime: Mutex::new(SendableRuntime(runtime)),
-        })
-    }
-
-    fn from_oasr_with_backend(
-        path: &Path,
-        backend: Option<GgmlCpuGraphBackend>,
-    ) -> Result<Self, DiariZenSegmenterError> {
-        let runtime = DiariZenRuntime::new(path, WINDOW_SAMPLES, false, backend)?;
-        Ok(Self {
-            runtime: Mutex::new(SendableRuntime(runtime)),
+            source: source.clone(),
+            pack_key: PackContentKey::for_runtime_source(source),
+            runtime_input,
         })
     }
 
@@ -142,10 +250,16 @@ impl DiariZenSegmenter {
     pub fn probe_oasr(path: &Path) -> Result<(), DiariZenSegmenterError> {
         let source = validate_ggml_runtime_source_path(path)
             .map_err(|error| DiariZenSegmenterError::PackSource(error.to_string()))?;
-        let metadata = read_gguf_metadata_from_runtime_source(&source)
+        Self::probe_runtime_source(&source)
+    }
+
+    pub(super) fn probe_runtime_source(
+        source: &crate::ggml_runtime::GgmlRuntimeSource,
+    ) -> Result<(), DiariZenSegmenterError> {
+        let metadata = read_gguf_metadata_from_runtime_source(source)
             .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
         config::validate_metadata(&metadata)?;
-        let reader = GgufTensorDataReader::from_runtime_source(&source)
+        let reader = GgufTensorDataReader::from_runtime_source(source)
             .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
         validate_tensor_contract(reader.tensor_index())
     }
@@ -166,11 +280,61 @@ impl DiariZenSegmenter {
                 actual: samples.len(),
             });
         }
-        let mut runtime = self
-            .runtime
-            .lock()
-            .map_err(|_| DiariZenSegmenterError::RuntimePoisoned)?;
-        runtime.0.infer(samples)
+        let pool = diarizen_worker_pool()
+            .as_ref()
+            .map_err(|error| DiariZenSegmenterError::WorkerPool(error.clone()))?;
+        let inherited_cancel = crate::ggml_runtime::thread_job_cancel_flag();
+        pool.install(|| {
+            let _cancel_guard = inherited_cancel
+                .as_ref()
+                .map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
+            self.infer_window_on_current_worker(samples)
+        })
+    }
+
+    fn infer_window_on_current_worker(
+        &self,
+        samples: &[f32],
+    ) -> Result<DiariZenWindowOutput, DiariZenSegmenterError> {
+        let mut last_route_error = None;
+        for candidate in self.runtime_input.candidates() {
+            let _backend_guard = crate::ggml_runtime::install_request_backend_override(
+                candidate.backend_preference.clone(),
+            );
+            let key = DiariZenWorkerRuntimeKey {
+                pack: self.pack_key.clone(),
+                execution: candidate.key.clone(),
+            };
+            let result = with_thread_local_cached_mut_by_key(
+                &DIARIZEN_RUNTIME_BY_KEY,
+                key,
+                DIARIZEN_RUNTIME_CACHE_CAPACITY,
+                || {
+                    DiariZenRuntime::from_runtime_source(
+                        &self.source,
+                        WINDOW_SAMPLES,
+                        false,
+                        Some(self.runtime_input.backend()),
+                    )
+                },
+                |runtime| runtime.infer(samples),
+            );
+            match result {
+                Err(error) if error.is_terminal_backend_failure() => {
+                    clear_current_thread_runtime_cache();
+                    return Err(error);
+                }
+                Err(error) if error.is_route_initialization_failure() => {
+                    last_route_error = Some(error);
+                }
+                other => return other,
+            }
+        }
+        Err(last_route_error.unwrap_or({
+            DiariZenSegmenterError::ExecutionRoute(
+                crate::device::execution_route::ExecutionRouteError::AcceleratedUnavailable,
+            )
+        }))
     }
 
     /// Decode the exact-window output into window-local overlap-aware turns.
@@ -181,14 +345,6 @@ impl DiariZenSegmenter {
     ) -> Result<Vec<SpeakerTurn>, DiariZenSegmenterError> {
         let output = self.infer_window(samples, sample_rate_hz)?;
         Ok(decode_segments(&output.activity, output.frame_count))
-    }
-
-    #[cfg(test)]
-    fn from_test_geometry(path: &Path, samples: usize) -> Result<Self, DiariZenSegmenterError> {
-        let runtime = DiariZenRuntime::new(path, samples, true, Some(GgmlCpuGraphBackend::Cpu))?;
-        Ok(Self {
-            runtime: Mutex::new(SendableRuntime(runtime)),
-        })
     }
 }
 

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, OnceLock},
@@ -182,6 +183,11 @@ pub(crate) fn unreadable_content_id(path: &Path) -> String {
 pub struct GgmlRuntimeSource {
     path: PathBuf,
     package_probe: GgmlPackageProbe,
+    /// The same file descriptor the mapping came from. Small auxiliary-model
+    /// request plans use it to make an anonymous immutable copy only after
+    /// audio validation and memory admission. A mutex serializes the shared
+    /// file cursor across cloned plans; mmap readers never take this lock.
+    file: Option<Arc<Mutex<File>>>,
     mmap: Arc<Mmap>,
     /// Captured from `file.metadata()` (an `fstat` on the fd this source
     /// opened) at validation time -- never from a later `stat` on `path`.
@@ -215,6 +221,7 @@ impl Clone for GgmlRuntimeSource {
         Self {
             path: self.path.clone(),
             package_probe: self.package_probe.clone(),
+            file: self.file.as_ref().map(Arc::clone),
             mmap: Arc::clone(&self.mmap),
             stat_identity: self.stat_identity,
             opened_read_only: self.opened_read_only,
@@ -252,6 +259,15 @@ impl Eq for GgmlRuntimeSource {}
 impl GgmlRuntimeSource {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Byte length of the exact open file generation pinned by this source.
+    /// Prefer this over re-statting `path` when admission must describe the
+    /// source a runtime is about to materialize. Auxiliary-model callers that
+    /// require byte stability across deferred materialization additionally
+    /// call [`Self::immutable_snapshot_matching_content_id`].
+    pub fn byte_len(&self) -> u64 {
+        self.mmap.len().try_into().unwrap_or(u64::MAX)
     }
 
     pub fn package_probe(&self) -> &GgmlPackageProbe {
@@ -319,6 +335,95 @@ impl GgmlRuntimeSource {
     pub(crate) fn backing_mmap_identity(&self) -> usize {
         Arc::as_ptr(&self.mmap) as usize
     }
+
+    /// Copy this source's currently held file generation into an anonymous,
+    /// read-only mapping. This is intentionally opt-in: copying a multi-GiB
+    /// ASR pack would defeat mmap's demand paging, while the small auxiliary
+    /// Voice ID packs need a byte-stable request snapshot across the gap
+    /// between preflight/admission and deferred graph materialization.
+    ///
+    /// The copy reads through the already-open descriptor, never `path()`. If
+    /// an in-place rewrite raced preflight, callers compare the returned
+    /// content id with their prepared key and fail closed before parsing or
+    /// constructing a graph. Once returned, later truncation or rewriting of
+    /// the original inode cannot affect this anonymous mapping.
+    pub(crate) fn immutable_snapshot(&self) -> Result<Self, GgmlRuntimeSourcePathError> {
+        let Some(source_file) = self.file.as_ref() else {
+            return Ok(self.clone());
+        };
+        let mut file = source_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.seek(SeekFrom::Start(0)).map_err(|source| {
+            GgmlRuntimeSourcePathError::SnapshotFile {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        let mut bytes = Vec::with_capacity(self.mmap.len());
+        file.read_to_end(&mut bytes).map_err(|source| {
+            GgmlRuntimeSourcePathError::SnapshotFile {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        if bytes.len() != self.mmap.len() {
+            return Err(GgmlRuntimeSourcePathError::SnapshotLengthChanged {
+                path: self.path.clone(),
+                expected: self.mmap.len(),
+                actual: bytes.len(),
+            });
+        }
+        drop(file);
+
+        let mut owned = memmap2::MmapMut::map_anon(bytes.len()).map_err(|source| {
+            GgmlRuntimeSourcePathError::MapFile {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        owned.copy_from_slice(&bytes);
+        let mmap =
+            owned
+                .make_read_only()
+                .map_err(|source| GgmlRuntimeSourcePathError::MapFile {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        let content_id = OnceLock::new();
+        content_id
+            .set(format!("sha256:{:x}", Sha256::digest(&mmap[..])))
+            .expect("fresh immutable runtime snapshot content id");
+        Ok(Self {
+            path: self.path.clone(),
+            package_probe: self.package_probe.clone(),
+            file: None,
+            mmap: Arc::new(mmap),
+            stat_identity: self.stat_identity,
+            opened_read_only: true,
+            content_id,
+        })
+    }
+
+    /// Create an immutable auxiliary-model snapshot and prove it is still the
+    /// content admitted during preflight. A rewrite between those phases is a
+    /// typed fail-closed error, never permission to parse different bytes or
+    /// fall back to another provider.
+    pub(crate) fn immutable_snapshot_matching_content_id(
+        &self,
+        expected: &str,
+    ) -> Result<Self, GgmlRuntimeSourcePathError> {
+        let snapshot = self.immutable_snapshot()?;
+        let actual = snapshot.content_id().to_string();
+        if actual != expected {
+            return Err(GgmlRuntimeSourcePathError::SnapshotContentChanged {
+                path: self.path.clone(),
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+        Ok(snapshot)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -352,6 +457,30 @@ pub enum GgmlRuntimeSourcePathError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error(
+        "could not copy ggml runtime source '{path}' into an immutable request snapshot: {source}"
+    )]
+    SnapshotFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "ggml runtime source '{path}' changed length while creating an immutable request snapshot: expected {expected} bytes, got {actual}"
+    )]
+    SnapshotLengthChanged {
+        path: PathBuf,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "ggml runtime source '{path}' changed after request preflight: expected {expected}, got {actual}"
+    )]
+    SnapshotContentChanged {
+        path: PathBuf,
+        expected: String,
+        actual: String,
     },
     #[error(
         "ggml runtime source '{path}' has a file identity this platform cannot represent (e.g. a pre-1970 mtime)"
@@ -441,6 +570,7 @@ pub fn validate_ggml_runtime_source_path(
     Ok(GgmlRuntimeSource {
         path: path.to_path_buf(),
         package_probe,
+        file: Some(Arc::new(Mutex::new(file))),
         mmap: Arc::new(mmap),
         stat_identity,
         opened_read_only,
@@ -737,6 +867,47 @@ mod tests {
             held_id_before,
             "a fresh resolution of the replaced path must yield a different id"
         );
+    }
+
+    #[test]
+    fn immutable_snapshot_bytes_survive_a_later_in_place_rewrite() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("auxiliary-pack.gguf");
+        let original = b"GGUFauxiliary-content-a";
+        let replacement = b"GGUFauxiliary-content-b";
+        assert_eq!(original.len(), replacement.len());
+        write_magic_file(&path, original);
+
+        let source = validate_ggml_runtime_source_path(&path).expect("validate source");
+        let expected = source.content_id().to_string();
+        let immutable = source
+            .immutable_snapshot_matching_content_id(&expected)
+            .expect("make immutable snapshot");
+        write_magic_file(&path, replacement);
+
+        assert_eq!(&immutable.backing_mmap()[..], original);
+        assert_eq!(immutable.content_id(), expected);
+    }
+
+    #[test]
+    fn immutable_snapshot_fails_closed_when_source_changed_after_preflight() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("auxiliary-pack.gguf");
+        let original = b"GGUFauxiliary-content-a";
+        let replacement = b"GGUFauxiliary-content-b";
+        assert_eq!(original.len(), replacement.len());
+        write_magic_file(&path, original);
+
+        let source = validate_ggml_runtime_source_path(&path).expect("validate source");
+        let expected = source.content_id().to_string();
+        write_magic_file(&path, replacement);
+        let error = source
+            .immutable_snapshot_matching_content_id(&expected)
+            .expect_err("content changed between preflight and materialization");
+        assert!(matches!(
+            error,
+            super::GgmlRuntimeSourcePathError::SnapshotContentChanged { .. }
+        ));
     }
 
     /// Performance guardrail: the whole point of family TLS caches switching

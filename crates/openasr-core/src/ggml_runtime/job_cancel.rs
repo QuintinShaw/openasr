@@ -71,6 +71,29 @@ pub(crate) fn thread_job_cancel_flag() -> Option<Arc<AtomicBool>> {
     ACTIVE_JOB_CANCEL.with(|cell| cell.borrow().as_ref().map(Arc::clone))
 }
 
+/// Installs a cloned job-cancel flag on a dedicated model worker and restores
+/// that worker's previous flag on drop. Model-specific worker pools must use
+/// this guard when they move graph execution off the request thread; otherwise
+/// mid-graph cancellation silently disappears at the thread boundary.
+pub(crate) struct InheritedJobCancelGuard {
+    flag: Arc<AtomicBool>,
+    previous: Option<Arc<AtomicBool>>,
+}
+
+impl InheritedJobCancelGuard {
+    pub(crate) fn arm(flag: &Arc<AtomicBool>) -> Self {
+        let flag = Arc::clone(flag);
+        let previous = arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        Self { flag, previous }
+    }
+}
+
+impl Drop for InheritedJobCancelGuard {
+    fn drop(&mut self) {
+        let _ = disarm_thread_job_cancel_flag_if_current(&self.flag, self.previous.take());
+    }
+}
+
 /// Wait-free cancel check used by the ggml abort trampoline.
 ///
 /// `data` is either null (defensive; callback-free production compute never

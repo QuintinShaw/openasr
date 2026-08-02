@@ -65,6 +65,60 @@ pub(crate) struct Weights {
 }
 
 impl Weights {
+    /// Logical f32 resident size from the already-open GGUF tensor index.
+    /// This performs only header/index/range validation and never copies or
+    /// dequantizes tensor payloads, so admission can run before materializing
+    /// the ReDimNet model while retaining the exact same mapped source.
+    pub(crate) fn logical_f32_bytes_from_runtime_source(
+        runtime_source: &GgmlRuntimeSource,
+    ) -> Result<u64, WeightsError> {
+        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+            .map_err(|error| WeightsError::Gguf(error.to_string()))?;
+        if reader.tensor_index().tensors().is_empty() {
+            return Err(WeightsError::InvalidInput(
+                "speaker-embedder pack contains no tensors".to_string(),
+            ));
+        }
+        reader.tensor_index().tensors().iter().enumerate().try_fold(
+            0_u64,
+            |total, (tensor_id, tensor)| {
+                // Validate that this tensor index entry addresses bytes inside
+                // the held mmap without copying those bytes.
+                reader
+                    .host_tensor_bytes_by_id(tensor_id)
+                    .map_err(|error| WeightsError::Gguf(error.to_string()))?;
+                let elements = tensor.num_elements().ok_or_else(|| {
+                    WeightsError::InvalidInput(format!(
+                        "tensor '{}' logical element count overflows",
+                        tensor.name
+                    ))
+                })?;
+                total
+                    .checked_add(elements.checked_mul(4).ok_or_else(|| {
+                        WeightsError::InvalidInput(format!(
+                            "tensor '{}' logical f32 byte count overflows",
+                            tensor.name
+                        ))
+                    })?)
+                    .ok_or_else(|| {
+                        WeightsError::InvalidInput(
+                            "speaker-embedder logical f32 byte total overflows".to_string(),
+                        )
+                    })
+            },
+        )
+    }
+
+    pub(crate) fn logical_f32_bytes(&self) -> u64 {
+        self.tensors.values().fold(0u64, |total, tensor| {
+            total.saturating_add(
+                u64::try_from(tensor.data.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<f32>() as u64),
+            )
+        })
+    }
+
     /// Parse a safetensors byte buffer.
     pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
         if bytes.len() < 8 {

@@ -89,7 +89,7 @@ class PackRoundTripTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "diarizen-test.oasr"
-            C.write_pack(out, plan, quant="q8_0")
+            C.write_pack(out, plan, quant="q8_0", model_id="diarizen-base-s80")
             reader = gguf.GGUFReader(str(out))
             tensors = {tensor.name: tensor for tensor in reader.tensors}
             self.assertEqual(
@@ -106,6 +106,17 @@ class PackRoundTripTest(unittest.TestCase):
             self.assertIn("diarizen.wavlm_config_json", fields)
             self.assertIn("diarizen.median_filter_frames", fields)
             self.assertIn("diarizen.tensor_schema", fields)
+            self.assertEqual(_kv_str(reader, "openasr.model.id"), "diarizen-base-s80")
+            self.assertEqual(
+                _kv_str(reader, "diarizen.upstream_model_id"),
+                "BUT-FIT/diarizen-wavlm-base-s80-md",
+            )
+
+
+def _kv_str(reader, key):
+    field = reader.get_field(key)
+    part = field.parts[field.data[-1]]
+    return bytes(part).decode("utf-8") if not isinstance(part, str) else part
 
 
 if __name__ == "__main__":

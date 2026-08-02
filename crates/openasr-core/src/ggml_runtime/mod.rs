@@ -36,6 +36,11 @@ pub(crate) use cpu_graph::{
     GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
     GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
 };
+#[cfg(test)]
+pub(crate) use cpu_graph::{
+    clear_test_graph_compute_status_override, install_test_graph_compute_abort,
+    install_test_graph_compute_device_lost,
+};
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32};
 pub(crate) use gguf_c_parser_sandbox::load_gguf_metadata_and_tensor_index_with_c_parser_sandbox;
@@ -62,7 +67,7 @@ pub(crate) use gguf_write::{
     write_gguf_file_v0,
 };
 pub(crate) use job_cancel::{
-    arm_thread_job_cancel_flag, cancel_flag_requested_from_data,
+    InheritedJobCancelGuard, arm_thread_job_cancel_flag, cancel_flag_requested_from_data,
     disarm_thread_job_cancel_flag_if_current, thread_job_cancel_flag,
 };
 #[cfg(test)]

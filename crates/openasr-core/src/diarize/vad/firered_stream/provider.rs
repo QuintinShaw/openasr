@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use super::frontend::SAMPLE_RATE_HZ;
 use super::model::{FRAME_SHIFT_MS, FireRedStreamVadModel};
+use super::streaming::FireRedStreamingVad;
 use super::weights::FireRedStreamVadWeightsError;
 use crate::longform::{
     LongFormOptions, LongFormVadProvider, LongFormVadProviderKind, LongFormVadSlice,
@@ -14,6 +15,10 @@ use crate::longform::{
 pub enum FireRedStreamVadError {
     #[error("firered Stream-VAD model is unavailable: {0}")]
     Unavailable(#[from] FireRedStreamVadWeightsError),
+    #[error("firered Stream-VAD requires {expected} Hz mono audio, got {actual} Hz")]
+    UnsupportedSampleRate { expected: u32, actual: u32 },
+    #[error("firered Stream-VAD was canceled")]
+    Canceled,
 }
 
 /// Neural VAD provider over the process-wide shared Stream-VAD model. Cheap
@@ -33,6 +38,40 @@ impl FireRedStreamVadProvider {
     pub fn probabilities(&self, samples: &[f32]) -> Vec<f32> {
         self.model.probabilities(samples)
     }
+
+    /// Offline speech slicing with bounded cancellation latency. One second
+    /// of PCM is frontended and scored at a time while the causal DFSMN cache
+    /// and the fbank overlap tail remain continuous, so output matches the
+    /// batch model without making a long recording one uninterruptible call.
+    pub(crate) fn compute_speech_slices_cancellable(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        options: &LongFormOptions,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<LongFormVadSlice>, FireRedStreamVadError> {
+        if sample_rate_hz != SAMPLE_RATE_HZ {
+            return Err(FireRedStreamVadError::UnsupportedSampleRate {
+                expected: SAMPLE_RATE_HZ,
+                actual: sample_rate_hz,
+            });
+        }
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut streaming = FireRedStreamingVad::from_model(self.model);
+        let mut probabilities = Vec::new();
+        for chunk in samples.chunks(SAMPLE_RATE_HZ as usize) {
+            if canceled() {
+                return Err(FireRedStreamVadError::Canceled);
+            }
+            probabilities.extend(streaming.accept_f32_chunk(chunk));
+        }
+        if canceled() {
+            return Err(FireRedStreamVadError::Canceled);
+        }
+        Ok(spans_from_probs(&probabilities, samples.len(), options))
+    }
 }
 
 impl LongFormVadProvider for FireRedStreamVadProvider {
@@ -46,16 +85,8 @@ impl LongFormVadProvider for FireRedStreamVadProvider {
         sample_rate_hz: u32,
         options: &LongFormOptions,
     ) -> Result<Vec<LongFormVadSlice>, String> {
-        if sample_rate_hz != SAMPLE_RATE_HZ {
-            return Err(format!(
-                "firered Stream-VAD requires {SAMPLE_RATE_HZ} Hz mono audio, got {sample_rate_hz} Hz"
-            ));
-        }
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-        let probs = self.model.probabilities(samples);
-        Ok(spans_from_probs(&probs, samples.len(), options))
+        self.compute_speech_slices_cancellable(samples, sample_rate_hz, options, &|| false)
+            .map_err(|error| error.to_string())
     }
 }
 

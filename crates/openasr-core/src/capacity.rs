@@ -494,17 +494,11 @@ pub(crate) enum MemoryAdmissionDomain {
     /// Metal). VRAM cannot be paged to swap, so an over-budget request is a
     /// hard failure with no "run it slower" fallback; swap is never added.
     ///
-    /// NOTE (device-aware accounting, still partial): a true VRAM budget is
-    /// not yet plumbed to this function, so the discrete path still charges the
-    /// KV and pack bytes against a fraction of HOST RAM
-    /// (`host_memory_budget_bytes`) as a conservative stand-in. That is
-    /// conservative-to-a-fault (it can refuse a request that a large VRAM
-    /// would actually hold) but never unsafe, and no family that runs
-    /// meaningfully large on a discrete GPU is wired to this check today
-    /// (moss-transcribe-diarize, the only wired family, runs CPU/Metal and
-    /// stays small). Wiring a real per-device VRAM budget here is the
-    /// remaining follow-up.
-    DiscreteVram,
+    /// `budget_bytes` is derived from the actual selected device's live ggml
+    /// memory report (`min(free, total * 3/4)`). It is never inferred from host
+    /// RAM. Callers that cannot obtain this value must fail closed or choose a
+    /// CPU route before entering admission.
+    DiscreteVram { budget_bytes: u64 },
 }
 
 /// A family's decoder KV footprint for THIS request clearly does not fit this
@@ -522,8 +516,8 @@ pub(crate) struct HostMemoryCapacityRejection {
     /// [`evaluate_host_memory_admission`] actually knows.
     pub needed_bytes: u64,
     /// The budget `needed_bytes` was compared against: total RAM + swap on a
-    /// unified-memory host, `host_total_memory_bytes * 3/4` on the discrete
-    /// (no-swap) path (see [`MemoryAdmissionDomain`]).
+    /// unified-memory host, or the exact selected device's live VRAM admission
+    /// budget on the discrete (no-swap) path (see [`MemoryAdmissionDomain`]).
     pub budget_bytes: u64,
     pub host_total_memory_bytes: u64,
     pub pack_bytes_on_disk: u64,
@@ -548,7 +542,7 @@ impl HostMemoryCapacityRejection {
     pub(crate) fn provenance(&self) -> String {
         let (domain, swap_bytes) = match self.domain {
             MemoryAdmissionDomain::UnifiedMemory { swap_bytes } => ("unified", swap_bytes),
-            MemoryAdmissionDomain::DiscreteVram => ("discrete_vram", 0),
+            MemoryAdmissionDomain::DiscreteVram { .. } => ("discrete_vram", 0),
         };
         format!(
             "core.native.capacity.admission:reject,domain={},needed_bytes={},budget_bytes={},host_total_memory_bytes={},swap_bytes={},pack_bytes_on_disk={},auxiliary_resident_bytes={},required_positions={}",
@@ -573,21 +567,25 @@ impl HostMemoryCapacityRejection {
         let needed_gib = self.needed_bytes as f64 / GIB;
         let budget_gib = self.budget_bytes as f64 / GIB;
         let host_gib = self.host_total_memory_bytes as f64 / GIB;
+        let workload = if self.required_positions == 0 && self.auxiliary_resident_bytes > 0 {
+            "the model pack plus the Voice ID working set".to_string()
+        } else {
+            format!(
+                "the model pack plus its decode context for {} decoder positions",
+                self.required_positions
+            )
+        };
         let headline = match self.domain {
             MemoryAdmissionDomain::UnifiedMemory { swap_bytes } => format!(
-                "This request needs about {needed_gib:.1} GiB (the model pack plus its decode \
-                 context for {positions} decoder positions), but this host's admission budget is \
+                "This request needs about {needed_gib:.1} GiB ({workload}), but this host's admission budget is \
                  only {budget_gib:.1} GiB ({host_gib:.1} GiB RAM + {swap_gib:.1} GiB swap). It \
                  does not fit even after paging to swap.",
-                positions = self.required_positions,
                 swap_gib = swap_bytes as f64 / GIB,
             ),
-            MemoryAdmissionDomain::DiscreteVram => format!(
-                "This request needs about {needed_gib:.1} GiB (the model pack plus its decode \
-                 context for {positions} decoder positions), but this discrete GPU's admission \
+            MemoryAdmissionDomain::DiscreteVram { .. } => format!(
+                "This request needs about {needed_gib:.1} GiB ({workload}), but this discrete GPU's admission \
                  budget is only {budget_gib:.1} GiB. GPU VRAM cannot page to swap, so it cannot \
                  be run slower to fit.",
-                positions = self.required_positions,
             ),
         };
         format!(
@@ -625,9 +623,9 @@ impl HostMemoryCapacityRejection {
 ///   swap that working set pages out too, and the point of this path is to let
 ///   a large decode run rather than be refused. When swap is unprobeable the
 ///   domain carries zero, reverting to a RAM-only budget (conservative).
-/// - **Discrete VRAM (CUDA/HIP/Vulkan):** budget = 75% of host RAM, no swap
-///   added (VRAM cannot page). This is a conservative stand-in until a real
-///   per-device VRAM budget is plumbed here; see [`MemoryAdmissionDomain`].
+/// - **Discrete VRAM (CUDA/HIP/Vulkan):** budget = the actual selected
+///   device's admission budget carried in [`MemoryAdmissionDomain`], no swap
+///   added (VRAM cannot page).
 ///
 /// Fails OPEN on a degenerate geometry (`kv_bytes_at_positions` erring):
 /// geometry validity is enforced elsewhere (pack import), not here, and
@@ -649,6 +647,46 @@ pub(crate) fn evaluate_host_memory_admission(
         .total()
         .saturating_add(pack_bytes_on_disk)
         .saturating_add(auxiliary_resident_bytes);
+    evaluate_known_host_memory_bytes(
+        needed_bytes,
+        pack_bytes_on_disk,
+        auxiliary_resident_bytes,
+        required_positions,
+        host_total_memory_bytes,
+        domain,
+    )
+}
+
+/// Admission for a family without positional KV facts when this request still
+/// has a known co-resident auxiliary working set (Voice ID). This preserves
+/// fail-open behavior for unknown decoder geometry while no longer dropping a
+/// deterministic pack + auxiliary charge on model families outside the KV
+/// registry.
+pub(crate) fn evaluate_static_host_memory_admission(
+    pack_bytes_on_disk: u64,
+    auxiliary_resident_bytes: u64,
+    host_total_memory_bytes: u64,
+    domain: MemoryAdmissionDomain,
+) -> Result<(), HostMemoryCapacityRejection> {
+    let needed_bytes = pack_bytes_on_disk.saturating_add(auxiliary_resident_bytes);
+    evaluate_known_host_memory_bytes(
+        needed_bytes,
+        pack_bytes_on_disk,
+        auxiliary_resident_bytes,
+        0,
+        host_total_memory_bytes,
+        domain,
+    )
+}
+
+fn evaluate_known_host_memory_bytes(
+    needed_bytes: u64,
+    pack_bytes_on_disk: u64,
+    auxiliary_resident_bytes: u64,
+    required_positions: usize,
+    host_total_memory_bytes: u64,
+    domain: MemoryAdmissionDomain,
+) -> Result<(), HostMemoryCapacityRejection> {
     let budget_bytes = match domain {
         // Unified memory can page to swap, so the physical ceiling a decode can
         // draw on is RAM + swap -- not the 75% RAM budget the discrete path and
@@ -656,10 +694,8 @@ pub(crate) fn evaluate_host_memory_admission(
         MemoryAdmissionDomain::UnifiedMemory { swap_bytes } => {
             host_total_memory_bytes.saturating_add(swap_bytes)
         }
-        // VRAM cannot swap; keep the conservative host-RAM stand-in budget.
-        MemoryAdmissionDomain::DiscreteVram => {
-            crate::host::host_memory_budget_bytes(host_total_memory_bytes)
-        }
+        // VRAM cannot swap and is a different physical pool from host RAM.
+        MemoryAdmissionDomain::DiscreteVram { budget_bytes } => budget_bytes,
     };
     if needed_bytes <= budget_bytes {
         return Ok(());
@@ -1036,13 +1072,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn static_admission_charges_voice_id_without_decoder_kv_facts() {
+        let host_ram: u64 = 4 * GIB;
+        let pack_bytes: u64 = 3 * GIB + GIB / 2;
+        evaluate_static_host_memory_admission(pack_bytes, 0, host_ram, unified(0))
+            .expect("pack alone fits");
+
+        let auxiliary = GIB;
+        let rejection =
+            evaluate_static_host_memory_admission(pack_bytes, auxiliary, host_ram, unified(0))
+                .expect_err("known Voice ID state must be charged even without KV geometry");
+        assert_eq!(rejection.required_positions, 0);
+        assert_eq!(rejection.auxiliary_resident_bytes, auxiliary);
+        assert!(rejection.user_message().contains("Voice ID working set"));
+    }
+
     /// Discrete VRAM cannot page: swap never enters its budget, and the
     /// rejection message says so. A budget that would trivially admit the same
     /// request as unified-with-swap still rejects here.
     #[test]
     fn host_memory_admission_discrete_vram_never_uses_swap() {
         let geometry = moss_geometry();
-        let host_ram: u64 = 8 * GIB; // 75% budget = 6 GiB
+        let host_ram: u64 = 8 * GIB;
+        let vram_budget: u64 = 6 * GIB;
         let pack_bytes: u64 = 5 * GIB;
         // 8192 DEFAULT positions ~= 2.6 GiB KV -> needed ~= 7.6 GiB > 6 GiB.
         let rejection = evaluate_host_memory_admission(
@@ -1052,14 +1105,12 @@ mod tests {
             pack_bytes,
             0,
             host_ram,
-            MemoryAdmissionDomain::DiscreteVram,
+            MemoryAdmissionDomain::DiscreteVram {
+                budget_bytes: vram_budget,
+            },
         )
-        .expect_err("VRAM budget (75% of host RAM stand-in) cannot hold this request");
-        // No swap term -- budget is the 75% RAM stand-in, unchanged by swap.
-        assert_eq!(
-            rejection.budget_bytes,
-            crate::host::host_memory_budget_bytes(host_ram)
-        );
+        .expect_err("the selected device's VRAM budget cannot hold this request");
+        assert_eq!(rejection.budget_bytes, vram_budget);
         let message = rejection.user_message();
         assert!(
             message.contains("GPU VRAM cannot page to swap"),

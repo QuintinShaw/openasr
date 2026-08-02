@@ -97,6 +97,25 @@ fn chunked_streaming_forward_matches_batch_forward_bit_close() {
 }
 
 #[test]
+fn offline_f32_chunking_matches_every_batch_probability() {
+    use super::streaming::FireRedStreamingVad;
+
+    let (samples, _) = golden();
+    let model = FireRedStreamVadModel::embedded().expect("vendored firered Stream-VAD weights");
+    let batch = model.probabilities(&samples);
+    let mut streaming = FireRedStreamingVad::shared().expect("shared Stream-VAD streaming model");
+    let mut chunked = Vec::new();
+    for chunk in samples.chunks(7_913) {
+        chunked.extend(streaming.accept_f32_chunk(chunk));
+    }
+    let (max_diff, at) = max_abs_diff_with_location(&chunked, &batch);
+    assert!(
+        max_diff < 1e-5,
+        "offline f32 chunking diverged from batch by {max_diff} at frame {at}"
+    );
+}
+
+#[test]
 fn probabilities_are_finite_and_in_unit_range() {
     let (samples, _) = golden();
     let model = FireRedStreamVadModel::embedded().expect("vendored firered Stream-VAD weights");
@@ -147,6 +166,24 @@ fn provider_rejects_wrong_sample_rate() {
         .compute_speech_slices(&samples, 8_000, &LongFormOptions::default())
         .expect_err("wrong sample rate must fail closed");
     assert!(err.contains("16000"));
+}
+
+#[test]
+fn provider_cancellable_path_stops_before_frontend_work() {
+    let provider = FireRedStreamVadProvider::shared().expect("shared Stream-VAD provider");
+    let samples = vec![0.0f32; 32_000];
+    let error = provider
+        .compute_speech_slices_cancellable(
+            &samples,
+            super::frontend::SAMPLE_RATE_HZ,
+            &crate::LongFormOptions::default(),
+            &|| true,
+        )
+        .expect_err("pre-canceled VAD must stop");
+    assert!(matches!(
+        error,
+        super::provider::FireRedStreamVadError::Canceled
+    ));
 }
 
 /// Host-local RTF benchmark over a real 5-minute recording (not part of the

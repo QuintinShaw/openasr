@@ -108,6 +108,16 @@ impl<K, T> BoundedRuntimeCache<K, T> {
         }
     }
 
+    /// Eagerly drop every entry on its owning thread and synchronize the
+    /// cache to the process unload generation. Dedicated long-lived worker
+    /// pools can broadcast this operation during idle unload instead of
+    /// relying on a future model request to trigger the normal lazy sync.
+    pub(crate) fn clear_for_idle_unload(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.unload_generation = current_unload_generation();
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

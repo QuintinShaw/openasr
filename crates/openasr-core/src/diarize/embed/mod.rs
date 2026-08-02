@@ -13,7 +13,6 @@ pub(crate) mod weights;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pack::speaker_attribution_admission_bytes;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderIdentity,
@@ -21,8 +20,10 @@ pub use pack::{
     VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON, embedder_pack_installed, shared_embedder,
     shared_embedder_identity,
 };
+pub(crate) use pack::{prepare_shared_embedder_snapshot, unload_idle_embedder_cache};
 
 use rayon::prelude::*;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 use super::calibration::{REDIMNET_CALIBRATION, SpeakerCalibrationProfile};
@@ -32,6 +33,101 @@ use redimnet::frontend::RedimNetFrontend;
 
 /// Sample rate the embedder requires.
 const SAMPLE_RATE_HZ: u32 = 16_000;
+pub(crate) const REDIMNET_MAX_BATCH_WORKERS: usize = 4;
+
+#[cfg(test)]
+const REDIMNET_BENCH_WORKERS_ENV: &str = "OPENASR_REDIMNET_BENCH_WORKERS";
+
+static REDIMNET_BATCH_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+fn redimnet_batch_pool() -> &'static Result<rayon::ThreadPool, String> {
+    REDIMNET_BATCH_POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(REDIMNET_MAX_BATCH_WORKERS);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("openasr-redimnet-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Eager idle-unload for the dedicated, persistent ReDim worker pool. A mere
+/// generation bump is insufficient here: unlike tokio blocking workers these
+/// threads intentionally remain alive, so without a broadcast their uploaded
+/// arenas would stay resident forever when no later Voice ID request arrives.
+pub(crate) fn unload_idle_redimnet_worker_runtimes() {
+    if let Some(Ok(pool)) = REDIMNET_BATCH_POOL.get() {
+        pool.broadcast(|_| redimnet::backbone::clear_current_thread_runtime_cache());
+    }
+}
+
+#[cfg(test)]
+fn redimnet_worker_runtime_entry_count() -> usize {
+    let Some(Ok(pool)) = REDIMNET_BATCH_POOL.get() else {
+        return 0;
+    };
+    pool.broadcast(|_| redimnet::backbone::current_thread_runtime_cache_len())
+        .into_iter()
+        .sum()
+}
+
+#[cfg(test)]
+fn install_worker_graph_compute_device_lost() {
+    let pool = redimnet_batch_pool()
+        .as_ref()
+        .expect("ReDimNet test worker pool");
+    pool.broadcast(|_| crate::ggml_runtime::install_test_graph_compute_device_lost());
+}
+
+#[cfg(test)]
+fn clear_worker_graph_compute_status_override() {
+    let pool = redimnet_batch_pool()
+        .as_ref()
+        .expect("ReDimNet test worker pool");
+    pool.broadcast(|_| crate::ggml_runtime::clear_test_graph_compute_status_override());
+}
+
+#[cfg(test)]
+fn redimnet_runtime_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpeakerEmbeddingExecutionPlan {
+    workers: usize,
+    threads_per_runner: usize,
+}
+
+impl SpeakerEmbeddingExecutionPlan {
+    fn for_clips(clips: usize, available: usize, pool_threads: usize) -> Self {
+        let workers = clips.max(1).min(pool_threads.max(1));
+        Self {
+            workers,
+            threads_per_runner: (available.max(1) / workers).max(1),
+        }
+    }
+
+    fn worker_range(self, worker: usize, clips: usize) -> std::ops::Range<usize> {
+        worker * clips / self.workers..(worker + 1) * clips / self.workers
+    }
+}
+
+fn redimnet_batch_worker_limit(pool_threads: usize) -> usize {
+    #[cfg(test)]
+    if let Some(limit) = std::env::var(REDIMNET_BENCH_WORKERS_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|limit| (1..=REDIMNET_MAX_BATCH_WORKERS).contains(limit))
+    {
+        return pool_threads.max(1).min(limit);
+    }
+    pool_threads.clamp(1, REDIMNET_MAX_BATCH_WORKERS)
+}
 
 #[derive(Debug, Error)]
 pub enum EmbedError {
@@ -126,6 +222,10 @@ impl RedimNet2Embedder {
         pack::REDIMNET_EMBEDDING_SPACE_VERSION
     }
 
+    pub(crate) fn logical_f32_weight_bytes(&self) -> u64 {
+        self.model.logical_f32_weight_bytes()
+    }
+
     fn embed_with_threads(
         &self,
         samples: &[f32],
@@ -160,6 +260,65 @@ impl RedimNet2Embedder {
         Ok(SpeakerEmbedding::l2_normalized(raw))
     }
 
+    fn embed_on_bounded_pool(
+        &self,
+        clips: &[&[f32]],
+        sample_rate_hz: u32,
+    ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+        if clips.is_empty() {
+            return Vec::new();
+        }
+        let pool = match redimnet_batch_pool().as_ref() {
+            Ok(pool) => pool,
+            Err(error) => {
+                return clips
+                    .iter()
+                    .map(|_| {
+                        Err(EmbedError::Unavailable(format!(
+                            "could not create bounded ReDimNet worker pool: {error}"
+                        )))
+                    })
+                    .collect();
+            }
+        };
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let plan = SpeakerEmbeddingExecutionPlan::for_clips(
+            clips.len(),
+            available,
+            redimnet_batch_worker_limit(pool.current_num_threads()),
+        );
+        let inherited_cancel = crate::ggml_runtime::thread_job_cancel_flag();
+        pool.install(|| {
+            (0..plan.workers)
+                .into_par_iter()
+                .map(|worker| {
+                    clips[plan.worker_range(worker, clips.len())]
+                        .iter()
+                        .map(|samples| {
+                            let _cancel_guard = inherited_cancel
+                                .as_ref()
+                                .map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
+                            if inherited_cancel.as_ref().is_some_and(cancel_requested) {
+                                Err(EmbedError::Canceled)
+                            } else {
+                                self.embed_with_threads(
+                                    samples,
+                                    sample_rate_hz,
+                                    Some(plan.threads_per_runner),
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect()
+        })
+    }
+
     #[cfg(test)]
     fn embed_uncached_for_bench(
         &self,
@@ -183,7 +342,10 @@ impl RedimNet2Embedder {
 
 impl SpeakerEmbedder for RedimNet2Embedder {
     fn embed(&self, samples: &[f32], sample_rate_hz: u32) -> Result<SpeakerEmbedding, EmbedError> {
-        self.embed_with_threads(samples, sample_rate_hz, None)
+        self.embed_on_bounded_pool(&[samples], sample_rate_hz)
+            .into_iter()
+            .next()
+            .expect("one ReDimNet input produces one result")
     }
 
     fn embed_batch(
@@ -191,29 +353,7 @@ impl SpeakerEmbedder for RedimNet2Embedder {
         clips: &[&[f32]],
         sample_rate_hz: u32,
     ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
-        if clips.len() <= 1 {
-            return clips
-                .iter()
-                .map(|samples| self.embed(samples, sample_rate_hz))
-                .collect();
-        }
-        let available = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1);
-        let workers = clips.len().min(available).max(1);
-        let threads_per_runner = (available / workers).max(1);
-        let inherited_cancel = crate::ggml_runtime::thread_job_cancel_flag();
-        clips
-            .par_iter()
-            .map(|samples| {
-                let _cancel_guard = inherited_cancel.as_ref().map(InheritedCancelGuard::arm);
-                if inherited_cancel.as_ref().is_some_and(cancel_requested) {
-                    Err(EmbedError::Canceled)
-                } else {
-                    self.embed_with_threads(samples, sample_rate_hz, Some(threads_per_runner))
-                }
-            })
-            .collect()
+        self.embed_on_bounded_pool(clips, sample_rate_hz)
     }
 
     fn embedding_dim(&self) -> usize {
@@ -234,29 +374,6 @@ impl SpeakerEmbedder for RedimNet2Embedder {
 
 fn cancel_requested(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> bool {
     flag.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-struct InheritedCancelGuard {
-    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    previous: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-}
-
-impl InheritedCancelGuard {
-    fn arm(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
-        let flag = std::sync::Arc::clone(flag);
-        let previous =
-            crate::ggml_runtime::arm_thread_job_cancel_flag(Some(std::sync::Arc::clone(&flag)));
-        Self { flag, previous }
-    }
-}
-
-impl Drop for InheritedCancelGuard {
-    fn drop(&mut self) {
-        let _ = crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(
-            &self.flag,
-            self.previous.take(),
-        );
-    }
 }
 
 #[cfg(test)]

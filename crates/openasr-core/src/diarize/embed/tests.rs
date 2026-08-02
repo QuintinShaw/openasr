@@ -1,7 +1,7 @@
 //! Parity tests for the ReDimNet2-B6 embedder.
 
 use super::RedimNet2Embedder;
-use super::{EmbedError, SpeakerEmbedder};
+use super::{EmbedError, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan};
 use crate::diarize::contract::SpeakerEmbedding;
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -9,6 +9,38 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     dot / (na * nb)
+}
+
+#[test]
+fn redimnet_execution_plan_caps_resident_workers_and_divides_cpu_threads() {
+    assert_eq!(
+        SpeakerEmbeddingExecutionPlan::for_clips(100, 8, 4),
+        SpeakerEmbeddingExecutionPlan {
+            workers: 4,
+            threads_per_runner: 2,
+        }
+    );
+    assert_eq!(
+        SpeakerEmbeddingExecutionPlan::for_clips(2, 8, 4),
+        SpeakerEmbeddingExecutionPlan {
+            workers: 2,
+            threads_per_runner: 4,
+        }
+    );
+    assert_eq!(
+        SpeakerEmbeddingExecutionPlan::for_clips(1, 8, 4),
+        SpeakerEmbeddingExecutionPlan {
+            workers: 1,
+            threads_per_runner: 8,
+        }
+    );
+    let plan = SpeakerEmbeddingExecutionPlan::for_clips(5, 8, 4);
+    assert_eq!(
+        (0..plan.workers)
+            .map(|worker| plan.worker_range(worker, 5))
+            .collect::<Vec<_>>(),
+        vec![0..1, 1..2, 2..3, 3..5]
+    );
 }
 
 #[ignore = "host-local bench: needs OPENASR_REDIMNET_PACK; run with --release for catalog numbers"]
@@ -309,6 +341,39 @@ fn redimnet_reuses_resident_runner_and_uploaded_weights() {
         after_second, after_first,
         "warm call rebuilt resident state"
     );
+}
+
+#[test]
+#[ignore = "requires OPENASR_REDIMNET_PACK; validates terminal-backend eviction"]
+fn redimnet_rebuilds_the_runner_after_device_loss_without_retrying_request() {
+    let _test_guard = super::redimnet_runtime_test_lock();
+    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
+        eprintln!("skipping: OPENASR_REDIMNET_PACK is not set");
+        return;
+    };
+    let embedder =
+        RedimNet2Embedder::from_oasr(std::path::Path::new(&pack)).expect("load ReDimNet pack");
+    let samples = vec![0.01_f32; 16_000];
+
+    super::install_worker_graph_compute_device_lost();
+    let error = embedder
+        .embed(&samples, 16_000)
+        .expect_err("device loss must fail this request without retry");
+    assert!(matches!(error, EmbedError::Unavailable(_)));
+    // The one-shot injection was broadcast because Rayon may choose any
+    // worker. Clear unused workers before recovery; the worker that actually
+    // failed consumed its injection and must already have evicted its runtime.
+    super::clear_worker_graph_compute_status_override();
+    assert_eq!(
+        super::redimnet_worker_runtime_entry_count(),
+        0,
+        "a terminal backend handle must be evicted on its owner worker"
+    );
+
+    let recovered = embedder
+        .embed(&samples, 16_000)
+        .expect("the next request builds a fresh runner");
+    assert_eq!(recovered.dim(), 192);
 }
 
 #[test]

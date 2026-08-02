@@ -510,6 +510,11 @@ pub fn unload_idle_native_model_runtime_caches() {
     // tokio keeps alive pins those weights (e.g. the qwen whole-decoder's
     // device-uploaded LLM layers) across the unload indefinitely.
     crate::models::thread_local_runtime_cache::bump_unload_generation();
+    // Voice ID also owns process-wide model snapshots plus a dedicated,
+    // long-lived ReDim Rayon pool. Run this after the generation advances so
+    // every worker eagerly clears and synchronizes its TLS cache to the new
+    // generation; no future request is required to release uploaded arenas.
+    crate::diarize::unload_idle_voice_id_runtime_caches();
 }
 
 fn native_ggml_streaming_error_to_asr(
