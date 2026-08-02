@@ -646,10 +646,7 @@ mod tests {
     fn ggml_dims_for_pack_reverses_rank2_only() {
         // Linear / embedding: safetensors [out, in] -> ggml [in, out].
         assert_eq!(ggml_dims_for_pack(&[1024, 160]), vec![160, 1024]);
-        assert_eq!(
-            ggml_dims_for_pack(&[100353, 2048]),
-            vec![2048, 100353]
-        );
+        assert_eq!(ggml_dims_for_pack(&[100353, 2048]), vec![2048, 100353]);
         // Square is a no-op on the extents.
         assert_eq!(ggml_dims_for_pack(&[1024, 1024]), vec![1024, 1024]);
         // Bias / norm stays 1-D; depthwise conv / projector.query stay rank-3+.

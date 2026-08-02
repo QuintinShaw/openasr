@@ -5894,11 +5894,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let max_allowed_samples = ((resolution.options.chunk_seconds
-            + resolution.options.padding_seconds * 2.0
-            + 1.0)
-            * SAMPLE_RATE_HZ as f32)
-            .ceil() as usize;
+        let max_allowed_samples =
+            ((resolution.options.chunk_seconds + resolution.options.padding_seconds * 2.0 + 1.0)
+                * SAMPLE_RATE_HZ as f32)
+                .ceil() as usize;
         for (index, slice) in plan.slices.iter().enumerate() {
             assert!(
                 slice.duration_samples() <= max_allowed_samples,
