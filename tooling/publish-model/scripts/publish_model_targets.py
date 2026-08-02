@@ -32,6 +32,17 @@ XASR_ZIPFORMER_EXPECTED_GENERAL_ARCHITECTURE = b"xasr-zipformer-transducer"
 HYMT2_EXPECTED_GENERAL_ARCHITECTURE = b"hunyuan-dense"
 FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE = b"firered-punc"
 REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE = b"redimnet2"
+DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE = b"diarizen-wavlm-conformer-segmentation"
+DIARIZEN_REQUIRED_HEADER_MARKERS = (
+    b"openasr.source.name",
+    b"BUT-FIT/diarizen-wavlm-base-s80-md",
+    b"openasr.source.revision",
+    b"a9857fc34908197fb5336d9d0562f291834a04b2",
+    b"openasr.license.name",
+    b"CC BY-NC 4.0",
+    b"openasr.license.source",
+    b"https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/a9857fc34908197fb5336d9d0562f291834a04b2/README.md",
+)
 HYMT2_REQUIRED_HEADER_MARKERS = (
     b"openasr.model.kind",
     b"translation-model",
@@ -45,7 +56,8 @@ HYMT2_REQUIRED_HEADER_MARKERS = (
     b"LICENSE.txt",
     b"NOTICE.openasr.txt",
 )
-# Models cleared for the public release lane.
+# Models cleared for this pack-publish lane. Repository visibility and public
+# catalog listing remain separately gated; DiariZen stays `release_public=false`.
 RELEASE_LANE_MODELS = (
     DEFAULT_MODEL,
     "qwen3-asr-1.7b",
@@ -66,6 +78,7 @@ RELEASE_LANE_MODELS = (
     "whisper-medium.en",
     "redimnet2-b6-cn",
     "pyannote-segmentation-3.0",
+    "diarizen-base-s80",
     "hymt2-1.8b",
     "dolphin-cn-dialect-base",
     "dolphin-small",
@@ -116,6 +129,8 @@ def expected_general_architecture(model: str) -> bytes | None:
         return FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE
     if model == "redimnet2-b6-cn":
         return REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE
+    if model == "diarizen-base-s80":
+        return DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE
     return None
 
 
@@ -140,6 +155,12 @@ def validate_pack_runtime_metadata(model: str, pack: Path) -> None:
             if marker not in header:
                 raise SystemExit(
                     f"pack missing Hy-MT2 required metadata marker {marker.decode(errors='replace')}: {pack}"
+                )
+    if model == "diarizen-base-s80":
+        for marker in DIARIZEN_REQUIRED_HEADER_MARKERS:
+            if marker not in header:
+                raise SystemExit(
+                    f"pack missing DiariZen license provenance marker {marker.decode(errors='replace')}: {pack}"
                 )
 
 

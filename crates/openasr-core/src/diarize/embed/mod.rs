@@ -133,6 +133,10 @@ fn redimnet_batch_worker_limit(pool_threads: usize) -> usize {
 pub enum EmbedError {
     #[error("speaker-embedding model is unavailable: {0}")]
     Unavailable(String),
+    #[error("speaker-embedding backend failed terminally: {0}")]
+    TerminalBackend(String),
+    #[error("speaker-embedding batch aborted after a terminal backend failure: {0}")]
+    BatchAbortedAfterTerminalBackend(String),
     #[error("audio is too short to embed (need at least one frame)")]
     TooShort,
     #[error("speaker embedder requires 16 kHz mono audio, got {0} Hz")]
@@ -253,6 +257,8 @@ impl RedimNet2Embedder {
             .map_err(|error| {
                 if error.is_canceled() {
                     EmbedError::Canceled
+                } else if error.is_terminal_backend_failure() {
+                    EmbedError::TerminalBackend(error.to_string())
                 } else {
                     EmbedError::Unavailable(error.to_string())
                 }
@@ -290,33 +296,38 @@ impl RedimNet2Embedder {
             redimnet_batch_worker_limit(pool.current_num_threads()),
         );
         let inherited_cancel = crate::ggml_runtime::thread_job_cancel_flag();
-        pool.install(|| {
+        let terminal_failure = OnceLock::new();
+        let mut results: Vec<Result<SpeakerEmbedding, EmbedError>> = pool.install(|| {
             (0..plan.workers)
                 .into_par_iter()
                 .map(|worker| {
-                    clips[plan.worker_range(worker, clips.len())]
-                        .iter()
-                        .map(|samples| {
-                            let _cancel_guard = inherited_cancel
-                                .as_ref()
-                                .map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
-                            if inherited_cancel.as_ref().is_some_and(cancel_requested) {
-                                Err(EmbedError::Canceled)
-                            } else {
-                                self.embed_with_threads(
-                                    samples,
-                                    sample_rate_hz,
-                                    Some(plan.threads_per_runner),
-                                )
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                    embed_batch_worker_range(
+                        &clips[plan.worker_range(worker, clips.len())],
+                        inherited_cancel.as_ref(),
+                        &terminal_failure,
+                        |samples| {
+                            self.embed_with_threads(
+                                samples,
+                                sample_rate_hz,
+                                Some(plan.threads_per_runner),
+                            )
+                        },
+                    )
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
                 .flatten()
-                .collect()
-        })
+                .collect::<Vec<_>>()
+        });
+        if let Some(reason) = terminal_failure.get() {
+            // A terminal device/backend failure invalidates every resident
+            // handle in this request's worker pool. Evict only after the batch
+            // has stopped; the failed batch is never retried, and the next
+            // request is the first place a runtime may be rebuilt.
+            pool.broadcast(|_| redimnet::backbone::clear_current_thread_runtime_cache());
+            abort_successful_results_after_terminal_failure(&mut results, reason);
+        }
+        results
     }
 
     #[cfg(test)]
@@ -374,6 +385,43 @@ impl SpeakerEmbedder for RedimNet2Embedder {
 
 fn cancel_requested(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> bool {
     flag.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn embed_batch_worker_range(
+    clips: &[&[f32]],
+    inherited_cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    terminal_failure: &OnceLock<String>,
+    mut embed: impl FnMut(&[f32]) -> Result<SpeakerEmbedding, EmbedError>,
+) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+    let mut results = Vec::with_capacity(clips.len());
+    for samples in clips {
+        let _cancel_guard = inherited_cancel.map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
+        let result = if inherited_cancel.is_some_and(cancel_requested) {
+            Err(EmbedError::Canceled)
+        } else if let Some(reason) = terminal_failure.get() {
+            Err(EmbedError::BatchAbortedAfterTerminalBackend(reason.clone()))
+        } else {
+            embed(samples)
+        };
+        if let Err(EmbedError::TerminalBackend(reason)) = &result {
+            let _ = terminal_failure.set(reason.clone());
+        }
+        results.push(result);
+    }
+    results
+}
+
+fn abort_successful_results_after_terminal_failure(
+    results: &mut [Result<SpeakerEmbedding, EmbedError>],
+    reason: &str,
+) {
+    for result in results {
+        if result.is_ok() {
+            *result = Err(EmbedError::BatchAbortedAfterTerminalBackend(
+                reason.to_string(),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

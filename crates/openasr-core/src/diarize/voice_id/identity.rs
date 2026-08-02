@@ -79,6 +79,10 @@ pub enum SpeakerIdentityError {
     EmbedderPackMissing,
     #[error("Voice ID speaker embedding failed: {reason}")]
     EmbeddingFailed { reason: String },
+    #[error("Voice ID person library is unavailable: {0}")]
+    LibraryUnavailable(#[from] super::VoiceIdLibraryError),
+    #[error("Voice ID decode-scope provenance is invalid: {reason}")]
+    InvalidScopeProvenance { reason: String },
     #[error("Voice ID speaker embedding was canceled")]
     Canceled,
 }
@@ -245,7 +249,7 @@ fn name_speakers_across_scopes_with(
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     name_speakers_across_scopes_with_library_state(
         embedder,
-        super::person_library_is_non_empty(),
+        super::person_library_is_non_empty()?,
         scopes,
     )
 }
@@ -384,7 +388,7 @@ fn name_speakers_across_scopes_with_library_state(
         }
     }
 
-    let matcher = super::load_person_matcher_for_embedder(embedder);
+    let matcher = super::load_person_matcher_for_embedder(embedder)?;
     let mut matches: BTreeMap<String, super::PersonMatch> = BTreeMap::new();
     for (label, evidence) in evidence {
         let Some(centroid) = evidence.centroid_for_naming() else {

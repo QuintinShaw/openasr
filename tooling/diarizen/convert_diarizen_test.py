@@ -111,6 +111,16 @@ class PackRoundTripTest(unittest.TestCase):
                 _kv_str(reader, "diarizen.upstream_model_id"),
                 "BUT-FIT/diarizen-wavlm-base-s80-md",
             )
+            self.assertEqual(
+                _kv_str(reader, "openasr.source.name"), C.UPSTREAM_MODEL_ID
+            )
+            self.assertEqual(
+                _kv_str(reader, "openasr.source.revision"), C.PINNED_REVISION
+            )
+            self.assertEqual(_kv_str(reader, "openasr.license.name"), C.LICENSE_NAME)
+            self.assertEqual(
+                _kv_str(reader, "openasr.license.source"), C.LICENSE_SOURCE
+            )
 
 
 def _kv_str(reader, key):

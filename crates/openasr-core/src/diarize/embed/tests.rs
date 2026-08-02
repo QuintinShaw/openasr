@@ -1,7 +1,10 @@
 //! Parity tests for the ReDimNet2-B6 embedder.
 
 use super::RedimNet2Embedder;
-use super::{EmbedError, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan};
+use super::{
+    EmbedError, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
+    abort_successful_results_after_terminal_failure, embed_batch_worker_range,
+};
 use crate::diarize::contract::SpeakerEmbedding;
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -204,6 +207,59 @@ fn speaker_embedder_default_batch_stops_before_work_when_canceled() {
     assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
 }
 
+#[test]
+fn redimnet_worker_stops_range_after_terminal_backend_failure() {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let samples = [0.0_f32];
+    let clips: Vec<&[f32]> = vec![&samples, &samples, &samples];
+    let terminal = OnceLock::new();
+    let calls = AtomicUsize::new(0);
+    let results = embed_batch_worker_range(&clips, None, &terminal, |_| {
+        let call = calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            Err(EmbedError::TerminalBackend("device lost".to_string()))
+        } else {
+            Ok(SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+        }
+    });
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        &results[0],
+        Err(EmbedError::TerminalBackend(reason)) if reason == "device lost"
+    ));
+    assert!(results[1..].iter().all(|result| matches!(
+        result,
+        Err(EmbedError::BatchAbortedAfterTerminalBackend(reason)) if reason == "device lost"
+    )));
+}
+
+#[test]
+fn redimnet_terminal_failure_invalidates_successes_from_peer_workers() {
+    let mut results = vec![
+        Ok(SpeakerEmbedding::l2_normalized(vec![1.0, 0.0])),
+        Err(EmbedError::TerminalBackend("device lost".to_string())),
+        Ok(SpeakerEmbedding::l2_normalized(vec![0.0, 1.0])),
+    ];
+
+    abort_successful_results_after_terminal_failure(&mut results, "device lost");
+
+    assert!(matches!(
+        &results[0],
+        Err(EmbedError::BatchAbortedAfterTerminalBackend(reason)) if reason == "device lost"
+    ));
+    assert!(matches!(
+        &results[1],
+        Err(EmbedError::TerminalBackend(reason)) if reason == "device lost"
+    ));
+    assert!(matches!(
+        &results[2],
+        Err(EmbedError::BatchAbortedAfterTerminalBackend(reason)) if reason == "device lost"
+    ));
+}
+
 fn redimnet_spike_root() -> Option<std::path::PathBuf> {
     match crate::testing::external_test_fixture_path(
         "OPENASR_REDIMNET_SPIKE_ROOT",
@@ -355,25 +411,51 @@ fn redimnet_rebuilds_the_runner_after_device_loss_without_retrying_request() {
         RedimNet2Embedder::from_oasr(std::path::Path::new(&pack)).expect("load ReDimNet pack");
     let samples = vec![0.01_f32; 16_000];
 
-    super::install_worker_graph_compute_device_lost();
-    let error = embedder
-        .embed(&samples, 16_000)
-        .expect_err("device loss must fail this request without retry");
-    assert!(matches!(error, EmbedError::Unavailable(_)));
-    // The one-shot injection was broadcast because Rayon may choose any
-    // worker. Clear unused workers before recovery; the worker that actually
-    // failed consumed its injection and must already have evicted its runtime.
-    super::clear_worker_graph_compute_status_override();
-    assert_eq!(
-        super::redimnet_worker_runtime_entry_count(),
-        0,
-        "a terminal backend handle must be evicted on its owner worker"
-    );
+    crate::test_process_env::with_test_process_env(
+        [(
+            super::REDIMNET_BENCH_WORKERS_ENV,
+            Some(std::ffi::OsString::from("1")),
+        )],
+        || {
+            super::clear_worker_graph_compute_status_override();
+            super::unload_idle_redimnet_worker_runtimes();
+            let builds_before = super::redimnet::backbone::resident_runtime_build_count();
 
-    let recovered = embedder
-        .embed(&samples, 16_000)
-        .expect("the next request builds a fresh runner");
-    assert_eq!(recovered.dim(), 192);
+            super::install_worker_graph_compute_device_lost();
+            let clips: Vec<&[f32]> = vec![&samples, &samples, &samples];
+            let results = embedder.embed_batch(&clips, 16_000);
+            assert!(matches!(&results[0], Err(EmbedError::TerminalBackend(_))));
+            assert!(results[1..].iter().all(|result| matches!(
+                result,
+                Err(EmbedError::BatchAbortedAfterTerminalBackend(_))
+            )));
+            assert_eq!(
+                super::redimnet::backbone::resident_runtime_build_count(),
+                builds_before + 1,
+                "the failed batch must not rebuild and retry"
+            );
+
+            // The one-shot injection was broadcast because Rayon may choose
+            // any worker. Clear unused test overrides before recovery; the
+            // production batch path must already have evicted every runtime.
+            super::clear_worker_graph_compute_status_override();
+            assert_eq!(
+                super::redimnet_worker_runtime_entry_count(),
+                0,
+                "terminal batch failure must evict all resident worker handles"
+            );
+
+            let recovered = embedder
+                .embed(&samples, 16_000)
+                .expect("the next request builds a fresh runner");
+            assert_eq!(recovered.dim(), 192);
+            assert_eq!(
+                super::redimnet::backbone::resident_runtime_build_count(),
+                builds_before + 2,
+                "only the next request may rebuild after terminal failure"
+            );
+        },
+    );
 }
 
 #[test]

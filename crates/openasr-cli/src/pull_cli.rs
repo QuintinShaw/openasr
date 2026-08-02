@@ -34,16 +34,11 @@ pub(crate) fn pull(options: PullCommandOptions<'_>) -> Result<()> {
         );
     }
 
-    if matches!(resolved.license_class, LicenseClass::Gated)
-        && !options.accept_license
-        && options.from.is_none()
-    {
-        bail!(
-            "Model '{}' requires vendor license acceptance before download.\nOpen vendor site: {}\nThen rerun with --accept-license or --from <local-pack>.",
-            resolved.model_id,
-            resolved.license_url
-        );
-    }
+    ensure_explicit_pull_license_acceptance(
+        &resolved,
+        options.accept_license,
+        options.from.is_some(),
+    )?;
 
     let mut reporter = crate::progress::PullReporter::new(&resolved.pull);
     let progress = |event| reporter.on(event);
@@ -113,6 +108,61 @@ fn should_update_default_asr_model(catalog: &ModelCatalog, model_id: &str) -> bo
         .is_some_and(|model| model.public && model.kind == openasr_core::CatalogModelKind::AsrModel)
 }
 
+fn ensure_explicit_pull_license_acceptance(
+    resolved: &ResolvedCatalogPull,
+    accepted: bool,
+    from_local_pack: bool,
+) -> Result<()> {
+    if matches!(resolved.license_class, LicenseClass::Unknown) {
+        bail!(
+            "Model '{}' has an unsupported license class and cannot be installed by this OpenASR version.",
+            resolved.model_id
+        );
+    }
+    if accepted {
+        return Ok(());
+    }
+    match resolved.license_class {
+        LicenseClass::Noncommercial => bail!(
+            "Model '{}' is licensed for non-commercial use only ({}).\nReview {} and rerun with --accept-license{}.",
+            resolved.model_id,
+            resolved.license,
+            resolved.license_url,
+            if from_local_pack {
+                " together with the same --from <local-pack>"
+            } else {
+                ""
+            }
+        ),
+        LicenseClass::Gated if !from_local_pack => bail!(
+            "Model '{}' requires vendor license acceptance before download.\nOpen vendor site: {}\nThen rerun with --accept-license or --from <local-pack>.",
+            resolved.model_id,
+            resolved.license_url
+        ),
+        LicenseClass::Permissive | LicenseClass::Gated | LicenseClass::Unknown => Ok(()),
+    }
+}
+
+/// Automatic CLI convenience pulls must never stand in for accepting a
+/// restricted license. Returns a user-facing route to the explicit pull flow.
+pub(crate) fn automatic_pull_license_refusal(resolved: &ResolvedCatalogPull) -> Option<String> {
+    match resolved.license_class {
+        LicenseClass::Noncommercial => Some(format!(
+            "Model '{}' is licensed for non-commercial use only ({}) and cannot be downloaded automatically.\nReview {} then run: openasr pull {} --accept-license",
+            resolved.model_id, resolved.license, resolved.license_url, resolved.pull
+        )),
+        LicenseClass::Gated => Some(format!(
+            "Model '{}' requires accepting a vendor license and cannot be downloaded automatically.\nReview {} then run: openasr pull {} --accept-license",
+            resolved.model_id, resolved.license_url, resolved.pull
+        )),
+        LicenseClass::Unknown => Some(format!(
+            "Model '{}' has an unsupported license class and cannot be downloaded automatically.",
+            resolved.model_id
+        )),
+        LicenseClass::Permissive => None,
+    }
+}
+
 pub(crate) fn list_installed() -> Result<()> {
     let home = openasr_home()?;
     let packs = list_installed_packs(home)?;
@@ -148,10 +198,10 @@ pub(crate) fn remove_installed(id: &str) -> Result<()> {
 ///
 /// This is a CLI-only affordance and must never be called from the server. A
 /// pull only happens here, gated on `--offline`, an interactive terminal, or an
-/// explicit `--yes`. Gated-license models are refused and routed to the explicit
-/// `openasr pull --accept-license` path so consent cannot become a license
-/// bypass. When the model is already installed this answers from on-disk packs
-/// with no network access.
+/// explicit `--yes`. Restricted-license models are refused and routed to the
+/// explicit `openasr pull --accept-license` path so download consent cannot
+/// become license acceptance. When the model is already installed this answers
+/// from on-disk packs with no network access.
 pub(crate) fn ensure_asr_model_installed(
     model: Option<&str>,
     config: &OpenAsrConfig,
@@ -234,15 +284,8 @@ pub(crate) fn ensure_asr_model_installed(
         )
     })?;
 
-    if matches!(resolved.license_class, LicenseClass::Gated) {
-        return Err(CliExit::new(
-            ExitCode::ModelNotInstalled,
-            format!(
-                "Model '{}' requires accepting a vendor license before download.\nReview {} then run: openasr pull {} --accept-license",
-                resolved.model_id, resolved.license_url, model_ref
-            ),
-        )
-        .into());
+    if let Some(message) = automatic_pull_license_refusal(&resolved) {
+        return Err(CliExit::new(ExitCode::ModelNotInstalled, message).into());
     }
 
     let disclosure = format!(
@@ -338,6 +381,57 @@ mod tests {
             prose_locales: None,
             quants: Vec::new(),
         }
+    }
+
+    fn resolved_pull(license_class: LicenseClass) -> ResolvedCatalogPull {
+        ResolvedCatalogPull {
+            requested: "diarizen-base-s80".to_string(),
+            model_id: "diarizen-base-s80".to_string(),
+            display_name: "DiariZen Base-s80".to_string(),
+            quant: "fp16".to_string(),
+            suffix: "fp16".to_string(),
+            pull: "diarizen-base-s80:fp16".to_string(),
+            filename: "diarizen-base-s80-fp16.oasr".to_string(),
+            url: "https://example.invalid/diarizen.oasr".to_string(),
+            mirrors: Vec::new(),
+            hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 123,
+            license: "CC BY-NC 4.0".to_string(),
+            license_url: "https://example.invalid/license".to_string(),
+            license_class,
+        }
+    }
+
+    #[test]
+    fn noncommercial_pull_requires_explicit_acceptance_even_for_local_import() {
+        let resolved = resolved_pull(LicenseClass::Noncommercial);
+        let download_error = ensure_explicit_pull_license_acceptance(&resolved, false, false)
+            .expect_err("download needs explicit license confirmation");
+        assert!(
+            download_error
+                .to_string()
+                .contains("non-commercial use only")
+        );
+
+        let import_error = ensure_explicit_pull_license_acceptance(&resolved, false, true)
+            .expect_err("local import still needs explicit license confirmation");
+        assert!(import_error.to_string().contains("same --from"));
+        ensure_explicit_pull_license_acceptance(&resolved, true, false)
+            .expect("explicit confirmation permits the pull");
+    }
+
+    #[test]
+    fn automatic_pull_refuses_every_restricted_license_class() {
+        let noncommercial =
+            automatic_pull_license_refusal(&resolved_pull(LicenseClass::Noncommercial))
+                .expect("noncommercial auto-pull refusal");
+        assert!(noncommercial.contains("non-commercial use only"));
+        assert!(noncommercial.contains("--accept-license"));
+
+        assert!(automatic_pull_license_refusal(&resolved_pull(LicenseClass::Gated)).is_some());
+        assert!(automatic_pull_license_refusal(&resolved_pull(LicenseClass::Unknown)).is_some());
+        assert!(automatic_pull_license_refusal(&resolved_pull(LicenseClass::Permissive)).is_none());
     }
 
     #[test]

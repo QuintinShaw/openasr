@@ -29,6 +29,11 @@ ARCH = "diarizen-wavlm-conformer-segmentation"
 MODEL_ID = "diarizen-base-s80"
 UPSTREAM_MODEL_ID = "BUT-FIT/diarizen-wavlm-base-s80-md"
 PINNED_REVISION = "a9857fc34908197fb5336d9d0562f291834a04b2"
+LICENSE_NAME = "CC BY-NC 4.0"
+LICENSE_SOURCE = (
+    "https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/"
+    f"{PINNED_REVISION}/README.md"
+)
 TENSOR_SCHEMA = "compact-v1"
 GGUF_MAX_TENSOR_NAME_BYTES = 63
 
@@ -299,6 +304,10 @@ def write_pack(
     writer.add_string("openasr.model.architecture", ARCH)
     writer.add_string("openasr.model.id", model_id)
     writer.add_string("openasr.quantization", {"f16": "fp16"}.get(quant, quant))
+    writer.add_string("openasr.source.name", UPSTREAM_MODEL_ID)
+    writer.add_string("openasr.source.revision", PINNED_REVISION)
+    writer.add_string("openasr.license.name", LICENSE_NAME)
+    writer.add_string("openasr.license.source", LICENSE_SOURCE)
     writer.add_string("diarizen.upstream_model_id", UPSTREAM_MODEL_ID)
     writer.add_string("diarizen.upstream_revision", PINNED_REVISION)
     writer.add_string("diarizen.tensor_schema", TENSOR_SCHEMA)

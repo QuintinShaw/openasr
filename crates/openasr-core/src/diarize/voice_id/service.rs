@@ -34,6 +34,14 @@ pub enum VoiceIdServiceError {
     InvalidSampleCount { min: usize, max: usize, got: usize },
 }
 
+#[derive(Debug, Error)]
+pub enum VoiceIdLibraryError {
+    #[error("Voice ID speaker embedder does not expose an embedding-space identity")]
+    EmbedderIdentityUnavailable,
+    #[error(transparent)]
+    Store(#[from] VoiceIdStoreError),
+}
+
 const MIN_INITIAL_SAMPLES: usize = 1;
 const MAX_INITIAL_SAMPLES: usize = 5;
 
@@ -44,36 +52,31 @@ pub struct EnrollmentClip {
 
 /// Load the live Voice ID matcher for the active embedder pack.
 ///
-/// Opens the Voice ID store. Returns an empty matcher when the embedder pack,
-/// home directory, or store is unavailable so batch/streaming paths stay
-/// fail-open toward anonymous labels rather than aborting transcription.
-pub fn load_person_matcher_for_active_embedder() -> PersonMatcher {
+/// A missing embedder is represented by `Ok(None)`. Store/home failures stay
+/// typed errors; callers must not misreport an unreadable library as empty.
+pub fn load_person_matcher_for_active_embedder()
+-> Result<Option<PersonMatcher>, VoiceIdLibraryError> {
     let Some(embedder) = shared_embedder() else {
-        return empty_person_matcher();
+        return Ok(None);
     };
-    load_person_matcher_for_embedder(embedder.as_ref())
+    load_person_matcher_for_embedder(embedder.as_ref()).map(Some)
 }
 
 /// Load the person library for the exact embedding-space snapshot held by a
 /// caller. This prevents a same-path pack replacement from pairing embeddings
 /// produced by the old snapshot with enrollment rows from the new one.
-pub(crate) fn load_person_matcher_for_embedder(embedder: &dyn SpeakerEmbedder) -> PersonMatcher {
+pub(crate) fn load_person_matcher_for_embedder(
+    embedder: &dyn SpeakerEmbedder,
+) -> Result<PersonMatcher, VoiceIdLibraryError> {
     let Some(identity) = embedder.identity() else {
-        return empty_person_matcher();
+        return Err(VoiceIdLibraryError::EmbedderIdentityUnavailable);
     };
     let calibration = embedder.calibration_profile();
     let space = EmbeddingSpace::for_active_embedder(&identity, calibration);
     let threshold = calibration.voice_id_accept_threshold();
     let margin = calibration.voice_id_margin();
-    let Ok(home) = crate::openasr_home() else {
-        return PersonMatcher::new(space, Vec::new(), threshold, margin);
-    };
-    let Ok(store) = VoiceIdStore::open_checked(home) else {
-        return PersonMatcher::new(space, Vec::new(), threshold, margin);
-    };
-    store
-        .matcher_for_space(&space, threshold, margin)
-        .unwrap_or_else(|_| PersonMatcher::new(space, Vec::new(), threshold, margin))
+    let store = VoiceIdStore::open_default()?;
+    Ok(store.matcher_for_space(&space, threshold, margin)?)
 }
 
 /// Whether any enrolled (non-deleted) person exists, independent of the
@@ -86,31 +89,11 @@ pub(crate) fn load_person_matcher_for_embedder(embedder: &dyn SpeakerEmbedder) -
 /// Deliberately not gated on the embedder identity the way
 /// [`load_person_matcher_for_active_embedder`] is -- the question here is
 /// "does a library exist at all", not "can today's embedder match against
-/// it" -- and any failure to open the home directory or store degrades to
-/// "empty", the same fail-open-toward-anonymous convention that function
-/// uses, since an unreadable store means Voice ID could not have been used to
-/// enroll anyone in the first place.
-pub fn person_library_is_non_empty() -> bool {
-    let Ok(home) = crate::openasr_home() else {
-        return false;
-    };
-    let Ok(store) = VoiceIdStore::open_checked(home) else {
-        return false;
-    };
-    store
-        .list_persons(None)
-        .map(|persons| !persons.is_empty())
-        .unwrap_or(false)
-}
-
-fn empty_person_matcher() -> PersonMatcher {
-    // Unmatchable placeholder space: best_match always returns None.
-    PersonMatcher::new(
-        EmbeddingSpace::legacy_unverifiable_v1(1, "none"),
-        Vec::new(),
-        1.0,
-        0.0,
-    )
+/// it". An unreadable store is not evidence of an empty library, so failures
+/// propagate to the request boundary.
+pub fn person_library_is_non_empty() -> Result<bool, VoiceIdLibraryError> {
+    let store = VoiceIdStore::open_default()?;
+    Ok(!store.list_persons(None)?.is_empty())
 }
 
 /// Embed + quality-gate one clip. Does not touch the store.
@@ -284,4 +267,97 @@ fn load_wav(path: &Path) -> Result<Vec<f32>, VoiceIdServiceError> {
         path.to_str().unwrap_or("voice-id enrollment input"),
     )
     .map_err(|e| VoiceIdServiceError::InvalidAudio(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    struct IdentifiedEmbedder;
+
+    impl SpeakerEmbedder for IdentifiedEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, EmbedError> {
+            unreachable!("matcher loading must not run inference")
+        }
+
+        fn embedding_dim(&self) -> usize {
+            192
+        }
+
+        fn identity(&self) -> Option<SpeakerEmbedderIdentity> {
+            Some(SpeakerEmbedderIdentity {
+                embedding_dim: 192,
+                pack_fingerprint: "test-pack".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn empty_library_is_empty_but_unreadable_library_is_an_error() {
+        let home = tempdir().expect("temporary OpenASR home");
+        let db = home.path().join("voice-id.db");
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_HOME", Some(home.path().as_os_str().to_os_string())),
+                (
+                    super::super::VOICE_ID_DB_ENV,
+                    Some(db.as_os_str().to_os_string()),
+                ),
+            ],
+            || {
+                assert!(!person_library_is_non_empty().expect("fresh store"));
+                assert!(
+                    load_person_matcher_for_embedder(&IdentifiedEmbedder)
+                        .expect("fresh store matcher")
+                        .is_empty()
+                );
+
+                std::fs::remove_file(&db).expect("remove fresh database");
+                std::fs::create_dir(&db).expect("replace database with a directory");
+
+                assert!(matches!(
+                    person_library_is_non_empty(),
+                    Err(VoiceIdLibraryError::Store(
+                        VoiceIdStoreError::OpenDatabase { .. }
+                    ))
+                ));
+                assert!(matches!(
+                    load_person_matcher_for_embedder(&IdentifiedEmbedder),
+                    Err(VoiceIdLibraryError::Store(
+                        VoiceIdStoreError::OpenDatabase { .. }
+                    ))
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn identityless_embedder_is_not_reported_as_an_empty_library() {
+        struct IdentitylessEmbedder;
+
+        impl SpeakerEmbedder for IdentitylessEmbedder {
+            fn embed(
+                &self,
+                _samples: &[f32],
+                _sample_rate_hz: u32,
+            ) -> Result<SpeakerEmbedding, EmbedError> {
+                unreachable!("matcher loading must not run inference")
+            }
+
+            fn embedding_dim(&self) -> usize {
+                192
+            }
+        }
+
+        assert!(matches!(
+            load_person_matcher_for_embedder(&IdentitylessEmbedder),
+            Err(VoiceIdLibraryError::EmbedderIdentityUnavailable)
+        ));
+    }
 }

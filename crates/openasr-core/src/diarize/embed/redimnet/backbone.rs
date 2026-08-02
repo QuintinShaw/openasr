@@ -41,7 +41,7 @@ impl RedimNetBackboneError {
         )
     }
 
-    fn is_terminal_backend_failure(&self) -> bool {
+    pub(crate) fn is_terminal_backend_failure(&self) -> bool {
         matches!(
             self,
             Self::Ggml(GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned)

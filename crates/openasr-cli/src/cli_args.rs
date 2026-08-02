@@ -206,7 +206,7 @@ pub(crate) enum Command {
         /// Acknowledge the model license when the catalog requires it.
         #[arg(long)]
         accept_license: bool,
-        /// Use an already downloaded local pack for gated/vendor flows.
+        /// Use an already downloaded local pack for restricted-license flows.
         #[arg(long)]
         from: Option<PathBuf>,
     },

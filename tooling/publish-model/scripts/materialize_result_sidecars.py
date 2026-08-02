@@ -25,6 +25,17 @@ CATALOG = CATALOG_CORE
 QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE = b"qwen3-asr"
 QWEN3_ASR_LEGACY_GENERAL_ARCHITECTURE = b"qwen3asr"
 HYMT2_EXPECTED_GENERAL_ARCHITECTURE = b"hunyuan-dense"
+DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE = b"diarizen-wavlm-conformer-segmentation"
+DIARIZEN_REQUIRED_HEADER_MARKERS = (
+    b"openasr.source.name",
+    b"BUT-FIT/diarizen-wavlm-base-s80-md",
+    b"openasr.source.revision",
+    b"a9857fc34908197fb5336d9d0562f291834a04b2",
+    b"openasr.license.name",
+    b"CC BY-NC 4.0",
+    b"openasr.license.source",
+    b"https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/a9857fc34908197fb5336d9d0562f291834a04b2/README.md",
+)
 HYMT2_REQUIRED_HEADER_MARKERS = (
     b"openasr.model.kind",
     b"translation-model",
@@ -75,6 +86,8 @@ def expected_general_architecture(model: str) -> bytes | None:
         return QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE
     if model == "hymt2-1.8b":
         return HYMT2_EXPECTED_GENERAL_ARCHITECTURE
+    if model == "diarizen-base-s80":
+        return DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE
     return None
 
 
@@ -101,6 +114,12 @@ def validate_pack_runtime_metadata(model: str, pack: Path) -> None:
             if marker not in header:
                 raise ResultSidecarError(
                     f"pack missing Hy-MT2 required metadata marker {marker.decode(errors='replace')}: {pack}"
+                )
+    if model == "diarizen-base-s80":
+        for marker in DIARIZEN_REQUIRED_HEADER_MARKERS:
+            if marker not in header:
+                raise ResultSidecarError(
+                    f"pack missing DiariZen license provenance marker {marker.decode(errors='replace')}: {pack}"
                 )
 
 

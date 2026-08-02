@@ -661,12 +661,20 @@ fn shared_change_detector_embedder() -> Option<Arc<dyn SpeakerEmbedder>> {
 }
 
 impl StreamingDiarizer {
-    /// Build over the shared embedder, or `None` if the pack is unavailable.
-    pub fn shared(sample_rate_hz: u32) -> Option<Self> {
-        shared_embedder().map(|embedder| {
-            let persons = load_person_matcher_for_embedder(embedder.as_ref());
-            Self::with_shared_embedder_and_persons(embedder, sample_rate_hz, persons)
-        })
+    /// Build over the shared embedder, or `Ok(None)` if the pack is unavailable.
+    /// An unreadable Voice ID library is a typed error, never an empty matcher.
+    pub fn shared(
+        sample_rate_hz: u32,
+    ) -> Result<Option<Self>, super::voice_id::VoiceIdLibraryError> {
+        let Some(embedder) = shared_embedder() else {
+            return Ok(None);
+        };
+        let persons = load_person_matcher_for_embedder(embedder.as_ref())?;
+        Ok(Some(Self::with_shared_embedder_and_persons(
+            embedder,
+            sample_rate_hz,
+            persons,
+        )))
     }
 
     /// Build over a caller-supplied embedder (tests, alternative backends).

@@ -1038,6 +1038,9 @@ fn install_cli_capability_pack_if_missing(
             size: None,
         },
     )?;
+    if let Some(message) = crate::pull_cli::automatic_pull_license_refusal(&resolved) {
+        bail!(message);
+    }
     install_cli_capability_pack(&resolved, home, source_chain)
 }
 
