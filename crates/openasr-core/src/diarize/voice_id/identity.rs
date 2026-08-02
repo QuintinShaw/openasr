@@ -225,6 +225,16 @@ pub fn name_speakers_across_scopes(
     name_speakers_across_scopes_with(embedder.as_deref(), scopes)
 }
 
+/// Request-scoped variant used after transcription preflight has frozen an
+/// exact embedding-space snapshot. Pack replacement or removal during a long
+/// job cannot change the evidence model halfway through finalization.
+pub(crate) fn name_speakers_across_scopes_with_embedder(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    scopes: &mut [SpeakerScope<'_>],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with(Some(embedder), scopes)
+}
+
 /// [`name_speakers_across_scopes`] with the embedder passed explicitly.
 ///
 /// The public entry point resolves the process-wide shared embedder; this
@@ -235,6 +245,18 @@ fn name_speakers_across_scopes_with(
     embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     scopes: &mut [SpeakerScope<'_>],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with_library_state(
+        embedder,
+        super::person_library_is_non_empty(),
+        scopes,
+    )
+}
+
+fn name_speakers_across_scopes_with_library_state(
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+    person_library_non_empty: bool,
+    scopes: &mut [SpeakerScope<'_>],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     for scope in scopes.iter_mut() {
         normalize_local_labels(scope.segments);
     }
@@ -242,7 +264,7 @@ fn name_speakers_across_scopes_with(
         disambiguate_labels_across_scopes(scopes);
     }
     let Some(embedder) = embedder else {
-        if scopes.len() > 1 || super::person_library_is_non_empty() {
+        if scopes.len() > 1 || person_library_non_empty {
             return Err(SpeakerIdentityError::EmbedderPackMissing);
         }
         // No embedder, nobody enrolled, one scope: separation stands, naming
@@ -524,6 +546,14 @@ pub fn name_speakers_from_labeled_segments(
     samples: &[f32],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }])
+}
+
+pub(crate) fn name_speakers_from_labeled_segments_with_embedder(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    segments: &mut [Segment],
+    samples: &[f32],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with_embedder(embedder, &mut [SpeakerScope { segments, samples }])
 }
 
 /// What a label's voice amounts to: the windows that survived main-cluster
@@ -917,8 +947,9 @@ mod tests {
     #[test]
     fn single_scope_empty_library_without_embedder_is_not_an_error() {
         let mut segments = vec![labeled(0.0, 1.0, Some("SPEAKER_01"))];
-        let result = name_speakers_across_scopes_with(
+        let result = name_speakers_across_scopes_with_library_state(
             None,
+            false,
             &mut [SpeakerScope {
                 segments: &mut segments,
                 samples: &[],
@@ -1533,8 +1564,9 @@ mod tests {
     #[test]
     fn a_missing_embedder_is_reported_as_a_missing_embedder() {
         let mut segments = vec![labeled(0.0, 30.0, Some("SPEAKER_01"))];
-        let unnamed = name_speakers_across_scopes_with(
+        let unnamed = name_speakers_across_scopes_with_library_state(
             None,
+            false,
             &mut [SpeakerScope {
                 segments: &mut segments,
                 samples: &[],

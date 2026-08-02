@@ -6,6 +6,7 @@
 //! reconstruction stay local to this implementation.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -23,8 +24,6 @@ const EMBEDDING_STEP_S: f64 = 0.75;
 
 #[derive(Debug, Error)]
 pub enum ExternalDiarizationError {
-    #[error("external Voice ID needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn)")]
-    MissingEmbedder,
     #[error(transparent)]
     Segmenter(#[from] SegmentError),
     #[error("external Voice ID could not load the vendored FireRed Stream-VAD")]
@@ -44,7 +43,7 @@ pub enum ExternalDiarizationError {
 /// selection.
 pub(crate) struct ExternalDiarizer {
     segmenter: SelectedSegmenter,
-    embedder: &'static dyn SpeakerEmbedder,
+    embedder: Arc<dyn SpeakerEmbedder>,
     vad: super::vad::FireRedStreamVadProvider,
     clusterer: AutomaticClusterer,
 }
@@ -52,10 +51,9 @@ pub(crate) struct ExternalDiarizer {
 impl ExternalDiarizer {
     pub(crate) fn preflight(
         preference: VoiceIdSegmenterPreference,
+        embedder: Arc<dyn SpeakerEmbedder>,
     ) -> Result<Self, ExternalDiarizationError> {
         let segmenter = super::segment::resolve_segmenter(preference)?;
-        let embedder =
-            super::embed::shared_embedder().ok_or(ExternalDiarizationError::MissingEmbedder)?;
         let vad = super::vad::FireRedStreamVadProvider::shared()
             .ok_or(ExternalDiarizationError::VadUnavailable)?;
         Ok(Self {
@@ -92,8 +90,13 @@ impl ExternalDiarizer {
         let activity_regions = activity.valid_regions(samples.len() as f64 / sample_rate_hz as f64);
         let speech = union_regions(vad_regions.into_iter().chain(activity_regions));
         let chunks = embedding_chunks(&speech);
-        let (embedded_chunks, embeddings) =
-            embed_chunks(self.embedder, samples, sample_rate_hz, &chunks, canceled)?;
+        let (embedded_chunks, embeddings) = embed_chunks(
+            self.embedder.as_ref(),
+            samples,
+            sample_rate_hz,
+            &chunks,
+            canceled,
+        )?;
         if embeddings.is_empty() {
             return Ok(Diarization {
                 turns: Vec::new(),

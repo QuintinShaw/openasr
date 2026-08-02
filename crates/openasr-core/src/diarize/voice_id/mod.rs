@@ -25,6 +25,9 @@ pub use identity::{
     SpeakerIdentityError, SpeakerScope, name_speakers_across_scopes,
     name_speakers_from_labeled_segments,
 };
+pub(crate) use identity::{
+    name_speakers_across_scopes_with_embedder, name_speakers_from_labeled_segments_with_embedder,
+};
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
 pub use naming::{SpeakerNamingRefusal, UnnamedSpeaker};

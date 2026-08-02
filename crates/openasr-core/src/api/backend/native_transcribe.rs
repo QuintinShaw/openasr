@@ -1593,20 +1593,34 @@ fn run_native_transcription_impl(
     // the family's own decode, or the external segment/embed/cluster pass --
     // never both, so nothing can overwrite the other's labels downstream.
     let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
+    // Freeze the exact ReDim pack snapshot for the full request. The external
+    // clusterer and the shared identity stage must never observe different
+    // embedding spaces if a pack is replaced while a long transcription is
+    // running.
+    let voice_id_embedder = if speaker_plan == SpeakerPlan::Off {
+        None
+    } else {
+        Some(crate::diarize::embed::shared_embedder().ok_or(
+            BackendError::VoiceIdIdentityFailed(
+                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
+            ),
+        )?)
+    };
     let external_diarizer = if speaker_plan == SpeakerPlan::External {
         Some(
-            crate::diarize::external::ExternalDiarizer::preflight(request.voice_id_segmenter)
-                .map_err(external_diarization_error_to_backend)?,
+            crate::diarize::external::ExternalDiarizer::preflight(
+                request.voice_id_segmenter,
+                Arc::clone(
+                    voice_id_embedder
+                        .as_ref()
+                        .expect("external Voice ID preflight resolved its embedder"),
+                ),
+            )
+            .map_err(external_diarization_error_to_backend)?,
         )
     } else {
         None
     };
-    if speaker_plan == SpeakerPlan::InDecoder && crate::diarize::embed::shared_embedder().is_none()
-    {
-        return Err(BackendError::VoiceIdIdentityFailed(
-            crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
-        ));
-    }
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
         // needs Voice ID on, and only the external clustering path clusters.
@@ -2200,6 +2214,7 @@ fn run_native_transcription_impl(
                     Some(run_metadata),
                     &speaker_turns,
                     voice_id_audio.as_deref().unwrap_or(&[]),
+                    voice_id_embedder.as_deref(),
                     speaker_plan,
                     &[],
                     strip_forced_word_timestamps,
@@ -2213,6 +2228,7 @@ fn run_native_transcription_impl(
                 Some(run_metadata),
                 &speaker_turns,
                 voice_id_audio.as_deref().unwrap_or(&[]),
+                voice_id_embedder.as_deref(),
                 speaker_plan,
                 &speaker_scope_starts,
                 strip_forced_word_timestamps,
@@ -2296,6 +2312,7 @@ fn run_native_transcription_impl(
         longform_metadata,
         &speaker_turns,
         voice_id_audio.as_deref().unwrap_or(&[]),
+        voice_id_embedder.as_deref(),
         speaker_plan,
         &[],
         strip_forced_word_timestamps,
@@ -2351,6 +2368,7 @@ fn finalize_native_transcription(
     longform_metadata: Option<TranscriptionLongFormMetadata>,
     speaker_turns: &SpeakerAttribution,
     prepared_audio: &[f32],
+    voice_id_embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     speaker_plan: SpeakerPlan,
     speaker_scope_starts: &[f32],
     strip_forced_word_timestamps: bool,
@@ -2376,16 +2394,26 @@ fn finalize_native_transcription(
                 speaker_scope_starts,
                 prepared_audio,
             );
+            let embedder = voice_id_embedder.ok_or(BackendError::VoiceIdIdentityFailed(
+                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
+            ))?;
             transcription.unnamed_speakers =
-                crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes)?;
+                crate::diarize::voice_id::name_speakers_across_scopes_with_embedder(
+                    embedder,
+                    &mut scopes,
+                )?;
         }
         SpeakerPlan::External => {
             // External segmentation has already been normalized to the same
             // recording-local labels. Naming deliberately runs through the
             // identical evidence/purity/matcher policy as in-decoder models;
             // clustering centroids are not trusted as identity evidence.
+            let embedder = voice_id_embedder.ok_or(BackendError::VoiceIdIdentityFailed(
+                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
+            ))?;
             transcription.unnamed_speakers =
-                crate::diarize::voice_id::name_speakers_from_labeled_segments(
+                crate::diarize::voice_id::name_speakers_from_labeled_segments_with_embedder(
+                    embedder,
                     &mut transcription.segments,
                     prepared_audio,
                 )?;
@@ -2538,9 +2566,6 @@ fn external_diarization_error_to_backend(
         }
         ExternalDiarizationError::Segmenter(SegmentError::MissingPack { .. }) => {
             BackendError::DiarizationSegmenterUnavailable
-        }
-        ExternalDiarizationError::MissingEmbedder => {
-            BackendError::DiarizationNotSupported { backend: "native" }
         }
         error => BackendError::ExternalDiarizationFailed {
             reason: error.to_string(),
