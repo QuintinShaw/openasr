@@ -141,11 +141,13 @@ The same core pull engine backs three surfaces:
 
 Pulling a published `capability-pack` (e.g. `redimnet2-b6-cn:fp16`) or a
 `translation-model` does not change the default ASR model. `openasr transcribe
---diarize` and `live --diarize` are explicit consent for the
-CLI to install a missing required `speaker-diarization` capability pack before the
-fail-closed capability check; `serve` / `session.start` never download. The
-default CLI `transcribe` / `live` flow installs a missing ASR model only with a
-visible consent prompt (or fails closed when non-interactive / `--offline`);
+--diarize` is explicit consent for the CLI to install a missing required
+`speaker-diarization` capability pack before the fail-closed capability check.
+Realtime `live --diarize` is a hidden compatibility flag that fails before
+device/model resolution because recording-level Voice ID is
+file-transcription-only. The default CLI `transcribe` / `live` flow installs a
+missing ASR model only with a visible consent prompt (or fails closed when
+non-interactive / `--offline`);
 `serve` and the shared resolve path never execute downloads. The pull path is
 fail-closed: HTTPS-only catalog pack URLs, size/sha256 checks, GGUF preflight,
 runtime-source validation, and a same-directory atomic rename are required before
