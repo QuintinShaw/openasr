@@ -8,6 +8,7 @@
 //! identities, while high-confidence enrollment matches anchor profile-owned
 //! speakers before anonymous assignment.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::calibration::StreamingCalibrationProfile;
@@ -15,7 +16,7 @@ use super::contract::{SpeakerEmbedding, SpeakerId};
 use super::debug::diarize_debug_enabled as debug_enabled;
 use super::embed::{SpeakerEmbedder, shared_embedder};
 use super::enrollment::SpeakerDisplayAssignment;
-use super::voice_id::{PersonMatcher, VoiceIdAssignment, load_person_matcher_for_active_embedder};
+use super::voice_id::{PersonMatcher, VoiceIdAssignment, load_person_matcher_for_embedder};
 
 /// Default cosine-similarity floor to reuse an existing speaker. Mirrors the
 /// legacy reuse floor. The active ReDimNet2-B6 calibration can override this in
@@ -459,7 +460,7 @@ impl SpeakerRegistry {
 
 /// Per-session streaming diarizer over the shared ReDimNet2-B6 embedder.
 pub struct StreamingDiarizer {
-    embedder: &'static dyn SpeakerEmbedder,
+    embedder: SpeakerEmbedderHandle,
     registry: SpeakerRegistry,
     /// Voice ID v2 person matcher (live path). Empty when no pack / no persons.
     persons: PersonMatcher,
@@ -484,7 +485,7 @@ pub struct StreamingSpeakerChange {
 /// positive decision to split the ASR segment and then run the normal streaming
 /// diarizer on each side.
 pub struct StreamingSpeakerChangeDetector {
-    embedder: &'static dyn SpeakerEmbedder,
+    embedder: SpeakerEmbedderHandle,
     sample_rate_hz: u32,
     reference_window_samples: usize,
     recent_window_samples: usize,
@@ -496,13 +497,37 @@ pub struct StreamingSpeakerChangeDetector {
     anchor_quality: Option<UtteranceQuality>,
 }
 
+enum SpeakerEmbedderHandle {
+    Shared(Arc<dyn SpeakerEmbedder>),
+    Static(&'static dyn SpeakerEmbedder),
+}
+
+impl std::ops::Deref for SpeakerEmbedderHandle {
+    type Target = dyn SpeakerEmbedder;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(embedder) => embedder.as_ref(),
+            Self::Static(embedder) => *embedder,
+        }
+    }
+}
+
 impl StreamingSpeakerChangeDetector {
     pub fn shared(sample_rate_hz: u32) -> Option<Self> {
         shared_change_detector_embedder()
-            .map(|embedder| Self::with_embedder(embedder, sample_rate_hz))
+            .map(|embedder| Self::with_shared_embedder(embedder, sample_rate_hz))
     }
 
     pub fn with_embedder(embedder: &'static dyn SpeakerEmbedder, sample_rate_hz: u32) -> Self {
+        Self::with_handle(SpeakerEmbedderHandle::Static(embedder), sample_rate_hz)
+    }
+
+    fn with_shared_embedder(embedder: Arc<dyn SpeakerEmbedder>, sample_rate_hz: u32) -> Self {
+        Self::with_handle(SpeakerEmbedderHandle::Shared(embedder), sample_rate_hz)
+    }
+
+    fn with_handle(embedder: SpeakerEmbedderHandle, sample_rate_hz: u32) -> Self {
         let reference_window_samples =
             (SPEAKER_CHANGE_REFERENCE_WINDOW_S * sample_rate_hz as f32) as usize;
         let recent_window_samples =
@@ -631,7 +656,7 @@ impl StreamingSpeakerChangeDetector {
     }
 }
 
-fn shared_change_detector_embedder() -> Option<&'static dyn SpeakerEmbedder> {
+fn shared_change_detector_embedder() -> Option<Arc<dyn SpeakerEmbedder>> {
     shared_embedder()
 }
 
@@ -639,11 +664,8 @@ impl StreamingDiarizer {
     /// Build over the shared embedder, or `None` if the pack is unavailable.
     pub fn shared(sample_rate_hz: u32) -> Option<Self> {
         shared_embedder().map(|embedder| {
-            Self::with_embedder_and_persons(
-                embedder,
-                sample_rate_hz,
-                load_person_matcher_for_active_embedder(),
-            )
+            let persons = load_person_matcher_for_embedder(embedder.as_ref());
+            Self::with_shared_embedder_and_persons(embedder, sample_rate_hz, persons)
         })
     }
 
@@ -663,6 +685,30 @@ impl StreamingDiarizer {
 
     pub fn with_embedder_and_persons(
         embedder: &'static dyn SpeakerEmbedder,
+        sample_rate_hz: u32,
+        persons: PersonMatcher,
+    ) -> Self {
+        Self::with_handle_and_persons(
+            SpeakerEmbedderHandle::Static(embedder),
+            sample_rate_hz,
+            persons,
+        )
+    }
+
+    fn with_shared_embedder_and_persons(
+        embedder: Arc<dyn SpeakerEmbedder>,
+        sample_rate_hz: u32,
+        persons: PersonMatcher,
+    ) -> Self {
+        Self::with_handle_and_persons(
+            SpeakerEmbedderHandle::Shared(embedder),
+            sample_rate_hz,
+            persons,
+        )
+    }
+
+    fn with_handle_and_persons(
+        embedder: SpeakerEmbedderHandle,
         sample_rate_hz: u32,
         persons: PersonMatcher,
     ) -> Self {

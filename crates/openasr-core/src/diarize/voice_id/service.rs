@@ -15,7 +15,7 @@ use super::space::EmbeddingSpace;
 use super::store::{NewSampleInput, VoiceIdStore, VoiceIdStoreError};
 use crate::diarize::contract::SpeakerEmbedding;
 use crate::diarize::embed::{
-    EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity, shared_embedder, shared_embedder_identity,
+    EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity, shared_embedder,
 };
 
 #[derive(Debug, Error)]
@@ -48,14 +48,21 @@ pub struct EnrollmentClip {
 /// home directory, or store is unavailable so batch/streaming paths stay
 /// fail-open toward anonymous labels rather than aborting transcription.
 pub fn load_person_matcher_for_active_embedder() -> PersonMatcher {
-    let Some(identity) = shared_embedder_identity() else {
-        return empty_person_matcher();
-    };
     let Some(embedder) = shared_embedder() else {
         return empty_person_matcher();
     };
+    load_person_matcher_for_embedder(embedder.as_ref())
+}
+
+/// Load the person library for the exact embedding-space snapshot held by a
+/// caller. This prevents a same-path pack replacement from pairing embeddings
+/// produced by the old snapshot with enrollment rows from the new one.
+pub(crate) fn load_person_matcher_for_embedder(embedder: &dyn SpeakerEmbedder) -> PersonMatcher {
+    let Some(identity) = embedder.identity() else {
+        return empty_person_matcher();
+    };
     let calibration = embedder.calibration_profile();
-    let space = EmbeddingSpace::for_active_embedder(identity, calibration);
+    let space = EmbeddingSpace::for_active_embedder(&identity, calibration);
     let threshold = calibration.voice_id_accept_threshold();
     let margin = calibration.voice_id_margin();
     let Ok(home) = crate::openasr_home() else {

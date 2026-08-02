@@ -168,7 +168,8 @@ impl<'a> BatchDiarizer<'a> {
         speech: &[DiarizationRegion],
         hint: DiarizeHint,
     ) -> Diarization {
-        let mut embedded_regions: Vec<EmbeddedRegion> = Vec::new();
+        let mut pending_regions = Vec::new();
+        let mut clips = Vec::new();
         for (source_index, region) in speech.iter().enumerate() {
             for range in embedding_ranges(region.range, self.min_segment_s) {
                 let start = (range.start_s * sample_rate_hz as f64).max(0.0) as usize;
@@ -176,21 +177,30 @@ impl<'a> BatchDiarizer<'a> {
                 if end <= start {
                     continue;
                 }
-                if let Ok(embedding) = self.embedder.embed(&samples[start..end], sample_rate_hz) {
-                    let context = ClusterContext {
+                clips.push(&samples[start..end]);
+                pending_regions.push((
+                    source_index,
+                    range,
+                    ClusterContext {
                         range,
                         local_speaker: region.local_speaker,
                         overlap: region.overlap,
-                    };
-                    embedded_regions.push(EmbeddedRegion {
-                        source_index,
-                        range,
-                        context,
-                        embedding,
-                    });
-                }
+                    },
+                ));
             }
         }
+        let embedded_regions: Vec<EmbeddedRegion> = pending_regions
+            .into_iter()
+            .zip(self.embedder.embed_batch(&clips, sample_rate_hz))
+            .filter_map(|((source_index, range, context), embedding)| {
+                Some(EmbeddedRegion {
+                    source_index,
+                    range,
+                    context,
+                    embedding: embedding.ok()?,
+                })
+            })
+            .collect();
         let embeddings: Vec<SpeakerEmbedding> = embedded_regions
             .iter()
             .map(|region| region.embedding.clone())
@@ -536,6 +546,7 @@ mod tests {
     use super::*;
     use crate::diarize::clustering::AgglomerativeClusterer;
     use crate::diarize::embed::EmbedError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock embedder: returns a fixed embedding per "speaker", chosen by the
     /// segment's mean amplitude sign, so two speakers are separable.
@@ -550,6 +561,32 @@ mod tests {
             };
             Ok(SpeakerEmbedding::l2_normalized(v))
         }
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    struct BatchRecordingEmbedder {
+        batch_calls: AtomicUsize,
+    }
+
+    impl SpeakerEmbedder for BatchRecordingEmbedder {
+        fn embed(&self, samples: &[f32], _sr: u32) -> Result<SpeakerEmbedding, EmbedError> {
+            Ok(SpeakerEmbedding::l2_normalized(vec![samples[0], 1.0]))
+        }
+
+        fn embed_batch(
+            &self,
+            clips: &[&[f32]],
+            _sample_rate_hz: u32,
+        ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            clips
+                .iter()
+                .map(|clip| Ok(SpeakerEmbedding::l2_normalized(vec![clip[0], 1.0])))
+                .collect()
+        }
+
         fn embedding_dim(&self) -> usize {
             2
         }
@@ -602,6 +639,37 @@ mod tests {
         assert_ne!(turns[0].speaker, turns[1].speaker, "B differs");
         // Two speakers -> two centroids.
         assert_eq!(result.centroids.len(), 2);
+    }
+
+    #[test]
+    fn pipeline_submits_all_crop_embeddings_as_one_ordered_batch() {
+        let sr = 16_000_u32;
+        let mut samples = vec![0.0_f32; sr as usize * 3];
+        samples[..sr as usize].fill(3.0);
+        samples[sr as usize..2 * sr as usize].fill(1.0);
+        samples[2 * sr as usize..].fill(2.0);
+        let speech = vec![
+            TimeRange::new(0.0, 1.0),
+            TimeRange::new(1.0, 2.0),
+            TimeRange::new(2.0, 3.0),
+        ];
+        let embedder = BatchRecordingEmbedder {
+            batch_calls: AtomicUsize::new(0),
+        };
+        let clusterer = FixedClusterer {
+            labels: vec![SpeakerId(0), SpeakerId(1), SpeakerId(2)],
+        };
+        let result = BatchDiarizer::new(&embedder, &clusterer).diarize(
+            &samples,
+            sr,
+            &speech,
+            DiarizeHint::Auto,
+        );
+        assert_eq!(embedder.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.turns.len(), 3);
+        assert_eq!(result.turns[0].speaker, SpeakerId(0));
+        assert_eq!(result.turns[1].speaker, SpeakerId(1));
+        assert_eq!(result.turns[2].speaker, SpeakerId(2));
     }
 
     #[test]

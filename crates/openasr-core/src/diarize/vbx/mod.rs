@@ -491,7 +491,7 @@ fn dense_window_cache_metadata(
     sample_rate_hz: u32,
     embedder: &dyn SpeakerEmbedder,
 ) -> Option<DenseWindowCacheMetadata> {
-    let identity = super::embed::shared_embedder_identity()?;
+    let identity = embedder.identity()?;
     if identity.embedding_dim != embedder.embedding_dim() {
         return None;
     }
@@ -499,7 +499,7 @@ fn dense_window_cache_metadata(
         schema_version: DENSE_WINDOW_CACHE_SCHEMA,
         audio_sha256: audio_sha256(samples),
         sample_rate_hz,
-        embedder_fingerprint: identity.pack_fingerprint.clone(),
+        embedder_fingerprint: identity.pack_fingerprint,
         embedder_dim: identity.embedding_dim,
         window_s: DENSE_WINDOW_S,
         shift_s: DENSE_SHIFT_S,

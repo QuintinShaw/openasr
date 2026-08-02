@@ -36,6 +36,7 @@ pub use quality::{
     MIN_SAMPLE_SPEECH_SECONDS, QualityError, TARGET_SAMPLE_SPEECH_SECONDS,
     assess_enrollment_quality,
 };
+pub(crate) use service::load_person_matcher_for_embedder;
 pub use service::{
     EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, add_sample_from_pcm_idempotent,
     enroll_person_from_clips, enroll_person_from_clips_idempotent,

@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::ggml_runtime::GgufTensorDataReader;
+use crate::ggml_runtime::{GgmlRuntimeSource, GgufTensorDataReader};
 
 #[derive(Debug, Error)]
 pub enum WeightsError {
@@ -141,7 +141,16 @@ impl Weights {
         // step to reuse), so there is no reopen race here either way.
         let runtime_source = crate::ggml_runtime::validate_ggml_runtime_source_path(path)
             .map_err(|e| WeightsError::Gguf(e.to_string()))?;
-        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)
+        Self::from_runtime_source(&runtime_source)
+    }
+
+    /// Parse weights from the same already-open mapping whose content id keys
+    /// the resident runtime. This prevents a path replacement between cache-key
+    /// resolution and weight loading from binding different bytes to that key.
+    pub(crate) fn from_runtime_source(
+        runtime_source: &GgmlRuntimeSource,
+    ) -> Result<Self, WeightsError> {
+        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(|e| WeightsError::Gguf(e.to_string()))?;
         let mut tensors = BTreeMap::new();
         for metadata in reader.tensor_index().tensors() {

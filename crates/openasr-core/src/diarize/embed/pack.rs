@@ -5,13 +5,17 @@
 //! `None` and callers fail closed with a clear "install redimnet2-b6-cn" error
 //! rather than falling back to any other embedder.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::RedimNet2Embedder;
 use super::SpeakerEmbedder;
+use crate::models::thread_local_runtime_cache::PackContentKey;
 
-static SHARED_EMBEDDER: OnceLock<SharedEmbedderState> = OnceLock::new();
+static ACTIVE_REDIMNET: LazyLock<Mutex<Option<(PackContentKey, Arc<RedimNet2Embedder>)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 const REDIMNET_PACK_ENV: &str = "OPENASR_REDIMNET_PACK";
 const REDIMNET_INSTALLED_MODEL_ID_HINT: &str = "redimnet";
@@ -60,11 +64,6 @@ pub struct SpeakerEmbedderIdentity {
     pub pack_fingerprint: String,
 }
 
-struct SharedEmbedderState {
-    embedder: Box<dyn SpeakerEmbedder>,
-    identity: SpeakerEmbedderIdentity,
-}
-
 fn redimnet_pack_path() -> Option<PathBuf> {
     crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_INSTALLED_MODEL_ID_HINT)
 }
@@ -108,50 +107,67 @@ pub(crate) fn speaker_attribution_admission_bytes() -> u64 {
         .saturating_mul(SPEAKER_ATTRIBUTION_ADMISSION_PACK_MULTIPLIER)
 }
 
-/// The process-wide active ReDimNet2-B6 embedder, or `None` if the pack is not
-/// installed.
-///
-/// Only a successful load is cached. A failed resolve/load must NOT poison the
-/// cache: capability reporting re-probes the filesystem on every ask, so a
-/// daemon that saw a diarize request before the pack was installed has to pick
-/// the pack up on the next request, not after a restart.
-///
-/// That "no restart needed" behavior covers only the not-installed -> installed
-/// transition, not installed -> *replaced*: once `SHARED_EMBEDDER` has served one
-/// successful load, `OnceLock` keeps that same embedder (and its
-/// `pack_fingerprint`) for the rest of the process's life. Reinstalling,
-/// repacking, or swapping in a different `redimnet2-b6-cn` object on disk after
-/// the first successful resolve is invisible until the process restarts -- a
-/// long-lived `openasr serve` daemon needs an explicit restart to pick up a
-/// replaced pack; the CLI's one-shot-per-invocation lifetime never hits this.
-pub fn shared_embedder() -> Option<&'static dyn SpeakerEmbedder> {
-    shared_embedder_state().map(|state| state.embedder.as_ref())
+/// Snapshot of the currently resolved ReDimNet2-B6 pack. Every call reopens
+/// the resolved path and derives a content id from that exact mapping. Equal
+/// content reuses the one active parsed model; replacement atomically swaps
+/// that content slot, and deletion clears it. An `Arc` pins an in-flight or
+/// streaming-session snapshot without pinning the resolved path's identity.
+pub fn shared_embedder() -> Option<Arc<dyn SpeakerEmbedder>> {
+    let embedder: Arc<dyn SpeakerEmbedder> = load_current_embedder()?;
+    Some(embedder)
 }
 
-/// Metadata for the process-wide active embedder, including the content
-/// fingerprint stored next to enrolled voice-match embeddings.
-pub fn shared_embedder_identity() -> Option<&'static SpeakerEmbedderIdentity> {
-    shared_embedder_state().map(|state| &state.identity)
+/// Metadata for a fresh snapshot of the currently resolved pack.
+pub fn shared_embedder_identity() -> Option<SpeakerEmbedderIdentity> {
+    load_current_embedder()?.identity()
 }
 
-fn shared_embedder_state() -> Option<&'static SharedEmbedderState> {
-    if let Some(state) = SHARED_EMBEDDER.get() {
-        return Some(state);
-    }
-    let path = redimnet_pack_path()?;
-    let state = load_embedder_state(&path)?;
-    let _ = SHARED_EMBEDDER.set(state);
-    SHARED_EMBEDDER.get()
-}
-
-fn load_embedder_state(path: &Path) -> Option<SharedEmbedderState> {
-    // ReDimNet2 is GGUF-only (a ggml-native artifact; no safetensors fast path).
-    let embedder: Box<dyn SpeakerEmbedder> = Box::new(RedimNet2Embedder::from_oasr(path).ok()?);
-    let identity = SpeakerEmbedderIdentity {
-        embedding_dim: embedder.embedding_dim(),
-        pack_fingerprint: pack_fingerprint(path)?,
+fn load_current_embedder() -> Option<Arc<RedimNet2Embedder>> {
+    let Some(path) = redimnet_pack_path() else {
+        clear_active_embedder();
+        return None;
     };
-    Some(SharedEmbedderState { embedder, identity })
+    let source = match crate::validate_ggml_runtime_source_path(&path) {
+        Ok(source) => source,
+        Err(_) => {
+            clear_active_embedder();
+            return None;
+        }
+    };
+    let key = PackContentKey::for_runtime_source(&source);
+    if let Ok(cache) = ACTIVE_REDIMNET.lock()
+        && let Some((cached_key, embedder)) = cache.as_ref()
+        && cached_key == &key
+    {
+        return Some(Arc::clone(embedder));
+    }
+
+    // Build outside the mutex: parsing/dequantizing a pack is expensive and
+    // inference must never run under this lock. The second lookup below
+    // coalesces a benign concurrent first-load race.
+    let built = match RedimNet2Embedder::from_runtime_source(&source) {
+        Ok(embedder) => Arc::new(embedder),
+        Err(_) => {
+            clear_active_embedder();
+            return None;
+        }
+    };
+    let Ok(mut cache) = ACTIVE_REDIMNET.lock() else {
+        return Some(built);
+    };
+    if let Some((cached_key, existing)) = cache.as_ref()
+        && cached_key == &key
+    {
+        return Some(Arc::clone(existing));
+    }
+    *cache = Some((key, Arc::clone(&built)));
+    Some(built)
+}
+
+fn clear_active_embedder() {
+    if let Ok(mut cache) = ACTIVE_REDIMNET.lock() {
+        *cache = None;
+    }
 }
 
 /// Content fingerprint of the embedder pack: `sha256:<hex>`.
@@ -168,6 +184,7 @@ fn load_embedder_state(path: &Path) -> Option<SharedEmbedderState> {
 /// the gate declines -- an env-override pack, an unsealed object, or a path
 /// outside the resolved model store -- is hashed the slow way: those are
 /// arbitrary paths with no digest to trust.
+#[cfg(test)]
 fn pack_fingerprint(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -205,6 +222,26 @@ mod tests {
     fn redimnet_pack_env_name_is_stable() {
         assert_eq!(REDIMNET_PACK_ENV, "OPENASR_REDIMNET_PACK");
         assert_eq!(REDIMNET_INSTALLED_MODEL_ID_HINT, "redimnet");
+    }
+
+    #[test]
+    fn runtime_content_identity_tracks_same_path_replacement_and_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("redimnet.oasr");
+        std::fs::write(&pack, b"GGUFredimnet-content-a").expect("write a");
+        let source_a = crate::validate_ggml_runtime_source_path(&pack).expect("source a");
+        let key_a = PackContentKey::for_runtime_source(&source_a);
+
+        std::fs::write(&pack, b"GGUFredimnet-content-b").expect("replace b");
+        let source_b = crate::validate_ggml_runtime_source_path(&pack).expect("source b");
+        let key_b = PackContentKey::for_runtime_source(&source_b);
+        assert_ne!(key_a, key_b, "same-path replacement must miss the cache");
+
+        std::fs::remove_file(&pack).expect("delete pack");
+        assert!(
+            crate::validate_ggml_runtime_source_path(&pack).is_err(),
+            "deleted pack must not resolve to the old content"
+        );
     }
 
     /// The admission estimate is the resolved pack's on-disk size times the
