@@ -303,7 +303,9 @@ fn reconstruct_global_turns(
             continue;
         }
         let usable = window.frame_activity.len().min(frames - start);
-        let mut overlap = vec![vec![-1i64; speaker_count]; 3];
+        debug_assert!(activity.local_speaker_slots <= u8::BITS as u8);
+        let local_slots = activity.local_speaker_slots.min(u8::BITS as u8) as usize;
+        let mut overlap = vec![vec![-1i64; speaker_count]; local_slots];
         for (local, local_scores) in overlap.iter_mut().enumerate() {
             let bit = 1u8 << local;
             let active = window.frame_activity[..usable]
@@ -571,6 +573,7 @@ mod tests {
                 start_s: 0.0,
                 frame_activity: vec![0b01, 0b11, 0b10, 0],
             }],
+            local_speaker_slots: 3,
             speaker_count: vec![1, 2, 1, 0],
         };
         let clusters = vec![
@@ -593,6 +596,32 @@ mod tests {
             turns
                 .iter()
                 .any(|turn| turn.speaker == SpeakerId(1) && turn.overlap)
+        );
+    }
+
+    #[test]
+    fn reconstruction_keeps_a_fourth_local_speaker_slot() {
+        let activity = LocalActivity {
+            frame_clock: clock(),
+            windows: vec![LocalActivityWindow {
+                start_s: 0.0,
+                frame_activity: vec![0b0001, 0b0010, 0b0100, 0b1000],
+            }],
+            local_speaker_slots: 4,
+            speaker_count: vec![1, 1, 1, 1],
+        };
+        let clusters = (0..4)
+            .map(|speaker| ClusterSegment {
+                range: TimeRange::new(speaker as f64 * 0.1, (speaker + 1) as f64 * 0.1),
+                speaker: SpeakerId(speaker),
+            })
+            .collect::<Vec<_>>();
+
+        let turns = reconstruct_global_turns(&activity, &clusters, 4, 0.4);
+
+        assert!(
+            turns.iter().any(|turn| turn.speaker == SpeakerId(3)),
+            "the fourth DiariZen-local slot must survive Hungarian alignment"
         );
     }
 }

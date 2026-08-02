@@ -20,6 +20,7 @@ use super::ops::{
 };
 use crate::diarize::embed::ops::conv1d;
 use crate::diarize::embed::weights::{Weights, WeightsError};
+use crate::ggml_runtime::GgmlRuntimeSource;
 
 const EPS: f32 = 1e-5;
 const ALPHA: f32 = 0.01;
@@ -55,6 +56,14 @@ impl PyannetModel {
     pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, WeightsError> {
         Ok(Self {
             w: Weights::from_oasr(path)?,
+        })
+    }
+
+    /// Load from the same already-open mapping whose content id keys the
+    /// resident segmenter snapshot.
+    pub(crate) fn from_runtime_source(source: &GgmlRuntimeSource) -> Result<Self, WeightsError> {
+        Ok(Self {
+            w: Weights::from_runtime_source(source)?,
         })
     }
 

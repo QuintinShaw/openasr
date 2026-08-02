@@ -81,6 +81,10 @@ pub(crate) struct LocalActivityWindow {
 pub(crate) struct LocalActivity {
     pub frame_clock: ActivityFrameClock,
     pub windows: Vec<LocalActivityWindow>,
+    /// Number of window-local speaker slots emitted by the selected model.
+    /// This is part of the activity contract: segmentation-3.0 emits three,
+    /// while DiariZen emits four.
+    pub local_speaker_slots: u8,
     /// Overlap-add mean of each window's active-speaker count, rounded to the
     /// nearest integer exactly once after aggregation.
     pub speaker_count: Vec<u8>,
@@ -163,6 +167,15 @@ impl PyannoteSegmenter {
         })
     }
 
+    pub(crate) fn from_runtime_source(
+        source: &crate::ggml_runtime::GgmlRuntimeSource,
+    ) -> Result<Self, WeightsError> {
+        Ok(Self {
+            model: PyannetModel::from_runtime_source(source)?,
+            protocol: SlidingProtocol::default(),
+        })
+    }
+
     /// Compatibility helper for diagnostics. Production external diarization
     /// consumes [`LocalActivity`] and performs local-to-global reconstruction;
     /// this helper only renders each window-local slot independently.
@@ -201,6 +214,7 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
             return Ok(LocalActivity {
                 frame_clock: activity_frame_clock(),
                 windows: Vec::new(),
+                local_speaker_slots: MAX_LOCAL_SPEAKERS as u8,
                 speaker_count: Vec::new(),
             });
         }
@@ -248,6 +262,7 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
         Ok(LocalActivity {
             frame_clock,
             windows,
+            local_speaker_slots: MAX_LOCAL_SPEAKERS as u8,
             speaker_count,
         })
     }
@@ -414,6 +429,7 @@ mod decode_tests {
                 step_s: 0.1,
             },
             windows: Vec::new(),
+            local_speaker_slots: 3,
             speaker_count: vec![0, 1, 1, 0],
         };
         assert_eq!(activity.valid_regions(1.0), vec![TimeRange::new(0.2, 0.4)]);
