@@ -1,0 +1,349 @@
+name: Docker release
+
+# Build (and optionally push) CPU + CUDA runtime images to Docker Hub from
+# published GitHub Release assets. Release-core calls this after the full
+# binary matrix lands so the images match the just-published CLI; a failed
+# Docker job does not delete or roll back the GitHub Release.
+#
+# Images (Docker Hub namespace `quintinshaw`, repository `openasr`):
+#   CPU  (linux/amd64 + linux/arm64):
+#     quintinshaw/openasr:<version>
+#     quintinshaw/openasr:latest          (only when mark_latest=true)
+#     quintinshaw/openasr:sha-<short>
+#   CUDA (linux/amd64 only):
+#     quintinshaw/openasr:cuda-<version>
+#     quintinshaw/openasr:cuda-latest     (only when mark_latest=true)
+#     quintinshaw/openasr:cuda-sha-<short>
+#
+# Secrets: DOCKER_PAT (Docker Hub access token for user `quintinshaw`). When
+# push=true but the secret is missing, the job prints a ::notice:: and skips
+# the push (same optional-infra pattern as HOMEBREW_TAP_TOKEN) so a missing
+# registry credential cannot turn a successful core release into a mystery
+# failure. workflow_dispatch defaults to push=false for dry-run builds.
+#
+# Manual:
+#   gh workflow run docker-release.yml \
+#     -f version=0.1.28 -f push=false -f mark_latest=false -f variants=all
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "OpenASR version without the leading v (e.g. 0.1.28); empty = Cargo.toml"
+        required: false
+        type: string
+        default: ""
+      tag:
+        description: "Release tag (e.g. v0.1.28); empty = v<version>"
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Push images to Docker Hub"
+        required: false
+        type: boolean
+        default: true
+      mark_latest:
+        description: "Also move latest / cuda-latest"
+        required: false
+        type: boolean
+        default: true
+      variants:
+        description: "cpu | cuda | all"
+        required: false
+        type: string
+        default: "all"
+      ref:
+        description: "Git ref to checkout for Dockerfiles/scripts (empty = tag)"
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "OpenASR version without the leading v (empty = read Cargo.toml at ref)"
+        required: false
+        default: ""
+      tag:
+        description: "Release tag (empty = v<version>)"
+        required: false
+        default: ""
+      ref:
+        description: "Git ref to checkout for Dockerfiles/scripts (empty = tag or default branch)"
+        required: false
+        default: ""
+      push:
+        description: "Push images to Docker Hub (false = build-only dry run)"
+        required: false
+        default: false
+        type: boolean
+      mark_latest:
+        description: "Also move latest / cuda-latest (only meaningful when push is true)"
+        required: false
+        default: false
+        type: boolean
+      variants:
+        description: "cpu | cuda | all"
+        required: false
+        default: "all"
+
+concurrency:
+  group: docker-release-${{ inputs.tag || inputs.version || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_NAMESPACE: quintinshaw
+  DOCKERHUB_IMAGE: openasr
+  DOCKERHUB_USERNAME: quintinshaw
+
+jobs:
+  resolve:
+    name: Resolve version and push plan
+    if: github.repository_owner == 'QuintinShaw'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      checkout_ref: ${{ steps.plan.outputs.checkout_ref }}
+      short_sha: ${{ steps.plan.outputs.short_sha }}
+      do_push: ${{ steps.plan.outputs.do_push }}
+      mark_latest: ${{ steps.plan.outputs.mark_latest }}
+      build_cpu: ${{ steps.plan.outputs.build_cpu }}
+      build_cuda: ${{ steps.plan.outputs.build_cuda }}
+    steps:
+      - name: Checkout for version metadata
+        uses: actions/checkout@v7
+        with:
+          # Prefer an explicit ref, then the release tag, then the default ref.
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
+
+      - name: Plan
+        id: plan
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PUSH: ${{ inputs.push }}
+          INPUT_MARK_LATEST: ${{ inputs.mark_latest }}
+          INPUT_VARIANTS: ${{ inputs.variants }}
+          # Deliberately expanded in env (not shell) so a missing secret stays
+          # empty rather than printing a literal secrets reference.
+          DOCKER_PAT: ${{ secrets.DOCKER_PAT }}
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION}"
+          if [ -z "${version}" ]; then
+            version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          fi
+          if [ -z "${version}" ]; then
+            echo "could not resolve OPENASR version" >&2
+            exit 1
+          fi
+
+          tag="${INPUT_TAG}"
+          if [ -z "${tag}" ]; then
+            tag="v${version}"
+          fi
+
+          checkout_ref="${INPUT_REF}"
+          if [ -z "${checkout_ref}" ]; then
+            checkout_ref="${tag}"
+          fi
+
+          short_sha="$(git rev-parse --short HEAD)"
+
+          variants="$(printf '%s' "${INPUT_VARIANTS:-all}" | tr '[:upper:]' '[:lower:]')"
+          case "${variants}" in
+            cpu|cuda|all) ;;
+            *)
+              echo "variants must be cpu, cuda, or all (got: ${INPUT_VARIANTS})" >&2
+              exit 1
+              ;;
+          esac
+          build_cpu=false
+          build_cuda=false
+          if [ "${variants}" = "cpu" ] || [ "${variants}" = "all" ]; then
+            build_cpu=true
+          fi
+          if [ "${variants}" = "cuda" ] || [ "${variants}" = "all" ]; then
+            build_cuda=true
+          fi
+
+          want_push=false
+          if [ "${INPUT_PUSH}" = "true" ]; then
+            want_push=true
+          fi
+          do_push=false
+          if [ "${want_push}" = "true" ]; then
+            if [ -n "${DOCKER_PAT}" ]; then
+              do_push=true
+            else
+              echo "::notice::DOCKER_PAT secret not set -- building images without pushing to Docker Hub. Add a Docker Hub access token for user quintinshaw as the DOCKER_PAT repository secret to enable pushes."
+            fi
+          fi
+
+          mark_latest=false
+          if [ "${INPUT_MARK_LATEST}" = "true" ]; then
+            mark_latest=true
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "checkout_ref=${checkout_ref}"
+            echo "short_sha=${short_sha}"
+            echo "do_push=${do_push}"
+            echo "mark_latest=${mark_latest}"
+            echo "build_cpu=${build_cpu}"
+            echo "build_cuda=${build_cuda}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Docker release plan"
+            echo
+            echo "- version: \`${version}\`"
+            echo "- tag: \`${tag}\`"
+            echo "- checkout_ref: \`${checkout_ref}\`"
+            echo "- short_sha: \`${short_sha}\`"
+            echo "- variants: \`${variants}\`"
+            echo "- push: \`${do_push}\` (requested=${want_push})"
+            echo "- mark_latest: \`${mark_latest}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  cpu:
+    name: CPU image (amd64 + arm64)
+    needs: resolve
+    if: needs.resolve.outputs.build_cpu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.checkout_ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: needs.resolve.outputs.do_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          image="${DOCKERHUB_NAMESPACE}/${DOCKERHUB_IMAGE}"
+          version="${{ needs.resolve.outputs.version }}"
+          short_sha="${{ needs.resolve.outputs.short_sha }}"
+          tags="${image}:${version},${image}:sha-${short_sha}"
+          if [ "${{ needs.resolve.outputs.mark_latest }}" = "true" ]; then
+            tags="${tags},${image}:latest"
+          fi
+          echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
+          echo "tags=${tags}"
+
+      - name: Build and push CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          # Multi-arch cannot `load` into the local docker driver. When not
+          # pushing, export type=cacheonly so the dry-run still compiles every
+          # platform layer without needing a registry.
+          push: ${{ needs.resolve.outputs.do_push == 'true' }}
+          outputs: ${{ needs.resolve.outputs.do_push == 'true' && 'type=registry' || 'type=cacheonly' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            OPENASR_VERSION=${{ needs.resolve.outputs.version }}
+            OPENASR_REPO=${{ github.repository }}
+          # Release-assemble downloads the published asset; GHA cache does not
+          # help the fetch stage and would only cache the thin runtime layer.
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### CPU image"
+            echo
+            if [ "${{ needs.resolve.outputs.do_push }}" = "true" ]; then
+              echo "Pushed: \`${{ steps.tags.outputs.tags }}\`"
+            else
+              echo "Build-only (no Docker Hub push). Tags prepared:"
+              echo "\`${{ steps.tags.outputs.tags }}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  cuda:
+    name: CUDA image (amd64)
+    needs: resolve
+    if: needs.resolve.outputs.build_cuda == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.checkout_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: needs.resolve.outputs.do_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          image="${DOCKERHUB_NAMESPACE}/${DOCKERHUB_IMAGE}"
+          version="${{ needs.resolve.outputs.version }}"
+          short_sha="${{ needs.resolve.outputs.short_sha }}"
+          tags="${image}:cuda-${version},${image}:cuda-sha-${short_sha}"
+          if [ "${{ needs.resolve.outputs.mark_latest }}" = "true" ]; then
+            tags="${tags},${image}:cuda-latest"
+          fi
+          echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
+          echo "tags=${tags}"
+
+      - name: Build and push CUDA image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cuda.release
+          platforms: linux/amd64
+          push: ${{ needs.resolve.outputs.do_push == 'true' }}
+          outputs: ${{ needs.resolve.outputs.do_push == 'true' && 'type=registry' || 'type=cacheonly' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            OPENASR_VERSION=${{ needs.resolve.outputs.version }}
+            OPENASR_REPO=${{ github.repository }}
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### CUDA image"
+            echo
+            if [ "${{ needs.resolve.outputs.do_push }}" = "true" ]; then
+              echo "Pushed: \`${{ steps.tags.outputs.tags }}\`"
+            else
+              echo "Build-only (no Docker Hub push). Tags prepared:"
+              echo "\`${{ steps.tags.outputs.tags }}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

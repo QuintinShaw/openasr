@@ -1,36 +1,31 @@
 name: Docker CUDA release
 
-# Manual-only: builds Dockerfile.cuda (the NVIDIA GPU image; see that file for
-# why it compiles from source instead of assembling the released
-# linux-x86_64-cuda binary) and, when explicitly asked to, pushes it to GHCR.
-#
-# GitHub-hosted runners have no GPU, so this validates "compiles + links +
-# packages" only -- exactly like the `linux-x86_64-cuda` leg in
-# release-binaries.yml, which already compiles the same `cuda` feature
-# successfully on a GPU-less hosted runner today (nvcc device-code
-# compilation does not require a physical GPU, only a matching driver at
-# *run* time). Real GPU execution is validated on real hardware, e.g. via
-# `docker compose --profile gpu up openasr-cuda` on a machine with an NVIDIA
-# card and the NVIDIA Container Toolkit installed -- see compose.yaml and
-# scripts/docker-cuda-entrypoint.sh for the fail-closed GPU-visibility gate
-# that guards against a silent CPU fallback there.
-#
-# Dispatch manually from the Actions tab or `gh workflow run docker-cuda-release.yml`.
+# Convenience wrapper around docker-release.yml for CUDA-only builds.
+# Prefer `docker-release.yml` (variants=all|cpu|cuda) for new manual runs.
+# Pushes go to Docker Hub (`quintinshaw/openasr:cuda-*`), not GHCR.
 
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "OpenASR version without the leading v (empty = read Cargo.toml at ref)"
+        required: false
+        default: ""
+      tag:
+        description: "Release tag (empty = v<version>)"
+        required: false
+        default: ""
       ref:
-        description: "Git ref (branch, tag, or SHA) to build; empty = default branch"
+        description: "Git ref to checkout for Dockerfiles/scripts (empty = tag or default branch)"
         required: false
         default: ""
       push:
-        description: "Push the built image to ghcr.io (false = build-only dry run, no registry writes)"
+        description: "Push the built image to Docker Hub (false = build-only dry run)"
         required: false
         default: false
         type: boolean
       mark_latest:
-        description: "Also tag/push cuda-latest (only meaningful when push is true; use for a real release ref, not an arbitrary dev branch)"
+        description: "Also tag/push cuda-latest (only meaningful when push is true)"
         required: false
         default: false
         type: boolean
@@ -42,88 +37,16 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
-  build-and-push:
-    name: Build (and optionally push) the CUDA image
-    # Only the canonical repo may push to its GHCR namespace; forks can still
-    # dispatch this for a build-only dry run since `packages: write` is not
-    # granted below unless this check passes.
+  docker:
+    name: Build CUDA image via docker-release
     if: github.repository_owner == 'QuintinShaw'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref }}
-          submodules: recursive
-
-      - name: Resolve workspace version
-        id: version
-        run: |
-          set -euo pipefail
-          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
-          if [ -z "${version}" ]; then
-            echo "could not read workspace version from Cargo.toml" >&2
-            exit 1
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: inputs.push
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image tags
-        id: tags
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          # Lowercase (GHCR requires lowercase repository paths); github.repository
-          # is already QuintinShaw/openasr (mixed case owner), so normalize.
-          image="$(printf '%s' "${image}" | tr '[:upper:]' '[:lower:]')"
-          short_sha="$(git rev-parse --short HEAD)"
-          tags="${image}:cuda-${{ steps.version.outputs.version }},${image}:cuda-sha-${short_sha}"
-          if [ "${{ inputs.mark_latest }}" = "true" ]; then
-            tags="${tags},${image}:cuda-latest"
-          fi
-          echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
-
-      # linux/amd64 only: matches release-binaries.yml's Linux CUDA leg
-      # (x86_64-only -- there is no aarch64 desktop/server NVIDIA CUDA leg
-      # there either; Jetson uses a separate l4t base image, out of scope).
-      - name: Build image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.cuda
-          platforms: linux/amd64
-          push: ${{ inputs.push }}
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Summary
-        run: |
-          {
-            echo "### Docker CUDA image"
-            echo
-            if [ "${{ inputs.push }}" = "true" ]; then
-              echo "Pushed: \`${{ steps.tags.outputs.tags }}\`"
-            else
-              echo "Build-only dry run (push=false) -- no registry writes. Tags that would have been pushed:"
-              echo "\`${{ steps.tags.outputs.tags }}\`"
-            fi
-          } >> "${GITHUB_STEP_SUMMARY}"
+    uses: ./.github/workflows/docker-release.yml
+    with:
+      version: ${{ inputs.version }}
+      tag: ${{ inputs.tag }}
+      ref: ${{ inputs.ref }}
+      push: ${{ inputs.push }}
+      mark_latest: ${{ inputs.mark_latest }}
+      variants: cuda
+    secrets: inherit

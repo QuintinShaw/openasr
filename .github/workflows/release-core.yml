@@ -296,6 +296,26 @@ jobs:
 
           gh release edit "$tag" --notes-file new-body.md
 
+  docker-images:
+    name: Publish Docker Hub images
+    # Needs the full asset matrix so Dockerfile.release / Dockerfile.cuda.release
+    # can download the just-published linux-x86_64, linux-arm64, and
+    # linux-x86_64-cuda archives (+ SHA256SUMS). A red Docker job fails this
+    # workflow leg only -- it must never delete or roll back the GitHub Release
+    # the earlier jobs already published.
+    needs: [resolve, release, binaries]
+    if: needs.resolve.outputs.should_release == 'true' && success()
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-release.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      push: true
+      mark_latest: true
+      variants: all
+    secrets: inherit
+
   update-homebrew-tap:
     name: Update Homebrew tap formula
     # Needs the full asset matrix (binaries), not just the core build job's

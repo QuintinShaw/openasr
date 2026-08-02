@@ -1,0 +1,76 @@
+# Assemble a CPU runtime image from a published GitHub Release asset.
+#
+# Used by .github/workflows/docker-release.yml so a core release does not
+# recompile the CLI inside Docker: the binary, model-registry metadata, and
+# checksums already shipped on the release are the source of truth. Local
+# development and CI smoke still use the source-build Dockerfile.
+#
+# Build (single arch example):
+#   docker build -f Dockerfile.release \
+#     --build-arg OPENASR_VERSION=0.1.28 \
+#     -t quintinshaw/openasr:0.1.28 .
+#
+# Multi-arch (amd64 + arm64) is handled by buildx in CI.
+
+ARG OPENASR_VERSION
+ARG OPENASR_REPO=QuintinShaw/openasr
+
+FROM debian:trixie-slim AS fetch
+
+ARG OPENASR_VERSION
+ARG OPENASR_REPO
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -euo pipefail \
+    && if [ -z "${OPENASR_VERSION:-}" ]; then \
+         echo "OPENASR_VERSION build-arg is required" >&2; exit 1; \
+       fi \
+    && case "${TARGETARCH}" in \
+         amd64) asset_arch="linux-x86_64" ;; \
+         arm64) asset_arch="linux-arm64" ;; \
+         *) echo "unsupported TARGETARCH=${TARGETARCH} (want amd64 or arm64)" >&2; exit 1 ;; \
+       esac \
+    && tag="v${OPENASR_VERSION}" \
+    && archive="openasr-${OPENASR_VERSION}-${asset_arch}.tar.gz" \
+    && base="https://github.com/${OPENASR_REPO}/releases/download/${tag}" \
+    && curl -fsSL -o /tmp/SHA256SUMS "${base}/SHA256SUMS" \
+    && curl -fsSL -o "/tmp/${archive}" "${base}/${archive}" \
+    && expected="$(grep -E "  ${archive}\$" /tmp/SHA256SUMS | awk '{print $1}')" \
+    && if [ -z "${expected}" ]; then \
+         echo "no SHA256SUMS entry for ${archive}" >&2; exit 1; \
+       fi \
+    && echo "${expected}  /tmp/${archive}" | sha256sum -c - \
+    && mkdir -p /out \
+    && tar -xzf "/tmp/${archive}" -C /out --strip-components=1 \
+    && test -x /out/openasr \
+    && test -d /out/model-registry
+
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libasound2t64 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 openasr \
+    && mkdir -p /app /data \
+    && chown -R openasr:openasr /app /data
+
+WORKDIR /app
+COPY --from=fetch /out/openasr /usr/local/bin/openasr
+COPY --from=fetch /out/model-registry ./model-registry
+
+ENV OPENASR_HOME=/data
+# Binding 0.0.0.0 inside the container is the standard Docker pattern (exposure is
+# controlled by the operator's port-publish / orchestration). The server is
+# fail-closed against non-loopback plaintext by default; this image opts in
+# explicitly. Front it with TLS (or a TLS-terminating proxy) for untrusted networks.
+ENV OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1
+
+EXPOSE 8080
+
+USER openasr
+ENTRYPOINT ["openasr"]
+CMD ["serve", "--addr", "0.0.0.0:8080"]

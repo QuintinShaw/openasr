@@ -70,12 +70,19 @@ cargo run -p openasr-cli -- doctor
 
 ## Optional Docker smoke
 
+Source-build image (what `docker-smoke.yml` exercises; good for local tree changes):
+
 ```bash
 docker build -t openasr:local .
-docker run --rm -d --name openasr-docker-smoke -p 18080:8080 openasr:local
+docker run --rm -d --name openasr-docker-smoke -p 18080:8080 openasr:local serve --addr 0.0.0.0:8080 --backend mock
 curl -fsS http://127.0.0.1:18080/health
 docker rm -f openasr-docker-smoke
 ```
+
+Published release images live on Docker Hub (`quintinshaw/openasr`,
+`quintinshaw/openasr:cuda-*`) and are assembled from GitHub Release assets by
+`.github/workflows/docker-release.yml` via `Dockerfile.release` /
+`Dockerfile.cuda.release`. See [RELEASING.md](RELEASING.md#docker-hub-images).
 
 ## Formatting and linting
 

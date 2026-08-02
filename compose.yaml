@@ -1,4 +1,7 @@
 services:
+  # Local source-build services. Published images are on Docker Hub:
+  #   docker pull quintinshaw/openasr:latest
+  #   docker pull quintinshaw/openasr:cuda-latest
   openasr:
     build:
       context: .

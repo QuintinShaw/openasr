@@ -203,3 +203,49 @@ set, the job prints a `::notice::` and skips -- the release itself still
 succeeds and stays green; the tap formula just does not get bumped for that
 release (bump it manually by re-running the `update-homebrew-tap` job, or by
 hand, once the secret exists).
+
+## Docker Hub images
+
+`release-core.yml`'s `docker-images` job runs after the full binary matrix
+(`binaries`) and builds runtime images from the just-published Linux release
+assets (no second cargo build inside Docker):
+
+- CPU multi-arch (`linux/amd64` + `linux/arm64`) from
+  `openasr-<version>-linux-x86_64.tar.gz` / `linux-arm64.tar.gz` via
+  `Dockerfile.release`
+- CUDA (`linux/amd64` only) from `openasr-<version>-linux-x86_64-cuda.tar.gz`
+  via `Dockerfile.cuda.release`
+
+Images push to Docker Hub under the `quintinshaw` namespace:
+
+```text
+quintinshaw/openasr:<version>
+quintinshaw/openasr:latest
+quintinshaw/openasr:sha-<short>
+quintinshaw/openasr:cuda-<version>
+quintinshaw/openasr:cuda-latest
+quintinshaw/openasr:cuda-sha-<short>
+```
+
+`latest` / `cuda-latest` move only on a successful formal release
+(`mark_latest: true`). Images ship the CLI binary plus bundled
+`model-registry` metadata only -- never model weights. Data lives under
+`OPENASR_HOME=/data`.
+
+This needs a `DOCKER_PAT` repository secret: a Docker Hub access token for
+user `quintinshaw` with permission to push `quintinshaw/openasr`. If the
+secret is not set, the job prints a `::notice::` and builds without pushing
+-- the GitHub Release itself still succeeds; only the Hub publish is skipped.
+A red Docker job fails that leg of the workflow only and does not delete or
+roll back the already-published Release.
+
+Manual dry-run / re-publish against an existing tag:
+
+```bash
+gh workflow run docker-release.yml \
+  -f version=X.Y.Z -f tag=vX.Y.Z -f push=false -f mark_latest=false -f variants=all
+```
+
+Local source-build Dockerfiles (`Dockerfile`, `Dockerfile.cuda`) remain for
+development and `docker-smoke.yml`; they are not the release path.
+

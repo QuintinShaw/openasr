@@ -88,6 +88,24 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 
 Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`). Offline native requests are serial by default. Operators can set `--max-native-sessions-per-model N`; `N` is both the admission limit and, for eligible direct-GPU Cohere, Moonshine, Qwen, and Whisper jobs, the source for an internal batch width capped at 8. CPU, scheduler, adapter, realtime, FireRed-AED, and FireRed2 paths remain serial; translations follow the offline policy. See [Agent Integration](docs/AGENT_INTEGRATION.md) for API key setup and agent workflows.
 
+### Docker
+
+Published images track each core release on Docker Hub (binary + model-registry
+metadata only; pull models at runtime into a volume mounted at `/data`):
+
+```bash
+docker pull quintinshaw/openasr:latest
+docker run --rm -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+
+# NVIDIA GPU (requires NVIDIA Container Toolkit)
+docker pull quintinshaw/openasr:cuda-latest
+docker run --rm --gpus all -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+```
+
+CPU images are multi-arch (`linux/amd64`, `linux/arm64`). CUDA images are
+`linux/amd64` only (Turing / sm_75 and newer). For local source builds see
+`Dockerfile` / `Dockerfile.cuda` and `compose.yaml`.
+
 ### Building from source
 
 ```bash

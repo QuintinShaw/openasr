@@ -1,17 +1,16 @@
-# CUDA-enabled image for NVIDIA GPUs (Turing/sm_75 and up -- RTX 20xx, GTX
-# 16xx, T4, and newer Ampere/Ada/Hopper cards).
+# CUDA-enabled *source-build* image for local NVIDIA GPU development
+# (Turing/sm_75 and up -- RTX 20xx, GTX 16xx, T4, and newer Ampere/Ada/Hopper).
 #
-# Why compile from source here instead of assembling the released
-# `openasr-<version>-linux-x86_64-cuda.tar.gz` binary (release-binaries.yml
-# does publish one): that release binary is compiled against
-# `openasr-core/build.rs`'s current default CUDA arch list, which does not
-# include sm_75 on `main` today, so it silently drops Turing cards ("no
-# kernel image available" at runtime) -- exactly the failure this image
-# exists to fix. Building in-image with an explicit OPENASR_CUDA_GPU_TARGETS
-# below decouples this image from that default and guarantees Turing support
-# regardless of upstream's current state. Once a released binary is built
-# with sm_75 included, switching this Dockerfile to "download + unpack the
-# release asset" becomes a valid, lighter-weight alternative -- revisit then.
+# Published images on Docker Hub are assembled from the released
+# `openasr-<version>-linux-x86_64-cuda.tar.gz` asset via Dockerfile.cuda.release
+# (see .github/workflows/docker-release.yml). That path is preferred for
+# releases because crates/openasr-core's default CUDA arch list already
+# includes sm_75 (see crates/openasr-core/src/cuda_targets.rs), so the
+# published binary matches this image's Turing floor without a second compile.
+#
+# Keep this Dockerfile for:
+#   - `docker compose --profile gpu` / unreleased tree testing
+#   - validating a CUDA build when no release asset exists yet
 #
 # CUDA toolkit version (13.2.0) and base OS (Ubuntu 22.04) match the
 # `linux-x86_64-cuda` leg in .github/workflows/release-binaries.yml so the

@@ -88,6 +88,21 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 
 与 OpenAI SDK 直接兼容(`base_url="http://127.0.0.1:8080/v1"`)。API Key 和 Agent 集成见 [Agent Integration](docs/AGENT_INTEGRATION.md)。
 
+### Docker
+
+每个 core release 会同步发布到 Docker Hub(仅二进制 + model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷):
+
+```bash
+docker pull quintinshaw/openasr:latest
+docker run --rm -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+
+# NVIDIA GPU(需要 NVIDIA Container Toolkit)
+docker pull quintinshaw/openasr:cuda-latest
+docker run --rm --gpus all -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+```
+
+CPU 镜像为 multi-arch(`linux/amd64`、`linux/arm64`)。CUDA 镜像仅 `linux/amd64`(Turing / sm_75 及以上)。本地源码构建见 `Dockerfile` / `Dockerfile.cuda` 与 `compose.yaml`。
+
 ### 从源码构建
 
 ```bash
