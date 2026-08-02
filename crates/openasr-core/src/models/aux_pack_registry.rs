@@ -71,6 +71,10 @@ fn validate_pyannote(path: &Path, _metadata: &GgufMetadata) -> Result<(), String
         .map_err(|error| error.to_string())
 }
 
+fn validate_diarizen(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
+    crate::diarize::segment::DiariZenSegmenter::probe_oasr(path).map_err(|error| error.to_string())
+}
+
 fn validate_hymt2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
     crate::models::hymt2::Hymt2Runtime::probe_path(path)
         .map(|_| ())
@@ -114,6 +118,11 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
         validate: validate_pyannote,
+    },
+    AuxPackDescriptor {
+        architecture_id: crate::diarize::segment::DIARIZEN_GGML_ARCHITECTURE_ID,
+        kind: AuxPackKind::Diarization,
+        validate: validate_diarizen,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,

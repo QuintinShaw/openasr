@@ -28,6 +28,8 @@ import numpy as np
 ARCH = "diarizen-wavlm-conformer-segmentation"
 MODEL_ID = "diarizen-wavlm-base-s80-md"
 PINNED_REVISION = "a9857fc34908197fb5336d9d0562f291834a04b2"
+TENSOR_SCHEMA = "compact-v1"
+GGUF_MAX_TENSOR_NAME_BYTES = 63
 
 EXPECTED_MODEL_PATH = "diarizen.models.eend.model_wavlm_conformer.Model"
 EXPECTED_MODEL_ARGS = {
@@ -94,6 +96,27 @@ POS_CONV_V = (
     "parametrizations.weight.original1"
 )
 POS_CONV_WEIGHT = "wavlm_model.encoder.transformer.pos_conv_embed.conv.weight"
+
+TENSOR_PREFIXES = (
+    ("wavlm_model.feature_extractor.", "dz.fe."),
+    ("wavlm_model.encoder.feature_projection.", "dz.fp."),
+    ("wavlm_model.encoder.transformer.", "dz.tr."),
+    ("conformer.conformer_layer.", "dz.cf."),
+)
+
+
+def runtime_tensor_name(upstream_name: str) -> str:
+    """Map the pinned checkpoint namespace into GGML's 63-byte name ABI."""
+    name = upstream_name
+    for upstream_prefix, runtime_prefix in TENSOR_PREFIXES:
+        if upstream_name.startswith(upstream_prefix):
+            name = runtime_prefix + upstream_name[len(upstream_prefix) :]
+            break
+    if len(name.encode("utf-8")) > GGUF_MAX_TENSOR_NAME_BYTES:
+        raise ConversionError(
+            f"runtime tensor name exceeds {GGUF_MAX_TENSOR_NAME_BYTES} bytes: {name}"
+        )
+    return name
 
 
 def load_and_validate_config(path: Path) -> dict[str, object]:
@@ -241,14 +264,23 @@ def choose_tensor_type(name: str, shape: tuple[int, ...], quant: str) -> str:
 def build_tensor_plan(state: dict[str, np.ndarray], quant: str) -> list[TensorPlan]:
     validate_state_dict(state)
     state = materialize_runtime_state(state)
-    return [
-        TensorPlan(
-            name=name,
-            values=np.ascontiguousarray(state[name]),
-            tensor_type=choose_tensor_type(name, tuple(state[name].shape), quant),
+    plan = []
+    seen = set()
+    for upstream_name in sorted(state):
+        name = runtime_tensor_name(upstream_name)
+        if name in seen:
+            raise ConversionError(f"runtime tensor name collision: {name}")
+        seen.add(name)
+        plan.append(
+            TensorPlan(
+                name=name,
+                values=np.ascontiguousarray(state[upstream_name]),
+                tensor_type=choose_tensor_type(
+                    upstream_name, tuple(state[upstream_name].shape), quant
+                ),
+            )
         )
-        for name in sorted(state)
-    ]
+    return plan
 
 
 def write_pack(
@@ -267,6 +299,7 @@ def write_pack(
     writer.add_string("openasr.model.id", model_id)
     writer.add_string("openasr.quantization", {"f16": "fp16"}.get(quant, quant))
     writer.add_string("diarizen.upstream_revision", PINNED_REVISION)
+    writer.add_string("diarizen.tensor_schema", TENSOR_SCHEMA)
     writer.add_uint32("diarizen.sample_rate", 16_000)
     writer.add_uint32("diarizen.window_samples", 16 * 16_000)
     writer.add_uint32("diarizen.window_step_samples", 16 * 1_600)

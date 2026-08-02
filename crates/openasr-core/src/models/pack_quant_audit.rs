@@ -312,6 +312,7 @@ pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<Audi
         // encoder in the ASR-floor sense.
         crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE => Rule::NoAudioEncoder,
         crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID => Rule::NoAudioEncoder,
+        crate::diarize::segment::DIARIZEN_GGML_ARCHITECTURE_ID => Rule::NoAudioEncoder,
         crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE => {
             Rule::NoAudioEncoder
         }

@@ -37,6 +37,32 @@ class TensorTypeTest(unittest.TestCase):
         self.assertEqual(C.normalize_quant("q8_0"), "q8_0")
 
 
+class RuntimeTensorNameTest(unittest.TestCase):
+    def test_compacts_every_long_upstream_namespace(self):
+        cases = {
+            "wavlm_model.feature_extractor.conv_layers.0.layer_norm.weight":
+                "dz.fe.conv_layers.0.layer_norm.weight",
+            "wavlm_model.encoder.feature_projection.projection.weight":
+                "dz.fp.projection.weight",
+            "wavlm_model.encoder.transformer.layers.0.feed_forward.intermediate_dense.weight":
+                "dz.tr.layers.0.feed_forward.intermediate_dense.weight",
+            "conformer.conformer_layer.0.conv.depthwise_conv.weight":
+                "dz.cf.0.conv.depthwise_conv.weight",
+            "classifier.weight": "classifier.weight",
+        }
+        for upstream, expected in cases.items():
+            with self.subTest(upstream=upstream):
+                actual = C.runtime_tensor_name(upstream)
+                self.assertEqual(actual, expected)
+                self.assertLessEqual(
+                    len(actual.encode("utf-8")), C.GGUF_MAX_TENSOR_NAME_BYTES
+                )
+
+    def test_rejects_an_unmapped_overlong_name(self):
+        with self.assertRaisesRegex(C.ConversionError, "exceeds 63 bytes"):
+            C.runtime_tensor_name("x" * 64)
+
+
 class PositionalConvFoldTest(unittest.TestCase):
     def test_fold_matches_weight_norm_dim_two(self):
         rng = np.random.default_rng(0)
@@ -79,6 +105,7 @@ class PackRoundTripTest(unittest.TestCase):
             fields = set(reader.fields)
             self.assertIn("diarizen.wavlm_config_json", fields)
             self.assertIn("diarizen.median_filter_frames", fields)
+            self.assertIn("diarizen.tensor_schema", fields)
 
 
 if __name__ == "__main__":

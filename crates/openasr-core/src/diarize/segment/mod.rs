@@ -5,6 +5,7 @@
 //! unaligned window-local activity and an aggregated speaker count: global
 //! speaker identity is reconstructed later from ReDim embeddings.
 
+mod diarizen;
 mod ops;
 mod pack;
 mod pyannet;
@@ -12,6 +13,10 @@ mod pyannet;
 #[cfg(test)]
 mod tests;
 
+pub use diarizen::{
+    DIARIZEN_GGML_ARCHITECTURE_ID, DiariZenSegmenter, DiariZenSegmenterError, DiariZenWindowOutput,
+    diarizen_pack_installed, load_diarizen_segmenter, shared_diarizen_segmenter,
+};
 pub use pack::{SEGMENTER_PACK_ID, segmenter_pack_installed, shared_segmenter};
 pub(crate) use pack::{SelectedSegmenter, resolve_segmenter};
 
