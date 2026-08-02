@@ -64,6 +64,29 @@ audio bytes -> frontend -> ggml graph -> decode -> transcript
 5. **Transcript.** Tokens become the transcript, with optional word timestamps,
    diarization labels, and the requested output format (`text`/`json`/`srt`/...).
 
+For local file Voice ID, the architecture descriptor selects exactly one source
+of recording-local speaker turns:
+
+```text
+MOSS decode speaker tokens --------------------------+
+                                                      v
+other ASR -> FireRed VAD -> segmenter -> ReDimNet -> clustering
+                                                      |
+                                                      v
+                       shared label normalization -> identity evidence/match
+                                                      |
+                                                      v
+                                           transcript attribution
+```
+
+MOSS is the only built-in family whose speaker segmentation is `InDecoder`;
+every other family declares `External` and reuses the shared pipeline. ReDimNet
+is still required on both routes because native speaker turns answer "who spoke
+when", while the shared identity stage answers whether that voice matches an
+enrolled person. segmentation-3.0 is the permissive default segmenter. The
+optional DiariZen provider is isolated behind the same local-activity interface;
+its CC BY-NC 4.0 pack is staged but not published.
+
 The whole path is **fail-closed by stage**: each step (pack path, metadata,
 tensor index, encoder binding, encoder graph, tokenizer, decoder binding,
 decoder graph, decode, text) returns a typed error rather than fabricating
@@ -91,8 +114,9 @@ Adding or reading a family means understanding two directories under
   `models/cohere/`, `models/parakeet_ctc/`, `models/parakeet_tdt/`,
   `models/wav2vec2_ctc/`,
   `models/moonshine/`, `models/dolphin/`, `models/sensevoice/`,
-`models/firered_aed/`, `models/xasr_zipformer/`, plus the
-  diarization capability packs under `diarize/embed/` and `models/pyannote/`) that
+  `models/firered_aed/`, `models/xasr_zipformer/`, plus the
+  diarization capability packs under `diarize/{embed,segment}/` and
+  `models/pyannote/`) that
   assembles those blocks into a graph and owns family-specific tensor binding,
   frontend, decode, and local-source import.
 

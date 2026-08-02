@@ -10,12 +10,13 @@
 # API-only and not part of this pack. Re-verify against upstream if the
 # checkpoint changes.
 
-tagline = "Joint transcription and speaker diarization in a single 0.9B-parameter model — know who said what, and when"
+tagline = "Joint transcription and in-decoder speaker diarization in one 0.9B-parameter model"
 
 highlights = [
-  "🎯 **Transcription + speaker identification in one pass** — a single inference run produces both the transcript and per-speaker timestamps, no separate pipeline needed",
+  "🎯 **Transcription + anonymous speaker turns in one decode** — one inference run emits text, recording-local speaker labels, and timestamps without the external segmenter/clusterer",
+  "🧬 **Shared Voice ID after decode** — naming an enrolled person still uses OpenASR's ReDimNet2-B6 evidence and identity stage; native diarization is not a persistent identity database",
   "📊 **Verified accuracy: 2.52% CER (Chinese), 2.23% WER (English)** — benchmarked by OpenASR on frozen evaluation datasets, not upstream-reported numbers",
-  "🌐 **Chinese and English first, 15+ additional languages** — optimized for Mandarin and English with broad multilingual coverage built in",
+  "🌐 **15 cataloged languages** — Mandarin plus 14 languages named by upstream, including English",
   "📦 **Three quantization tiers: fp16 / q8_0 / q4_k** — delivered in OpenASR's native .oasr format for CPU inference, choose the precision-to-size tradeoff that fits your hardware",
 ]
 
@@ -23,10 +24,12 @@ intro = """
 MOSS-Transcribe-Diarize is a 0.9B-parameter joint speech-recognition and speaker-diarization
 model from the OpenMOSS team. Its architecture pairs a Whisper-Medium-scale audio encoder with a
 lightweight MLP/LayerNorm adapter feeding into a Qwen3-0.6B-scale decoder, enabling the model to
-transcribe speech and attribute each segment to its speaker with start/end timestamps in a single
-forward pass. Language coverage centers on Chinese and English, with support for 15 additional
-languages. OpenASR distributes this model in three quantization tiers -- fp16, q8_0, and q4_k --
-packaged in the native `.oasr` runtime format for CPU-based local inference.
+transcribe speech and attribute each segment to a recording-local speaker with start/end timestamps
+in a single forward pass. This native speaker source replaces the external segmenter and clusterer,
+but Voice ID naming still runs through the shared ReDimNet2-B6 evidence/matching stage. The catalog
+lists Mandarin plus the 14 additional languages named by upstream. OpenASR distributes this model in
+three quantization tiers -- fp16, q8_0, and q4_k -- packaged in the native `.oasr` runtime format for
+CPU-based local inference.
 """
 
 acknowledgement = """
@@ -40,12 +43,13 @@ to the OpenMOSS team for releasing their work openly.
 """
 
 [prose_locales."zh-CN"]
-tagline = "转写文字的同时自动分清是谁在说话——0.9B 参数，一次推理全搞定"
+tagline = "0.9B 参数，一次解码同时完成转写和录音内说话人分离"
 
 highlights = [
-  "🎯 **转写和区分讲话人一步到位** — 跑一次就能同时出文字、标出是谁在说话以及每段话的起止时间，不需要拼接多个工具",
+  "🎯 **一次解码同时得到文字和匿名说话人片段** — 直接输出本次录音内的说话人编号和起止时间，不需要外部分割与聚类",
+  "🧬 **身份匹配仍走统一 Voice ID** — 要把匿名编号认成已登记的人，仍使用 OpenASR 共用的 ReDimNet2-B6 证据与身份层；内置分离不等于跨录音身份库",
   "📊 **实测精度：中文字错率 2.52%，英文词错率 2.23%** — 由 OpenASR 在固定评测集上实测，不是上游自报数据",
-  "🌐 **中英文为主，另外覆盖 15 种语言** — 针对普通话和英文做了重点优化，同时内置多语言支持",
+  "🌐 **目录明确列出 15 种语言** — 包含普通话，以及上游点名的英文等 14 种语言",
   "📦 **fp16 / q8_0 / q4_k 三档量化可选** — 使用 OpenASR 原生 .oasr 格式，CPU 本地推理，按自己的硬件条件选择精度和体积的平衡点",
 ]
-source_sha256 = "cb8630bfe7bcf00f5d5ce423a7b334176fff7760930d6c142dada5f89ff74ae2"
+source_sha256 = "56fcbbfff468fae5fed2c7f7bbcf0b8090da9a94792ffd5c8031ae79f3c1496d"

@@ -99,19 +99,33 @@ packs and public product guarantees are still pending — see
 
 ## Is diarization available?
 
-Yes, opt-in via `--diarize` (and the API `diarize` flag). It uses the
-ReDimNet2-B6 speaker-embedding pack (ggml-graph `.oasr`) and the optional
-pyannote segmentation capability pack (pulled or
-installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any model's
-transcript; without the required ReDimNet2-B6 pack the request fails closed rather
-than fabricating speakers.
+Yes. For local file transcription, `--diarize` (and the API `diarize` flag)
+enables the complete Voice ID path: first determine who spoke when, then match
+enough clean evidence against the local person library. The speaker source is
+selected by the ASR architecture rather than by a model-id allowlist:
 
-Cross-file speaker identity -- naming the same person consistently across
-separate recordings, rather than a fresh `SPEAKER_NN` number each time -- is a
-separate, opt-in system called Voice ID, exposed through the operator-only
-`/v1/voice-id/*` API (`crates/openasr-server/src/routes/voice_id.rs`): person
-and sample CRUD, consent revoke, and metadata export. Enrolling a person
-requires at least 10 seconds of clean speech per registered sample
+- `moss-transcribe-diarize` supplies recording-local speaker turns from its own
+  decoder.
+- Every other ASR family uses the shared recording-level pipeline: FireRed
+  Stream-VAD, segmentation-3.0, ReDimNet2-B6 embeddings, automatic AHC/spectral
+  clustering, and overlap-aware reconstruction.
+
+Both routes still require the ReDimNet2-B6 capability pack: MOSS removes the
+external segmentation/clustering step, not the acoustic identity step. Missing
+or broken required packs fail closed instead of fabricating speakers or silently
+falling back to a different embedding space.
+
+segmentation-3.0 is the permissive default external segmenter. DiariZen Base-s80
+is a higher-accuracy optional provider whose checkpoint is CC BY-NC 4.0; it is
+staged for an explicit non-commercial consent flow but is not currently present
+in the downloadable catalog. The candidate pack is fp16-only and q8 remains
+deferred. Do not interpret the staged source metadata as an available
+`openasr pull` target.
+
+The operator-only `/v1/voice-id/*` API
+(`crates/openasr-server/src/routes/voice_id.rs`) manages people and samples,
+consent revocation, and metadata export. Enrolling a person requires at least
+10 seconds of clean speech per registered sample
 (`MIN_SAMPLE_SPEECH_SECONDS`,
 `crates/openasr-core/src/diarize/voice_id/quality.rs`); once a person is
 enrolled, automatically naming an anonymous `SPEAKER_NN` label to that person
@@ -122,6 +136,11 @@ person speaking uninterrupted in one turn to clear naming's evidence gate
 enrolled, or whose evidence falls short of that gate, simply keeps a
 session-relative `SPEAKER_NN` number -- Voice ID never fabricates an identity
 match.
+
+This universal identity contract is qualified for local file transcription.
+Realtime and remote-compute diarization use separate API and privacy contracts;
+their lower-level speaker fields do not establish the same cross-recording
+identity guarantee.
 
 OpenASR does not perform source/audio separation (isolating vocals from
 background music or noise, the way Demucs or similar stem-splitting tools do).

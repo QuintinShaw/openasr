@@ -72,28 +72,29 @@ the binary, so no network is required to view the model list.
 Diarization is privacy-by-default: it answers "who spoke when", not "who is this
 named person".
 
-- Labels are anonymous and session-relative (`SPEAKER_00/01`, ...). Speaker
-  embeddings are used only within a session and are not persisted as a
-  cross-file identity.
-- Identity is opt-in and stays on the device. Two optional, off-by-default
-  features build on the anonymous labels: a single enrolled primary user (an
-  on-device centroid that relabels one cluster `SPEAKER_ME`), and Voice ID
-  (enrolled voiceprints for one or more named people, used to keep a person's
-  label consistent across turns and files). Enrolled voiceprints and their
+- Labels are anonymous and session-relative (`SPEAKER_00/01`, ...) until a
+  speaker has enough evidence to match an explicitly enrolled local person.
+  Temporary recording-level embeddings are not persisted as identities.
+- Identity enrollment is opt-in, and the person library stays on the device.
+  Voice ID stores enrolled voiceprints for named people so a person's label can
+  remain consistent across turns and later local file transcriptions. Enrolled voiceprints and their
   samples are persisted only in a local SQLite database under
   `$OPENASR_HOME/diarize/` -- never committed, uploaded, or attached to
   transcription output. All Voice ID reads and writes go through the
   operator-only HTTP surface (`/v1/voice-id/*`, gated by `is_operator_only_path`),
   so a paired remote-compute client can never read or write the voiceprint store.
-- Remote-compute contract: the server runs VAD/diarization/ASR and returns only
-  anonymous labels. It never receives or stores an enrolled voiceprint; the
-  anonymous-to-identity mapping (`SPEAKER_ME` or a named Voice ID person) happens
-  on the client. The voiceprint never leaves the device, even in remote mode.
-- Bundled diarization weights are license-clean only (FireRedVAD Stream-VAD
-  Apache-2.0, pyannote-segmentation-3.0 MIT, ReDimNet2-B6 MIT with
-  attribution).
-  Non-permissive models (e.g. NVIDIA Sortformer, CC-BY-NC) are never bundled and
-  are reachable only through an explicit `openasr pull` with a license link-out.
+- Surface boundary: operator-only routing prevents non-operator clients from
+  reading or mutating the local person library, but that CRUD boundary alone is
+  not proof that a transcription/realtime response is anonymous. Any surface
+  advertised as anonymous must separately disable identity matching and strip
+  `speaker_person_id`/named labels at its response boundary; the universal
+  Voice ID contract documented here is qualified for local file transcription.
+- The default local pipeline uses FireRedVAD Stream-VAD (Apache-2.0),
+  pyannote-segmentation-3.0 (MIT), and ReDimNet2-B6 (MIT), with attribution.
+  DiariZen Base-s80 weights are CC BY-NC 4.0: they are not bundled and no
+  DiariZen artifact is currently exposed in either signed catalog. Any future
+  distribution must be an explicit, license-linked non-commercial consent flow;
+  staged source metadata alone never authorizes a download.
 
 ### Transcription history
 

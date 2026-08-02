@@ -77,13 +77,18 @@ credits the people who built the original.
 
 **Speaker diarization**
 
-- pyannote segmentation — <https://huggingface.co/OpenASR/pyannote-segmentation-3.0>
-- ReDimNet2-B6 speaker embedder — <https://huggingface.co/OpenASR/redimnet2-b6-cn>
-- ReDimNet2-B6 speaker embedder (PalabraAI, MIT) —
+- pyannote segmentation-3.0 (pyannote.audio, MIT) --
+  <https://huggingface.co/OpenASR/pyannote-segmentation-3.0> (default
+  overlap-aware speaker segmenter; source weights come from the pinned
+  onnx-community mirror).
+- ReDimNet2-B6 speaker embedder (PalabraAI, MIT) --
   <https://huggingface.co/OpenASR/redimnet2-b6-cn> (192-d ggml-graph embedder
   from the upstream `b6-vb2+vox2+cnc2_v0-lm.pt` checkpoint;
   <https://github.com/PalabraAI/redimnet2>).
-- FireRedVAD Stream-VAD (FireRedTeam, Apache-2.0) — the sole voice-activity
+- DiariZen Base-s80 (BUT Speech@FIT, CC BY-NC 4.0 weights) --
+  <https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md> (evaluated as an
+  optional segmenter; OpenASR has not published or made this pack downloadable).
+- FireRedVAD Stream-VAD (FireRedTeam, Apache-2.0) -- the voice-activity
   detection engine, backing realtime endpointing, long-form speech slicing, and
   diarization — see [NOTICE](NOTICE).
 - The BUT Speech@FIT PLDA parameters (via the pyannote community bundle) power

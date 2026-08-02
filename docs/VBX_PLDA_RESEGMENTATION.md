@@ -30,8 +30,8 @@ The pass is intentionally conservative:
 - only 192-dimensional ReDimNet2-B6 embeddings are eligible;
 - only context-rich, dense files with clear AHC oversegmentation enter the pass;
 - cannot-link constraints from simultaneous pyannote regions are preserved;
-- short files, the real-time path, and CAM++ fallback diarization keep the
-  previous AHC behavior.
+- short files, the realtime path, and recordings outside the dense-refinement
+  gate keep the ordinary automatic-clustering behavior.
 
 The default pass enables PLDA-constrained state merging and PLDA mixture
 resegmentation over 1.5s windows with a 0.25s shift across the speech mask. Long

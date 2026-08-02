@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-02T08:03:39+00:00",
+  "generated_at": "2026-08-02T20:37:07+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1060,14 +1060,15 @@
       "recommended_quant": "q8_0",
       "pull_recommended": "moss-transcribe-diarize:q8",
       "prose": {
-        "tagline": "Joint transcription and speaker diarization in a single 0.9B-parameter model \u2014 know who said what, and when",
+        "tagline": "Joint transcription and in-decoder speaker diarization in one 0.9B-parameter model",
         "overview": [
-          "MOSS-Transcribe-Diarize is a 0.9B-parameter joint speech-recognition and speaker-diarization\nmodel from the OpenMOSS team. Its architecture pairs a Whisper-Medium-scale audio encoder with a\nlightweight MLP/LayerNorm adapter feeding into a Qwen3-0.6B-scale decoder, enabling the model to\ntranscribe speech and attribute each segment to its speaker with start/end timestamps in a single\nforward pass. Language coverage centers on Chinese and English, with support for 15 additional\nlanguages. OpenASR distributes this model in three quantization tiers -- fp16, q8_0, and q4_k --\npackaged in the native `.oasr` runtime format for CPU-based local inference."
+          "MOSS-Transcribe-Diarize is a 0.9B-parameter joint speech-recognition and speaker-diarization\nmodel from the OpenMOSS team. Its architecture pairs a Whisper-Medium-scale audio encoder with a\nlightweight MLP/LayerNorm adapter feeding into a Qwen3-0.6B-scale decoder, enabling the model to\ntranscribe speech and attribute each segment to a recording-local speaker with start/end timestamps\nin a single forward pass. This native speaker source replaces the external segmenter and clusterer,\nbut Voice ID naming still runs through the shared ReDimNet2-B6 evidence/matching stage. The catalog\nlists Mandarin plus the 14 additional languages named by upstream. OpenASR distributes this model in\nthree quantization tiers -- fp16, q8_0, and q4_k -- packaged in the native `.oasr` runtime format for\nCPU-based local inference."
         ],
         "highlights": [
-          "\ud83c\udfaf **Transcription + speaker identification in one pass** \u2014 a single inference run produces both the transcript and per-speaker timestamps, no separate pipeline needed",
+          "\ud83c\udfaf **Transcription + anonymous speaker turns in one decode** \u2014 one inference run emits text, recording-local speaker labels, and timestamps without the external segmenter/clusterer",
+          "\ud83e\uddec **Shared Voice ID after decode** \u2014 naming an enrolled person still uses OpenASR's ReDimNet2-B6 evidence and identity stage; native diarization is not a persistent identity database",
           "\ud83d\udcca **Verified accuracy: 2.52% CER (Chinese), 2.23% WER (English)** \u2014 benchmarked by OpenASR on frozen evaluation datasets, not upstream-reported numbers",
-          "\ud83c\udf10 **Chinese and English first, 15+ additional languages** \u2014 optimized for Mandarin and English with broad multilingual coverage built in",
+          "\ud83c\udf10 **15 cataloged languages** \u2014 Mandarin plus 14 languages named by upstream, including English",
           "\ud83d\udce6 **Three quantization tiers: fp16 / q8_0 / q4_k** \u2014 delivered in OpenASR's native .oasr format for CPU inference, choose the precision-to-size tradeoff that fits your hardware"
         ]
       },
@@ -1122,20 +1123,21 @@
         }
       ],
       "language_mode": "detect_implicit",
+      "speaker_source": "native",
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u8f6c\u5199\u6587\u5b57\u7684\u540c\u65f6\u81ea\u52a8\u5206\u6e05\u662f\u8c01\u5728\u8bf4\u8bdd\u2014\u20140.9B \u53c2\u6570\uff0c\u4e00\u6b21\u63a8\u7406\u5168\u641e\u5b9a",
+          "tagline": "0.9B \u53c2\u6570\uff0c\u4e00\u6b21\u89e3\u7801\u540c\u65f6\u5b8c\u6210\u8f6c\u5199\u548c\u5f55\u97f3\u5185\u8bf4\u8bdd\u4eba\u5206\u79bb",
           "highlights": [
-            "\ud83c\udfaf **\u8f6c\u5199\u548c\u533a\u5206\u8bb2\u8bdd\u4eba\u4e00\u6b65\u5230\u4f4d** \u2014 \u8dd1\u4e00\u6b21\u5c31\u80fd\u540c\u65f6\u51fa\u6587\u5b57\u3001\u6807\u51fa\u662f\u8c01\u5728\u8bf4\u8bdd\u4ee5\u53ca\u6bcf\u6bb5\u8bdd\u7684\u8d77\u6b62\u65f6\u95f4\uff0c\u4e0d\u9700\u8981\u62fc\u63a5\u591a\u4e2a\u5de5\u5177",
+            "\ud83c\udfaf **\u4e00\u6b21\u89e3\u7801\u540c\u65f6\u5f97\u5230\u6587\u5b57\u548c\u533f\u540d\u8bf4\u8bdd\u4eba\u7247\u6bb5** \u2014 \u76f4\u63a5\u8f93\u51fa\u672c\u6b21\u5f55\u97f3\u5185\u7684\u8bf4\u8bdd\u4eba\u7f16\u53f7\u548c\u8d77\u6b62\u65f6\u95f4\uff0c\u4e0d\u9700\u8981\u5916\u90e8\u5206\u5272\u4e0e\u805a\u7c7b",
+            "\ud83e\uddec **\u8eab\u4efd\u5339\u914d\u4ecd\u8d70\u7edf\u4e00 Voice ID** \u2014 \u8981\u628a\u533f\u540d\u7f16\u53f7\u8ba4\u6210\u5df2\u767b\u8bb0\u7684\u4eba\uff0c\u4ecd\u4f7f\u7528 OpenASR \u5171\u7528\u7684 ReDimNet2-B6 \u8bc1\u636e\u4e0e\u8eab\u4efd\u5c42\uff1b\u5185\u7f6e\u5206\u79bb\u4e0d\u7b49\u4e8e\u8de8\u5f55\u97f3\u8eab\u4efd\u5e93",
             "\ud83d\udcca **\u5b9e\u6d4b\u7cbe\u5ea6\uff1a\u4e2d\u6587\u5b57\u9519\u7387 2.52%\uff0c\u82f1\u6587\u8bcd\u9519\u7387 2.23%** \u2014 \u7531 OpenASR \u5728\u56fa\u5b9a\u8bc4\u6d4b\u96c6\u4e0a\u5b9e\u6d4b\uff0c\u4e0d\u662f\u4e0a\u6e38\u81ea\u62a5\u6570\u636e",
-            "\ud83c\udf10 **\u4e2d\u82f1\u6587\u4e3a\u4e3b\uff0c\u53e6\u5916\u8986\u76d6 15 \u79cd\u8bed\u8a00** \u2014 \u9488\u5bf9\u666e\u901a\u8bdd\u548c\u82f1\u6587\u505a\u4e86\u91cd\u70b9\u4f18\u5316\uff0c\u540c\u65f6\u5185\u7f6e\u591a\u8bed\u8a00\u652f\u6301",
+            "\ud83c\udf10 **\u76ee\u5f55\u660e\u786e\u5217\u51fa 15 \u79cd\u8bed\u8a00** \u2014 \u5305\u542b\u666e\u901a\u8bdd\uff0c\u4ee5\u53ca\u4e0a\u6e38\u70b9\u540d\u7684\u82f1\u6587\u7b49 14 \u79cd\u8bed\u8a00",
             "\ud83d\udce6 **fp16 / q8_0 / q4_k \u4e09\u6863\u91cf\u5316\u53ef\u9009** \u2014 \u4f7f\u7528 OpenASR \u539f\u751f .oasr \u683c\u5f0f\uff0cCPU \u672c\u5730\u63a8\u7406\uff0c\u6309\u81ea\u5df1\u7684\u786c\u4ef6\u6761\u4ef6\u9009\u62e9\u7cbe\u5ea6\u548c\u4f53\u79ef\u7684\u5e73\u8861\u70b9"
           ]
         }
       },
       "upstream_release_date": "2026-07-09",
-      "min_core_version": "0.1.24",
-      "speaker_source": "native"
+      "min_core_version": "0.1.24"
     },
     {
       "id": "dolphin-base",
@@ -1732,14 +1734,14 @@
       "recommended_quant": "fp16",
       "pull_recommended": "redimnet2-b6-cn:fp16",
       "prose": {
-        "tagline": "ReDimNet2-B6 speaker embedder for OpenASR diarization \u2014 192-d CN-enhanced embeddings, fully on-device",
+        "tagline": "ReDimNet2-B6 \u2014 the shared 192-d speaker embedding and Voice ID space for every OpenASR model",
         "overview": [
-          "ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the\nReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and\nChinese speakers share one embedding space. OpenASR packages the MIT-licensed\ncheckpoint as a local `.oasr` capability pack and runs it through a ggml graph\n(not a pure-Rust hand-written forward). This is the only supported speaker-embedding\nstage for diarization and Voice ID: when the pack is missing, diarize/Voice ID\nrequests fail closed rather than falling back to another embedder. Embeddings are\n192-d cosine vectors with a ReDimNet-specific calibration profile."
+          "ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the\nReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and\nChinese speakers share one embedding space. OpenASR packages the MIT-licensed\ncheckpoint as a local fp16 `.oasr` capability pack and runs it through a ggml\ngraph (not a pure-Rust hand-written forward). It is the only supported speaker\nembedding and identity space: the shared external diarizer uses it for clustering,\nand every Voice ID route -- including MOSS's native speaker turns -- uses it for\nevidence and enrolled-person matching. Missing or broken packs fail closed rather\nthan changing embedding spaces or fabricating an identity. Embeddings are 192-d\ncosine vectors with a ReDimNet-specific calibration profile."
         ],
         "highlights": [
-          "\ud83d\udde3\ufe0f **OpenASR speaker embedder** \u2014 the only supported speaker-embedding pack for diarization and Voice ID; required for anonymous speaker labels on any ASR family",
+          "\ud83d\udde3\ufe0f **One Voice ID space for every ASR model** \u2014 clusters external speaker turns and matches enrolled people; MOSS keeps its native turns but uses the same identity stage",
           "\ud83e\uddec **192-dim ReDimNet2-B6** \u2014 PalabraAI's dimension-reshaping speaker net (12.5M params) with a Chinese-enhanced vb2+vox2+cnc2 training mix",
-          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
+          "\ud83d\udd12 **Local and explicit identity** \u2014 unknown voices keep anonymous session-relative labels; only explicitly enrolled profiles persist for future local file transcriptions",
           "\ud83c\udfaf **Parity-gated packaging** \u2014 ggml-graph forward pass matches the upstream Python reference at cosine \u2265 0.9999 on held-out fixtures",
           "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models"
         ]
@@ -1764,11 +1766,11 @@
       ],
       "prose_locales": {
         "zh-CN": {
-          "tagline": "ReDimNet2-B6 \u8bf4\u8bdd\u4eba\u58f0\u7eb9\u6a21\u578b\uff0c\u670d\u52a1\u4e8e OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb \u2014 192 \u7ef4\u4e2d\u82f1\u589e\u5f3a\u58f0\u7eb9\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
+          "tagline": "ReDimNet2-B6\uff1a\u6240\u6709 OpenASR \u6a21\u578b\u5171\u7528\u7684 192 \u7ef4\u8bf4\u8bdd\u4eba\u58f0\u7eb9\u4e0e Voice ID \u7a7a\u95f4",
           "highlights": [
-            "\ud83d\udde3\ufe0f **OpenASR \u58f0\u7eb9\u6a21\u578b** \u2014 \u8bf4\u8bdd\u4eba\u5206\u79bb\u4e0e Voice ID \u552f\u4e00\u652f\u6301\u7684\u58f0\u7eb9\u5305\uff1b\u7f3a\u5931\u65f6\u4f1a\u660e\u786e\u5931\u8d25\uff0c\u4e0d\u4f1a\u9759\u9ed8\u964d\u7ea7",
+            "\ud83d\udde3\ufe0f **\u6240\u6709\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u5171\u7528\u4e00\u5957 Voice ID** \u2014 \u4e3a\u5916\u90e8\u5206\u79bb\u7ed3\u679c\u805a\u7c7b\u5e76\u5339\u914d\u5df2\u767b\u8bb0\u7684\u4eba\uff1bMOSS \u4fdd\u7559\u5185\u7f6e\u5206\u79bb\uff0c\u4f46\u8eab\u4efd\u5339\u914d\u4ecd\u8d70\u540c\u4e00\u5c42",
             "\ud83e\uddec **192 \u7ef4 ReDimNet2-B6** \u2014 \u6765\u81ea PalabraAI \u7684\u7ef4\u5ea6\u91cd\u5851\u58f0\u7eb9\u7f51\u7edc\uff08\u7ea6 12.5M \u53c2\u6570\uff09\uff0c\u7528\u542b vb2+vox2+cnc2 \u7684\u4e2d\u82f1\u6df7\u5408\u6570\u636e\u8bad\u7ec3",
-            "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u58f0\u7eb9\u6570\u636e\u7559\u5728\u672c\u5730\u4e14\u7528\u5b8c\u5373\u5220\uff0c\u9664\u975e\u4f60\u4e3b\u52a8\u6ce8\u518c\u672c\u5730\u6863\u6848",
+            "\ud83d\udd12 **\u8eab\u4efd\u8bc6\u522b\u7559\u5728\u672c\u5730\u4e14\u5fc5\u987b\u4e3b\u52a8\u767b\u8bb0** \u2014 \u964c\u751f\u4eba\u53ea\u663e\u793a\u672c\u6b21\u5f55\u97f3\u5185\u7684\u533f\u540d\u7f16\u53f7\uff1b\u53ea\u6709\u4e3b\u52a8\u767b\u8bb0\u7684\u58f0\u7eb9\u624d\u4f1a\u7559\u7ed9\u540e\u7eed\u672c\u5730\u6587\u4ef6\u8f6c\u5199\u4f7f\u7528",
             "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 ggml \u8ba1\u7b97\u56fe\u524d\u5411\u4e0e\u4e0a\u6e38 Python \u53c2\u8003\u5b9e\u73b0\u5728\u56fa\u5b9a\u6837\u672c\u4e0a\u7684\u4f59\u5f26\u76f8\u4f3c\u5ea6 \u2265 0.9999",
             "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700 Python\uff0c\u4e0e\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u5171\u7528\u540c\u4e00\u5957\u4e0b\u8f7d\u548c\u5b89\u88c5\u6d41\u7a0b"
           ]
@@ -2569,16 +2571,16 @@
       "recommended_quant": "f32",
       "pull_recommended": "pyannote-segmentation-3.0:f32",
       "prose": {
-        "tagline": "pyannote segmentation-3.0 \u2014 speaker-change and overlap aware speech segmentation for OpenASR diarization",
+        "tagline": "pyannote segmentation-3.0 \u2014 OpenASR's default permissive speaker-change and overlap segmenter",
         "overview": [
-          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the ReDimNet2-B6 embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
+          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that tracks three local speaker slots in each 10 s window, with no more than two active\nsimultaneously -- including overlapped speech. OpenASR uses it as the default permissive segmenter in the\nmodel-independent file Voice ID pipeline for ASR families without native speaker\nturns. Its local activity is combined with FireRed Stream-VAD; ReDimNet2-B6 then\nembeds speech windows for automatic clustering and overlap-aware reconstruction.\nWeights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
         ],
         "highlights": [
-          "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
-          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the ReDimNet2-B6 embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
+          "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) tracks 3 local speaker slots and scores at most 2 as active at once, including overlapped speech",
+          "\ud83e\udd1d **Default external Voice ID segmenter** \u2014 combines with FireRed Stream-VAD, ReDimNet2-B6 and automatic clustering for ASR models without native speaker turns",
           "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; nothing leaves the machine",
           "\ud83c\udfaf **Bit-exact packaging** \u2014 single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "\ud83e\udd80 **Native in OpenASR** \u2014 the raw-f32 `.oasr` pack runs through the pure-Rust CPU inference path with no Python at runtime"
         ]
       },
       "quants": [
@@ -2601,13 +2603,13 @@
       ],
       "prose_locales": {
         "zh-CN": {
-          "tagline": "pyannote segmentation-3.0 \u2014 \u80fd\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u548c\u591a\u4eba\u91cd\u53e0\u7684\u8bed\u97f3\u5206\u5272\u6a21\u578b\uff0c\u4e3a OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb\u800c\u751f",
+          "tagline": "pyannote segmentation-3.0\uff1aOpenASR \u9ed8\u8ba4\u4f7f\u7528\u7684\u5bbd\u677e\u8bb8\u53ef\u8bf4\u8bdd\u4eba\u5207\u6362\u4e0e\u91cd\u53e0\u5206\u5272\u6a21\u578b",
           "highlights": [
-            "\u2702\ufe0f **\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u7684\u5206\u5272** \u2014 \u6700\u591a\u53ef\u540c\u65f6\u68c0\u6d4b 3 \u4f4d\u8bf4\u8bdd\u4eba\uff0c\u5305\u62ec\u591a\u4eba\u91cd\u53e0\u8bf4\u8bdd\u7684\u573a\u666f",
-            "\ud83e\udd1d **\u63d0\u5347 `--diarize` \u5206\u79bb\u6548\u679c** \u2014 \u642d\u914d ReDimNet2-B6 \u58f0\u7eb9\u6a21\u578b\u4e00\u8d77\u5b89\u88c5\uff0c\u7528\u7cbe\u7ec6\u7684\u8bf4\u8bdd\u4eba\u5207\u6362\u8fb9\u754c\u66ff\u4ee3\u7c97\u7565\u7684\u8bed\u97f3\u7247\u6bb5\u5212\u5206",
+            "\u2702\ufe0f **\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u7684\u5206\u5272** \u2014 \u6bcf\u4e2a\u7a97\u53e3\u8ddf\u8e2a 3 \u4e2a\u5c40\u90e8\u8bf4\u8bdd\u4eba\u69fd\u4f4d\uff0c\u4f46\u540c\u4e00\u65f6\u523b\u6700\u591a\u5224\u5b9a 2 \u4eba\u53d1\u8a00\uff0c\u53ef\u5904\u7406\u53cc\u4eba\u91cd\u53e0",
+            "\ud83e\udd1d **\u5916\u90e8 Voice ID \u7ba1\u7ebf\u7684\u9ed8\u8ba4\u5206\u5272\u6a21\u578b** \u2014 \u4e0e FireRed Stream-VAD\u3001ReDimNet2-B6 \u548c\u81ea\u52a8\u805a\u7c7b\u914d\u5408\uff0c\u4e3a\u6ca1\u6709\u5185\u7f6e\u8bf4\u8bdd\u4eba\u5206\u79bb\u7684\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u8865\u9f50\u80fd\u529b",
             "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u6240\u6709\u6570\u636e\u90fd\u7559\u5728\u4f60\u7684\u7535\u8111\u4e0a",
             "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff0c\u7eaf Rust \u8ba1\u7b97\u4e0e\u4e0a\u6e38\u539f\u7248\u8f93\u51fa\u9ad8\u5ea6\u4e00\u81f4\uff08\u6700\u5927\u7edd\u5bf9\u8bef\u5dee ~7e-5\uff09",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 raw-f32 `.oasr` \u5305\u8d70\u7eaf Rust CPU \u63a8\u7406\uff0c\u8fd0\u884c\u65f6\u4e0d\u9700\u8981 Python"
           ]
         }
       },

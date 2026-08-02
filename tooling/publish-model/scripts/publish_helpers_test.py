@@ -19,10 +19,10 @@ from _file_loaders import load_toml
 
 
 EXPECTED_CAPABILITY_PACKS = {
+    "diarizen-base-s80": "speaker-segmenter",
     "firered-punc": "punctuation-restorer",
     "pyannote-segmentation-3.0": "speaker-segmenter",
     "qwen3-forced-aligner-0.6b": "forced-aligner",
-    "redimnet2-b6-cn": "speaker-embedder",
     "redimnet2-b6-cn": "speaker-embedder",
 }
 # Capability-pack feature per model: most existing packs serve
@@ -30,10 +30,10 @@ EXPECTED_CAPABILITY_PACKS = {
 # word-timestamps feature (see registry.rs CATALOG_FEATURE_WORD_TIMESTAMPS) and
 # firered-punc serves the punctuation feature (CATALOG_FEATURE_PUNCTUATION).
 EXPECTED_CAPABILITY_FEATURES = {
+    "diarizen-base-s80": "speaker-diarization",
     "firered-punc": "punctuation",
     "pyannote-segmentation-3.0": "speaker-diarization",
     "qwen3-forced-aligner-0.6b": "word-timestamps",
-    "redimnet2-b6-cn": "speaker-diarization",
     "redimnet2-b6-cn": "speaker-diarization",
 }
 EXPECTED_TRANSLATION_MODELS = {

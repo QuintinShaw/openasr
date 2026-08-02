@@ -24,20 +24,29 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   every other family re-decodes a growing window (may revise partials, FINAL is
   byte-identical to offline). Official published packs with public product
   guarantees are still pending.
-- Speaker diarization is opt-in (`--diarize` / the API `diarize` flag). It uses
-  the ReDimNet2-B6 speaker-embedding pack and optional pyannote segmentation
-  capability packs (pulled/installed on demand) to attribute anonymous `SPEAKER_NN`
-  labels onto any model's transcript; without ReDimNet2-B6 installed, diarize fails
-  closed. Cohere packs that declare
-  `openasr.features.diarization=cohere-token-stream-v1` can additionally emit
-  inline speaker tokens. Without the required capability pack a diarize request
-  fails closed rather than fabricating speaker labels. Labels are session-relative
-  (`SPEAKER_00/01`, ...) unless the speaker has been enrolled through the opt-in,
-  operator-only Voice ID system (`/v1/voice-id/*`; see [FAQ.md](FAQ.md#is-diarization-available)
-  for enrollment/naming requirements); an unenrolled speaker, or one whose speech
-  falls short of Voice ID's naming evidence gate, still only gets a
-  session-relative number. See [SECURITY.md](../SECURITY.md) for the diarization
-  privacy model and the remote-mode trust contract.
+- Universal Voice ID is currently a local **file-transcription** feature. MOSS
+  supplies its own speaker turns; all other ASR families use FireRed Stream-VAD,
+  a speaker segmenter, ReDimNet2-B6, automatic clustering, and overlap-aware
+  reconstruction. Both paths reuse the shared identity/evidence stage and both
+  require ReDimNet2-B6. Missing or broken required packs fail closed. This
+  universal contract is qualified for local file transcription; realtime and
+  remote-compute diarization remain separate surfaces with their own output and
+  privacy gates.
+  Labels stay session-relative (`SPEAKER_00/01`, ...) unless an enrolled person
+  clears Voice ID's evidence gates. See [FAQ.md](FAQ.md#is-diarization-available)
+  and [SECURITY.md](../SECURITY.md).
+- segmentation-3.0 is the default, MIT-licensed external segmenter. DiariZen
+  Base-s80 is staged as an optional CC BY-NC 4.0 provider, but no DiariZen pack
+  is present in the signed full/public catalogs and it is not currently an
+  `openasr pull` target. The qualified candidate is fp16-only; q8 is deferred.
+  Its 9.0481% DER result is from the locked research adapter, not yet a native
+  product-quality claim. Under the same six-file, duration-weighted protocol
+  (0.25 s collar, overlap scored), the FireRed + segmentation-3.0 research
+  adapter measured 12.4466% DER and MOSS measured 18.6787%. The native external
+  frontend now follows the same union/windowing/automatic-clustering/overlap
+  stage shape, but those locked numbers have not been reproduced through its
+  full six-file runtime path. They are therefore architecture targets, not
+  shipped product DER or a cross-domain accuracy guarantee.
 - Phrase bias / hotword boosting is implemented for the native runtime decode
   path. Requests still fail closed when the selected model tokenizer cannot
   encode a requested phrase, and the mock backend still rejects non-empty

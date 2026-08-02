@@ -63,6 +63,15 @@ also carry
 public visibility, recommended quant, and per-quant pack entries with pull
 tokens, filenames, HTTPS URLs, sha256, size, and performance metadata.
 
+Every `asr-model` also carries `speaker_source = "native" | "external"`. This is
+a signed, read-only mirror of the architecture descriptor's
+`speaker_segmentation`, not an editorial capability toggle: MOSS is `native`,
+and all other built-in ASR families are `external`. Capability and translation
+entries omit the field. The catalog generator owns the denormalization and
+`embedded_catalog_speaker_source_matches_architecture_registry` prevents a
+generated catalog from drifting from the Rust registry. Clients use the field
+to preflight Voice ID dependencies without a model-id allowlist.
+
 `public` means published/downloadable/importable. It is not the model-market
 predicate. The Rust market-list helper is `CatalogModel::is_market_listed()`,
 defined as `public && kind in {asr-model, translation-model}`; capability packs
@@ -96,6 +105,14 @@ record the Hugging Face revision in `tmp/publish/<id>/hf_revision.txt`, then run
 `tooling/publish-model/scripts/regenerate_all.sh <id>`. Do not pass `--public` or
 add `release_public = true` until the public-listing gate passes.
 
+DiariZen Base-s80 is intentionally in that source-only state. Its
+`release_public = false` row records the pinned upstream checkpoint and CC BY-NC
+4.0 license, but it has no generated local card, no full/public catalog entry,
+and no download URL or sha256. It is therefore not pullable. The current
+candidate is fp16-only; q8 is deferred. Do not invent publication metadata or
+promote it until the native quality/resource audit and the product's explicit
+non-commercial consent flow have both been approved.
+
 ## Local registry cards
 
 The local registry is the TOML card set under `model-registry/models/*.toml`. The
@@ -122,7 +139,7 @@ The same core pull engine backs three surfaces:
 - Desktop: the Models page installs through the local daemon, never from the
   webview.
 
-Pulling a `capability-pack` (e.g. `redimnet2-b6-cn:fp16`) or a
+Pulling a published `capability-pack` (e.g. `redimnet2-b6-cn:fp16`) or a
 `translation-model` does not change the default ASR model. `openasr transcribe
 --diarize` and `live --diarize` are explicit consent for the
 CLI to install a missing required `speaker-diarization` capability pack before the
@@ -134,6 +151,13 @@ fail-closed: HTTPS-only catalog pack URLs, size/sha256 checks, GGUF preflight,
 runtime-source validation, and a same-directory atomic rename are required before
 a pack counts as installed, and untrusted catalog pack filenames must be
 relative basename-only `.oasr` targets.
+
+For the local file Voice ID pipeline, ReDimNet2-B6 is required for both
+`speaker_source` values. An `external` ASR additionally needs the default
+segmentation-3.0 pack; a `native` model such as MOSS does not. A future
+consent-installed DiariZen pack may replace segmentation-3.0 behind the same
+segmenter interface, but its staged source row does not authorize any current
+CLI/server auto-install behavior.
 
 The public anonymous distribution path is exercised by
 `tooling/public-hf-e2e/run.sh` and the manual/scheduled `public-hf-e2e` workflow,

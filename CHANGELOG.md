@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Voice ID: local file transcription now has one model-independent speaker
+  pipeline. `moss-transcribe-diarize` keeps its in-decoder speaker turns; every
+  other ASR family uses the shared FireRed Stream-VAD + speaker-segmenter +
+  ReDimNet2-B6 + automatic clustering path. Both sources converge on the same
+  recording-local labels, evidence gates, enrolled-person matching, and
+  transcript attribution instead of each ASR family growing its own Voice ID
+  integration.
+- Diarization: a native DiariZen Base-s80 segmenter runtime and staged pack
+  contract are available for qualification. Its checkpoint is CC BY-NC 4.0,
+  the staged source is not in either downloadable catalog, and only an fp16
+  candidate is supported; q8 remains deferred. segmentation-3.0 stays the
+  permissive default unless a future product release explicitly offers and the
+  user consents to the optional DiariZen download.
 - Catalog: Fun-ASR-Nano (`funasr-nano`) and Granite Speech 4.1 2B (`granite-speech-4.1-2b`) are public in the signed catalog; both ship fp16 / q8_0 / q4_k packs on Hugging Face under the OpenASR namespace, with min_cli/core floor 0.1.27.
 - Core: Fun-ASR-Nano family (SAN-M/DFSMN encoder + adaptor + Qwen3-0.6B decoder; keep-quantized resident path) and Granite Speech 4.1 2B family (Conformer + Q-Former + 2B decoder; keep-quantized Metal path; decoder-context-derived 382s single-buffer `AudioTooLong` ceiling).
 - Server: `GET /v1/audio/transcriptions/{id}/progress` reports the progress of one specific file transcription. Native progress is tracked per request id instead of in a single process-wide slot, so concurrent transcriptions each report their own phase and fraction. Previously the first request to publish claimed the only writable slot and every other request's progress publish was a no-op until that owner finished.
@@ -23,6 +36,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Voice ID: ReDimNet2-B6 now embeds independent speech windows through the
+  ordered batch seam, reuses content-keyed resident runtimes, and freezes one
+  exact pack snapshot for the entire request. Parallel work preserves input
+  order and cancellation while pack replacement cannot mix embedding spaces in
+  one transcript.
 - CLI: `openasr verify` now runs the same quantization-floor audit `model-pack audit-quant` performs (the audio-encoder Q8_0 floor, plus the declared-tier ceiling) against every local pack it checks, and fails closed on a violation. A pack that previously passed `openasr verify` on tensor structure alone may no longer pass if its quantization does not meet the floor.
 - CLI: `openasr model-pack verify` now re-seals (marks read-only) any object it re-hashes and finds intact, so a store whose file permissions were lost -- for example a backup restored without them -- gets its fast, no-rehash object identity back after one verify pass.
 - Core: `pull` no longer re-hashes an already-installed, sealed pack before deciding to skip its download; it trusts the digest named by the object's own path once the seal is intact. A same-size, in-place corruption of an installed pack (bit rot, or a backup restored to the same bytes-mostly-but-not-quite state) is therefore no longer self-healed by re-running `pull` -- run `openasr model-pack verify` to detect and, once re-sealed, recover from that case instead.

@@ -3,12 +3,12 @@
 
 pipeline_tag = "feature-extraction"
 
-tagline = "ReDimNet2-B6 speaker embedder for OpenASR diarization — 192-d CN-enhanced embeddings, fully on-device"
+tagline = "ReDimNet2-B6 — the shared 192-d speaker embedding and Voice ID space for every OpenASR model"
 
 highlights = [
-  "🗣️ **OpenASR speaker embedder** — the only supported speaker-embedding pack for diarization and Voice ID; required for anonymous speaker labels on any ASR family",
+  "🗣️ **One Voice ID space for every ASR model** — clusters external speaker turns and matches enrolled people; MOSS keeps its native turns but uses the same identity stage",
   "🧬 **192-dim ReDimNet2-B6** — PalabraAI's dimension-reshaping speaker net (12.5M params) with a Chinese-enhanced vb2+vox2+cnc2 training mix",
-  "🔒 **Diarization, not identification** — anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
+  "🔒 **Local and explicit identity** — unknown voices keep anonymous session-relative labels; only explicitly enrolled profiles persist for future local file transcriptions",
   "🎯 **Parity-gated packaging** — ggml-graph forward pass matches the upstream Python reference at cosine ≥ 0.9999 on held-out fixtures",
   "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models",
 ]
@@ -17,11 +17,13 @@ intro = """
 ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the
 ReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and
 Chinese speakers share one embedding space. OpenASR packages the MIT-licensed
-checkpoint as a local `.oasr` capability pack and runs it through a ggml graph
-(not a pure-Rust hand-written forward). This is the only supported speaker-embedding
-stage for diarization and Voice ID: when the pack is missing, diarize/Voice ID
-requests fail closed rather than falling back to another embedder. Embeddings are
-192-d cosine vectors with a ReDimNet-specific calibration profile.
+checkpoint as a local fp16 `.oasr` capability pack and runs it through a ggml
+graph (not a pure-Rust hand-written forward). It is the only supported speaker
+embedding and identity space: the shared external diarizer uses it for clustering,
+and every Voice ID route -- including MOSS's native speaker turns -- uses it for
+evidence and enrolled-person matching. Missing or broken packs fail closed rather
+than changing embedding spaces or fabricating an identity. Embeddings are 192-d
+cosine vectors with a ReDimNet-specific calibration profile.
 """
 
 acknowledgement = """
@@ -35,14 +37,14 @@ being format conversion for local ggml-graph loading.
 """
 
 [prose_locales."zh-CN"]
-tagline = "ReDimNet2-B6 说话人声纹模型，服务于 OpenASR 说话人分离 — 192 维中英增强声纹，完全本地运行"
+tagline = "ReDimNet2-B6：所有 OpenASR 模型共用的 192 维说话人声纹与 Voice ID 空间"
 
 highlights = [
-  "🗣️ **OpenASR 声纹模型** — 说话人分离与 Voice ID 唯一支持的声纹包；缺失时会明确失败，不会静默降级",
+  "🗣️ **所有语音识别模型共用一套 Voice ID** — 为外部分离结果聚类并匹配已登记的人；MOSS 保留内置分离，但身份匹配仍走同一层",
   "🧬 **192 维 ReDimNet2-B6** — 来自 PalabraAI 的维度重塑声纹网络（约 12.5M 参数），用含 vb2+vox2+cnc2 的中英混合数据训练",
-  "🔒 **只分离说话人，不识别身份** — 只给匿名编号，声纹数据留在本地且用完即删，除非你主动注册本地档案",
+  "🔒 **身份识别留在本地且必须主动登记** — 陌生人只显示本次录音内的匿名编号；只有主动登记的声纹才会留给后续本地文件转写使用",
   "🎯 **精度严格校验** — ggml 计算图前向与上游 Python 参考实现在固定样本上的余弦相似度 ≥ 0.9999",
   "🦀 **OpenASR 原生运行** — `.oasr` 格式无需 Python，与语音识别模型共用同一套下载和安装流程",
 ]
 
-source_sha256 = "b10d0b09639e22624457be6cd9bbe81a774d8eed3340880f67e533e462648a78"
+source_sha256 = "24af86901b610431ff1fde2023af7ebd2dc5c08c67490aa79c71c72de4880801"

@@ -1,12 +1,11 @@
 # ReDimNet2-B6 speaker embedder (ggml)
 
-Design and bring-up plan for adding the **ReDimNet2-B6** speaker embedder
-(PalabraAI/redimnet2, MIT) as a ggml-graph model under `diarize/embed/`.
+Implemented design and validation record for the **ReDimNet2-B6** speaker
+embedder (PalabraAI/redimnet2, MIT) under `diarize/embed/`.
 B6 is a 12.46 M-param UNet-style "dimension reshaping" net that outputs a
 192-dim speaker embedding, with a Chinese-enhanced training mix (vb2+vox2+cnc2).
-It is a candidate replacement for the retired pure-Rust WeSpeaker ResNet34
-(256-dim). WeSpeaker (retired) has been fully removed; only ReDimNet2-B6 remains. Historical note: removal was originally gated behind
-full B6 validation.
+It replaced the retired pure-Rust WeSpeaker ResNet34 (256-dim) and is the sole
+speaker embedding space used by diarization and Voice ID.
 
 Reference source is the upstream `redimnet2/` Python package (checkpoint
 `b6-vb2+vox2+cnc2_v0-lm.pt`, SHA256 `287365f6...`, byte-verified against the
@@ -17,10 +16,9 @@ GitHub release digest). Spike anchors (specs, golden `.npy` dumps) live under
 
 ### 1. Delivery = GGUF `.oasr` pack + ggml graph (not pure-Rust forward)
 
-The existing WeSpeaker (retired) embedder runs a hand-written pure-Rust forward pass -- a
+The retired WeSpeaker embedder used a hand-written pure-Rust forward pass, a
 historical exception predating the ggml-only invariant. ReDimNet2 does **not**
-repeat that: it executes through a ggml `GgmlCpuGraphBuilder` graph, like every
-ASR family, fed from a `.oasr` GGUF pack.
+repeat that: it executes through a ggml graph fed from a `.oasr` GGUF pack.
 
 - **Converter**: `tooling/redimnet2/convert_redimnet2.py` (torch `.pt` -> GGUF),
   mirroring the `tooling/mimo-asr/convert_mimo_asr.py` convention (python `gguf`
@@ -71,7 +69,7 @@ against `frontend_dump/*.npy` (kernels/matrix bit-tight; staged tensors under
 the cross-impl fp32 convention: wide max / tight mean, per the firered-aed
 precedent).
 
-### 4. Backbone: per-stage hard-coded dims, staged golden pinning
+### 4. Backbone: per-stage explicit dims, golden-pinned
 
 B6 is **not** a uniform scale-up of B3; every per-stage constant (block count,
 `conv_exp`, `att_block_red`, running `c`/`f`, TCM hidden dim) is listed
@@ -79,19 +77,23 @@ explicitly in `redimnet::config::STAGES` and cross-checked against checkpoint
 tensor shapes by a unit test. The 2D<->1D reshape layout (`to1d`/`to2d`, risk
 item #1) is documented per op with its ggml dim derivation when implemented.
 
-Bring-up is staged, each step golden-pinned against `stage_dump_b6_jfk/` before
-the next: stem -> stage0..5 -> `fin_wght1d` -> head -> ASTP pool -> BN ->
-linear. See "Backbone plan" below.
+Bring-up was staged and each step is golden-pinned against
+`stage_dump_b6_jfk/`: stem -> stage0..5 -> `fin_wght1d` -> head -> ASTP pool ->
+BN -> linear. See "Validation record" below.
 
-### 5. `SpeakerEmbedder` wiring deferred until the backbone is golden-clean
+### 5. One shared embedder and identity contract
 
-The `SpeakerEmbedder` trait impl, runtime pack resolution, and a ReDimNet
-calibration profile (192-dim cosine space, distinct from `the retired WeSpeaker calibration`)
-land **after** the backbone reproduces the golden embeddings. Wiring a
-half-built forward into the fail-closed diarize dispatch would risk fabricating
-embeddings. ReDimNet2-B6 is now the sole runtime embedder. The
-`embedding_dim` (256 -> 192) and `pack_fingerprint` / embedding-space-version go
-through the existing `SpeakerEmbedderIdentity` mechanism at that point.
+The `SpeakerEmbedder` implementation, runtime pack resolver, and ReDimNet
+calibration profile are now the single embedding seam used by external speaker
+clustering and enrolled-person matching. `SpeakerEmbedderIdentity` binds the
+192-d space to the exact pack content fingerprint, so a same-path replacement
+cannot reuse enrollment data or a resident runtime from different bytes. A
+request freezes one `Arc` snapshot so clustering and naming cannot observe
+different embedding spaces halfway through a long transcription.
+
+The published capability pack is fp16-only. q8_0 did not justify a second
+public tier on this small network and remains deferred; f32 is a parity/development
+artifact rather than a distributed tier.
 
 ## Architecture reference (upstream forward)
 
@@ -137,7 +139,7 @@ along channels (2016 -> 6048) -> `linear1 (6048->128,1)` -> tanh ->
 `linear2 (128->2016,1)` -> softmax over T -> attentive mean+std -> 4032. Then
 `bn (4032)` -> `linear (4032->192)`.
 
-## Backbone plan (remaining work, each step golden-pinned)
+## Validation record
 
 Golden anchors: `tmp/redimnet2-spike/stage_dump_b6_jfk/` (jfk.wav, 176000
 samples). `00_spec_output (72,1099)`, `01..08_outputs_1d (4608,1096)` (01=stem,
@@ -145,6 +147,8 @@ samples). `00_spec_output (72,1099)`, `01..08_outputs_1d (4608,1096)` (01=stem,
 `a0_pre_pool_flattened (2016,1096)`, `a1_post_pool (4032,)`, `a2_post_bn (4032,)`,
 `a3_final_embedding (192,)`. End-to-end cosine target vs `embeddings_b6/*.npy`
 > 0.9999 for jfk/zh/en_zh.
+
+The completed stage gates are:
 
 1. **Stem** -> pin `01_outputs_1d`. Exercises conv_2d (same pad), LayerNorm
    channels-first over C, `to1d` (permute `(bs,c,f,t)->(bs,c*f,t)`), GroupNorm.
@@ -157,10 +161,26 @@ samples). `00_spec_output (72,1099)`, `01..08_outputs_1d (4608,1096)` (01=stem,
 5. **head + fin_to2d** -> pin `99_backbone_2d_output` and `a0_pre_pool_flattened`.
 6. **ASTP pool -> BN -> linear** -> pin `a1/a2/a3`, then the cosine gate.
 
-Each stage lands with a `#[ignore]` parity test (loads the f32 `.oasr` pack via
+Each stage has a `#[ignore]` parity test (loads the f32 `.oasr` pack via
 `Weights::from_oasr`, or the reference safetensors export like dolphin, runs the
 partial graph, compares against the stage's `.npy`). Tolerance: `1e-3` max abs
 per tap (cumulative f32 bound), tightened where a tap is bit-stable.
+
+## Resident execution and batching
+
+Parsed weights are shared by content id. Each worker keeps a thread-confined
+resident ggml runner, uploaded weight arena, and prepared graph for the active
+frame geometry; changing geometry or a poisoned compute rebuilds only the graph.
+Independent external-clustering crops and Voice ID evidence windows use the same
+ordered `embed_batch` seam. Batch execution inherits cancellation, preserves
+input/result order, and keeps one failed crop isolated instead of discarding the
+whole recording.
+
+The runtime tests pin batch/single cosine parity, stable ordering, concurrent
+execution, cancellation inheritance, content-aware pack replacement, and graph
+reuse. Performance numbers remain an environment-gated benchmark rather than a
+public speed claim; rerun it on the release build and quiet target hardware when
+changing pool sizing or graph residency.
 
 ## Risks
 

@@ -143,9 +143,9 @@ inline in the family module when the pattern is reusable.
 
 ### 7. Capabilities
 
-`supports_phrase_bias`, diarization support, `emits_punctuation`, and
-streaming registration are declared **once**, on the family's executor
-(`capabilities()`), and read everywhere else through
+`supports_phrase_bias`, `emits_punctuation`, and streaming registration are
+declared **once**, on the family's executor (`capabilities()`), and read
+everywhere else through
 `crates/openasr-core/src/models/executor_component_registry.rs`
 (`builtin_executor_supports_phrase_bias_for_model_architecture` and its
 siblings) or the streaming-executor completeness gate in
@@ -155,6 +155,21 @@ be generated or read from this single source, not hand-maintained as a second
 constant. **Do not** declare the same capability as a separate literal in the
 catalog card, a client-side table, and the executor -- three places drift the
 way capabilities and decode logic drifted before.
+
+Speaker routing is the related architecture-level contract. Every ASR
+descriptor must declare exactly one `speaker_segmentation` source:
+
+- `InDecoder` only when the family itself emits usable recording-local speaker
+  turns (currently MOSS).
+- `External` for every other family. That choice automatically opts the family
+  into the shared FireRed VAD + selected segmenter + ReDimNet2-B6 + clustering
+  pipeline for local file Voice ID.
+
+The signed catalog's `speaker_source` is generated from this value and checked
+against the Rust descriptor. Do not add a model-id allowlist, a family-local
+diarizer, or a second identity matcher. Both speaker sources converge on
+`diarize::voice_id`; even an `InDecoder` family still needs ReDimNet2-B6 for
+cross-scope reconciliation and enrolled-person matching.
 
 ### 8. GPU weight placement
 
@@ -228,10 +243,14 @@ with a one-line structural justification for going another way):
       lands) -- not a third scheme.
 - [ ] Tokenizer reuses `gpt2_bpe` (BPE) or the shared SPM path once it lands;
       no new hand-rolled `▁`/byte-fallback table duplicating an existing one.
-- [ ] Capabilities (`supports_phrase_bias`, diarization, `emits_punctuation`,
-      streaming) are declared once on the executor and read via
+- [ ] Capabilities (`supports_phrase_bias`, `emits_punctuation`, streaming) are
+      declared once on the executor and read via
       `executor_component_registry.rs`; no second literal in the catalog card
       or a client-side table.
+- [ ] The architecture descriptor declares `speaker_segmentation` as
+      `InDecoder` or `External`; the generated catalog mirrors it through
+      `speaker_source`, and no family-local Voice ID/diarization pipeline or
+      model-id allowlist was added.
 - [ ] Encoder/decoder stack composes over `nn::{attn, ffn, norm, conv}`; any
       bypass has a structural reason stated in the PR description.
 - [ ] GPU weight placement (see [GPU weight placement](gpu-weight-placement.md)):

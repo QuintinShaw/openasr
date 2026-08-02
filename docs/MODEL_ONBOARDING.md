@@ -54,6 +54,11 @@ purpose — the exact symbol names drift, so read the code for current names:
   matches the descriptor's shape / kind / scope / count (`arch/`).
 - Registries for the audio frontend, tokenizer, prepared-runtime cache, and
   runtime tensor contract, keyed by the component ids on your descriptor.
+- Universal local file Voice ID routing. The architecture descriptor's
+  `speaker_segmentation` selects either the family's in-decoder turns or the
+  shared external FireRed/segmenter/ReDimNet/clustering path; both feed one
+  identity and transcript-attribution stage. A new family does not implement a
+  bespoke diarizer or person matcher.
 
 **Punctuation fidelity is a product promise.** Whatever the model decodes is what
 the user sees, in every mode (batch, streaming, dictation, server API). Text
@@ -67,7 +72,8 @@ model's honest output.
 
 In `arch/mod.rs`, add the component id consts, then a
 `BUILTIN_ARCHITECTURE_DESCRIPTORS` entry (family / architecture / component ids,
-`execution_capability`, an hparam schema in `arch/hparams.rs`, and a `block_stack`
+`execution_capability`, `speaker_segmentation`, an hparam schema in
+`arch/hparams.rs`, and a `block_stack`
 in `arch/block_stack.rs`) plus the matching `BUILTIN_COMPONENT_DESCRIPTORS`. If
 you pick an existing `orchestration_shape` (`LlmDecoder`, `Seq2SeqEncoderDecoder`,
 `Ctc`, or transducer) with existing block kinds, the whole step is pure data — an
