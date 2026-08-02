@@ -19,16 +19,25 @@ use super::encoder_graph::{GraniteSpeechEncoderConfig, encode};
 use super::frontend::GraniteSpeechMelFrontend;
 use super::qformer::{GraniteSpeechProjectorConfig, project};
 
-const WEIGHTS_ROOT: &str =
-    "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/granite-speech-4.1-2b-src";
-const GOLDEN_ROOT: &str = "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/golden";
+const SOURCE_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_SOURCE_ROOT";
+const GOLDEN_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_GOLDEN_ROOT";
+const SAMPLES_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_SAMPLES_ROOT";
 
-fn weights_root() -> PathBuf {
-    PathBuf::from(WEIGHTS_ROOT)
+fn weights_root() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(SOURCE_ROOT_ENV)?);
+    path.join("model.safetensors.index.json")
+        .exists()
+        .then_some(path)
 }
 
-fn golden_root() -> PathBuf {
-    PathBuf::from(GOLDEN_ROOT)
+fn golden_root() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(GOLDEN_ROOT_ENV)?);
+    path.is_dir().then_some(path)
+}
+
+fn sample_wav(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(SAMPLES_ROOT_ENV)?).join(name);
+    path.is_file().then_some(path)
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
@@ -146,12 +155,14 @@ fn relative_max_diff(actual: &[f32], expected: &[f32]) -> f32 {
 #[test]
 #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights + golden fixtures under tmp/ (not committed)"]
 fn granite_speech_encoder_parity() {
-    let weights_dir = weights_root();
-    if !weights_dir.join("model.safetensors.index.json").exists() {
-        eprintln!("skip: {weights_dir:?} not present");
+    let Some(weights_dir) = weights_root() else {
+        eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
         return;
-    }
-    let golden = golden_root();
+    };
+    let Some(golden) = golden_root() else {
+        eprintln!("skip: set {GOLDEN_ROOT_ENV} to a local granite-speech golden dir");
+        return;
+    };
 
     let weights = load_safetensors_prefixed(&weights_dir, "encoder.");
     let (in_shape, features) = load_npy_f32(&golden.join("en_short_input_features.npy"));
@@ -210,12 +221,14 @@ fn granite_speech_encoder_parity() {
 #[test]
 #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights + golden fixtures under tmp/ (not committed)"]
 fn granite_speech_projector_parity() {
-    let weights_dir = weights_root();
-    if !weights_dir.join("model.safetensors.index.json").exists() {
-        eprintln!("skip: {weights_dir:?} not present");
+    let Some(weights_dir) = weights_root() else {
+        eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
         return;
-    }
-    let golden = golden_root();
+    };
+    let Some(golden) = golden_root() else {
+        eprintln!("skip: set {GOLDEN_ROOT_ENV} to a local granite-speech golden dir");
+        return;
+    };
 
     let encoder_weights = load_safetensors_prefixed(&weights_dir, "encoder.");
     let projector_weights = load_safetensors_prefixed(&weights_dir, "projector.");
@@ -309,12 +322,14 @@ fn top_k_indices(values: &[f32], k: usize) -> Vec<usize> {
 #[test]
 #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights + golden fixtures under tmp/ (not committed)"]
 fn granite_speech_decoder_prefill_parity() {
-    let weights_dir = weights_root();
-    if !weights_dir.join("model.safetensors.index.json").exists() {
-        eprintln!("skip: {weights_dir:?} not present");
+    let Some(weights_dir) = weights_root() else {
+        eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
         return;
-    }
-    let golden = golden_root();
+    };
+    let Some(golden) = golden_root() else {
+        eprintln!("skip: set {GOLDEN_ROOT_ENV} to a local granite-speech golden dir");
+        return;
+    };
 
     let weights = load_safetensors_prefixed(&weights_dir, "language_model.");
     let (ids_shape, ids_i64) = load_npy_i64(&golden.join("decoder_input_ids.npy"));
@@ -418,12 +433,17 @@ fn load_wav_pcm16_mono_f32(path: &Path) -> Vec<f32> {
 
 #[test]
 fn granite_speech_frontend_parity() {
-    let golden = golden_root();
-    let sample_path =
-        PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/en_short.wav");
+    let Some(golden) = golden_root() else {
+        eprintln!("skip: set {GOLDEN_ROOT_ENV} to a local granite-speech golden dir");
+        return;
+    };
+    let Some(sample_path) = sample_wav("en_short.wav") else {
+        eprintln!("skip: set {SAMPLES_ROOT_ENV} to a local granite-speech samples dir");
+        return;
+    };
     let golden_path = golden.join("en_short_input_features.npy");
-    if !sample_path.exists() || !golden_path.exists() {
-        eprintln!("skip: {sample_path:?} or {golden_path:?} not present");
+    if !golden_path.exists() {
+        eprintln!("skip: {golden_path:?} not present");
         return;
     }
 

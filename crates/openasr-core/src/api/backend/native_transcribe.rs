@@ -4696,8 +4696,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let oversized = dir.path().join("oversized.oasr");
         let file = std::fs::File::create(&oversized).expect("create sparse pack");
-        // 1 PiB sparse: larger than any host's RAM + swap, no disk cost.
-        file.set_len(1 << 50).expect("sparse set_len");
+        // 1 TiB sparse: larger than any host's RAM + swap, no disk cost.
+        // Stay under common Linux CI/FS sparse-file caps (1 PiB trips
+        // FileTooLarge on some runners).
+        file.set_len(1 << 40).expect("sparse set_len");
         drop(file);
         let modest = dir.path().join("modest.oasr");
         std::fs::write(&modest, vec![0u8; 4096]).expect("write modest pack");

@@ -618,11 +618,10 @@ mod tests {
     use super::*;
     use crate::ggml_runtime::GgufTensorDataReader;
 
-    const SOURCE_ROOT: &str =
-        "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/granite-speech-4.1-2b-src";
+    const SOURCE_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_SOURCE_ROOT";
 
     fn source_root() -> Option<PathBuf> {
-        let path = PathBuf::from(SOURCE_ROOT);
+        let path = PathBuf::from(std::env::var_os(SOURCE_ROOT_ENV)?);
         path.join(SOURCE_INDEX_JSON).exists().then_some(path)
     }
 
@@ -636,7 +635,7 @@ mod tests {
     #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
     fn granite_speech_converter_round_trips_sampled_tensors() {
         let Some(source_root) = source_root() else {
-            eprintln!("skip: {SOURCE_ROOT} not present");
+            eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
             return;
         };
         let output_root = std::env::temp_dir().join("granite_speech_converter_test.oasr");

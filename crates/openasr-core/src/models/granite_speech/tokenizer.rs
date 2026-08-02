@@ -221,17 +221,20 @@ impl GraniteSpeechTokenizer {
 mod tests {
     use super::*;
 
-    const SOURCE_ROOT: &str =
-        "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/granite-speech-4.1-2b-src";
+    const SOURCE_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_SOURCE_ROOT";
+
+    fn source_root() -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(std::env::var_os(SOURCE_ROOT_ENV)?);
+        path.join("vocab.json").exists().then_some(path)
+    }
 
     #[test]
     #[ignore = "requires local granite-speech-4.1-2b tokenizer files under tmp/ (not committed)"]
     fn granite_speech_tokenizer_round_trips_plain_text() {
-        let root = std::path::PathBuf::from(SOURCE_ROOT);
-        if !root.join("vocab.json").exists() {
-            eprintln!("skip: {SOURCE_ROOT} not present");
+        let Some(root) = source_root() else {
+            eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
             return;
-        }
+        };
         let tokenizer = GraniteSpeechTokenizer::from_source_files(&root).expect("load tokenizer");
         let text = "The quick brown fox jumps over the lazy dog.";
         let ids = tokenizer.encode_prompt_text(text).expect("encode");

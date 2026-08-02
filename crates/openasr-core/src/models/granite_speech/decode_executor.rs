@@ -295,9 +295,26 @@ mod tests {
         Seq2SeqGreedyDecodeConfig, run_seq2seq_greedy_decode_loop_with_adapter_v0,
     };
 
-    const SOURCE_ROOT: &str =
-        "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/granite-speech-4.1-2b-src";
-    const GOLDEN_ROOT: &str = "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/golden";
+    const SOURCE_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_SOURCE_ROOT";
+    const GOLDEN_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_GOLDEN_ROOT";
+    const SAMPLES_ROOT_ENV: &str = "OPENASR_GRANITE_SPEECH_SAMPLES_ROOT";
+
+    fn source_root() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os(SOURCE_ROOT_ENV)?);
+        path.join("model.safetensors.index.json")
+            .exists()
+            .then_some(path)
+    }
+
+    fn golden_root() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os(GOLDEN_ROOT_ENV)?);
+        path.is_dir().then_some(path)
+    }
+
+    fn sample_wav(name: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os(SAMPLES_ROOT_ENV)?).join(name);
+        path.is_file().then_some(path)
+    }
 
     fn load_safetensors_prefixed(dir: &Path, prefix: &str) -> HashMap<String, Vec<f32>> {
         let index_path = dir.join("model.safetensors.index.json");
@@ -367,12 +384,14 @@ mod tests {
     #[test]
     #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights + golden fixtures under tmp/ (not committed)"]
     fn granite_speech_greedy_decode_matches_hf_reference() {
-        let source_root = PathBuf::from(SOURCE_ROOT);
-        if !source_root.join("model.safetensors.index.json").exists() {
-            eprintln!("skip: {SOURCE_ROOT} not present");
+        let Some(source_root) = source_root() else {
+            eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
             return;
-        }
-        let golden_root = PathBuf::from(GOLDEN_ROOT);
+        };
+        let Some(golden_root) = golden_root() else {
+            eprintln!("skip: set {GOLDEN_ROOT_ENV} to a local granite-speech golden dir");
+            return;
+        };
 
         let weights = load_safetensors_prefixed(&source_root, "language_model.");
         let config = GraniteSpeechDecoderConfig::granite_speech_4_1_2b();
@@ -573,14 +592,14 @@ mod tests {
     #[test]
     #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
     fn granite_speech_end_to_end_transcribes_en_short() {
-        let source_root = PathBuf::from(SOURCE_ROOT);
-        if !source_root.join("model.safetensors.index.json").exists() {
-            eprintln!("skip: {SOURCE_ROOT} not present");
+        let Some(source_root) = source_root() else {
+            eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
             return;
-        }
-        let wav_path = PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/en_short.wav",
-        );
+        };
+        let Some(wav_path) = sample_wav("en_short.wav") else {
+            eprintln!("skip: set {SAMPLES_ROOT_ENV} to a local granite-speech samples dir");
+            return;
+        };
         let text = transcribe_wav(
             &source_root,
             &wav_path,
@@ -601,14 +620,14 @@ mod tests {
     #[test]
     #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
     fn granite_speech_end_to_end_transcribes_ja_short() {
-        let source_root = PathBuf::from(SOURCE_ROOT);
-        if !source_root.join("model.safetensors.index.json").exists() {
-            eprintln!("skip: {SOURCE_ROOT} not present");
+        let Some(source_root) = source_root() else {
+            eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
             return;
-        }
-        let wav_path = PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/ja_short.wav",
-        );
+        };
+        let Some(wav_path) = sample_wav("ja_short.wav") else {
+            eprintln!("skip: set {SAMPLES_ROOT_ENV} to a local granite-speech samples dir");
+            return;
+        };
         let text = transcribe_wav(
             &source_root,
             &wav_path,
@@ -631,14 +650,14 @@ mod tests {
     #[test]
     #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
     fn granite_speech_keyword_list_biasing_corrects_name() {
-        let source_root = PathBuf::from(SOURCE_ROOT);
-        if !source_root.join("model.safetensors.index.json").exists() {
-            eprintln!("skip: {SOURCE_ROOT} not present");
+        let Some(source_root) = source_root() else {
+            eprintln!("skip: set {SOURCE_ROOT_ENV} to a local granite-speech source tree");
             return;
-        }
-        let wav_path = PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/kwb_test.wav",
-        );
+        };
+        let Some(wav_path) = sample_wav("kwb_test.wav") else {
+            eprintln!("skip: set {SAMPLES_ROOT_ENV} to a local granite-speech samples dir");
+            return;
+        };
 
         let without_kwb = transcribe_wav(
             &source_root,
