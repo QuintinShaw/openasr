@@ -913,6 +913,15 @@ async fn capabilities_endpoint_exposes_transcription_capability_contract() {
         parsed["realtime"]["word_timestamps"]["behavior"],
         "supported"
     );
+    assert_eq!(parsed["realtime"]["diarization"]["supported"], false);
+    assert_eq!(
+        parsed["realtime"]["diarization"]["behavior"],
+        "reject_request"
+    );
+    assert_eq!(
+        parsed["realtime"]["diarization"]["reason"],
+        "Voice ID is available only for file transcription; realtime sessions do not support diarize=true or --diarize."
+    );
     assert_eq!(parsed["realtime"]["translation"]["supported"], false);
     assert_eq!(parsed["realtime"]["translation"]["installed"], false);
     assert_eq!(

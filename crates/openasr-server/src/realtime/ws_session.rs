@@ -67,11 +67,6 @@ pub(crate) struct WsSession {
     pub(crate) history_duration_ms: u64,
     pub(crate) history_recorded: bool,
     pub(crate) record_history: bool,
-    /// Product scope guard: remote-compute clients may transcribe audio but
-    /// cannot consult this daemon's local voice-profile library. This is
-    /// independent of history retention even though both are disabled for the
-    /// current remote-compute transport.
-    pub(crate) voice_id_allowed: bool,
     pub(crate) backend_failed: bool,
     pub(crate) closed: bool,
     pub(crate) captured_audio_frames: VecDeque<RealtimeAudioFrame>,
@@ -84,9 +79,6 @@ pub(crate) struct WsSession {
     /// points; labels still come from the normal streaming diarizer.
     pub(crate) native_speaker_change_detector:
         Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector>,
-    #[cfg(test)]
-    pub(crate) test_streaming_diarizer_embedder:
-        Option<&'static dyn openasr_core::diarize::embed::SpeakerEmbedder>,
     /// Speaker label per utterance, computed at queue time (has the audio) and
     /// consumed when the backend transcript comes back.
     pub(crate) pending_utterance_speakers: std::collections::HashMap<
@@ -642,22 +634,11 @@ impl WsSession {
         Self::new_with_history(runtime, distribution, event_sender, true)
     }
 
-    #[cfg(test)]
     pub(crate) fn new_with_history(
         runtime: ServerRuntime,
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
         record_history: bool,
-    ) -> Self {
-        Self::new_with_client_policy(runtime, distribution, event_sender, record_history, true)
-    }
-
-    pub(crate) fn new_with_client_policy(
-        runtime: ServerRuntime,
-        distribution: DistributionContext,
-        event_sender: mpsc::Sender<RealtimeEventEnvelope>,
-        record_history: bool,
-        voice_id_allowed: bool,
     ) -> Self {
         let (audio_frames, audio_frame_receiver) = mpsc::channel(AUDIO_FRAME_QUEUE_CAPACITY);
         let format = RealtimeAudioFormat::pcm16_mono_16khz();
@@ -704,14 +685,11 @@ impl WsSession {
             history_duration_ms: 0,
             history_recorded: false,
             record_history,
-            voice_id_allowed,
             backend_failed: false,
             closed: false,
             captured_audio_frames: VecDeque::new(),
             streaming_diarizer: None,
             native_speaker_change_detector: None,
-            #[cfg(test)]
-            test_streaming_diarizer_embedder: None,
             pending_utterance_speakers: std::collections::HashMap::new(),
             native_diarize_samples: Vec::new(),
             native_diarize_preroll_frames: VecDeque::new(),
@@ -1003,23 +981,10 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        let diarize = session.diarize.unwrap_or(false);
-        if diarize && !self.voice_id_allowed {
+        if session.diarize.unwrap_or(false) {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
-                "Voice ID is available only for local file transcription; remote-compute realtime sessions must omit diarize=true.",
-                false,
-            )
-            .await?;
-            return Err(());
-        }
-        if diarize && !capabilities.diarization.supported {
-            self.emit_error(
-                RealtimeErrorCode::StartupConfigError,
-                capabilities
-                    .diarization
-                    .reason
-                    .unwrap_or("Realtime diarization is not supported by this backend."),
+                REALTIME_VOICE_ID_UNSUPPORTED_REASON,
                 false,
             )
             .await?;
@@ -1052,23 +1017,6 @@ impl WsSession {
                 .await?;
                 return Err(());
             }
-        };
-        // Build the per-session diarizer up front so a pack that resolves but
-        // fails to load rejects the session instead of silently degrading to
-        // anonymous transcripts.
-        self.streaming_diarizer = if diarize {
-            let Some(diarizer) = self.build_streaming_diarizer(16_000) else {
-                self.emit_error(
-                    RealtimeErrorCode::StartupConfigError,
-                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
-                    false,
-                )
-                .await?;
-                return Err(());
-            };
-            Some(diarizer)
-        } else {
-            None
         };
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
@@ -1120,11 +1068,6 @@ impl WsSession {
             .map(ToOwned::to_owned);
         let use_native_streaming =
             should_use_native_streaming_session(source_name.as_deref(), capabilities);
-        self.native_speaker_change_detector = if diarize && use_native_streaming {
-            self.build_streaming_speaker_change_detector(16_000)
-        } else {
-            None
-        };
         let effective_partial_results = effective_session_partial_results(
             session.partial_results.unwrap_or(false),
             capabilities,
@@ -1137,7 +1080,6 @@ impl WsSession {
         );
         config.partial_results = effective_partial_results;
         config.word_timestamps = word_timestamps;
-        config.diarize = diarize;
         config.translation = translation_summary;
         config.vad = vad;
         config.buffer = buffer;
@@ -1188,7 +1130,6 @@ impl WsSession {
                     normalized_model,
                     effective_partial_results,
                     word_timestamps,
-                    diarize,
                 )
                 .await;
             if result.is_err() {
@@ -1611,46 +1552,11 @@ impl WsSession {
         })
     }
 
-    fn build_streaming_diarizer(
-        &self,
-        sample_rate_hz: u32,
-    ) -> Option<openasr_core::diarize::streaming::StreamingDiarizer> {
-        #[cfg(test)]
-        if let Some(embedder) = self.test_streaming_diarizer_embedder {
-            return Some(
-                openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(
-                    embedder,
-                    sample_rate_hz,
-                ),
-            );
-        }
-
-        openasr_core::diarize::streaming::StreamingDiarizer::shared(sample_rate_hz)
-    }
-
-    fn build_streaming_speaker_change_detector(
-        &self,
-        sample_rate_hz: u32,
-    ) -> Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector> {
-        #[cfg(test)]
-        if let Some(embedder) = self.test_streaming_diarizer_embedder {
-            return Some(
-                openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::with_embedder(
-                    embedder,
-                    sample_rate_hz,
-                ),
-            );
-        }
-
-        openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::shared(sample_rate_hz)
-    }
-
     pub(crate) async fn start_native_streaming_session(
         &mut self,
         model_id: String,
         partial_results: bool,
         word_timestamps: bool,
-        diarize: bool,
     ) -> Result<(), ()> {
         let Some(model_pack_path) = self.runtime.model_pack_path.clone() else {
             self.emit_error(
@@ -1722,7 +1628,7 @@ impl WsSession {
             .with_prompt(self.prompt.clone())
             .with_phrase_bias(self.phrase_bias.clone())
             .with_inference_threads(self.inference_threads)
-            .with_voice_id(diarize)
+            .with_voice_id(false)
             .with_partial_results(partial_results)
             .with_word_timestamps(word_timestamps);
         let session_config = NativeAsrStreamingSessionConfig::new()

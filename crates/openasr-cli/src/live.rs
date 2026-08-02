@@ -29,8 +29,7 @@ use openasr_core::{
 
 use crate::catalog_cli::load_cli_model_catalog;
 use crate::{
-    BackendKind, RuntimePathOverrides, TranscriptionRequest, backend_name,
-    ensure_cli_diarization_packs_installed, ensure_diarization_supported, find_model, load_config,
+    BackendKind, RuntimePathOverrides, TranscriptionRequest, backend_name, find_model, load_config,
     openasr_home, resolve_backend, runtime_registry, selected_model_ref, transcribe_with_backend,
     validate_local_native_model_pack_path,
 };
@@ -117,6 +116,7 @@ pub(crate) fn parse_live_output_format(
 }
 
 pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
+    ensure_live_voice_id_not_requested(options.diarize)?;
     validate_live_limits(options.max_seconds, options.max_utterances)?;
 
     let host = cpal::default_host();
@@ -147,8 +147,6 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
         options.model_pack,
         catalog.as_ref(),
     )?;
-    ensure_cli_diarization_packs_installed(backend, model_pack_path.as_deref(), options.diarize)?;
-    ensure_diarization_supported(backend, model_pack_path.as_deref(), options.diarize)?;
     ensure_live_backend_ready(backend, model_pack_path.as_deref())?;
     let live_config =
         LivePipelineConfig::from_options(&options, card.id.clone(), model_pack_path.clone())?;
@@ -240,6 +238,13 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
     let result = capture.run(&mut pipeline);
     drop(stream);
     result
+}
+
+fn ensure_live_voice_id_not_requested(diarize: bool) -> Result<()> {
+    if diarize {
+        bail!(openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON);
+    }
+    Ok(())
 }
 
 fn run_live_from_system_audio(
@@ -1239,7 +1244,6 @@ struct LivePipelineConfig {
     buffer: RealtimeBufferConfig,
     partial_interval_ms: u64,
     partial_window_ms: u32,
-    diarize: bool,
 }
 
 /// Resolve the live VAD mode. Delegates to the shared `openasr-core` resolver so
@@ -1319,7 +1323,6 @@ impl LivePipelineConfig {
             buffer,
             partial_interval_ms,
             partial_window_ms,
-            diarize: options.diarize,
         })
     }
 }
@@ -1341,14 +1344,6 @@ struct LivePipeline {
     partial_interval_ms: u64,
     partial_window_ms: u32,
     partial_flights: HashMap<TranscriptUtteranceId, PartialFlight>,
-    /// Per-session streaming diarizer, built at startup when `--diarize` is
-    /// requested; labels each finalized utterance with a stable anonymous
-    /// speaker.
-    streaming_diarizer: Option<openasr_core::diarize::streaming::StreamingDiarizer>,
-    /// Speaker label per utterance, computed at queue time (has the audio) and
-    /// consumed when the final transcript comes back.
-    pending_utterance_speakers:
-        HashMap<TranscriptUtteranceId, openasr_core::diarize::enrollment::SpeakerDisplayAssignment>,
     audio_running: bool,
     history: RealtimeTranscriptHistory,
     save_options: Option<LiveSaveOptions>,
@@ -1434,19 +1429,6 @@ impl LivePipeline {
         session.partial_results = true;
         session.vad = config.vad;
         session.buffer = config.buffer;
-        session.diarize = config.diarize;
-        // Build the diarizer up front so a pack that resolves but fails to
-        // load aborts the session instead of silently degrading to anonymous
-        // transcripts.
-        let streaming_diarizer = if config.diarize {
-            Some(
-                openasr_core::diarize::streaming::StreamingDiarizer::shared(16_000).context(
-                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
-                )?,
-            )
-        } else {
-            None
-        };
         Ok(Self {
             controller: RealtimeSessionController::new(session)?,
             output_format,
@@ -1464,8 +1446,6 @@ impl LivePipeline {
             partial_interval_ms: config.partial_interval_ms,
             partial_window_ms: config.partial_window_ms,
             partial_flights: HashMap::new(),
-            streaming_diarizer,
-            pending_utterance_speakers: HashMap::new(),
             audio_running: false,
             history: RealtimeTranscriptHistory::new(),
             save_options,
@@ -1799,15 +1779,6 @@ impl LivePipeline {
         let display_name = format!("{}.wav", utterance.utterance_id.0);
         let segment_id = TranscriptSegmentId(format!("{}_seg_000001", utterance.utterance_id.0));
         let utterance_id = utterance.utterance_id.clone();
-        // Diarize the utterance here, where its audio is still owned; the label
-        // is attributed when the final transcript returns.
-        if let Some(diarizer) = self.streaming_diarizer.as_mut() {
-            let samples = utterance_samples_f32(&utterance.frames);
-            if let Some(assignment) = diarizer.assign(&samples, 16_000) {
-                self.pending_utterance_speakers
-                    .insert(utterance_id.clone(), assignment);
-            }
-        }
         let flight = self
             .partial_flights
             .entry(utterance_id.clone())
@@ -1868,28 +1839,6 @@ impl LivePipeline {
             }
         }
 
-        let speaker_assignment = if result.partial {
-            None
-        } else {
-            self.pending_utterance_speakers.remove(&result.utterance_id)
-        };
-        let (speaker, speaker_label, speaker_person_id, speaker_snapshot_label) =
-            speaker_assignment
-                .map(|assignment| {
-                    let matched = assignment.speaker_person_id.is_some();
-                    let speaker_label = matched.then_some(assignment.speaker_label.clone());
-                    let snapshot = assignment
-                        .speaker_snapshot_label
-                        .clone()
-                        .or_else(|| matched.then_some(assignment.speaker.clone()));
-                    (
-                        Some(assignment.speaker),
-                        speaker_label,
-                        assignment.speaker_person_id,
-                        snapshot,
-                    )
-                })
-                .unwrap_or((None, None, None, None));
         let update = TranscriptUpdate {
             utterance_id: result.utterance_id.clone(),
             segment_id: result.segment_id,
@@ -1898,10 +1847,10 @@ impl LivePipeline {
             start_ms: result.start_ms,
             end_ms: result.end_ms,
             language: None,
-            speaker,
-            speaker_label,
-            speaker_person_id,
-            speaker_snapshot_label,
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
             revises_event_id: None,
         };
@@ -2424,14 +2373,6 @@ impl LiveAudioNormalizer {
     }
 }
 
-/// Flatten an utterance's PCM16 frames to `[-1, 1]` `f32` mono for embedding.
-fn utterance_samples_f32(frames: &[RealtimeAudioFrame]) -> Vec<f32> {
-    frames
-        .iter()
-        .flat_map(|frame| frame.samples().iter().map(|s| *s as f32 / 32768.0))
-        .collect()
-}
-
 fn write_temp_utterance_wav(utterance: &BufferedUtterance) -> Result<tempfile::NamedTempFile> {
     let mut file = tempfile::Builder::new()
         .prefix(LIVE_TEMP_PREFIX)
@@ -2517,7 +2458,6 @@ mod tests {
         LivePipelineConfig {
             model_id: "whisper-large-v3-turbo".to_string(),
             model_pack_path: None,
-            diarize: false,
             vad: VadConfig {
                 frame_duration_ms: 20,
                 speech_start_ms: 40,
@@ -2743,6 +2683,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("--max-utterances")
+        );
+    }
+
+    #[test]
+    fn live_voice_id_is_always_rejected() {
+        ensure_live_voice_id_not_requested(false).unwrap();
+        let error = ensure_live_voice_id_not_requested(true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON
         );
     }
 
@@ -4382,7 +4334,6 @@ mod tests {
         let config = LivePipelineConfig {
             model_id: "whisper-large-v3-turbo".to_string(),
             model_pack_path: None,
-            diarize: false,
             vad: VadConfig {
                 frame_duration_ms: 20,
                 speech_start_ms: 20,
@@ -4420,7 +4371,6 @@ mod tests {
         let config = LivePipelineConfig {
             model_id: "whisper-large-v3-turbo".to_string(),
             model_pack_path: None,
-            diarize: false,
             vad: VadConfig {
                 frame_duration_ms: 20,
                 speech_start_ms: 20,

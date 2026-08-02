@@ -22,6 +22,7 @@ use axum::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
+use openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON;
 use openasr_core::{
     BufferedUtterance, ClauseId, ClauseSegment, ClauseSegmenter, ClauseStatus,
     MAX_INFERENCE_THREADS, PhraseBiasConfig, RealtimeAudioEncoding, RealtimeAudioFormat,
@@ -149,15 +150,7 @@ pub(crate) async fn websocket(
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .write_buffer_size(MAX_WS_MESSAGE_BYTES)
         .max_write_buffer_size(MAX_WS_MESSAGE_BYTES * 2)
-        .on_upgrade(move |socket| {
-            handle_websocket(
-                socket,
-                runtime,
-                distribution,
-                record_history,
-                !remote_compute_client,
-            )
-        })
+        .on_upgrade(move |socket| handle_websocket(socket, runtime, distribution, record_history))
 }
 
 pub(crate) async fn stream_transcription(
@@ -386,7 +379,6 @@ async fn handle_websocket(
     runtime: ServerRuntime,
     distribution: DistributionContext,
     record_history: bool,
-    voice_id_allowed: bool,
 ) {
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (event_sender, mut event_receiver) =
@@ -417,13 +409,8 @@ async fn handle_websocket(
         let _ = socket_sender.send(ws_close(close_code)).await;
     });
 
-    let mut session = WsSession::new_with_client_policy(
-        runtime,
-        distribution,
-        event_sender,
-        record_history,
-        voice_id_allowed,
-    );
+    let mut session =
+        WsSession::new_with_history(runtime, distribution, event_sender, record_history);
     if session.emit_capabilities().await.is_err() {
         return;
     }

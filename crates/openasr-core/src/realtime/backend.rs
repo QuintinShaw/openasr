@@ -50,6 +50,8 @@ pub struct RealtimeBackendCapabilities {
     pub frame_sync_partials: bool,
 }
 
+pub const REALTIME_VOICE_ID_UNSUPPORTED_REASON: &str = "Voice ID is available only for file transcription; realtime sessions do not support diarize=true or --diarize.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
 #[cfg_attr(
@@ -122,10 +124,7 @@ impl RealtimeBackendCapabilities {
             supports_partial_results,
             phrase_bias,
             word_timestamps,
-            // The diarization capability is mode- and install-dependent, so the
-            // const builders stay conservative; the non-const constructors
-            // overwrite it via [`realtime_diarization_capability`].
-            diarization: realtime_diarization_unprobed(),
+            diarization: realtime_diarization_unsupported(),
             translation: RealtimeTranslationCapability::unavailable(
                 RealtimeTranslationCapability::REASON_PACK_MISSING,
             ),
@@ -259,34 +258,15 @@ impl RealtimeBackendCapabilities {
     }
 }
 
-/// Realtime diarization capability for a session mode, derived fresh on every
-/// call: the streaming diarizer labels utterances inside the session loop, so
-/// it is model-agnostic and needs only the installed ReDimNet2-B6
-/// (`redimnet2-b6-cn`) pack. The file-per-utterance path diarizes the buffered
-/// utterance audio; true-streaming sessions retain a bounded speech-gated copy
-/// of each utterance for the same purpose. Presence-only probe; pack load
-/// failures still fail closed at session configure time.
-pub fn realtime_diarization_capability(mode: RealtimeBackendMode) -> BackendFeatureCapability {
-    match mode {
-        RealtimeBackendMode::Unsupported => realtime_diarization_unprobed(),
-        RealtimeBackendMode::FilePerUtteranceFallback | RealtimeBackendMode::TrueStreaming => {
-            if crate::diarize::vad_diarization_available() {
-                BackendFeatureCapability::supported()
-            } else {
-                BackendFeatureCapability::reject_request(
-                    crate::diarize::embed::REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
-                )
-            }
-        }
-    }
+/// Realtime Voice ID is outside the product contract for every backend mode.
+/// Recording-level diarization needs the complete file so independently
+/// finalized live utterances must never advertise or silently approximate it.
+pub fn realtime_diarization_capability(_mode: RealtimeBackendMode) -> BackendFeatureCapability {
+    realtime_diarization_unsupported()
 }
 
-/// Conservative const default for the const capability builders; the non-const
-/// constructors overwrite it via [`realtime_diarization_capability`].
-const fn realtime_diarization_unprobed() -> BackendFeatureCapability {
-    BackendFeatureCapability::reject_request(
-        crate::diarize::embed::REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
-    )
+const fn realtime_diarization_unsupported() -> BackendFeatureCapability {
+    BackendFeatureCapability::reject_request(REALTIME_VOICE_ID_UNSUPPORTED_REASON)
 }
 
 const fn realtime_phrase_bias_unsupported() -> BackendFeatureCapability {
@@ -324,6 +304,11 @@ mod tests {
                 backend == BackendKind::Native
             );
             assert!(capabilities.word_timestamps.supported);
+            assert!(!capabilities.diarization.supported);
+            assert_eq!(
+                capabilities.diarization.reason,
+                Some(REALTIME_VOICE_ID_UNSUPPORTED_REASON)
+            );
             assert!(capabilities.requires_vad_utterance_boundaries);
             assert!(capabilities.is_file_per_utterance_fallback);
             assert!(!capabilities.is_true_streaming);
@@ -333,80 +318,39 @@ mod tests {
     }
 
     #[test]
-    fn realtime_diarization_capability_depends_on_mode_and_pack() {
-        let temp = tempfile::tempdir().unwrap();
-        {
-            // Hermetic: the probe consults the installed ReDimNet2-B6 embedder pack.
-            // Scoped so this guard drops (and releases the lock) before the
-            // second guard below is created; the process env lock is not
-            // reentrant, so two live guards on the same thread would
-            // self-deadlock on the second `lock()` call.
-            let _env = crate::test_process_env::TestProcessEnvGuard::new([
-                ("OPENASR_REDIMNET_PACK", None),
-                ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
-            ]);
-
-            let fallback =
-                realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback);
-            assert!(!fallback.supported);
-            assert!(
-                fallback
-                    .reason
-                    .is_some_and(|reason| reason.contains("speaker-embedder pack")
-                        && reason.contains("redimnet2-b6-cn"))
+    fn realtime_diarization_is_file_transcription_only_for_every_mode() {
+        for mode in [
+            RealtimeBackendMode::Unsupported,
+            RealtimeBackendMode::FilePerUtteranceFallback,
+            RealtimeBackendMode::TrueStreaming,
+        ] {
+            let capability = realtime_diarization_capability(mode);
+            assert!(!capability.supported);
+            assert_eq!(
+                capability.behavior,
+                crate::api::backend::BackendCapabilityBehavior::RejectRequest
             );
-            let streaming = realtime_diarization_capability(RealtimeBackendMode::TrueStreaming);
-            assert!(!streaming.supported);
-            assert!(
-                streaming
-                    .reason
-                    .is_some_and(|reason| reason.contains("speaker-embedder pack")
-                        && reason.contains("redimnet2-b6-cn"))
+            assert_eq!(
+                capability.reason,
+                Some(REALTIME_VOICE_ID_UNSUPPORTED_REASON)
             );
-
-            let install_dir = temp.path().join("models/redimnet2-b6-cn/fp16");
-            std::fs::create_dir_all(&install_dir).unwrap();
-            let installed_pack = install_dir.join("redimnet2-b6-cn-fp16.oasr");
-            std::fs::write(&installed_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-            let installed_meta = serde_json::json!({
-                "model_id": "redimnet2-b6-cn",
-                "display_name": "ReDimNet2-B6 Speaker Embedder",
-                "quant": "f32",
-                "suffix": "f32",
-                "pull": "redimnet2-b6-cn:f32",
-                "filename": "redimnet2-b6-cn-fp16.oasr",
-                "path": installed_pack,
-                "url": "https://example.invalid/OpenASR/redimnet2-b6-cn/redimnet2-b6-cn-fp16.oasr",
-                "hf_revision": "0123456789abcdef0123456789abcdef01234567",
-                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-                "size_bytes": 8,
-                "installed_at_unix_seconds": 1
-            });
-            std::fs::write(
-                install_dir.join("installed.json"),
-                format!("{installed_meta}\n"),
-            )
-            .unwrap();
-            assert!(
-                realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback)
-                    .supported
-            );
-            assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
         }
 
-        let redimnet = temp.path().join("redimnet.oasr");
-        std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00").unwrap();
-        let _redimnet_env = crate::test_process_env::TestProcessEnvGuard::new([
-            ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
-            ("OPENASR_REDIMNET_PACK", Some(redimnet.into_os_string())),
-        ]);
-        assert!(
-            realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback)
-                .supported
+        let native = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::native_true_streaming(),
         );
-        // True-streaming sessions retain a bounded copy of each utterance's
-        // speech, so the pack is the only gate there as well.
-        assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
+        for capabilities in [
+            RealtimeBackendCapabilities::unsupported(),
+            RealtimeBackendCapabilities::file_per_utterance_fallback(),
+            RealtimeBackendCapabilities::true_streaming_local(),
+            native,
+        ] {
+            assert!(!capabilities.diarization.supported);
+            assert_eq!(
+                capabilities.diarization.reason,
+                Some(REALTIME_VOICE_ID_UNSUPPORTED_REASON)
+            );
+        }
     }
 
     #[test]

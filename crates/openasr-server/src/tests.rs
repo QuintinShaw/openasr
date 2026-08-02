@@ -1754,6 +1754,11 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
     assert_eq!(capabilities.mode, RealtimeBackendMode::TrueStreaming);
     assert!(capabilities.phrase_bias.supported);
     assert!(capabilities.supports_partial_results);
+    assert!(!capabilities.diarization.supported);
+    assert_eq!(
+        capabilities.diarization.reason,
+        Some(openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON)
+    );
 }
 
 #[tokio::test]

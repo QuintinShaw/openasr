@@ -15,8 +15,8 @@ pub use audio::{
     RealtimeAudioFormat, RealtimeAudioFrame, RealtimeFrameError,
 };
 pub use backend::{
-    RealtimeBackendCapabilities, RealtimeBackendMode, RealtimeTranslationCapability,
-    realtime_diarization_capability,
+    REALTIME_VOICE_ID_UNSUPPORTED_REASON, RealtimeBackendCapabilities, RealtimeBackendMode,
+    RealtimeTranslationCapability, realtime_diarization_capability,
 };
 pub use buffer::{
     BufferedUtterance, RealtimeBuffer, RealtimeBufferConfig, RealtimeBufferError,
