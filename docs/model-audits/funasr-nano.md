@@ -10,8 +10,8 @@
 | --- | --- |
 | Family (`models-core.toml` `family`) | funasr-nano |
 | Models covered | Fun-ASR-Nano-2512 (SAN-M encoder + 2-layer adaptor + Qwen3-0.6B decoder); tiers fp16 / q8_0 / q4_k |
-| Auditor / date | main-loop / 2026-08-01 |
-| Core version + commit audited | `feat/funasr-nano` @ 96a3f841 (base main e8adde84 = v0.1.26) |
+| Auditor / date | main-loop / 2026-08-02 |
+| Core version + commit audited | `feat/funasr-nano` @ post-`1d92474b` (rebase origin/main `8e670cf2` = v0.1.26 line; encoder keep-quantized load + K1/K2 gates) |
 | Bench hardware | Apple M1, 16 GB, macOS |
 
 **How to fill.** Status is exactly one of: `Supported`, `Not applicable`, `Deferred` (with justification + unlock condition).
@@ -32,7 +32,7 @@
 | --- | --- | --- |
 | KV cache quantization | Supported | Q8_0 double-copy production KV (via `resolve_qwen_family_production_kv_cache_policy`), 59.5 KiB/token/copy, deliberate. |
 | Activation precision policy chosen deliberately (f32 vs f16) | Supported | Audio path forced f32 (no fp16 activation; adaptor output std 28.0 / |max| 1100 measured, would overflow f16). Decode uses qwen precision policy. |
-| Keep-quantized matmul (native Q blocks bound, no load-time dequant; RAM orders q4 < q8 < fp16) | Deferred | RAM ordering confirmed by measurement (q4_k 1769 < q8_0 2463 < fp16 3642 MiB Metal). BUT peak-RSS reconciliation found quant weights re-materialized to a backend buffer (~pack size) and QKV projection uses an f32 arena (~448 MiB); code claims native-q8 zero-copy but it is not effective. Unlock: implement zero-copy native Q-block binding for the quant tiers (QKV f32 arena is the biggest single item). |
+| Keep-quantized matmul (native Q blocks bound, no load-time dequant; RAM orders q4 < q8 < fp16) | Supported | RAM ordering confirmed (q4_k 1769 < q8_0 2463 < fp16 3642 MiB Metal). **Encoder:** rank-2 mul_mat weights (`attn.qkv/out`, `ffn.up/down`) bind via `load_named_bound` + `bind_loaded` -- metadata only at load, no host dequant; host-f32 is limited to norms/biases/FSMN (`encoder_graph.rs`). K1 inventories `funasr_nano/encoder_graph.rs`. **Decoder:** reuses qwen family loader with `materialize_qkv: false`; q8 pack stores `blk.*.attn_{q,k,v}.weight` as native Q8_0 in `[in,out]` orientation so `raw_ggml` binds and `FusedQkvProjectionWeight` takes the raw-concat path (`fuse_raw_qkv_projection_weights`) -- no f32 QKV arena. Host payload dropped after bind (`dropped_projection_payload`). The earlier ~448 MiB QKV f32-arena residual is closed on this path (stale as of shared qwen fused-raw + this encoder split). Remaining whole-pack backend buffer materialization is the engine-level eager-load item (Known dead ends), not a family keep-quantized gap. Correctness: ignored golden `golden_encoder_adapter_cosine_and_end_to_end_text` + `cached_encoder_adapter_matches_fresh_build_bit_for_bit` green on fp16-tok pack after the encoder load split. |
 | Quant tiers complete (q4_k / q8_0 / fp16) | Supported | All three built and byte/WER-verified (`funasr-nano-{fp16-tok,q8_0,q4_k}.oasr`); encoder half floored at Q8_0, decoder half Q4_K on the q4_k tier. |
 
 ## 3. Memory & data movement
@@ -40,9 +40,9 @@
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | mmap weight loading | Supported | Pack is mmap-resident (reclaimable); RSS = mmap resident + private, residual <=3 MiB of the identity RSS-footprint = pack + 37 MiB. (Eager backend materialization overhead is an engine-level item, see dead ends.) |
-| Resident pool reuse across requests (weights stay resident) | Supported | encoder + adapter + decoder all resident across requests via BoundedRuntimeCache keyed by (PackContentKey, backend); idle unload via central `bump_unload_generation`. Commit 96a3f841. |
+| Resident pool reuse across requests (weights stay resident) | Supported | K2: `("funasr_nano", Resident)` in `GGML_EXECUTOR_FAMILY_GATES`. encoder + adapter + decoder all resident across requests via BoundedRuntimeCache keyed by (PackContentKey, backend); idle unload via central `bump_unload_generation`. Test `cached_encoder_adapter_matches_fresh_build_bit_for_bit`. |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | Supported | Encoder/adapter/decoder graphs inherited from audited sensevoice/qwen paths; no new avoidable copy nodes introduced (adaptor tensors zero-copy bound from loaded context). |
-| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled ... catalog RAM requirement matches the measured peak | Supported | Measured (36 runs, <=2 MiB jitter): Metal RSS fp16 3642 / q8_0 2463 / q4_k 1769 MiB; no unexplained excess (closes to pack + QKV f32 arena 448 MiB + KV 63 MiB + misc). Catalog RAM requirement set fp16 4300 / q8_0 2900 / q4_k 2100 MB (conservative >= CPU peak). |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled ... catalog RAM requirement matches the measured peak | Supported | Quiet-host matrix (36 runs, <=2 MiB jitter, pre-final keep-quantized close): Metal RSS fp16 3642 / q8_0 2463 / q4_k 1769 MiB. Residual then attributed partly to a QKV f32 arena that the decoder raw-fuse path no longer builds; catalog RAM still set conservatively fp16 4300 / q8_0 2900 / q4_k 2100 MB (>= measured peaks, safe headroom). Optional tighten on first catalog write after a fresh quiet 3-run matrix. |
 
 ## 4. Decode algorithms
 

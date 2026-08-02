@@ -101,6 +101,7 @@ const GGML_EXECUTOR_FAMILY_GATES: &[(&str, ResidentClassification)] = &[
     ("dolphin", ResidentClassification::Resident),
     ("firered_aed", ResidentClassification::Resident),
     ("firered_llm", ResidentClassification::Resident),
+    ("funasr_nano", ResidentClassification::Resident),
     ("granite_speech", ResidentClassification::Resident),
     ("mimo_asr", ResidentClassification::Resident),
     ("moonshine", ResidentClassification::Resident),

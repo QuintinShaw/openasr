@@ -31,6 +31,7 @@ firered_aed/executor.rs
 firered_llm/adapter_graph.rs
 firered_llm/executor.rs
 firered_punc/weights.rs
+funasr_nano/encoder_graph.rs
 granite_speech/encoder_graph.rs
 granite_speech/package_import.rs
 granite_speech/qformer.rs

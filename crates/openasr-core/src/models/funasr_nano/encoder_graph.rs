@@ -96,10 +96,10 @@ struct EncoderWeights {
     tp_norm_bias: NamedTensor,
 }
 
-fn load_named(
+fn load_tensor_meta(
     reader: &GgufTensorDataReader,
     name: &str,
-) -> Result<NamedTensor, FunasrNanoEncoderError> {
+) -> Result<(String, Vec<usize>, Vec<u64>), FunasrNanoEncoderError> {
     let tensor = reader.tensor_index().get(name).ok_or_else(|| {
         FunasrNanoEncoderError::WeightRead(GgufTensorDataReadError::TensorNotFound {
             path: reader.tensor_index().path().to_path_buf(),
@@ -107,12 +107,32 @@ fn load_named(
         })
     })?;
     let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-    let shape_u64: Vec<u64> = tensor.dims.clone();
-    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &shape_u64)?;
+    Ok((name.to_string(), dims, tensor.dims.clone()))
+}
+
+/// Host-f32 materialization for tensors that legitimately stay f32/f16 in the
+/// keep-quantized contract: 1-D norms/biases and the FSMN conv kernel.
+fn load_named(
+    reader: &GgufTensorDataReader,
+    name: &str,
+) -> Result<NamedTensor, FunasrNanoEncoderError> {
+    let (name, dims, shape_u64) = load_tensor_meta(reader, name)?;
+    let values = reader.host_tensor_f32_copy_dequantized_by_name(&name, &shape_u64)?;
+    Ok(NamedTensor { name, dims, values })
+}
+
+/// Metadata-only load for rank-2 `mul_mat` weights bound zero-copy from the
+/// mmap'd pack. Must NOT dequant to host f32 -- that is the load-time-dequant
+/// pitfall K1 forbids for bulk weights.
+fn load_named_bound(
+    reader: &GgufTensorDataReader,
+    name: &str,
+) -> Result<NamedTensor, FunasrNanoEncoderError> {
+    let (name, dims, _) = load_tensor_meta(reader, name)?;
     Ok(NamedTensor {
-        name: name.to_string(),
+        name,
         dims,
-        values,
+        values: Vec::new(),
     })
 }
 
@@ -122,32 +142,21 @@ fn load_layer(
     layer: usize,
 ) -> Result<LayerWeights, FunasrNanoEncoderError> {
     let n = |suffix: &str| format!("{scope}.{layer}.{suffix}");
-    let mut weights = LayerWeights {
+    Ok(LayerWeights {
         attn_norm_weight: load_named(reader, &n("attn.norm.weight"))?,
         attn_norm_bias: load_named(reader, &n("attn.norm.bias"))?,
-        attn_qkv_weight: load_named(reader, &n("attn.qkv.weight"))?,
+        attn_qkv_weight: load_named_bound(reader, &n("attn.qkv.weight"))?,
         attn_qkv_bias: load_named(reader, &n("attn.qkv.bias"))?,
-        attn_out_weight: load_named(reader, &n("attn.out.weight"))?,
+        attn_out_weight: load_named_bound(reader, &n("attn.out.weight"))?,
         attn_out_bias: load_named(reader, &n("attn.out.bias"))?,
         attn_fsmn_weight: load_named(reader, &n("attn.fsmn.weight"))?,
         ffn_norm_weight: load_named(reader, &n("ffn.norm.weight"))?,
         ffn_norm_bias: load_named(reader, &n("ffn.norm.bias"))?,
-        ffn_up_weight: load_named(reader, &n("ffn.up.weight"))?,
+        ffn_up_weight: load_named_bound(reader, &n("ffn.up.weight"))?,
         ffn_up_bias: load_named(reader, &n("ffn.up.bias"))?,
-        ffn_down_weight: load_named(reader, &n("ffn.down.weight"))?,
+        ffn_down_weight: load_named_bound(reader, &n("ffn.down.weight"))?,
         ffn_down_bias: load_named(reader, &n("ffn.down.bias"))?,
-    };
-    // The 2-D linears are bound zero-copy from the mmap'd pack by the graph;
-    // drop their dominant f32 host payloads (keep-quantized seam).
-    for w in [
-        &mut weights.attn_qkv_weight,
-        &mut weights.attn_out_weight,
-        &mut weights.ffn_up_weight,
-        &mut weights.ffn_down_weight,
-    ] {
-        w.values = Vec::new();
-    }
-    Ok(weights)
+    })
 }
 
 fn load_encoder_weights(
