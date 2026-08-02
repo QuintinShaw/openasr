@@ -1522,8 +1522,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = EnvVarRestore::set("OPENASR_HOME", temp.path().as_os_str());
         let redimnet_pack = temp.path().join("redimnet.oasr");
+        let segmenter_pack = temp.path().join("segmenter.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        std::fs::write(&segmenter_pack, b"GGUF\x00\x00\x00\x00").unwrap();
         let _redimnet_pack = EnvVarRestore::set("OPENASR_REDIMNET_PACK", redimnet_pack.as_os_str());
+        let _segmenter_pack =
+            EnvVarRestore::set("OPENASR_PYANNOTE_PACK", segmenter_pack.as_os_str());
         let runtime_path = temp.path().join("whisper-runtime.oasr");
         let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(
             "whisper-runtime-fixture",

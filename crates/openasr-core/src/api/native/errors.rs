@@ -15,6 +15,8 @@ pub enum NativeAsrError {
     ProviderUnavailable { provider: String },
     #[error("Backend '{backend}' does not support true streaming ASR.")]
     BackendDoesNotSupportTrueStreaming { backend: String },
+    #[error("Voice ID is available only for file transcription, not Native ASR realtime sessions.")]
+    VoiceIdUnsupportedForRealtime,
     #[error(
         "Phrase bias / hotword boosting is not supported by the '{model_family}' native model family ({adapter}). The request was rejected instead of silently ignoring phrase_bias."
     )]

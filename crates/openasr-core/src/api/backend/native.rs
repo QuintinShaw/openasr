@@ -105,6 +105,7 @@ impl NativeRuntimeModelAdapter {
     /// Whether this model's own decode carries the speaker structure. Read
     /// from the family descriptor (the single declaration); never re-derived
     /// from pack metadata or an `adapter_id` string match.
+    #[cfg(test)]
     fn segments_speakers_in_decoder(&self) -> bool {
         self.descriptor.speaker_segmentation.is_in_decoder()
     }
@@ -200,6 +201,9 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         session_config: NativeAsrStreamingSessionConfig,
     ) -> Result<Box<dyn NativeAsrSession>, NativeAsrError> {
         session_config.validate()?;
+        if options.voice_id {
+            return Err(NativeAsrError::VoiceIdUnsupportedForRealtime);
+        }
         if !self.capabilities.supports_true_streaming {
             return Err(NativeAsrError::BackendDoesNotSupportTrueStreaming {
                 backend: self.adapter_id().to_string(),
@@ -230,10 +234,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         )
         .map_err(native_backend_error_to_asr)?;
         let backend_preference = native_ggml_backend_preference_from_hardware_target(target)?;
-        let request_options = native_streaming_request_options_from_session_options(
-            &options,
-            self.segments_speakers_in_decoder(),
-        );
+        let request_options = native_streaming_request_options_from_session_options(&options);
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             backend_preference.request_backend_override(),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
@@ -259,7 +260,6 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
 
 fn native_streaming_request_options_from_session_options(
     options: &NativeAsrRequestOptions,
-    segments_speakers_in_decoder: bool,
 ) -> GgmlAsrExecutionOptions {
     let mut request_options = GgmlAsrExecutionOptions::from_transcription_request_with_phrase_bias(
         options.language.clone(),
@@ -270,14 +270,11 @@ fn native_streaming_request_options_from_session_options(
     request_options.task = options.task.unwrap_or_default();
     request_options.inference_threads = options.inference_threads.map(usize::from);
     request_options.word_timestamps = options.word_timestamps;
-    // `NativeAsrRequestOptions::voice_id` is the accepted session-level user
-    // intent: realtime uses it to emit `session.configured` and to run the
-    // external local-segmenter + speaker-embedder diarizer. The decode-side
-    // option means something narrower -- "this family's own decode should
-    // carry speaker structure" -- so it is set only for an in-decoder family.
-    // Forwarding the external path's intent here would be the double-apply the
-    // one-source-only rule forbids.
-    request_options.in_decoder_speakers = options.voice_id && segments_speakers_in_decoder;
+    // Recording-level Voice ID is rejected by `start_streaming_session` before
+    // device/model execution. Keep the lower decode request speaker-free too,
+    // so a future caller cannot accidentally revive model-local speaker tokens
+    // by bypassing only the public capability probe.
+    request_options.in_decoder_speakers = false;
     request_options
 }
 
@@ -1715,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn native_streaming_request_keeps_external_speakers_out_of_ggml_decode_options() {
+    fn native_streaming_rejects_voice_id_and_keeps_speakers_out_of_decode_options() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-redimnet-only-streaming.gguf");
         let spec = whisper_streaming_runtime_fixture_spec("whisper-redimnet-only-streaming");
@@ -1731,10 +1728,7 @@ mod tests {
         );
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
         assert!(adapter.capabilities().supports_true_streaming);
-        assert!(
-            realtime_capabilities.diarization.supported,
-            "an installed embedder pack accepts the session-level Voice ID request"
-        );
+        assert!(!realtime_capabilities.diarization.supported);
         assert!(
             !adapter.segments_speakers_in_decoder(),
             "whisper takes its speaker structure from the external source"
@@ -1744,21 +1738,31 @@ mod tests {
             .with_voice_id(true)
             .with_partial_results(true)
             .with_word_timestamps(true);
-        let request_options = native_streaming_request_options_from_session_options(
-            &session_options,
-            adapter.segments_speakers_in_decoder(),
-        );
+        let request_options =
+            native_streaming_request_options_from_session_options(&session_options);
 
         assert!(
             !request_options.in_decoder_speakers,
             "the external speaker source must not also switch the decoder into in-decoder mode"
         );
         assert!(request_options.word_timestamps);
-        assert!(
-            native_streaming_request_options_from_session_options(&session_options, true)
-                .in_decoder_speakers,
-            "an in-decoder family does ask its own decode for speaker structure"
+
+        let pack = NativeAsrModelPackRef::new(
+            "whisper-redimnet-only-streaming",
+            adapter.model_family(),
+            runtime_path,
         );
+        let error = match adapter.start_streaming_session(
+            &pack,
+            NativeAsrHardwareTarget::Cpu,
+            NativeAsrSessionContext::new("rt_voice_id_rejected"),
+            session_options,
+            NativeAsrStreamingSessionConfig::default(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("realtime Voice ID must fail at the native adapter boundary"),
+        };
+        assert_eq!(error, NativeAsrError::VoiceIdUnsupportedForRealtime);
     }
 
     #[test]
@@ -2531,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_rejects_voice_id_when_no_speaker_source_exists() {
+    fn native_backend_rejects_voice_id_when_shared_embedder_is_missing() {
         // Flattened into one multi-key override instead of nesting
         // `with_forced_cpu_backend_for_test` inside a second env guard: the
         // process env lock is not reentrant, so two nested guards on the same
@@ -2545,8 +2549,9 @@ mod tests {
                 ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
             ],
             || {
-                // Hermetic: the run-time gate probes the host's installed
-                // ReDimNet2-B6 pack, so pin the lookup to an empty home.
+                // Every Voice ID route needs the shared acoustic identity
+                // space, so the runtime must stop before loading either the ASR
+                // model or the external segmenter when ReDim is absent.
                 let runtime_path = temp.path().join("whisper-runtime.gguf");
                 let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
                 write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
@@ -2559,8 +2564,8 @@ mod tests {
 
                 let error = backend.transcribe(request).unwrap_err().to_string();
 
-                assert!(error.contains("local speaker segmenter pack"));
-                assert!(error.contains("pyannote-segmentation-3.0"));
+                assert!(error.contains("ReDimNet2-B6"), "{error}");
+                assert!(error.contains("redimnet2-b6-cn"), "{error}");
             },
         );
     }
