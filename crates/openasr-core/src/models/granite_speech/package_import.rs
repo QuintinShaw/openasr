@@ -13,12 +13,16 @@
 //! deeply nested `projector.qformer.encoder.layer.{i}....` names overflow
 //! that (up to 72 bytes), so just that one prefix is shortened to
 //! `projector.qf.{i}.` in the pack (see `remap_tensor_name`'s doc comment).
-//! 1-D tensors (norms, biases, the BatchNorm stats, the rel-pos-emb table's
-//! row width, the `projector.query` parameter) are stored F32; every 2-D+
-//! matmul/conv weight is stored F16. The four
-//! Granite-architecture scaling scalars (`attention_multiplier`,
-//! `embedding_multiplier`, `residual_multiplier`, `logits_scaling`) and every
-//! other decoder/encoder/projector shape hparam land in GGUF metadata as
+//! 1-D tensors (norms, biases, the BatchNorm stats) are stored F32; every 2-D+
+//! matmul/conv weight is stored F16. Rank-2 tensors are written with ggml
+//! dims (`[ne0=in, ne1=out]`): safetensors carries PyTorch row-major
+//! `[out, in]` bytes, which are already the correct flat layout for ggml
+//! `mul_mat`, so the converter only **relabels** the two extents (no byte
+//! transpose). Rank-3+ tensors (depthwise conv kernels, `projector.query`)
+//! keep their source shape verbatim. The four Granite-architecture scaling
+//! scalars (`attention_multiplier`, `embedding_multiplier`,
+//! `residual_multiplier`, `logits_scaling`) and every other
+//! decoder/encoder/projector shape hparam land in GGUF metadata as
 //! stringified numbers (this writer's `GgufWriteValue` has no native float
 //! variant; `insert_metadata` accepts any `ToString`, so this is the
 //! established convention other families already use for non-integer hparams).
@@ -211,8 +215,21 @@ fn tensor_type_for_rank(shape: &[u64]) -> GgufWriteTensorType {
     }
 }
 
+/// `[out, in]` safetensors row-major -> ggml `[in, out]` on-disk dims: reverse
+/// the two extents, keep the flat byte layout. Same convention every other
+/// importer in this crate uses for 2-D `Linear` / embedding weights so the
+/// keep-quantized zero-copy path can bind pack tensors without a reshape.
+fn ggml_dims_for_pack(shape: &[u64]) -> Vec<u64> {
+    if shape.len() == 2 {
+        vec![shape[1], shape[0]]
+    } else {
+        shape.to_vec()
+    }
+}
+
 fn make_write_tensor(name: String, shape: Vec<u64>, values: Vec<f32>) -> GgufWriteTensor {
-    let tensor_type = tensor_type_for_rank(&shape);
+    let dims = ggml_dims_for_pack(&shape);
+    let tensor_type = tensor_type_for_rank(&dims);
     match tensor_type {
         GgufWriteTensorType::F32 => {
             let mut bytes = Vec::with_capacity(values.len() * 4);
@@ -221,7 +238,7 @@ fn make_write_tensor(name: String, shape: Vec<u64>, values: Vec<f32>) -> GgufWri
             }
             GgufWriteTensor {
                 name,
-                dims: shape,
+                dims,
                 tensor_type: GgufWriteTensorType::F32,
                 data: bytes,
             }
@@ -230,7 +247,7 @@ fn make_write_tensor(name: String, shape: Vec<u64>, values: Vec<f32>) -> GgufWri
             let bits: Vec<u16> = values.iter().copied().map(f32_to_f16_bits).collect();
             GgufWriteTensor {
                 name,
-                dims: shape,
+                dims,
                 tensor_type: GgufWriteTensorType::F16,
                 data: encode_f16_bits_le(bits),
             }
@@ -625,6 +642,22 @@ mod tests {
         path.join(SOURCE_INDEX_JSON).exists().then_some(path)
     }
 
+    #[test]
+    fn ggml_dims_for_pack_reverses_rank2_only() {
+        // Linear / embedding: safetensors [out, in] -> ggml [in, out].
+        assert_eq!(ggml_dims_for_pack(&[1024, 160]), vec![160, 1024]);
+        assert_eq!(
+            ggml_dims_for_pack(&[100353, 2048]),
+            vec![2048, 100353]
+        );
+        // Square is a no-op on the extents.
+        assert_eq!(ggml_dims_for_pack(&[1024, 1024]), vec![1024, 1024]);
+        // Bias / norm stays 1-D; depthwise conv / projector.query stay rank-3+.
+        assert_eq!(ggml_dims_for_pack(&[1024]), vec![1024]);
+        assert_eq!(ggml_dims_for_pack(&[1024, 1, 31]), vec![1024, 1, 31]);
+        assert_eq!(ggml_dims_for_pack(&[1, 3, 1024]), vec![1, 3, 1024]);
+    }
+
     /// End-to-end converter smoke test + sampled tensor parity: converts the
     /// real checkpoint to a scratch `.oasr`, then re-reads a handful of
     /// tensors from every carried segment (encoder / projector / decoder) and
@@ -670,10 +703,12 @@ mod tests {
             let (shape, expected) = source.read_f32(name).unwrap_or_else(|e| {
                 panic!("source tensor '{name}' missing (a `lm_head.weight` may be tied to the embedding on this checkpoint -- adjust sample list if so): {e}")
             });
-            let shape_u64 = shape.clone();
+            // Pack stores ggml dims (`[in, out]` for rank-2); the flat f32
+            // payload is still the safetensors row-major byte order.
+            let pack_shape = ggml_dims_for_pack(&shape);
             let packed_name = remap_tensor_name(name);
             let actual = reader
-                .host_tensor_f32_copy_dequantized_by_name(&packed_name, &shape_u64)
+                .host_tensor_f32_copy_dequantized_by_name(&packed_name, &pack_shape)
                 .unwrap_or_else(|e| panic!("read back '{packed_name}' (from '{name}'): {e}"));
             assert_eq!(actual.len(), expected.len(), "'{name}' length mismatch");
             let is_f32 = shape.len() < 2;
