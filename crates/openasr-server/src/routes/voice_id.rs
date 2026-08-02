@@ -150,7 +150,7 @@ pub(crate) async fn enroll_person(
                 parsed.display_name,
                 parsed.consent,
                 parsed.clips,
-                embedder,
+                embedder.as_ref(),
                 &identity,
                 parsed.color_preference,
                 idempotency,
@@ -163,7 +163,7 @@ pub(crate) async fn enroll_person(
             parsed.display_name,
             parsed.consent,
             parsed.clips,
-            embedder,
+            embedder.as_ref(),
             &identity,
             parsed.color_preference,
         )
@@ -201,7 +201,7 @@ pub(crate) async fn enroll_person_from_source_audio(
                 parsed.display_name,
                 parsed.consent,
                 vec![parsed.clip],
-                embedder,
+                embedder.as_ref(),
                 &identity,
                 parsed.color_preference,
                 idempotency,
@@ -214,7 +214,7 @@ pub(crate) async fn enroll_person_from_source_audio(
             parsed.display_name,
             parsed.consent,
             vec![parsed.clip],
-            embedder,
+            embedder.as_ref(),
             &identity,
             parsed.color_preference,
         )
@@ -252,7 +252,7 @@ pub(crate) async fn add_sample_from_source_audio(
                 parsed.consent,
                 &parsed.pcm,
                 parsed.capture_context,
-                embedder,
+                embedder.as_ref(),
                 &identity,
                 idempotency,
             )
@@ -266,7 +266,7 @@ pub(crate) async fn add_sample_from_source_audio(
             parsed.consent,
             &parsed.pcm,
             parsed.capture_context,
-            embedder,
+            embedder.as_ref(),
             &identity,
         )
         .map_err(voice_id_service_error)?,
@@ -360,7 +360,7 @@ pub(crate) async fn add_sample(
                 parsed.consent,
                 &parsed.pcm,
                 parsed.capture_context,
-                embedder,
+                embedder.as_ref(),
                 &identity,
                 idempotency,
             )
@@ -374,7 +374,7 @@ pub(crate) async fn add_sample(
             parsed.consent,
             &parsed.pcm,
             parsed.capture_context,
-            embedder,
+            embedder.as_ref(),
             &identity,
         )
         .map_err(voice_id_service_error)?,
@@ -991,11 +991,14 @@ pub(crate) fn open_voice_id_store(
 }
 
 pub(crate) fn active_space() -> Option<openasr_core::diarize::voice_id::EmbeddingSpace> {
-    let identity = openasr_core::diarize::embed::shared_embedder_identity()?;
     let embedder = openasr_core::diarize::embed::shared_embedder()?;
+    // Derive both values from one pinned pack snapshot. Resolving the identity
+    // independently can observe a path replacement between the two calls and
+    // pair one model's calibration with another model's content identity.
+    let identity = embedder.identity()?;
     Some(
         openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(
-            identity,
+            &identity,
             embedder.calibration_profile(),
         ),
     )
@@ -1003,7 +1006,7 @@ pub(crate) fn active_space() -> Option<openasr_core::diarize::voice_id::Embeddin
 
 fn active_embedder_and_identity() -> Result<
     (
-        &'static dyn openasr_core::diarize::embed::SpeakerEmbedder,
+        std::sync::Arc<dyn openasr_core::diarize::embed::SpeakerEmbedder>,
         openasr_core::diarize::embed::SpeakerEmbedderIdentity,
     ),
     ApiError,
@@ -1013,13 +1016,14 @@ fn active_embedder_and_identity() -> Result<
             openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
         )
     })?;
-    let identity = openasr_core::diarize::embed::shared_embedder_identity()
-        .cloned()
-        .ok_or_else(|| {
-            ApiError::BadRequest(
-                openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
-            )
-        })?;
+    // Keep the Arc and identity coupled to the exact same resolved pack for
+    // the full enrollment operation; the configured path may be replaced by
+    // an installer while this request is in flight.
+    let identity = embedder.identity().ok_or_else(|| {
+        ApiError::BadRequest(
+            openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
+        )
+    })?;
     Ok((embedder, identity))
 }
 

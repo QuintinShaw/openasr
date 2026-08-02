@@ -67,6 +67,11 @@ pub(crate) struct WsSession {
     pub(crate) history_duration_ms: u64,
     pub(crate) history_recorded: bool,
     pub(crate) record_history: bool,
+    /// Product scope guard: remote-compute clients may transcribe audio but
+    /// cannot consult this daemon's local voice-profile library. This is
+    /// independent of history retention even though both are disabled for the
+    /// current remote-compute transport.
+    pub(crate) voice_id_allowed: bool,
     pub(crate) backend_failed: bool,
     pub(crate) closed: bool,
     pub(crate) captured_audio_frames: VecDeque<RealtimeAudioFrame>,
@@ -637,11 +642,22 @@ impl WsSession {
         Self::new_with_history(runtime, distribution, event_sender, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_history(
         runtime: ServerRuntime,
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
         record_history: bool,
+    ) -> Self {
+        Self::new_with_client_policy(runtime, distribution, event_sender, record_history, true)
+    }
+
+    pub(crate) fn new_with_client_policy(
+        runtime: ServerRuntime,
+        distribution: DistributionContext,
+        event_sender: mpsc::Sender<RealtimeEventEnvelope>,
+        record_history: bool,
+        voice_id_allowed: bool,
     ) -> Self {
         let (audio_frames, audio_frame_receiver) = mpsc::channel(AUDIO_FRAME_QUEUE_CAPACITY);
         let format = RealtimeAudioFormat::pcm16_mono_16khz();
@@ -688,6 +704,7 @@ impl WsSession {
             history_duration_ms: 0,
             history_recorded: false,
             record_history,
+            voice_id_allowed,
             backend_failed: false,
             closed: false,
             captured_audio_frames: VecDeque::new(),
@@ -987,6 +1004,15 @@ impl WsSession {
             return Err(());
         }
         let diarize = session.diarize.unwrap_or(false);
+        if diarize && !self.voice_id_allowed {
+            self.emit_error(
+                RealtimeErrorCode::StartupConfigError,
+                "Voice ID is available only for local file transcription; remote-compute realtime sessions must omit diarize=true.",
+                false,
+            )
+            .await?;
+            return Err(());
+        }
         if diarize && !capabilities.diarization.supported {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
@@ -2327,14 +2353,20 @@ impl WsSession {
     /// task and back, so per-session centroid state stays single-owner; if
     /// the task panics, diarization disables for the rest of the session
     /// instead of risking misaligned labels.
-    async fn assign_speaker_off_loop(
+    pub(super) async fn assign_speaker_off_loop(
         &mut self,
         samples: Vec<f32>,
         path: openasr_core::diarize::streaming::StreamingDiarizePath,
     ) -> Option<openasr_core::diarize::enrollment::SpeakerDisplayAssignment> {
         let mut diarizer = self.streaming_diarizer.take()?;
+        let control = Arc::clone(&self.backend_control);
         match tokio::task::spawn_blocking(move || {
-            let assignment = if samples.is_empty() {
+            // ReDimNet dispatches its resident runners onto a dedicated Rayon
+            // pool. Arm this blocking owner thread with the session control so
+            // the embedder can inherit the same per-job cancel flag onto those
+            // worker threads and abort an in-flight ggml graph promptly.
+            let _abort_guard = control.arm_for_native_decode();
+            let assignment = if samples.is_empty() || control.is_canceled() {
                 None
             } else {
                 diarizer.assign_with_path(&samples, 16_000, path)
@@ -2354,7 +2386,7 @@ impl WsSession {
         }
     }
 
-    async fn detect_native_speaker_change_off_loop(
+    pub(super) async fn detect_native_speaker_change_off_loop(
         &mut self,
     ) -> Option<openasr_core::diarize::streaming::StreamingSpeakerChange> {
         let mut detector = self.native_speaker_change_detector.take()?;
@@ -2363,8 +2395,15 @@ impl WsSession {
             return None;
         }
         let samples = self.native_diarize_samples.clone();
+        let control = Arc::clone(&self.backend_control);
         match tokio::task::spawn_blocking(move || {
-            let change = detector.analyze(&samples);
+            // Keep speaker-change embeddings under the same cancel scope as
+            // terminal speaker assignment; both ultimately execute ReDimNet
+            // graphs on its dedicated worker pool.
+            let _abort_guard = control.arm_for_native_decode();
+            let change = (!control.is_canceled())
+                .then(|| detector.analyze(&samples))
+                .flatten();
             (detector, change)
         })
         .await

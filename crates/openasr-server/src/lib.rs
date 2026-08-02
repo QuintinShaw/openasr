@@ -97,7 +97,9 @@ const SERVER_INSTANCE_TOKEN_ENV: &str = "OPENASR_SERVER_INSTANCE_TOKEN";
 const MAX_CONCURRENT_PULL_JOBS_PER_HOME: usize = 1;
 const PULL_JOB_PROGRESS_PERSIST_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const PULL_JOB_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
 pub(crate) const REMOTE_COMPUTE_HEADER: &str = "x-openasr-remote-compute";
+#[cfg(test)]
 pub(crate) const REMOTE_COMPUTE_CLIENT_VALUE: &str = "client";
 
 static ATOMIC_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);

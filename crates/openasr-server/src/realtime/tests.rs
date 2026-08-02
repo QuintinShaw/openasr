@@ -3874,6 +3874,40 @@ async fn session_start_rejects_diarize_without_embedder_pack() {
     }
 }
 
+#[tokio::test]
+async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_client_policy(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        false,
+    );
+    static EMBEDDER: FixedSpeakerEmbedder = FixedSpeakerEmbedder;
+    session.test_streaming_diarizer_embedder = Some(&EMBEDDER);
+
+    let result = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            diarize: Some(true),
+            ..StartSession::default()
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert!(session.streaming_diarizer.is_none());
+    let event = event_receiver.recv().await.unwrap();
+    match event.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
+            assert_eq!(code, RealtimeErrorCode::StartupConfigError);
+            assert!(message.contains("available only for local file transcription"));
+            assert!(message.contains("omit diarize=true"));
+        }
+        other => panic!("expected startup config error, got {other:?}"),
+    }
+}
+
 #[test]
 fn hymt2_translation_worker_permit_lives_until_worker_exits() {
     let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap());
@@ -5557,6 +5591,67 @@ impl openasr_core::diarize::embed::SpeakerEmbedder for FixedSpeakerEmbedder {
     }
 }
 
+/// Cancels the owning realtime session from inside `embed`, then delegates to
+/// a default `embed_batch` implementation. That default method observes only
+/// the ggml per-job cancel publication, so it is a deterministic probe for the
+/// `spawn_blocking` owner's `arm_for_native_decode` guard rather than merely a
+/// second read of `TranscriptionControl::is_canceled`.
+struct CancelInsideEmbedProbe {
+    control: Arc<openasr_core::TranscriptionControl>,
+    delegated_calls: Arc<AtomicUsize>,
+}
+
+struct CountingDelegatedEmbedder<'a> {
+    calls: &'a AtomicUsize,
+}
+
+impl openasr_core::diarize::embed::SpeakerEmbedder for CountingDelegatedEmbedder<'_> {
+    fn embed(
+        &self,
+        _samples: &[f32],
+        _sample_rate_hz: u32,
+    ) -> Result<
+        openasr_core::diarize::contract::SpeakerEmbedding,
+        openasr_core::diarize::embed::EmbedError,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(openasr_core::diarize::contract::SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+    }
+
+    fn embedding_dim(&self) -> usize {
+        2
+    }
+}
+
+impl openasr_core::diarize::embed::SpeakerEmbedder for CancelInsideEmbedProbe {
+    fn embed(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+    ) -> Result<
+        openasr_core::diarize::contract::SpeakerEmbedding,
+        openasr_core::diarize::embed::EmbedError,
+    > {
+        self.control.request_cancel();
+        let delegated = CountingDelegatedEmbedder {
+            calls: self.delegated_calls.as_ref(),
+        };
+        let clips = [samples];
+        openasr_core::diarize::embed::SpeakerEmbedder::embed_batch(
+            &delegated,
+            &clips,
+            sample_rate_hz,
+        )
+        .into_iter()
+        .next()
+        .expect("one cancellation probe input produces one result")
+    }
+
+    fn embedding_dim(&self) -> usize {
+        2
+    }
+}
+
 struct PolaritySpeakerEmbedder;
 
 impl openasr_core::diarize::embed::SpeakerEmbedder for PolaritySpeakerEmbedder {
@@ -5606,6 +5701,61 @@ impl openasr_core::diarize::embed::SpeakerEmbedder for ThreeSpeakerEmbedder {
     fn embedding_dim(&self) -> usize {
         3
     }
+}
+
+#[tokio::test]
+async fn realtime_speaker_assignment_blocking_task_publishes_session_cancel() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let delegated_calls = Arc::new(AtomicUsize::new(0));
+    let probe = Box::leak(Box::new(CancelInsideEmbedProbe {
+        control: Arc::clone(&session.backend_control),
+        delegated_calls: Arc::clone(&delegated_calls),
+    }));
+    session.streaming_diarizer =
+        Some(openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(probe, 16_000));
+
+    let assignment = session
+        .assign_speaker_off_loop(
+            vec![0.1; 16_000 * 3],
+            openasr_core::diarize::streaming::StreamingDiarizePath::Native,
+        )
+        .await;
+
+    assert!(session.backend_control.is_canceled());
+    assert!(assignment.is_none());
+    assert_eq!(
+        delegated_calls.load(Ordering::SeqCst),
+        0,
+        "the nested embedder must observe the blocking owner's published cancel flag"
+    );
+}
+
+#[tokio::test]
+async fn realtime_speaker_change_blocking_task_publishes_session_cancel() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let delegated_calls = Arc::new(AtomicUsize::new(0));
+    let probe = Box::leak(Box::new(CancelInsideEmbedProbe {
+        control: Arc::clone(&session.backend_control),
+        delegated_calls: Arc::clone(&delegated_calls),
+    }));
+    session.native_speaker_change_detector = Some(
+        openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::with_embedder(
+            probe, 16_000,
+        ),
+    );
+    session.native_diarize_samples = vec![0.1; 16_000 * 5];
+
+    let change = session.detect_native_speaker_change_off_loop().await;
+
+    assert!(session.backend_control.is_canceled());
+    assert!(change.is_none());
+    assert_eq!(
+        delegated_calls.load(Ordering::SeqCst),
+        0,
+        "speaker-change embedding must inherit the same published cancel flag"
+    );
 }
 
 // A stop mid-speech never reaches the VAD SpeechStopped path, so the session
