@@ -46,6 +46,10 @@ FAMILY_DOC_KEYWORDS = {
     "firered-aed": "firered",
     "firered2-llm": "fireredasr2-llm",
     "mimo-asr": "mimo",
+    # FAQ/ACK prose uses hyphenated / spaced display names, not bare family ids.
+    "funasr-nano": "fun-asr-nano",
+    "granite-speech": "granite speech",
+    "moss-transcribe-diarize": "moss-transcribe-diarize",
 }
 
 WORD_TO_NUMBER = {

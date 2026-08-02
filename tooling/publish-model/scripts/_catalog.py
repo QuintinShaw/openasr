@@ -315,12 +315,19 @@ LANG_BY_FAMILY = {
     # &["zh", "en", "yue"] } arch descriptor). "yue" is a base ISO 639-3 code
     # (Cantonese), not a dialect subtag.
     "mimo-asr": ["en", "yue", "zh"],
-    # moss-transcribe-diarize / funasr-nano / granite-speech are intentionally
-    # NOT listed here (their entries carry an explicit `languages` override
-    # instead) so the user-facing "N model families" doc counts
-    # (check_family_count_strings) do not move before each family's public
-    # flip -- same staging convention used for firered2-llm/mimo-asr in
-    # c847ae2.
+    # moss-transcribe-diarize: conservative list from models-core.toml -- the
+    # upstream card's unenumerated "50+" claim is NOT mirrored; only languages
+    # with a concrete source (Mandarin meeting benchmarks + the 14 languages
+    # named for the 2nd MLC-SLM Challenge result).
+    "moss-transcribe-diarize": [
+        "de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "th", "tl", "tr",
+        "ur", "vi", "zh",
+    ],
+    # funasr-nano: FixedMultilingual zh+en (arch descriptor; upstream card also
+    # mentions Japanese, but the runtime only ships the zh+en fixed set).
+    "funasr-nano": ["en", "zh"],
+    # granite-speech: upstream trained-language list (en/fr/de/es/pt/ja).
+    "granite-speech": ["de", "en", "es", "fr", "ja", "pt"],
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`
