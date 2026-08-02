@@ -90,21 +90,32 @@ Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`). Off
 
 ### Docker
 
-Published images track each core release on Docker Hub (binary + model-registry
-metadata only; pull models at runtime into a volume mounted at `/data`):
+Published images track each core release on
+[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr) (binary +
+model-registry metadata only; pull models at runtime into a volume mounted at
+`/data`). The HTTP server never auto-downloads a pack — install one first:
 
 ```bash
 docker pull quintinshaw/openasr:latest
-docker run --rm -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker run --rm -d --name openasr \
+  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker exec openasr openasr pull whisper-small --yes
 
-# NVIDIA GPU (requires NVIDIA Container Toolkit)
+# NVIDIA GPU (requires NVIDIA Container Toolkit; sm_75 / Turing+)
 docker pull quintinshaw/openasr:cuda-latest
-docker run --rm --gpus all -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+docker run --rm -d --name openasr-cuda --gpus all \
+  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
 ```
 
-CPU images are multi-arch (`linux/amd64`, `linux/arm64`). CUDA images are
-`linux/amd64` only (Turing / sm_75 and newer). For local source builds see
-`Dockerfile` / `Dockerfile.cuda` and `compose.yaml`.
+| Tag | Platforms | Notes |
+| --- | --- | --- |
+| `latest`, `<version>`, `sha-<short>` | `linux/amd64`, `linux/arm64` | CPU |
+| `cuda-latest`, `cuda-<version>`, `cuda-sha-<short>` | `linux/amd64` | CUDA 13.2 runtime; fail-closed if no GPU is visible |
+
+Vulkan, ROCm, and musl builds ship as GitHub Release archives only (not as
+images). Local source builds: `Dockerfile` / `Dockerfile.cuda` and
+`compose.yaml`. Longer guide (tags, compose, networking):
+[openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ### Building from source
 

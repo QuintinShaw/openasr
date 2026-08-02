@@ -19,9 +19,13 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | [Catalog Forward Compatibility and Client Resilience](CATALOG_COMPATIBILITY.md) | What a running build must do with a catalog from a different epoch: fail-closed boundary (signature/epoch rollback/schema-major/required fields) vs. must-tolerate degradation (unknown language codes, unknown kind/license_class/capability role -> hide the entry, not the catalog); the epoch floor's narrower boot-local-candidate exception; the verify-then-persist + cache/embedded fallback chain; the `catalog_degraded` status surface (`doctor`, `/health`); and the 2026-07-16 cache-pollution incident this hardens against. |
 | [Known Limitations](KNOWN_LIMITATIONS.md) | Current user-visible limits: no public binary release yet, `.oasr`-only native packs, gated streaming/diarization (declared/capability packs only), generic accelerator selection, and internal-only benchmarks. |
 | [FAQ](FAQ.md) | Current-behavior questions: what OpenASR is, which families run, which backends are active, and the conservative offline transcription lane. |
-| [Releasing](../RELEASING.md) | The commit-driven release process: the single workspace version, `scripts/bump-version.sh`, and the version-triggered `Release core` workflow. |
+| [Releasing](../RELEASING.md) | The commit-driven release process: the single workspace version, `scripts/bump-version.sh`, the version-triggered `Release core` workflow, and the post-release Docker Hub image push (`docker-release.yml`). |
 | [Agent Integration](AGENT_INTEGRATION.md) | How a coding agent uses OpenASR: the `skills/openasr` Skill (CLI path) and the local OpenAI-compatible HTTP API, including `openasr apikey` for opt-in loopback authentication. |
 | [Default Model Resolution](default-model-resolution.md) | The single-authority `default_selection` resolver (fail-closed, `config.json` + `default.json` pointer, three-state result) that the server, CLI, and any future shell must all read/write through -- no second resolver, no fabricated defaults. |
+
+User-facing Docker install/run guide (tags, GPU, volumes, pull-before-serve):
+[openasr.org/docs/docker](https://openasr.org/docs/docker/). The short form lives
+in the root [README](../README.md#docker).
 
 ## Format contracts (`docs/format/`)
 

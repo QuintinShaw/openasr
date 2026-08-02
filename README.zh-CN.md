@@ -90,18 +90,32 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 
 ### Docker
 
-每个 core release 会同步发布到 Docker Hub(仅二进制 + model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷):
+每个 core release 会同步发布到
+[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr)(仅二进制 +
+model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷)。HTTP 服务
+**不会**自动下载模型——先显式安装:
 
 ```bash
 docker pull quintinshaw/openasr:latest
-docker run --rm -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker run --rm -d --name openasr \
+  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker exec openasr openasr pull whisper-small --yes
 
-# NVIDIA GPU(需要 NVIDIA Container Toolkit)
+# NVIDIA GPU(需要 NVIDIA Container Toolkit; sm_75 / Turing 及以上)
 docker pull quintinshaw/openasr:cuda-latest
-docker run --rm --gpus all -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+docker run --rm -d --name openasr-cuda --gpus all \
+  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
 ```
 
-CPU 镜像为 multi-arch(`linux/amd64`、`linux/arm64`)。CUDA 镜像仅 `linux/amd64`(Turing / sm_75 及以上)。本地源码构建见 `Dockerfile` / `Dockerfile.cuda` 与 `compose.yaml`。
+| 标签 | 平台 | 说明 |
+| --- | --- | --- |
+| `latest`、`<version>`、`sha-<short>` | `linux/amd64`、`linux/arm64` | CPU |
+| `cuda-latest`、`cuda-<version>`、`cuda-sha-<short>` | `linux/amd64` | CUDA 13.2 runtime;看不到 GPU 时失败即停 |
+
+Vulkan / ROCm / musl 变体只以 GitHub Release 压缩包形式提供(不做镜像)。本地
+源码构建见 `Dockerfile` / `Dockerfile.cuda` 与 `compose.yaml`。更完整的标签、
+组网与 compose 说明:
+[openasr.org/docs/docker](https://openasr.org/docs/docker/)。
 
 ### 从源码构建
 

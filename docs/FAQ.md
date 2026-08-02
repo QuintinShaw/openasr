@@ -145,9 +145,24 @@ Model packs are distributed separately under their own upstream licenses. See
 
 ## Are official installers/releases available?
 
-Not yet. Public binary-release readiness (signed, checksummed release artifacts
-and package-manager channels) remains deferred. Build from source meanwhile — see
-the README and CONTRIBUTING.
+Yes for the open-core CLI and local server. Each core release publishes
+checksummed archives on
+[GitHub Releases](https://github.com/QuintinShaw/openasr/releases) (macOS,
+Linux, Windows, plus CUDA/ROCm/Vulkan/musl variants where applicable) and
+matching runtime images on
+[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr) (`latest` /
+`<version>` for CPU multi-arch, `cuda-latest` / `cuda-<version>` for CUDA
+amd64). The separate macOS/Windows desktop apps ship from
+[openasr.org/download](https://openasr.org/download/).
+
+## Is there an official Docker image?
+
+Yes. `quintinshaw/openasr` on Docker Hub. Images contain the release binary and
+model-registry metadata only — mount a volume at `/data`, then
+`docker exec … openasr pull <model> --yes` before calling the HTTP API. The
+server never auto-pulls. CUDA tags require the NVIDIA Container Toolkit and
+refuse to start if no GPU is visible. Longer guide:
+[openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?
 
