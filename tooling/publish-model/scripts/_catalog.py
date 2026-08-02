@@ -315,11 +315,12 @@ LANG_BY_FAMILY = {
     # &["zh", "en", "yue"] } arch descriptor). "yue" is a base ISO 639-3 code
     # (Cantonese), not a dialect subtag.
     "mimo-asr": ["en", "yue", "zh"],
-    # moss-transcribe-diarize is intentionally NOT listed here (its entry
-    # carries an explicit `languages` override instead) so the user-facing "N
-    # model families" doc counts (check_family_count_strings) do not move
-    # before this family's public flip -- same staging convention used for
-    # firered2-llm/mimo-asr in c847ae2.
+    # moss-transcribe-diarize / funasr-nano / granite-speech are intentionally
+    # NOT listed here (their entries carry an explicit `languages` override
+    # instead) so the user-facing "N model families" doc counts
+    # (check_family_count_strings) do not move before each family's public
+    # flip -- same staging convention used for firered2-llm/mimo-asr in
+    # c847ae2.
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`
@@ -376,6 +377,12 @@ LANGUAGE_MODE_BY_FAMILY = {
     # decoder auto-detects/produces the transcript language through free-text
     # instruction-following (no dedicated language token), same shape as qwen.
     "moss-transcribe-diarize": "detect_implicit",
+    # Fun-ASR-Nano: FixedMultilingual -- fixed zh+en Qwen3 BPE vocab, no
+    # per-request language selection or decode-time LID token.
+    "funasr-nano": "fixed_multilingual",
+    # Granite Speech: SelfDetectsRejectsHint -- free-text instruction-following
+    # auto-detects language (no dedicated language token), same shape as qwen.
+    "granite-speech": "detect_implicit",
 }
 
 # SpecifyOnly's conditioned default, mirroring the `default_language` literal
@@ -506,6 +513,13 @@ PUNCTUATION_BY_FAMILY = {
     # enough real transcripts to assert as a capability yet (arch descriptor
     # declares emits_punctuation: None -- see arch/mod.rs) -- unclaimed.
     "moss-transcribe-diarize": None,
+    # funasr-nano: stock Qwen3 ChatML decode can emit punctuation, but no
+    # punctuation-suppression behavior has been separately characterized
+    # (arch descriptor declares emits_punctuation: None) -- unclaimed.
+    "funasr-nano": None,
+    # granite-speech: observed punctuated on family goldens; arch descriptor
+    # declares emits_punctuation: Some(true) -- see arch/mod.rs.
+    "granite-speech": True,
 }
 
 

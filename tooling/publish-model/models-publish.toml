@@ -435,3 +435,33 @@ required_source_files = [
     "model.safetensors.index.json", "model*.safetensors",
 ]
 import_command = "model-pack import moss {src} {out} --package-id {registry_id} --quantization {quant}"
+
+# Fun-ASR-Nano: ExternalTooling path. The published packs already exist under
+# the golden workdir; convert.sh is not re-run for this private HF staging.
+# Provenance for a future full pipeline rebuild: pt->safetensors via
+# funasr_nano_pt_to_safetensors.py, then the Rust package_import quantize/pack.
+["funasr-nano"]
+import_subcommand = "external: tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py"
+upstream_repo = "FunAudioLLM/Fun-ASR-Nano-2512"
+source_revision = "main"
+needs_license_flags = false
+required_download_files = ["model.pt", "config.yaml"]
+required_source_files = ["model.pt", "config.yaml"]
+
+# Granite Speech 4.1 2B: CoreConvert symbol
+# convert_local_granite_speech_source_to_runtime_pack (no CLI import subcommand
+# yet). Packs for this private HF staging were produced offline; a future
+# pipeline rebuild wires the CoreConvert surface through convert.sh.
+["granite-speech-4.1-2b"]
+import_subcommand = "core: convert_local_granite_speech_source_to_runtime_pack"
+upstream_repo = "ibm-granite/granite-speech-4.1-2b"
+source_revision = "main"
+needs_license_flags = false
+required_download_files = [
+    "config.json", "tokenizer.json", "vocab.json", "merges.txt",
+    "model.safetensors.index.json", "model*.safetensors",
+]
+required_source_files = [
+    "config.json", "tokenizer.json", "vocab.json", "merges.txt",
+    "model.safetensors.index.json", "model*.safetensors",
+]

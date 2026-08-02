@@ -1,0 +1,45 @@
+# Per-model card prose for openasr/granite-speech-4.1-2b. Distilled from the
+# upstream ibm-granite/granite-speech-4.1-2b Hugging Face model card and this
+# repo's own frozen en-eval measurements (docs/model-audits/granite-speech.md:
+# en WER 0.54% on fp16/q8_0/q4_k). Upstream license = Apache-2.0. Keep every
+# factual claim to what those two sources state.
+
+tagline = "IBM Granite Speech 4.1 — a 2B multilingual ASR model with strong English accuracy"
+
+highlights = [
+  "📊 **Verified English WER: 0.54%** — identical across fp16 / q8_0 / q4_k on OpenASR's frozen evaluation set",
+  "🌐 **Six trained languages** — English, French, German, Spanish, Portuguese, Japanese (auto-detected; no language token)",
+  "📦 **Three quantization tiers: fp16 / q8_0 / q4_k** — delivered in OpenASR's native .oasr format for local inference",
+  "🦀 **Native in OpenASR** — .oasr packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+intro = """
+Granite Speech 4.1 2B is a speech-recognition model from IBM Granite. Its
+architecture pairs a 16-layer Conformer audio encoder with a Q-Former projector
+feeding a 2B Granite decoder. The model auto-detects the source language through
+free-text instruction-following and ships trained coverage for English, French,
+German, Spanish, Portuguese, and Japanese. OpenASR distributes this model in
+three quantization tiers -- fp16, q8_0, and q4_k -- packaged in the native
+`.oasr` runtime format for local inference.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **granite-speech-4.1-2b**, created and released by
+**IBM Granite**
+([ibm-granite/granite-speech-4.1-2b](https://huggingface.co/ibm-granite/granite-speech-4.1-2b))
+under the [Apache License 2.0](https://huggingface.co/ibm-granite/granite-speech-4.1-2b/blob/main/LICENSE).
+OpenASR performs format conversion, quantization, runtime validation, and local-inference
+adaptation only; all model weights and training are the work of the original authors.
+"""
+
+[prose_locales."zh-CN"]
+tagline = "IBM Granite Speech 4.1——2B 多语言语音识别，英文精度突出"
+
+highlights = [
+  "📊 **实测英文词错率 0.54%** — fp16 / q8_0 / q4_k 三档在 OpenASR 固定评测集上结果一致",
+  "🌐 **覆盖 6 种训练语言** — 英、法、德、西、葡、日（自动识别，无需选语言）",
+  "📦 **fp16 / q8_0 / q4_k 三档量化可选** — OpenASR 原生 .oasr 格式，本地推理",
+  "🦀 **OpenASR 原生支持** — .oasr 本地推理，不依赖 Python，针对 CPU 与 GPU 做了性能优化",
+]
+
+source_sha256 = "5e63e363bcb5bb4b90e524d3bb6a736680b17fbfcc76abe4f3d2b7550d898825"

@@ -823,3 +823,69 @@ recommended_quant = "q8_0"
 upstream_release_date = "2026-07-09"
 min_core_version = "0.1.24"
 min_cli_version = "0.1.24"
+
+# Fun-ASR-Nano (FunAudioLLM/Fun-ASR-Nano-2512, ~0.8B): FunASR SAN-M/DFSMN audio
+# encoder + 2-layer transformer adaptor + stock Qwen3-0.6B decoder. Its own
+# runtime family/architecture (`funasr-nano` / `funasr-nano-sanm-adapter-qwen3`
+# in arch/mod.rs). FixedMultilingual zh+en (no language-selection prompt
+# token); emits_punctuation unclaimed (None). Pack import is ExternalTooling
+# (tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py) then the
+# Rust package_import quantize/pack step. Staged PRIVATE: release_public only
+# gates the eventual `--public` catalog flip (needs a completed
+# docs/model-audits/funasr-nano.md -- already filled); HF upload stays private
+# until a deliberate later flip. languages is an explicit override so
+# LANG_BY_FAMILY does not move the user-facing family-count strings before
+# the public flip (same staging convention as moss-transcribe-diarize).
+["funasr-nano"]
+family = "funasr-nano"
+hf_repo = "OpenASR/funasr-nano"
+release_public = false
+size = "0.8b"
+registry_id = "funasr-nano"
+display_name = "Fun-ASR-Nano"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE"
+license_class = "permissive"
+aliases = ["funasr", "fun-asr-nano"]
+pull_alias = "funasr-nano"
+# Explicit override, lockstep with FixedMultilingual { languages: &["zh","en"] }
+# in arch/mod.rs. Upstream card also mentions Japanese; the runtime arch only
+# ships the zh+en fixed set, so the catalog follows the arch, not marketing.
+languages = ["en", "zh"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+upstream_release_date = "2025-12-01"
+# Runtime first ships with the next core release after 0.1.26; private HF
+# staging is allowed before that bump. Author-set floor for eventual catalog.
+min_core_version = "0.1.27"
+min_cli_version = "0.1.27"
+
+# IBM Granite Speech 4.1 2B (ibm-granite/granite-speech-4.1-2b): 16-layer
+# Conformer encoder + Q-Former projector + 2B Granite decoder. Its own runtime
+# family/architecture (`granite-speech` in arch/mod.rs). SelfDetectsRejectsHint
+# (detect_implicit) -- free-text instruction-following, no language token;
+# emits_punctuation Some(true) (observed on goldens). Pack import is
+# CoreConvert `convert_local_granite_speech_source_to_runtime_pack`. Staged
+# PRIVATE like funasr-nano above; languages is an explicit override so
+# LANG_BY_FAMILY / family-count docs do not move before the public flip.
+["granite-speech-4.1-2b"]
+family = "granite-speech"
+hf_repo = "OpenASR/granite-speech-4.1-2b"
+release_public = false
+size = "2b"
+registry_id = "granite-speech-4.1-2b"
+display_name = "Granite Speech 4.1 2B"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/ibm-granite/granite-speech-4.1-2b/blob/main/LICENSE"
+license_class = "permissive"
+aliases = ["granite-speech", "granite"]
+pull_alias = "granite-speech"
+# Explicit override from the upstream model card's trained-language list
+# (English, French, German, Spanish, Portuguese, Japanese). Do not expand
+# without a concrete per-language source.
+languages = ["de", "en", "es", "fr", "ja", "pt"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+upstream_release_date = "2025-05-01"
+min_core_version = "0.1.27"
+min_cli_version = "0.1.27"

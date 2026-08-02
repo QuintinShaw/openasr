@@ -1,0 +1,45 @@
+# Per-model card prose for openasr/funasr-nano. Distilled from the upstream
+# FunAudioLLM/Fun-ASR-Nano-2512 Hugging Face model card and this repo's own
+# frozen-eval-v1 measurements (docs/model-audits/funasr-nano.md: zh CER 3.03% /
+# en WER 2.57% on the fp16 tier). Upstream license = Apache-2.0. Keep every
+# factual claim to what those two sources state; the runtime ships a fixed
+# zh+en set (arch FixedMultilingual), not the full upstream marketing list.
+
+tagline = "Compact bilingual speech recognition — Mandarin and English in an ~0.8B SAN-M + Qwen3 pack"
+
+highlights = [
+  "📊 **Verified accuracy: 3.03% CER (Chinese), 2.57% WER (English)** — benchmarked by OpenASR on frozen evaluation datasets, not upstream-reported numbers",
+  "🌐 **Fixed bilingual Mandarin + English** — stock Qwen3 BPE vocab, no language-selection prompt needed",
+  "📦 **Three quantization tiers: fp16 / q8_0 / q4_k** — delivered in OpenASR's native .oasr format; encoder floored at Q8_0 on the q4_k tier",
+  "🦀 **Native in OpenASR** — .oasr packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+intro = """
+Fun-ASR-Nano is an ~0.8B-parameter speech-recognition model from FunAudioLLM
+(Fun-ASR-Nano-2512). Its architecture pairs a FunASR SAN-M/DFSMN audio encoder
+with a 2-layer transformer adaptor feeding a stock Qwen3-0.6B decoder. Language
+coverage is a fixed Mandarin + English set. OpenASR distributes this model in
+three quantization tiers -- fp16, q8_0, and q4_k -- packaged in the native
+`.oasr` runtime format for local inference.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Fun-ASR-Nano-2512**, created and released by
+**FunAudioLLM**
+([FunAudioLLM/Fun-ASR-Nano-2512](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512))
+under the [Apache License 2.0](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE).
+OpenASR performs format conversion, quantization, runtime validation, and local-inference
+adaptation only; all model weights and training are the work of the original authors.
+"""
+
+[prose_locales."zh-CN"]
+tagline = "小体积双语语音识别——普通话和英文，约 0.8B 的 SAN-M + Qwen3 组合"
+
+highlights = [
+  "📊 **实测精度：中文字错率 3.03%，英文词错率 2.57%** — 由 OpenASR 在固定评测集上实测，不是上游自报数据",
+  "🌐 **固定覆盖普通话和英文** — 使用 Qwen3 词表，不用单独选语言",
+  "📦 **fp16 / q8_0 / q4_k 三档量化可选** — OpenASR 原生 .oasr 格式；q4_k 档编码器不低于 Q8_0",
+  "🦀 **OpenASR 原生支持** — .oasr 本地推理，不依赖 Python，针对 CPU 与 GPU 做了性能优化",
+]
+
+source_sha256 = "3f49a20767d1fb8148fa42f509caf285931fa5f5cde93b379b0c88393c473991"
