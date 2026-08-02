@@ -214,7 +214,11 @@ const GRANITE_SPEECH_EXECUTOR_ID: &str = "granite-speech-ggml-executor-v1";
 const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
 const GRANITE_SPEECH_DEFAULT_QUESTION: &str =
     "can you transcribe the speech into a written format?";
-const GRANITE_SPEECH_MAX_GENERATED_TOKENS: usize = 256;
+/// Fail-closed backstop against a non-terminating decode -- greedy decode stops
+/// at `<|end_of_text|>` well before this in practice. Also a first-class input
+/// to `capacity::derive_max_input_seconds` (must stay in lockstep with that
+/// derivation's published limit).
+pub(crate) const GRANITE_SPEECH_MAX_GENERATED_TOKENS: usize = 256;
 
 #[derive(Debug, Error)]
 enum GraniteSpeechGgmlExecutorError {
@@ -225,6 +229,17 @@ enum GraniteSpeechGgmlExecutorError {
     },
     #[error("granite-speech ggml executor runtime preflight failed: {reason}")]
     RuntimePreflightFailed { reason: String },
+    #[error(
+        "granite-speech audio duration {seconds:.1}s exceeds the derived {limit:.0}s \
+         single-decode cap (decoder context {ctx} tokens at {rate:.0} audio tokens/s; \
+         longer audio is the shared longform slicer's job)"
+    )]
+    AudioTooLong {
+        seconds: f32,
+        limit: f32,
+        ctx: usize,
+        rate: f32,
+    },
     #[error("granite-speech ggml executor frontend failed: {reason}")]
     FrontendFailed { reason: String },
     #[error("granite-speech ggml executor metadata contract failed: {reason}")]
@@ -239,6 +254,25 @@ enum GraniteSpeechGgmlExecutorError {
     PromptFailed { reason: String },
     #[error("granite-speech ggml executor decode failed: {reason}")]
     DecodeFailed { reason: String },
+}
+
+/// Fail-closed single-decode duration gate. Pure so unit tests can exercise the
+/// typed `AudioTooLong` path without materializing a multi-GB pack. Limit and
+/// rate come from `super::capacity` (derived, not guessed).
+fn ensure_audio_within_capacity(seconds: f32) -> Result<(), GraniteSpeechGgmlExecutorError> {
+    use super::capacity::{
+        GRANITE_SPEECH_DECODER_MAX_POSITIONS, GRANITE_SPEECH_MAX_INPUT_SECONDS,
+        granite_speech_audio_tokens_per_second,
+    };
+    if seconds > GRANITE_SPEECH_MAX_INPUT_SECONDS {
+        return Err(GraniteSpeechGgmlExecutorError::AudioTooLong {
+            seconds,
+            limit: GRANITE_SPEECH_MAX_INPUT_SECONDS,
+            ctx: GRANITE_SPEECH_DECODER_MAX_POSITIONS,
+            rate: granite_speech_audio_tokens_per_second(),
+        });
+    }
+    Ok(())
 }
 
 /// No-op phrase-bias shim: granite-speech applies keyword biasing through its
@@ -285,6 +319,14 @@ impl GraniteSpeechGgmlExecutor {
                 },
             )?;
         let samples = downmix_prepared_audio(&request.prepared_audio);
+        // Duration gate before any frontend / encoder / projector work: the
+        // limit is the decoder-context-derived ceiling in `super::capacity`
+        // (not a magic number). Over-limit fails closed with a typed error --
+        // never silent truncation. Shared longform slicing keeps ordinary
+        // multi-minute work inside 30s windows well under this bound.
+        let audio_duration_seconds =
+            samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
+        ensure_audio_within_capacity(audio_duration_seconds)?;
         let frontend = super::frontend::GraniteSpeechMelFrontend::new();
         let (features, frames) = frontend.extract(&samples).map_err(|error| {
             GraniteSpeechGgmlExecutorError::FrontendFailed {
@@ -538,8 +580,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::api::backend::{
+        DecodeTruncationReason, ExecutionTarget, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
+        TranscriptionBackend, TranscriptionRequest,
+    };
     use crate::models::ggml_asr_executor::GgmlAsrBackendPreference;
     use crate::models::ggml_family_registry::granite_speech_runtime_descriptor_v1;
+    use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStopReason;
+    use crate::{LongFormMode, LongFormOptions};
 
     /// Points at a real converted granite-speech `.oasr` pack via
     /// `OPENASR_GRANITE_SPEECH_PACK`. Loading it mmaps + touches a multi-GB
@@ -564,7 +612,66 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
     }
 
+    fn longform_en_zh_wav_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/longform_en_zh.wav")
+    }
+
     const JFK_REFERENCE_TRANSCRIPT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country";
+    /// Anchor phrase that appears three times in `fixtures/longform_en_zh.wav`
+    /// (EN/ZH/EN/ZH/EN concat of committed short fixtures). Used to detect both
+    /// under-coverage (pathological truncation dropping later EN clips) and
+    /// runaway repetition (the same phrase looping past the fixture's real
+    /// count).
+    const JFK_ANCHOR_PHRASE: &str = "ask not what your country can do for you";
+    const ZH_ANCHOR_PHRASE: &str = "今天天气";
+
+    /// Generation budget backstop the executor hands the shared greedy driver.
+    /// Multi-minute audio is NOT served by raising this -- it is served by the
+    /// SharedWindow longform slicer keeping each buffer inside one decode's
+    /// budget. Pinning the number here keeps the audit form and the code from
+    /// drifting independently.
+    #[test]
+    fn generation_budget_backstop_is_finite_and_not_a_longform_substitute() {
+        // Pin the published backstop: audit form + long-audio degradation gate
+        // assume this exact figure. Multi-minute audio is served by the
+        // SharedWindow slicer, not by raising this into the thousands.
+        const {
+            assert!(GRANITE_SPEECH_MAX_GENERATED_TOKENS == 256);
+            assert!(GRANITE_SPEECH_MAX_GENERATED_TOKENS < 1024);
+        }
+    }
+
+    /// The executor lifts every driver stop reason through
+    /// `into_decode_truncation` so a truncated decode cannot be laundered into a
+    /// normal success. Weight-free contract test: the mapping itself, which is
+    /// the only place a silent-truncation regression can hide on this family.
+    #[test]
+    fn stop_reason_maps_to_visible_decode_truncation() {
+        assert!(
+            Seq2SeqGreedyDecodeStopReason::StopToken
+                .into_decode_truncation(None)
+                .is_none(),
+            "a clean EOT must not mark the transcript truncated"
+        );
+
+        let guard = Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
+            .into_decode_truncation(None)
+            .expect("guard trip must surface");
+        assert_eq!(guard.reason, DecodeTruncationReason::DegenerateRepeatGuard);
+        assert!(Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard.is_truncated());
+
+        let budget = Seq2SeqGreedyDecodeStopReason::BudgetExhausted
+            .into_decode_truncation(None)
+            .expect("budget exhaustion must surface");
+        assert_eq!(budget.reason, DecodeTruncationReason::BudgetExhausted);
+        assert!(Seq2SeqGreedyDecodeStopReason::BudgetExhausted.is_truncated());
+
+        // Granite has no honest intra-decode time anchor (one segment spans the
+        // whole buffer), so the cut point stays None -- same as mimo/firered.
+        // Presence of the truncation entry is the load-bearing signal.
+        assert!(guard.transcript_covers_up_to_seconds.is_none());
+        assert!(budget.transcript_covers_up_to_seconds.is_none());
+    }
 
     /// Runs one full `execute()` against `pack_path` on the requested backend and
     /// returns the transcript. Skips (returns `None`) when the pack is absent.
@@ -622,7 +729,233 @@ mod tests {
         let result = executor
             .execute(&request)
             .expect("granite-speech transcribe");
+        // Single-pass path: a clean EOT leaves decode_truncation unset. If the
+        // driver ever trips the budget/guard on short JFK audio, surface it
+        // rather than silently returning a short "success" string.
+        assert!(
+            result.decode_truncation.is_none(),
+            "short JFK fixture must finish on EOT, not truncate: {:?}",
+            result.decode_truncation
+        );
         Some(result.transcription.text)
+    }
+
+    /// Count case-insensitive non-overlapping occurrences of `needle` in `hay`.
+    fn count_phrase_occurrences(hay: &str, needle: &str) -> usize {
+        let hay_l = hay.to_lowercase();
+        let needle_l = needle.to_lowercase();
+        if needle_l.is_empty() {
+            return 0;
+        }
+        let mut count = 0usize;
+        let mut start = 0usize;
+        while let Some(offset) = hay_l[start..].find(&needle_l) {
+            count += 1;
+            start += offset + needle_l.len();
+        }
+        count
+    }
+
+    /// True when a medium-length token window repeats back-to-back enough times
+    /// to indicate a runaway decode loop rather than ordinary seam overlap.
+    fn has_pathological_token_run(text: &str) -> bool {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        if tokens.len() < 16 {
+            return false;
+        }
+        // 4-token window repeating 6+ times consecutively is not human speech.
+        const WINDOW: usize = 4;
+        const MIN_REPEATS: usize = 6;
+        if tokens.len() < WINDOW * MIN_REPEATS {
+            return false;
+        }
+        let mut i = 0usize;
+        while i + WINDOW * MIN_REPEATS <= tokens.len() {
+            let pattern = &tokens[i..i + WINDOW];
+            let mut repeats = 1usize;
+            let mut cursor = i + WINDOW;
+            while cursor + WINDOW <= tokens.len() && &tokens[cursor..cursor + WINDOW] == pattern {
+                repeats += 1;
+                cursor += WINDOW;
+            }
+            if repeats >= MIN_REPEATS {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Full native longform path (not the low-level single-buffer executor): the
+    /// SharedWindow slicer must split `fixtures/longform_en_zh.wav` (~69s) into
+    /// multiple chunks, assemble a multi-clip transcript without pathological
+    /// repetition, and never claim success while a slice hit the 256-token
+    /// budget or the degenerate-loop guard without recording it on
+    /// `truncated_decodes`.
+    #[test]
+    #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
+                OPENASR_GRANITE_SPEECH_PACK; runs the real native longform path on \
+                fixtures/longform_en_zh.wav (multi-slice, CPU)"]
+    fn longform_multi_slice_avoids_repetition_and_silent_truncation() {
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
+        let audio = longform_en_zh_wav_path();
+        assert!(
+            audio.is_file(),
+            "committed longform fixture missing at {}",
+            audio.display()
+        );
+
+        // Fixed 30s window forces a deterministic multi-slice plan independent of
+        // VAD availability, matching the SharedWindow default chunk length.
+        let longform = LongFormOptions {
+            mode: LongFormMode::Fixed,
+            chunk_seconds: 30.0,
+            // Carry is allowed for granite's Default profile; leave it on so the
+            // test exercises the production-shaped path rather than a carry-off
+            // laboratory mode.
+            carry_prompt_across_slices: true,
+            ..LongFormOptions::default()
+        };
+        let request = TranscriptionRequest::new(audio, NATIVE_RUNTIME_MODEL_ID_AUTO)
+            .with_model_pack_path(Some(pack_path))
+            .with_execution_target(Some(ExecutionTarget::Cpu))
+            .with_longform(Some(longform));
+        let transcription = NativeBackend
+            .transcribe(request)
+            .expect("granite-speech longform native transcribe");
+
+        let longform_meta = transcription
+            .longform
+            .as_ref()
+            .expect("longform metadata must be present on a multi-slice run");
+        assert!(
+            longform_meta.chunk_count >= 2,
+            "69s fixture must slice under the 30s SharedWindow, got chunk_count={}",
+            longform_meta.chunk_count
+        );
+
+        let text = transcription.text.trim();
+        assert!(!text.is_empty(), "longform transcript must be non-empty");
+        eprintln!(
+            "granite-speech longform: chunk_count={} truncated={} text_chars={} text={text:?}",
+            longform_meta.chunk_count,
+            transcription.is_truncated(),
+            text.len(),
+        );
+
+        // Truncation visibility: either every slice finished on EOT (happy path
+        // for this fixture), or any budget/guard stop is recorded on the
+        // transcript. Claiming success with a short string and an empty
+        // truncated_decodes list is the silent-truncation defect.
+        if transcription.is_truncated() {
+            assert!(
+                !transcription.truncated_decodes.is_empty(),
+                "is_truncated() without truncated_decodes entries"
+            );
+            for entry in &transcription.truncated_decodes {
+                assert!(
+                    matches!(
+                        entry.truncation.reason,
+                        DecodeTruncationReason::BudgetExhausted
+                            | DecodeTruncationReason::DegenerateRepeatGuard
+                    ),
+                    "unexpected truncation reason: {:?}",
+                    entry.truncation.reason
+                );
+            }
+            // A truncated multi-slice run is still a degradation we want the
+            // audit to see -- fail the gate so it cannot be marked Supported
+            // while this fixture trips the budget/guard.
+            panic!(
+                "longform fixture truncated on one or more slices: {:?}; \
+                 multi-slice path must finish this ~69s recording without hitting \
+                 the 256-token backstop or the degenerate-loop guard",
+                transcription.truncated_decodes
+            );
+        }
+
+        assert!(
+            !has_pathological_token_run(text),
+            "pathological consecutive n-gram run in longform transcript: {text:?}"
+        );
+
+        // Coverage anchors: fixture is EN/ZH/EN/ZH/EN. Expect the JFK anchor on
+        // the order of the three EN clips (allow seam duplication up to 2x) and
+        // at least one Chinese weather phrase from the ZH clips.
+        let jfk_hits = count_phrase_occurrences(text, JFK_ANCHOR_PHRASE);
+        assert!(
+            (2..=6).contains(&jfk_hits),
+            "JFK anchor should appear ~3 times (fixture has 3 EN clips); got {jfk_hits} in {text:?}"
+        );
+        let zh_hits = count_phrase_occurrences(text, ZH_ANCHOR_PHRASE);
+        assert!(
+            zh_hits >= 1,
+            "Chinese anchor missing from multi-slice transcript (possible mid-recording drop): {text:?}"
+        );
+    }
+
+    /// Cross-backend parity skeleton on a medium multi-slice fixture. Compares
+    /// CPU vs Accelerated (Metal on macOS) transcripts under the same Fixed
+    /// longform plan. Not a bit-exact logits gate -- greedy text equivalence is
+    /// the external contract, matching the short JFK Metal/CPU acceptance.
+    #[test]
+    #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
+                OPENASR_GRANITE_SPEECH_PACK and a GPU-class host; runs CPU + \
+                Accelerated native longform on fixtures/longform_en_zh.wav"]
+    fn longform_cpu_vs_accelerated_transcript_parity() {
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
+        let audio = longform_en_zh_wav_path();
+        assert!(audio.is_file(), "fixture missing at {}", audio.display());
+
+        let longform = LongFormOptions {
+            mode: LongFormMode::Fixed,
+            chunk_seconds: 30.0,
+            carry_prompt_across_slices: true,
+            ..LongFormOptions::default()
+        };
+
+        let transcribe = |target: ExecutionTarget| {
+            NativeBackend
+                .transcribe(
+                    TranscriptionRequest::new(audio.clone(), NATIVE_RUNTIME_MODEL_ID_AUTO)
+                        .with_model_pack_path(Some(pack_path.clone()))
+                        .with_execution_target(Some(target))
+                        .with_longform(Some(longform.clone())),
+                )
+                .unwrap_or_else(|error| panic!("{target:?} longform failed: {error}"))
+        };
+
+        let cpu = transcribe(ExecutionTarget::Cpu);
+        let accelerated = transcribe(ExecutionTarget::Accelerated);
+
+        assert!(
+            cpu.longform.as_ref().map(|m| m.chunk_count).unwrap_or(0) >= 2,
+            "CPU longform must multi-slice"
+        );
+        assert_eq!(
+            cpu.longform.as_ref().map(|m| m.chunk_count),
+            accelerated.longform.as_ref().map(|m| m.chunk_count),
+            "CPU and Accelerated must share the same slice plan shape"
+        );
+        assert!(
+            !cpu.is_truncated() && !accelerated.is_truncated(),
+            "parity gate requires both backends finish without truncation; cpu={:?} accel={:?}",
+            cpu.truncated_decodes,
+            accelerated.truncated_decodes
+        );
+
+        let cpu_text = cpu.text.trim();
+        let accel_text = accelerated.text.trim();
+        eprintln!("granite longform CPU text:  {cpu_text:?}");
+        eprintln!("granite longform Accel text:{accel_text:?}");
+        assert_eq!(
+            cpu_text, accel_text,
+            "CPU and Accelerated longform transcripts must match under greedy decode"
+        );
     }
 
     /// Resident prepared-runtime cache regression: calling `execute()` twice in
@@ -677,6 +1010,55 @@ mod tests {
             first_text, second_text,
             "warm resident graph reuse must preserve the cold greedy transcript"
         );
+    }
+
+    #[test]
+    fn audio_within_derived_capacity_is_accepted() {
+        use super::super::capacity::GRANITE_SPEECH_MAX_INPUT_SECONDS;
+        ensure_audio_within_capacity(0.0).expect("empty buffer");
+        ensure_audio_within_capacity(30.0).expect("shared-window slice");
+        ensure_audio_within_capacity(GRANITE_SPEECH_MAX_INPUT_SECONDS)
+            .expect("exactly at the derived limit must pass (strict >)");
+    }
+
+    #[test]
+    fn audio_past_derived_capacity_fails_closed_with_typed_error() {
+        use super::super::capacity::{
+            GRANITE_SPEECH_DECODER_MAX_POSITIONS, GRANITE_SPEECH_MAX_INPUT_SECONDS,
+            granite_speech_audio_tokens_per_second,
+        };
+        let over = GRANITE_SPEECH_MAX_INPUT_SECONDS + 0.1;
+        let err = ensure_audio_within_capacity(over).expect_err("over-limit must fail closed");
+        let message = err.to_string();
+        match err {
+            GraniteSpeechGgmlExecutorError::AudioTooLong {
+                seconds,
+                limit,
+                ctx,
+                rate,
+            } => {
+                assert!((seconds - over).abs() < 1e-6);
+                assert_eq!(limit, GRANITE_SPEECH_MAX_INPUT_SECONDS);
+                assert_eq!(ctx, GRANITE_SPEECH_DECODER_MAX_POSITIONS);
+                assert_eq!(rate, granite_speech_audio_tokens_per_second());
+            }
+            other => panic!("expected AudioTooLong, got {other}"),
+        }
+        assert!(
+            message.contains("exceeds the derived"),
+            "error text must name the derived cap: {message}"
+        );
+        assert!(
+            message.contains("382"),
+            "error text must surface the numeric limit: {message}"
+        );
+        // A multi-minute buffer that would previously have run OOD against the
+        // 4096-token context must also hit the same typed path.
+        let long = ensure_audio_within_capacity(600.0).expect_err("10-minute buffer");
+        assert!(matches!(
+            long,
+            GraniteSpeechGgmlExecutorError::AudioTooLong { .. }
+        ));
     }
 
     #[test]

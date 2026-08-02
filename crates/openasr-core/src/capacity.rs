@@ -251,6 +251,20 @@ const FRONTEND_CAPACITY_REGISTRY: &[(&str, AudioFrontendCapacityBasis)] = &[
                          downcast sets the final audio-token rate",
         },
     ),
+    (
+        crate::arch::GRANITE_SPEECH_AUDIO_FRONTEND_ID,
+        AudioFrontendCapacityBasis::Constant(FrontendGeometry {
+            // mel 16 kHz / 160-hop + 2x frame-stack (`frontend.rs`) + Q-Former
+            // downsample_rate=5 (`qformer.rs` / pack `granite_speech.downsample_rate`)
+            // -> 10 audio tokens/s (one projector token per 100ms). Pinned equal
+            // to `granite_speech::capacity::granite_speech_frontend_geometry` by
+            // that module's registry drift guard.
+            sample_rate_hz: 16_000,
+            hop_length: 160,
+            encoder_conv_stride: 2,
+            adaptor_merge_size: 5,
+        }),
+    ),
 ];
 
 /// The capacity basis a frontend id declares, if any. `None` for families

@@ -18,6 +18,7 @@
 //! registration, and end-to-end golden are a separate follow-up pass -- see
 //! `docs` note in `encoder_graph.rs` on the long-audio context-window bound.
 
+pub(crate) mod capacity;
 pub(crate) mod decode_executor;
 pub(crate) mod decode_session;
 pub(crate) mod decoder_graph;

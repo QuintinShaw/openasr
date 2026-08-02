@@ -5800,6 +5800,125 @@ mod tests {
         assert!(resolution.options.carry_prompt_across_slices);
     }
 
+    /// granite-speech is `SharedWindow` + `LocalChunked` + decode-policy
+    /// `Default` (not `ConservativeSeq2SeqV1`): multi-minute audio must ride the
+    /// generic longform window (default 30s chunk) rather than a tighter
+    /// conservative cap or a whole-recording integral window. This is the
+    /// planner-side half of the long-audio degradation gate -- the pack-backed
+    /// multi-slice e2e lives next to the family executor.
+    #[test]
+    fn granite_speech_shared_window_keeps_generic_longform_window() {
+        let defaults = crate::LongFormOptions::default();
+        assert_eq!(
+            crate::arch::longform_slice_shape_for_model_architecture(
+                crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            crate::arch::OpenAsrLongformSliceShape::SharedWindow,
+            "granite-speech must stay SharedWindow so multi-minute audio is sliced"
+        );
+
+        let resolution = resolve_native_longform_policy_for_backend(
+            None,
+            90.0,
+            crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.mode, LongFormMode::Auto);
+        assert_eq!(resolution.options.chunk_seconds, defaults.chunk_seconds);
+        assert_eq!(
+            resolution.options.max_chunk_seconds,
+            defaults.max_chunk_seconds
+        );
+        assert!(
+            resolution.options.carry_prompt_across_slices,
+            "Default longform profile keeps prompt carry (unlike ConservativeSeq2SeqV1)"
+        );
+        // LocalChunked encoder + Default profile: no encoder-memory or
+        // conservative-seq2seq provenance tags on the auto path.
+        assert!(
+            resolution.provenance.iter().all(|entry| {
+                !entry.contains("cohere-chunk-cap")
+                    && !entry.contains("encoder-attention-span")
+                    && !entry.contains("scoped-slices")
+            }),
+            "unexpected longform safety provenance for granite-speech: {:?}",
+            resolution.provenance
+        );
+    }
+
+    /// Fixed-window plan for ~69s of audio under granite's resolved longform
+    /// options must produce multiple slices, each bounded by the default chunk
+    /// window (+ padding). This is the weight-free structural gate that the
+    /// multi-slice pack e2e depends on: if the planner ever collapsed back to a
+    /// single whole-recording buffer, the 256-token generation backstop would
+    /// silently truncate multi-minute speech inside one decode.
+    #[test]
+    fn granite_speech_longform_planner_splits_beyond_default_window() {
+        const SAMPLE_RATE_HZ: u32 = 16_000;
+        const AUDIO_SECONDS: f32 = 69.0;
+        let total_samples = (AUDIO_SECONDS * SAMPLE_RATE_HZ as f32) as usize;
+        // Non-silent samples so energy/auto fallbacks do not collapse the plan.
+        let samples = vec![0.05_f32; total_samples];
+
+        let requested = crate::LongFormOptions {
+            mode: LongFormMode::Fixed,
+            ..crate::LongFormOptions::default()
+        };
+        let resolution = resolve_native_longform_policy_for_backend(
+            Some(&requested),
+            AUDIO_SECONDS,
+            crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.mode, LongFormMode::Fixed);
+        assert_eq!(
+            resolution.options.chunk_seconds,
+            crate::LongFormOptions::default().chunk_seconds
+        );
+
+        let plan = plan_longform_slices(&samples, SAMPLE_RATE_HZ, &resolution.options, None)
+            .expect("granite SharedWindow fixed plan must build");
+        assert!(
+            plan.stats.chunk_count >= 3,
+            "69s at the default 30s window must yield >=3 slices, got {} ({:?})",
+            plan.stats.chunk_count,
+            plan.slices
+                .iter()
+                .map(|slice| {
+                    (
+                        slice.content_start_sample,
+                        slice.content_end_sample,
+                        slice.duration_samples(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let max_allowed_samples = ((resolution.options.chunk_seconds
+            + resolution.options.padding_seconds * 2.0
+            + 1.0)
+            * SAMPLE_RATE_HZ as f32)
+            .ceil() as usize;
+        for (index, slice) in plan.slices.iter().enumerate() {
+            assert!(
+                slice.duration_samples() <= max_allowed_samples,
+                "slice {index} is {} samples (>{max_allowed_samples}); granite must not hand the \
+                 executor a buffer past the shared window",
+                slice.duration_samples()
+            );
+            assert!(
+                slice.content_end_sample > slice.content_start_sample,
+                "slice {index} must cover content"
+            );
+        }
+        // Content coverage: first content starts at 0, last content reaches the end.
+        assert_eq!(plan.slices.first().unwrap().content_start_sample, 0);
+        assert_eq!(
+            plan.slices.last().unwrap().content_end_sample,
+            total_samples
+        );
+    }
+
     #[test]
     fn explicit_native_longform_request_is_preserved() {
         let requested = crate::LongFormOptions {

@@ -2351,18 +2351,16 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // single-prompt `ScopedSlices` case (only moss-transcribe-diarize is),
         // so no integral window is declared or consumed here.
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // The projected audio tokens splice into the Granite decoder prompt,
-        // but a single decode only ever sees one shared-window slice (this is
-        // `SharedWindow`, not the whole-recording integral `ScopedSlices`
-        // case), and the decoder declares no max-position/context pack key, so
-        // there is no KV integral figure to derive without a pack revision
-        // this landing does not need -- the shared window is what bounds the
-        // audio per decode. Same shape as firered-aed/moonshine above.
-        // (Promoting this to a `Derived` decoder-context model is deferred to
-        // the capacity-derivation follow-up.)
-        capacity_model: CapacityModelDeclaration::BoundedElsewhere {
-            by: "shared-window slice; no decoder max-position pack key to derive from",
-        },
+        // Projected audio tokens splice into the Granite decoder prompt, so the
+        // decoder's 4096-token trained context is the binding single-decode
+        // audio-length constraint (`CapacityAudioBound::DecoderContext`). The
+        // derived ceiling lives in `granite_speech::capacity` (382s for the
+        // shipped 4.1-2b geometry) and the executor fails closed above it with
+        // a typed `AudioTooLong`; ordinary longform work is further bounded by
+        // the shared 30s `SharedWindow` slice and never approaches that ceiling.
+        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
+            audio_bound: CapacityAudioBound::DecoderContext,
+        }),
         // The model card documents punctuation/truecasing as a real,
         // evaluated capability (a documented prompt variant + reported PER/
         // Cap-F1 metrics), and the family's own end-to-end golden samples
@@ -2684,9 +2682,7 @@ mod tests {
             ),
             (
                 GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::BoundedElsewhere {
-                    by: "shared-window slice; no decoder max-position pack key to derive from",
-                },
+                derived(CapacityAudioBound::DecoderContext),
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
@@ -2741,14 +2737,14 @@ mod tests {
                 );
             }
         }
-        // Guards the walk: the design review's taxonomy derives exactly six
+        // Guards the walk: the design review's taxonomy derives exactly seven
         // builtin families (qwen3-asr, cohere, firered-llm, mimo-asr,
-        // funasr-nano -- all DecoderContext-bound -- plus any future addition);
-        // a rename that stops matching would otherwise make this test vacuously
-        // pass.
+        // funasr-nano, moss-td, granite-speech -- all DecoderContext-bound
+        // except cohere's EncoderSpan); a rename that stops matching would
+        // otherwise make this test vacuously pass.
         assert_eq!(
-            derived_count, 6,
-            "expected exactly six Derived builtin families"
+            derived_count, 7,
+            "expected exactly seven Derived builtin families"
         );
     }
 
