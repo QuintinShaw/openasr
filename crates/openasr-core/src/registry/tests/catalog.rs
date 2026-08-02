@@ -1725,6 +1725,64 @@ fn embedded_catalog_emits_punctuation_matches_family() {
 }
 
 #[test]
+fn embedded_catalog_speaker_source_matches_architecture_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let catalog = super::load_embedded_signed_catalog(home.path())
+        .expect("embedded catalog should verify and parse offline");
+    let architectures = crate::arch::OpenAsrArchitectureRegistry::with_builtins();
+
+    let architecture_for_family = |family: &str| match family {
+        "qwen" => Some(crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID),
+        "parakeet-tdt" => Some(crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID),
+        "cohere" => Some(crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID),
+        "whisper" => Some(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
+        "xasr-zipformer" => Some(crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID),
+        "dolphin" => Some(crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID),
+        "moonshine" => Some(crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID),
+        "sensevoice" => Some(crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID),
+        "firered-aed" => Some(crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID),
+        "firered2-llm" => Some(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
+        "mimo-asr" => Some(crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID),
+        "moss-transcribe-diarize" => Some(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
+        "funasr-nano" => Some(crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID),
+        "granite-speech" => Some(crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID),
+        _ => None,
+    };
+
+    for model in &catalog.models {
+        if model.kind != CatalogModelKind::AsrModel {
+            assert_eq!(
+                model.speaker_source, None,
+                "non-ASR model '{}' must omit speaker_source",
+                model.id
+            );
+            continue;
+        }
+        let architecture = architecture_for_family(&model.family).unwrap_or_else(|| {
+            panic!(
+                "ASR catalog family '{}' has no Rust architecture mapping",
+                model.family
+            )
+        });
+        let descriptor = architectures
+            .find_by_model_architecture(architecture)
+            .unwrap_or_else(|| panic!("missing architecture descriptor '{architecture}'"));
+        let expected = if descriptor.speaker_segmentation.is_in_decoder() {
+            CatalogSpeakerSource::Native
+        } else {
+            CatalogSpeakerSource::External
+        };
+        assert_eq!(
+            model.speaker_source,
+            Some(expected),
+            "catalog model '{}' speaker_source drifted from architecture '{}'",
+            model.id,
+            architecture
+        );
+    }
+}
+
+#[test]
 fn embedded_catalog_resolves_bare_dolphin_aliases_to_the_intended_tiers() {
     // 2026-07: bare `dolphin` now resolves to the multilingual `dolphin-small`
     // (what a user asking for plain "dolphin" almost certainly means), and

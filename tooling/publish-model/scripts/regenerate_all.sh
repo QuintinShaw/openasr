@@ -99,3 +99,9 @@ done
 # with _catalog.LANGUAGE_DISPLAY_LABELS. Idempotent; leaves models[] untouched.
 log "refreshing catalog language-label map"
 python3 "$CATALOG_PY" write-language-labels "$REPO_ROOT/model-registry/catalog.json"
+
+# `speaker_source` is an architecture-derived scalar shared by every ASR model.
+# Refresh it catalog-wide without requiring historical metrics/result sidecars
+# for packs that are otherwise unchanged.
+log "refreshing catalog speaker-source map"
+python3 "$CATALOG_PY" write-speaker-sources "$REPO_ROOT/model-registry/catalog.json"
