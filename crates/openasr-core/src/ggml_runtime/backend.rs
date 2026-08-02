@@ -267,20 +267,100 @@ pub(crate) fn accelerated_device_rank(kind: GgmlBackendKind) -> u8 {
     }
 }
 
+/// Minimum free memory a device must report to be considered a viable
+/// model-load target. Conservative floor: most OpenASR models need roughly
+/// 500 MB - 1 GB of weights, so a device that cannot even guarantee 512 MiB
+/// free is too loaded to be useful -- a hybrid-graphics laptop whose discrete
+/// VRAM is consumed by other workloads (browser, game) is better served by
+/// its integrated GPU (shared system RAM, often 16 GB+) than by a
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` on the discrete device and the resulting
+/// fall-through to CPU.
+const MIN_VIABLE_FREE_VRAM_BYTES: usize = 512 * 1024 * 1024;
+
+/// Whether `device` reports enough free memory to be a viable model-load
+/// target (see [`MIN_VIABLE_FREE_VRAM_BYTES`]). Devices that report no memory
+/// information at all are treated as viable: absence of a report must not
+/// penalize a backend that does not surface `ggml_backend_dev_memory`.
+fn device_reports_viable_free_vram(device: &GgmlBackendDevice) -> bool {
+    device
+        .memory
+        .is_none_or(|memory| memory.free_bytes >= MIN_VIABLE_FREE_VRAM_BYTES)
+}
+
+/// Why [`select_accelerated_device`] picked the device it did. Surfaced in the
+/// daemon boot log (`gpu_selection=... rule=...`) so a "wrong GPU used" report
+/// is diagnosable from `daemon.log` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceleratedDeviceSelectionRule {
+    /// The best-ranked accelerated device reports viable free memory (or none
+    /// at all); kind ranking alone decided.
+    KindRanking,
+    /// A better-ranked accelerated device was skipped because it reported less
+    /// than [`MIN_VIABLE_FREE_VRAM_BYTES`] free; the pick is the best-ranked
+    /// device among those with viable free memory.
+    LowVramSkipped,
+    /// No accelerated device reported viable free memory; selection fell back
+    /// to kind-only ranking (the historical behavior) so ggml still tries the
+    /// best-ranked device and drives its own OOM fallback.
+    LowVramFallback,
+}
+
+impl AcceleratedDeviceSelectionRule {
+    /// The `rule=` value used in the boot summary's `gpu_selection` field.
+    fn boot_log_label(self) -> &'static str {
+        match self {
+            Self::KindRanking => "discrete_over_integrated",
+            Self::LowVramSkipped => "discrete_low_vram_skipped",
+            Self::LowVramFallback => "all_low_vram_kind_fallback",
+        }
+    }
+}
+
 /// Pick the device to prefer when more than one accelerated device is
-/// available, per [`accelerated_device_rank`]. `is_accelerated` lets each
-/// caller keep its own notion of "counts as an accelerated device" (some
-/// only want `Gpu`/`IntegratedGpu`, `init_gpu_backend` also folds in
+/// available and record why it won (see [`AcceleratedDeviceSelectionRule`]).
+/// Kind ranking ([`accelerated_device_rank`]) decides, except that a device
+/// reporting less than [`MIN_VIABLE_FREE_VRAM_BYTES`] of free memory is
+/// skipped in favor of a viable lower-ranked one: on a hybrid-graphics laptop
+/// whose discrete GPU's VRAM is largely consumed by other workloads, loading
+/// model weights onto it fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY` and the
+/// run falls back to CPU, even though the integrated GPU (shared system RAM)
+/// has ample space. If NO accelerated device reports viable free memory the
+/// selection falls back to kind-only ranking (the historical behavior), so
+/// ggml still attempts the best-ranked device and drives its own OOM
+/// fallback. Devices that report no memory information are never penalized.
+fn select_accelerated_device(
+    devices: &[GgmlBackendDevice],
+    is_accelerated: impl Fn(GgmlBackendKind) -> bool,
+) -> Option<(&GgmlBackendDevice, AcceleratedDeviceSelectionRule)> {
+    let kind_pick = devices
+        .iter()
+        .filter(|device| is_accelerated(device.kind))
+        .min_by_key(|device| accelerated_device_rank(device.kind))?;
+    if device_reports_viable_free_vram(kind_pick) {
+        return Some((kind_pick, AcceleratedDeviceSelectionRule::KindRanking));
+    }
+    match devices
+        .iter()
+        .filter(|device| is_accelerated(device.kind) && device_reports_viable_free_vram(device))
+        .min_by_key(|device| accelerated_device_rank(device.kind))
+    {
+        Some(viable_pick) => Some((viable_pick, AcceleratedDeviceSelectionRule::LowVramSkipped)),
+        None => Some((kind_pick, AcceleratedDeviceSelectionRule::LowVramFallback)),
+    }
+}
+
+/// Pick the device to prefer when more than one accelerated device is
+/// available: the free-VRAM-aware kind ranking of
+/// [`select_accelerated_device`]. `is_accelerated` lets each caller keep its
+/// own notion of "counts as an accelerated device" (today's callers want
+/// `Gpu`/`IntegratedGpu`; an NPU-aware initializer could fold in
 /// `Accelerator`), while the tie-break/ranking logic stays in one place so
 /// device selection can never drift from the diagnostics that describe it.
 pub(crate) fn preferred_accelerated_device(
     devices: &[GgmlBackendDevice],
     is_accelerated: impl Fn(GgmlBackendKind) -> bool,
 ) -> Option<&GgmlBackendDevice> {
-    devices
-        .iter()
-        .filter(|device| is_accelerated(device.kind))
-        .min_by_key(|device| accelerated_device_rank(device.kind))
+    select_accelerated_device(devices, is_accelerated).map(|(device, _rule)| device)
 }
 
 /// Register backend plugin DLLs once per process before the first registry
@@ -446,11 +526,15 @@ pub fn ggml_runtime_info() -> GgmlRuntimeInfo {
 ///
 /// When more than one accelerated-kind device is present (an Optimus/hybrid-
 /// graphics host exposing both an integrated and a discrete GPU through the
-/// same Vulkan backend), the summary also appends
-/// `gpu_selection=discrete_over_integrated` naming the device
-/// [`preferred_accelerated_device`] picked and why -- so a "wrong GPU used"
-/// report is diagnosable from the boot log alone (see the discrete-GPU
-/// preference fix that added this).
+/// same Vulkan backend), the summary also appends a `gpu_selection=` field
+/// naming the device [`preferred_accelerated_device`] picked and the `rule`
+/// that decided it: `discrete_over_integrated` (kind ranking alone decided),
+/// `discrete_low_vram_skipped` (a better-ranked device was skipped because it
+/// reported too little free VRAM to load a model), or
+/// `all_low_vram_kind_fallback` (no device reported viable free VRAM, so kind
+/// ranking alone decided and ggml's own OOM fallback stays in charge) -- so a
+/// "wrong GPU used" report is diagnosable from the boot log alone (see the
+/// discrete-GPU preference fix that added this).
 pub fn ggml_runtime_boot_summary(info: &GgmlRuntimeInfo) -> String {
     let best = info.best_backend_name.as_deref().unwrap_or("unavailable");
     let mut summary = format!("best_backend={best} cpu_backend={}", info.cpu_backend_name);
@@ -487,12 +571,14 @@ pub fn ggml_runtime_boot_summary(info: &GgmlRuntimeInfo) -> String {
         .filter(|device| device.kind.is_gpu())
         .count();
     if accelerated_kinds > 1
-        && let Some(preferred) =
-            preferred_accelerated_device(&info.devices, GgmlBackendKind::is_gpu)
+        && let Some((preferred, rule)) =
+            select_accelerated_device(&info.devices, GgmlBackendKind::is_gpu)
     {
         summary.push_str(&format!(
-            " gpu_selection={{picked={:?} kind={:?} rule=discrete_over_integrated}}",
-            preferred.name, preferred.kind
+            " gpu_selection={{picked={:?} kind={:?} rule={}}}",
+            preferred.name,
+            preferred.kind,
+            rule.boot_log_label()
         ));
     }
     summary
@@ -725,19 +811,181 @@ mod tests {
         GgmlBackendDevice::for_test(name, name, kind, None)
     }
 
+    fn test_device_with_memory(
+        name: &str,
+        kind: GgmlBackendKind,
+        memory: Option<GgmlDeviceMemory>,
+    ) -> GgmlBackendDevice {
+        GgmlBackendDevice::for_test(name, name, kind, memory)
+    }
+
+    fn memory_mib(free_mib: usize, total_mib: usize) -> GgmlDeviceMemory {
+        GgmlDeviceMemory {
+            free_bytes: free_mib * 1024 * 1024,
+            total_bytes: total_mib * 1024 * 1024,
+        }
+    }
+
     #[test]
     fn preferred_accelerated_device_picks_discrete_over_integrated() {
         // The Optimus/hybrid-graphics case (issue: "double GPU picks the
         // wrong one"): an Intel integrated GPU enumerated ahead of the
-        // NVIDIA discrete GPU must still yield the discrete GPU.
+        // NVIDIA discrete GPU must still yield the discrete GPU when it
+        // reports enough free VRAM to load a model.
         let devices = vec![
-            test_device("Vulkan0", GgmlBackendKind::IntegratedGpu),
-            test_device("Vulkan1", GgmlBackendKind::Gpu),
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some(memory_mib(16 * 1024, 16 * 1024)),
+            ),
+            test_device_with_memory(
+                "Vulkan1",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(8 * 1024, 12 * 1024)),
+            ),
         ];
         let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
             .expect("a device is picked");
         assert_eq!(picked.name, "Vulkan1");
         assert_eq!(picked.kind, GgmlBackendKind::Gpu);
+    }
+
+    #[test]
+    fn preferred_accelerated_device_skips_discrete_with_low_free_vram() {
+        // The failure this guards: on a hybrid-graphics laptop whose discrete
+        // GPU's VRAM is consumed by other workloads (browser, game), a ~1 GB
+        // weight allocation on the discrete GPU fails with
+        // VK_ERROR_OUT_OF_DEVICE_MEMORY and the run falls back to CPU -- even
+        // though the integrated GPU (shared system RAM) has ample space. The
+        // low-VRAM discrete device must be skipped, not merely ranked first.
+        let devices = vec![
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some(memory_mib(16 * 1024, 16 * 1024)),
+            ),
+            test_device_with_memory(
+                "Vulkan1",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(128, 8 * 1024)),
+            ),
+        ];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("a device is picked");
+        assert_eq!(picked.name, "Vulkan0");
+        assert_eq!(picked.kind, GgmlBackendKind::IntegratedGpu);
+    }
+
+    #[test]
+    fn preferred_accelerated_device_falls_back_to_kind_ranking_when_every_device_is_low() {
+        // No device can guarantee the minimum free memory: keep the historical
+        // kind-only pick (discrete first) so ggml still attempts it and drives
+        // its own OOM fallback, rather than the selector diverting to an
+        // equally-loaded integrated GPU.
+        let devices = vec![
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some(memory_mib(64, 16 * 1024)),
+            ),
+            test_device_with_memory(
+                "Vulkan1",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(128, 8 * 1024)),
+            ),
+        ];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("a device is picked");
+        assert_eq!(picked.name, "Vulkan1");
+        assert_eq!(picked.kind, GgmlBackendKind::Gpu);
+    }
+
+    #[test]
+    fn preferred_accelerated_device_does_not_penalize_missing_memory_reports() {
+        // A backend that does not surface memory info (memory: None) must not
+        // be treated as low-VRAM and skipped: the discrete GPU with no report
+        // still beats an integrated GPU that reports plenty.
+        let devices = vec![
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some(memory_mib(16 * 1024, 16 * 1024)),
+            ),
+            test_device("Vulkan1", GgmlBackendKind::Gpu), // memory: None
+        ];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("a device is picked");
+        assert_eq!(picked.name, "Vulkan1");
+        assert_eq!(picked.kind, GgmlBackendKind::Gpu);
+    }
+
+    #[test]
+    fn select_accelerated_device_reports_why_the_pick_won() {
+        let kind_only = vec![
+            test_device("Vulkan0", GgmlBackendKind::IntegratedGpu),
+            test_device("Vulkan1", GgmlBackendKind::Gpu),
+        ];
+        assert_eq!(
+            select_accelerated_device(&kind_only, GgmlBackendKind::is_gpu),
+            Some((&kind_only[1], AcceleratedDeviceSelectionRule::KindRanking))
+        );
+
+        let skipped = vec![
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some(memory_mib(16 * 1024, 16 * 1024)),
+            ),
+            test_device_with_memory(
+                "Vulkan1",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(128, 8 * 1024)),
+            ),
+        ];
+        assert_eq!(
+            select_accelerated_device(&skipped, GgmlBackendKind::is_gpu),
+            Some((&skipped[0], AcceleratedDeviceSelectionRule::LowVramSkipped))
+        );
+
+        let all_low = vec![
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some(memory_mib(64, 16 * 1024)),
+            ),
+            test_device_with_memory(
+                "Vulkan1",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(128, 8 * 1024)),
+            ),
+        ];
+        assert_eq!(
+            select_accelerated_device(&all_low, GgmlBackendKind::is_gpu),
+            Some((&all_low[1], AcceleratedDeviceSelectionRule::LowVramFallback))
+        );
+
+        assert_eq!(
+            select_accelerated_device(&[], GgmlBackendKind::is_gpu),
+            None
+        );
+    }
+
+    #[test]
+    fn accelerated_device_selection_rule_boot_log_labels_are_stable() {
+        // The labels are a boot-log contract ("wrong GPU used" reports are
+        // triaged off daemon.log); pin them so a rename is a deliberate diff.
+        assert_eq!(
+            AcceleratedDeviceSelectionRule::KindRanking.boot_log_label(),
+            "discrete_over_integrated"
+        );
+        assert_eq!(
+            AcceleratedDeviceSelectionRule::LowVramSkipped.boot_log_label(),
+            "discrete_low_vram_skipped"
+        );
+        assert_eq!(
+            AcceleratedDeviceSelectionRule::LowVramFallback.boot_log_label(),
+            "all_low_vram_kind_fallback"
+        );
     }
 
     #[test]
@@ -809,6 +1057,31 @@ mod tests {
         let summary = ggml_runtime_boot_summary(&hybrid);
         assert!(summary.contains("gpu_selection={picked=\"Vulkan1\" kind=Gpu"));
         assert!(summary.contains("rule=discrete_over_integrated"));
+    }
+
+    #[test]
+    fn boot_summary_reports_discrete_low_vram_skipped_rule() {
+        let hybrid = GgmlRuntimeInfo {
+            cpu_backend_name: "CPU".to_string(),
+            best_backend_name: Some("Vulkan0".to_string()),
+            metal_backend_name: None,
+            devices: vec![
+                test_device_with_memory(
+                    "Vulkan0",
+                    GgmlBackendKind::IntegratedGpu,
+                    Some(memory_mib(16 * 1024, 16 * 1024)),
+                ),
+                test_device_with_memory(
+                    "Vulkan1",
+                    GgmlBackendKind::Gpu,
+                    Some(memory_mib(128, 8 * 1024)),
+                ),
+            ],
+            cpu_features: GgmlCpuFeatures::default(),
+        };
+        let summary = ggml_runtime_boot_summary(&hybrid);
+        assert!(summary.contains("gpu_selection={picked=\"Vulkan0\" kind=IntegratedGpu"));
+        assert!(summary.contains("rule=discrete_low_vram_skipped"));
     }
 
     #[test]
