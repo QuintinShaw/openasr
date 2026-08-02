@@ -533,6 +533,17 @@ impl ModelCatalog {
         self.speaker_diarization_embedder_pack(CATALOG_SPEAKER_EMBEDDER_REDIMNET_ID)
     }
 
+    pub fn speaker_diarization_required_segmenter_pack(&self) -> Option<&CatalogModel> {
+        self.capability_packs_for_feature(CATALOG_FEATURE_SPEAKER_DIARIZATION)
+            .into_iter()
+            .find(|model| {
+                model.id == crate::diarize::segment::SEGMENTER_PACK_ID
+                    && model.capability.as_ref().is_some_and(|capability| {
+                        capability.role == CatalogCapabilityRole::SpeakerSegmenter
+                    })
+            })
+    }
+
     fn speaker_diarization_embedder_pack(&self, model_id: &str) -> Option<&CatalogModel> {
         self.capability_packs_for_feature(CATALOG_FEATURE_SPEAKER_DIARIZATION)
             .into_iter()

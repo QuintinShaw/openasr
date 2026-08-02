@@ -272,10 +272,10 @@ fn native_streaming_request_options_from_session_options(
     request_options.word_timestamps = options.word_timestamps;
     // `NativeAsrRequestOptions::voice_id` is the accepted session-level user
     // intent: realtime uses it to emit `session.configured` and to run the
-    // external VAD + speaker-embedder diarizer. The decode-side option means
-    // something narrower -- "this family's own decode should carry speaker
-    // structure" -- so it is set only for an in-decoder family. Forwarding the
-    // external path's intent here would be the double-apply the
+    // external local-segmenter + speaker-embedder diarizer. The decode-side
+    // option means something narrower -- "this family's own decode should
+    // carry speaker structure" -- so it is set only for an in-decoder family.
+    // Forwarding the external path's intent here would be the double-apply the
     // one-source-only rule forbids.
     request_options.in_decoder_speakers = options.voice_id && segments_speakers_in_decoder;
     request_options
@@ -561,7 +561,8 @@ fn native_offline_request_to_transcription_request(
     execution_target: ExecutionTarget,
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
-    TranscriptionRequest::new(request.input_path, model_pack.id.clone())
+    let segmenter = request.voice_id_segmenter;
+    let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
         .with_model_pack_path(Some(model_pack.root.clone()))
         .with_language(request.options.language)
         .with_task(request.options.task)
@@ -579,7 +580,9 @@ fn native_offline_request_to_transcription_request(
         .with_source_container(request.source_container)
         .with_prepared_samples(request.prepared_samples)
         .with_execution_context(request.execution_context)
-        .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions)
+        .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
+    converted.voice_id_segmenter = segmenter;
+    converted
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
@@ -678,14 +681,14 @@ fn native_phrase_bias_capability_for_adapter(
 }
 
 /// Reason reported when the model does not segment speakers in-decoder and the
-/// model-agnostic VAD + ReDimNet2-B6 (`redimnet2-b6-cn`) path is not installed
-/// either, i.e. no speaker segmentation source exists for this request.
-pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "This model does not separate speakers itself, so diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit diarize=true.";
+/// model-agnostic external segment/embed/cluster path is not installed either,
+/// i.e. no speaker segmentation source exists for this request.
+pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "This model does not separate speakers itself, so external Voice ID needs both the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) and an active local speaker segmenter pack (pyannote-segmentation-3.0); install both, pick a model that separates speakers itself, or omit diarize=true.";
 
 /// Voice ID capability for a runtime pack: supported when a speaker
 /// segmentation source exists at all -- either the family segments in-decoder,
-/// or the model-agnostic VAD + ReDimNet2-B6 path is installed for this
-/// process. Deliberately not gated on the speaker embedder for an in-decoder
+/// or the model-agnostic external pipeline is installed for this process.
+/// Deliberately not gated on external support packs for an in-decoder
 /// family: without one the turns simply stay recording-local instead of being
 /// matched to known people, which is a degraded result, not an unavailable
 /// feature.
@@ -694,7 +697,7 @@ fn native_diarization_capability_for_adapter(
 ) -> BackendFeatureCapability {
     native_diarization_capability(
         native_runtime_adapter_segments_speakers_in_decoder(adapter),
-        crate::diarize::vad_diarization_available(),
+        crate::diarize::external_diarization_available(),
     )
 }
 
@@ -705,9 +708,9 @@ fn native_diarization_capability_for_adapter(
 /// family's pack.
 fn native_diarization_capability(
     segments_speakers_in_decoder: bool,
-    embedder_pack_installed: bool,
+    external_pipeline_available: bool,
 ) -> BackendFeatureCapability {
-    if segments_speakers_in_decoder || embedder_pack_installed {
+    if segments_speakers_in_decoder || external_pipeline_available {
         BackendFeatureCapability::supported()
     } else {
         BackendFeatureCapability::reject_request(NATIVE_DIARIZATION_UNAVAILABLE_REASON)
@@ -1689,16 +1692,17 @@ mod tests {
     /// this row at all.)
     #[test]
     fn voice_id_is_offered_when_any_speaker_source_exists() {
-        for (segments_in_decoder, embedder_installed, expected) in [
+        for (segments_in_decoder, external_pipeline_available, expected) in [
             (true, false, true),
             (true, true, true),
             (false, true, true),
             (false, false, false),
         ] {
-            let capability = native_diarization_capability(segments_in_decoder, embedder_installed);
+            let capability =
+                native_diarization_capability(segments_in_decoder, external_pipeline_available);
             assert_eq!(
                 capability.supported, expected,
-                "in_decoder={segments_in_decoder} embedder={embedder_installed}"
+                "in_decoder={segments_in_decoder} external={external_pipeline_available}"
             );
             if !expected {
                 assert!(
@@ -2278,6 +2282,7 @@ mod tests {
                     .with_voice_id(true)
                     .with_word_timestamps(true),
             )
+            .with_voice_id_segmenter(crate::config::VoiceIdSegmenterPreference::Segmentation3_0)
             .with_longform(Some(longform.clone()))
             .with_display_file_name(Some("meeting.wav".to_string()));
 
@@ -2288,6 +2293,10 @@ mod tests {
         );
 
         assert!(converted.input_path.ends_with("input.wav"));
+        assert_eq!(
+            converted.voice_id_segmenter,
+            crate::config::VoiceIdSegmenterPreference::Segmentation3_0
+        );
         assert_eq!(converted.model_id, "qwen3-asr-0.6b:q8_0");
         assert_eq!(
             converted.model_pack_path.as_deref(),
@@ -2532,6 +2541,7 @@ mod tests {
             [
                 ("OPENASR_GGML_BACKEND", Some("cpu".into())),
                 ("OPENASR_REDIMNET_PACK", None),
+                ("OPENASR_PYANNOTE_PACK", None),
                 ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
             ],
             || {
@@ -2549,9 +2559,8 @@ mod tests {
 
                 let error = backend.transcribe(request).unwrap_err().to_string();
 
-                assert!(error.contains("speaker-embedder pack"));
-                assert!(error.contains("redimnet2-b6-cn"));
-                assert!(error.contains("native backend"));
+                assert!(error.contains("local speaker segmenter pack"));
+                assert!(error.contains("pyannote-segmentation-3.0"));
             },
         );
     }
@@ -2826,24 +2835,32 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_capabilities_enable_vad_diarization_when_redimnet_pack_installed() {
+    fn native_runtime_capabilities_require_embedder_and_segmenter_for_external_voice_id() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-runtime.gguf");
         let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
+        let segmenter_pack = temp.path().join("segmenter.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        std::fs::write(&segmenter_pack, b"GGUF\x00\x00\x00\x00").unwrap();
         let capabilities = crate::test_process_env::with_test_process_env(
-            [(
-                "OPENASR_REDIMNET_PACK",
-                Some(redimnet_pack.into_os_string()),
-            )],
+            [
+                (
+                    "OPENASR_REDIMNET_PACK",
+                    Some(redimnet_pack.into_os_string()),
+                ),
+                (
+                    "OPENASR_PYANNOTE_PACK",
+                    Some(segmenter_pack.into_os_string()),
+                ),
+            ],
             || native_runtime_transcription_capabilities_for_path(&runtime_path),
         );
 
         // The VAD + ReDimNet2-B6 path is model-agnostic: a family that takes
         // its speaker structure from an external source reports Voice ID
-        // supported once the embedder pack is installed.
+        // supported only once both external pipeline packs are installed.
         assert!(capabilities.diarization.supported);
     }
 

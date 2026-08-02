@@ -382,6 +382,11 @@ pub struct TranscriptionRequest {
     /// speakers in-decoder therefore honors this switch with no embedder
     /// installed at all -- it just cannot name anyone.
     pub voice_id: bool,
+    /// Persisted recording-level segmenter preference copied into the request
+    /// by the host configuration layer. This is internal execution plumbing,
+    /// not a multipart/per-job picker.
+    #[doc(hidden)]
+    pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
     /// Exact speaker count to force during diarization clustering (the
     /// `DiarizeHint::NumSpeakers` hint); `None` lets the threshold decide.
     pub diarize_speakers: Option<u8>,
@@ -457,6 +462,7 @@ impl TranscriptionRequest {
             longform: None,
             display_file_name: None,
             voice_id: false,
+            voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),
@@ -928,9 +934,15 @@ pub(crate) fn reject_unsupported_language(
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(
-        "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so it needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit --diarize / diarize=true."
+        "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so external Voice ID needs both the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) and an active local speaker segmenter pack (pyannote-segmentation-3.0); install both, pick a model that separates speakers itself, or omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
+    #[error(
+        "External Voice ID needs an active local speaker segmenter pack. Install pyannote-segmentation-3.0, or turn off Voice ID."
+    )]
+    DiarizationSegmenterUnavailable,
+    #[error("External Voice ID failed closed: {reason}")]
+    ExternalDiarizationFailed { reason: String },
     #[error(transparent)]
     VoiceIdIdentityFailed(#[from] crate::diarize::voice_id::SpeakerIdentityError),
     #[error(

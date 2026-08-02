@@ -1,46 +1,105 @@
-//! Runtime resolution of the pulled pyannote segmentation pack.
-//!
-//! Resolved by the shared [`crate::diarize::pack`] resolver from
-//! `OPENASR_PYANNOTE_PACK` or the installed pack whose model id contains
-//! `pyannote`, loaded once into
-//! a process-wide segmenter. Absence is graceful (callers fall back to
-//! VAD-segment diarization). The pack payload is a GGUF `.oasr` pack (the
-//! catalog/pull format); a raw `.safetensors` is still accepted as the dev fast
-//! path. The loader sniffs the file magic to pick the path.
+//! One-shot selection and loading of local-activity segmenter packs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use super::PyannoteSegmenter;
+use super::{LocalActivitySegmenter, PyannoteSegmenter, SegmentError};
+use crate::config::VoiceIdSegmenterPreference;
 
-static SHARED: OnceLock<PyannoteSegmenter> = OnceLock::new();
+static SEGMENTATION_3_0: OnceLock<PyannoteSegmenter> = OnceLock::new();
 
 const PACK_ENV: &str = "OPENASR_PYANNOTE_PACK";
+const INSTALLED_MODEL_ID_HINT: &str = "pyannote";
+pub const SEGMENTER_PACK_ID: &str = "pyannote-segmentation-3.0";
 
-/// The process-wide pyannote segmenter, or `None` if no pack is installed.
-///
-/// Only a successful load is cached: a probe while the pack is absent must not
-/// poison the cache for the rest of the daemon's life (the pack can be pulled
-/// mid-daemon and has to be picked up on the next request).
-pub fn shared_segmenter() -> Option<&'static PyannoteSegmenter> {
-    if let Some(segmenter) = SHARED.get() {
-        return Some(segmenter);
-    }
-    let path = crate::diarize::pack::resolve_pack(PACK_ENV, "pyannote")?;
-    let segmenter = load_segmenter(&path)?;
-    // A concurrent loader may have won the race; either value came from the
-    // same pack, so keep whichever landed first.
-    let _ = SHARED.set(segmenter);
-    SHARED.get()
+/// The adapter selected during request preflight. Holding this value pins the
+/// choice for the whole request: inference errors are returned directly and
+/// are never interpreted as permission to try the next provider.
+pub(crate) struct SelectedSegmenter {
+    pub preference: VoiceIdSegmenterPreference,
+    pub adapter: &'static dyn LocalActivitySegmenter,
 }
 
-/// Load the segmenter from a resolved pack path, choosing the GGUF `.oasr` loader
-/// or the raw safetensors fast path by sniffing the file magic.
-fn load_segmenter(path: &Path) -> Option<PyannoteSegmenter> {
+fn segmentation_3_0_path() -> Option<PathBuf> {
+    crate::diarize::pack::resolve_pack(PACK_ENV, INSTALLED_MODEL_ID_HINT)
+}
+
+pub fn segmenter_pack_installed() -> bool {
+    segmentation_3_0_path().is_some()
+}
+
+/// Resolve the user's model-level preference once. `Auto` is intentionally a
+/// provider registry rather than an alias for segmentation-3.0: a future
+/// DiariZen adapter can be inserted ahead of the baseline without changing
+/// the diarization module's interface. `Segmentation3_0` filters that registry
+/// to the locked baseline and therefore disables any future preferred model.
+pub(crate) fn resolve_segmenter(
+    preference: VoiceIdSegmenterPreference,
+) -> Result<SelectedSegmenter, SegmentError> {
+    match preference {
+        VoiceIdSegmenterPreference::Auto | VoiceIdSegmenterPreference::Segmentation3_0 => {
+            let adapter = load_segmentation_3_0(preference)?;
+            Ok(SelectedSegmenter {
+                preference: VoiceIdSegmenterPreference::Segmentation3_0,
+                adapter,
+            })
+        }
+    }
+}
+
+fn load_segmentation_3_0(
+    preference: VoiceIdSegmenterPreference,
+) -> Result<&'static PyannoteSegmenter, SegmentError> {
+    if let Some(segmenter) = SEGMENTATION_3_0.get() {
+        return Ok(segmenter);
+    }
+    let path = segmentation_3_0_path().ok_or(SegmentError::MissingPack { preference })?;
+    let segmenter = load_segmenter(&path)
+        .map_err(|error| SegmentError::LoadFailed(format!("{}: {error}", path.display())))?;
+    let _ = SEGMENTATION_3_0.set(segmenter);
+    SEGMENTATION_3_0
+        .get()
+        .ok_or_else(|| SegmentError::LoadFailed("segmenter cache initialization failed".into()))
+}
+
+/// Compatibility probe for diagnostics. Production code uses
+/// [`resolve_segmenter`] so selection errors retain their typed reason.
+pub fn shared_segmenter() -> Option<&'static PyannoteSegmenter> {
+    load_segmentation_3_0(VoiceIdSegmenterPreference::Segmentation3_0).ok()
+}
+
+fn load_segmenter(path: &Path) -> Result<PyannoteSegmenter, String> {
     if crate::diarize::pack::is_gguf(path) {
-        PyannoteSegmenter::from_oasr(path).ok()
+        PyannoteSegmenter::from_oasr(path).map_err(|error| error.to_string())
     } else {
-        let bytes = std::fs::read(path).ok()?;
-        PyannoteSegmenter::from_safetensors(&bytes).ok()
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        PyannoteSegmenter::from_safetensors(&bytes).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_baseline_missing_pack_fails_closed_with_typed_error() {
+        let home = tempfile::tempdir().unwrap();
+        let error = crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_PYANNOTE_PACK", None),
+                ("OPENASR_HOME", Some(home.path().as_os_str().to_os_string())),
+            ],
+            || {
+                resolve_segmenter(VoiceIdSegmenterPreference::Segmentation3_0)
+                    .err()
+                    .expect("missing forced baseline must fail closed")
+            },
+        );
+        assert!(matches!(
+            error,
+            SegmentError::MissingPack {
+                preference: VoiceIdSegmenterPreference::Segmentation3_0
+            }
+        ));
     }
 }

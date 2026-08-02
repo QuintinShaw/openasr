@@ -897,9 +897,9 @@ fn diarization_supported(backend: BackendKind, model_pack_path: Option<&Path>) -
                 .diarization
                 .supported
         }
-        // The VAD + ReDimNet2-B6 diarization path is model-agnostic,
-        // so without a resolved pack path the native answer is exactly "is it installed".
-        (BackendKind::Native, None) => openasr_core::diarize::vad_diarization_available(),
+        // The recording-level external pipeline is model-agnostic, so without
+        // a resolved pack path the native answer is exactly "is it installed".
+        (BackendKind::Native, None) => openasr_core::diarize::external_diarization_available(),
         _ => {
             openasr_core::api::backend::TranscriptionBackendCapabilities::for_backend_kind(backend)
                 .diarization
@@ -926,7 +926,7 @@ pub(super) fn ensure_cli_diarization_packs_installed(
     };
     let installed_packs = openasr_core::list_installed_packs(&home)?;
     let source_chain = openasr_core::resolve_chain(&config.download_source);
-    let required_pack = catalog
+    let required_embedder = catalog
         .speaker_diarization_required_embedder_pack()
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -934,10 +934,25 @@ pub(super) fn ensure_cli_diarization_packs_installed(
             )
         })?;
 
+    let required_segmenter = catalog
+        .speaker_diarization_required_segmenter_pack()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Public catalog does not contain the segmentation-3.0 speaker-diarization segmenter pack."
+            )
+        })?;
+
     install_cli_capability_pack_if_missing(
         &installed_packs,
         &catalog,
-        required_pack,
+        required_embedder,
+        &home,
+        &source_chain,
+    )?;
+    install_cli_capability_pack_if_missing(
+        &installed_packs,
+        &catalog,
+        required_segmenter,
         &home,
         &source_chain,
     )?;
@@ -1733,9 +1748,10 @@ mod tests {
     fn diarization_cli_uses_backend_capabilities() {
         let _guard = env_lock();
         let temp = tempfile::tempdir().unwrap();
-        // Isolate the model-agnostic VAD + ReDimNet2-B6 probe from the host
+        // Isolate the model-agnostic external-pipeline probe from the host
         // machine's installed packs so the fail-closed expectations are hermetic.
         let _redimnet_pack = EnvVarRestore::remove("OPENASR_REDIMNET_PACK");
+        let _segmenter_pack = EnvVarRestore::remove("OPENASR_PYANNOTE_PACK");
         let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
 
         let error = ensure_diarization_supported(BackendKind::Mock, None, true)
@@ -1761,16 +1777,20 @@ mod tests {
         assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains(backend_name(BackendKind::Native)));
 
-        // Installing the ReDimNet2-B6 embedder pack enables the model-agnostic
-        // path for any native pack, and for the no-pack-path live preflight.
+        // Both recording-level support packs are required for an external
+        // family. In-decoder families remain independent of this gate.
         let redimnet_pack = temp.path().join("redimnet.oasr");
+        let segmenter_pack = temp.path().join("segmenter.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        std::fs::write(&segmenter_pack, b"GGUF\x00\x00\x00\x00").unwrap();
         let _installed_redimnet_pack =
             EnvVarRestore::set_os("OPENASR_REDIMNET_PACK", &redimnet_pack);
+        let _installed_segmenter_pack =
+            EnvVarRestore::set_os("OPENASR_PYANNOTE_PACK", &segmenter_pack);
         ensure_diarization_supported(BackendKind::Native, Some(&base_runtime_path), true)
-            .expect("ReDimNet2-B6 pack should pass the CLI gate for any native pack");
+            .expect("both external packs should pass the CLI gate for any native pack");
         ensure_diarization_supported(BackendKind::Native, None, true)
-            .expect("ReDimNet2-B6 pack should pass the CLI gate without a pack path");
+            .expect("both external packs should pass the CLI gate without a pack path");
     }
 
     #[test]

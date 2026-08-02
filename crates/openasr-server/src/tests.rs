@@ -1535,12 +1535,17 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
 fn transcription_preferences_fill_missing_thread_request_only() {
     let preferences = Preferences {
         inference_threads: Some(6),
+        voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
         ..Default::default()
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
 
     apply_transcription_preferences(&mut request, &preferences);
     assert_eq!(request.inference_threads, Some(6));
+    assert_eq!(
+        request.voice_id_segmenter,
+        openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0
+    );
 
     request.inference_threads = Some(2);
     apply_transcription_preferences(&mut request, &preferences);
@@ -2026,6 +2031,19 @@ fn transcription_canceled_backend_error_maps_to_409() {
     let response =
         ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled).into_response();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[test]
+fn external_diarization_fail_closed_errors_map_to_400() {
+    let missing = ApiError::Backend(openasr_core::BackendError::DiarizationSegmenterUnavailable)
+        .into_response();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let failed = ApiError::Backend(openasr_core::BackendError::ExternalDiarizationFailed {
+        reason: "segmenter inference failed".to_string(),
+    })
+    .into_response();
+    assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

@@ -2489,6 +2489,8 @@ impl IntoResponse for ApiError {
             Self::Backend(error) => {
                 let status = match &error {
                     openasr_core::BackendError::DiarizationNotSupported { .. }
+                    | openasr_core::BackendError::DiarizationSegmenterUnavailable
+                    | openasr_core::BackendError::ExternalDiarizationFailed { .. }
                     | openasr_core::BackendError::VoiceIdIdentityFailed(_)
                     | openasr_core::BackendError::DiarizeSpeakersRequiresDiarization
                     | openasr_core::BackendError::PhraseBiasNotSupported { .. }

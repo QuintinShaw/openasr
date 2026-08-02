@@ -322,6 +322,11 @@ pub struct NativeAsrOfflineRequest {
     /// [`crate::TranscriptionRequest::prepared_samples`], which this carries
     /// through to via `native_offline_request_to_transcription_request`.
     pub prepared_samples: Option<Arc<Vec<f32>>>,
+    /// Persisted host preference for the recording-level activity model. This
+    /// is carried across the server's native offline adapter round-trip; it is
+    /// not exposed as a multipart/per-job option.
+    #[doc(hidden)]
+    pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
     /// Cancel/pause/resume control and request id for this decode -- same
     /// "explicit, never TLS" contract as
     /// [`crate::TranscriptionRequest::execution_context`], which this carries
@@ -350,6 +355,7 @@ impl NativeAsrOfflineRequest {
             source_channels: None,
             source_container: None,
             prepared_samples: None,
+            voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
             execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
                 "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
                  cancellation attaches a real context via with_execution_context",
@@ -362,6 +368,15 @@ impl NativeAsrOfflineRequest {
     /// `input_path` from disk -- see the field's doc comment.
     pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<Vec<f32>>>) -> Self {
         self.prepared_samples = prepared_samples;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_voice_id_segmenter(
+        mut self,
+        preference: crate::config::VoiceIdSegmenterPreference,
+    ) -> Self {
+        self.voice_id_segmenter = preference;
         self
     }
 

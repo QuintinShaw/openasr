@@ -1396,6 +1396,7 @@ pub(crate) fn apply_transcription_preferences(
     request: &mut TranscriptionRequest,
     preferences: &openasr_core::config::Preferences,
 ) {
+    request.voice_id_segmenter = preferences.voice_id_segmenter;
     if request.inference_threads.is_none() {
         request.inference_threads = preferences.inference_threads;
     }
@@ -1743,6 +1744,7 @@ pub(crate) async fn transcribe_with_runtime(
                         // re-reading `input_path` from disk -- see
                         // `PreparedAudioInput::shared_samples`.
                         .with_prepared_samples(prepared.shared_samples())
+                        .with_voice_id_segmenter(request.voice_id_segmenter)
                         // Explicit cancel/pause/resume context for the whole
                         // synchronous decode call below -- never a thread-local.
                         .with_execution_context(Arc::clone(&execution_context))

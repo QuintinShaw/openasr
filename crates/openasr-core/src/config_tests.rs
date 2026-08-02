@@ -266,7 +266,7 @@ fn voice_id_segmenter_preference_is_additive_and_roundtrips() {
     );
 
     let forced = Preferences {
-        voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Segmentation3,
+        voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Segmentation3_0,
         ..Preferences::default()
     };
     let json = serde_json::to_string(&forced).unwrap();
@@ -704,4 +704,20 @@ fn validate_accepts_absolute_models_dir_that_does_not_exist_yet() {
         ..OpenAsrConfig::default()
     };
     config.validate(&registry()).unwrap();
+}
+
+#[test]
+fn voice_id_segmenter_preference_has_stable_wire_values() {
+    assert_eq!(
+        serde_json::to_string(&VoiceIdSegmenterPreference::Auto).unwrap(),
+        "\"auto\""
+    );
+    assert_eq!(
+        serde_json::to_string(&VoiceIdSegmenterPreference::Segmentation3_0).unwrap(),
+        "\"segmentation_3_0\""
+    );
+    assert_eq!(
+        serde_json::from_str::<VoiceIdSegmenterPreference>("\"segmentation_3_0\"").unwrap(),
+        VoiceIdSegmenterPreference::Segmentation3_0
+    );
 }

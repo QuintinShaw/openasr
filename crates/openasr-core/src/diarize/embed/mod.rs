@@ -47,6 +47,21 @@ pub trait SpeakerEmbedder: Send + Sync {
     /// Embed `samples`; the result is L2-normalized.
     fn embed(&self, samples: &[f32], sample_rate_hz: u32) -> Result<SpeakerEmbedding, EmbedError>;
 
+    /// Embed a collection of independently padded speech chunks. Runtime
+    /// adapters with a real batched graph override this; the default preserves
+    /// the exact per-chunk error surface while keeping the diarization module
+    /// independent of a particular ReDim execution strategy.
+    fn embed_batch(
+        &self,
+        chunks: &[&[f32]],
+        sample_rate_hz: u32,
+    ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+        chunks
+            .iter()
+            .map(|samples| self.embed(samples, sample_rate_hz))
+            .collect()
+    }
+
     /// Embedding dimensionality (ReDimNet2-B6 = 192).
     fn embedding_dim(&self) -> usize;
 

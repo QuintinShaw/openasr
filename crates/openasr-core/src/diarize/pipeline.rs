@@ -1,11 +1,10 @@
-//! Batch diarization pipeline: speech segments → speaker embeddings →
-//! clustering → speaker turns.
+//! Compatibility helpers for enrollment and older internal callers.
 //!
-//! Speech regions arrive pre-computed (one assumed speaker per region): the
-//! caller (`native_transcribe::resolve_speech_segments`) prefers pyannote
-//! segmentation regions (speaker-change + overlap aware, P3-full) when that
-//! pack is installed and falls back to the neural VAD's slices (P3-lite),
-//! which works for turn-taking conversations with pauses.
+//! The production recording-level external diarization path lives in
+//! [`super::external`]. It owns segmentation, embedding, clustering and
+//! overlap reconstruction as a single fail-closed module. These helpers keep
+//! the older pre-segmented API available for enrollment; they must not be used
+//! to reintroduce VAD-only fallback into production diarization.
 
 use std::collections::BTreeMap;
 
@@ -13,10 +12,11 @@ use super::clustering::{ClusterContext, SpeakerClusterer};
 use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
 use super::embed::SpeakerEmbedder;
 
-/// Resolve the speech regions to embed: pyannote segmentation when its pack is
-/// installed (finer, speaker-change + overlap aware), else the neural VAD
-/// slices. Both batch attribution and enrollment go through this single
-/// resolver so their embeddings live in the same space.
+/// Resolve speech regions for the compatibility/enrollment path.
+///
+/// This may fall back to neural VAD because enrollment needs speech crops, not
+/// recording-level diarization. Production external diarization deliberately
+/// does not call this function.
 pub fn resolve_speech_regions(samples: &[f32]) -> Option<Vec<TimeRange>> {
     Some(
         resolve_diarization_regions(samples)?

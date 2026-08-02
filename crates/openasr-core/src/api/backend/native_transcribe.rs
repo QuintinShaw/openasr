@@ -1202,6 +1202,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::NativeModelPackPathRejected { .. }
         | BackendError::NativeModelSelectionMismatch { .. } => FailureCategory::ModelResolve,
         BackendError::DiarizationNotSupported { .. }
+        | BackendError::DiarizationSegmenterUnavailable
         | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
         | BackendError::PhraseBiasNotSupported { .. }
@@ -1225,6 +1226,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
             FailureCategory::Alloc
         }
         BackendError::NativeFailClosed { .. }
+        | BackendError::ExternalDiarizationFailed { .. }
         | BackendError::WordTimestampAlignmentFailed { .. } => FailureCategory::Decode,
     }
 }
@@ -1508,8 +1510,8 @@ enum SpeakerPlan {
     Off,
     /// The family's own decode carries the turns.
     InDecoder,
-    /// A separate segmenter over the same audio produces the turns: today the
-    /// VAD + speaker-embedder clustering path.
+    /// A separate recording-level segmenter over the same audio produces the
+    /// turns, followed by speaker embedding, clustering and overlap recovery.
     External,
 }
 
@@ -1587,20 +1589,17 @@ fn run_native_transcription_impl(
         request.phrase_bias.as_ref(),
     )?;
     // Resolve the one segmentation source for this request. Exactly one runs:
-    // the family's own decode, or the external VAD + speaker-embedder pass --
+    // the family's own decode, or the external segment/embed/cluster pass --
     // never both, so nothing can overwrite the other's labels downstream.
     let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
-    if speaker_plan == SpeakerPlan::External
-        && (crate::diarize::embed::shared_embedder().is_none()
-            || crate::diarize::vad::FireRedStreamVadProvider::shared().is_none())
-    {
-        // Fail closed up front rather than silently returning a speaker-less
-        // transcript: this family has no speaker structure of its own, so with
-        // no embedder or VAD model there is no source at all. (An in-decoder
-        // family never reaches this branch -- it degrades to recording-local
-        // turns instead of refusing the request.)
-        return Err(BackendError::DiarizationNotSupported { backend: "native" });
-    }
+    let external_diarizer = if speaker_plan == SpeakerPlan::External {
+        Some(
+            crate::diarize::external::ExternalDiarizer::preflight(request.voice_id_segmenter)
+                .map_err(external_diarization_error_to_backend)?,
+        )
+    } else {
+        None
+    };
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
         // needs Voice ID on, and only the external clustering path clusters.
@@ -1611,7 +1610,7 @@ fn run_native_transcription_impl(
             return Err(BackendError::RequestOptionUnsupportedByModel {
                 adapter: selected_family.adapter_id,
                 option: "speakers hint",
-                reason: "The model separates speakers in-decoder; the exact-speaker-count hint only applies to the VAD + speaker-embedder clustering path.",
+                reason: "The model separates speakers in-decoder; the exact-speaker-count hint only applies to the external segment/embed/cluster path.",
             });
         }
     }
@@ -1637,8 +1636,8 @@ fn run_native_transcription_impl(
     );
 
     // Reject before any decode graph gets built -- and before
-    // `compute_speaker_attribution` below, which loads the speaker-embedder
-    // model and runs VAD + embedding + clustering over the whole recording,
+    // `compute_speaker_attribution` below, which loads the segmenter and
+    // speaker-embedder models and runs the whole-recording diarization module,
     // itself a significant memory user -- if this request's decoder KV
     // footprint plainly does not fit this host's memory budget (a pack whose
     // KV cache plus weights exceed the host memory budget, surfacing
@@ -1683,12 +1682,12 @@ fn run_native_transcription_impl(
 
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
-    let speaker_turns = if speaker_plan == SpeakerPlan::External {
+    let speaker_turns = if let Some(diarizer) = external_diarizer.as_ref() {
         let hint = match request.diarize_speakers {
             Some(speakers) => crate::diarize::contract::DiarizeHint::NumSpeakers(speakers),
             None => crate::diarize::contract::DiarizeHint::Auto,
         };
-        compute_speaker_attribution(&prepared_audio, hint)
+        compute_speaker_attribution(diarizer, &prepared_audio, hint, &execution_context)?
     } else {
         SpeakerAttribution::default()
     };
@@ -2505,50 +2504,26 @@ fn retain_visible_unnamed_speakers(
         .collect()
 }
 
-/// Diarize the prepared audio into speaker turns, then match the optional
-/// enrolled primary user. Speech segments come from pyannote segmentation
-/// (speaker-change + overlap aware) when its pack is installed, else the neural
-/// VAD; the shared speaker embedder + agglomerative clustering assign global
-/// speakers. Returns empty if the embedder/segmenter are unavailable.
+/// Diarize the prepared audio into recording-local speaker turns, then match
+/// the optional enrolled primary user. All external protocol details stay
+/// behind `ExternalDiarizer`; this layer only consumes normalized turns and
+/// centroids.
 fn compute_speaker_attribution(
+    diarizer: &crate::diarize::external::ExternalDiarizer,
     samples: &[f32],
     hint: crate::diarize::contract::DiarizeHint,
-) -> SpeakerAttribution {
-    use crate::diarize::clustering::AgglomerativeClusterer;
-    use crate::diarize::embed::shared_embedder;
-    use crate::diarize::pipeline::BatchDiarizer;
-
+    execution_context: &crate::RequestExecutionContext,
+) -> Result<SpeakerAttribution, BackendError> {
     let diarize_debug = crate::diarize::debug::diarize_debug_enabled();
-    let Some(embedder) = shared_embedder() else {
-        if diarize_debug {
-            eprintln!("openasr_diarize_debug stage=batch decision=no-embedder");
-        }
-        return SpeakerAttribution::default();
-    };
-    let Some(speech) = crate::diarize::pipeline::resolve_diarization_regions(samples) else {
-        if diarize_debug {
-            eprintln!("openasr_diarize_debug stage=batch decision=no-speech-regions");
-        }
-        return SpeakerAttribution::default();
-    };
     if diarize_debug {
-        eprintln!("openasr_diarize_debug stage=batch regions={}", speech.len());
-        for region in &speech {
-            eprintln!(
-                "openasr_diarize_debug stage=batch region start={:.2} end={:.2} local_speaker={} overlap={}",
-                region.range.start_s,
-                region.range.end_s,
-                region
-                    .local_speaker
-                    .map(|speaker| speaker.label())
-                    .unwrap_or_else(|| "none".to_string()),
-                region.overlap
-            );
-        }
+        eprintln!(
+            "openasr_diarize_debug stage=batch segmenter={:?}",
+            diarizer.selected_segmenter()
+        );
     }
-    let clusterer = AgglomerativeClusterer::for_embedder(embedder);
-    let diarization =
-        BatchDiarizer::new(embedder, &clusterer).diarize_regions(samples, 16_000, &speech, hint);
+    let diarization = diarizer
+        .diarize(samples, 16_000, hint, &|| execution_context.is_canceled())
+        .map_err(external_diarization_error_to_backend)?;
     if diarize_debug {
         eprintln!(
             "openasr_diarize_debug stage=batch turns={} speakers={}",
@@ -2609,10 +2584,33 @@ fn compute_speaker_attribution(
             );
         }
     }
-    SpeakerAttribution {
+    Ok(SpeakerAttribution {
         turns: diarization.turns,
         identities,
         unnamed,
+    })
+}
+
+fn external_diarization_error_to_backend(
+    error: crate::diarize::external::ExternalDiarizationError,
+) -> BackendError {
+    use crate::diarize::external::ExternalDiarizationError;
+    use crate::diarize::segment::SegmentError;
+
+    match error {
+        ExternalDiarizationError::Canceled
+        | ExternalDiarizationError::Segmenter(SegmentError::Canceled) => {
+            BackendError::TranscriptionCanceled
+        }
+        ExternalDiarizationError::Segmenter(SegmentError::MissingPack { .. }) => {
+            BackendError::DiarizationSegmenterUnavailable
+        }
+        ExternalDiarizationError::MissingEmbedder => {
+            BackendError::DiarizationNotSupported { backend: "native" }
+        }
+        error => BackendError::ExternalDiarizationFailed {
+            reason: error.to_string(),
+        },
     }
 }
 
