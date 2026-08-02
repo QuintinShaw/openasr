@@ -117,8 +117,12 @@ jobs:
       - name: Checkout for version metadata
         uses: actions/checkout@v7
         with:
-          # Prefer an explicit ref, then the release tag, then the default ref.
-          ref: ${{ inputs.ref || inputs.tag || github.ref }}
+          # Dockerfiles and scripts come from the workflow tree (or an
+          # explicit inputs.ref). Never default to the release tag here:
+          # tags cut before Dockerfile.release existed would make the build
+          # jobs fail with "no such file". Version/tag inputs alone select
+          # which GitHub Release assets to download.
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Plan
         id: plan
@@ -149,11 +153,19 @@ jobs:
             tag="v${version}"
           fi
 
+          # Release-assemble Dockerfiles (Dockerfile.release / Dockerfile.cuda.release)
+          # live on the workflow commit / default branch. The release tag only
+          # names which GitHub Release assets to download -- checking out the
+          # tag itself fails for any release cut before those Dockerfiles
+          # existed (open Dockerfile.release: no such file).
           checkout_ref="${INPUT_REF}"
           if [ -z "${checkout_ref}" ]; then
-            checkout_ref="${tag}"
+            checkout_ref="${GITHUB_SHA}"
           fi
 
+          # Prefer the release-tag commit for the image sha-* label when the
+          # resolve job checked out that tag (binary provenance). Fall back to
+          # the workflow commit otherwise.
           short_sha="$(git rev-parse --short HEAD)"
 
           variants="$(printf '%s' "${INPUT_VARIANTS:-all}" | tr '[:upper:]' '[:lower:]')"
