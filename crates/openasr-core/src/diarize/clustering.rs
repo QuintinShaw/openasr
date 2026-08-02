@@ -369,34 +369,193 @@ enum AutomaticStrategy {
     Spectral,
 }
 
+/// Test-only view of the production automatic-clustering route.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutomaticClusteringStrategy {
+    Ahc,
+    Spectral,
+}
+
+#[cfg(test)]
+impl From<AutomaticStrategy> for AutomaticClusteringStrategy {
+    fn from(strategy: AutomaticStrategy) -> Self {
+        match strategy {
+            AutomaticStrategy::Ahc => Self::Ahc,
+            AutomaticStrategy::Spectral => Self::Spectral,
+        }
+    }
+}
+
+/// Test-only snapshot of every decision boundary in automatic clustering.
+///
+/// The native fixture emitter consumes this seam instead of maintaining a
+/// diagnostic copy of the algorithm. Labels are session-relative and preserve
+/// the exact ordering produced by the production path.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AutomaticClusteringDiagnostics {
+    pub(crate) strategy: AutomaticClusteringStrategy,
+    /// Smallest unnormalized-Laplacian eigenvalues used by the spectral path.
+    /// Automatic clustering needs at most `SPECTRAL_MAX_SPEAKERS + 1` (16).
+    /// Forced counts above that retain the same diagnostic prefix.
+    pub(crate) spectral_eigenvalues: Vec<f64>,
+    /// Eigengap-selected count for automatic spectral clustering. Forced
+    /// counts and AHC deliberately leave this unset.
+    pub(crate) eigengap_speakers: Option<usize>,
+    /// Speaker count selected by the active route before post-processing.
+    pub(crate) selected_speakers: usize,
+    pub(crate) raw_labels: Vec<SpeakerId>,
+    pub(crate) minor_filtered_labels: Vec<SpeakerId>,
+    pub(crate) final_labels: Vec<SpeakerId>,
+}
+
+trait AutomaticClusteringObserver {
+    fn record_strategy(&mut self, _strategy: AutomaticStrategy) {}
+
+    fn record_spectral(&mut self, _eigenvalues: &[f64], _eigengap_speakers: Option<usize>) {}
+
+    fn record_selected_speakers(&mut self, _speakers: usize) {}
+
+    fn record_raw_labels(&mut self, _labels: &[usize]) {}
+
+    fn record_minor_filtered_labels(&mut self, _labels: &[usize]) {}
+}
+
+struct IgnoreAutomaticClusteringDiagnostics;
+
+impl AutomaticClusteringObserver for IgnoreAutomaticClusteringDiagnostics {}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CaptureAutomaticClusteringDiagnostics {
+    strategy: Option<AutomaticClusteringStrategy>,
+    spectral_eigenvalues: Vec<f64>,
+    eigengap_speakers: Option<usize>,
+    selected_speakers: Option<usize>,
+    raw_labels: Vec<SpeakerId>,
+    minor_filtered_labels: Vec<SpeakerId>,
+}
+
+#[cfg(test)]
+impl CaptureAutomaticClusteringDiagnostics {
+    fn finish(self, final_labels: Vec<SpeakerId>) -> AutomaticClusteringDiagnostics {
+        AutomaticClusteringDiagnostics {
+            strategy: self
+                .strategy
+                .expect("automatic clustering must record its strategy"),
+            spectral_eigenvalues: self.spectral_eigenvalues,
+            eigengap_speakers: self.eigengap_speakers,
+            selected_speakers: self
+                .selected_speakers
+                .expect("automatic clustering must record its selected speaker count"),
+            raw_labels: self.raw_labels,
+            minor_filtered_labels: self.minor_filtered_labels,
+            final_labels,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AutomaticClusteringObserver for CaptureAutomaticClusteringDiagnostics {
+    fn record_strategy(&mut self, strategy: AutomaticStrategy) {
+        self.strategy = Some(strategy.into());
+    }
+
+    fn record_spectral(&mut self, eigenvalues: &[f64], eigengap_speakers: Option<usize>) {
+        self.spectral_eigenvalues = eigenvalues
+            .iter()
+            .take(SPECTRAL_MAX_SPEAKERS + 1)
+            .copied()
+            .collect();
+        self.eigengap_speakers = eigengap_speakers;
+    }
+
+    fn record_selected_speakers(&mut self, speakers: usize) {
+        self.selected_speakers = Some(speakers);
+    }
+
+    fn record_raw_labels(&mut self, labels: &[usize]) {
+        self.raw_labels = speaker_ids_from_labels(labels);
+    }
+
+    fn record_minor_filtered_labels(&mut self, labels: &[usize]) {
+        self.minor_filtered_labels = speaker_ids_from_labels(labels);
+    }
+}
+
 impl AutomaticClusterer {
     pub(crate) fn cluster(
         &self,
         embeddings: &[SpeakerEmbedding],
         hint: DiarizeHint,
     ) -> Vec<SpeakerId> {
+        let mut observer = IgnoreAutomaticClusteringDiagnostics;
+        self.cluster_observed(embeddings, hint, &mut observer)
+    }
+
+    /// Run the exact production clustering path while retaining its
+    /// intermediate decisions for the ignored native fixture emitter.
+    #[cfg(test)]
+    pub(crate) fn diagnostics(
+        &self,
+        embeddings: &[SpeakerEmbedding],
+        hint: DiarizeHint,
+    ) -> AutomaticClusteringDiagnostics {
+        let mut observer = CaptureAutomaticClusteringDiagnostics::default();
+        let final_labels = self.cluster_observed(embeddings, hint, &mut observer);
+        observer.finish(final_labels)
+    }
+
+    fn cluster_observed<O: AutomaticClusteringObserver>(
+        &self,
+        embeddings: &[SpeakerEmbedding],
+        hint: DiarizeHint,
+        observer: &mut O,
+    ) -> Vec<SpeakerId> {
+        let strategy = match hint {
+            DiarizeHint::NumSpeakers(_) => AutomaticStrategy::Spectral,
+            DiarizeHint::Threshold(_) => AutomaticStrategy::Ahc,
+            DiarizeHint::Auto => Self::strategy_for_len(embeddings.len()),
+        };
+        observer.record_strategy(strategy);
+
         if embeddings.len() <= 1 {
-            return vec![SpeakerId(0); embeddings.len()];
+            let labels = vec![0usize; embeddings.len()];
+            observer.record_selected_speakers(embeddings.len());
+            observer.record_raw_labels(&labels);
+            observer.record_minor_filtered_labels(&labels);
+            return as_speaker_ids(labels);
         }
 
         let labels = match hint {
             DiarizeHint::NumSpeakers(speakers) => spectral_labels(
                 embeddings,
                 Some((speakers as usize).clamp(1, embeddings.len())),
+                observer,
             ),
             DiarizeHint::Threshold(distance) => {
-                ahc_labels(embeddings, 1.0 - distance.clamp(0.0, 2.0), 1)
+                let labels = ahc_labels(embeddings, 1.0 - distance.clamp(0.0, 2.0), 1);
+                observer.record_selected_speakers(label_count(&labels));
+                labels
             }
-            DiarizeHint::Auto => match Self::strategy_for_len(embeddings.len()) {
-                AutomaticStrategy::Ahc => ahc_labels(embeddings, AUTOMATIC_AHC_COSINE_THRESHOLD, 1),
-                AutomaticStrategy::Spectral => spectral_labels(embeddings, None),
+            DiarizeHint::Auto => match strategy {
+                AutomaticStrategy::Ahc => {
+                    let labels = ahc_labels(embeddings, AUTOMATIC_AHC_COSINE_THRESHOLD, 1);
+                    observer.record_selected_speakers(label_count(&labels));
+                    labels
+                }
+                AutomaticStrategy::Spectral => spectral_labels(embeddings, None, observer),
             },
         };
+        observer.record_raw_labels(&labels);
 
         if matches!(hint, DiarizeHint::NumSpeakers(_)) {
+            observer.record_minor_filtered_labels(&labels);
             return as_speaker_ids(compact_labels(&labels));
         }
         let labels = filter_minor_clusters(&labels, embeddings, MINOR_CLUSTER_MAX_SIZE);
+        observer.record_minor_filtered_labels(&labels);
         as_speaker_ids(compact_labels(&merge_similar_centroids(
             &labels,
             embeddings,
@@ -418,6 +577,18 @@ fn as_speaker_ids(labels: Vec<usize>) -> Vec<SpeakerId> {
         .into_iter()
         .map(|label| SpeakerId(label as u32))
         .collect()
+}
+
+#[cfg(test)]
+fn speaker_ids_from_labels(labels: &[usize]) -> Vec<SpeakerId> {
+    labels
+        .iter()
+        .map(|&label| SpeakerId(label as u32))
+        .collect()
+}
+
+fn label_count(labels: &[usize]) -> usize {
+    labels.iter().copied().max().map_or(0, |label| label + 1)
 }
 
 fn ahc_labels(
@@ -463,17 +634,25 @@ fn ahc_labels(
     raw_labels_from_clusters(&clusters, n)
 }
 
-fn spectral_labels(embeddings: &[SpeakerEmbedding], forced_speakers: Option<usize>) -> Vec<usize> {
+fn spectral_labels<O: AutomaticClusteringObserver>(
+    embeddings: &[SpeakerEmbedding],
+    forced_speakers: Option<usize>,
+    observer: &mut O,
+) -> Vec<usize> {
     let affinity = pruned_affinity(embeddings);
     let vector_count = forced_speakers
         .unwrap_or(SPECTRAL_MAX_SPEAKERS + 1)
         .min(embeddings.len());
     let (eigenvalues, eigenvectors) = smallest_laplacian_eigenvectors(&affinity, vector_count);
+    let eigengap_speakers = forced_speakers.is_none().then(|| {
+        choose_eigengap_speakers(&eigenvalues, SPECTRAL_MIN_SPEAKERS, SPECTRAL_MAX_SPEAKERS)
+    });
     let speakers = forced_speakers
-        .unwrap_or_else(|| {
-            choose_eigengap_speakers(&eigenvalues, SPECTRAL_MIN_SPEAKERS, SPECTRAL_MAX_SPEAKERS)
-        })
+        .or(eigengap_speakers)
+        .unwrap_or(1)
         .clamp(1, embeddings.len());
+    observer.record_spectral(&eigenvalues, eigengap_speakers);
+    observer.record_selected_speakers(speakers);
     let features: Vec<f64> = (0..embeddings.len())
         .flat_map(|row| {
             eigenvectors[row * vector_count..row * vector_count + speakers]
@@ -1107,6 +1286,92 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(clusterer.cluster(&embeddings, DiarizeHint::Auto), expected);
         }
+    }
+
+    #[test]
+    fn automatic_diagnostics_final_labels_exactly_match_production() {
+        let ahc_embeddings: Vec<_> = (0..12)
+            .map(|index| {
+                if index < 6 {
+                    emb(vec![1.0, 0.01 * index as f32, 0.0])
+                } else {
+                    emb(vec![0.01 * (index - 6) as f32, 1.0, 0.0])
+                }
+            })
+            .collect();
+        let spectral_embeddings: Vec<_> = (0..48)
+            .map(|index| {
+                let group = index % 3;
+                let mut values = vec![0.01 * index as f32, 0.0, 0.0];
+                values[group] += 1.0;
+                emb(values)
+            })
+            .collect();
+        let clusterer = AutomaticClusterer;
+
+        let ahc = clusterer.diagnostics(&ahc_embeddings, DiarizeHint::Auto);
+        assert_eq!(
+            ahc.final_labels,
+            clusterer.cluster(&ahc_embeddings, DiarizeHint::Auto)
+        );
+        assert_eq!(ahc.strategy, AutomaticClusteringStrategy::Ahc);
+        assert!(ahc.spectral_eigenvalues.is_empty());
+        assert_eq!(ahc.eigengap_speakers, None);
+        assert_eq!(ahc.selected_speakers, 2);
+        assert_eq!(ahc.raw_labels.len(), ahc_embeddings.len());
+        assert_eq!(ahc.minor_filtered_labels.len(), ahc_embeddings.len());
+
+        let spectral = clusterer.diagnostics(&spectral_embeddings, DiarizeHint::Auto);
+        assert_eq!(
+            spectral.final_labels,
+            clusterer.cluster(&spectral_embeddings, DiarizeHint::Auto)
+        );
+        assert_eq!(spectral.strategy, AutomaticClusteringStrategy::Spectral);
+        assert_eq!(
+            spectral.spectral_eigenvalues.len(),
+            SPECTRAL_MAX_SPEAKERS + 1
+        );
+        assert_eq!(spectral.eigengap_speakers, Some(spectral.selected_speakers));
+        assert_eq!(spectral.raw_labels.len(), spectral_embeddings.len());
+        assert_eq!(
+            spectral.minor_filtered_labels.len(),
+            spectral_embeddings.len()
+        );
+    }
+
+    #[test]
+    fn automatic_diagnostics_distinguish_forced_and_degenerate_paths() {
+        let embeddings: Vec<_> = (0..40)
+            .map(|index| {
+                if index < 20 {
+                    emb(vec![1.0, 0.01 * index as f32])
+                } else {
+                    emb(vec![0.01 * (index - 20) as f32, 1.0])
+                }
+            })
+            .collect();
+        let clusterer = AutomaticClusterer;
+
+        let forced = clusterer.diagnostics(&embeddings, DiarizeHint::NumSpeakers(2));
+        assert_eq!(forced.strategy, AutomaticClusteringStrategy::Spectral);
+        assert_eq!(forced.spectral_eigenvalues.len(), 2);
+        assert_eq!(forced.eigengap_speakers, None);
+        assert_eq!(forced.selected_speakers, 2);
+        assert_eq!(forced.raw_labels, forced.minor_filtered_labels);
+        assert_eq!(
+            forced.final_labels,
+            clusterer.cluster(&embeddings, DiarizeHint::NumSpeakers(2))
+        );
+
+        let singleton = vec![emb(vec![1.0, 0.0])];
+        let short = clusterer.diagnostics(&singleton, DiarizeHint::Auto);
+        assert_eq!(short.strategy, AutomaticClusteringStrategy::Ahc);
+        assert!(short.spectral_eigenvalues.is_empty());
+        assert_eq!(short.eigengap_speakers, None);
+        assert_eq!(short.selected_speakers, 1);
+        assert_eq!(short.raw_labels, vec![SpeakerId(0)]);
+        assert_eq!(short.minor_filtered_labels, short.raw_labels);
+        assert_eq!(short.final_labels, short.raw_labels);
     }
 
     #[test]
