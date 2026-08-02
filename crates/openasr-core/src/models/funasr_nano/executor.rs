@@ -66,10 +66,13 @@ const FUNASR_NANO_STREAMING_EXECUTOR_ID: &str = "funasr-nano-ggml-snapshot-strea
 /// it). The executor fails closed rather than silently running an OOD
 /// multi-minute prefill; longer audio is the shared longform slicing
 /// orchestrator's job (see the `ConservativeSeq2SeqV1` longform profile).
-const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
+/// Also the single-decode clamp host-memory admission reads
+/// ([`super::capacity::FUNASR_NANO_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS`]).
+pub(crate) const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
 /// Fail-closed backstop against a non-terminating decode -- greedy decode stops
-/// at `<|im_end|>` well before this in practice.
-const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
+/// at `<|im_end|>` well before this in practice. Admission charges the same
+/// figure (`super::capacity::funasr_nano_admission_required_positions`).
+pub(crate) const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
 
 type FunasrNanoRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 

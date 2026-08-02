@@ -2902,6 +2902,70 @@ fn firered_aed_native_capacity_admission_facts(
     })
 }
 
+/// This request's decoder KV admission facts for `funasr-nano`, assembled from
+/// the loaded pack's Qwen3 decoder metadata
+/// (`crate::models::funasr_nano::capacity`). Audio-token count walks the same
+/// fbank + LFR + low-frame-rate truncation arithmetic the executor uses;
+/// generation backstop and single-decode window reuse the executor's own
+/// constants. The KV element-type policy is resolved from the SAME
+/// `resolve_qwen_family_production_kv_cache_policy(backend, head_dim)` the
+/// real decoder allocates against (`Qwen3AsrLlmWholeDecoderGraphExecutor`
+/// construction). `None` (unparseable funasr-nano metadata) leaves the
+/// request admission-unchecked (fail open).
+fn funasr_nano_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<NativeKvAdmissionFacts> {
+    let decoder =
+        crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(metadata)
+            .ok()?;
+    let geometry = crate::models::funasr_nano::capacity::funasr_nano_kv_geometry(&decoder);
+    let required_positions =
+        crate::models::funasr_nano::capacity::funasr_nano_admission_required_positions(
+            audio_duration_seconds,
+        );
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    Some(NativeKvAdmissionFacts {
+        geometry,
+        spec,
+        required_positions,
+        fixed_decode_state_bytes: 0,
+    })
+}
+
+/// This request's decoder KV admission facts for `granite-speech`, assembled
+/// from the loaded pack's decoder metadata
+/// (`crate::models::granite_speech::capacity`). Audio-token rate and fixed
+/// prompt overhead reuse the family's capacity module (the same geometry the
+/// max-input-seconds derivation uses); generation headroom is the executor's
+/// `GRANITE_SPEECH_MAX_GENERATED_TOKENS`. Spec is
+/// `GRANITE_SPEECH_ADMISSION_KV_SPEC` (two f16 halves = the single f32 copy
+/// the runtime keeps -- see that constant's doc; NOT the qwen-family
+/// resolver, granite does not share the qwen decoder path). `None`
+/// (unparseable granite-speech metadata) leaves the request
+/// admission-unchecked (fail open).
+fn granite_speech_native_capacity_admission_facts(
+    metadata: &crate::ggml_runtime::GgufMetadata,
+    audio_duration_seconds: f32,
+) -> Option<NativeKvAdmissionFacts> {
+    let decoder =
+        crate::models::granite_speech::runtime_contract::parse_decoder_metadata(metadata).ok()?;
+    Some(NativeKvAdmissionFacts {
+        geometry: crate::models::granite_speech::capacity::granite_speech_kv_geometry(&decoder),
+        spec: crate::models::granite_speech::capacity::GRANITE_SPEECH_ADMISSION_KV_SPEC,
+        required_positions:
+            crate::models::granite_speech::capacity::granite_speech_admission_required_positions(
+                audio_duration_seconds,
+            ),
+        fixed_decode_state_bytes: 0,
+    })
+}
+
 /// The per-family KV admission facts deriver for `model_architecture`, or
 /// `None` when this architecture has no wired deriver (fail open -- left
 /// admission-unchecked, exactly as before this check existed). Each wired arm
@@ -2911,11 +2975,12 @@ fn firered_aed_native_capacity_admission_facts(
 /// family geometry.
 ///
 /// Wired today: every `Derived`-capacity family (moss-transcribe-diarize,
-/// qwen3-asr, firered-llm, mimo-asr, cohere-transcribe) plus firered-aed
-/// (whose fixed-ceiling decoder arenas are large enough to matter even
-/// though its audio bound lives elsewhere). Families that keep no
-/// per-request decoder KV state worth charging (CTC/transducer shapes, the
-/// small `BoundedElsewhere` decoders) stay unchecked.
+/// qwen3-asr, firered-llm, mimo-asr, cohere-transcribe, funasr-nano,
+/// granite-speech) plus firered-aed (whose fixed-ceiling decoder arenas are
+/// large enough to matter even though its audio bound lives elsewhere).
+/// Families that keep no per-request decoder KV state worth charging
+/// (CTC/transducer shapes, the small `BoundedElsewhere` decoders) stay
+/// unchecked.
 fn native_capacity_admission_facts(
     model_architecture: &str,
     metadata: &crate::ggml_runtime::GgufMetadata,
@@ -2934,6 +2999,10 @@ fn native_capacity_admission_facts(
         cohere_native_capacity_admission_facts(metadata)
     } else if model_architecture == crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID {
         firered_aed_native_capacity_admission_facts(metadata)
+    } else if model_architecture == crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID {
+        funasr_nano_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
+    } else if model_architecture == crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID {
+        granite_speech_native_capacity_admission_facts(metadata, audio_duration_seconds)
     } else {
         None
     }
@@ -4685,6 +4754,150 @@ mod tests {
         );
     }
 
+    /// Synthetic GGUF metadata carrying the real Fun-ASR-Nano-2512
+    /// checkpoint's Qwen3-0.6B decoder facts (the same values
+    /// `funasr_nano::runtime_contract`'s `full_metadata` fixture parses).
+    /// Only the decoder keys are required: the admission deriver only parses
+    /// the LLM decoder subset.
+    fn funasr_nano_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+        use crate::models::funasr_nano::runtime_contract::*;
+
+        let mut values = std::collections::BTreeMap::new();
+        for (key, value) in [
+            (LLM_N_LAYERS_KEY, 28u64),
+            (LLM_D_MODEL_KEY, 1024),
+            (LLM_N_HEADS_KEY, 16),
+            (LLM_N_KV_HEADS_KEY, 8),
+            (LLM_HEAD_DIM_KEY, 128),
+            (LLM_FFN_DIM_KEY, 3072),
+            (LLM_VOCAB_SIZE_KEY, 151_936),
+            (LLM_MAX_POSITIONS_KEY, 40_960),
+            (LLM_CHATML_IM_START_TOKEN_ID_KEY, 151_644),
+            (LLM_CHATML_IM_END_TOKEN_ID_KEY, 151_645),
+            (LLM_ENDOFTEXT_TOKEN_ID_KEY, 151_643),
+        ] {
+            values.insert(key.to_string(), V::U64(value));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// Synthetic GGUF metadata carrying the real granite-speech-4.1-2b
+    /// checkpoint's decoder facts (the same values
+    /// `GraniteSpeechDecoderConfig::granite_speech_4_1_2b` pins and
+    /// `package_import` writes). Integer keys as u32; the four scaling
+    /// scalars + rms/rope as stringified floats (the pack's real encoding).
+    fn granite_speech_shipped_pack_metadata_for_test() -> crate::ggml_runtime::GgufMetadata {
+        use crate::ggml_runtime::GgufMetadataValue as V;
+
+        let mut values = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("granite_speech.decoder.hidden_size", 2048u32),
+            ("granite_speech.decoder.num_hidden_layers", 40),
+            ("granite_speech.decoder.num_attention_heads", 16),
+            ("granite_speech.decoder.num_key_value_heads", 4),
+            ("granite_speech.decoder.head_dim", 128),
+            ("granite_speech.decoder.intermediate_size", 4096),
+            ("granite_speech.decoder.vocab_size", 100_353),
+        ] {
+            values.insert(key.to_string(), V::U32(value));
+        }
+        for (key, value) in [
+            ("granite_speech.decoder.rms_norm_eps", "0.00001"),
+            ("granite_speech.decoder.rope_theta", "10000"),
+            ("granite_speech.decoder.attention_multiplier", "0.0078125"),
+            ("granite_speech.decoder.embedding_multiplier", "12"),
+            ("granite_speech.decoder.residual_multiplier", "0.22"),
+            ("granite_speech.decoder.logits_scaling", "8"),
+        ] {
+            values.insert(key.to_string(), V::String(value.to_string()));
+        }
+        crate::ggml_runtime::GgufMetadata::from_values_for_test(values)
+    }
+
+    /// funasr-nano is now wired: geometry off the pack's Qwen3 decoder keys,
+    /// spec from the same resolver the real decoder allocates against (Q8_0
+    /// on CPU at head_dim 128), positions cross-checked against the family
+    /// deriver, and the single-decode clamp holding for a multi-hour file.
+    #[test]
+    fn funasr_nano_capacity_admission_facts_derive_from_pack_metadata() {
+        let metadata = funasr_nano_shipped_pack_metadata_for_test();
+        let facts = native_capacity_admission_facts(
+            crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+            &metadata,
+            40.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("funasr-nano-shaped metadata must derive admission facts");
+        assert_eq!(
+            facts.geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 28,
+                kv_heads: 8,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(facts.spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(facts.fixed_decode_state_bytes, 0);
+        assert_eq!(
+            facts.required_positions,
+            crate::models::funasr_nano::capacity::funasr_nano_admission_required_positions(40.0)
+        );
+        // A multi-hour recording clamps to the 40s single-decode window.
+        let at_hour = native_capacity_admission_facts(
+            crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+            &metadata,
+            3600.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("facts");
+        assert_eq!(at_hour, facts);
+    }
+
+    /// granite-speech is now wired: geometry off the pack's decoder keys,
+    /// spec is the family's single-f32-copy admission stand-in (not the
+    /// qwen-family resolver), positions cross-checked against the family
+    /// deriver, and the SharedWindow clamp holding for a multi-hour file.
+    #[test]
+    fn granite_speech_capacity_admission_facts_derive_from_pack_metadata() {
+        let metadata = granite_speech_shipped_pack_metadata_for_test();
+        let facts = native_capacity_admission_facts(
+            crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            &metadata,
+            30.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("granite-speech-shaped metadata must derive admission facts");
+        assert_eq!(
+            facts.geometry,
+            crate::capacity::KvGeometry {
+                n_layers: 40,
+                kv_heads: 4,
+                head_dim: 128,
+            }
+        );
+        assert_eq!(
+            facts.spec,
+            crate::models::granite_speech::capacity::GRANITE_SPEECH_ADMISSION_KV_SPEC
+        );
+        assert_eq!(facts.fixed_decode_state_bytes, 0);
+        assert_eq!(
+            facts.required_positions,
+            crate::models::granite_speech::capacity::granite_speech_admission_required_positions(
+                30.0
+            )
+        );
+        // A multi-hour recording clamps to the SharedWindow single-decode window.
+        let at_hour = native_capacity_admission_facts(
+            crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            &metadata,
+            3600.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("facts");
+        assert_eq!(at_hour, facts);
+    }
+
     /// The gap this round closes for every newly wired family: a pack whose
     /// on-disk bytes plainly exceed any host budget is refused with the
     /// typed, actionable `NativeInsufficientHostMemory` error BEFORE the
@@ -4704,7 +4917,7 @@ mod tests {
         let modest = dir.path().join("modest.oasr");
         std::fs::write(&modest, vec![0u8; 4096]).expect("write modest pack");
 
-        let cases: [(&str, crate::ggml_runtime::GgufMetadata); 4] = [
+        let cases: [(&str, crate::ggml_runtime::GgufMetadata); 6] = [
             (
                 crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
                 firered_llm_shipped_pack_metadata_for_test(),
@@ -4721,6 +4934,14 @@ mod tests {
                 crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
                 firered_aed_shipped_pack_metadata_for_test(),
             ),
+            (
+                crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+                funasr_nano_shipped_pack_metadata_for_test(),
+            ),
+            (
+                crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+                granite_speech_shipped_pack_metadata_for_test(),
+            ),
         ];
         for (architecture, metadata) in &cases {
             let error = enforce_native_host_memory_admission(
@@ -4731,7 +4952,7 @@ mod tests {
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
                 0,
             )
-            .expect_err("a 1 PiB pack cannot fit any host");
+            .expect_err("a 1 TiB pack cannot fit any host");
             match error {
                 BackendError::NativeInsufficientHostMemory { reason } => {
                     assert!(

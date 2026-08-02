@@ -1,9 +1,10 @@
-//! granite-speech capacity derivation: the single-decode max audio length is
-//! computed from the decoder's trained context window, the fixed prompt text
+//! granite-speech capacity derivation: two related surfaces.
+//!
+//! # 1. Single-decode max audio length
+//!
+//! Computed from the decoder's trained context window, the fixed prompt text
 //! overhead, the generation backstop, and the Q-Former audio-token rate --
 //! never a margin-note magic number.
-//!
-//! # Formula
 //!
 //! ```text
 //! audio_token_budget = decoder_max_positions
@@ -17,8 +18,6 @@
 //! (16_000 / (160 * 2 * 5) = 10 tok/s -- one projector token per 100ms, the
 //! same rate `encoder_graph.rs`'s long-audio note documents).
 //!
-//! # What this bound protects
-//!
 //! The executor rejects a single buffer longer than
 //! [`GRANITE_SPEECH_MAX_INPUT_SECONDS`] with a typed `AudioTooLong` error
 //! (fail-closed, no silent truncation). Longer recordings are the shared
@@ -28,13 +27,54 @@
 //! against a direct over-limit buffer, the slicer keeps ordinary longform
 //! work inside a comfortable window.
 //!
-//! Production reads the derived constant below. The pure derivation helpers
-//! stay unit-tested so a future pack-carried `max_position_embeddings` key
-//! can replace the architecture constant without silent drift.
+//! # 2. Host-memory admission (decoder KV)
+//!
+//! [`granite_speech_kv_geometry`] / [`granite_speech_admission_required_positions`]
+//! / [`GRANITE_SPEECH_ADMISSION_KV_SPEC`] feed the shared host-memory admission
+//! check ([`crate::capacity::evaluate_host_memory_admission`]) so a pack whose
+//! weights + decode KV plainly cannot fit is refused BEFORE the ggml graph
+//! build turns the shortfall into an opaque allocation failure.
+//!
+//! Reuses, never re-derives:
+//! - KV geometry comes straight off the parsed pack
+//!   (`granite_speech.decoder.{num_hidden_layers,num_key_value_heads,head_dim}`).
+//! - Audio-token rate is [`granite_speech_audio_tokens_per_second`] (the same
+//!   frontend geometry product the max-input-seconds derivation uses).
+//! - Fixed prompt overhead is [`GRANITE_SPEECH_FIXED_PROMPT_TOKENS`]; generation
+//!   headroom is [`super::executor::GRANITE_SPEECH_MAX_GENERATED_TOKENS`] (the
+//!   same figure `decode_session`'s resident-KV arena headroom reserves).
+//! - The single-decode admission window is the shared longform safety chunk
+//!   ([`crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`]): granite is
+//!   `SharedWindow`, so no single decode's KV cache ever spans more audio than
+//!   one slice. Clamping here keeps a multi-hour recording from being judged
+//!   (and falsely rejected) as if it decoded whole. A user who forces a larger
+//!   `longform.chunk_seconds` only makes admission MORE permissive (an under-
+//!   estimate resolves to "allow", per `crate::capacity`'s fail-open
+//!   invariant), never falsely rejecting.
+//!
+//! KV element-type truth source: the runtime keeps a SINGLE f32 copy of the
+//! decode KV -- host growing history on CPU (`decode_session`'s `k_history` /
+//! `v_history`), device-resident f32 arena on Metal
+//! (`GRANITE_RESIDENT_KV_SPEC` in `decode_session.rs`). The shared position
+//! model charges host + resident halves, so
+//! [`GRANITE_SPEECH_ADMISSION_KV_SPEC`] models that single f32 copy as two f16
+//! halves whose `.total()` equals one f32 (the same cohere / firered-aed
+//! modeling stand-in). Hard-coding `LlmKvCacheSpec::DEFAULT` (f32 host + f16
+//! resident) would overstate by 1.5x in the false-reject direction admission
+//! forbids.
+//!
+//! Production reads the derived max-input-seconds constant below. The pure
+//! derivation helpers stay unit-tested so a future pack-carried
+//! `max_position_embeddings` key can replace the architecture constant
+//! without silent drift.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::capacity::{FrontendGeometry, audio_tokens_per_second};
+use crate::capacity::{FrontendGeometry, KvGeometry, audio_tokens_per_second};
+use crate::ggml_runtime::GgmlKvElementType;
+use crate::nn::decoder::LlmKvCacheSpec;
 
+use super::decoder_graph::GraniteSpeechDecoderConfig;
+use super::executor::GRANITE_SPEECH_MAX_GENERATED_TOKENS;
 use super::frontend::{HOP_LENGTH, SAMPLE_RATE_HZ};
 use super::qformer::GraniteSpeechProjectorConfig;
 
@@ -113,12 +153,72 @@ pub(crate) fn derive_max_input_seconds(
 /// to [`derive_max_input_seconds`] so the arithmetic cannot drift silently.
 pub(crate) const GRANITE_SPEECH_MAX_INPUT_SECONDS: f32 = 382.0;
 
+/// The audio a single granite-speech decode is estimated to fold in, for
+/// host-memory admission. granite-speech is
+/// [`crate::arch::OpenAsrLongformSliceShape::SharedWindow`]: a recording
+/// longer than the shared longform safety chunk is sliced, and each slice is
+/// its own decode, so no single decode's KV cache ever spans more than one
+/// window's audio. Clamping the admission estimate here (the analogue of
+/// qwen3's `QWEN3_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS` clamp) is what
+/// keeps a multi-hour recording from being judged -- and falsely rejected --
+/// as if it decoded whole. The executor's own 382s decoder-context ceiling
+/// is a separate fail-closed bound on a direct over-limit buffer; ordinary
+/// longform work never approaches it.
+pub(crate) const GRANITE_SPEECH_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS: f32 =
+    crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
+
+/// Two f16 copies = 4 B/value total: byte-for-byte the single f32 copy the
+/// runtime actually keeps (host growing history on CPU; device-resident f32
+/// arena on Metal -- see the module doc). Only
+/// [`crate::capacity::KvBytesPerPosition::total`] is consumed by admission,
+/// so the host/resident split is a modeling stand-in, not a claim that both
+/// copies exist at once.
+pub(crate) const GRANITE_SPEECH_ADMISSION_KV_SPEC: LlmKvCacheSpec = LlmKvCacheSpec {
+    host: GgmlKvElementType::F16,
+    resident: GgmlKvElementType::F16,
+};
+
+/// The decoder KV geometry the loaded pack advertises.
+pub(crate) fn granite_speech_kv_geometry(decoder: &GraniteSpeechDecoderConfig) -> KvGeometry {
+    KvGeometry {
+        n_layers: decoder.num_layers,
+        kv_heads: decoder.num_kv_heads,
+        head_dim: decoder.head_dim,
+    }
+}
+
+/// Decoder positions a single decode of `audio_duration_seconds` requires --
+/// the admission figure `evaluate_host_memory_admission` charges KV bytes
+/// against. Mirrors the runtime's own KV-capacity sizing
+/// (`prompt_tokens + GRANITE_SPEECH_MAX_GENERATED_TOKENS` /
+/// `GRANITE_RESIDENT_DECODE_HEADROOM` in `decode_session`): fixed prompt
+/// overhead + projected audio tokens at the frontend rate + the full
+/// generation backstop, with the audio clamped to the SharedWindow single-
+/// decode window.
+pub(crate) fn granite_speech_admission_required_positions(audio_duration_seconds: f32) -> usize {
+    let admission_seconds =
+        audio_duration_seconds.clamp(0.0, GRANITE_SPEECH_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS);
+    let rate = granite_speech_audio_tokens_per_second();
+    // Ceil so a fractional token still reserves a full position (matches the
+    // Q-Former's partial-window pad behaviour at the frame boundary). A non-
+    // positive rate fails closed to zero audio tokens -- an under-estimate
+    // resolves to "allow" per `crate::capacity`'s fail-open invariant.
+    let audio_tokens = if rate.is_finite() && rate > 0.0 {
+        (admission_seconds * rate).ceil() as usize
+    } else {
+        0
+    };
+    GRANITE_SPEECH_FIXED_PROMPT_TOKENS
+        .saturating_add(audio_tokens)
+        .saturating_add(GRANITE_SPEECH_MAX_GENERATED_TOKENS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::executor::GRANITE_SPEECH_MAX_GENERATED_TOKENS;
     use super::*;
     use crate::capacity::{
-        AudioFrontendCapacityBasis, audio_tokens_per_second, frontend_capacity_basis,
+        AudioFrontendCapacityBasis, KvGeometry, audio_tokens_per_second, frontend_capacity_basis,
+        kv_bytes_per_position,
     };
 
     #[test]
@@ -205,5 +305,40 @@ mod tests {
             GraniteSpeechProjectorConfig::granite_speech_4_1_2b().window_size,
             15
         );
+    }
+
+    #[test]
+    fn kv_geometry_reads_the_llm_decoder_metadata() {
+        let geometry =
+            granite_speech_kv_geometry(&GraniteSpeechDecoderConfig::granite_speech_4_1_2b());
+        assert_eq!(
+            geometry,
+            KvGeometry {
+                n_layers: 40,
+                kv_heads: 4,
+                head_dim: 128,
+            }
+        );
+        // Two f16 halves = one f32 copy: 40 layers * 2 (K+V) * 4 kv-heads *
+        // 128 * 4 B = 163_840 B/position.
+        let per_pos =
+            kv_bytes_per_position(&geometry, GRANITE_SPEECH_ADMISSION_KV_SPEC).expect("spec");
+        assert_eq!(per_pos.total(), 40 * 2 * 4 * 128 * 4);
+    }
+
+    #[test]
+    fn required_positions_is_clamped_to_the_shared_window() {
+        // 30s and 3600s clamp to the same SharedWindow single-decode window.
+        let at_window = granite_speech_admission_required_positions(
+            GRANITE_SPEECH_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS,
+        );
+        let at_hour = granite_speech_admission_required_positions(3600.0);
+        assert_eq!(at_window, at_hour);
+        let short = granite_speech_admission_required_positions(5.0);
+        assert!(short < at_window, "short={short} window={at_window}");
+        // Explicit arithmetic pin at the SharedWindow: 19 fixed + ceil(30*10)
+        // audio + 256 generation = 19 + 300 + 256 = 575.
+        assert_eq!(at_window, 575);
+        assert_eq!(granite_speech_admission_required_positions(30.0), 575);
     }
 }

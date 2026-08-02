@@ -16,6 +16,7 @@
 //! to the model catalog is a later step.
 
 pub(crate) mod adapter_graph;
+pub(crate) mod capacity;
 pub(crate) mod decode_prompt;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;
