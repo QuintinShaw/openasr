@@ -1249,6 +1249,13 @@ mod tests {
     /// there is, never about which one.
     struct OneVoiceEmbedder;
 
+    fn deterministic_test_embedder_identity() -> crate::diarize::embed::SpeakerEmbedderIdentity {
+        crate::diarize::embed::SpeakerEmbedderIdentity {
+            embedding_dim: 2,
+            pack_fingerprint: "voice-id-identity-tests-v1".to_string(),
+        }
+    }
+
     impl crate::diarize::embed::SpeakerEmbedder for OneVoiceEmbedder {
         fn embed(
             &self,
@@ -1260,6 +1267,10 @@ mod tests {
 
         fn embedding_dim(&self) -> usize {
             2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
         }
     }
 
@@ -1290,6 +1301,10 @@ mod tests {
 
         fn embedding_dim(&self) -> usize {
             2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
         }
     }
 
@@ -1348,6 +1363,10 @@ mod tests {
 
         fn embedding_dim(&self) -> usize {
             2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
         }
     }
 
@@ -1538,6 +1557,10 @@ mod tests {
 
         fn embedding_dim(&self) -> usize {
             2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
         }
     }
 
