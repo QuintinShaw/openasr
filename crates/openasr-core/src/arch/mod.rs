@@ -2332,7 +2332,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             pack_import: OpenAsrPackImportSurface::CoreConvert {
                 symbol: "convert_local_granite_speech_source_to_runtime_pack",
             },
-            reference_dumper_source: None,
+            reference_dumper_source: Some("tooling/granite-speech-reference-dumper/dump_golden.py"),
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
