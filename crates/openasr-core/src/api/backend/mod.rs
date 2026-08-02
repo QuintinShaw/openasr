@@ -398,10 +398,10 @@ pub struct TranscriptionRequest {
     /// same fail-closed contract as `word_timestamps_refine`.
     pub punctuate: bool,
     /// Which call path built this request (CLI transcribe/live, server
-    /// transcribe/translate/realtime) -- diagnostics only, logged verbatim
-    /// into the `stage=request_context` `daemon.log` line so a bug report is
-    /// self-describing. Defaults to [`RequestSource::Unspecified`]; real
-    /// entry points set it via [`Self::with_source`].
+    /// transcribe/translate/realtime). Besides diagnostics, this enforces
+    /// request-shape policy such as file-only recording Voice ID; real entry
+    /// points must therefore set it via [`Self::with_source`]. Defaults to
+    /// [`RequestSource::Unspecified`] for legacy embedded callers and tests.
     pub source: RequestSource,
     /// The *source* audio's real sample rate/channel count (before this
     /// crate's normalization pipeline resamples/downmixes to 16 kHz mono) --
@@ -932,6 +932,10 @@ pub(crate) fn reject_unsupported_language(
 
 #[derive(Debug, Error)]
 pub enum BackendError {
+    #[error(
+        "Voice ID is available only for file transcription, not realtime source '{request_source}'.\nTurn Voice ID off for Live/Dictation/realtime requests."
+    )]
+    VoiceIdUnsupportedForRealtime { request_source: &'static str },
     #[error(
         "Voice ID is not available for the {backend} backend in this setup.\nInstall the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn). Models without native speaker tracks also need an active local speaker segmenter (pyannote-segmentation-3.0, or an installed optional provider selected by the global policy); otherwise omit --diarize / diarize=true."
     )]

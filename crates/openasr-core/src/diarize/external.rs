@@ -72,6 +72,11 @@ impl PreparedExternalDiarizer {
         self.segmenter.discrete_vram_budget_bytes()
     }
 
+    #[cfg(test)]
+    pub(crate) fn segmenter_content_id(&self) -> &str {
+        self.segmenter.content_id()
+    }
+
     pub(crate) fn materialize(
         self,
         embedder: Arc<dyn SpeakerEmbedder>,
@@ -567,6 +572,7 @@ fn speaker_centroids(
 mod tests {
     use super::*;
     use crate::diarize::segment::LocalActivityWindow;
+    use sha2::Digest;
 
     #[derive(serde::Deserialize)]
     struct NativeDiarizationFixture {
@@ -749,11 +755,13 @@ mod tests {
         );
     }
 
-    /// Exact, ASR-independent acceptance seam for the locked diarization
+    /// Exact, ASR-independent hypothesis emitter for the locked diarization
     /// corpus. Unlike `OPENASR_DIARIZE_DEBUG`, this runs the same production
     /// recording-level module directly and writes full-precision raw turns.
-    /// The caller owns fixture/output paths so every large or private asset can
-    /// stay under one disposable research root.
+    /// Corpus scoring and the DER threshold are a separate gate: naming this
+    /// an emitter prevents a successful inference run from being mistaken for
+    /// quality acceptance. The caller owns fixture/output paths so every large
+    /// or private asset can stay under one disposable research root.
     #[test]
     #[ignore = "requires OPENASR_NATIVE_DIARIZATION_FIXTURES/OUTPUT plus local model packs"]
     fn native_locked_fixture_manifest_emits_exact_rttm() {
@@ -767,6 +775,12 @@ mod tests {
             .expect("OPENASR_NATIVE_DIARIZATION_OUTPUT must name a disposable run directory");
         let provider = std::env::var("OPENASR_NATIVE_DIARIZATION_PROVIDER")
             .expect("OPENASR_NATIVE_DIARIZATION_PROVIDER must be segmentation_3_0 or diarizen");
+        let core_revision = std::env::var("OPENASR_NATIVE_DIARIZATION_CORE_REV")
+            .expect("OPENASR_NATIVE_DIARIZATION_CORE_REV must pin the tested commit");
+        let segmenter_quant = std::env::var("OPENASR_NATIVE_DIARIZATION_SEGMENTER_QUANT")
+            .expect("OPENASR_NATIVE_DIARIZATION_SEGMENTER_QUANT must state the tested pack tier");
+        let embedder_quant = std::env::var("OPENASR_NATIVE_DIARIZATION_EMBEDDER_QUANT")
+            .expect("OPENASR_NATIVE_DIARIZATION_EMBEDDER_QUANT must state the tested pack tier");
         let (preference, expected_provider) = match provider.as_str() {
             "segmentation_3_0" => (
                 VoiceIdSegmenterPreference::Segmentation3_0,
@@ -803,6 +817,8 @@ mod tests {
             .expect("OPENASR_REDIMNET_PACK must resolve to a valid ReDimNet2-B6 pack");
         let diarizer_plan = PreparedExternalDiarizer::prepare(preference, backend_preference)
             .expect("prepare native external diarizer");
+        let embedder_content_id = embedder_plan.content_id().to_string();
+        let segmenter_content_id = diarizer_plan.segmenter_content_id().to_string();
         assert_eq!(
             diarizer_plan.segmenter_admission_backend(),
             expected_backend,
@@ -849,6 +865,31 @@ mod tests {
         assert_eq!(diarizer.selected_segmenter(), expected_provider);
 
         std::fs::create_dir_all(&output).expect("create native diarization output directory");
+        let manifest_sha256 = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                std::fs::read(&manifest).expect("read fixture manifest for provenance")
+            )
+        );
+        let provenance = serde_json::json!({
+            "schema": "openasr.native-diarization-emitter.v1",
+            "core_revision": core_revision,
+            "fixture_manifest_sha256": manifest_sha256,
+            "provider": provider,
+            "segmenter_content_id": segmenter_content_id,
+            "segmenter_quant": segmenter_quant,
+            "embedder": "redimnet2-b6-cn",
+            "embedder_content_id": embedder_content_id,
+            "embedder_quant": embedder_quant,
+            "requested_backend": backend,
+            "resolved_backend": format!("{expected_backend:?}").to_ascii_lowercase(),
+            "overlap_output": "raw-turns-preserved",
+        });
+        std::fs::write(
+            output.join("provenance.json"),
+            serde_json::to_vec_pretty(&provenance).expect("serialize native run provenance"),
+        )
+        .expect("write native run provenance");
         for fixture in fixtures {
             eprintln!(
                 "NATIVE_DIARIZATION_FIXTURE provider={provider} backend={backend} id={} stage=start",
@@ -864,6 +905,11 @@ mod tests {
             let diarization = diarizer
                 .diarize(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
                 .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
+            assert!(
+                !diarization.turns.is_empty(),
+                "native diarization emitter produced no turns for '{}'",
+                fixture.id
+            );
             let mut rttm = String::new();
             for turn in diarization.turns {
                 let duration = turn.range.duration_s();

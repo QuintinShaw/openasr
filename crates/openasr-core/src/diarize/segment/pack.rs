@@ -181,6 +181,14 @@ impl PreparedSelectedSegmenter {
         self.discrete_vram_budget_bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn content_id(&self) -> &str {
+        match &self.source {
+            PreparedSegmenterSource::DiariZen(prepared) => prepared.content_id(),
+            PreparedSegmenterSource::Segmentation3_0(prepared) => &prepared.key.pack_content_id,
+        }
+    }
+
     pub(crate) fn materialize(self) -> Result<SelectedSegmenter, SegmentError> {
         let adapter: Arc<dyn LocalActivitySegmenter> = match self.source {
             PreparedSegmenterSource::DiariZen(prepared) => {

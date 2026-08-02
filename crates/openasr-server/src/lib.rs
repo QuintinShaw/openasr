@@ -2002,9 +2002,9 @@ pub(crate) fn realtime_capabilities_for_runtime(
     } else {
         RealtimeBackendCapabilities::for_backend_kind(runtime.backend)
     };
-    // Model-pack capabilities are immutable for the daemon's lifetime (and so
-    // cacheable), but diarization also depends on whether the active embedder
-    // pack is installed — re-derive it fresh on every ask.
+    // Re-derive product policy on every ask instead of trusting a cached pack
+    // capability. Realtime Voice ID remains file-only regardless of the active
+    // ASR or installed speaker packs.
     capabilities.diarization =
         openasr_core::realtime::realtime_diarization_capability(capabilities.mode);
     capabilities
@@ -2490,7 +2490,8 @@ impl IntoResponse for ApiError {
             ),
             Self::Backend(error) => {
                 let status = match &error {
-                    openasr_core::BackendError::DiarizationNotSupported { .. }
+                    openasr_core::BackendError::VoiceIdUnsupportedForRealtime { .. }
+                    | openasr_core::BackendError::DiarizationNotSupported { .. }
                     | openasr_core::BackendError::DiarizationSegmenterUnavailable
                     | openasr_core::BackendError::ExternalDiarizationFailed { .. }
                     | openasr_core::BackendError::VoiceIdIdentityFailed(_)

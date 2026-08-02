@@ -45,6 +45,12 @@ pub struct TranscriptAssembler {
     timeline: TimelineMap,
     merge_policy: SegmentMergePolicy,
     segments: Vec<Segment>,
+    /// Decode-scope provenance aligned one-for-one with `segments`. This is
+    /// intentionally carried beside the public transcript contract: local
+    /// speaker counters are meaningful only inside the slice that produced
+    /// them, but that implementation detail must not leak into serialized
+    /// transcript segments.
+    speaker_scope_by_segment: Vec<Option<usize>>,
     stats: LongFormAssembleStats,
     /// End of the audio region (original-timeline seconds) already committed by
     /// prior slices. Consecutive slices overlap at forced/energy cuts, so the
@@ -60,12 +66,33 @@ impl TranscriptAssembler {
             timeline,
             merge_policy,
             segments: Vec::new(),
+            speaker_scope_by_segment: Vec::new(),
             stats: LongFormAssembleStats::default(),
             committed_end_original: None,
         }
     }
 
-    pub fn push_slice_result(&mut self, mut transcript: SliceTranscript) {
+    pub fn push_slice_result(&mut self, transcript: SliceTranscript) {
+        self.push_slice_result_with_scope(transcript, None);
+    }
+
+    /// Assemble one independently decoded slice while retaining the exact
+    /// scope that owns its local speaker labels. The scope travels through the
+    /// same overlap trimming and duplicate suppression as the segment itself,
+    /// so callers never need to guess provenance back from final timestamps.
+    pub(crate) fn push_slice_result_with_speaker_scope(
+        &mut self,
+        transcript: SliceTranscript,
+        speaker_scope: usize,
+    ) {
+        self.push_slice_result_with_scope(transcript, Some(speaker_scope));
+    }
+
+    fn push_slice_result_with_scope(
+        &mut self,
+        mut transcript: SliceTranscript,
+        speaker_scope: Option<usize>,
+    ) {
         // The trim boundary is the region committed by *prior* slices; this
         // slice's own span is folded into the boundary afterwards so the next
         // slice trims against it (even if this slice is silent / emits nothing).
@@ -128,6 +155,7 @@ impl TranscriptAssembler {
             // blobs. Only exact / high-overlap duplicates from slice overlap are
             // dropped above.
             self.segments.push(mapped);
+            self.speaker_scope_by_segment.push(speaker_scope);
         }
     }
 
@@ -136,6 +164,16 @@ impl TranscriptAssembler {
     }
 
     pub fn into_parts(self) -> (Transcription, LongFormAssembleStats) {
+        let (transcription, stats, _) = self.into_parts_with_speaker_scopes();
+        (transcription, stats)
+    }
+
+    /// Return the assembled transcript together with exact per-segment decode
+    /// scope provenance. The vector is aligned with `transcription.segments`;
+    /// `None` denotes a caller that did not opt into local-speaker scopes.
+    pub(crate) fn into_parts_with_speaker_scopes(
+        self,
+    ) -> (Transcription, LongFormAssembleStats, Vec<Option<usize>>) {
         let text = self
             .segments
             .iter()
@@ -143,17 +181,20 @@ impl TranscriptAssembler {
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        (
-            Transcription {
-                truncated_decodes: Vec::new(),
-                unnamed_speakers: Vec::new(),
-                text,
-                segments: self.segments,
-                longform: None,
-                language: None,
-            },
-            self.stats,
-        )
+        let transcription = Transcription {
+            truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
+            text,
+            segments: self.segments,
+            longform: None,
+            language: None,
+        };
+        debug_assert_eq!(
+            transcription.segments.len(),
+            self.speaker_scope_by_segment.len(),
+            "speaker scope provenance must stay aligned with assembled segments"
+        );
+        (transcription, self.stats, self.speaker_scope_by_segment)
     }
 
     pub fn benchmark_metadata(&self) -> LongFormBenchmarkMetadata {
@@ -460,6 +501,49 @@ mod tests {
         assert_eq!(transcription.segments[0].words[0].word, "hello");
         assert!(transcription.segments[0].words[0].start >= 1.1);
         assert!(transcription.segments[0].words[0].end <= 1.4);
+    }
+
+    #[test]
+    fn assembler_keeps_exact_scope_provenance_across_slice_overlap() {
+        fn labeled_segment(start: f32, end: f32, text: &str) -> Segment {
+            Segment {
+                start,
+                end,
+                text: text.to_string(),
+                speaker: Some("SPEAKER_01".to_string()),
+                speaker_label: Some("SPEAKER_01".to_string()),
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words: Vec::new(),
+            }
+        }
+
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result_with_speaker_scope(
+            SliceTranscript {
+                slice: slice(0, 480_000),
+                text: "first owner".to_string(),
+                segments: vec![labeled_segment(29.6, 29.9, "first owner")],
+                time_domain: SegmentTimeDomain::RelativeToSliceContent,
+            },
+            0,
+        );
+        assembler.push_slice_result_with_speaker_scope(
+            SliceTranscript {
+                slice: slice(472_000, 496_000),
+                text: "second owner".to_string(),
+                segments: vec![labeled_segment(0.6, 0.9, "second owner")],
+                time_domain: SegmentTimeDomain::RelativeToSliceContent,
+            },
+            1,
+        );
+
+        let (transcription, _, scopes) = assembler.into_parts_with_speaker_scopes();
+        assert_eq!(transcription.segments.len(), 2);
+        assert!((transcription.segments[0].start - 29.6).abs() < 1e-4);
+        assert!((transcription.segments[1].start - 30.1).abs() < 1e-4);
+        assert_eq!(scopes, vec![Some(0), Some(1)]);
     }
 
     #[test]

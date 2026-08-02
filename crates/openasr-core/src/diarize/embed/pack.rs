@@ -101,6 +101,11 @@ impl PreparedSpeakerEmbedderSnapshot {
         self.admission_bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn content_id(&self) -> &str {
+        &self.key.pack_content_id
+    }
+
     pub(crate) fn materialize(self) -> Option<Arc<dyn SpeakerEmbedder>> {
         let embedder = materialize_prepared_embedder(self)?;
         let adapter: Arc<dyn SpeakerEmbedder> = embedder;

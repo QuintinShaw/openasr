@@ -845,7 +845,6 @@ struct ConcurrentSlicePipeline<'a> {
     width: usize,
     slices: Vec<crate::longform::AudioSlice>,
     plan_audio: &'a [f32],
-    timeline: &'a crate::longform::TimelineMap,
     dispatch: &'a GgmlAsrExecutionDispatch,
     runtime_preflight: &'a GgmlAsrRuntimeSourcePreflight,
     selected_family: &'a GgmlFamilyAdapterDescriptor,
@@ -861,7 +860,7 @@ struct ConcurrentSlicePipeline<'a> {
     degraded_slice_fallbacks: &'a mut Vec<(usize, SliceGpuFallback)>,
     truncated_slices: &'a mut Vec<String>,
     truncated_decodes: &'a mut Vec<TruncatedDecode>,
-    speaker_scope_starts: &'a mut Vec<f32>,
+    speaker_scope_count: &'a mut usize,
 }
 
 /// Long-audio slice pipeline: decode up to `width` slices concurrently and
@@ -896,7 +895,6 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         width,
         slices,
         plan_audio,
-        timeline,
         dispatch,
         runtime_preflight,
         selected_family,
@@ -912,7 +910,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         degraded_slice_fallbacks,
         truncated_slices,
         truncated_decodes,
-        speaker_scope_starts,
+        speaker_scope_count,
     } = pipeline;
 
     // Pre-scan on the main thread: decide silence once (identical predicate to
@@ -1076,17 +1074,19 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                     });
                 }
                 *ran_any_slice = true;
-                if speaker_plan == SpeakerPlan::InDecoder {
-                    speaker_scope_starts.push(timeline.map_processed_to_original_seconds(
-                        item.slice.content_start_sample as f32 / 16_000.0,
-                    ));
-                }
-                assembler.push_slice_result(SliceTranscript {
+                let transcript = SliceTranscript {
                     slice: item.slice,
                     text: decoded.text,
                     segments: decoded.segments,
                     time_domain: SegmentTimeDomain::RelativeToSliceContent,
-                });
+                };
+                if speaker_plan == SpeakerPlan::InDecoder {
+                    let scope = *speaker_scope_count;
+                    *speaker_scope_count += 1;
+                    assembler.push_slice_result_with_speaker_scope(transcript, scope);
+                } else {
+                    assembler.push_slice_result(transcript);
+                }
             }
             // Keep the first (lowest-index) error so the returned failure matches
             // the serial `?`, which fails at the earliest bad slice.
@@ -1201,7 +1201,8 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         BackendError::NativeModelPackPathRequired
         | BackendError::NativeModelPackPathRejected { .. }
         | BackendError::NativeModelSelectionMismatch { .. } => FailureCategory::ModelResolve,
-        BackendError::DiarizationNotSupported { .. }
+        BackendError::VoiceIdUnsupportedForRealtime { .. }
+        | BackendError::DiarizationNotSupported { .. }
         | BackendError::DiarizationSegmenterUnavailable
         | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
@@ -1234,6 +1235,11 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
 fn run_native_transcription_fallible(
     request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
+    if request.voice_id && !request.source.supports_recording_voice_id() {
+        return Err(BackendError::VoiceIdUnsupportedForRealtime {
+            request_source: request.source.as_log_label(),
+        });
+    }
     let refine = request.word_timestamps_refine;
     if refine && !request.word_timestamps {
         return Err(BackendError::WordTimestampAlignmentRequiresWordTimestamps);
@@ -1977,14 +1983,12 @@ fn run_native_transcription_impl(
             // for the provenance string channel (see
             // `format_truncated_slice_provenance`).
             let mut truncated_slices: Vec<String> = Vec::new();
-            // Original-timeline start of every slice that actually decoded,
-            // collected only for an in-decoder-diarizing family: each such
-            // slice numbered its speakers from one on its own, so these are
-            // the seams between independent speaker scopes (see
-            // `speaker_scopes_by_start`). A family whose speakers come from the
-            // one whole-recording external pass has a single scope and leaves
-            // this empty.
-            let mut speaker_scope_starts: Vec<f32> = Vec::new();
+            // Monotonic identity assigned to every slice that actually decoded
+            // with an in-decoder speaker model. The assembler carries this
+            // provenance beside each surviving segment through overlap trim and
+            // de-duplication, so final identity matching never guesses a slice
+            // from its timestamp.
+            let mut speaker_scope_count = 0usize;
             // P1 long-audio slice pipeline: decode K slices concurrently to
             // overlap the encode/decode GPU bubbles (the admission-concurrency
             // win, applied to one file's slices). The default is gated on this
@@ -2015,7 +2019,6 @@ fn run_native_transcription_impl(
                     width: pipeline_width,
                     slices: plan.slices,
                     plan_audio,
-                    timeline: &plan.timeline,
                     dispatch,
                     runtime_preflight: &runtime_preflight,
                     selected_family: &selected_family,
@@ -2031,7 +2034,7 @@ fn run_native_transcription_impl(
                     degraded_slice_fallbacks: &mut degraded_slice_fallbacks,
                     truncated_slices: &mut truncated_slices,
                     truncated_decodes: &mut truncated_decodes,
-                    speaker_scope_starts: &mut speaker_scope_starts,
+                    speaker_scope_count: &mut speaker_scope_count,
                 })?;
             } else {
                 for slice in plan.slices {
@@ -2157,17 +2160,19 @@ fn run_native_transcription_impl(
                             }
                         }
                     }
-                    if speaker_plan == SpeakerPlan::InDecoder {
-                        speaker_scope_starts.push(plan.timeline.map_processed_to_original_seconds(
-                            slice.content_start_sample as f32 / 16_000.0,
-                        ));
-                    }
-                    assembler.push_slice_result(SliceTranscript {
+                    let transcript = SliceTranscript {
                         slice,
                         text: transcription.text,
                         segments: transcription.segments,
                         time_domain: SegmentTimeDomain::RelativeToSliceContent,
-                    });
+                    };
+                    if speaker_plan == SpeakerPlan::InDecoder {
+                        let scope = speaker_scope_count;
+                        speaker_scope_count += 1;
+                        assembler.push_slice_result_with_speaker_scope(transcript, scope);
+                    } else {
+                        assembler.push_slice_result(transcript);
+                    }
                 }
             }
             // Decode done; the merge/resegment tail below runs uncounted otherwise,
@@ -2213,7 +2218,8 @@ fn run_native_transcription_impl(
                     truncated_slices.join(";")
                 ));
             }
-            let (assembled, assemble_stats) = assembler.into_parts();
+            let (assembled, assemble_stats, speaker_scope_by_segment) =
+                assembler.into_parts_with_speaker_scopes();
             let run_metadata = build_longform_metadata(
                 &longform_options,
                 plan_stats.chunk_count,
@@ -2272,7 +2278,7 @@ fn run_native_transcription_impl(
                 voice_id_audio.as_deref().unwrap_or(&[]),
                 voice_id_embedder.as_deref(),
                 speaker_plan,
-                &speaker_scope_starts,
+                &speaker_scope_by_segment,
                 strip_forced_word_timestamps,
                 reported_language.clone(),
                 truncated_decodes,
@@ -2395,9 +2401,10 @@ fn format_truncation_anchor(truncation: &DecodeTruncation) -> String {
 /// Finalize a decoded transcription for return from
 /// `run_native_transcription_impl`: normalize segment timing/text (dropping
 /// empty segments, filling a fallback span from the request-level audio
-/// duration), stamp the longform metadata for this run, attribute + re-segment
-/// speaker turns, and stamp the reported source language -- in that fixed
-/// order. Every exit path of `run_native_transcription_impl` (the longform
+/// duration), stamp the longform metadata, attribute recording-level turns,
+/// resolve identity while exact decode-scope provenance is still aligned,
+/// re-segment presentation cues, and stamp the reported source language -- in
+/// that fixed order. Every exit path of `run_native_transcription_impl` (the longform
 /// all-silent fallback, the longform assembled result, and the short-form /
 /// single-slice result) funnels through this single function so the order and
 /// parameters of the chain cannot drift between paths; only the decoded
@@ -2412,30 +2419,29 @@ fn finalize_native_transcription(
     prepared_audio: &[f32],
     voice_id_embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     speaker_plan: SpeakerPlan,
-    speaker_scope_starts: &[f32],
+    speaker_scope_by_segment: &[Option<usize>],
     strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
     truncated_decodes: Vec<TruncatedDecode>,
 ) -> Result<Transcription, BackendError> {
-    let mut transcription = apply_speaker_turns(
-        with_longform_metadata(
-            normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
-            longform_metadata,
-        ),
-        speaker_turns,
-        strip_forced_word_timestamps,
+    let mut transcription = with_longform_metadata(
+        normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
+        longform_metadata,
     );
+    if speaker_plan == SpeakerPlan::External {
+        transcription = apply_speaker_attribution(transcription, speaker_turns);
+    }
     match speaker_plan {
         SpeakerPlan::InDecoder => {
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
             // acoustic evidence, stitches matching voices, and names enrolled
             // people.
-            let mut scopes = speaker_scopes_by_start(
+            let mut scopes = speaker_scopes_by_provenance(
                 &mut transcription.segments,
-                speaker_scope_starts,
+                speaker_scope_by_segment,
                 prepared_audio,
-            );
+            )?;
             let embedder = voice_id_embedder.ok_or(BackendError::VoiceIdIdentityFailed(
                 crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
             ))?;
@@ -2466,6 +2472,17 @@ fn finalize_native_transcription(
             transcription.unnamed_speakers.clear();
         }
     }
+    // Identity runs before cue re-segmentation. Besides avoiding redundant
+    // embedding work over presentation-only cue fragments, this preserves the
+    // exact one-to-one alignment between assembled in-decoder segments and
+    // their decode-scope provenance. Cue splitting copies the resolved speaker
+    // identity fields onto every child afterwards.
+    transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
+    if strip_forced_word_timestamps {
+        for segment in &mut transcription.segments {
+            segment.words.clear();
+        }
+    }
     // Stamped after the body is assembled and before the transcript leaves the
     // engine, on every exit path: the per-decode results this run consumed are
     // gone by now, so this is the last point at which "the transcript is short"
@@ -2486,41 +2503,67 @@ fn finalize_native_transcription(
     Ok(with_reported_language(transcription, reported_language))
 }
 
-/// Cut time-ordered segments into the decode scopes they came from.
+/// Cut time-ordered segments into the exact decode scopes that produced them.
 ///
-/// `scope_starts` holds the original-timeline start of each independently
-/// decoded slice, in order; fewer than two means the whole transcription is one
-/// scope. A segment belongs to the last scope that started at or before its
-/// midpoint, and scope assignment is forced non-decreasing so every scope is a
-/// contiguous run even if a boundary-straddling segment's midpoint lands on the
-/// wrong side. The midpoint (not the start) is the anchor because the
-/// assembler's overlap trim can leave a kept segment reaching slightly back
-/// into the previous slice's committed span.
+/// `scope_by_segment` is emitted by [`TranscriptAssembler`] after overlap trim
+/// and de-duplication, aligned one-for-one with the final segments. This is a
+/// provenance contract, not a time heuristic: a segment retained from an
+/// earlier overlapping slice remains in that slice's label namespace even if
+/// its midpoint lies after the next slice's content start.
 ///
 /// Every scope shares the whole recording as its `samples`: segment times are
 /// already mapped to the original timeline by the assembler, so they index
-/// straight into it. Scope identity here is about *label provenance*, not about
-/// which audio a scope may look at.
-fn speaker_scopes_by_start<'a>(
+/// straight into it. Empty decoded slices simply leave no group; scope numbers
+/// may therefore skip but must never move backwards.
+fn speaker_scopes_by_provenance<'a>(
     segments: &'a mut [Segment],
-    scope_starts: &[f32],
+    scope_by_segment: &[Option<usize>],
     samples: &'a [f32],
-) -> Vec<crate::diarize::voice_id::SpeakerScope<'a>> {
-    if scope_starts.len() < 2 {
-        return vec![crate::diarize::voice_id::SpeakerScope { segments, samples }];
+) -> Result<Vec<crate::diarize::voice_id::SpeakerScope<'a>>, BackendError> {
+    if scope_by_segment.is_empty() {
+        return Ok(vec![crate::diarize::voice_id::SpeakerScope {
+            segments,
+            samples,
+        }]);
     }
-    let mut lengths = vec![0usize; scope_starts.len()];
-    let mut current = 0usize;
-    for segment in segments.iter() {
-        let midpoint = (segment.start + segment.end.max(segment.start)) / 2.0;
-        let matched = scope_starts
-            .iter()
-            .rposition(|start| *start <= midpoint)
-            .unwrap_or(0);
-        current = current.max(matched);
-        lengths[current] += 1;
+    if scope_by_segment.len() != segments.len() {
+        return Err(BackendError::VoiceIdIdentityFailed(
+            crate::diarize::voice_id::SpeakerIdentityError::InvalidScopeProvenance {
+                reason: format!(
+                    "{} scope entries for {} assembled segments",
+                    scope_by_segment.len(),
+                    segments.len()
+                ),
+            },
+        ));
     }
-    let mut scopes = Vec::with_capacity(scope_starts.len());
+    let mut lengths = Vec::new();
+    let mut previous_scope = None;
+    for scope in scope_by_segment {
+        let scope = scope.ok_or_else(|| {
+            BackendError::VoiceIdIdentityFailed(
+                crate::diarize::voice_id::SpeakerIdentityError::InvalidScopeProvenance {
+                    reason: "an assembled in-decoder segment has no decode scope".to_string(),
+                },
+            )
+        })?;
+        match previous_scope {
+            None => lengths.push(1usize),
+            Some(previous) if scope == previous => {
+                *lengths.last_mut().expect("a previous scope has a length") += 1;
+            }
+            Some(previous) if scope > previous => lengths.push(1usize),
+            Some(previous) => {
+                return Err(BackendError::VoiceIdIdentityFailed(
+                    crate::diarize::voice_id::SpeakerIdentityError::InvalidScopeProvenance {
+                        reason: format!("decode scope moved backwards from {previous} to {scope}"),
+                    },
+                ));
+            }
+        }
+        previous_scope = Some(scope);
+    }
+    let mut scopes = Vec::with_capacity(lengths.len());
     let mut rest = segments;
     for length in lengths {
         let (head, tail) = rest.split_at_mut(length);
@@ -2530,7 +2573,7 @@ fn speaker_scopes_by_start<'a>(
             samples,
         });
     }
-    scopes
+    Ok(scopes)
 }
 
 /// Stamp the effective source language onto a finished transcription so every
@@ -2628,17 +2671,14 @@ fn speaker_identity_error_to_backend(
     }
 }
 
-/// Finalize a transcription for output: attribute speaker turns onto its
-/// segments (no-op if empty, splitting segments that span multiple speakers at
-/// word-snapped turn boundaries), then re-segment every (single-speaker) segment
-/// into subtitle-grade cues. Re-segmentation runs after attribution so cues
-/// never straddle a speaker turn, and before the strip so it can use the word
-/// anchors. `strip_forced_word_timestamps` removes the anchors that were
-/// force-enabled for the split when the caller did not request them.
-fn apply_speaker_turns(
+/// Attribute recording-level speaker turns onto decoded segments. This is
+/// deliberately separate from cue re-segmentation: identity resolution needs
+/// the original assembled-segment boundaries and exact decode-scope
+/// provenance, while subtitle cue splitting is presentation-only and copies
+/// the resolved speaker fields afterwards.
+fn apply_speaker_attribution(
     mut transcription: Transcription,
     attribution: &SpeakerAttribution,
-    strip_forced_word_timestamps: bool,
 ) -> Transcription {
     if !attribution.turns.is_empty() {
         let identities = BTreeMap::new();
@@ -2647,12 +2687,6 @@ fn apply_speaker_turns(
             std::mem::take(&mut transcription.segments),
             &identities,
         );
-    }
-    transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
-    if strip_forced_word_timestamps {
-        for segment in &mut transcription.segments {
-            segment.words.clear();
-        }
     }
     transcription
 }
@@ -4179,6 +4213,31 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_boundary_rejects_voice_id_before_any_realtime_model_load() {
+        for source in [
+            crate::RequestSource::CliLive,
+            crate::RequestSource::ServerRealtime,
+        ] {
+            let mut request = TranscriptionRequest::new("unused.wav", "unused-model");
+            request.voice_id = true;
+            request.source = source;
+            assert!(matches!(
+                run_native_transcription_fallible(request),
+                Err(BackendError::VoiceIdUnsupportedForRealtime { request_source: label })
+                    if label == source.as_log_label()
+            ));
+        }
+
+        let mut file_request = TranscriptionRequest::new("unused.wav", "unused-model");
+        file_request.voice_id = true;
+        file_request.source = crate::RequestSource::CliTranscribe;
+        assert!(matches!(
+            run_native_transcription_fallible(file_request),
+            Err(BackendError::NativeModelPackPathRequired)
+        ));
+    }
     use crate::GgmlAsrExecutor;
     use crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
     use std::sync::Mutex;
@@ -6956,14 +7015,14 @@ mod tests {
     /// A single decode unit stays one scope, so its source's own numbering is
     /// authoritative and nothing gets renumbered.
     #[test]
-    fn fewer_than_two_scope_starts_is_one_scope() {
+    fn absent_scope_provenance_is_one_scope() {
         let mut segments = vec![segment(0.0, 1.0, "a"), segment(1.0, 2.0, "b")];
-        let scopes = speaker_scopes_by_start(&mut segments, &[], &[]);
+        let scopes = speaker_scopes_by_provenance(&mut segments, &[], &[]).unwrap();
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].segments.len(), 2);
 
         let mut segments = vec![segment(0.0, 1.0, "a")];
-        let scopes = speaker_scopes_by_start(&mut segments, &[0.0], &[]);
+        let scopes = speaker_scopes_by_provenance(&mut segments, &[Some(0)], &[]).unwrap();
         assert_eq!(scopes.len(), 1);
     }
 
@@ -6977,37 +7036,41 @@ mod tests {
             segment(180.5, 190.0, "c"),
             segment(360.0, 370.0, "d"),
         ];
-        let scopes = speaker_scopes_by_start(&mut segments, &[0.0, 180.0, 360.0], &[]);
+        let scopes =
+            speaker_scopes_by_provenance(&mut segments, &[Some(0), Some(0), Some(1), Some(2)], &[])
+                .unwrap();
         let sizes: Vec<usize> = scopes.iter().map(|scope| scope.segments.len()).collect();
         assert_eq!(sizes, vec![2, 1, 1]);
     }
 
-    /// A segment kept from a slice's overlap re-read can start marginally
-    /// before its own slice began. Scope assignment is forced non-decreasing so
-    /// such a segment cannot fall back into the previous scope and split that
-    /// scope's run in two.
+    /// A segment retained from the earlier owner of an overlap can have a
+    /// midpoint after the next slice started. Exact decode provenance keeps it
+    /// in the earlier label namespace instead of guessing from that midpoint.
     #[test]
-    fn scope_assignment_never_moves_backwards() {
+    fn overlapping_slice_midpoints_do_not_change_scope_provenance() {
         let mut segments = vec![
-            segment(0.0, 10.0, "a"),
-            segment(181.0, 190.0, "b"),
-            segment(179.0, 181.0, "c"),
-            segment(360.0, 370.0, "d"),
+            segment(29.6, 29.9, "owned by the first slice"),
+            segment(30.1, 30.4, "owned by the second slice"),
         ];
-        let scopes = speaker_scopes_by_start(&mut segments, &[0.0, 180.0, 360.0], &[]);
+        let scopes = speaker_scopes_by_provenance(&mut segments, &[Some(0), Some(1)], &[]).unwrap();
         let sizes: Vec<usize> = scopes.iter().map(|scope| scope.segments.len()).collect();
-        assert_eq!(sizes, vec![1, 2, 1]);
-        assert_eq!(scopes[1].segments[1].text, "c");
+        assert_eq!(sizes, vec![1, 1]);
+        assert_eq!(scopes[0].segments[0].text, "owned by the first slice");
     }
 
-    /// Every scope must be represented even when a slice produced no surviving
-    /// segments, so scope indices keep lining up with the slices that decoded.
     #[test]
-    fn a_scope_with_no_surviving_segments_is_still_a_scope() {
-        let mut segments = vec![segment(0.0, 10.0, "a"), segment(360.0, 370.0, "d")];
-        let scopes = speaker_scopes_by_start(&mut segments, &[0.0, 180.0, 360.0], &[]);
-        let sizes: Vec<usize> = scopes.iter().map(|scope| scope.segments.len()).collect();
-        assert_eq!(sizes, vec![1, 0, 1]);
+    fn invalid_scope_provenance_fails_closed() {
+        let mut missing = vec![segment(0.0, 1.0, "a")];
+        assert!(
+            speaker_scopes_by_provenance(&mut missing, &[None], &[]).is_err(),
+            "a local speaker label without a decode scope must not be merged"
+        );
+
+        let mut backwards = vec![segment(0.0, 1.0, "a"), segment(1.0, 2.0, "b")];
+        assert!(
+            speaker_scopes_by_provenance(&mut backwards, &[Some(2), Some(1)], &[]).is_err(),
+            "scope provenance must remain ordered with assembled segments"
+        );
     }
 
     fn item(text: &str, start_time_s: f64, end_time_s: f64) -> ForcedAlignItem {
@@ -7810,12 +7873,11 @@ mod tests {
         let mut degraded = Vec::new();
         let mut truncated_slices = Vec::new();
         let mut truncated_decodes = Vec::new();
-        let mut speaker_scope_starts = Vec::new();
+        let mut speaker_scope_count = 0usize;
         run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
             width,
             slices,
             plan_audio: audio,
-            timeline: &timeline,
             dispatch: &dispatch,
             runtime_preflight: &preflight,
             selected_family: &family,
@@ -7831,7 +7893,7 @@ mod tests {
             degraded_slice_fallbacks: &mut degraded,
             truncated_slices: &mut truncated_slices,
             truncated_decodes: &mut truncated_decodes,
-            speaker_scope_starts: &mut speaker_scope_starts,
+            speaker_scope_count: &mut speaker_scope_count,
         })?;
         let (assembled, _stats) = assembler.into_parts();
         Ok(ConcurrentPipelineOutcome {

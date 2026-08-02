@@ -35,6 +35,11 @@ impl PreparedDiariZenSegmenter {
         self.runtime_input.minimum_vram_budget_bytes()
     }
 
+    #[cfg(test)]
+    pub(crate) fn content_id(&self) -> &str {
+        &self.key.pack.pack_content_id
+    }
+
     pub(crate) fn materialize(self) -> Result<Arc<DiariZenSegmenter>, DiariZenSegmenterError> {
         if let Ok(cache) = ACTIVE_DIARIZEN.lock()
             && let Some((cached_key, segmenter, _)) = cache.as_ref()

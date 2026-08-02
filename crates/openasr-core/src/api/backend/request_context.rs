@@ -76,6 +76,16 @@ impl RequestSource {
             Self::Unspecified => "unspecified",
         }
     }
+
+    /// Product boundary for the recording-level Voice ID pipeline. Realtime
+    /// sources finalize independent utterances and therefore cannot provide
+    /// the whole-recording speaker structure this feature promises. Unknown
+    /// and embedded/benchmark callers remain allowed because they are
+    /// one-shot requests; concrete realtime entry points must identify
+    /// themselves with `CliLive` or `ServerRealtime`.
+    pub const fn supports_recording_voice_id(self) -> bool {
+        !matches!(self, Self::CliLive | Self::ServerRealtime)
+    }
 }
 
 /// Formats the per-request context line's payload (everything after the
@@ -380,6 +390,22 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), original_len, "duplicate RequestSource labels");
+    }
+
+    #[test]
+    fn recording_voice_id_rejects_only_concrete_realtime_sources() {
+        assert!(!RequestSource::CliLive.supports_recording_voice_id());
+        assert!(!RequestSource::ServerRealtime.supports_recording_voice_id());
+        for source in [
+            RequestSource::CliTranscribe,
+            RequestSource::ServerTranscribe,
+            RequestSource::ServerTranslate,
+            RequestSource::CliBenchSuite,
+            RequestSource::Ffi,
+            RequestSource::Unspecified,
+        ] {
+            assert!(source.supports_recording_voice_id(), "{source:?}");
+        }
     }
 
     #[test]
