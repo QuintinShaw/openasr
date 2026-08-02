@@ -16,6 +16,7 @@ from _catalog import (
     languages_for_model,
     prose_locale_source_sha256,
     punctuation_for_model,
+    speaker_source_for_model,
     validate_all_card_prose_locales,
     validate_card_prose_locales,
     validate_display_ranking,
@@ -330,6 +331,32 @@ class PunctuationForModelTest(unittest.TestCase):
         entry = {"kind": "asr-model", "family": "made-up-family", "id": "m"}
         with self.assertRaisesRegex(KeyError, "no emits_punctuation mapping"):
             punctuation_for_model(entry)
+
+
+class SpeakerSourceForModelTest(unittest.TestCase):
+    def test_moss_uses_native_tracks(self) -> None:
+        entry = {"kind": "asr-model", "family": "moss-transcribe-diarize"}
+        self.assertEqual(speaker_source_for_model(entry), {"speaker_source": "native"})
+
+    def test_other_asr_families_use_external_tracks(self) -> None:
+        for family in ("qwen", "cohere", "whisper", "firered2-llm", "granite-speech"):
+            with self.subTest(family=family):
+                entry = {"kind": "asr-model", "family": family}
+                self.assertEqual(
+                    speaker_source_for_model(entry), {"speaker_source": "external"}
+                )
+
+    def test_non_asr_kinds_omit_speaker_source(self) -> None:
+        self.assertEqual(
+            speaker_source_for_model({"kind": "capability-pack", "family": "redimnet2"}),
+            {},
+        )
+
+    def test_unknown_family_raises(self) -> None:
+        with self.assertRaisesRegex(KeyError, "no speaker_source mapping"):
+            speaker_source_for_model(
+                {"kind": "asr-model", "family": "made-up-family", "id": "m"}
+            )
 
 
 class RecognitionLanguageValidatorTest(unittest.TestCase):

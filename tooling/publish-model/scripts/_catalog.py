@@ -559,6 +559,45 @@ def punctuation_for_model(entry: dict) -> dict:
     return {"emits_punctuation": emits_punctuation}
 
 
+# Which component owns recording-local speaker tracks. This mirrors
+# `OpenAsrArchitectureDescriptor::speaker_segmentation`: MOSS currently emits
+# speaker tracks in decoder tokens, while every other ASR family uses the
+# external segmenter/embedder pipeline. It is catalog data so Desktop can plan
+# explicit dependency downloads before launching a model, not a UI-maintained
+# model-id allowlist.
+SPEAKER_SOURCE_BY_FAMILY = {
+    "qwen": "external",
+    "parakeet-tdt": "external",
+    "cohere": "external",
+    "whisper": "external",
+    "xasr-zipformer": "external",
+    "dolphin": "external",
+    "moonshine": "external",
+    "sensevoice": "external",
+    "firered-aed": "external",
+    "firered2-llm": "external",
+    "mimo-asr": "external",
+    "moss-transcribe-diarize": "native",
+    "funasr-nano": "external",
+    "granite-speech": "external",
+}
+
+
+def speaker_source_for_model(entry: dict) -> dict:
+    """Return the normalized Voice-ID speaker-track source for ASR models."""
+    if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
+        return {}
+    family = entry["family"]
+    source = SPEAKER_SOURCE_BY_FAMILY.get(family)
+    if source is None:
+        known = ", ".join(sorted(SPEAKER_SOURCE_BY_FAMILY))
+        raise KeyError(
+            f"model '{entry.get('id', '?')}' family '{family}' has no speaker_source "
+            f"mapping. Known families: {known}"
+        )
+    return {"speaker_source": source}
+
+
 def load() -> dict:
     core = load_toml(CATALOG_CORE)
     publish = load_toml(CATALOG_PUBLISH)

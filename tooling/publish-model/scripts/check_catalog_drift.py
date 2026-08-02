@@ -25,6 +25,7 @@ from _catalog import (  # noqa: E402
     languages_for_model,
     load as load_publish_catalog,
     punctuation_for_model,
+    speaker_source_for_model,
     validate_all_card_prose_locales,
 )
 from _manifest import prose_locales_block, read_prose  # noqa: E402
@@ -169,6 +170,7 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
     # punctuation_for_model() returns {} for; compare against None so a
     # spuriously-added field on those entries is still caught as drift.
     expected_scalars["emits_punctuation"] = punctuation_for_model(entry).get("emits_punctuation")
+    expected_scalars["speaker_source"] = speaker_source_for_model(entry).get("speaker_source")
     for key, value in expected_scalars.items():
         if machine_model.get(key) != value:
             errors.append(f"{model}: catalog {key} drifted: got {machine_model.get(key)!r}, expected {value!r}")

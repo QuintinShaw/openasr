@@ -78,6 +78,12 @@ pub struct Preferences {
     pub language: Option<String>,
     #[serde(default)]
     pub diarize: bool,
+    /// Global file-Voice-ID segmenter preference. `Auto` prefers a valid,
+    /// installed DiariZen pack and otherwise resolves segmentation-3.0;
+    /// `Segmentation3` is the user's explicit DiariZen-disable state. This is
+    /// deliberately not a per-transcription model picker.
+    #[serde(default)]
+    pub voice_id_segmenter: VoiceIdSegmenterPreference,
     #[serde(default)]
     pub word_timestamps: bool,
     #[serde(default)]
@@ -137,6 +143,15 @@ pub enum HistoryRetentionPolicy {
     // serialization always emits `forever`.
     #[serde(alias = "never")]
     Forever,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceIdSegmenterPreference {
+    #[default]
+    Auto,
+    #[serde(rename = "segmentation_3_0")]
+    Segmentation3,
 }
 
 impl HistoryRetentionPolicy {
@@ -339,6 +354,7 @@ impl Default for Preferences {
             version: PREFERENCES_SCHEMA_VERSION,
             language: None,
             diarize: false,
+            voice_id_segmenter: VoiceIdSegmenterPreference::Auto,
             word_timestamps: false,
             auto_save: false,
             launch_at_login: false,

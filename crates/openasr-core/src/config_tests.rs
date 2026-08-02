@@ -73,6 +73,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             sort_weight: 0,
             recommended: false,
             upstream_release_date: None,
+            speaker_source: None,
             emits_punctuation: None,
             prose: None,
             prose_locales: None,
@@ -254,6 +255,23 @@ fn legacy_config_file_defaults_config_document_preferences() {
         Some("whisper-small")
     );
     assert_eq!(loaded.preferences, Preferences::default());
+}
+
+#[test]
+fn voice_id_segmenter_preference_is_additive_and_roundtrips() {
+    let legacy: Preferences = serde_json::from_str(r#"{"version":1}"#).unwrap();
+    assert_eq!(
+        legacy.voice_id_segmenter,
+        crate::config::VoiceIdSegmenterPreference::Auto
+    );
+
+    let forced = Preferences {
+        voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Segmentation3,
+        ..Preferences::default()
+    };
+    let json = serde_json::to_string(&forced).unwrap();
+    assert!(json.contains(r#""voice_id_segmenter":"segmentation_3_0""#));
+    assert_eq!(serde_json::from_str::<Preferences>(&json).unwrap(), forced);
 }
 
 #[test]

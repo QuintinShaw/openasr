@@ -27,6 +27,7 @@ from _catalog import (
     languages_for_model,
     load as load_publish_catalog,
     punctuation_for_model,
+    speaker_source_for_model,
     validate_card_prose_locales,
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
@@ -283,6 +284,10 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     # family (asr-model only; see punctuation_for_model()'s docstring for why
     # translation-model / capability-pack entries omit it).
     model_entry.update(punctuation_for_model(entry))
+    # Recording-local speaker tracks come from either the ASR decoder itself or
+    # the shared external diarizer. Desktop consumes this signed field to plan
+    # ReDim-only vs ReDim+segmenter dependencies without a model-id allowlist.
+    model_entry.update(speaker_source_for_model(entry))
     if entry.get("experimental") is True:
         model_entry["experimental"] = True
     # Explicit, author-set display hints (models-core.toml `sort_weight`/

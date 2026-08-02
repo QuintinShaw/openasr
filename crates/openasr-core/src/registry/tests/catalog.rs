@@ -12,6 +12,7 @@ fn catalog_json() -> String {
       "kind": "asr-model",
       "display_name": "Moonshine Tiny",
       "family": "moonshine",
+      "speaker_source": "external",
       "aliases": ["moonshine", "ambiguous-family"],
       "pull_alias": "moonshine",
       "size": "tiny",
@@ -183,6 +184,7 @@ fn alias_contract_model(
         sort_weight: 0,
         recommended: false,
         upstream_release_date: None,
+        speaker_source: None,
         emits_punctuation: None,
         prose: None,
         prose_locales: None,
@@ -310,6 +312,10 @@ fn catalog_parser_resolves_id_quant_suffix() {
     assert_eq!(resolved.suffix, "q8");
     assert_eq!(resolved.pull, "moonshine-tiny:q8");
     assert_eq!(resolved.license_class, LicenseClass::Permissive);
+    assert_eq!(
+        catalog.models[0].speaker_source,
+        Some(CatalogSpeakerSource::External)
+    );
 }
 
 #[test]

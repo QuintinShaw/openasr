@@ -283,6 +283,13 @@ pub struct CatalogModel {
     // signed catalog stays byte-identical while empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_release_date: Option<String>,
+    /// Whether recording-local speaker tracks come from the ASR model itself
+    /// or from OpenASR's shared external diarizer. This is a read-only mirror
+    /// of `OpenAsrArchitectureDescriptor::speaker_segmentation`, denormalized
+    /// into the signed catalog so clients can preflight capability-pack
+    /// dependencies without maintaining model-id allowlists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_source: Option<CatalogSpeakerSource>,
     // Whether the model's transcripts include punctuation -- an architecture/
     // training-corpus property, not a per-release editorial choice. This field
     // is a read-only wire mirror, not an independent declaration: the single
@@ -325,6 +332,17 @@ pub enum CatalogModelKind {
     /// parse; a model in this state is dropped from the loaded catalog by
     /// [`filter_forward_compatible_catalog`] (hidden, not rejected) with a
     /// one-line diagnostic -- see `docs/CATALOG_COMPATIBILITY.md`.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSpeakerSource {
+    Native,
+    External,
+    /// Future source values remain parseable; clients conservatively plan the
+    /// external dependency set unless they explicitly recognize `Native`.
     #[serde(other)]
     Unknown,
 }
@@ -2462,6 +2480,12 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
 }
 
 fn validate_catalog_model_kind(model: &CatalogModel) -> Result<(), CatalogError> {
+    if model.kind != CatalogModelKind::AsrModel && model.speaker_source.is_some() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' has speaker_source but kind is not asr-model",
+            model.id
+        )));
+    }
     match (model.kind, model.capability.as_ref()) {
         (CatalogModelKind::AsrModel, None) => {
             validate_no_translation_metadata(model)?;
