@@ -500,9 +500,9 @@ pub(crate) enum Command {
         /// Sliding-window duration for partial snapshot audio.
         #[arg(long)]
         partial_window_ms: Option<u32>,
-        /// Label finalized utterances with anonymous speakers (SPEAKER_00,
-        /// SPEAKER_01, ...). May install the required speaker-diarization capability pack.
-        #[arg(long)]
+        /// Compatibility flag retained only to return an explicit unsupported error.
+        /// Voice ID is available for file transcription, not live sessions.
+        #[arg(long, hide = true)]
         diarize: bool,
         /// Save finalized live transcript history at session end.
         ///
