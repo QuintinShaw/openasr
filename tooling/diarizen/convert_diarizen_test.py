@@ -32,6 +32,10 @@ class TensorTypeTest(unittest.TestCase):
             C.choose_tensor_type("conv.weight", (256, 256, 1), "q8_0"), "f16"
         )
 
+    def test_catalog_fp16_spelling_is_accepted(self):
+        self.assertEqual(C.normalize_quant("fp16"), "f16")
+        self.assertEqual(C.normalize_quant("q8_0"), "q8_0")
+
 
 class PositionalConvFoldTest(unittest.TestCase):
     def test_fold_matches_weight_norm_dim_two(self):

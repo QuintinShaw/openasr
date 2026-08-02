@@ -410,6 +410,33 @@ upstream_release_date = "2023-09-22"
 feature = "speaker-diarization"
 role = "speaker-segmenter"
 
+# Optional higher-accuracy speaker segmenter. The code/runtime is MIT, but the
+# pinned Base-s80 checkpoint is CC BY-NC 4.0 because some training corpora are
+# research-only/non-commercial. Keep it out of the public catalog until the
+# converted pack has passed native parity/DER/resource audits and a maintainer
+# deliberately publishes it with the product's explicit non-commercial consent
+# gate. segmentation-3.0 remains the permissive default/fallback.
+["diarizen-base-s80"]
+kind = "capability-pack"
+family = "diarizen-segmentation"
+hf_repo = "OpenASR/diarizen-base-s80"
+release_public = false
+size = "segmenter"
+registry_id = "diarizen-base-s80"
+display_name = "DiariZen Base-s80"
+license_name = "CC BY-NC 4.0"
+license_source = "https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/a9857fc34908197fb5336d9d0562f291834a04b2/README.md"
+license_class = "noncommercial"
+languages = ["en", "zh"]
+quants = ["fp16"]
+recommended_quant = "fp16"
+min_core_version = "0.1.28"
+min_cli_version = "0.1.28"
+
+["diarizen-base-s80".capability]
+feature = "speaker-diarization"
+role = "speaker-segmenter"
+
 # Simultaneous-translation MVP model. Published as an experimental
 # translation-model pack: the importer repackages the pinned upstream GGUF
 # byte-for-byte (no weight changes) and splices license/notice/provenance

@@ -212,6 +212,18 @@ prep_scripts = [
 required_source_files = ["pyannote_seg.safetensors"]
 import_command = "model-pack import pyannote {src}/pyannote_seg.safetensors {out} --package-id {registry_id}"
 
+# DiariZen Base-s80 structured-pruned WavLM + Conformer segmenter. Conversion
+# is architecture-specific and validates the pinned pruning layout before it
+# writes an OpenASR pack. The upstream weights are CC BY-NC 4.0.
+["diarizen-base-s80"]
+import_subcommand = "external: tooling/diarizen/convert_diarizen.py"
+upstream_repo = "BUT-FIT/diarizen-wavlm-base-s80-md"
+source_revision = "a9857fc34908197fb5336d9d0562f291834a04b2"
+needs_license_flags = false
+required_download_files = ["config.toml", "pytorch_model.bin"]
+required_source_files = ["config.toml", "pytorch_model.bin"]
+external_converter = "python3 tooling/diarizen/convert_diarizen.py --checkpoint {src}/pytorch_model.bin --config {src}/config.toml --out {out} --model-id {registry_id} --quant {quant}"
+
 # Hy-MT2 repackaging: fixed-revision upstream GGUF -> .oasr, tensors preserved
 # byte-for-byte; only openasr.* metadata + license/notice are spliced in.
 # Fetch exactly the pinned Q4_K_M GGUF + LICENSE.txt (the repo also ships Q6_K

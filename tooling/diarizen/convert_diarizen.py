@@ -80,6 +80,11 @@ class TensorPlan:
     tensor_type: str
 
 
+def normalize_quant(quant: str) -> str:
+    """Normalize the public catalog spelling to the GGML tensor spelling."""
+    return "f16" if quant == "fp16" else quant
+
+
 POS_CONV_G = (
     "wavlm_model.encoder.transformer.pos_conv_embed.conv."
     "parametrizations.weight.original0"
@@ -337,7 +342,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--quant", choices=("f32", "f16", "q8_0"), default="f16")
+    parser.add_argument(
+        "--quant",
+        choices=("f32", "f16", "fp16", "q8_0"),
+        default="fp16",
+        help="Pack quantization; fp16 is the catalog spelling (f16 is accepted as an alias)",
+    )
     parser.add_argument("--model-id", default=MODEL_ID)
     args = parser.parse_args(argv)
     for path in (args.checkpoint, args.config):
@@ -345,7 +355,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"error: input not found: {path}", file=sys.stderr)
             return 2
     try:
-        convert(args.checkpoint, args.config, args.out, args.quant, args.model_id)
+        convert(
+            args.checkpoint,
+            args.config,
+            args.out,
+            normalize_quant(args.quant),
+            args.model_id,
+        )
     except ConversionError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
