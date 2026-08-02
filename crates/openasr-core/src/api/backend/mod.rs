@@ -376,11 +376,10 @@ pub struct TranscriptionRequest {
     /// One user intent, deliberately not one mechanism. Which speaker
     /// segmentation source runs is decided from the resolved model's
     /// `arch::SpeakerSegmentationSource` (in-decoder markup vs the external
-    /// VAD + speaker-embedder path), and whether the resulting
-    /// recording-local turns can be matched to known people additionally
-    /// depends on an installed speaker embedder. A model that segments
-    /// speakers in-decoder therefore honors this switch with no embedder
-    /// installed at all -- it just cannot name anyone.
+    /// VAD + segment/embed/cluster path). Both sources then converge on the
+    /// same ReDim acoustic-evidence, unknown-rejection, cross-scope stitching,
+    /// and enrolled-person matcher, so an explicit request fails closed when
+    /// that embedder is unavailable.
     pub voice_id: bool,
     /// Persisted recording-level segmenter preference copied into the request
     /// by the host configuration layer. This is internal execution plumbing,
@@ -934,11 +933,11 @@ pub(crate) fn reject_unsupported_language(
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(
-        "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so external Voice ID needs both the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) and an active local speaker segmenter pack (pyannote-segmentation-3.0); install both, pick a model that separates speakers itself, or omit --diarize / diarize=true."
+        "Voice ID is not available for the {backend} backend in this setup.\nInstall the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn). Models without native speaker tracks also need an active local speaker segmenter (pyannote-segmentation-3.0, or an installed optional provider selected by the global policy); otherwise omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
     #[error(
-        "External Voice ID needs an active local speaker segmenter pack. Install pyannote-segmentation-3.0, or turn off Voice ID."
+        "External Voice ID needs an active local speaker segmenter pack. Install pyannote-segmentation-3.0 or an optional supported provider, or turn off Voice ID."
     )]
     DiarizationSegmenterUnavailable,
     #[error("External Voice ID failed closed: {reason}")]

@@ -680,37 +680,33 @@ fn native_phrase_bias_capability_for_adapter(
     }
 }
 
-/// Reason reported when the model does not segment speakers in-decoder and the
-/// model-agnostic external segment/embed/cluster path is not installed either,
-/// i.e. no speaker segmentation source exists for this request.
-pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "This model does not separate speakers itself, so external Voice ID needs both the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) and an active local speaker segmenter pack (pyannote-segmentation-3.0); install both, pick a model that separates speakers itself, or omit diarize=true.";
+/// Reason reported when the acoustic identity stack required by Voice ID is
+/// incomplete. Every model needs ReDimNet2-B6; models without native speaker
+/// tracks additionally need the active recording-level segmenter.
+pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Voice ID needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) for acoustic identity. Models that do not separate speakers themselves also need an active local speaker segmenter pack (pyannote-segmentation-3.0, or an installed optional provider selected by the global policy); install the required Voice ID packs or omit diarize=true.";
 
-/// Voice ID capability for a runtime pack: supported when a speaker
-/// segmentation source exists at all -- either the family segments in-decoder,
-/// or the model-agnostic external pipeline is installed for this process.
-/// Deliberately not gated on external support packs for an in-decoder
-/// family: without one the turns simply stay recording-local instead of being
-/// matched to known people, which is a degraded result, not an unavailable
-/// feature.
+/// Voice ID capability for a runtime pack: ReDim must be installed for every
+/// source, and a family without in-decoder speaker tracks also needs the full
+/// external segment/embed/cluster pipeline.
 fn native_diarization_capability_for_adapter(
     adapter: Option<&NativeRuntimeModelAdapter>,
 ) -> BackendFeatureCapability {
     native_diarization_capability(
         native_runtime_adapter_segments_speakers_in_decoder(adapter),
+        crate::diarize::embed::embedder_pack_installed(),
         crate::diarize::external_diarization_available(),
     )
 }
 
 /// The rule itself, separated from the two live lookups it consults: one
-/// speaker segmentation source is enough. Kept as a pure function so the
-/// in-decoder row is assertable -- the host-installed-pack half is an ambient
-/// filesystem probe, and no tiny-GGUF fixture can stand in for an in-decoder
-/// family's pack.
+/// segmentation source plus the shared acoustic identity model is enough.
+/// Kept as a pure function so every source/dependency row is assertable.
 fn native_diarization_capability(
     segments_speakers_in_decoder: bool,
+    embedder_available: bool,
     external_pipeline_available: bool,
 ) -> BackendFeatureCapability {
-    if segments_speakers_in_decoder || external_pipeline_available {
+    if embedder_available && (segments_speakers_in_decoder || external_pipeline_available) {
         BackendFeatureCapability::supported()
     } else {
         BackendFeatureCapability::reject_request(NATIVE_DIARIZATION_UNAVAILABLE_REASON)
@@ -1683,26 +1679,25 @@ mod tests {
         }
     }
 
-    /// Voice ID is offered when *any* speaker segmentation source exists. The
-    /// row that matters is the first one: a family that separates speakers in
-    /// its own decode offers Voice ID on a host with no speaker-embedder pack,
-    /// because the missing embedder costs it only the ability to put names to
-    /// the voices. (Asserted on the pure rule: no tiny-GGUF fixture can build
-    /// an in-decoder family's pack today, so a pack-level test could not cover
-    /// this row at all.)
+    /// Voice ID always needs acoustic identity. Native speaker tracks remove
+    /// only the external segmenter requirement; they never remove ReDim.
     #[test]
-    fn voice_id_is_offered_when_any_speaker_source_exists() {
-        for (segments_in_decoder, external_pipeline_available, expected) in [
-            (true, false, true),
-            (true, true, true),
-            (false, true, true),
-            (false, false, false),
+    fn voice_id_requires_redim_for_both_speaker_sources() {
+        for (segments_in_decoder, embedder_available, external_pipeline_available, expected) in [
+            (true, true, false, true),
+            (true, false, false, false),
+            (false, true, true, true),
+            (false, false, true, false),
+            (false, true, false, false),
         ] {
-            let capability =
-                native_diarization_capability(segments_in_decoder, external_pipeline_available);
+            let capability = native_diarization_capability(
+                segments_in_decoder,
+                embedder_available,
+                external_pipeline_available,
+            );
             assert_eq!(
                 capability.supported, expected,
-                "in_decoder={segments_in_decoder} external={external_pipeline_available}"
+                "in_decoder={segments_in_decoder} embedder={embedder_available} external={external_pipeline_available}"
             );
             if !expected {
                 assert!(

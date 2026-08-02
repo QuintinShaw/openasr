@@ -1498,8 +1498,9 @@ fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAli
 ///
 /// Identity is deliberately NOT part of this decision: matching
 /// recording-local turns to known people is one source-independent stage that
-/// runs afterwards (`diarize::voice_id`), so it composes with either source and
-/// its absence degrades the result instead of failing the request.
+/// runs afterwards (`diarize::voice_id`), so it composes with either source.
+/// An explicit Voice ID request preflights the shared embedder and fails closed
+/// when its acoustic-identity stage cannot run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpeakerPlan {
     /// Voice ID off. No speaker structure reaches the caller -- including for a
@@ -1600,6 +1601,12 @@ fn run_native_transcription_impl(
     } else {
         None
     };
+    if speaker_plan == SpeakerPlan::InDecoder && crate::diarize::embed::shared_embedder().is_none()
+    {
+        return Err(BackendError::VoiceIdIdentityFailed(
+            crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
+        ));
+    }
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
         // needs Voice ID on, and only the external clustering path clusters.
@@ -1650,10 +1657,9 @@ fn run_native_transcription_impl(
     // real graph build, not in the server route layer (which the CLI never
     // goes through). Wired per family via `native_capacity_admission_facts`;
     // families without a wired deriver fall through to "allow". A request
-    // whose speaker plan runs the external attribution pass is additionally
-    // charged that pass's co-resident embedder footprint
-    // (`external_speaker_attribution_admission_bytes`) -- the pass this very
-    // check must run ahead of.
+    // whose speaker plan enables Voice ID is additionally charged the shared
+    // embedder's co-resident footprint (`voice_id_embedder_admission_bytes`)
+    // -- the acoustic-identity pass this very check must run ahead of.
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
     // The backend this request will actually dispatch on, resolved the same
     // way `resolved_runtime_for_request` further down resolves it (explicit
@@ -1677,7 +1683,7 @@ fn run_native_transcription_impl(
         runtime_source.path(),
         audio_duration_seconds,
         admission_backend,
-        external_speaker_attribution_admission_bytes(speaker_plan),
+        voice_id_embedder_admission_bytes(speaker_plan),
     )?;
 
     // Compute speaker turns up front (independent of the transcript) so they can
@@ -1692,11 +1698,10 @@ fn run_native_transcription_impl(
         SpeakerAttribution::default()
     };
     // The executor consumes its input buffer on the short-form path. Retain a
-    // copy only for the in-decoder plan, whose recording-local turns need their
-    // own acoustic evidence before they can be matched to known people;
-    // ordinary transcriptions keep the zero-copy path.
-    let in_decoder_turn_audio =
-        (speaker_plan == SpeakerPlan::InDecoder).then(|| prepared_audio.clone());
+    // copy for either Voice ID source: both converge on the shared acoustic
+    // evidence and enrolled-person matcher after their turns are normalized.
+    // Voice ID-off transcriptions keep the zero-copy path.
+    let voice_id_audio = (speaker_plan != SpeakerPlan::Off).then(|| prepared_audio.clone());
 
     let dispatch = shared_native_ggml_execution_dispatch();
     let longform_resolution = resolve_native_longform_policy(
@@ -2194,7 +2199,7 @@ fn run_native_transcription_impl(
                     audio_duration_seconds,
                     Some(run_metadata),
                     &speaker_turns,
-                    in_decoder_turn_audio.as_deref().unwrap_or(&[]),
+                    voice_id_audio.as_deref().unwrap_or(&[]),
                     speaker_plan,
                     &[],
                     strip_forced_word_timestamps,
@@ -2207,7 +2212,7 @@ fn run_native_transcription_impl(
                 audio_duration_seconds,
                 Some(run_metadata),
                 &speaker_turns,
-                in_decoder_turn_audio.as_deref().unwrap_or(&[]),
+                voice_id_audio.as_deref().unwrap_or(&[]),
                 speaker_plan,
                 &speaker_scope_starts,
                 strip_forced_word_timestamps,
@@ -2290,7 +2295,7 @@ fn run_native_transcription_impl(
         audio_duration_seconds,
         longform_metadata,
         &speaker_turns,
-        in_decoder_turn_audio.as_deref().unwrap_or(&[]),
+        voice_id_audio.as_deref().unwrap_or(&[]),
         speaker_plan,
         &[],
         strip_forced_word_timestamps,
@@ -2360,32 +2365,34 @@ fn finalize_native_transcription(
         speaker_turns,
         strip_forced_word_timestamps,
     );
-    if speaker_plan == SpeakerPlan::InDecoder {
-        // The family already produced turns, but only *within* each decode
-        // unit: a sliced run numbered its speakers from one per slice, so the
-        // labels only mean something relative to the scope that produced them.
-        // The source-independent identity stage is what relates the scopes,
-        // and fails closed (rather than silently degrading) when it had
-        // stitching or naming work to do and no embedder to do it with -- see
-        // `voice_id::name_speakers_across_scopes`.
-        let mut scopes = speaker_scopes_by_start(
-            &mut transcription.segments,
-            speaker_scope_starts,
-            prepared_audio,
-        );
-        let unnamed = crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes)?;
-        transcription.unnamed_speakers = unnamed;
-    } else {
-        // The external VAD + speaker-embedder pass judged its own speakers
-        // before the transcript existed; carry its refusals through the same
-        // field so a caller never has to know which segmentation source ran to
-        // find out why a speaker is anonymous. Filtered to the labels the
-        // finished transcript actually spells, matching the in-decoder path:
-        // a turn that ended up covering no segment is not a speaker the user
-        // can see, so reporting it would be reporting a label that is not
-        // there.
-        transcription.unnamed_speakers =
-            retain_visible_unnamed_speakers(speaker_turns.unnamed.clone(), &transcription.segments);
+    match speaker_plan {
+        SpeakerPlan::InDecoder => {
+            // Each independently decoded slice is a label scope. The shared
+            // identity stage disambiguates those local counters, gathers
+            // acoustic evidence, stitches matching voices, and names enrolled
+            // people.
+            let mut scopes = speaker_scopes_by_start(
+                &mut transcription.segments,
+                speaker_scope_starts,
+                prepared_audio,
+            );
+            transcription.unnamed_speakers =
+                crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes)?;
+        }
+        SpeakerPlan::External => {
+            // External segmentation has already been normalized to the same
+            // recording-local labels. Naming deliberately runs through the
+            // identical evidence/purity/matcher policy as in-decoder models;
+            // clustering centroids are not trusted as identity evidence.
+            transcription.unnamed_speakers =
+                crate::diarize::voice_id::name_speakers_from_labeled_segments(
+                    &mut transcription.segments,
+                    prepared_audio,
+                )?;
+        }
+        SpeakerPlan::Off => {
+            transcription.unnamed_speakers.clear();
+        }
     }
     // Stamped after the body is assembled and before the transcript leaves the
     // engine, on every exit path: the per-decode results this run consumed are
@@ -2469,39 +2476,12 @@ fn with_reported_language(
     transcription
 }
 
-/// Speaker turns plus the optionally-matched enrolled primary-user identity.
+/// Recording-local speaker turns normalized from the selected segmentation
+/// source. Enrolled-person matching happens later in the one shared Voice ID
+/// evidence stage, after these turns have been reconciled with ASR segments.
 #[derive(Default)]
 struct SpeakerAttribution {
     turns: Vec<crate::diarize::contract::SpeakerTurn>,
-    identities: BTreeMap<
-        crate::diarize::contract::SpeakerId,
-        crate::diarize::enrollment::SpeakerDisplayAssignment,
-    >,
-    /// Speakers this pass clustered but could not name, and why. The
-    /// counterpart of `identities`: between them they account for every
-    /// clustered speaker, so "anonymous" is never left unexplained.
-    unnamed: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
-}
-
-/// Drop refusals for labels the finished transcript does not spell, and for
-/// labels that ended up named after all.
-///
-/// The report is a statement about what the reader can see, so it is derived
-/// from the segments rather than from whatever the matching stage happened to
-/// consider.
-fn retain_visible_unnamed_speakers(
-    unnamed: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
-    segments: &[crate::Segment],
-) -> Vec<crate::diarize::voice_id::UnnamedSpeaker> {
-    let visible: std::collections::BTreeSet<&str> = segments
-        .iter()
-        .filter(|segment| segment.speaker_person_id.is_none())
-        .filter_map(|segment| segment.speaker_label.as_deref())
-        .collect();
-    unnamed
-        .into_iter()
-        .filter(|speaker| visible.contains(speaker.label.as_str()))
-        .collect()
 }
 
 /// Diarize the prepared audio into recording-local speaker turns, then match
@@ -2540,54 +2520,8 @@ fn compute_speaker_attribution(
             );
         }
     }
-    let matcher = crate::diarize::voice_id::load_person_matcher_for_active_embedder();
-    let mut identities: BTreeMap<
-        crate::diarize::contract::SpeakerId,
-        crate::diarize::enrollment::SpeakerDisplayAssignment,
-    > = BTreeMap::new();
-    let mut unnamed: Vec<crate::diarize::voice_id::UnnamedSpeaker> = Vec::new();
-    for (speaker_id, embedding) in &diarization.centroids {
-        let Some(person_match) = matcher.best_match(embedding) else {
-            // This path has no evidence-quantity gate of its own -- the
-            // clusterer only ever hands over speakers it built a centroid for
-            // -- so the one refusal it can reach is "nobody in the library is
-            // this voice".
-            let scored = matcher.best_score_and_threshold(embedding);
-            unnamed.push(crate::diarize::voice_id::UnnamedSpeaker {
-                label: speaker_id.label(),
-                reason: crate::diarize::voice_id::SpeakerNamingRefusal::NoMatchInLibrary {
-                    library_empty: matcher.is_empty(),
-                    best_score: scored.map(|(score, _)| score),
-                    accept_threshold: scored.map(|(_, threshold)| threshold),
-                },
-            });
-            continue;
-        };
-        let assignment = crate::diarize::voice_id::VoiceIdAssignment::from_person_match(
-            *speaker_id,
-            &person_match,
-        );
-        identities.insert(
-            *speaker_id,
-            crate::diarize::enrollment::SpeakerDisplayAssignment::from_voice_id_assignment(
-                assignment,
-            ),
-        );
-    }
-    if diarize_debug {
-        for (speaker_id, assignment) in &identities {
-            eprintln!(
-                "openasr_diarize_debug stage=batch identity speaker={} display={} person_id={}",
-                speaker_id.label(),
-                assignment.speaker,
-                assignment.speaker_person_id.as_deref().unwrap_or("none"),
-            );
-        }
-    }
     Ok(SpeakerAttribution {
         turns: diarization.turns,
-        identities,
-        unnamed,
     })
 }
 
@@ -2627,10 +2561,11 @@ fn apply_speaker_turns(
     strip_forced_word_timestamps: bool,
 ) -> Transcription {
     if !attribution.turns.is_empty() {
+        let identities = BTreeMap::new();
         transcription.segments = crate::diarize::attribution::assign_speakers(
             &attribution.turns,
             std::mem::take(&mut transcription.segments),
-            &attribution.identities,
+            &identities,
         );
     }
     transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
@@ -3007,20 +2942,18 @@ fn native_capacity_admission_facts(
 }
 
 /// The auxiliary resident bytes this request's speaker plan adds to the
-/// admission charge: the VAD + speaker-embedder attribution pass
-/// (`compute_speaker_attribution`) runs right after admission for the
-/// `External` plan only, so only that plan is charged
+/// admission charge. Every explicit Voice ID request runs the shared ReDim
+/// acoustic-identity stage, so both native-speaker and external-speaker plans
+/// are charged
 /// (`crate::diarize::embed::speaker_attribution_admission_bytes`'s
-/// conservative pack-size-based estimate). `Off` and `InDecoder` requests
-/// never run that pass and must not be made stricter by it. (The `InDecoder`
-/// plan's later voice-id naming stage can also touch the embedder; its
-/// working set is bounded by the same figure but is deliberately not charged
-/// -- degrading naming is that stage's own documented fallback, never an
-/// admission failure.)
-fn external_speaker_attribution_admission_bytes(speaker_plan: SpeakerPlan) -> u64 {
+/// conservative pack-size-based estimate). The external segmenter adds a
+/// small second pack, but ReDim is the dominant shared resident charge.
+fn voice_id_embedder_admission_bytes(speaker_plan: SpeakerPlan) -> u64 {
     match speaker_plan {
-        SpeakerPlan::External => crate::diarize::embed::speaker_attribution_admission_bytes(),
-        SpeakerPlan::Off | SpeakerPlan::InDecoder => 0,
+        SpeakerPlan::InDecoder | SpeakerPlan::External => {
+            crate::diarize::embed::speaker_attribution_admission_bytes()
+        }
+        SpeakerPlan::Off => 0,
     }
 }
 
@@ -3030,11 +2963,10 @@ fn external_speaker_attribution_admission_bytes(speaker_plan: SpeakerPlan) -> u6
 /// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
 /// of an actionable error (issue #159 on CPU). Wired per family through
 /// [`native_capacity_admission_facts`]; families without a wired deriver stay
-/// unchecked. `external_speaker_attribution_bytes` is the extra resident
-/// charge for a request that will run the VAD + speaker-embedder attribution
-/// pass right after admission
-/// ([`external_speaker_attribution_admission_bytes`]; `0` for every other
-/// request). Fails OPEN whenever the answer is uncertain rather than
+/// unchecked. `voice_id_embedder_bytes` is the extra resident
+/// charge for a request that will run the shared Voice ID embedder
+/// ([`voice_id_embedder_admission_bytes`]; `0` when Voice ID is off). Fails
+/// OPEN whenever the answer is uncertain rather than
 /// definite -- an unresolvable family, unprobeable host RAM, or an
 /// unreadable pack file all fall through to "allow" (`crate::capacity`'s
 /// invariant: refuse only when certain it will not fit; the worst case is
@@ -3045,7 +2977,7 @@ fn enforce_native_host_memory_admission(
     pack_path: &Path,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    external_speaker_attribution_bytes: u64,
+    voice_id_embedder_bytes: u64,
 ) -> Result<(), BackendError> {
     let Some(facts) = native_capacity_admission_facts(
         model_architecture,
@@ -3068,7 +3000,7 @@ fn enforce_native_host_memory_admission(
         pack_metadata.len(),
         facts
             .fixed_decode_state_bytes
-            .saturating_add(external_speaker_attribution_bytes),
+            .saturating_add(voice_id_embedder_bytes),
         host_total_memory_bytes,
         host_memory_admission_domain_for_backend(backend),
     ) {
@@ -4978,21 +4910,17 @@ mod tests {
         }
     }
 
-    /// Only a request whose speaker plan actually runs the external VAD +
-    /// speaker-embedder pass is charged its co-resident footprint; `Off` and
-    /// `InDecoder` requests must never be made stricter by it.
+    /// Both segmentation sources converge on the same ReDim identity stage,
+    /// so every explicit Voice ID request is charged its resident footprint.
     #[test]
-    fn external_speaker_attribution_bytes_charged_only_for_the_external_plan() {
+    fn voice_id_embedder_bytes_charged_for_both_segmentation_sources() {
+        assert_eq!(voice_id_embedder_admission_bytes(SpeakerPlan::Off), 0);
         assert_eq!(
-            external_speaker_attribution_admission_bytes(SpeakerPlan::Off),
-            0
+            voice_id_embedder_admission_bytes(SpeakerPlan::InDecoder),
+            crate::diarize::embed::speaker_attribution_admission_bytes()
         );
         assert_eq!(
-            external_speaker_attribution_admission_bytes(SpeakerPlan::InDecoder),
-            0
-        );
-        assert_eq!(
-            external_speaker_attribution_admission_bytes(SpeakerPlan::External),
+            voice_id_embedder_admission_bytes(SpeakerPlan::External),
             crate::diarize::embed::speaker_attribution_admission_bytes()
         );
     }

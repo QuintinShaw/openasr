@@ -345,8 +345,8 @@ pub(crate) const DEFAULT_ENCODER_SAFE_CHUNK_SECONDS: f32 = 30.0;
 /// recording-local turn label into a known person is the Voice ID matching
 /// stage in `crate::diarize::voice_id`, which runs on top of whichever source
 /// produced the turns). Keeping the three apart is what lets a self-segmenting
-/// family work without a speaker-embedder pack installed, and lets an
-/// embedder-equipped host name the speakers of a self-segmenting family.
+/// family reuse its own stable tracks while both source types still converge
+/// on the same required ReDim acoustic identity and enrolled-person matcher.
 ///
 /// The variants are mutually exclusive by construction: exactly one source
 /// produces the turns for a given transcription, so no second pass can
