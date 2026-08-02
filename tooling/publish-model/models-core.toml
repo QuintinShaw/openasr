@@ -830,16 +830,14 @@ min_cli_version = "0.1.24"
 # in arch/mod.rs). FixedMultilingual zh+en (no language-selection prompt
 # token); emits_punctuation unclaimed (None). Pack import is ExternalTooling
 # (tooling/publish-model/scripts/funasr_nano_pt_to_safetensors.py) then the
-# Rust package_import quantize/pack step. Staged PRIVATE: release_public only
-# gates the eventual `--public` catalog flip (needs a completed
-# docs/model-audits/funasr-nano.md -- already filled); HF upload stays private
-# until a deliberate later flip. languages is an explicit override so
-# LANG_BY_FAMILY does not move the user-facing family-count strings before
-# the public flip (same staging convention as moss-transcribe-diarize).
+# Rust package_import quantize/pack step. Public catalog entry; HF packs live
+# at OpenASR/funasr-nano. languages is an explicit override, lockstep with
+# FixedMultilingual { languages: &["zh","en"] } in arch/mod.rs (upstream card
+# also mentions Japanese; the runtime arch only ships the zh+en fixed set).
 ["funasr-nano"]
 family = "funasr-nano"
 hf_repo = "OpenASR/funasr-nano"
-release_public = false
+release_public = true
 size = "0.8b"
 registry_id = "funasr-nano"
 display_name = "Fun-ASR-Nano"
@@ -855,8 +853,7 @@ languages = ["en", "zh"]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 upstream_release_date = "2025-12-01"
-# Runtime first ships with the next core release after 0.1.26; private HF
-# staging is allowed before that bump. Author-set floor for eventual catalog.
+# Runtime first ships with core 0.1.27; catalog min_* floors match.
 min_core_version = "0.1.27"
 min_cli_version = "0.1.27"
 
@@ -865,13 +862,13 @@ min_cli_version = "0.1.27"
 # family/architecture (`granite-speech` in arch/mod.rs). SelfDetectsRejectsHint
 # (detect_implicit) -- free-text instruction-following, no language token;
 # emits_punctuation Some(true) (observed on goldens). Pack import is
-# CoreConvert `convert_local_granite_speech_source_to_runtime_pack`. Staged
-# PRIVATE like funasr-nano above; languages is an explicit override so
-# LANG_BY_FAMILY / family-count docs do not move before the public flip.
+# CoreConvert `convert_local_granite_speech_source_to_runtime_pack`. Public
+# catalog entry; HF packs live at OpenASR/granite-speech-4.1-2b. languages is
+# an explicit override from the upstream trained-language list.
 ["granite-speech-4.1-2b"]
 family = "granite-speech"
 hf_repo = "OpenASR/granite-speech-4.1-2b"
-release_public = false
+release_public = true
 size = "2b"
 registry_id = "granite-speech-4.1-2b"
 display_name = "Granite Speech 4.1 2B"

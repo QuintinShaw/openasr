@@ -61,6 +61,15 @@ credits the people who built the original.
   <https://huggingface.co/OpenASR/mimo-v2.5-asr> (Mandarin Chinese, English,
   and Cantonese; 1.2B RVQ tokenizer + 8B Qwen2 decoder; original weights:
   <https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR>).
+- Fun-ASR-Nano (FunAudioLLM, Apache-2.0) --
+  <https://huggingface.co/OpenASR/funasr-nano> (Mandarin + English; SAN-M/DFSMN
+  encoder + adaptor + Qwen3-0.6B decoder; original weights:
+  <https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512>).
+- Granite Speech 4.1 2B (IBM Granite, Apache-2.0) --
+  <https://huggingface.co/OpenASR/granite-speech-4.1-2b> (English, French,
+  German, Spanish, Portuguese, Japanese; Conformer encoder + Q-Former + 2B
+  Granite decoder; original weights:
+  <https://huggingface.co/ibm-granite/granite-speech-4.1-2b>).
 - Qwen3-ForcedAligner 0.6B (Alibaba Qwen team, Apache-2.0) --
   <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B> (optional word-level
   timestamp refinement via `--word-timestamps=aligned`; OpenASR pack staged,
