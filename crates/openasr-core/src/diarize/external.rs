@@ -11,6 +11,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::clustering::AutomaticClusterer;
+#[cfg(test)]
+use super::clustering::{AutomaticClusteringDiagnostics, AutomaticClusteringStrategy};
 use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
 use super::embed::{EmbedError, SpeakerEmbedder};
 use super::pipeline::Diarization;
@@ -103,6 +105,108 @@ pub(crate) struct ExternalDiarizer {
     clusterer: AutomaticClusterer,
 }
 
+struct PreparedExternalRecording {
+    activity: LocalActivity,
+    embedded_chunks: Vec<TimeRange>,
+    embeddings: Vec<SpeakerEmbedding>,
+    audio_duration_s: f64,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+struct NativeDiarizationDiagnostics {
+    schema: &'static str,
+    chunks: Vec<NativeDiarizationDiagnosticChunk>,
+    embeddings: Vec<Vec<f32>>,
+    clustering: NativeClusteringDiagnostics,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+struct NativeDiarizationDiagnosticChunk {
+    start_s: f64,
+    end_s: f64,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+struct NativeClusteringDiagnostics {
+    strategy: &'static str,
+    spectral_eigenvalues: Vec<f64>,
+    eigengap_speakers: Option<usize>,
+    selected_speakers: usize,
+    raw_labels: Vec<u32>,
+    minor_filtered_labels: Vec<u32>,
+    final_labels: Vec<u32>,
+}
+
+#[cfg(test)]
+impl NativeDiarizationDiagnostics {
+    fn from_pipeline(
+        chunks: &[TimeRange],
+        embeddings: &[SpeakerEmbedding],
+        clustering: AutomaticClusteringDiagnostics,
+    ) -> Self {
+        assert_eq!(
+            chunks.len(),
+            embeddings.len(),
+            "native diagnostics require one embedding per successful chunk"
+        );
+        assert_eq!(
+            chunks.len(),
+            clustering.raw_labels.len(),
+            "native diagnostics require one raw label per embedding"
+        );
+        assert_eq!(
+            chunks.len(),
+            clustering.minor_filtered_labels.len(),
+            "native diagnostics require one filtered label per embedding"
+        );
+        assert_eq!(
+            chunks.len(),
+            clustering.final_labels.len(),
+            "native diagnostics require one final label per embedding"
+        );
+        let strategy = match clustering.strategy {
+            AutomaticClusteringStrategy::Ahc => "ahc",
+            AutomaticClusteringStrategy::Spectral => "spectral",
+        };
+        Self {
+            schema: "openasr.native-diarization-diagnostics.v1",
+            chunks: chunks
+                .iter()
+                .map(|range| NativeDiarizationDiagnosticChunk {
+                    start_s: range.start_s,
+                    end_s: range.end_s,
+                })
+                .collect(),
+            embeddings: embeddings
+                .iter()
+                .map(|embedding| embedding.0.clone())
+                .collect(),
+            clustering: NativeClusteringDiagnostics {
+                strategy,
+                spectral_eigenvalues: clustering.spectral_eigenvalues,
+                eigengap_speakers: clustering.eigengap_speakers,
+                selected_speakers: clustering.selected_speakers,
+                raw_labels: speaker_label_values(clustering.raw_labels),
+                minor_filtered_labels: speaker_label_values(clustering.minor_filtered_labels),
+                final_labels: speaker_label_values(clustering.final_labels),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+fn speaker_label_values(labels: Vec<SpeakerId>) -> Vec<u32> {
+    labels.into_iter().map(|speaker| speaker.0).collect()
+}
+
+#[cfg(test)]
+fn native_diagnostics_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 impl ExternalDiarizer {
     pub(crate) fn selected_segmenter(&self) -> SegmenterProvider {
         self.segmenter.provider
@@ -115,6 +219,73 @@ impl ExternalDiarizer {
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
     ) -> Result<Diarization, ExternalDiarizationError> {
+        self.diarize_with_clustering(
+            samples,
+            sample_rate_hz,
+            hint,
+            canceled,
+            |clusterer, _chunks, embeddings, hint| (clusterer.cluster(embeddings, hint), ()),
+        )
+        .map(|(diarization, ())| diarization)
+    }
+
+    #[cfg(test)]
+    fn diarize_with_diagnostics(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        hint: DiarizeHint,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<(Diarization, NativeDiarizationDiagnostics), ExternalDiarizationError> {
+        self.diarize_with_clustering(
+            samples,
+            sample_rate_hz,
+            hint,
+            canceled,
+            |clusterer, chunks, embeddings, hint| {
+                let clustering = clusterer.diagnostics(embeddings, hint);
+                let labels = clustering.final_labels.clone();
+                (
+                    labels,
+                    NativeDiarizationDiagnostics::from_pipeline(chunks, embeddings, clustering),
+                )
+            },
+        )
+    }
+
+    fn diarize_with_clustering<T>(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        hint: DiarizeHint,
+        canceled: &dyn Fn() -> bool,
+        cluster: impl FnOnce(
+            &AutomaticClusterer,
+            &[TimeRange],
+            &[SpeakerEmbedding],
+            DiarizeHint,
+        ) -> (Vec<SpeakerId>, T),
+    ) -> Result<(Diarization, T), ExternalDiarizationError> {
+        let prepared = self.prepare_recording(samples, sample_rate_hz, canceled)?;
+        if !prepared.embeddings.is_empty() {
+            cancel_checkpoint(canceled)?;
+        }
+        let (labels, output) = cluster(
+            &self.clusterer,
+            &prepared.embedded_chunks,
+            &prepared.embeddings,
+            hint,
+        );
+        debug_assert_eq!(labels.len(), prepared.embeddings.len());
+        Ok((assemble_recording(&prepared, &labels), output))
+    }
+
+    fn prepare_recording(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<PreparedExternalRecording, ExternalDiarizationError> {
         if sample_rate_hz != SAMPLE_RATE_HZ {
             return Err(ExternalDiarizationError::UnsupportedSampleRate(
                 sample_rate_hz,
@@ -137,28 +308,12 @@ impl ExternalDiarizer {
             &chunks,
             canceled,
         )?;
-        if embeddings.is_empty() {
-            return Ok(Diarization {
-                turns: Vec::new(),
-                centroids: Vec::new(),
-            });
-        }
-        cancel_checkpoint(canceled)?;
-        let labels = self.clusterer.cluster(&embeddings, hint);
-        let cluster_segments = compress_cluster_segments(&embedded_chunks, &labels);
-        let speaker_count = labels
-            .iter()
-            .map(|speaker| speaker.0 as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let turns = reconstruct_global_turns(
-            &activity,
-            &cluster_segments,
-            speaker_count,
-            samples.len() as f64 / sample_rate_hz as f64,
-        );
-        let centroids = speaker_centroids(&labels, &embeddings);
-        Ok(Diarization { turns, centroids })
+        Ok(PreparedExternalRecording {
+            activity,
+            embedded_chunks,
+            embeddings,
+            audio_duration_s: samples.len() as f64 / sample_rate_hz as f64,
+        })
     }
 
     fn vad_regions(
@@ -190,6 +345,23 @@ impl ExternalDiarizer {
                 other => ExternalDiarizationError::Vad(other.to_string()),
             })
     }
+}
+
+fn assemble_recording(prepared: &PreparedExternalRecording, labels: &[SpeakerId]) -> Diarization {
+    let cluster_segments = compress_cluster_segments(&prepared.embedded_chunks, labels);
+    let speaker_count = labels
+        .iter()
+        .map(|speaker| speaker.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let turns = reconstruct_global_turns(
+        &prepared.activity,
+        &cluster_segments,
+        speaker_count,
+        prepared.audio_duration_s,
+    );
+    let centroids = speaker_centroids(labels, &prepared.embeddings);
+    Diarization { turns, centroids }
 }
 
 fn cancel_checkpoint(canceled: &dyn Fn() -> bool) -> Result<(), ExternalDiarizationError> {
@@ -755,6 +927,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_diagnostics_require_explicit_one() {
+        assert!(!native_diagnostics_enabled(None));
+        assert!(!native_diagnostics_enabled(Some("")));
+        assert!(!native_diagnostics_enabled(Some("0")));
+        assert!(!native_diagnostics_enabled(Some("true")));
+        assert!(native_diagnostics_enabled(Some("1")));
+    }
+
+    #[test]
+    fn native_diagnostics_serialize_exact_pipeline_artifacts() {
+        let chunks = vec![TimeRange::new(0.0, 1.5), TimeRange::new(0.75, 2.25)];
+        let embeddings = vec![
+            SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
+            SpeakerEmbedding::l2_normalized(vec![0.0, 1.0]),
+        ];
+        let clustering = AutomaticClusterer.diagnostics(&embeddings, DiarizeHint::NumSpeakers(2));
+        let expected_raw: Vec<_> = clustering
+            .raw_labels
+            .iter()
+            .map(|speaker| speaker.0)
+            .collect();
+        let expected_minor: Vec<_> = clustering
+            .minor_filtered_labels
+            .iter()
+            .map(|speaker| speaker.0)
+            .collect();
+        let expected_final: Vec<_> = clustering
+            .final_labels
+            .iter()
+            .map(|speaker| speaker.0)
+            .collect();
+
+        let value = serde_json::to_value(NativeDiarizationDiagnostics::from_pipeline(
+            &chunks,
+            &embeddings,
+            clustering,
+        ))
+        .expect("serialize native diagnostics fixture");
+
+        assert_eq!(value["schema"], "openasr.native-diarization-diagnostics.v1");
+        assert_eq!(
+            value["chunks"],
+            serde_json::json!([
+                {"start_s": 0.0, "end_s": 1.5},
+                {"start_s": 0.75, "end_s": 2.25}
+            ])
+        );
+        assert_eq!(
+            value["embeddings"],
+            serde_json::json!([[1.0, 0.0], [0.0, 1.0]])
+        );
+        assert_eq!(value["clustering"]["strategy"], "spectral");
+        assert_eq!(
+            value["clustering"]["spectral_eigenvalues"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(value["clustering"]["eigengap_speakers"].is_null());
+        assert_eq!(value["clustering"]["selected_speakers"], 2);
+        assert_eq!(
+            value["clustering"]["raw_labels"],
+            serde_json::to_value(expected_raw).expect("serialize expected raw labels")
+        );
+        assert_eq!(
+            value["clustering"]["minor_filtered_labels"],
+            serde_json::to_value(expected_minor).expect("serialize expected filtered labels")
+        );
+        assert_eq!(
+            value["clustering"]["final_labels"],
+            serde_json::to_value(expected_final).expect("serialize expected final labels")
+        );
+    }
+
     /// Exact, ASR-independent hypothesis emitter for the locked diarization
     /// corpus. Unlike `OPENASR_DIARIZE_DEBUG`, this runs the same production
     /// recording-level module directly and writes full-precision raw turns.
@@ -781,6 +1028,8 @@ mod tests {
             .expect("OPENASR_NATIVE_DIARIZATION_SEGMENTER_QUANT must state the tested pack tier");
         let embedder_quant = std::env::var("OPENASR_NATIVE_DIARIZATION_EMBEDDER_QUANT")
             .expect("OPENASR_NATIVE_DIARIZATION_EMBEDDER_QUANT must state the tested pack tier");
+        let diagnostics_env = std::env::var("OPENASR_NATIVE_DIARIZATION_DIAGNOSTICS").ok();
+        let emit_diagnostics = native_diagnostics_enabled(diagnostics_env.as_deref());
         let (preference, expected_provider) = match provider.as_str() {
             "segmentation_3_0" => (
                 VoiceIdSegmenterPreference::Segmentation3_0,
@@ -903,14 +1152,32 @@ mod tests {
                 "native diarization acceptance",
             )
             .unwrap_or_else(|error| panic!("load fixture '{}': {error}", wav.display()));
-            let diarization = diarizer
-                .diarize(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
-                .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
+            let (diarization, diagnostics) = if emit_diagnostics {
+                let (diarization, diagnostics) = diarizer
+                    .diarize_with_diagnostics(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| {
+                        false
+                    })
+                    .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
+                (diarization, Some(diagnostics))
+            } else {
+                let diarization = diarizer
+                    .diarize(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
+                    .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
+                (diarization, None)
+            };
             assert!(
                 !diarization.turns.is_empty(),
                 "native diarization emitter produced no turns for '{}'",
                 fixture.id
             );
+            if let Some(diagnostics) = diagnostics {
+                std::fs::write(
+                    output.join(format!("{}.diagnostics.json", fixture.id)),
+                    serde_json::to_vec_pretty(&diagnostics)
+                        .expect("serialize native diarization diagnostics"),
+                )
+                .expect("write native diarization diagnostics");
+            }
             let mut rttm = String::new();
             for turn in diarization.turns {
                 let duration = turn.range.duration_s();
