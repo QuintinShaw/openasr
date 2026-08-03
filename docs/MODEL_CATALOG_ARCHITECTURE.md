@@ -105,11 +105,11 @@ record the Hugging Face revision in `tmp/publish/<id>/hf_revision.txt`, then run
 `tooling/publish-model/scripts/regenerate_all.sh <id>`. Do not pass `--public` or
 add `release_public = true` until the public-listing gate passes.
 
-DiariZen Base-s80 is intentionally in that source-only state. Its
+DiariZen Large-s80-md-v2 is intentionally in that source-only state. Its
 `release_public = false` row records the pinned upstream checkpoint and CC BY-NC
 4.0 license, but it has no generated local card, no full/public catalog entry,
 and no download URL or sha256. It is therefore not pullable. The current
-candidate is fp16-only; q8 is deferred. Do not invent publication metadata or
+candidate is fp16-only. Do not invent publication metadata or
 promote it until the native quality/resource audit and the product's explicit
 non-commercial consent flow have both been approved.
 

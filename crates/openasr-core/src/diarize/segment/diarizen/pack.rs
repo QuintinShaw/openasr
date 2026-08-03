@@ -8,7 +8,7 @@ use crate::ggml_runtime::request_backend_override;
 use crate::models::thread_local_runtime_cache::PackContentKey;
 
 const PACK_ENV: &str = "OPENASR_DIARIZEN_PACK";
-const INSTALLED_MODEL_ID_HINT: &str = "diarizen-base-s80";
+const INSTALLED_MODEL_ID_HINT: &str = super::DIARIZEN_MODEL_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DiariZenRuntimeKey {
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn installed_pack_identity_is_exact_and_stable() {
         assert_eq!(PACK_ENV, "OPENASR_DIARIZEN_PACK");
-        assert_eq!(INSTALLED_MODEL_ID_HINT, "diarizen-base-s80");
+        assert_eq!(INSTALLED_MODEL_ID_HINT, "diarizen-large-s80-v2");
     }
 
     #[test]

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Convert the pinned DiariZen Base-s80 checkpoint to an OpenASR ``.oasr``.
+"""Convert the pinned DiariZen Large-s80-v2 checkpoint to an OpenASR ``.oasr``.
 
-The target is ``BUT-FIT/diarizen-wavlm-base-s80-md`` at revision
-``a9857fc34908197fb5336d9d0562f291834a04b2``.  It is a structured-pruned
-WavLM-Base+ encoder followed by a four-layer Conformer and an 11-class
-powerset head.  The converter is deliberately architecture-specific: accepting
-an arbitrary checkpoint and silently guessing its pruning layout would make the
-native runtime contract impossible to audit.
+The target is ``BUT-FIT/diarizen-wavlm-large-s80-md-v2`` at revision
+``f27b9ffbedcf422856d104ecee9b94be37ea578e``. It is a structured-pruned
+WavLM-Large encoder followed by a four-layer Conformer and a 16-class powerset
+head that represents up to four simultaneous speakers. The converter is
+deliberately architecture-specific: accepting an arbitrary checkpoint and
+silently guessing its pruning layout would make the native runtime contract
+impossible to audit.
 
 The upstream *weights* are CC BY-NC 4.0.  This converter is tooling only; it
 does not grant permission to redistribute a converted pack.
@@ -26,22 +27,22 @@ import numpy as np
 
 
 ARCH = "diarizen-wavlm-conformer-segmentation"
-MODEL_ID = "diarizen-base-s80"
-UPSTREAM_MODEL_ID = "BUT-FIT/diarizen-wavlm-base-s80-md"
-PINNED_REVISION = "a9857fc34908197fb5336d9d0562f291834a04b2"
+MODEL_ID = "diarizen-large-s80-v2"
+UPSTREAM_MODEL_ID = "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
+PINNED_REVISION = "f27b9ffbedcf422856d104ecee9b94be37ea578e"
 LICENSE_NAME = "CC BY-NC 4.0"
 LICENSE_SOURCE = (
-    "https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/"
+    "https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/"
     f"{PINNED_REVISION}/README.md"
 )
-TENSOR_SCHEMA = "compact-v1"
+TENSOR_SCHEMA = "compact-v2"
 GGUF_MAX_TENSOR_NAME_BYTES = 63
 
 EXPECTED_MODEL_PATH = "diarizen.models.eend.model_wavlm_conformer.Model"
 EXPECTED_MODEL_ARGS = {
-    "wavlm_src": "wavlm_base_s80_md",
-    "wavlm_layer_num": 13,
-    "wavlm_feat_dim": 768,
+    "wavlm_src": "wavlm_large_s80_md",
+    "wavlm_layer_num": 25,
+    "wavlm_feat_dim": 1024,
     "attention_in": 256,
     "ffn_hidden": 1024,
     "num_head": 4,
@@ -51,30 +52,45 @@ EXPECTED_MODEL_ARGS = {
     "use_posi": False,
     "output_activate_function": False,
     "max_speakers_per_chunk": 4,
-    "max_speakers_per_frame": 2,
+    "max_speakers_per_frame": 4,
     "chunk_size": 16,
     "selected_channel": 0,
     "sample_rate": 16000,
 }
 
-WAVLM_CONV_CHANNELS = [90, 161, 173, 181, 351, 155, 137]
+WAVLM_CONV_CHANNELS = [512, 153, 224, 255, 302, 368, 211]
 WAVLM_CONV_KERNELS = [10, 3, 3, 3, 3, 2, 2]
 WAVLM_CONV_STRIDES = [5, 2, 2, 2, 2, 2, 2]
 WAVLM_REMAINING_HEADS = [
-    [1, 6],
-    [5, 7, 8],
-    [0, 3, 9],
-    [0, 1, 4, 8, 11],
-    [6, 8],
-    [0],
-    [7, 8, 10, 11],
-    [0, 1, 4, 8],
+    [1, 2, 4, 5, 6],
+    [9, 10, 14],
+    [0, 1, 2, 4, 5, 7],
+    [1, 4, 7, 12, 13, 14],
+    [0, 2, 3, 4, 13],
+    [1, 7, 13, 14, 15],
+    [11, 13, 15],
+    [2, 3, 4, 8, 15],
+    [2, 5, 6, 15],
+    [],
+    [0, 1],
+    [1, 3, 5, 12],
+    [],
+    [4, 7, 11],
+    [6, 9],
+    [11],
     [],
     [],
-    [4, 7],
-    [5],
+    [14],
+    [5, 15],
+    [0, 2, 8, 11, 13, 15],
+    [0, 1, 3, 4, 5, 6, 7, 10, 13],
+    [0, 1, 3, 6, 7, 9, 10, 11, 12, 14],
+    [1, 2, 3, 4, 7, 13, 14, 15],
 ]
-WAVLM_FFN_DIMS = [666, 660, 649, 1080, 237, 299, 437, 573, 53, 80, 211, 334]
+WAVLM_FFN_DIMS = [
+    1092, 925, 759, 646, 745, 615, 684, 958, 286, 294, 406, 377,
+    463, 542, 298, 236, 96, 104, 134, 211, 473, 1011, 1770, 1316,
+]
 
 
 class ConversionError(RuntimeError):
@@ -90,7 +106,9 @@ class TensorPlan:
 
 def normalize_quant(quant: str) -> str:
     """Normalize the public catalog spelling to the GGML tensor spelling."""
-    return "f16" if quant == "fp16" else quant
+    if quant not in {"f16", "fp16"}:
+        raise ConversionError(f"Large-s80-v2 supports FP16 packs only, got {quant!r}")
+    return "f16"
 
 
 POS_CONV_G = (
@@ -135,18 +153,27 @@ def load_and_validate_config(path: Path) -> dict[str, object]:
         raise ConversionError(f"missing model.args in {path}")
     for key, expected in EXPECTED_MODEL_ARGS.items():
         # The upstream TOML omits constructor defaults such as kernel_size and
-        # max_speakers_per_frame. Resolve those omissions exactly as Python's
-        # constructor does, while still rejecting an explicit drift.
+        # sample_rate. Resolve those omissions exactly as Python's constructor
+        # does, while still rejecting an explicit drift.
         if args.get(key, expected) != expected:
             raise ConversionError(
                 f"unsupported model.args.{key}: expected {expected!r}, got {args.get(key)!r}"
             )
     inference = config.get("inference")
     inference_args = inference.get("args") if isinstance(inference, dict) else None
-    if not isinstance(inference_args, dict) or inference_args.get(
-        "apply_median_filtering"
-    ) is not True:
-        raise ConversionError("Base-s80 runtime contract requires median filtering")
+    expected_inference_args = {
+        "seg_duration": 16,
+        "segmentation_step": 0.1,
+        "apply_median_filtering": True,
+    }
+    if not isinstance(inference_args, dict):
+        raise ConversionError(f"missing inference.args in {path}")
+    for key, expected in expected_inference_args.items():
+        if inference_args.get(key) != expected:
+            raise ConversionError(
+                f"unsupported inference.args.{key}: expected {expected!r}, "
+                f"got {inference_args.get(key)!r}"
+            )
     return config
 
 
@@ -179,9 +206,9 @@ def _shape(state: dict[str, np.ndarray], name: str, expected: tuple[int, ...]) -
 
 
 def validate_state_dict(state: dict[str, np.ndarray]) -> None:
-    _shape(state, "weight_sum.weight", (1, 13))
-    _shape(state, "proj.weight", (256, 768))
-    _shape(state, "classifier.weight", (11, 256))
+    _shape(state, "weight_sum.weight", (1, 25))
+    _shape(state, "proj.weight", (256, 1024))
+    _shape(state, "classifier.weight", (16, 256))
     in_channels = 1
     for index, (out_channels, kernel) in enumerate(
         zip(WAVLM_CONV_CHANNELS, WAVLM_CONV_KERNELS, strict=True)
@@ -196,13 +223,13 @@ def validate_state_dict(state: dict[str, np.ndarray]) -> None:
         zip(WAVLM_REMAINING_HEADS, WAVLM_FFN_DIMS, strict=True)
     ):
         prefix = f"wavlm_model.encoder.transformer.layers.{index}"
-        _shape(state, f"{prefix}.layer_norm.weight", (768,))
-        _shape(state, f"{prefix}.final_layer_norm.weight", (768,))
-        _shape(state, f"{prefix}.feed_forward.intermediate_dense.weight", (ffn_dim, 768))
-        _shape(state, f"{prefix}.feed_forward.output_dense.weight", (768, ffn_dim))
+        _shape(state, f"{prefix}.layer_norm.weight", (1024,))
+        _shape(state, f"{prefix}.final_layer_norm.weight", (1024,))
+        _shape(state, f"{prefix}.feed_forward.intermediate_dense.weight", (ffn_dim, 1024))
+        _shape(state, f"{prefix}.feed_forward.output_dense.weight", (1024, ffn_dim))
         q_name = f"{prefix}.attention.q_proj.weight"
         if heads:
-            _shape(state, q_name, (len(heads) * 64, 768))
+            _shape(state, q_name, (len(heads) * 64, 1024))
         elif q_name in state:
             raise ConversionError(f"pruned attention layer {index} unexpectedly has q_proj")
     for index in range(4):
@@ -210,8 +237,8 @@ def validate_state_dict(state: dict[str, np.ndarray]) -> None:
         _shape(state, f"{prefix}.ffn1.w_1.weight", (1024, 256))
         _shape(state, f"{prefix}.mha.mha.linearQ.weight", (256, 256))
         _shape(state, f"{prefix}.conv.depthwise_conv.weight", (256, 1, 31))
-    if len(state) != 377:
-        raise ConversionError(f"expected 377 runtime tensors, found {len(state)}")
+    if len(state) != 595:
+        raise ConversionError(f"expected 595 runtime tensors, found {len(state)}")
 
 
 def is_force_f32(name: str, shape: tuple[int, ...]) -> bool:
@@ -242,7 +269,7 @@ def materialize_runtime_state(state: dict[str, np.ndarray]) -> dict[str, np.ndar
     v = result.pop(POS_CONV_V, None)
     if g is None or v is None:
         raise ConversionError("missing positional-convolution weight-norm tensors")
-    if tuple(g.shape) != (1, 1, 128) or tuple(v.shape) != (768, 48, 128):
+    if tuple(g.shape) != (1, 1, 128) or tuple(v.shape) != (1024, 64, 128):
         raise ConversionError(
             f"unexpected positional-convolution weight-norm shapes: {g.shape}, {v.shape}"
         )
@@ -256,18 +283,15 @@ def materialize_runtime_state(state: dict[str, np.ndarray]) -> dict[str, np.ndar
 
 
 def choose_tensor_type(name: str, shape: tuple[int, ...], quant: str) -> str:
-    if quant == "f32" or is_force_f32(name, shape):
+    if quant != "f16":
+        raise ConversionError(f"Large-s80-v2 supports FP16 packs only, got {quant!r}")
+    if is_force_f32(name, shape):
         return "f32"
-    if quant == "f16":
-        return "f16"
-    # Q8_0 is useful for dense projections. Keep convolutions in f16: ggml's
-    # conv kernels consume f16/f32 weights, while quantized matmul is native.
-    if name.endswith(".weight") and "conv" not in name and shape[-1] % 32 == 0:
-        return "q8_0"
     return "f16"
 
 
 def build_tensor_plan(state: dict[str, np.ndarray], quant: str) -> list[TensorPlan]:
+    quant = normalize_quant(quant)
     validate_state_dict(state)
     state = materialize_runtime_state(state)
     plan = []
@@ -298,6 +322,7 @@ def write_pack(
 ) -> None:
     import gguf
 
+    quant = normalize_quant(quant)
     writer = gguf.GGUFWriter(str(out_path), ARCH, use_temp_file=True)
     writer.add_string("openasr.package.version", "1")
     writer.add_string("openasr.model.family", "diarizen-segmentation")
@@ -316,8 +341,8 @@ def write_pack(
     writer.add_uint32("diarizen.window_step_samples", 16 * 1_600)
     writer.add_uint32("diarizen.output_frame_stride_samples", 320)
     writer.add_uint32("diarizen.local_speakers", 4)
-    writer.add_uint32("diarizen.max_simultaneous_speakers", 2)
-    writer.add_uint32("diarizen.powerset_classes", 11)
+    writer.add_uint32("diarizen.max_simultaneous_speakers", 4)
+    writer.add_uint32("diarizen.powerset_classes", 16)
     writer.add_uint32("diarizen.median_filter_frames", 11)
     writer.add_string(
         "diarizen.wavlm_config_json",
@@ -328,33 +353,36 @@ def write_pack(
                 "conv_strides": WAVLM_CONV_STRIDES,
                 "remaining_heads": WAVLM_REMAINING_HEADS,
                 "ffn_dims": WAVLM_FFN_DIMS,
-                "hidden_size": 768,
-                "total_heads": 12,
+                "hidden_size": 1024,
+                "total_heads": 16,
                 "head_dim": 64,
                 "relative_position_buckets": 320,
                 "relative_position_max_distance": 800,
+                "extractor_norm": "layer_norm",
+                "normalize_waveform": True,
+                "encoder_layer_norm_first": True,
+                "transformer_layer_norm_first": False,
             },
             separators=(",", ":"),
         ),
     )
 
     for tensor in plan:
-        if tensor.tensor_type == "q8_0":
-            data = gguf.quants.quantize(tensor.values, gguf.GGMLQuantizationType.Q8_0)
-            writer.add_tensor(
-                tensor.name, data, raw_dtype=gguf.GGMLQuantizationType.Q8_0
-            )
-        elif tensor.tensor_type == "f16":
+        if tensor.tensor_type == "f16":
             writer.add_tensor(
                 tensor.name,
                 tensor.values.astype(np.float16),
                 raw_dtype=gguf.GGMLQuantizationType.F16,
             )
-        else:
+        elif tensor.tensor_type == "f32":
             writer.add_tensor(
                 tensor.name,
                 tensor.values.astype(np.float32),
                 raw_dtype=gguf.GGMLQuantizationType.F32,
+            )
+        else:
+            raise ConversionError(
+                f"unsupported planned tensor type {tensor.tensor_type!r} for {tensor.name}"
             )
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -369,6 +397,7 @@ def convert(
     quant: str,
     model_id: str = MODEL_ID,
 ) -> int:
+    quant = normalize_quant(quant)
     load_and_validate_config(config_path)
     state = load_state_dict(checkpoint_path)
     plan = build_tensor_plan(state, quant)
@@ -388,7 +417,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument(
         "--quant",
-        choices=("f32", "f16", "fp16", "q8_0"),
+        choices=("f16", "fp16"),
         default="fp16",
         help="Pack quantization; fp16 is the catalog spelling (f16 is accepted as an alias)",
     )

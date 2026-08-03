@@ -91,7 +91,7 @@ named person".
   Voice ID contract documented here is qualified for local file transcription.
 - The default local pipeline uses FireRedVAD Stream-VAD (Apache-2.0),
   pyannote-segmentation-3.0 (MIT), and ReDimNet2-B6 (MIT), with attribution.
-  DiariZen Base-s80 weights are CC BY-NC 4.0: they are not bundled and no
+  DiariZen Large-s80-md-v2 weights are CC BY-NC 4.0: they are not bundled and no
   DiariZen artifact is currently exposed in either signed catalog. Any future
   distribution must be an explicit, license-linked non-commercial consent flow;
   staged source metadata alone never authorizes a download.

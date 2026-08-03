@@ -139,7 +139,7 @@ fn legacy_long_name_pack_is_rejected_by_the_compact_schema_runtime() {
     let pack = external_path("OPENASR_DIARIZEN_LEGACY_PACK");
     assert!(
         DiariZenSegmenter::probe_oasr(&pack).is_err(),
-        "a pre-compact-v1 pack must never enter the native runtime"
+        "a pre-compact-v2 pack must never enter the native runtime"
     );
 }
 
@@ -178,18 +178,26 @@ fn native_graph_matches_external_pytorch_golden() {
     let trace = runtime.infer_trace(&waveform).expect("native trace");
 
     for (name, actual) in &trace {
-        if *name == "weighted_layer_sum_raw" {
+        if name == "weighted_layer_sum_raw" {
             // The golden carries a trailing singleton dimension; flat order is
             // identical to the native [hidden, frame] tensor.
         }
         let expected = npy_f32(&golden, name);
         let (max_abs, mean_abs) = diff(actual, &expected);
         eprintln!("{name}: max_abs={max_abs}, mean_abs={mean_abs}");
-        let (max_limit, mean_limit) = match *name {
+        // Dense FP16 rounding accumulates across the 24-layer WavLM, most
+        // visibly in its final layer. The learned layer mixture, projection,
+        // and LayerNorm contract that drift again, so keep those downstream
+        // limits tight and require exact powerset argmax below.
+        let (max_limit, mean_limit) = match name.as_str() {
+            "wavlm_layer_23" => (3.0, 0.14),
+            name if name.starts_with("wavlm_layer_") => (0.55, 0.035),
+            "weighted_layer_sum_raw" => (1.0, 0.05),
+            "projection_raw" => (1.5, 0.18),
             "projection_norm" | "conformer_layer_00" | "conformer_layer_01"
-            | "conformer_layer_02" | "conformer_layer_03" => (0.16, 0.008),
-            "logits" => (0.05, 0.02),
-            _ => (0.06, 0.008),
+            | "conformer_layer_02" | "conformer_layer_03" => (0.08, 0.008),
+            "logits" => (0.04, 0.015),
+            _ => (0.05, 0.005),
         };
         assert!(
             max_abs <= max_limit && mean_abs <= mean_limit,
@@ -199,28 +207,29 @@ fn native_graph_matches_external_pytorch_golden() {
 
     let logits = trace
         .iter()
-        .find(|(name, _)| *name == "logits")
+        .find(|(name, _)| name == "logits")
         .map(|(_, values)| values.as_slice())
         .expect("logits trace");
-    let (classes, activity) = postprocess_logits(logits, 49);
+    let frames = super::config::output_frames(waveform.len());
+    let (classes, activity) = postprocess_logits(logits, frames);
     let expected_classes = npy_i64(&golden, "powerset_class")
         .into_iter()
         .map(|value| value as u8)
         .collect::<Vec<_>>();
     assert_eq!(classes, expected_classes, "powerset argmax parity");
 
-    let mut expected_logits = vec![-1.0e9_f32; 49 * POWERSET_CLASSES];
+    let mut expected_logits = vec![-1.0e9_f32; frames * POWERSET_CLASSES];
     for (frame, class) in expected_classes.iter().enumerate() {
         expected_logits[frame * POWERSET_CLASSES + *class as usize] = 0.0;
     }
-    let (_, expected_activity) = postprocess_logits(&expected_logits, 49);
+    let (_, expected_activity) = postprocess_logits(&expected_logits, frames);
     assert_eq!(
         activity, expected_activity,
         "median-filtered activity parity"
     );
     assert_eq!(
-        decode_segments(&activity, 49),
-        decode_segments(&expected_activity, 49),
+        decode_segments(&activity, frames),
+        decode_segments(&expected_activity, frames),
         "segment-boundary parity"
     );
 }

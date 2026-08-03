@@ -24,7 +24,7 @@ static ACTIVE_SEGMENTATION_3_0: LazyLock<
 const PACK_ENV: &str = "OPENASR_PYANNOTE_PACK";
 const INSTALLED_MODEL_ID_HINT: &str = "pyannote-segmentation-3.0";
 pub const SEGMENTER_PACK_ID: &str = "pyannote-segmentation-3.0";
-pub const DIARIZEN_PACK_ID: &str = "diarizen-base-s80";
+pub const DIARIZEN_PACK_ID: &str = super::diarizen::DIARIZEN_MODEL_ID;
 const SEGMENTER_ADMISSION_PACK_MULTIPLIER: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

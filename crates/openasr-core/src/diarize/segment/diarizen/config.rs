@@ -6,22 +6,25 @@ use super::DiariZenSegmenterError;
 
 pub const ARCHITECTURE_ID: &str = "diarizen-wavlm-conformer-segmentation";
 pub(super) const FAMILY_ID: &str = "diarizen-segmentation";
-pub(super) const MODEL_ID: &str = "diarizen-base-s80";
-pub(super) const UPSTREAM_MODEL_ID: &str = "BUT-FIT/diarizen-wavlm-base-s80-md";
-pub(super) const PINNED_REVISION: &str = "a9857fc34908197fb5336d9d0562f291834a04b2";
-pub(super) const TENSOR_SCHEMA: &str = "compact-v1";
+pub(super) const MODEL_ID: &str = "diarizen-large-s80-v2";
+pub(super) const UPSTREAM_MODEL_ID: &str = "BUT-FIT/diarizen-wavlm-large-s80-md-v2";
+pub(super) const PINNED_REVISION: &str = "f27b9ffbedcf422856d104ecee9b94be37ea578e";
+pub(super) const TENSOR_SCHEMA: &str = "compact-v2";
+pub(super) const QUANTIZATION: &str = "fp16";
 
 pub(super) const SAMPLE_RATE_HZ: u32 = 16_000;
 pub(super) const WINDOW_SAMPLES: usize = 16 * SAMPLE_RATE_HZ as usize;
 pub(super) const WINDOW_STEP_SAMPLES: usize = 16 * 1_600;
 pub(super) const FRAME_STRIDE_SAMPLES: usize = 320;
 pub(super) const LOCAL_SPEAKERS: usize = 4;
-pub(super) const MAX_SIMULTANEOUS_SPEAKERS: usize = 2;
-pub(super) const POWERSET_CLASSES: usize = 11;
+pub(super) const MAX_SIMULTANEOUS_SPEAKERS: usize = 4;
+pub(super) const POWERSET_CLASSES: usize = 16;
 pub(super) const MEDIAN_FILTER_FRAMES: usize = 11;
 
-pub(super) const HIDDEN_SIZE: usize = 768;
-pub(super) const TOTAL_HEADS: usize = 12;
+pub(super) const HIDDEN_SIZE: usize = 1024;
+pub(super) const TRANSFORMER_LAYERS: usize = 24;
+pub(super) const LAYER_REPRESENTATIONS: usize = TRANSFORMER_LAYERS + 1;
+pub(super) const TOTAL_HEADS: usize = 16;
 pub(super) const HEAD_DIM: usize = 64;
 pub(super) const CONFORMER_DIM: usize = 256;
 pub(super) const CONFORMER_HEADS: usize = 4;
@@ -31,25 +34,39 @@ pub(super) const CONFORMER_KERNEL: usize = 31;
 pub(super) const RELATIVE_POSITION_BUCKETS: usize = 320;
 pub(super) const RELATIVE_POSITION_MAX_DISTANCE: usize = 800;
 
-pub(super) const CONV_CHANNELS: [usize; 7] = [90, 161, 173, 181, 351, 155, 137];
+pub(super) const CONV_CHANNELS: [usize; 7] = [512, 153, 224, 255, 302, 368, 211];
 pub(super) const CONV_KERNELS: [usize; 7] = [10, 3, 3, 3, 3, 2, 2];
 pub(super) const CONV_STRIDES: [usize; 7] = [5, 2, 2, 2, 2, 2, 2];
-pub(super) const REMAINING_HEADS: [&[usize]; 12] = [
-    &[1, 6],
-    &[5, 7, 8],
-    &[0, 3, 9],
-    &[0, 1, 4, 8, 11],
-    &[6, 8],
-    &[0],
-    &[7, 8, 10, 11],
-    &[0, 1, 4, 8],
+pub(super) const REMAINING_HEADS: [&[usize]; TRANSFORMER_LAYERS] = [
+    &[1, 2, 4, 5, 6],
+    &[9, 10, 14],
+    &[0, 1, 2, 4, 5, 7],
+    &[1, 4, 7, 12, 13, 14],
+    &[0, 2, 3, 4, 13],
+    &[1, 7, 13, 14, 15],
+    &[11, 13, 15],
+    &[2, 3, 4, 8, 15],
+    &[2, 5, 6, 15],
+    &[],
+    &[0, 1],
+    &[1, 3, 5, 12],
+    &[],
+    &[4, 7, 11],
+    &[6, 9],
+    &[11],
     &[],
     &[],
-    &[4, 7],
-    &[5],
+    &[14],
+    &[5, 15],
+    &[0, 2, 8, 11, 13, 15],
+    &[0, 1, 3, 4, 5, 6, 7, 10, 13],
+    &[0, 1, 3, 6, 7, 9, 10, 11, 12, 14],
+    &[1, 2, 3, 4, 7, 13, 14, 15],
 ];
-pub(super) const FFN_DIMS: [usize; 12] =
-    [666, 660, 649, 1080, 237, 299, 437, 573, 53, 80, 211, 334];
+pub(super) const FFN_DIMS: [usize; TRANSFORMER_LAYERS] = [
+    1092, 925, 759, 646, 745, 615, 684, 958, 286, 294, 406, 377, 463, 542, 298, 236, 96, 104, 134,
+    211, 473, 1011, 1770, 1316,
+];
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct WavLmConfig {
@@ -63,6 +80,10 @@ struct WavLmConfig {
     head_dim: usize,
     relative_position_buckets: usize,
     relative_position_max_distance: usize,
+    extractor_norm: String,
+    normalize_waveform: bool,
+    encoder_layer_norm_first: bool,
+    transformer_layer_norm_first: bool,
 }
 
 fn require_string<'a>(
@@ -117,6 +138,7 @@ pub(super) fn validate_metadata(metadata: &GgufMetadata) -> Result<(), DiariZenS
     expect_string(metadata, "openasr.model.family", FAMILY_ID)?;
     expect_string(metadata, "openasr.model.architecture", ARCHITECTURE_ID)?;
     expect_string(metadata, "openasr.model.id", MODEL_ID)?;
+    expect_string(metadata, "openasr.quantization", QUANTIZATION)?;
     expect_string(metadata, "diarizen.upstream_model_id", UPSTREAM_MODEL_ID)?;
     expect_string(metadata, "diarizen.upstream_revision", PINNED_REVISION)?;
     expect_string(metadata, "diarizen.tensor_schema", TENSOR_SCHEMA)?;
@@ -167,6 +189,10 @@ pub(super) fn validate_metadata(metadata: &GgufMetadata) -> Result<(), DiariZenS
         head_dim: HEAD_DIM,
         relative_position_buckets: RELATIVE_POSITION_BUCKETS,
         relative_position_max_distance: RELATIVE_POSITION_MAX_DISTANCE,
+        extractor_norm: "layer_norm".to_string(),
+        normalize_waveform: true,
+        encoder_layer_norm_first: true,
+        transformer_layer_norm_first: false,
     };
     if actual != expected {
         return Err(DiariZenSegmenterError::MetadataMismatch {

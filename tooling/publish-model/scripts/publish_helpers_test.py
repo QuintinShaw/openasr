@@ -19,7 +19,7 @@ from _file_loaders import load_toml
 
 
 EXPECTED_CAPABILITY_PACKS = {
-    "diarizen-base-s80": "speaker-segmenter",
+    "diarizen-large-s80-v2": "speaker-segmenter",
     "firered-punc": "punctuation-restorer",
     "pyannote-segmentation-3.0": "speaker-segmenter",
     "qwen3-forced-aligner-0.6b": "forced-aligner",
@@ -30,7 +30,7 @@ EXPECTED_CAPABILITY_PACKS = {
 # word-timestamps feature (see registry.rs CATALOG_FEATURE_WORD_TIMESTAMPS) and
 # firered-punc serves the punctuation feature (CATALOG_FEATURE_PUNCTUATION).
 EXPECTED_CAPABILITY_FEATURES = {
-    "diarizen-base-s80": "speaker-diarization",
+    "diarizen-large-s80-v2": "speaker-diarization",
     "firered-punc": "punctuation",
     "pyannote-segmentation-3.0": "speaker-diarization",
     "qwen3-forced-aligner-0.6b": "word-timestamps",

@@ -20,7 +20,7 @@ class PublishModelTargetsTest(unittest.TestCase):
             "redimnet2-b6-cn", ["fp16", "q8_0", "f32"], ["fp16", "q8_0", "f32"]
         )
         publish.validate_scope("pyannote-segmentation-3.0", ["f32"], ["f32"])
-        publish.validate_scope("diarizen-base-s80", ["fp16"], ["fp16"])
+        publish.validate_scope("diarizen-large-s80-v2", ["fp16"], ["fp16"])
 
         # Published support packs (moonshine, diarization, ...) are in the lane;
         # a model the lane does not list is rejected before any quant check.
@@ -218,21 +218,21 @@ class PublishModelTargetsTest(unittest.TestCase):
             pack = Path(temp) / "diarizen.oasr"
             pack.write_bytes(
                 b"general.architecture\0diarizen-wavlm-conformer-segmentation\0"
-                b"openasr.source.name\0BUT-FIT/diarizen-wavlm-base-s80-md\0"
-                b"openasr.source.revision\0a9857fc34908197fb5336d9d0562f291834a04b2\0"
+                b"openasr.source.name\0BUT-FIT/diarizen-wavlm-large-s80-md-v2\0"
+                b"openasr.source.revision\0f27b9ffbedcf422856d104ecee9b94be37ea578e\0"
                 b"openasr.license.name\0CC BY-NC 4.0\0"
             )
 
             with self.assertRaisesRegex(SystemExit, "openasr.license.source"):
-                publish.validate_pack_runtime_metadata("diarizen-base-s80", pack)
+                publish.validate_pack_runtime_metadata("diarizen-large-s80-v2", pack)
 
             pack.write_bytes(
                 pack.read_bytes()
                 + b"openasr.license.source\0"
-                + b"https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/"
-                + b"a9857fc34908197fb5336d9d0562f291834a04b2/README.md\0"
+                + b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/"
+                + b"f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md\0"
             )
-            publish.validate_pack_runtime_metadata("diarizen-base-s80", pack)
+            publish.validate_pack_runtime_metadata("diarizen-large-s80-v2", pack)
 
 
 if __name__ == "__main__":

@@ -35,13 +35,13 @@ REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE = b"redimnet2"
 DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE = b"diarizen-wavlm-conformer-segmentation"
 DIARIZEN_REQUIRED_HEADER_MARKERS = (
     b"openasr.source.name",
-    b"BUT-FIT/diarizen-wavlm-base-s80-md",
+    b"BUT-FIT/diarizen-wavlm-large-s80-md-v2",
     b"openasr.source.revision",
-    b"a9857fc34908197fb5336d9d0562f291834a04b2",
+    b"f27b9ffbedcf422856d104ecee9b94be37ea578e",
     b"openasr.license.name",
     b"CC BY-NC 4.0",
     b"openasr.license.source",
-    b"https://huggingface.co/BUT-FIT/diarizen-wavlm-base-s80-md/blob/a9857fc34908197fb5336d9d0562f291834a04b2/README.md",
+    b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md",
 )
 HYMT2_REQUIRED_HEADER_MARKERS = (
     b"openasr.model.kind",
@@ -78,7 +78,7 @@ RELEASE_LANE_MODELS = (
     "whisper-medium.en",
     "redimnet2-b6-cn",
     "pyannote-segmentation-3.0",
-    "diarizen-base-s80",
+    "diarizen-large-s80-v2",
     "hymt2-1.8b",
     "dolphin-cn-dialect-base",
     "dolphin-small",
@@ -129,7 +129,7 @@ def expected_general_architecture(model: str) -> bytes | None:
         return FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE
     if model == "redimnet2-b6-cn":
         return REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "diarizen-base-s80":
+    if model == "diarizen-large-s80-v2":
         return DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE
     return None
 
@@ -156,7 +156,7 @@ def validate_pack_runtime_metadata(model: str, pack: Path) -> None:
                 raise SystemExit(
                     f"pack missing Hy-MT2 required metadata marker {marker.decode(errors='replace')}: {pack}"
                 )
-    if model == "diarizen-base-s80":
+    if model == "diarizen-large-s80-v2":
         for marker in DIARIZEN_REQUIRED_HEADER_MARKERS:
             if marker not in header:
                 raise SystemExit(

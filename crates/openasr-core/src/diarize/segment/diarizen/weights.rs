@@ -5,11 +5,11 @@ use crate::ggml_runtime::{GgufTensorDataReader, GgufTensorIndex};
 use super::DiariZenSegmenterError;
 use super::config::{
     CONFORMER_DIM, CONFORMER_FFN_DIM, CONFORMER_KERNEL, CONFORMER_LAYERS, CONV_CHANNELS,
-    CONV_KERNELS, FFN_DIMS, HEAD_DIM, HIDDEN_SIZE, LOCAL_SPEAKERS, POWERSET_CLASSES,
-    RELATIVE_POSITION_BUCKETS, REMAINING_HEADS, TOTAL_HEADS,
+    CONV_KERNELS, FFN_DIMS, HEAD_DIM, HIDDEN_SIZE, LAYER_REPRESENTATIONS, LOCAL_SPEAKERS,
+    POWERSET_CLASSES, RELATIVE_POSITION_BUCKETS, REMAINING_HEADS, TOTAL_HEADS,
 };
 
-pub(super) const EXPECTED_TENSOR_COUNT: usize = 376;
+pub(super) const EXPECTED_TENSOR_COUNT: usize = 594;
 const GGUF_MAX_TENSOR_NAME_BYTES: usize = 63;
 
 pub(super) fn runtime_tensor_name(upstream_name: &str) -> String {
@@ -52,7 +52,7 @@ fn expected_tensors() -> BTreeMap<String, Vec<u64>> {
     insert(&mut tensors, "lnorm.weight", &[CONFORMER_DIM]);
     insert(&mut tensors, "proj.bias", &[CONFORMER_DIM]);
     insert(&mut tensors, "proj.weight", &[HIDDEN_SIZE, CONFORMER_DIM]);
-    insert(&mut tensors, "weight_sum.weight", &[13]);
+    insert(&mut tensors, "weight_sum.weight", &[LAYER_REPRESENTATIONS]);
 
     let mut in_channels = 1;
     for (index, (&out_channels, &kernel)) in
@@ -63,14 +63,12 @@ fn expected_tensors() -> BTreeMap<String, Vec<u64>> {
             format!("wavlm_model.feature_extractor.conv_layers.{index}.conv.weight"),
             &[kernel, in_channels, out_channels],
         );
-        if index == 0 {
-            for suffix in ["bias", "weight"] {
-                insert(
-                    &mut tensors,
-                    format!("wavlm_model.feature_extractor.conv_layers.0.layer_norm.{suffix}"),
-                    &[out_channels],
-                );
-            }
+        for suffix in ["bias", "weight"] {
+            insert(
+                &mut tensors,
+                format!("wavlm_model.feature_extractor.conv_layers.{index}.layer_norm.{suffix}"),
+                &[out_channels],
+            );
         }
         in_channels = out_channels;
     }
@@ -339,7 +337,7 @@ pub(super) fn validate_tensor_contract(
                 actual: tensor.dims.clone(),
             });
         }
-        if !matches!(tensor.type_name.as_str(), "f32" | "f16" | "q8_0") {
+        if !matches!(tensor.type_name.as_str(), "f32" | "f16") {
             return Err(DiariZenSegmenterError::UnsupportedTensorType {
                 name: tensor.name.clone(),
                 tensor_type: tensor.type_name.clone(),

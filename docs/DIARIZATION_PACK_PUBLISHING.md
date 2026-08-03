@@ -32,7 +32,7 @@ file-pipeline design.
 | --- | --- | --- | --- |
 | `redimnet2-b6-cn` | Sole speaker embedder and identity space | fp16 | MIT, published |
 | `pyannote-segmentation-3.0` | Default external local-activity segmenter | f32 | MIT, published |
-| `diarizen-base-s80` | Optional external local-activity segmenter | fp16 only; q8 deferred | CC BY-NC 4.0, source-only staged, not published or pullable |
+| `diarizen-large-s80-v2` | Optional external local-activity segmenter | fp16 | CC BY-NC 4.0, source-only staged, not published or pullable |
 
 FireRed Stream-VAD is a vendored Apache-2.0 runtime asset rather than a separate
 user-installed capability pack.
@@ -55,9 +55,15 @@ duration-weighted DER, a 0.25 s collar, and overlap scoring:
 
 | Path | DER | Scope |
 | --- | ---: | --- |
-| FireRed + DiariZen + ReDimNet2-B6 research adapter | 9.0481% | Research reference pipeline; not a native release claim |
+| FireRed + DiariZen Large-s80-md-v2 + ReDimNet2-B6 research adapter | 8.13% | Locked six-file research comparison; not a native or fp16 release claim |
+| FireRed + DiariZen Base-s80 + ReDimNet2-B6 research adapter | 9.0481% | Historical Base-s80 F32 reference configuration; not a current product model or native release claim |
 | FireRed + segmentation-3.0 + ReDimNet2-B6 research adapter | 12.4466% | Research reference pipeline; not a native release claim |
 | MOSS in-decoder diarization | 18.6787% | Native ASR speaker source baseline |
+
+The Large-s80-md-v2 comparison recorded 3.87% miss, 1.16% false alarm, and
+3.11% speaker error within its 8.13% DER. The protocol is duration-weighted
+across six 10-minute excerpts; it is neither an fp16-pack parity result nor a
+native production-runtime result.
 
 These results qualify the architecture on that fixed Mandarin meeting slice;
 they are not a cross-language or cross-domain accuracy guarantee. Neither
@@ -106,7 +112,7 @@ Runtime override for a local development pack:
 export OPENASR_PYANNOTE_PACK=/path/to/pyannote-segmentation-3.0-f32.oasr
 ```
 
-### DiariZen Base-s80 qualification only
+### DiariZen Large-s80-md-v2 qualification only
 
 The converter is available for local qualification, but the output is not a
 published artifact:
@@ -115,8 +121,8 @@ published artifact:
 python3 tooling/diarizen/convert_diarizen.py \
     --checkpoint /path/to/pytorch_model.bin \
     --config /path/to/config.toml \
-    --out /path/to/diarizen-base-s80-fp16.oasr \
-    --model-id diarizen-base-s80 \
+    --out /path/to/diarizen-large-s80-v2-fp16.oasr \
+    --model-id diarizen-large-s80-v2 \
     --quant fp16
 ```
 
@@ -124,7 +130,7 @@ Do not run public regeneration for this source while `release_public = false`.
 The local override is for controlled qualification, not a distribution promise:
 
 ```bash
-export OPENASR_DIARIZEN_PACK=/path/to/diarizen-base-s80-fp16.oasr
+export OPENASR_DIARIZEN_PACK=/path/to/diarizen-large-s80-v2-fp16.oasr
 ```
 
 ## Catalog signing
@@ -149,7 +155,7 @@ openasr pull redimnet2-b6-cn
 openasr pull pyannote-segmentation-3.0
 ```
 
-`openasr pull diarizen-base-s80` is intentionally unavailable until a separate
+`openasr pull diarizen-large-s80-v2` is intentionally unavailable until a separate
 publication approval creates a real signed entry. Installed packs are resolved
 through the content-addressed model store or the development overrides above;
 runtime selection never authorizes a download.

@@ -378,13 +378,13 @@ mod tests {
 
     fn resolved_pull(license_class: LicenseClass) -> ResolvedCatalogPull {
         ResolvedCatalogPull {
-            requested: "diarizen-base-s80".to_string(),
-            model_id: "diarizen-base-s80".to_string(),
-            display_name: "DiariZen Base-s80".to_string(),
+            requested: "diarizen-large-s80-v2".to_string(),
+            model_id: "diarizen-large-s80-v2".to_string(),
+            display_name: "DiariZen Large-s80-md-v2".to_string(),
             quant: "fp16".to_string(),
             suffix: "fp16".to_string(),
-            pull: "diarizen-base-s80:fp16".to_string(),
-            filename: "diarizen-base-s80-fp16.oasr".to_string(),
+            pull: "diarizen-large-s80-v2:fp16".to_string(),
+            filename: "diarizen-large-s80-v2-fp16.oasr".to_string(),
             url: "https://example.invalid/diarizen.oasr".to_string(),
             mirrors: Vec::new(),
             hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump deterministic DiariZen Base-s80 stage goldens for the native port.
+"""Dump deterministic DiariZen Large-s80-v2 stage goldens for the native port.
 
 This tool intentionally depends on the pinned upstream DiariZen source and a
 research Python environment.  Runtime code does not.  Goldens are generated
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 import tomllib
 from functools import lru_cache
@@ -56,8 +57,8 @@ def build_model(diarizen_source: Path, config_path: Path) -> nn.Module:
         def __init__(self) -> None:
             super().__init__()
             self.wavlm_model = wav2vec2_model(**get_wavlm_config(args["wavlm_src"]))
-            self.weight_sum = nn.Linear(args.get("wavlm_layer_num", 13), 1, bias=False)
-            self.proj = nn.Linear(args.get("wavlm_feat_dim", 768), args.get("attention_in", 256))
+            self.weight_sum = nn.Linear(args["wavlm_layer_num"], 1, bias=False)
+            self.proj = nn.Linear(args["wavlm_feat_dim"], args.get("attention_in", 256))
             self.lnorm = nn.LayerNorm(args.get("attention_in", 256))
             self.conformer = ConformerEncoder(
                 attention_in=args.get("attention_in", 256),
@@ -69,7 +70,11 @@ def build_model(diarizen_source: Path, config_path: Path) -> nn.Module:
                 use_posi=args.get("use_posi", False),
                 output_activate_function=args.get("output_activate_function", False),
             )
-            self.classifier = nn.Linear(args.get("attention_in", 256), 11)
+            powerset_classes = sum(
+                math.comb(args["max_speakers_per_chunk"], active)
+                for active in range(args["max_speakers_per_frame"] + 1)
+            )
+            self.classifier = nn.Linear(args.get("attention_in", 256), powerset_classes)
 
         def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
             representations, _ = self.wavlm_model.extract_features(waveforms[:, 0, :])
@@ -117,6 +122,12 @@ def main() -> int:
 
         return hook
 
+    def capture_input(name: str):
+        def hook(_module, inputs) -> None:
+            captured[name] = inputs[0].detach().cpu().to(torch.float32).numpy()
+
+        return hook
+
     handles = [
         model.wavlm_model.feature_extractor.register_forward_hook(capture("wavlm_feature_extractor")),
         model.wavlm_model.encoder.feature_projection.register_forward_hook(capture("wavlm_feature_projection")),
@@ -127,6 +138,10 @@ def main() -> int:
         model.classifier.register_forward_hook(capture("logits")),
     ]
     for index, layer in enumerate(model.wavlm_model.encoder.transformer.layers):
+        if index == 0:
+            handles.append(
+                layer.register_forward_pre_hook(capture_input("wavlm_transformer_preprocessed"))
+            )
         handles.append(layer.register_forward_hook(capture(f"wavlm_layer_{index:02d}")))
     for index, layer in enumerate(model.conformer.conformer_layer):
         handles.append(layer.register_forward_hook(capture(f"conformer_layer_{index:02d}")))
@@ -141,7 +156,7 @@ def main() -> int:
     captured["waveform"] = waveform.numpy()
     captured["powerset_class"] = powerset_class.cpu().numpy().astype(np.int64)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(args.out_dir / "diarizen_base_s80_golden.npz", **captured)
+    np.savez(args.out_dir / "diarizen_large_s80_v2_golden.npz", **captured)
     metadata = {
         "checkpoint_sha256": sha256(args.checkpoint),
         "config_sha256": sha256(args.config),
@@ -156,7 +171,7 @@ def main() -> int:
     (args.out_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(args.out_dir / "diarizen_base_s80_golden.npz")
+    print(args.out_dir / "diarizen_large_s80_v2_golden.npz")
     return 0
 
 

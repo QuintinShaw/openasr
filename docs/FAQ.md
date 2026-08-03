@@ -115,11 +115,11 @@ external segmentation/clustering step, not the acoustic identity step. Missing
 or broken required packs fail closed instead of fabricating speakers or silently
 falling back to a different embedding space.
 
-segmentation-3.0 is the permissive default external segmenter. DiariZen Base-s80
-is a higher-accuracy optional provider whose checkpoint is CC BY-NC 4.0; it is
-staged for an explicit non-commercial consent flow but is not currently present
-in the downloadable catalog. The candidate pack is fp16-only and q8 remains
-deferred. Do not interpret the staged source metadata as an available
+segmentation-3.0 is the permissive default external segmenter. DiariZen
+Large-s80-md-v2 is a higher-accuracy optional provider whose checkpoint is CC
+BY-NC 4.0; it is staged for an explicit non-commercial consent flow but is not
+currently present in the downloadable catalog. The candidate pack is fp16-only.
+Do not interpret the staged source metadata as an available
 `openasr pull` target.
 
 The operator-only `/v1/voice-id/*` API

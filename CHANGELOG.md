@@ -14,10 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   recording-local labels, evidence gates, enrolled-person matching, and
   transcript attribution instead of each ASR family growing its own Voice ID
   integration.
-- Diarization: a native DiariZen Base-s80 segmenter runtime and staged pack
+- Diarization: a native DiariZen Large-s80-md-v2 segmenter runtime and staged pack
   contract are available for qualification. Its checkpoint is CC BY-NC 4.0,
   the staged source is not in either downloadable catalog, and only an fp16
-  candidate is supported; q8 remains deferred. segmentation-3.0 stays the
+  candidate is supported. segmentation-3.0 stays the
   permissive default unless a future product release explicitly offers and the
   user consents to the optional DiariZen download.
 - Catalog: Fun-ASR-Nano (`funasr-nano`) and Granite Speech 4.1 2B (`granite-speech-4.1-2b`) are public in the signed catalog; both ship fp16 / q8_0 / q4_k packs on Hugging Face under the OpenASR namespace, with min_cli/core floor 0.1.27.

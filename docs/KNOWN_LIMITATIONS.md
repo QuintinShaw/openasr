@@ -36,17 +36,19 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   clears Voice ID's evidence gates. See [FAQ.md](FAQ.md#is-diarization-available)
   and [SECURITY.md](../SECURITY.md).
 - segmentation-3.0 is the default, MIT-licensed external segmenter. DiariZen
-  Base-s80 is staged as an optional CC BY-NC 4.0 provider, but no DiariZen pack
-  is present in the signed full/public catalogs and it is not currently an
-  `openasr pull` target. The qualified candidate is fp16-only; q8 is deferred.
-  Its 9.0481% DER result is from the locked research adapter, not yet a native
-  product-quality claim. Under the same six-file, duration-weighted protocol
-  (0.25 s collar, overlap scored), the FireRed + segmentation-3.0 research
-  adapter measured 12.4466% DER and MOSS measured 18.6787%. The native external
-  frontend now follows the same union/windowing/automatic-clustering/overlap
-  stage shape, but those locked numbers have not been reproduced through its
-  full six-file runtime path. They are therefore architecture targets, not
-  shipped product DER or a cross-domain accuracy guarantee.
+  Large-s80-md-v2 is staged as an optional CC BY-NC 4.0 provider, but no
+  DiariZen pack is present in the signed full/public catalogs and it is not
+  currently an `openasr pull` target. The qualified candidate is fp16-only. Its
+  locked research-adapter result is 8.13% DER (3.87% miss, 1.16% false alarm,
+  3.11% speaker error), not yet a native or fp16 product-quality claim. Under
+  the same six-file, duration-weighted protocol (0.25 s collar, overlap scored),
+  the historical Base-s80 F32 reference measured 9.0481% DER, the FireRed +
+  segmentation-3.0 research adapter measured 12.4466% DER, and MOSS measured
+  18.6787%. The native external frontend now
+  follows the same union/windowing/automatic-clustering/overlap stage shape, but
+  those locked numbers have not been reproduced through its full six-file runtime
+  path. They are therefore architecture targets, not shipped product DER or a
+  cross-domain accuracy guarantee.
 - Phrase bias / hotword boosting is implemented for the native runtime decode
   path. Requests still fail closed when the selected model tokenizer cannot
   encode a requested phrase, and the mock backend still rejects non-empty

@@ -19,8 +19,9 @@ use crate::nn::wav2vec2::{GroupedConv1dParams, grouped_conv_1d};
 
 use super::config::{
     CONFORMER_DIM, CONFORMER_HEADS, CONFORMER_KERNEL, CONFORMER_LAYERS, CONV_CHANNELS,
-    CONV_KERNELS, CONV_STRIDES, HEAD_DIM, HIDDEN_SIZE, POWERSET_CLASSES, RELATIVE_POSITION_BUCKETS,
-    RELATIVE_POSITION_MAX_DISTANCE, REMAINING_HEADS, TOTAL_HEADS, output_frames,
+    CONV_KERNELS, CONV_STRIDES, HEAD_DIM, HIDDEN_SIZE, LAYER_REPRESENTATIONS, POWERSET_CLASSES,
+    RELATIVE_POSITION_BUCKETS, RELATIVE_POSITION_MAX_DISTANCE, REMAINING_HEADS, TOTAL_HEADS,
+    TRANSFORMER_LAYERS, output_frames,
 };
 use super::weights::{read_tensor_f32, runtime_tensor_name, validate_tensor_contract};
 use super::{DiariZenSegmenterError, DiariZenWindowOutput, postprocess_logits};
@@ -30,20 +31,6 @@ const STATIC_GRAPH_SIZE: usize = 1 << 10;
 const LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const BATCH_NORM_EPSILON: f32 = 1.0e-5;
 
-const WAVLM_TRACE_NAMES: [&str; 12] = [
-    "wavlm_layer_00",
-    "wavlm_layer_01",
-    "wavlm_layer_02",
-    "wavlm_layer_03",
-    "wavlm_layer_04",
-    "wavlm_layer_05",
-    "wavlm_layer_06",
-    "wavlm_layer_07",
-    "wavlm_layer_08",
-    "wavlm_layer_09",
-    "wavlm_layer_10",
-    "wavlm_layer_11",
-];
 const CONFORMER_TRACE_NAMES: [&str; 4] = [
     "conformer_layer_00",
     "conformer_layer_01",
@@ -68,10 +55,10 @@ struct StaticHandles {
     batch_norm: [BatchNormAffine; CONFORMER_LAYERS],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct TraceTensor {
-    name: &'static str,
+    name: String,
     tensor: GgmlCpuTensor<'static>,
     len: usize,
 }
@@ -164,10 +151,10 @@ impl DiariZenRuntime {
         upload_static_handles(&reader, &mut static_arena, static_handles, frames)?;
 
         let layer_sum = read_weight_f32(&reader, "weight_sum.weight")?;
-        if layer_sum.len() != 13 {
+        if layer_sum.len() != LAYER_REPRESENTATIONS {
             return Err(DiariZenSegmenterError::TensorShapeMismatch {
                 name: "weight_sum.weight".to_string(),
-                expected: vec![13],
+                expected: vec![LAYER_REPRESENTATIONS as u64],
                 actual: vec![layer_sum.len() as u64],
             });
         }
@@ -273,7 +260,7 @@ impl DiariZenRuntime {
     pub(super) fn infer_trace(
         &mut self,
         samples: &[f32],
-    ) -> Result<Vec<(&'static str, Vec<f32>)>, DiariZenSegmenterError> {
+    ) -> Result<Vec<(String, Vec<f32>)>, DiariZenSegmenterError> {
         if samples.len() != self.samples {
             return Err(DiariZenSegmenterError::WindowSize {
                 expected: self.samples,
@@ -302,9 +289,12 @@ impl DiariZenRuntime {
             .traces
             .iter()
             .zip(values.iter())
-            .map(|(tap, values)| (tap.name, values.clone()))
+            .map(|(tap, values)| (tap.name.clone(), values.clone()))
             .collect::<Vec<_>>();
-        named.push(("logits", values.last().cloned().unwrap_or_default()));
+        named.push((
+            "logits".to_string(),
+            values.last().cloned().unwrap_or_default(),
+        ));
         Ok(named)
     }
 }
@@ -480,7 +470,9 @@ fn build_graph(
         .map_err(graph_error("allocate_pcm"))?;
     let mut traces = Vec::new();
 
-    let mut state = pcm;
+    let mut state = graph
+        .norm(pcm, LAYER_NORM_EPSILON)
+        .map_err(graph_error("wavlm_waveform_norm"))?;
     let mut current_frames = samples;
     for layer in 0..CONV_CHANNELS.len() {
         let kernel = weight(
@@ -491,22 +483,18 @@ fn build_graph(
             .conv_1d(kernel, state, CONV_STRIDES[layer], 0, 1)
             .map_err(graph_error("wavlm_feature_conv"))?;
         current_frames = (current_frames - CONV_KERNELS[layer]) / CONV_STRIDES[layer] + 1;
-        if layer == 0 {
-            state = feature_group_norm(
-                graph,
-                state,
-                current_frames,
-                CONV_CHANNELS[layer],
-                weight(
-                    weights,
-                    "wavlm_model.feature_extractor.conv_layers.0.layer_norm.weight",
-                )?,
-                weight(
-                    weights,
-                    "wavlm_model.feature_extractor.conv_layers.0.layer_norm.bias",
-                )?,
-            )?;
-        }
+        state = feature_layer_norm(
+            graph,
+            state,
+            weight(
+                weights,
+                &format!("wavlm_model.feature_extractor.conv_layers.{layer}.layer_norm.weight"),
+            )?,
+            weight(
+                weights,
+                &format!("wavlm_model.feature_extractor.conv_layers.{layer}.layer_norm.bias"),
+            )?,
+        )?;
         state = graph
             .gelu_erf(state)
             .map_err(graph_error("wavlm_feature_gelu"))?;
@@ -524,7 +512,7 @@ fn build_graph(
         .map_err(graph_error("wavlm_feature_mask"))?;
     if trace {
         traces.push(TraceTensor {
-            name: "wavlm_feature_extractor",
+            name: "wavlm_feature_extractor".to_string(),
             tensor: state,
             len: frames * CONV_CHANNELS[6],
         });
@@ -558,7 +546,7 @@ fn build_graph(
     )?;
     if trace {
         traces.push(TraceTensor {
-            name: "wavlm_feature_projection",
+            name: "wavlm_feature_projection".to_string(),
             tensor: state,
             len: frames * HIDDEN_SIZE,
         });
@@ -568,7 +556,7 @@ fn build_graph(
         positional_convolution(graph, weights, state, frames, positional_conv_element_width)?;
     if trace {
         traces.push(TraceTensor {
-            name: "wavlm_positional_conv",
+            name: "wavlm_positional_conv".to_string(),
             tensor: positional,
             len: frames * HIDDEN_SIZE,
         });
@@ -576,23 +564,27 @@ fn build_graph(
     state = graph
         .add(state, positional)
         .map_err(graph_error("wavlm_positional_add"))?;
-    state = affine_layer_norm(
-        graph,
-        state,
-        weight(weights, "wavlm_model.encoder.transformer.layer_norm.weight")?,
-        weight(weights, "wavlm_model.encoder.transformer.layer_norm.bias")?,
-        "wavlm_transformer_pre_norm",
-    )?;
+    // DiariZen constructs the outer Transformer with
+    // `layer_norm_first = !encoder_layer_norm_first`. This checkpoint uses
+    // pre-norm encoder layers, so extract_features returns this positional sum
+    // directly and never applies the outer transformer's final LayerNorm.
+    if trace {
+        traces.push(TraceTensor {
+            name: "wavlm_transformer_preprocessed".to_string(),
+            tensor: state,
+            len: frames * HIDDEN_SIZE,
+        });
+    }
     let mut mixed = graph
         .cont(state)
         .and_then(|value| graph.scale(value, layer_sum[0]))
         .map_err(graph_error("wavlm_layer_sum_0"))?;
 
-    for layer in 0..12 {
+    for layer in 0..TRANSFORMER_LAYERS {
         state = wavlm_layer(graph, weights, arena, static_handles, state, frames, layer)?;
         if trace {
             traces.push(TraceTensor {
-                name: WAVLM_TRACE_NAMES[layer],
+                name: format!("wavlm_layer_{layer:02}"),
                 tensor: state,
                 len: frames * HIDDEN_SIZE,
             });
@@ -607,7 +599,7 @@ fn build_graph(
     }
     if trace {
         traces.push(TraceTensor {
-            name: "weighted_layer_sum_raw",
+            name: "weighted_layer_sum_raw".to_string(),
             tensor: mixed,
             len: frames * HIDDEN_SIZE,
         });
@@ -622,7 +614,7 @@ fn build_graph(
     )?;
     if trace {
         traces.push(TraceTensor {
-            name: "projection_raw",
+            name: "projection_raw".to_string(),
             tensor: projection_raw,
             len: frames * CONFORMER_DIM,
         });
@@ -636,7 +628,7 @@ fn build_graph(
     )?;
     if trace {
         traces.push(TraceTensor {
-            name: "projection_norm",
+            name: "projection_norm".to_string(),
             tensor: state,
             len: frames * CONFORMER_DIM,
         });
@@ -654,7 +646,7 @@ fn build_graph(
         )?;
         if trace {
             traces.push(TraceTensor {
-                name: trace_name,
+                name: trace_name.to_string(),
                 tensor: state,
                 len: frames * CONFORMER_DIM,
             });
@@ -724,31 +716,25 @@ fn affine_layer_norm<'a>(
     )
 }
 
-fn feature_group_norm<'a>(
+fn feature_layer_norm<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
-    frames: usize,
-    channels: usize,
     weight: GgmlCpuTensor<'a>,
     bias: GgmlCpuTensor<'a>,
 ) -> Result<GgmlCpuTensor<'a>, DiariZenSegmenterError> {
-    let normalized = graph
-        .reshape_4d(input, frames, 1, channels, 1)
-        .and_then(|value| graph.group_norm(value, channels, LAYER_NORM_EPSILON))
-        .and_then(|value| graph.reshape_2d(value, frames, channels))
-        .map_err(graph_error("feature_group_norm"))?;
     let feature_major = graph
-        .transpose(normalized)
+        .transpose(input)
         .and_then(|value| graph.cont(value))
-        .map_err(graph_error("feature_group_norm_transpose"))?;
+        .map_err(graph_error("feature_layer_norm_transpose"))?;
     let normalized = graph
-        .mul(feature_major, weight)
+        .norm(feature_major, LAYER_NORM_EPSILON)
+        .and_then(|value| graph.mul(value, weight))
         .and_then(|value| graph.add(value, bias))
-        .map_err(graph_error("feature_group_norm_affine"))?;
+        .map_err(graph_error("feature_layer_norm_affine"))?;
     let time_major = graph
         .transpose(normalized)
         .and_then(|value| graph.cont(value))
-        .map_err(graph_error("feature_group_norm_restore"))?;
+        .map_err(graph_error("feature_layer_norm_restore"))?;
     Ok(time_major)
 }
 
@@ -839,23 +825,37 @@ fn wavlm_layer<'a>(
     let prefix = format!("wavlm_model.encoder.transformer.layers.{layer}");
     if !REMAINING_HEADS[layer].is_empty() {
         let residual = state;
-        let attention =
-            wavlm_attention(graph, weights, arena, static_handles, state, frames, layer)?;
+        let normalized = affine_layer_norm(
+            graph,
+            state,
+            weight(weights, &format!("{prefix}.layer_norm.weight"))?,
+            weight(weights, &format!("{prefix}.layer_norm.bias"))?,
+            "wavlm_attention_pre_norm",
+        )?;
+        let attention = wavlm_attention(
+            graph,
+            weights,
+            arena,
+            static_handles,
+            normalized,
+            frames,
+            layer,
+        )?;
         state = graph
             .add(attention, residual)
             .map_err(graph_error("wavlm_attention_residual"))?;
     }
-    state = affine_layer_norm(
+    let residual = state;
+    let normalized = affine_layer_norm(
         graph,
         state,
-        weight(weights, &format!("{prefix}.layer_norm.weight"))?,
-        weight(weights, &format!("{prefix}.layer_norm.bias"))?,
-        "wavlm_layer_norm",
+        weight(weights, &format!("{prefix}.final_layer_norm.weight"))?,
+        weight(weights, &format!("{prefix}.final_layer_norm.bias"))?,
+        "wavlm_ffn_pre_norm",
     )?;
-    let residual = state;
     let up = linear(
         graph,
-        state,
+        normalized,
         weight(
             weights,
             &format!("{prefix}.feed_forward.intermediate_dense.weight"),
@@ -877,16 +877,9 @@ fn wavlm_layer<'a>(
         weight(weights, &format!("{prefix}.feed_forward.output_dense.bias"))?,
         "wavlm_ffn_down",
     )?;
-    state = graph
+    graph
         .add(residual, down)
-        .map_err(graph_error("wavlm_ffn_residual"))?;
-    affine_layer_norm(
-        graph,
-        state,
-        weight(weights, &format!("{prefix}.final_layer_norm.weight"))?,
-        weight(weights, &format!("{prefix}.final_layer_norm.bias"))?,
-        "wavlm_final_layer_norm",
-    )
+        .map_err(graph_error("wavlm_ffn_residual"))
 }
 
 #[allow(clippy::too_many_arguments)]

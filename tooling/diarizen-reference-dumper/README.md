@@ -1,4 +1,4 @@
-# DiariZen Base-s80 reference dumper
+# DiariZen Large-s80-v2 reference dumper
 
 This development-only tool emits stage-by-stage PyTorch goldens for the native
 OpenASR segmenter. It uses a deterministic synthetic waveform and never needs
@@ -13,5 +13,5 @@ python dump_golden.py \
   --out-dir /path/to/tmp/diarizen-golden
 ```
 
-The native parity test consumes `diarizen_base_s80_golden.npz` through a local
+The native parity test consumes `diarizen_large_s80_v2_golden.npz` through a local
 environment variable and remains ignored in ordinary CI.

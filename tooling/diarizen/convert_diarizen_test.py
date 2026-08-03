@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,29 +13,25 @@ import convert_diarizen as C
 class TensorTypeTest(unittest.TestCase):
     def test_sensitive_and_affine_tensors_stay_f32(self):
         cases = [
-            ("weight_sum.weight", (1, 13)),
-            ("x.layer_norm.weight", (768,)),
-            ("x.rel_attn_embed.weight", (320, 12)),
+            ("weight_sum.weight", (1, 25)),
+            ("x.layer_norm.weight", (1024,)),
+            ("x.rel_attn_embed.weight", (320, 16)),
             ("x.gru_rel_pos_linear.weight", (8, 64)),
-            ("x.bias", (768,)),
+            ("x.bias", (1024,)),
         ]
         for name, shape in cases:
             with self.subTest(name=name):
-                self.assertEqual(C.choose_tensor_type(name, shape, "q8_0"), "f32")
+                self.assertEqual(C.choose_tensor_type(name, shape, "f16"), "f32")
 
     def test_dense_projections_take_requested_quant(self):
-        self.assertEqual(C.choose_tensor_type("proj.weight", (256, 768), "f16"), "f16")
-        self.assertEqual(C.choose_tensor_type("proj.weight", (256, 768), "q8_0"), "q8_0")
-        self.assertEqual(
-            C.choose_tensor_type("odd.weight", (256, 137), "q8_0"), "f16"
-        )
-        self.assertEqual(
-            C.choose_tensor_type("conv.weight", (256, 256, 1), "q8_0"), "f16"
-        )
+        self.assertEqual(C.choose_tensor_type("proj.weight", (256, 1024), "f16"), "f16")
+        self.assertEqual(C.choose_tensor_type("odd.weight", (256, 137), "f16"), "f16")
+        self.assertEqual(C.choose_tensor_type("conv.weight", (256, 256, 1), "f16"), "f16")
 
     def test_catalog_fp16_spelling_is_accepted(self):
         self.assertEqual(C.normalize_quant("fp16"), "f16")
-        self.assertEqual(C.normalize_quant("q8_0"), "q8_0")
+        with self.assertRaisesRegex(C.ConversionError, "FP16 packs only"):
+            C.normalize_quant("q8_0")
 
 
 class RuntimeTensorNameTest(unittest.TestCase):
@@ -67,7 +64,7 @@ class PositionalConvFoldTest(unittest.TestCase):
     def test_fold_matches_weight_norm_dim_two(self):
         rng = np.random.default_rng(0)
         g = rng.standard_normal((1, 1, 128)).astype(np.float32)
-        v = rng.standard_normal((768, 48, 128)).astype(np.float32)
+        v = rng.standard_normal((1024, 64, 128)).astype(np.float32)
         state = {C.POS_CONV_G: g, C.POS_CONV_V: v}
         result = C.materialize_runtime_state(state)
         self.assertNotIn(C.POS_CONV_G, result)
@@ -83,17 +80,17 @@ class PackRoundTripTest(unittest.TestCase):
 
         rng = np.random.default_rng(1)
         plan = [
-            C.TensorPlan("proj.weight", rng.standard_normal((32, 64)).astype(np.float32), "q8_0"),
+            C.TensorPlan("proj.weight", rng.standard_normal((32, 64)).astype(np.float32), "f16"),
             C.TensorPlan("proj.bias", rng.standard_normal((32,)).astype(np.float32), "f32"),
-            C.TensorPlan("classifier.weight", rng.standard_normal((11, 32)).astype(np.float32), "f16"),
+            C.TensorPlan("classifier.weight", rng.standard_normal((16, 32)).astype(np.float32), "f16"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "diarizen-test.oasr"
-            C.write_pack(out, plan, quant="q8_0", model_id="diarizen-base-s80")
+            C.write_pack(out, plan, quant="f16", model_id="diarizen-large-s80-v2")
             reader = gguf.GGUFReader(str(out))
             tensors = {tensor.name: tensor for tensor in reader.tensors}
             self.assertEqual(
-                tensors["proj.weight"].tensor_type, gguf.GGMLQuantizationType.Q8_0
+                tensors["proj.weight"].tensor_type, gguf.GGMLQuantizationType.F16
             )
             self.assertEqual(
                 tensors["proj.bias"].tensor_type, gguf.GGMLQuantizationType.F32
@@ -106,10 +103,11 @@ class PackRoundTripTest(unittest.TestCase):
             self.assertIn("diarizen.wavlm_config_json", fields)
             self.assertIn("diarizen.median_filter_frames", fields)
             self.assertIn("diarizen.tensor_schema", fields)
-            self.assertEqual(_kv_str(reader, "openasr.model.id"), "diarizen-base-s80")
+            self.assertEqual(_kv_str(reader, "openasr.model.id"), "diarizen-large-s80-v2")
+            self.assertEqual(_kv_str(reader, "openasr.quantization"), "fp16")
             self.assertEqual(
                 _kv_str(reader, "diarizen.upstream_model_id"),
-                "BUT-FIT/diarizen-wavlm-base-s80-md",
+                "BUT-FIT/diarizen-wavlm-large-s80-md-v2",
             )
             self.assertEqual(
                 _kv_str(reader, "openasr.source.name"), C.UPSTREAM_MODEL_ID
@@ -121,6 +119,11 @@ class PackRoundTripTest(unittest.TestCase):
             self.assertEqual(
                 _kv_str(reader, "openasr.license.source"), C.LICENSE_SOURCE
             )
+            wavlm = json.loads(_kv_str(reader, "diarizen.wavlm_config_json"))
+            self.assertEqual(wavlm["extractor_norm"], "layer_norm")
+            self.assertTrue(wavlm["normalize_waveform"])
+            self.assertTrue(wavlm["encoder_layer_norm_first"])
+            self.assertFalse(wavlm["transformer_layer_norm_first"])
 
 
 def _kv_str(reader, key):

@@ -1,4 +1,4 @@
-//! Native DiariZen Base-s80 overlap-segmentation runtime.
+//! Native DiariZen Large-s80-v2 overlap-segmentation runtime.
 //!
 //! The public primitive deliberately accepts one exact 16-second, 16 kHz
 //! window.  Sliding-window aggregation belongs to the diarization pipeline;
@@ -26,6 +26,7 @@ use crate::models::thread_local_runtime_cache::{
 };
 
 pub use config::ARCHITECTURE_ID as DIARIZEN_GGML_ARCHITECTURE_ID;
+pub const DIARIZEN_MODEL_ID: &str = config::MODEL_ID;
 pub(crate) use pack::{
     PreparedDiariZenSegmenter, prepare_diarizen_segmenter_snapshot, unload_idle_diarizen_cache,
 };
@@ -214,7 +215,7 @@ pub struct DiariZenWindowOutput {
     pub activity: Vec<u8>,
 }
 
-/// Native DiariZen Base-s80 adapter. Only the immutable mapped source and a
+/// Native DiariZen Large-s80-v2 adapter. Only the immutable mapped source and a
 /// request-resolved execution plan cross threads. Native runners remain in the
 /// dedicated worker's TLS, alongside the backend cache that owns their raw
 /// handles; no `unsafe Send` bridge is needed.
@@ -392,6 +393,11 @@ const POWERSET: [[u8; LOCAL_SPEAKERS]; POWERSET_CLASSES] = [
     [0, 1, 1, 0],
     [0, 1, 0, 1],
     [0, 0, 1, 1],
+    [1, 1, 1, 0],
+    [1, 1, 0, 1],
+    [1, 0, 1, 1],
+    [0, 1, 1, 1],
+    [1, 1, 1, 1],
 ];
 
 fn postprocess_logits(logits: &[f32], frames: usize) -> (Vec<u8>, Vec<u8>) {
