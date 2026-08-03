@@ -8,7 +8,8 @@ use super::model::{FRAME_SHIFT_MS, FireRedStreamVadModel};
 use super::streaming::FireRedStreamingVad;
 use super::weights::FireRedStreamVadWeightsError;
 use crate::longform::{
-    LongFormOptions, LongFormVadProvider, LongFormVadProviderKind, LongFormVadSlice,
+    LongFormOptions, LongFormVadProvider, LongFormVadProviderError, LongFormVadProviderKind,
+    LongFormVadSlice,
 };
 
 #[derive(Debug, Error)]
@@ -101,6 +102,28 @@ impl LongFormVadProvider for FireRedStreamVadProvider {
     ) -> Result<Vec<LongFormVadSlice>, String> {
         self.compute_speech_slices_cancellable(samples, sample_rate_hz, options, &|| false)
             .map_err(|error| error.to_string())
+    }
+
+    fn compute_speech_slices_cancellable(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        options: &LongFormOptions,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<LongFormVadSlice>, LongFormVadProviderError> {
+        FireRedStreamVadProvider::compute_speech_slices_cancellable(
+            self,
+            samples,
+            sample_rate_hz,
+            options,
+            canceled,
+        )
+        .map_err(|error| match error {
+            FireRedStreamVadError::Canceled => LongFormVadProviderError::Canceled,
+            other => LongFormVadProviderError::Failed {
+                reason: other.to_string(),
+            },
+        })
     }
 }
 

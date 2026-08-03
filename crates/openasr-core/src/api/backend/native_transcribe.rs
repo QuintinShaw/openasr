@@ -26,9 +26,9 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBacken
 #[cfg(test)]
 use crate::longform::plan_longform_slices;
 use crate::longform::{
-    AudioSliceKind, LongFormMode, LongFormSlicePlanningError, LongFormVadProvider,
-    SegmentMergePolicy, SegmentTimeDomain, SliceTranscript, TranscriptAssembler,
-    plan_longform_slices_with_materialization_gate,
+    AudioSliceKind, LongFormMode, LongFormSliceError, LongFormSlicePlanningError,
+    LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
+    TranscriptAssembler, plan_longform_slices_with_materialization_gate,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyLongformProfile, BuiltinDecodePolicyLongformPromptCarryMode,
@@ -765,7 +765,7 @@ struct ConcurrentSlicePipeline<'a> {
 /// serial path except where a family's decode genuinely depended on the carried
 /// prompt.
 ///
-/// The six correctness properties the concurrent path must preserve:
+/// The five correctness properties the concurrent path must preserve:
 /// 1. Ordered assembly: workers finish out of order, results are routed back by
 ///    slice position and integrated strictly in slice order.
 /// 2. Cancel / pause: each worker gates on the shared control at every slice
@@ -774,11 +774,9 @@ struct ConcurrentSlicePipeline<'a> {
 ///    polls cancel per token via the job-carried control.
 /// 3. Progress: `DecodeProgress` accumulates atomically and the registry clamps
 ///    every report upward, so concurrent completions never move the bar back.
-/// 4. GPU-fallback tracker: each worker owns its own tracker, so one worker's
-///    fallback streak cannot corrupt another's backend choice.
-/// 5. Memory: `width` is already capacity-gated by the caller
+/// 4. Memory: `width` is already capacity-gated by the caller
 ///    (`effective_slice_pipeline_width`).
-/// 6. Errors / truncation: a worker's error and truncated-slice facts are routed
+/// 5. Errors / truncation: a worker's error and truncated-slice facts are routed
 ///    back and integrated in order; the first (lowest-index) error fails the run
 ///    closed, exactly like the serial `?`.
 fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<(), BackendError> {
@@ -864,11 +862,6 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                     let _abort_guard = execution_context
                         .control
                         .arm_for_native_decode_if_cancellable();
-                    // Per-worker fallback tracker (property 4): the GPU-allocation
-                    // streak is meaningful only within one worker's own sequence
-                    // of slices, and sharing it across threads would be a data
-                    // race.
-                    let mut tracker = GpuAllocationFallbackTracker::default();
                     loop {
                         if stop_ref.load(Ordering::Relaxed) {
                             break;
@@ -1886,6 +1879,7 @@ fn run_native_transcription_impl(
                     16_000,
                     &longform_options,
                     Some(vad_provider.as_ref()),
+                    &|| execution_context.is_canceled(),
                     |packed_samples| {
                         // Packing a VAD timeline creates a second, recording-sized
                         // PCM buffer. Reject a known-impossible allocation before
@@ -1909,12 +1903,7 @@ fn run_native_transcription_impl(
                         Ok(())
                     },
                 )
-                .map_err(|error| match error {
-                    LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
-                        reason: format!("could not build longform slice plan: {error}"),
-                    },
-                    LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
-                })?;
+                .map_err(longform_planning_error_to_backend)?;
                 Ok((plan, vad_engine_label))
             },
         )
@@ -2420,6 +2409,20 @@ fn run_native_transcription_impl(
         prepared_audio,
         emits_punctuation,
     })
+}
+
+fn longform_planning_error_to_backend(
+    error: LongFormSlicePlanningError<BackendError>,
+) -> BackendError {
+    match error {
+        LongFormSlicePlanningError::Planning(LongFormSliceError::Canceled) => {
+            BackendError::TranscriptionCanceled
+        }
+        LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
+            reason: format!("could not build longform slice plan: {error}"),
+        },
+        LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
+    }
 }
 
 /// Render one truncated slice for the `core.native.decode.truncated`
@@ -3813,6 +3816,29 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canceled_longform_planning_maps_to_typed_backend_cancel() {
+        let error = longform_planning_error_to_backend(LongFormSlicePlanningError::Planning(
+            LongFormSliceError::Canceled,
+        ));
+        assert!(matches!(error, BackendError::TranscriptionCanceled));
+    }
+
+    #[test]
+    fn auxiliary_execution_policy_preserves_typed_longform_cancel() {
+        let services = native_execution_services_for_test();
+        let plan = resolve_fixed_cpu_execution_plan(services.as_ref()).expect("CPU plan");
+        let error =
+            run_auxiliary_stage_with_policy(services.as_ref(), &plan, "longform-vad", |_| {
+                Err::<(), BackendError>(BackendError::TranscriptionCanceled)
+            })
+            .expect_err("canceled long-form VAD must fail the auxiliary stage");
+        assert!(matches!(
+            required_auxiliary_stage_error(error),
+            BackendError::TranscriptionCanceled
+        ));
+    }
 
     #[test]
     fn native_boundary_rejects_voice_id_before_any_realtime_model_load() {

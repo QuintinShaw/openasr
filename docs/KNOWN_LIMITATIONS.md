@@ -172,19 +172,26 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   code outside the advertised set reports `language: null` rather than a guess.
   SenseVoice also classifies emotion and audio events internally, but those
   tags are intentionally not exposed on the API surface yet.
-- Cooperative cancel of an in-flight offline transcription is layered: long-form
-  slice boundaries (L0), shared seq2seq greedy token / prefill chunk checks (L1),
-  and a compute-scoped ggml abort contract (L2). CPU uses its native per-node
-  callback. Metal and source-enabled CUDA/HIP/Vulkan/SYCL builds use the shared
-  backend fallback: while cancel is armed, a graph is submitted in at most
-  32-node views, synchronized, then polled. A scheduler reports the weakest mode
-  among all of its backends and applies the same contract to every split, with
-  checks around scheduler input transfers as well, so a missing backend-specific
-  proc is never a silent no-op. One already-entered kernel, event wait, or copy
-  remains non-preemptible; the bound is a graph/scheduler checkpoint, not a
-  wall-clock deadline. A failed persistent compute poisons its model/session
-  graph and forces graph/KV rebuild before reuse; cached backend handles and
-  uploaded immutable weights are retained. See
+- Cooperative cancel of an in-flight offline transcription is layered:
+  request-owned long-form planning/VAD checkpoints plus slice boundaries (L0),
+  shared seq2seq greedy token / prefill chunk checks (L1), and a compute-scoped
+  ggml abort contract (L2). The built-in neural and energy VAD providers poll
+  the same typed request control between bounded recording chunks; custom
+  providers that do not override the cancellable method are still checked
+  before and after their indivisible call. CPU, Metal, source-enabled CUDA/HIP,
+  and Vulkan expose native cancellation hooks; other backends use the shared
+  fallback, which submits at most 32-node views and synchronizes between views.
+  The capability also reports whether a newly raised request is observed at a
+  submission checkpoint or only at graph completion (notably a warmed CUDA/HIP
+  graph replay). A scheduler reports the weakest mechanism and coarsest
+  observation boundary among its backends and applies the same contract to every
+  split, with checks around scheduler input transfers as well, so a missing
+  backend-specific proc is never a silent no-op. One already-entered kernel,
+  graph replay, event wait, or copy remains non-preemptible; the bound is an
+  explicitly reported graph/scheduler checkpoint, not a wall-clock deadline. A
+  failed persistent compute poisons its model/session graph and forces graph/KV
+  rebuild before reuse; cached backend handles and uploaded immutable weights
+  are retained. See
   [Graph cancellation contract](design/graph-cancellation.md).
   Pause still only blocks at slice boundaries and never arms graph cancellation.
 

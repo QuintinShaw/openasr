@@ -11,8 +11,9 @@ pub use assembler::{
 };
 pub use options::{LongFormMode, LongFormOptions, LongFormOptionsError, LongFormVadOptions};
 pub use slicing::{
-    AudioSlice, AudioSliceKind, LongFormBenchmarkMetadata, LongFormSlicePlan, LongFormSliceStats,
-    LongFormVadProvider, LongFormVadProviderKind, LongFormVadSlice, plan_longform_slices,
+    AudioSlice, AudioSliceKind, LongFormBenchmarkMetadata, LongFormSliceError, LongFormSlicePlan,
+    LongFormSliceStats, LongFormVadProvider, LongFormVadProviderError, LongFormVadProviderKind,
+    LongFormVadSlice, plan_longform_slices,
 };
 pub(crate) use slicing::{
     LongFormSlicePlanningError, plan_longform_slices_with_materialization_gate,

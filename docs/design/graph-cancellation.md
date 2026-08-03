@@ -10,18 +10,21 @@ scheduler-backed runners; model families must not add backend-specific wiring.
 synchronous, compute-scoped calls. They report the mode used through an output
 parameter:
 
-- `NATIVE`: the backend exposes `ggml_backend_set_abort_callback`; today CPU
-  polls between graph nodes.
+- `NATIVE`: the backend exposes `ggml_backend_set_abort_callback` and reports
+  the observation boundary actually used by this compute. CPU polls between
+  graph nodes; Metal gates dispatches; CUDA/HIP and Vulkan stop later
+  submissions. A warmed CUDA/HIP graph replay is still one indivisible launch,
+  so it truthfully reports graph-completion observation.
 - `SEGMENTED`: the backend has no native hook. The shared layer submits graph
   views of at most 32 nodes, synchronizes after every view, and polls before the
   first and after every completed view.
 - `DISABLED`: no callback was supplied. OpenASR does not call the cancellation
   entry point in this case; it uses the original graph-compute API unchanged.
 
-The contract is unified; the mechanism is deliberately not. Forcing CPU through
-`SEGMENTED` would replace its finer per-node native polling with coarser graph
-views and unnecessary synchronization overhead, so CPU remains `NATIVE` while
-backends without an equivalent hook use the shared fallback.
+The contract is unified; the mechanism is deliberately not. Forcing a backend
+with a native hook through `SEGMENTED` would replace its normal submission path
+with coarser graph views and unnecessary synchronization overhead. Backends
+without an equivalent hook use the shared fallback.
 
 The 32-node segment is an explicit latency/throughput compromise. It is half of
 Metal's historical 64-node main submission: reducing it lowers worst-case
@@ -34,9 +37,9 @@ The source-build matrix is:
 | Backend | Mode | Cancellation checkpoint |
 | --- | --- | --- |
 | CPU | `NATIVE` | backend per-node poll |
-| Metal | `SEGMENTED` | synchronized graph views |
-| CUDA / HIP | `SEGMENTED` | synchronized graph views |
-| Vulkan | `SEGMENTED` | synchronized graph views |
+| Metal | `NATIVE` | host-visible abort flag sampled before dispatch |
+| CUDA / HIP | `NATIVE` | submission checkpoints; warmed replay at graph completion |
+| Vulkan | `NATIVE` | per-context submission/timeline completion |
 | SYCL | `SEGMENTED` | synchronized graph views |
 
 Future backends automatically receive `SEGMENTED` behavior unless they expose
@@ -52,12 +55,13 @@ safe across sequential jobs and keeps parallel worker threads isolated.
 The scheduler polls before graph allocation, before and after every
 scheduler-controlled input transfer/wait boundary, before each split compute,
 and inside each backend compute. Its reported mode is `SEGMENTED` if any
-scheduler backend lacks a native hook; otherwise it is `NATIVE`. A backend API
-call already entered by the scheduler (one event wait, synchronization, copy,
-or kernel) is indivisible, so cancellation cannot preempt that call; it is
-observed at the next shared checkpoint. An aborted return is synchronized: no
-submitted transfer or graph work remains in flight and can touch buffers reused
-by a later job.
+scheduler backend lacks a native hook; otherwise it is `NATIVE`. It also reports
+the coarsest observation boundary across the participating backends. A backend
+API call already entered by the scheduler (one graph replay, event wait,
+synchronization, copy, or kernel) is indivisible, so cancellation cannot preempt
+that call; it is observed at the next reported checkpoint. An aborted return is
+synchronized: no submitted transfer or graph work remains in flight and can
+touch buffers reused by a later job.
 
 Cancel unwinds the active request; it does not evict stateless cached backend or
 device handles. Model/session tensor state is different: native and segmented
@@ -84,6 +88,14 @@ paths that support per-request cancellation therefore carry each job's control
 explicitly and remove canceled members at typed prefill-chunk/token boundaries
 (currently Qwen); single-job graph execution uses L2.
 
+Before any long-form graph exists, the shared slice planner carries that same
+request control into VAD. Built-in FireRed Stream-VAD and energy VAD providers
+poll between bounded recording chunks and return a typed planning cancel;
+packed-audio admission and materialization are skipped after cancellation. The
+legacy provider method remains available for callers with no request control,
+while the cancellable trait method gives external providers an override point
+without putting family-specific cancellation code in the native executor.
+
 ## Boundary
 
 OpenASR invokes `ggml_backend_graph_compute` and scheduler graph compute; it
@@ -94,14 +106,18 @@ described above. OpenASR helpers named “graph plan” build ordinary
 
 ## Regression evidence
 
-The ggml fake-backend contract test proves callback-free single submission,
-`false` completion as `32 + 32 + 1`, a deterministic mid-graph flip after the
-first synchronized segment, typed abort, and no pending work on return. A
+The ggml fake-backend contract test proves the shared segmented fallback's
+callback-free single submission, `false` completion as `32 + 32 + 1`, a
+deterministic mid-graph flip after the first synchronized segment, typed abort,
+and no pending work on return. Native backend tests separately cover their
+reported observation boundaries. A
 two-backend scheduler seam also forces an incompatible-buffer copy, flips cancel
 inside that copy, proves the destination split is never submitted, and proves
 the pending copy is drained before return. Rust tests cover callback false/true,
-direct and scheduler paths, parallel-job isolation, real Metal segmented
-cancellation, Metal scheduler cancellation, callback-false completion across
-multiple Metal graph views (direct and scheduler), cached-Metal reuse after a
-canceled job, and persistent-session poison/rebuild including a synthetic
-cancellation-contract error.
+direct and scheduler paths, parallel-job isolation, real Metal native
+cancellation, Metal scheduler cancellation, callback-false completion,
+cached-Metal reuse after a canceled job, and persistent-session poison/rebuild
+including a synthetic cancellation-contract error. Long-form tests additionally
+prove a cancellation
+raised inside a provider remains typed through planning, skips packed-audio
+materialization, and maps to `BackendError::TranscriptionCanceled`.

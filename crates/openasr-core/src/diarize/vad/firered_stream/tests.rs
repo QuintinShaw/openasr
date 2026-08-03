@@ -186,6 +186,23 @@ fn provider_cancellable_path_stops_before_frontend_work() {
     ));
 }
 
+#[test]
+fn longform_provider_contract_preserves_typed_cancellation() {
+    use crate::longform::{LongFormVadProvider, LongFormVadProviderError};
+
+    let provider = FireRedStreamVadProvider::shared().expect("shared Stream-VAD provider");
+    let samples = vec![0.0f32; 32_000];
+    let error = LongFormVadProvider::compute_speech_slices_cancellable(
+        &provider,
+        &samples,
+        super::frontend::SAMPLE_RATE_HZ,
+        &crate::LongFormOptions::default(),
+        &|| true,
+    )
+    .expect_err("shared long-form contract must preserve provider cancellation");
+    assert!(matches!(error, LongFormVadProviderError::Canceled));
+}
+
 /// Host-local RTF benchmark over a real 5-minute recording (not part of the
 /// default gate; run explicitly with `--ignored` on a machine that has the
 /// fixture). Prints wall-clock forward-pass time and RTF (`elapsed / audio_s`)

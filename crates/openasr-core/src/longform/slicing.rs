@@ -46,6 +46,14 @@ pub enum LongFormVadProviderKind {
     EnergyLike,
 }
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LongFormVadProviderError {
+    #[error("longform VAD provider was canceled")]
+    Canceled,
+    #[error("{reason}")]
+    Failed { reason: String },
+}
+
 pub trait LongFormVadProvider: Send + Sync {
     fn provider_kind(&self) -> LongFormVadProviderKind {
         LongFormVadProviderKind::Custom
@@ -57,6 +65,32 @@ pub trait LongFormVadProvider: Send + Sync {
         sample_rate_hz: u32,
         options: &LongFormOptions,
     ) -> Result<Vec<LongFormVadSlice>, String>;
+
+    /// Cancellation-aware form used by request-owned long-form planning.
+    ///
+    /// Providers with bounded internal work should override this method and
+    /// poll `canceled` between those work units. The default preserves source
+    /// compatibility for third-party providers while still stopping before or
+    /// immediately after an otherwise indivisible provider call.
+    fn compute_speech_slices_cancellable(
+        &self,
+        samples: &[f32],
+        sample_rate_hz: u32,
+        options: &LongFormOptions,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<LongFormVadSlice>, LongFormVadProviderError> {
+        if canceled() {
+            return Err(LongFormVadProviderError::Canceled);
+        }
+        let slices = self
+            .compute_speech_slices(samples, sample_rate_hz, options)
+            .map_err(|reason| LongFormVadProviderError::Failed { reason })?;
+        if canceled() {
+            Err(LongFormVadProviderError::Canceled)
+        } else {
+            Ok(slices)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,6 +137,8 @@ struct PackedAudioMaterializationPlan {
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum LongFormSliceError {
+    #[error("longform slice planning was canceled")]
+    Canceled,
     #[error("longform sample_rate_hz must be > 0")]
     InvalidSampleRate,
     #[error("longform options are invalid: {reason}")]
@@ -136,6 +172,7 @@ pub fn plan_longform_slices(
         sample_rate_hz,
         options,
         vad_provider,
+        &|| false,
         |_| Ok::<(), std::convert::Infallible>(()),
     ) {
         Ok(plan) => Ok(plan),
@@ -153,8 +190,10 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
     sample_rate_hz: u32,
     options: &LongFormOptions,
     vad_provider: Option<&dyn LongFormVadProvider>,
+    canceled: &dyn Fn() -> bool,
     admit_packed_samples: impl FnOnce(usize) -> Result<(), E>,
 ) -> Result<LongFormSlicePlan, LongFormSlicePlanningError<E>> {
+    check_planning_canceled(canceled)?;
     if sample_rate_hz == 0 {
         return Err(LongFormSliceError::InvalidSampleRate.into());
     }
@@ -164,6 +203,7 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
             reason: error.to_string(),
         })
         .map_err(LongFormSlicePlanningError::Planning)?;
+    check_planning_canceled(canceled)?;
     if samples.is_empty() {
         return Ok(LongFormSlicePlan {
             sample_rate_hz,
@@ -188,9 +228,13 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
             sample_rate_hz,
             options,
             vad_provider,
+            canceled,
         )?),
-        LongFormMode::Auto => plan_auto_slices(samples, sample_rate_hz, options, vad_provider)?,
+        LongFormMode::Auto => {
+            plan_auto_slices(samples, sample_rate_hz, options, vad_provider, canceled)?
+        }
     };
+    check_planning_canceled(canceled)?;
     // Transparent fallback: for `Auto` this should never fire in practice
     // (`enforce_coverage_dominance` disqualifies any auto-planner candidate
     // that drops audible content whenever a full-coverage alternative
@@ -203,11 +247,18 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
     // bindings have to track) so a dropped-audio regression is observable in
     // `daemon.log` instead of only showing up as missing transcript text.
     log_dropped_audible_regions(samples, sample_rate_hz, &layout);
+    check_planning_canceled(canceled)?;
     if layout.processed_audio.is_none() {
         if let Some(materialization_plan) = layout.packed_audio_plan.take() {
+            check_planning_canceled(canceled)?;
             admit_packed_samples(materialization_plan.processed_samples)
                 .map_err(LongFormSlicePlanningError::PackedAudioAdmission)?;
-            layout.processed_audio = Some(materialize_packed_audio(samples, &materialization_plan));
+            check_planning_canceled(canceled)?;
+            layout.processed_audio = Some(materialize_packed_audio(
+                samples,
+                &materialization_plan,
+                canceled,
+            )?);
         } else {
             apply_padding(
                 &mut layout.slices,
@@ -234,6 +285,21 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
     })
 }
 
+fn check_planning_canceled(canceled: &dyn Fn() -> bool) -> Result<(), LongFormSliceError> {
+    if canceled() {
+        Err(LongFormSliceError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
+fn map_vad_provider_error(error: LongFormVadProviderError) -> LongFormSliceError {
+    match error {
+        LongFormVadProviderError::Canceled => LongFormSliceError::Canceled,
+        LongFormVadProviderError::Failed { reason } => LongFormSliceError::VadFailed { reason },
+    }
+}
+
 fn layout_from_identity_slices(slices: Vec<AudioSlice>) -> LongFormPlanningLayout {
     LongFormPlanningLayout {
         slices,
@@ -248,15 +314,21 @@ fn layout_uses_packed_timeline(layout: &LongFormPlanningLayout) -> bool {
     layout.processed_audio.is_some() || layout.packed_audio_plan.is_some()
 }
 
-fn materialize_packed_audio(samples: &[f32], plan: &PackedAudioMaterializationPlan) -> Vec<f32> {
+fn materialize_packed_audio(
+    samples: &[f32],
+    plan: &PackedAudioMaterializationPlan,
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<f32>, LongFormSliceError> {
     let mut processed_audio = Vec::with_capacity(plan.processed_samples);
     for (index, span) in plan.spans.iter().enumerate() {
+        check_planning_canceled(canceled)?;
         if index > 0 {
             processed_audio.resize(processed_audio.len() + plan.seam_samples, 0.0);
         }
         processed_audio.extend_from_slice(&samples[span.start_sample..span.end_sample]);
     }
-    processed_audio
+    check_planning_canceled(canceled)?;
+    Ok(processed_audio)
 }
 
 fn full_slice(total_samples: usize) -> AudioSlice {
@@ -339,7 +411,9 @@ fn plan_auto_slices(
     sample_rate_hz: u32,
     options: &LongFormOptions,
     vad_provider: Option<&dyn LongFormVadProvider>,
+    canceled: &dyn Fn() -> bool,
 ) -> Result<LongFormPlanningLayout, LongFormSliceError> {
+    check_planning_canceled(canceled)?;
     let total_samples = samples.len();
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
     if total_samples <= chunk_samples {
@@ -355,7 +429,9 @@ fn plan_auto_slices(
         sample_rate_hz,
         options,
     ));
-    if let Some(packed_energy_layout) = plan_packed_energy_layout(samples, sample_rate_hz, options)
+    check_planning_canceled(canceled)?;
+    if let Some(packed_energy_layout) =
+        plan_packed_energy_layout(samples, sample_rate_hz, options, canceled)?
     {
         candidates.push(build_auto_plan_candidate(
             AudioSliceKind::Energy,
@@ -366,6 +442,7 @@ fn plan_auto_slices(
             options,
         ));
     }
+    check_planning_canceled(canceled)?;
 
     let fixed_slices = plan_fixed_slices(total_samples, sample_rate_hz, options);
     if !fixed_slices.is_empty() {
@@ -378,13 +455,15 @@ fn plan_auto_slices(
             options,
         ));
     }
+    check_planning_canceled(canceled)?;
 
     if let Some(provider) = vad_provider
         && provider.provider_kind() != LongFormVadProviderKind::EnergyLike
     {
         let vad_spans = provider
-            .compute_speech_slices(samples, sample_rate_hz, options)
-            .map_err(|reason| LongFormSliceError::VadFailed { reason })?;
+            .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
+            .map_err(map_vad_provider_error)?;
+        check_planning_canceled(canceled)?;
         if let Some(packed_vad_layout) = plan_packed_layout_from_speech_spans(
             samples,
             sample_rate_hz,
@@ -415,6 +494,7 @@ fn plan_auto_slices(
         }
     }
 
+    check_planning_canceled(canceled)?;
     prune_dominated_vad_candidates(&mut candidates);
     let mut selection_provenance =
         enforce_coverage_dominance(&mut candidates, samples, sample_rate_hz);
@@ -437,6 +517,7 @@ fn plan_auto_slices(
     ));
     candidates.sort_by(compare_auto_plan_candidates);
     selection_provenance.extend(auto_selection_provenance(&candidates));
+    check_planning_canceled(canceled)?;
     Ok(candidates
         .into_iter()
         .next()
@@ -459,18 +540,20 @@ fn plan_packed_energy_layout(
     samples: &[f32],
     sample_rate_hz: u32,
     options: &LongFormOptions,
-) -> Option<LongFormPlanningLayout> {
+    canceled: &dyn Fn() -> bool,
+) -> Result<Option<LongFormPlanningLayout>, LongFormSliceError> {
     let provider = EnergyLongFormVadProvider;
     let speech_spans = provider
-        .compute_speech_slices(samples, sample_rate_hz, options)
-        .ok()?;
-    plan_packed_layout_from_speech_spans(
+        .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
+        .map_err(map_vad_provider_error)?;
+    check_planning_canceled(canceled)?;
+    Ok(plan_packed_layout_from_speech_spans(
         samples,
         sample_rate_hz,
         options,
         AudioSliceKind::Energy,
         speech_spans,
-    )
+    ))
 }
 
 fn plan_packed_layout_from_speech_spans(
@@ -625,7 +708,9 @@ fn plan_vad_slices(
     sample_rate_hz: u32,
     options: &LongFormOptions,
     vad_provider: Option<&dyn LongFormVadProvider>,
+    canceled: &dyn Fn() -> bool,
 ) -> Result<Vec<AudioSlice>, LongFormSliceError> {
+    check_planning_canceled(canceled)?;
     let Some(provider) = vad_provider else {
         if options.fallback_to_energy_when_vad_unavailable {
             return Ok(plan_energy_slices(samples, sample_rate_hz, options));
@@ -633,8 +718,9 @@ fn plan_vad_slices(
         return Err(LongFormSliceError::VadUnavailable);
     };
     let vad_slices = provider
-        .compute_speech_slices(samples, sample_rate_hz, options)
-        .map_err(|reason| LongFormSliceError::VadFailed { reason })?;
+        .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
+        .map_err(map_vad_provider_error)?;
+    check_planning_canceled(canceled)?;
     if vad_slices.is_empty() {
         if options.fallback_to_energy_when_vad_empty {
             return Ok(plan_energy_slices(samples, sample_rate_hz, options));
@@ -2248,7 +2334,9 @@ mod tests {
         samples.extend(vec![0.0; 16_000 * 12]);
         samples.extend(tone(16_000));
         let options = LongFormOptions::default();
-        let layout = plan_packed_energy_layout(&samples, 16_000, &options).expect("packed");
+        let layout = plan_packed_energy_layout(&samples, 16_000, &options, &|| false)
+            .expect("planning")
+            .expect("packed");
         assert_eq!(layout.slices.len(), 1);
         assert!(layout.processed_audio.is_none());
         assert!(
@@ -2270,7 +2358,11 @@ mod tests {
         samples.extend(vec![0.0; 16_000 * 3]);
         samples.extend(tone(16_000 * 10));
         let options = LongFormOptions::default();
-        assert!(plan_packed_energy_layout(&samples, 16_000, &options).is_some());
+        assert!(
+            plan_packed_energy_layout(&samples, 16_000, &options, &|| false)
+                .expect("planning")
+                .is_some()
+        );
         let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
         assert_eq!(plan.slices.len(), 1);
         assert!(plan.processed_audio.is_none());
@@ -2331,6 +2423,74 @@ mod tests {
         let samples = tone(16_000 * 2);
         let error = plan_longform_slices(&samples, 16_000, &options, None).unwrap_err();
         assert!(matches!(error, LongFormSliceError::VadUnavailable));
+    }
+
+    #[test]
+    fn mid_provider_cancel_stops_planning_before_materialization() {
+        use std::cell::Cell;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct CancelFromInsideProvider {
+            canceled: Arc<AtomicBool>,
+            legacy_calls: Arc<AtomicUsize>,
+        }
+
+        impl LongFormVadProvider for CancelFromInsideProvider {
+            fn compute_speech_slices(
+                &self,
+                _samples: &[f32],
+                _sample_rate_hz: u32,
+                _options: &LongFormOptions,
+            ) -> Result<Vec<LongFormVadSlice>, String> {
+                self.legacy_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Vec::new())
+            }
+
+            fn compute_speech_slices_cancellable(
+                &self,
+                _samples: &[f32],
+                _sample_rate_hz: u32,
+                _options: &LongFormOptions,
+                canceled: &dyn Fn() -> bool,
+            ) -> Result<Vec<LongFormVadSlice>, LongFormVadProviderError> {
+                self.canceled.store(true, Ordering::Release);
+                assert!(
+                    canceled(),
+                    "provider must observe the request cancel source"
+                );
+                Err(LongFormVadProviderError::Canceled)
+            }
+        }
+
+        let canceled = Arc::new(AtomicBool::new(false));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancelFromInsideProvider {
+            canceled: Arc::clone(&canceled),
+            legacy_calls: Arc::clone(&legacy_calls),
+        };
+        let gate_called = Cell::new(false);
+        let options = options_with_mode(LongFormMode::Vad);
+
+        let error = plan_longform_slices_with_materialization_gate(
+            &tone(16_000 * 2),
+            16_000,
+            &options,
+            Some(&provider),
+            &|| canceled.load(Ordering::Acquire),
+            |_| {
+                gate_called.set(true);
+                Ok::<(), ()>(())
+            },
+        )
+        .expect_err("mid-provider cancellation must stop planning");
+
+        assert!(matches!(
+            error,
+            LongFormSlicePlanningError::Planning(LongFormSliceError::Canceled)
+        ));
+        assert_eq!(legacy_calls.load(Ordering::Relaxed), 0);
+        assert!(!gate_called.get());
     }
 
     #[test]
@@ -3529,6 +3689,7 @@ mod tests {
             16_000,
             &options,
             None,
+            &|| false,
             |count| {
                 proposed_samples = Some(count);
                 Err("memory rejected")
@@ -4078,7 +4239,8 @@ mod tests {
         let mut options = options_with_mode(LongFormMode::Auto);
         options.chunk_seconds = 30.0;
 
-        let packed_layout = plan_packed_energy_layout(&samples, 16_000, &options)
+        let packed_layout = plan_packed_energy_layout(&samples, 16_000, &options, &|| false)
+            .expect("planning")
             .expect("energy VAD must produce a packed candidate for this profile");
         let (_, dropped) = candidate_kept_and_dropped_ranges(&packed_layout, samples.len());
         let dropped_seconds: f32 = dropped
