@@ -1580,9 +1580,18 @@ mod tests {
             "accelerated" => Some(RequestBackendPreference::Accelerated),
             other => panic!("unsupported native diarization backend '{other}'"),
         };
-        let expected_backend = SegmenterRuntimeInput::resolve(backend_preference.clone())
+        let requested_backend = SegmenterRuntimeInput::resolve(backend_preference.clone())
             .expect("resolve exact acceptance backend")
             .backend();
+        // segmentation-3.0 is a pure-Rust CPU model even when the request lets
+        // ReDimNet use Metal/GPU. DiariZen follows the requested graph backend.
+        // Keep both routes explicit so the acceptance harness mirrors the
+        // heterogeneous production pipeline instead of forcing every stage to
+        // the slowest common backend.
+        let expected_segmenter_backend = match expected_provider {
+            SegmenterProvider::Segmentation3_0 => GgmlCpuGraphBackend::Cpu,
+            SegmenterProvider::DiariZen => requested_backend,
+        };
         let manifest_root = manifest
             .parent()
             .and_then(std::path::Path::parent)
@@ -1603,19 +1612,21 @@ mod tests {
         let segmenter_content_id = diarizer_plan.segmenter_content_id().to_string();
         assert_eq!(
             diarizer_plan.segmenter_admission_backend(),
-            expected_backend,
-            "the exact acceptance harness must use the requested backend"
+            expected_segmenter_backend,
+            "the exact acceptance harness must use the provider's production backend"
         );
         let embedder_bytes = embedder_plan.admission_bytes();
         let segmenter_bytes = diarizer_plan.segmenter_admission_bytes();
         if let Some(total_memory) = crate::host::host_total_memory_bytes() {
             crate::capacity::evaluate_static_host_memory_admission(
                 0,
-                embedder_bytes.saturating_add(if expected_backend != GgmlCpuGraphBackend::Gpu {
-                    segmenter_bytes
-                } else {
-                    0
-                }),
+                embedder_bytes.saturating_add(
+                    if expected_segmenter_backend != GgmlCpuGraphBackend::Gpu {
+                        segmenter_bytes
+                    } else {
+                        0
+                    },
+                ),
                 total_memory,
                 crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
                     swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
@@ -1623,7 +1634,7 @@ mod tests {
             )
             .expect("native diarization fixture run must pass production-shaped admission");
         }
-        if expected_backend == GgmlCpuGraphBackend::Gpu {
+        if expected_segmenter_backend == GgmlCpuGraphBackend::Gpu {
             let budget = diarizer_plan
                 .segmenter_discrete_vram_budget_bytes()
                 .filter(|budget| *budget > 0)
@@ -1664,7 +1675,8 @@ mod tests {
             "embedder_content_id": embedder_content_id,
             "embedder_quant": embedder_quant,
             "requested_backend": backend,
-            "resolved_backend": format!("{expected_backend:?}").to_ascii_lowercase(),
+            "resolved_backend": format!("{requested_backend:?}").to_ascii_lowercase(),
+            "resolved_segmenter_backend": format!("{expected_segmenter_backend:?}").to_ascii_lowercase(),
             "overlap_output": "raw-turns-preserved",
         });
         std::fs::write(
