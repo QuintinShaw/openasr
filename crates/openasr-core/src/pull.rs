@@ -22,6 +22,10 @@ use crate::{
     catalog_series::family_aliases_match,
     content_store,
     download_source::{self, DownloadSource},
+    ggml_runtime::{
+        MAX_RUNTIME_GGUF_ARRAY_ELEMENTS, MAX_RUNTIME_GGUF_METADATA_ENTRIES,
+        MAX_RUNTIME_GGUF_STRING_BYTES, MAX_RUNTIME_GGUF_TENSORS,
+    },
     has_openasr_runtime_pack_extension, http, parse_model_ref, resolve_catalog_pull,
     safety::{validate_safe_relative_path, validate_sha256},
     validate_ggml_runtime_source_path, validate_native_runtime_model_pack_contract,
@@ -122,11 +126,7 @@ const SEGMENT_LOW_SPEED_REFERENCE_CAPACITY: usize = 64;
 /// or the bitmap's shape must also bump this string.
 const PARALLEL_META_FORMAT: &str = "segmented-v1";
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
-const MAX_GGUF_METADATA_ENTRIES: u64 = 100_000;
-const MAX_GGUF_TENSORS: u64 = 1_000_000;
-const MAX_GGUF_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_GGUF_DIMS: u32 = 8;
-const MAX_GGUF_ARRAY_VALUES: u64 = 16 * 1024 * 1024;
 const OASR_PACKAGE_VERSION_KEY: &str = "openasr.package.version";
 const OASR_PACKAGE_VERSION_V1: &str = "1";
 
@@ -4740,12 +4740,12 @@ impl<'a> GgufPreflightReader<'a> {
         }
         let tensor_count = self.read_u64()?;
         let kv_count = self.read_u64()?;
-        if tensor_count == 0 || tensor_count > MAX_GGUF_TENSORS {
+        if tensor_count == 0 || tensor_count > MAX_RUNTIME_GGUF_TENSORS {
             return Err(format!(
                 "tensor count {tensor_count} is outside supported bounds"
             ));
         }
-        if kv_count > MAX_GGUF_METADATA_ENTRIES {
+        if kv_count > MAX_RUNTIME_GGUF_METADATA_ENTRIES {
             return Err(format!(
                 "metadata entry count {kv_count} is outside supported bounds"
             ));
@@ -4843,7 +4843,7 @@ impl<'a> GgufPreflightReader<'a> {
     fn skip_array_value(&mut self) -> Result<(), String> {
         let item_type = self.read_u32()?;
         let item_count = self.read_u64()?;
-        if item_count > MAX_GGUF_ARRAY_VALUES {
+        if item_count > MAX_RUNTIME_GGUF_ARRAY_ELEMENTS {
             return Err(format!(
                 "GGUF array length {item_count} exceeds supported bounds"
             ));
@@ -4873,7 +4873,7 @@ impl<'a> GgufPreflightReader<'a> {
 
     fn read_string(&mut self) -> Result<String, String> {
         let len = self.read_u64()?;
-        if len > MAX_GGUF_STRING_BYTES {
+        if len > MAX_RUNTIME_GGUF_STRING_BYTES {
             return Err(format!("GGUF string length {len} exceeds supported bounds"));
         }
         let len_usize = usize::try_from(len).map_err(|_| "string length overflow".to_string())?;

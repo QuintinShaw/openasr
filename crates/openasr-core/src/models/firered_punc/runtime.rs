@@ -6,14 +6,13 @@
 //! graph needs `&mut` for a forward, so it sits behind a `RefCell` to keep the
 //! classifier trait's `&self`.
 
+#[cfg(test)]
+use crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source;
 use std::cell::RefCell;
 #[cfg(test)]
 use std::path::Path;
 
-use crate::ggml_runtime::{
-    GgufTensorDataReader, read_gguf_metadata_from_runtime_source,
-    read_gguf_tensor_index_from_runtime_source,
-};
+use crate::ggml_runtime::{GgufRuntimeSourcePreflight, build_runtime_tensor_reader_from_preflight};
 use crate::punctuation::{
     PunctuationClassifier, PunctuationError, PunctuationRestoreConfig, restore_punctuation,
 };
@@ -64,25 +63,23 @@ pub(crate) struct FireRedPuncRuntime {
 
 impl FireRedPuncRuntime {
     pub(crate) fn quote_candidate_system_memory(
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
     ) -> Result<
         crate::models::system_memory_owner::SystemMemoryAllocationQuote,
         FireRedPuncRuntimeError,
     > {
-        let gguf = read_gguf_metadata_from_runtime_source(runtime_source)
-            .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(runtime_source)
-            .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-        let metadata = parse_and_validate_firered_punc_metadata(&gguf)
+        let gguf = preflight.metadata.as_ref();
+        let tensor_index = preflight.tensor_index.as_ref();
+        let metadata = parse_and_validate_firered_punc_metadata(gguf)
             .map_err(|error| FireRedPuncRuntimeError::Metadata(error.to_string()))?;
         let mut quote = crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder::new::<
             Self,
-        >(runtime_source.content_id());
+        >(preflight.runtime_source.content_id());
         let map_capacity = |error: crate::models::system_memory_owner::SystemMemoryOwnerError| {
             FireRedPuncRuntimeError::Capacity(error.to_string())
         };
         quote
-            .add_tokenizer_metadata(&gguf, false)
+            .add_tokenizer_metadata(gguf, false)
             .map_err(map_capacity)?;
         quote
             .add_stable_owned_bytes(
@@ -92,7 +89,7 @@ impl FireRedPuncRuntime {
             )
             .map_err(map_capacity)?;
         quote.observe_transient_bytes(
-            FireRedPuncWeights::quoted_staging_system_memory_bytes(&tensor_index, &metadata)
+            FireRedPuncWeights::quoted_staging_system_memory_bytes(tensor_index, &metadata)
                 .map_err(FireRedPuncRuntimeError::Capacity)?,
             "firered-punc complete f32 upload staging",
         );
@@ -114,14 +111,14 @@ impl FireRedPuncRuntime {
 
     pub(crate) fn try_allocate_inside_parent_candidate(
         quote: crate::models::system_memory_owner::SystemMemoryAllocationQuote,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<crate::models::system_memory_owner::SystemMemoryOwner<Self>, FireRedPuncRuntimeError>
     {
         match crate::models::system_memory_owner::SystemMemoryOwner::try_allocate_transaction(
             quote,
             || {
-                let runtime = Self::from_runtime_source(runtime_source, backend)?;
+                let runtime = Self::from_preflight(preflight, backend)?;
                 let retained = runtime
                     .retained_system_memory_bytes()
                     .map_err(FireRedPuncRuntimeError::Capacity)?;
@@ -156,22 +153,23 @@ impl FireRedPuncRuntime {
     ) -> Result<Self, FireRedPuncRuntimeError> {
         let runtime_source = crate::validate_ggml_runtime_source_path(path)
             .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-        Self::from_runtime_source(&runtime_source, backend)
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
+        Self::from_preflight(&preflight, backend)
     }
 
     /// Build from one already-validated immutable mapping. Metadata and
     /// tensor bytes must always share this source; policy-owned callers also
     /// use its content id to prove a delayed build still targets the pack that
     /// was selected during preparation.
-    pub(crate) fn from_runtime_source(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn from_preflight(
+        preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedPuncRuntimeError> {
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+        let reader = build_runtime_tensor_reader_from_preflight(preflight)
             .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-        let gguf = read_gguf_metadata_from_runtime_source(runtime_source)
-            .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-        let metadata = parse_and_validate_firered_punc_metadata(&gguf)
+        let gguf = preflight.metadata.as_ref();
+        let metadata = parse_and_validate_firered_punc_metadata(gguf)
             .map_err(|error| FireRedPuncRuntimeError::Metadata(error.to_string()))?;
         let tokens = gguf.get_string_array(TOKENIZER_GGML_TOKENS_KEY).ok_or(
             FireRedPuncRuntimeError::MissingMetadata(TOKENIZER_GGML_TOKENS_KEY),

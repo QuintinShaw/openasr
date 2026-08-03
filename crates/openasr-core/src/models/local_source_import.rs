@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
@@ -110,181 +109,17 @@ pub(crate) struct SafetensorsFile {
 impl SafetensorsFile {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, LocalSourceImportError> {
         let path = path.as_ref().to_path_buf();
-        let mut file = File::open(&path).map_err(|source| LocalSourceImportError::Read {
+        let file = File::open(&path).map_err(|source| LocalSourceImportError::Read {
             path: path.clone(),
             source,
         })?;
-
-        // S1: read the 8-byte little-endian header-length prefix and bound it
-        // against SAFETENSORS_HEADER_MAX_BYTES *before* it is trusted for any
-        // allocation size. Without this, a crafted prefix (up to u64::MAX)
-        // would let an untrusted file drive `vec![0; header_length]` straight
-        // into an OOM / abort.
-        let mut header_len_prefix = [0_u8; 8];
-        file.read_exact(&mut header_len_prefix)
-            .map_err(|source| LocalSourceImportError::Read {
-                path: path.clone(),
-                source,
-            })?;
-        let header_length_bytes = u64::from_le_bytes(header_len_prefix);
-        if header_length_bytes > SAFETENSORS_HEADER_MAX_BYTES {
-            return Err(validate_error(format!(
-                "safetensors header length {header_length_bytes} exceeds max allowed {SAFETENSORS_HEADER_MAX_BYTES} bytes"
-            )));
-        }
-
-        // S1 (continued): cross-check the (now bounded) header length against
-        // the actual file size before allocating the header buffer -- a small
-        // file can still declare a header length that fits under the byte cap
-        // but does not fit the file itself.
-        let file_metadata = file
-            .metadata()
-            .map_err(|source| LocalSourceImportError::Read {
-                path: path.clone(),
-                source,
-            })?;
-        let total_len = file_metadata.len();
-        let header_section_len = 8_u64.checked_add(header_length_bytes).ok_or_else(|| {
-            validate_error(format!(
-                "safetensors header length {header_length_bytes} overflows file indexing bounds"
-            ))
-        })?;
-        if total_len < header_section_len {
-            return Err(validate_error(format!(
-                "safetensors file '{}' is smaller than its declared header ({header_section_len} bytes needed, {total_len} available)",
-                path.display()
-            )));
-        }
-
-        let header_length = usize::try_from(header_length_bytes).map_err(|_| {
-            validate_error(format!(
-                "safetensors header length {header_length_bytes} is not representable on this platform"
-            ))
-        })?;
-        let mut header_bytes = vec![0_u8; header_length];
-        file.read_exact(&mut header_bytes)
-            .map_err(|source| LocalSourceImportError::Read {
-                path: path.clone(),
-                source,
-            })?;
-
-        let data_length_bytes = total_len - header_section_len;
-
-        let header_text = std::str::from_utf8(&header_bytes).map_err(|error| {
-            validate_error(format!(
-                "safetensors header is not valid UTF-8 JSON: {error}"
-            ))
-        })?;
-        // S2: serde_json silently keeps the *last* value for a duplicate JSON
-        // object key, so a crafted header could smuggle a tensor definition
-        // past review under a repeated key. Reject duplicates outright before
-        // the normal typed parse below.
-        crate::models::safetensors_json::reject_duplicate_json_keys(header_text).map_err(
-            |error| {
-                validate_error(format!(
-                    "safetensors header has duplicate JSON keys: {error}"
-                ))
-            },
-        )?;
-
-        let raw_value: serde_json::Value =
-            serde_json::from_str(header_text).map_err(|source| LocalSourceImportError::Parse {
-                path: path.clone(),
-                source,
-            })?;
-        let raw_object = raw_value
-            .as_object()
-            .ok_or_else(|| validate_error("safetensors header must be a JSON object"))?;
-        let mut metadata = BTreeMap::new();
-        let mut tensors = Vec::new();
-        for (name, value) in raw_object {
-            if name == "__metadata__" {
-                metadata = serde_json::from_value(value.clone()).map_err(|source| {
-                    LocalSourceImportError::Parse {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-                continue;
-            }
-            let raw: RawSafetensorsTensorHeader =
-                serde_json::from_value(value.clone()).map_err(|source| {
-                    LocalSourceImportError::Parse {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-            if raw.dtype.trim().is_empty() {
-                return Err(validate_error(format!(
-                    "safetensors tensor '{name}' dtype must not be empty"
-                )));
-            }
-            let [start, end] = raw.data_offsets;
-            if end < start {
-                return Err(validate_error(format!(
-                    "safetensors tensor '{name}' has inverted offsets {:?}",
-                    raw.data_offsets
-                )));
-            }
-            if end > data_length_bytes {
-                return Err(validate_error(format!(
-                    "safetensors tensor '{name}' data_offsets end ({end}) exceeds data section length ({data_length_bytes})"
-                )));
-            }
-            // S4/S5: cross-check the declared byte range against
-            // shape-element-count * dtype-size for dtypes this parser has a
-            // size entry for. A family may pass an exotic/family-specific
-            // dtype string through unrecognized here (by design -- the shared
-            // layer does not own every family's dtype vocabulary), in which
-            // case only the range/overflow checks above apply.
-            if let Some(dtype_size) = dtype_size_bytes(&raw.dtype) {
-                let element_count = tensor_element_count(name, &raw.shape)?;
-                let expected_bytes = (element_count as u64)
-                    .checked_mul(dtype_size)
-                    .ok_or_else(|| {
-                        validate_error(format!(
-                            "safetensors tensor '{name}' expected byte size overflow from shape/dtype"
-                        ))
-                    })?;
-                let actual_bytes = end - start;
-                if actual_bytes != expected_bytes {
-                    return Err(validate_error(format!(
-                        "safetensors tensor '{name}' byte range ({actual_bytes}) does not match expected bytes ({expected_bytes}) from dtype '{}' and shape {:?}",
-                        raw.dtype, raw.shape
-                    )));
-                }
-            }
-            tensors.push(SafetensorsTensorHeader {
-                name: name.clone(),
-                dtype: raw.dtype,
-                shape: raw.shape,
-                data_offsets: raw.data_offsets,
-            });
-        }
-        if tensors.is_empty() {
-            return Err(validate_error(
-                "safetensors header must include at least one tensor entry",
-            ));
-        }
-
-        // S3: safetensors's on-disk contract is that tensor byte ranges are
-        // sorted-contiguous, non-overlapping, and exactly cover the data
-        // section. `Mmap::get` bounds-checking in `tensor_data` is a lazy
-        // last line of defense, not a substitute for this -- without it a
-        // header can claim disjoint or overlapping regions that still each
-        // individually pass the per-tensor range check above.
-        validate_tensor_offset_ranges(&tensors, data_length_bytes)?;
-
-        tensors.sort_by(|left, right| left.name.cmp(&right.name));
-
-        let data_offset_bytes = usize::try_from(header_section_len)
-            .map_err(|_| validate_error("safetensors data offset overflowed platform usize"))?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|source| LocalSourceImportError::Read {
             path: path.clone(),
             source,
         })?;
+        let (data_offset_bytes, header) = parse_safetensors_header(&path, &mmap)?;
         let mut by_name = BTreeMap::new();
-        for tensor in &tensors {
+        for tensor in &header.tensors {
             by_name.insert(tensor.name.clone(), tensor.clone());
         }
         Ok(Self {
@@ -292,14 +127,13 @@ impl SafetensorsFile {
             _file: file,
             mmap,
             data_offset_bytes,
-            header: SafetensorsHeader {
-                header_length_bytes,
-                data_length_bytes,
-                metadata,
-                tensors,
-            },
+            header,
             by_name,
         })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.mmap
     }
 
     pub(crate) fn header(&self) -> &SafetensorsHeader {
@@ -342,6 +176,142 @@ impl SafetensorsFile {
             ))
         })
     }
+}
+
+/// Parse and validate one safetensors header from an already-pinned byte
+/// generation. The caller owns the mapping; this helper never reopens a path
+/// and never allocates from the untrusted length prefix before enforcing the
+/// shared header bound.
+pub(crate) fn parse_safetensors_header(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(usize, SafetensorsHeader), LocalSourceImportError> {
+    let prefix = bytes.get(..8).ok_or_else(|| {
+        validate_error(format!(
+            "safetensors file '{}' is too short to contain its 8-byte header length",
+            path.display()
+        ))
+    })?;
+    let header_length_bytes = u64::from_le_bytes(prefix.try_into().expect("8-byte prefix"));
+    if header_length_bytes > SAFETENSORS_HEADER_MAX_BYTES {
+        return Err(validate_error(format!(
+            "safetensors header length {header_length_bytes} exceeds max allowed {SAFETENSORS_HEADER_MAX_BYTES} bytes"
+        )));
+    }
+    let header_section_len = 8_u64.checked_add(header_length_bytes).ok_or_else(|| {
+        validate_error(format!(
+            "safetensors header length {header_length_bytes} overflows file indexing bounds"
+        ))
+    })?;
+    let total_len = u64::try_from(bytes.len())
+        .map_err(|_| validate_error("safetensors file length does not fit u64"))?;
+    if total_len < header_section_len {
+        return Err(validate_error(format!(
+            "safetensors file '{}' is smaller than its declared header ({header_section_len} bytes needed, {total_len} available)",
+            path.display()
+        )));
+    }
+    let data_offset_bytes = usize::try_from(header_section_len)
+        .map_err(|_| validate_error("safetensors data offset overflowed platform usize"))?;
+    let header_bytes = bytes
+        .get(8..data_offset_bytes)
+        .ok_or_else(|| validate_error("safetensors header slice is out of bounds"))?;
+    let header_text = std::str::from_utf8(header_bytes).map_err(|error| {
+        validate_error(format!(
+            "safetensors header is not valid UTF-8 JSON: {error}"
+        ))
+    })?;
+    crate::models::safetensors_json::reject_duplicate_json_keys(header_text).map_err(|error| {
+        validate_error(format!(
+            "safetensors header has duplicate JSON keys: {error}"
+        ))
+    })?;
+
+    let raw_value: serde_json::Value =
+        serde_json::from_str(header_text).map_err(|source| LocalSourceImportError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let raw_object = raw_value
+        .as_object()
+        .ok_or_else(|| validate_error("safetensors header must be a JSON object"))?;
+    let data_length_bytes = total_len - header_section_len;
+    let mut metadata = BTreeMap::new();
+    let mut tensors = Vec::new();
+    for (name, value) in raw_object {
+        if name == "__metadata__" {
+            metadata = serde_json::from_value(value.clone()).map_err(|source| {
+                LocalSourceImportError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            continue;
+        }
+        let raw: RawSafetensorsTensorHeader =
+            serde_json::from_value(value.clone()).map_err(|source| {
+                LocalSourceImportError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        if raw.dtype.trim().is_empty() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{name}' dtype must not be empty"
+            )));
+        }
+        let [start, end] = raw.data_offsets;
+        if end < start {
+            return Err(validate_error(format!(
+                "safetensors tensor '{name}' has inverted offsets {:?}",
+                raw.data_offsets
+            )));
+        }
+        if end > data_length_bytes {
+            return Err(validate_error(format!(
+                "safetensors tensor '{name}' data_offsets end ({end}) exceeds data section length ({data_length_bytes})"
+            )));
+        }
+        if let Some(dtype_size) = dtype_size_bytes(&raw.dtype) {
+            let element_count = tensor_element_count(name, &raw.shape)?;
+            let expected_bytes = (element_count as u64).checked_mul(dtype_size).ok_or_else(
+                || {
+                    validate_error(format!(
+                        "safetensors tensor '{name}' expected byte size overflow from shape/dtype"
+                    ))
+                },
+            )?;
+            let actual_bytes = end - start;
+            if actual_bytes != expected_bytes {
+                return Err(validate_error(format!(
+                    "safetensors tensor '{name}' byte range ({actual_bytes}) does not match expected bytes ({expected_bytes}) from dtype '{}' and shape {:?}",
+                    raw.dtype, raw.shape
+                )));
+            }
+        }
+        tensors.push(SafetensorsTensorHeader {
+            name: name.clone(),
+            dtype: raw.dtype,
+            shape: raw.shape,
+            data_offsets: raw.data_offsets,
+        });
+    }
+    if tensors.is_empty() {
+        return Err(validate_error(
+            "safetensors header must include at least one tensor entry",
+        ));
+    }
+    validate_tensor_offset_ranges(&tensors, data_length_bytes)?;
+    tensors.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok((
+        data_offset_bytes,
+        SafetensorsHeader {
+            header_length_bytes,
+            data_length_bytes,
+            metadata,
+            tensors,
+        },
+    ))
 }
 
 /// Byte size of one element for the safetensors dtypes this shared importer

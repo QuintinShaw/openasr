@@ -19,10 +19,9 @@ use crate::models::runtime_preflight::{
     load_runtime_source_metadata_and_tensor_index,
 };
 use crate::{
-    GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, GgufMetadata,
-    GgufTensorIndex, LongFormOptions, NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice,
-    PhraseBiasConfig, RealtimeAudioFormat, RequestExecutionContext, Transcription,
-    TranscriptionTask,
+    GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, LongFormOptions,
+    NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice, PhraseBiasConfig, RealtimeAudioFormat,
+    RequestExecutionContext, Transcription, TranscriptionTask,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,16 +268,9 @@ impl From<PcmSlice> for GgmlAsrSamplesView<'static> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct GgmlAsrRuntimeSourcePreflight {
-    pub runtime_source: GgmlRuntimeSource,
-    /// `Arc`-wrapped so cloning this preflight (done once per long-form
-    /// slice on the native transcribe hot path) is a refcount bump instead
-    /// of a deep copy of the full GGUF metadata map (which typically
-    /// embeds the whole tokenizer vocab).
-    pub metadata: Arc<GgufMetadata>,
-    pub tensor_index: Arc<GgufTensorIndex>,
-}
+/// ASR-facing compatibility name for the runtime-wide GGUF preflight.
+/// Auxiliary and ASR models intentionally share the same provenance contract.
+pub type GgmlAsrRuntimeSourcePreflight = crate::ggml_runtime::GgufRuntimeSourcePreflight;
 
 /// Pure semantic decoder-state plan.
 ///
@@ -398,6 +390,7 @@ impl<'a> GgmlAsrDecoderStatePlanningInput<'a> {
     /// is the ceiling for the fully padded buffer handed to an executor (the
     /// slicer shrinks padding when content reaches that ceiling), so adding
     /// padding again here would overstate the legal invocation envelope.
+    #[cfg(test)]
     pub(crate) fn for_offline_request(
         preflight: &'a GgmlAsrRuntimeSourcePreflight,
         prepared_audio: &GgmlAsrPreparedAudio,
@@ -475,34 +468,6 @@ impl<'a> GgmlAsrDecoderStatePlanningInput<'a> {
         Ok(Self {
             preflight,
             invocation: envelope.maximum_invocation(),
-            envelope,
-            request_options,
-            backend,
-        })
-    }
-
-    /// Plan one snapshot decode's exact logical state against the immutable
-    /// envelope selected when the streaming session was constructed.
-    pub(crate) fn for_streaming_decode(
-        preflight: &'a GgmlAsrRuntimeSourcePreflight,
-        prepared_audio: &GgmlAsrPreparedAudio,
-        envelope: crate::capacity::topology::InvocationEnvelope,
-        request_options: &'a GgmlAsrExecutionOptions,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    ) -> Result<Self, GgmlAsrDecoderStatePlanningError> {
-        let sample_rate_hz = NonZeroU32::new(prepared_audio.sample_rate_hz).ok_or(
-            GgmlAsrDecoderStatePlanningError::InvalidSampleRate {
-                sample_rate_hz: prepared_audio.sample_rate_hz,
-            },
-        )?;
-        let invocation = crate::capacity::topology::InvocationShapeInput::new(
-            sample_rate_hz,
-            prepared_audio.samples_f32.len(),
-        )
-        .map_err(|source| GgmlAsrDecoderStatePlanningError::InvalidShape { source })?;
-        Ok(Self {
-            preflight,
-            invocation,
             envelope,
             request_options,
             backend,
@@ -1773,9 +1738,9 @@ impl GgmlAsrExecutionDispatch {
 
 /// OADP Phase 0 fail-closed gate: when an adapter is active (request-level
 /// adapter path, falling back to the server-side `OPENASR_ADAPTER` env var),
-/// only the moonshine family may execute; the adapter is then validated
-/// against the base pack inside the moonshine executor. Every other family
-/// hard-errors instead of silently ignoring the adapter.
+/// only families with an implemented LoRA binding contract may execute; the
+/// adapter is then validated against the base pack inside that executor.
+/// Every other family hard-errors instead of silently ignoring the adapter.
 fn ensure_adapter_supported_for_family(
     selected_family: &GgmlFamilyAdapterDescriptor,
     request_adapter_path: Option<&std::path::Path>,
@@ -1783,7 +1748,11 @@ fn ensure_adapter_supported_for_family(
     let Some(adapter_path) = crate::adapter_pack::active_adapter_path(request_adapter_path) else {
         return Ok(());
     };
-    if selected_family.model_family == crate::models::moonshine::MOONSHINE_MODEL_FAMILY {
+    if matches!(
+        selected_family.model_family,
+        crate::models::moonshine::MOONSHINE_MODEL_FAMILY
+            | crate::models::qwen::QWEN3_ASR_MODEL_FAMILY
+    ) {
         return Ok(());
     }
     Err(GgmlAsrExecutionError::AdapterUnsupportedForFamily {
@@ -2172,6 +2141,13 @@ mod tests {
                 false
             }
 
+            fn decoder_state_contract(
+                &self,
+                _selected_family: &GgmlFamilyAdapterDescriptor,
+            ) -> Result<GgmlAsrDecoderStateContract, GgmlAsrExecutionError> {
+                Ok(GgmlAsrDecoderStateContract::NoPersistentState)
+            }
+
             fn execute(
                 &self,
                 request: &GgmlAsrExecutionRequest,
@@ -2222,6 +2198,13 @@ mod tests {
 
             fn supports_phrase_bias(&self) -> bool {
                 false
+            }
+
+            fn decoder_state_contract(
+                &self,
+                _selected_family: &GgmlFamilyAdapterDescriptor,
+            ) -> Result<GgmlAsrDecoderStateContract, GgmlAsrExecutionError> {
+                Ok(GgmlAsrDecoderStateContract::NoPersistentState)
             }
 
             fn execute_view(
@@ -2459,7 +2442,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_fails_closed_when_adapter_is_active_for_non_moonshine_family() {
+    fn dispatch_allows_qwen_lora_and_rejects_unsupported_families() {
         struct StubExecutor;
         impl GgmlAsrExecutor for StubExecutor {
             fn executor_id(&self) -> &'static str {
@@ -2485,7 +2468,7 @@ mod tests {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
                         unnamed_speakers: Vec::new(),
-                        text: "must never run".to_string(),
+                        text: "qwen-lora".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
@@ -2496,27 +2479,32 @@ mod tests {
             }
         }
 
-        // qwen (non-moonshine) family with a request-level adapter: the gate
-        // must hard-error BEFORE any executor runs, even though one is
-        // registered for the capability.
+        // Qwen has a native LoRA binding contract, so it must reach the
+        // registered executor instead of dying in the family gate.
         let mut request = whisper_request(GgmlAsrBackendPreference::CpuOnly);
         request.selected_family = qwen3_asr_runtime_descriptor_v1();
         request.request_options.adapter_path = Some(PathBuf::from("/tmp/fixture.oadp"));
         let dispatch = GgmlAsrExecutionDispatch::default()
             .with_native_graph_lowering_v1(Arc::new(StubExecutor));
 
-        let error = dispatch
+        let result = dispatch
             .execute(&request)
-            .expect_err("adapter on a non-moonshine family must fail closed");
+            .expect("Qwen adapter request must reach its executor");
+        assert_eq!(result.transcription.text, "qwen-lora");
+
+        let mut unsupported_whisper_request = whisper_request(GgmlAsrBackendPreference::CpuOnly);
+        unsupported_whisper_request.request_options.adapter_path =
+            Some(PathBuf::from("/tmp/fixture.oadp"));
+        let error = dispatch
+            .execute(&unsupported_whisper_request)
+            .expect_err("unsupported family must fail closed before execution");
         assert!(matches!(
             error,
             GgmlAsrExecutionError::AdapterUnsupportedForFamily {
-                model_family: crate::QWEN3_ASR_MODEL_FAMILY,
+                model_family: "whisper",
                 ..
             }
         ));
-        assert!(error.to_string().contains("/tmp/fixture.oadp"));
-        assert!(error.to_string().contains("fail-closed"));
 
         // The same adapter on the moonshine family passes the gate: with no
         // moonshine executor registered it must reach executor lookup and

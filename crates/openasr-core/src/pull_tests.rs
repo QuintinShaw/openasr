@@ -1936,7 +1936,9 @@ fn pull_rejects_corrupt_gguf_before_installing() {
     bytes.extend_from_slice(b"GGUF");
     bytes.extend_from_slice(&3_u32.to_le_bytes());
     bytes.extend_from_slice(&1_u64.to_le_bytes());
-    bytes.extend_from_slice(&(MAX_GGUF_METADATA_ENTRIES + 1).to_le_bytes());
+    bytes.extend_from_slice(
+        &(crate::ggml_runtime::MAX_RUNTIME_GGUF_METADATA_ENTRIES + 1).to_le_bytes(),
+    );
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
     let mut client = FakeClient::with_responses(vec![ResponseSpec {

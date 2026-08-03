@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, CString},
+    ffi::CStr,
     os::raw::c_void,
     path::{Path, PathBuf},
     ptr,
@@ -97,10 +97,14 @@ impl GgufMetadata {
 pub enum GgufMetadataReadError {
     #[error(transparent)]
     InvalidRuntimeSource(#[from] GgmlRuntimeSourcePathError),
+    /// Retained for source compatibility. Buffer-backed parsing no longer
+    /// constructs a C path and therefore does not emit this variant.
     #[error("gguf metadata path cannot be represented as C string: {path}")]
     PathContainsNul { path: String },
     #[error("gguf metadata initialization failed for '{path}'")]
     InitFailed { path: PathBuf },
+    #[error("gguf metadata allocation failed for '{path}'")]
+    AllocationFailed { path: PathBuf },
     #[error("gguf metadata key count is negative for '{path}': {count}")]
     NegativeKeyCount { path: PathBuf, count: i64 },
     #[error("gguf metadata key {index} in '{path}' is null")]
@@ -148,22 +152,58 @@ pub fn read_gguf_metadata(path: impl AsRef<Path>) -> Result<GgufMetadata, GgufMe
 pub fn read_gguf_metadata_from_runtime_source(
     runtime_source: &GgmlRuntimeSource,
 ) -> Result<GgufMetadata, GgufMetadataReadError> {
-    let path = runtime_source.path();
-    let path_cstring = path_to_cstring(path)?;
+    read_gguf_metadata_from_runtime_source_internal(
+        runtime_source,
+        super::runtime_gguf_parse_limits(),
+    )
+}
 
-    let context = unsafe {
-        let raw = ffi::gguf_init_from_file(
-            path_cstring.as_ptr(),
-            ffi::GgufInitParams {
-                no_alloc: true,
-                ctx: ptr::null_mut(),
-            },
-        );
-        GgufContextGuard::from_raw(raw)
-    }
-    .ok_or_else(|| GgufMetadataReadError::InitFailed {
-        path: path.to_path_buf(),
+pub(crate) fn read_gguf_metadata_from_runtime_source_with_limits(
+    runtime_source: &GgmlRuntimeSource,
+    max_tensors: u64,
+    max_kv: u64,
+) -> Result<GgufMetadata, GgufMetadataReadError> {
+    read_gguf_metadata_from_runtime_source_internal(
+        runtime_source,
+        ffi::GgufParseLimits {
+            max_tensors,
+            max_kv,
+            ..super::runtime_gguf_parse_limits()
+        },
+    )
+}
+
+fn read_gguf_metadata_from_runtime_source_internal(
+    runtime_source: &GgmlRuntimeSource,
+    limits: ffi::GgufParseLimits,
+) -> Result<GgufMetadata, GgufMetadataReadError> {
+    let path = runtime_source.path();
+    let context = parse_bounded_gguf_context(runtime_source, limits).map_err(|failure| {
+        if failure == GgufBoundedParseFailure::Allocation {
+            crate::models::native_execution_services::record_current_execution_candidate_failure(
+                crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                    "gguf-bounded-metadata-parse",
+                    format!("allocation failed while parsing {}", path.display()),
+                ),
+            );
+            GgufMetadataReadError::AllocationFailed {
+                path: path.to_path_buf(),
+            }
+        } else {
+            GgufMetadataReadError::InitFailed {
+                path: path.to_path_buf(),
+            }
+        }
     })?;
+
+    read_gguf_metadata_from_context(runtime_source, &context)
+}
+
+pub(crate) fn read_gguf_metadata_from_context(
+    runtime_source: &GgmlRuntimeSource,
+    context: &GgufContextGuard,
+) -> Result<GgufMetadata, GgufMetadataReadError> {
+    let path = runtime_source.path();
 
     let key_count = unsafe { ffi::gguf_get_n_kv(context.as_ptr()) };
     if key_count < 0 {
@@ -284,27 +324,68 @@ pub fn read_gguf_metadata_from_runtime_source(
     Ok(GgufMetadata { values })
 }
 
-fn path_to_cstring(path: &Path) -> Result<CString, GgufMetadataReadError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            GgufMetadataReadError::PathContainsNul {
-                path: path.display().to_string(),
-            }
-        })
-    }
-
-    #[cfg(not(unix))]
-    {
-        let rendered = path.as_os_str().to_string_lossy();
-        CString::new(rendered.as_bytes()).map_err(|_| GgufMetadataReadError::PathContainsNul {
-            path: rendered.into_owned(),
-        })
-    }
+pub(crate) fn bounded_gguf_parser_structural_bytes(n_kv: u64, n_tensors: u64) -> Option<u64> {
+    let mut bytes = 0_usize;
+    let ok = unsafe { ffi::gguf_bounded_parser_structural_bytes(n_kv, n_tensors, &mut bytes) };
+    ok.then(|| u64::try_from(bytes).ok()).flatten()
 }
 
-struct GgufContextGuard {
+pub(crate) fn bounded_gguf_parser_payload_wire_multiplier() -> Option<u64> {
+    u64::try_from(unsafe { ffi::gguf_bounded_parser_payload_wire_multiplier() }).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GgufBoundedParseFailure {
+    InvalidData,
+    Allocation,
+}
+
+pub(crate) fn parse_bounded_gguf_context(
+    runtime_source: &GgmlRuntimeSource,
+    limits: ffi::GgufParseLimits,
+) -> Result<GgufContextGuard, GgufBoundedParseFailure> {
+    #[cfg(test)]
+    BOUNDED_PARSE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let mmap = runtime_source.backing_mmap();
+    let mut parse_error = ffi::GGUF_PARSE_ERROR_NONE;
+    let context = unsafe {
+        let params = ffi::GgufInitParams {
+            no_alloc: true,
+            ctx: ptr::null_mut(),
+        };
+        let raw = ffi::gguf_init_from_buffer_with_limits(
+            mmap.as_ptr().cast(),
+            mmap.len(),
+            params,
+            limits,
+            &mut parse_error,
+        );
+        GgufContextGuard::from_raw(raw)
+    };
+    context.ok_or_else(|| {
+        if parse_error == ffi::GGUF_PARSE_ERROR_ALLOCATION {
+            GgufBoundedParseFailure::Allocation
+        } else {
+            debug_assert!(matches!(
+                parse_error,
+                ffi::GGUF_PARSE_ERROR_NONE | ffi::GGUF_PARSE_ERROR_INVALID_DATA
+            ));
+            GgufBoundedParseFailure::InvalidData
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static BOUNDED_PARSE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn bounded_parse_call_count_for_current_thread() -> u64 {
+    BOUNDED_PARSE_CALLS.with(std::cell::Cell::get)
+}
+
+pub(crate) struct GgufContextGuard {
     raw: ffi::GgufContextRaw,
 }
 
@@ -313,7 +394,7 @@ impl GgufContextGuard {
         (!raw.is_null()).then_some(Self { raw })
     }
 
-    fn as_ptr(&self) -> *const c_void {
+    pub(crate) fn as_ptr(&self) -> *const c_void {
         self.raw as *const c_void
     }
 }
@@ -417,6 +498,104 @@ mod tests {
         assert!(ok, "gguf_write_to_file must succeed");
     }
 
+    fn parse_raw_with_limits(
+        bytes: &[u8],
+        limits: super::ffi::GgufParseLimits,
+    ) -> (bool, std::os::raw::c_int) {
+        let mut error = super::ffi::GGUF_PARSE_ERROR_NONE;
+        let raw = unsafe {
+            super::ffi::gguf_init_from_buffer_with_limits(
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                super::ffi::GgufInitParams {
+                    no_alloc: true,
+                    ctx: std::ptr::null_mut(),
+                },
+                limits,
+                &mut error,
+            )
+        };
+        if !raw.is_null() {
+            unsafe { super::ffi::gguf_free(raw) };
+        }
+        (!raw.is_null(), error)
+    }
+
+    fn empty_gguf_header(tensors: i64, kv: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&tensors.to_le_bytes());
+        bytes.extend_from_slice(&kv.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn bounded_parser_abi_enforces_every_header_resource_dimension() {
+        let defaults = super::super::runtime_gguf_parse_limits();
+        let valid = empty_gguf_header(0, 0);
+        assert_eq!(parse_raw_with_limits(&valid, defaults), (true, 0));
+
+        let (_, tensor_error) = parse_raw_with_limits(
+            &empty_gguf_header(1, 0),
+            super::ffi::GgufParseLimits {
+                max_tensors: 0,
+                ..defaults
+            },
+        );
+        assert_eq!(tensor_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
+
+        let (_, kv_error) = parse_raw_with_limits(
+            &empty_gguf_header(0, 1),
+            super::ffi::GgufParseLimits {
+                max_kv: 0,
+                ..defaults
+            },
+        );
+        assert_eq!(kv_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
+
+        let (_, header_error) = parse_raw_with_limits(
+            &valid,
+            super::ffi::GgufParseLimits {
+                max_header_bytes: u64::try_from(valid.len() - 1).expect("header length"),
+                ..defaults
+            },
+        );
+        assert_eq!(header_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
+
+        let mut string_value = empty_gguf_header(0, 1);
+        string_value.extend_from_slice(&4_u64.to_le_bytes());
+        string_value.extend_from_slice(b"name");
+        string_value.extend_from_slice(&super::ffi::GGUF_TYPE_STRING.to_le_bytes());
+        string_value.extend_from_slice(&1_u64.to_le_bytes());
+        string_value.extend_from_slice(b"x");
+        let (_, string_error) = parse_raw_with_limits(
+            &string_value,
+            super::ffi::GgufParseLimits {
+                max_string_bytes: 3,
+                ..defaults
+            },
+        );
+        assert_eq!(string_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
+
+        let mut array_value = empty_gguf_header(0, 1);
+        array_value.extend_from_slice(&1_u64.to_le_bytes());
+        array_value.extend_from_slice(b"x");
+        array_value.extend_from_slice(&super::ffi::GGUF_TYPE_ARRAY.to_le_bytes());
+        array_value.extend_from_slice(&super::ffi::GGUF_TYPE_UINT32.to_le_bytes());
+        array_value.extend_from_slice(&2_u64.to_le_bytes());
+        array_value.extend_from_slice(&1_u32.to_le_bytes());
+        array_value.extend_from_slice(&2_u32.to_le_bytes());
+        let (_, array_error) = parse_raw_with_limits(
+            &array_value,
+            super::ffi::GgufParseLimits {
+                max_array_elements: 1,
+                ..defaults
+            },
+        );
+        assert_eq!(array_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
+    }
+
     #[test]
     fn reads_supported_metadata_types() {
         let file = NamedTempFile::new().expect("temp file");
@@ -462,6 +641,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_u32_general_alignment_without_aborting() {
+        let file = NamedTempFile::new().expect("temp file");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_i64.to_le_bytes());
+        bytes.extend_from_slice(&1_i64.to_le_bytes());
+        let key = b"general.alignment";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&super::ffi::GGUF_TYPE_STRING.to_le_bytes());
+        let value = b"32";
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value);
+        std::fs::write(file.path(), bytes).expect("write malformed alignment fixture");
+
+        let error = read_gguf_metadata(file.path())
+            .expect_err("a string-valued alignment must be rejected by the C parser");
+        assert!(matches!(error, GgufMetadataReadError::InitFailed { .. }));
+    }
+
+    #[test]
     fn reads_metadata_from_validated_runtime_source() {
         let file = NamedTempFile::new().expect("temp file");
         write_fixture(
@@ -476,6 +677,39 @@ mod tests {
         assert_eq!(
             metadata.get_string("openasr.model.id"),
             Some("whisper-tiny:q8_0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_source_metadata_is_bound_to_the_validated_file_identity() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let source_path = directory.path().join("model.gguf");
+        let replacement_path = directory.path().join("replacement.gguf");
+        write_fixture(
+            &source_path,
+            &[TestEntry::String("openasr.model.id", "validated:model")],
+        );
+
+        let runtime_source =
+            validate_ggml_runtime_source_path(&source_path).expect("validate runtime source");
+        write_fixture(
+            &replacement_path,
+            &[TestEntry::String("openasr.model.id", "replacement:model")],
+        );
+        fs::rename(&replacement_path, &source_path).expect("atomically replace path");
+
+        let metadata =
+            read_gguf_metadata_from_runtime_source(&runtime_source).expect("read held source");
+        assert_eq!(
+            metadata.get_string("openasr.model.id"),
+            Some("validated:model")
+        );
+        assert_eq!(
+            read_gguf_metadata(&source_path)
+                .expect("read replacement")
+                .get_string("openasr.model.id"),
+            Some("replacement:model")
         );
     }
 

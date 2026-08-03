@@ -23,6 +23,7 @@ pub use pack::{
 pub use policy_runtime::PolicyResolvedSpeakerRuntime;
 pub(crate) use redimnet::backbone::RedimNetResidentRuntime;
 
+#[cfg(test)]
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -34,6 +35,10 @@ use redimnet::frontend::RedimNetFrontend;
 /// Sample rate the embedder requires.
 const SAMPLE_RATE_HZ: u32 = 16_000;
 pub(crate) const REDIMNET_MAX_BATCH_WORKERS: usize = 4;
+
+pub(crate) const fn redimnet_frontend_payload_quote(samples: usize) -> (u64, u64) {
+    RedimNetFrontend::quoted_forward_payload_bytes(samples)
+}
 
 #[cfg(test)]
 const REDIMNET_BENCH_WORKERS_ENV: &str = "OPENASR_REDIMNET_BENCH_WORKERS";
@@ -148,10 +153,10 @@ impl RedimNet2Embedder {
         })
     }
 
-    pub(crate) fn from_runtime_source(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     ) -> Result<Self, EmbedError> {
-        let model = RedimNet2Model::from_runtime_source(runtime_source)
+        let model = RedimNet2Model::from_preflight(preflight)
             .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
         Ok(Self {
             model,
@@ -193,10 +198,6 @@ impl RedimNet2Embedder {
         pack::REDIMNET_EMBEDDING_SPACE_VERSION
     }
 
-    pub(crate) fn logical_f32_weight_bytes(&self) -> u64 {
-        self.model.logical_f32_weight_bytes()
-    }
-
     pub(crate) fn prepare_embedding_input(
         &self,
         samples: &[f32],
@@ -211,8 +212,6 @@ impl RedimNet2Embedder {
         {
             return Err(EmbedError::Canceled);
         }
-        #[cfg(test)]
-        let _active_probe = RedimActiveProbe::enter();
         let (features, frames) = self.frontend.forward(samples);
         if frames == 0 {
             return Err(EmbedError::TooShort);
@@ -223,32 +222,13 @@ impl RedimNet2Embedder {
     pub(crate) fn shared_weights(&self) -> std::sync::Arc<weights::Weights> {
         self.model.shared_weights()
     }
-
-    #[cfg(test)]
-    fn embed_uncached_for_bench(
-        &self,
-        samples: &[f32],
-        sample_rate_hz: u32,
-    ) -> Result<SpeakerEmbedding, EmbedError> {
-        if sample_rate_hz != SAMPLE_RATE_HZ {
-            return Err(EmbedError::UnsupportedSampleRate(sample_rate_hz));
-        }
-        let (features, frames) = self.frontend.forward(samples);
-        if frames == 0 {
-            return Err(EmbedError::TooShort);
-        }
-        let raw = self
-            .model
-            .forward_uncached_for_bench(&features, frames)
-            .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
-        Ok(SpeakerEmbedding::l2_normalized(raw))
-    }
 }
 
 pub(crate) fn cancel_requested(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> bool {
     flag.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(test)]
 fn embed_batch_worker_range(
     clips: &[&[f32]],
     inherited_cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -284,39 +264,4 @@ fn abort_successful_results_after_terminal_failure(
             ));
         }
     }
-}
-
-#[cfg(test)]
-static REDIM_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static REDIM_MAX_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-struct RedimActiveProbe;
-
-#[cfg(test)]
-impl RedimActiveProbe {
-    fn enter() -> Self {
-        use std::sync::atomic::Ordering;
-        let active = REDIM_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
-        REDIM_MAX_ACTIVE.fetch_max(active, Ordering::SeqCst);
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for RedimActiveProbe {
-    fn drop(&mut self) {
-        REDIM_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-fn reset_redim_max_active() {
-    REDIM_MAX_ACTIVE.store(0, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(test)]
-fn redim_max_active() -> usize {
-    REDIM_MAX_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }

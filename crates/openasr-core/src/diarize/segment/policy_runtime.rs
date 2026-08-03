@@ -21,16 +21,17 @@ use crate::{
         },
         system_memory_owner::{
             AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
-            SystemMemoryOwner,
+            SystemMemoryAllocationTransactionError, SystemMemoryOwner,
         },
     },
 };
 
 use super::{
     DIARIZEN_GGML_ARCHITECTURE_ID, LocalActivity, LocalActivitySegmenter, PyannoteSegmenter,
-    SegmentError, SegmenterProvider, diarizen, pack::PreparedSelectedSegmenter,
+    SegmentError, SegmenterProvider, diarizen,
+    pack::{PreparedSegmenterSource, PreparedSelectedSegmenter},
 };
-use crate::diarize::embed::weights::{WeightsError, allocation_commitment_u64};
+use crate::diarize::embed::weights::WeightsError;
 use crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID;
 
 const PYANNOTE_STAGE: &str = "pyannote-segmentation-stage-v1";
@@ -75,18 +76,9 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         prepared: PreparedSelectedSegmenter,
     ) -> Result<Self, SegmentError> {
         debug_assert_eq!(prepared.provider, SegmenterProvider::Segmentation3_0);
-        let source = exact_source(&prepared)?;
-        let tensor_index = crate::read_gguf_tensor_index_from_runtime_source(&source)
-            .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-        let retained_quote =
-            PyannoteSegmenter::quoted_persistent_host_commitment_bytes(&tensor_index)
-                .map_err(weights_error)?;
-        let mapped_quote =
-            allocation_commitment_u64(source.backing_mmap().len() as u64).map_err(weights_error)?;
-        let peak_quote = retained_quote.checked_add(mapped_quote).ok_or_else(|| {
-            SegmentError::LoadFailed("pyannote construction peak byte sum overflow".to_string())
-        })?;
-        drop(source);
+        let source = prepared.source;
+        let content_id = source.content_id().to_string();
+        let (retained_quote, peak_quote) = pyannote_source_quote(&source)?;
 
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
@@ -95,8 +87,6 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         )
         .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
         let services_for_builder = Arc::clone(&execution_services);
-        let path = prepared.pack_path;
-        let content_id = prepared.content_id;
         let builder = Arc::new(move |_candidate: &ExecutionCandidate| {
             let key = AuxiliaryRuntimeCacheKey::for_current_lane::<PyannoteSegmenter>(
                 PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -109,7 +99,7 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
                 .get_or_try_insert_admitted_with(
                     key,
                     retained_quote,
-                    || build_admitted_pyannote(&path, &content_id, peak_quote, retained_quote),
+                    || build_admitted_pyannote(&source, &content_id, peak_quote, retained_quote),
                     |error| SegmentError::LoadFailed(error.to_string()),
                 )
         });
@@ -161,10 +151,22 @@ impl PolicyResolvedDiariZenSegmenterRuntime {
         )
         .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
         let services_for_builder = Arc::clone(&execution_services);
-        let path = prepared.pack_path;
-        let content_id = prepared.content_id;
+        let PreparedSegmenterSource::Gguf {
+            preflight,
+            content_id,
+        } = prepared.source
+        else {
+            return Err(SegmentError::LoadFailed(
+                "DiariZen runtime requires a GGUF .oasr source".to_string(),
+            ));
+        };
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
-            load_diarizen_actor(services_for_builder.as_ref(), &path, &content_id, candidate)
+            load_diarizen_actor(
+                services_for_builder.as_ref(),
+                &preflight,
+                &content_id,
+                candidate,
+            )
         });
         let runtime = PolicyResolvedAuxRuntime::try_new(
             execution_services,
@@ -250,17 +252,15 @@ impl PolicyResolvedSegmenterRuntime {
 
 fn load_diarizen_actor(
     execution_services: &NativeExecutionServices,
-    pack_path: &std::path::Path,
+    preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     expected_content_id: &str,
     candidate: &ExecutionCandidate,
 ) -> Result<DiariZenActor, SegmentError> {
-    let source = crate::validate_ggml_runtime_source_path(pack_path)
-        .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-    if source.content_id() != expected_content_id {
+    if preflight.runtime_source.content_id() != expected_content_id {
         return Err(content_changed(
             "DiariZen",
             expected_content_id,
-            source.content_id(),
+            preflight.runtime_source.content_id(),
         ));
     }
     let backend =
@@ -271,29 +271,22 @@ fn load_diarizen_actor(
         DIARIZEN_RUNTIME_REPRESENTATION,
         backend,
     );
-    let path = pack_path.to_path_buf();
+    let quote = diarizen::DiariZenRuntime::quote_candidate_system_memory(preflight)
+        .map_err(diarizen_error)?;
+    let retained_bytes = quote.retained_bytes;
+    let preflight = preflight.clone();
     let content_id = expected_content_id.to_string();
     execution_services
         .diarizen_segmenter_actors()
         .get_or_try_insert_with(
             key,
-            || {
-                let quote = diarizen::DiariZenRuntime::quote_candidate_system_memory(&source)
-                    .map_err(diarizen_error)?;
-                Ok((quote.retained_bytes, quote))
-            },
+            || Ok((retained_bytes, quote)),
             move |quote| {
-                let source = crate::validate_ggml_runtime_source_path(&path)
+                let snapshot = preflight
+                    .immutable_snapshot_matching_content_id(&content_id)
                     .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-                if source.content_id() != content_id {
-                    return Err(content_changed(
-                        "DiariZen",
-                        &content_id,
-                        source.content_id(),
-                    ));
-                }
                 let mut owner = diarizen::DiariZenRuntime::try_allocate_inside_parent_candidate(
-                    quote, &source, backend,
+                    quote, &snapshot, backend,
                 )
                 .map_err(diarizen_error)?;
                 let warmup = vec![0.0_f32; diarizen::DIARIZEN_WINDOW_SAMPLES];
@@ -304,23 +297,8 @@ fn load_diarizen_actor(
         )
 }
 
-fn exact_source(
-    prepared: &PreparedSelectedSegmenter,
-) -> Result<crate::GgmlRuntimeSource, SegmentError> {
-    let source = crate::validate_ggml_runtime_source_path(&prepared.pack_path)
-        .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-    if source.content_id() != prepared.content_id {
-        return Err(content_changed(
-            "segmenter",
-            &prepared.content_id,
-            source.content_id(),
-        ));
-    }
-    Ok(source)
-}
-
 fn build_admitted_pyannote(
-    pack_path: &std::path::Path,
+    source: &PreparedSegmenterSource,
     expected_content_id: &str,
     peak_quote: u64,
     retained_quote: u64,
@@ -331,33 +309,83 @@ fn build_admitted_pyannote(
         retained_quote,
     )
     .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-    let owner = SystemMemoryOwner::try_allocate(quote, || {
-        let source = crate::validate_ggml_runtime_source_path(pack_path)
-            .map_err(|error| error.to_string())?;
-        if source.content_id() != expected_content_id {
-            return Err(format!(
-                "pyannote pack changed between quote and construction: expected {expected_content_id}, got {}",
-                source.content_id()
-            ));
-        }
-        let mapped_commitment = allocation_commitment_u64(source.backing_mmap().len() as u64)
-            .map_err(|error| error.to_string())?;
-        let segmenter = PyannoteSegmenter::from_runtime_source(&source)
-            .map_err(|error| error.to_string())?;
+    let transaction = SystemMemoryOwner::try_allocate_transaction(quote, || {
+        let segmenter = match source {
+            PreparedSegmenterSource::Gguf { preflight, .. } => {
+                let snapshot = preflight
+                    .immutable_snapshot_matching_content_id(expected_content_id)
+                    .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+                PyannoteSegmenter::from_preflight(&snapshot).map_err(weights_error)?
+            }
+            PreparedSegmenterSource::Safetensors { path, .. } => {
+                let snapshot =
+                    super::pack::immutable_safetensors_snapshot(path, expected_content_id)?;
+                PyannoteSegmenter::from_safetensors(&snapshot).map_err(weights_error)?
+            }
+        };
         let actual_retained = segmenter
             .persistent_host_commitment_bytes()
-            .map_err(|error| error.to_string())?;
-        let actual_peak = actual_retained
-            .checked_add(mapped_commitment)
-            .ok_or_else(|| "pyannote measured construction peak overflow".to_string())?;
-        Ok(SystemMemoryAllocationOutcome::new(
+            .map_err(weights_error)?;
+        Ok::<_, SegmentError>(SystemMemoryAllocationOutcome::new(
             segmenter,
-            actual_peak,
+            peak_quote,
             actual_retained,
         ))
-    })
-    .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+    });
+    let owner = match transaction {
+        Ok(owner) => owner,
+        Err(SystemMemoryAllocationTransactionError::Allocation(error)) => return Err(error),
+        Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+            return Err(SegmentError::LoadFailed(error.to_string()));
+        }
+    };
     Ok(Arc::new(owner))
+}
+
+fn pyannote_source_quote(source: &PreparedSegmenterSource) -> Result<(u64, u64), SegmentError> {
+    match source {
+        PreparedSegmenterSource::Gguf {
+            preflight,
+            content_id,
+        } => {
+            if preflight.runtime_source.content_id() != content_id {
+                return Err(content_changed(
+                    "segmenter",
+                    content_id,
+                    preflight.runtime_source.content_id(),
+                ));
+            }
+            let retained =
+                PyannoteSegmenter::quoted_persistent_host_commitment_bytes(&preflight.tensor_index)
+                    .map_err(weights_error)?;
+            let peak = preflight
+                .runtime_source
+                .immutable_snapshot_construction_peak_bytes(retained)
+                .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+            Ok((retained, peak))
+        }
+        PreparedSegmenterSource::Safetensors {
+            source_bytes,
+            retained_quote,
+            parser_peak_quote,
+            ..
+        } => {
+            let copy_peak = source_bytes.checked_mul(2).ok_or_else(|| {
+                SegmentError::LoadFailed(
+                    "raw safetensors snapshot copy byte quote overflowed".to_string(),
+                )
+            })?;
+            let materialization_peak = source_bytes
+                .checked_add(*retained_quote)
+                .and_then(|bytes| bytes.checked_add(*parser_peak_quote))
+                .ok_or_else(|| {
+                    SegmentError::LoadFailed(
+                        "raw safetensors materialization byte quote overflowed".to_string(),
+                    )
+                })?;
+            Ok((*retained_quote, copy_peak.max(materialization_peak)))
+        }
+    }
 }
 
 fn weights_error(error: WeightsError) -> SegmentError {
@@ -383,4 +411,23 @@ fn content_changed(label: &str, expected: &str, actual: &str) -> SegmentError {
     SegmentError::LoadFailed(format!(
         "{label} pack changed between preflight and construction: expected {expected}, got {actual}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diarizen_graph_cancellation_remains_typed_across_policy_boundary() {
+        for source in [
+            crate::ggml_runtime::GgmlCpuGraphError::Aborted,
+            crate::ggml_runtime::GgmlCpuGraphError::Canceled,
+        ] {
+            let mapped = diarizen_error(diarizen::DiariZenSegmenterError::Graph {
+                step: "fixture",
+                source,
+            });
+            assert!(matches!(mapped, SegmentError::Canceled));
+        }
+    }
 }

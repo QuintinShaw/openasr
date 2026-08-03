@@ -328,6 +328,24 @@ impl<T> SystemMemoryOwner<T> {
     }
 }
 
+impl SystemMemoryOwner<()> {
+    /// Atomically reserves SystemMemory capacity for fallible allocations made
+    /// by an invocation whose individual containers cannot own the broker
+    /// lease. The returned guard must outlive every covered allocation.
+    pub(crate) fn try_reserve_invocation(
+        resource_id: impl Into<String>,
+        bytes: u64,
+    ) -> Result<Self, SystemMemoryOwnerError> {
+        if bytes == 0 {
+            return Ok(Self::without_allocation(()));
+        }
+        let quote = SystemMemoryAllocationQuote::new(resource_id, bytes, bytes)?;
+        Self::try_allocate(quote, || {
+            Ok(SystemMemoryAllocationOutcome::new((), bytes, bytes))
+        })
+    }
+}
+
 impl<T> Deref for SystemMemoryOwner<T> {
     type Target = T;
 

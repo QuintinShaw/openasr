@@ -1,7 +1,5 @@
 //! Admitted owner-thread runtime for FireRedPunc.
 
-use std::path::Path;
-
 use thiserror::Error;
 
 use crate::device::execution_policy::ExecutionCandidate;
@@ -31,16 +29,14 @@ pub(crate) enum PolicyOwnedFireRedPuncError {
 
 pub(crate) fn load_actor(
     execution_services: &NativeExecutionServices,
-    pack_path: &Path,
+    preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     expected_content_id: &str,
     candidate: &ExecutionCandidate,
 ) -> Result<FireRedPuncActor, PolicyOwnedFireRedPuncError> {
-    let source = crate::validate_ggml_runtime_source_path(pack_path)
-        .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-    if source.content_id() != expected_content_id {
+    if preflight.runtime_source.content_id() != expected_content_id {
         return Err(PolicyOwnedFireRedPuncError::ContentChanged {
             expected: expected_content_id.to_string(),
-            actual: source.content_id().to_string(),
+            actual: preflight.runtime_source.content_id().to_string(),
         });
     }
     let backend = resolved_runtime_for_auxiliary_candidate(
@@ -54,27 +50,22 @@ pub(crate) fn load_actor(
         "firered-punc.runtime.v1",
         backend,
     );
-    let build_path = pack_path.to_path_buf();
+    let build_preflight = preflight.clone();
     let build_content_id = expected_content_id.to_string();
     execution_services
         .firered_punc_actors()
         .get_or_try_insert_with(
             key,
             || {
-                let quote = FireRedPuncRuntime::quote_candidate_system_memory(&source)?;
+                let quote = FireRedPuncRuntime::quote_candidate_system_memory(preflight)?;
                 Ok((quote.retained_bytes, quote))
             },
             move |quote| {
-                let source = crate::validate_ggml_runtime_source_path(&build_path)
+                let snapshot = build_preflight
+                    .immutable_snapshot_matching_content_id(&build_content_id)
                     .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-                if source.content_id() != build_content_id {
-                    return Err(PolicyOwnedFireRedPuncError::ContentChanged {
-                        expected: build_content_id,
-                        actual: source.content_id().to_string(),
-                    });
-                }
                 let owner = FireRedPuncRuntime::try_allocate_inside_parent_candidate(
-                    quote, &source, backend,
+                    quote, &snapshot, backend,
                 )
                 .map_err(PolicyOwnedFireRedPuncError::from)?;
                 owner.punctuate(WARMUP_TEXT)?;

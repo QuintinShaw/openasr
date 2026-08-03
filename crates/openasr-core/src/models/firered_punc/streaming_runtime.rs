@@ -77,8 +77,22 @@ impl PolicyResolvedStreamingPunctuator {
                 return Ok(None);
             }
         };
-        let prepared_content_id = prepared_source.content_id().to_string();
-        drop(prepared_source);
+        let prepared_preflight =
+            match crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
+                &prepared_source,
+            ) {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    crate::stage_timing::log_detail_event(
+                        "native_auxiliary_runtime",
+                        format_args!(
+                            "stage=streaming_punctuation event=disabled reason=pack-preflight detail={error}"
+                        ),
+                    );
+                    return Ok(None);
+                }
+            };
+        let prepared_content_id = prepared_preflight.runtime_source.content_id().to_string();
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
             FIRERED_PUNC_ARCHITECTURE_VALUE,
@@ -95,7 +109,7 @@ impl PolicyResolvedStreamingPunctuator {
         let builder = Arc::new(move |candidate: &_| {
             load_actor(
                 builder_services.as_ref(),
-                &pack_path,
+                &prepared_preflight,
                 &prepared_content_id,
                 candidate,
             )

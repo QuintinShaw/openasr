@@ -1,15 +1,13 @@
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, CString},
-    fs,
-    os::raw::c_void,
+    ffi::CStr,
     path::{Path, PathBuf},
-    ptr,
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::gguf_metadata::{GgufBoundedParseFailure, GgufContextGuard, parse_bounded_gguf_context};
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, ffi, validate_ggml_runtime_source_path,
 };
@@ -125,16 +123,22 @@ impl GgufTensorIndex {
 pub enum GgufTensorIndexReadError {
     #[error(transparent)]
     InvalidRuntimeSource(#[from] GgmlRuntimeSourcePathError),
+    /// Retained for source compatibility. File size now comes from the held
+    /// mapping, so buffer-backed parsing does not emit this variant.
     #[error("could not read gguf runtime source metadata for '{path}': {source}")]
     SourceMetadata {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// Retained for source compatibility. Buffer-backed parsing no longer
+    /// constructs a C path and therefore does not emit this variant.
     #[error("gguf tensor index path cannot be represented as C string: {path}")]
     PathContainsNul { path: String },
     #[error("gguf tensor index initialization failed for '{path}'")]
     InitFailed { path: PathBuf },
+    #[error("gguf tensor index allocation failed for '{path}'")]
+    AllocationFailed { path: PathBuf },
     #[error("gguf tensor count is negative for '{path}': {count}")]
     NegativeTensorCount { path: PathBuf, count: i64 },
     #[error("gguf tensor count does not fit usize for '{path}': count={count}")]
@@ -236,28 +240,60 @@ pub fn read_gguf_tensor_index(
 pub fn read_gguf_tensor_index_from_runtime_source(
     runtime_source: &GgmlRuntimeSource,
 ) -> Result<GgufTensorIndex, GgufTensorIndexReadError> {
-    let path = runtime_source.path();
-    let file_size = fs::metadata(path)
-        .map_err(|source| GgufTensorIndexReadError::SourceMetadata {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
+    read_gguf_tensor_index_from_runtime_source_internal(
+        runtime_source,
+        super::runtime_gguf_parse_limits(),
+    )
+}
 
-    let path_cstring = path_to_cstring(path)?;
-    let context = unsafe {
-        let raw = ffi::gguf_init_from_file(
-            path_cstring.as_ptr(),
-            ffi::GgufInitParams {
-                no_alloc: true,
-                ctx: ptr::null_mut(),
-            },
-        );
-        GgufContextGuard::from_raw(raw)
-    }
-    .ok_or_else(|| GgufTensorIndexReadError::InitFailed {
-        path: path.to_path_buf(),
+pub(crate) fn read_gguf_tensor_index_from_runtime_source_with_limits(
+    runtime_source: &GgmlRuntimeSource,
+    max_tensors: u64,
+    max_kv: u64,
+) -> Result<GgufTensorIndex, GgufTensorIndexReadError> {
+    read_gguf_tensor_index_from_runtime_source_internal(
+        runtime_source,
+        ffi::GgufParseLimits {
+            max_tensors,
+            max_kv,
+            ..super::runtime_gguf_parse_limits()
+        },
+    )
+}
+
+fn read_gguf_tensor_index_from_runtime_source_internal(
+    runtime_source: &GgmlRuntimeSource,
+    limits: ffi::GgufParseLimits,
+) -> Result<GgufTensorIndex, GgufTensorIndexReadError> {
+    let path = runtime_source.path();
+    let context = parse_bounded_gguf_context(runtime_source, limits).map_err(|failure| {
+        if failure == GgufBoundedParseFailure::Allocation {
+            crate::models::native_execution_services::record_current_execution_candidate_failure(
+                crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                    "gguf-bounded-tensor-index-parse",
+                    format!("allocation failed while parsing {}", path.display()),
+                ),
+            );
+            GgufTensorIndexReadError::AllocationFailed {
+                path: path.to_path_buf(),
+            }
+        } else {
+            GgufTensorIndexReadError::InitFailed {
+                path: path.to_path_buf(),
+            }
+        }
     })?;
+
+    read_gguf_tensor_index_from_context(runtime_source, &context)
+}
+
+pub(crate) fn read_gguf_tensor_index_from_context(
+    runtime_source: &GgmlRuntimeSource,
+    context: &GgufContextGuard,
+) -> Result<GgufTensorIndex, GgufTensorIndexReadError> {
+    let path = runtime_source.path();
+    let mmap = runtime_source.backing_mmap();
+    let file_size = usize_to_u64(path, "file_size", mmap.len())?;
 
     let tensor_count = unsafe { ffi::gguf_get_n_tensors(context.as_ptr()) };
     if tensor_count < 0 {
@@ -414,26 +450,6 @@ pub fn read_gguf_tensor_index_from_runtime_source(
     })
 }
 
-fn path_to_cstring(path: &Path) -> Result<CString, GgufTensorIndexReadError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            GgufTensorIndexReadError::PathContainsNul {
-                path: path.display().to_string(),
-            }
-        })
-    }
-
-    #[cfg(not(unix))]
-    {
-        let rendered = path.as_os_str().to_string_lossy();
-        CString::new(rendered.as_bytes()).map_err(|_| GgufTensorIndexReadError::PathContainsNul {
-            path: rendered.into_owned(),
-        })
-    }
-}
-
 fn usize_to_u64(
     path: &Path,
     field: &'static str,
@@ -446,33 +462,17 @@ fn usize_to_u64(
     })
 }
 
-struct GgufContextGuard {
-    raw: ffi::GgufContextRaw,
-}
-
-impl GgufContextGuard {
-    unsafe fn from_raw(raw: ffi::GgufContextRaw) -> Option<Self> {
-        (!raw.is_null()).then_some(Self { raw })
-    }
-
-    fn as_ptr(&self) -> *const c_void {
-        self.raw as *const c_void
-    }
-}
-
-impl Drop for GgufContextGuard {
-    fn drop(&mut self) {
-        unsafe { ffi::gguf_free(self.raw) };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
 
     use tempfile::NamedTempFile;
 
-    use super::{GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index};
+    use super::{
+        GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index,
+        read_gguf_tensor_index_from_runtime_source,
+    };
+    use crate::validate_ggml_runtime_source_path;
 
     fn push_u32(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -495,7 +495,11 @@ mod tests {
         bytes.extend_from_slice(value.as_bytes());
     }
 
-    fn write_single_tensor_gguf_fixture(path: &Path) {
+    fn write_named_single_tensor_gguf_fixture_with_dims(
+        path: &Path,
+        tensor_name: &str,
+        dims: [i64; 2],
+    ) {
         const GGUF_VERSION: u32 = 3;
         const GGML_TYPE_F32: i32 = 0;
         const DEFAULT_ALIGNMENT: usize = 32;
@@ -506,10 +510,10 @@ mod tests {
         push_i64(&mut bytes, 1); // n_tensors
         push_i64(&mut bytes, 0); // n_kv
 
-        push_gguf_string(&mut bytes, "encoder.weight");
+        push_gguf_string(&mut bytes, tensor_name);
         push_u32(&mut bytes, 2); // n_dims
-        push_i64(&mut bytes, 4);
-        push_i64(&mut bytes, 2);
+        push_i64(&mut bytes, dims[0]);
+        push_i64(&mut bytes, dims[1]);
         push_i32(&mut bytes, GGML_TYPE_F32);
         push_u64(&mut bytes, 0); // first tensor starts at data blob offset 0
 
@@ -517,9 +521,18 @@ mod tests {
             bytes.push(0);
         }
 
-        // 4 * 2 elements * f32(4 bytes) = 32 bytes tensor payload
-        bytes.extend_from_slice(&[0u8; 32]);
+        let elements = dims[0].max(0).saturating_mul(dims[1].max(0));
+        let payload_bytes = usize::try_from(elements.saturating_mul(4)).unwrap_or(0);
+        bytes.resize(bytes.len().saturating_add(payload_bytes), 0);
         fs::write(path, bytes).expect("write gguf fixture");
+    }
+
+    fn write_named_single_tensor_gguf_fixture(path: &Path, tensor_name: &str) {
+        write_named_single_tensor_gguf_fixture_with_dims(path, tensor_name, [4, 2]);
+    }
+
+    fn write_single_tensor_gguf_fixture(path: &Path) {
+        write_named_single_tensor_gguf_fixture(path, "encoder.weight");
     }
 
     #[test]
@@ -548,12 +561,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_tensor_dimension_without_aborting() {
+        let file = NamedTempFile::new().expect("temp file");
+        write_named_single_tensor_gguf_fixture_with_dims(file.path(), "zero.weight", [0, 2]);
+
+        let error = read_gguf_tensor_index(file.path())
+            .expect_err("zero-sized GGUF tensors must be rejected by the C parser");
+        assert!(matches!(error, GgufTensorIndexReadError::InitFailed { .. }));
+    }
+
+    #[test]
     fn returns_none_for_missing_tensor_lookup() {
         let file = NamedTempFile::new().expect("temp file");
         write_single_tensor_gguf_fixture(file.path());
 
         let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
         assert!(index.get("missing.tensor").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_source_tensor_index_is_bound_to_the_validated_file_identity() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let source_path = directory.path().join("model.gguf");
+        let replacement_path = directory.path().join("replacement.gguf");
+        write_named_single_tensor_gguf_fixture(&source_path, "validated.weight");
+
+        let runtime_source =
+            validate_ggml_runtime_source_path(&source_path).expect("validate runtime source");
+        write_named_single_tensor_gguf_fixture(&replacement_path, "replacement.weight");
+        fs::rename(&replacement_path, &source_path).expect("atomically replace path");
+
+        let held_index =
+            read_gguf_tensor_index_from_runtime_source(&runtime_source).expect("read held source");
+        assert!(held_index.get("validated.weight").is_some());
+        assert!(held_index.get("replacement.weight").is_none());
+
+        let replacement_index =
+            read_gguf_tensor_index(&source_path).expect("read replacement source");
+        assert!(replacement_index.get("replacement.weight").is_some());
+        assert!(replacement_index.get("validated.weight").is_none());
     }
 
     #[test]

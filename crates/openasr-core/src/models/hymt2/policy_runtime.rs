@@ -7,7 +7,7 @@
 //! are surfaced instead of replaying accumulated context on another device.
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -84,8 +84,14 @@ impl PolicyResolvedHymt2TranslationRuntime {
     ) -> Result<Self, PolicyResolvedHymt2Error> {
         let quoted_source = crate::validate_ggml_runtime_source_path(&pack_path)
             .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        let content_id = quoted_source.content_id().to_string();
-        drop(quoted_source);
+        let preflight =
+            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
+                &quoted_source,
+            )
+            .map_err(|source| Hymt2RuntimeError::Preflight {
+                reason: source.to_string(),
+            })?;
+        let content_id = preflight.runtime_source.content_id().to_string();
 
         let intent = ExecutionIntent::from(execution_target);
         let actor_instance_id = NEXT_TRANSLATION_ACTOR_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
@@ -98,13 +104,13 @@ impl PolicyResolvedHymt2TranslationRuntime {
             reason: error.to_string(),
         })?;
 
-        let builder_path = pack_path;
+        let builder_preflight = preflight;
         let builder_content_id = content_id;
         let builder_services = Arc::clone(&execution_services);
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
             build_candidate(
                 builder_services.as_ref(),
-                &builder_path,
+                &builder_preflight,
                 &builder_content_id,
                 candidate,
                 max_source_clause_chars,
@@ -157,7 +163,7 @@ impl Drop for PolicyResolvedHymt2TranslationRuntime {
 
 fn build_candidate(
     execution_services: &NativeExecutionServices,
-    pack_path: &Path,
+    preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     expected_content_id: &str,
     candidate: &ExecutionCandidate,
     max_source_clause_chars: usize,
@@ -168,9 +174,7 @@ fn build_candidate(
     >,
     PolicyResolvedHymt2Error,
 > {
-    let source = crate::validate_ggml_runtime_source_path(pack_path)
-        .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-    let actual_content_id = source.content_id();
+    let actual_content_id = preflight.runtime_source.content_id();
     if actual_content_id != expected_content_id {
         return Err(PolicyResolvedHymt2Error::Policy {
             reason: format!(
@@ -190,34 +194,27 @@ fn build_candidate(
         actor_instance_id,
         backend,
     );
-    let build_path = pack_path.to_path_buf();
+    let build_preflight = preflight.clone();
     let build_content_id = expected_content_id.to_string();
     execution_services.hymt2_translation_actors().get_or_try_insert_with(
         key,
         || {
             let quote = Hymt2Runtime::quote_candidate_system_memory(
-                &source,
+                preflight,
                 backend,
                 max_source_clause_chars,
             )?;
             Ok((quote.retained_bytes, quote))
         },
         move |quote| {
-            let source = crate::validate_ggml_runtime_source_path(&build_path)
+            let snapshot = build_preflight
+                .immutable_snapshot_matching_content_id(&build_content_id)
                 .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-            if source.content_id() != build_content_id {
-                return Err(PolicyResolvedHymt2Error::Policy {
-                    reason: format!(
-                        "Hy-MT2 pack changed during actor construction: expected {build_content_id}, got {}",
-                        source.content_id()
-                    ),
-                });
-            }
             match crate::models::system_memory_owner::SystemMemoryOwner::try_allocate_transaction(
                 quote,
                 || {
-                    let runtime = Hymt2Runtime::from_runtime_source_with_clause_envelope_inside_parent_transaction(
-                        &source,
+                    let runtime = Hymt2Runtime::from_preflight_with_clause_envelope_inside_parent_transaction(
+                        &snapshot,
                         backend,
                         max_source_clause_chars,
                     )?;

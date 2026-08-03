@@ -48,12 +48,12 @@ pub(crate) enum BuiltinExecutorComponentRegistryError {
         reason: String,
     },
     #[error(
-        "builtin executor decoder-state class mismatch for architecture '{model_architecture}': declared={declared:?}, actual={actual:?}"
+        "builtin executor decoder-state topology mismatch for architecture '{model_architecture}': declared={declared:?}, actual={actual:?}"
     )]
-    DecoderStateClassMismatch {
+    DecoderStateTopologyMismatch {
         model_architecture: String,
-        declared: crate::arch::OpenAsrDecoderStateClass,
-        actual: crate::arch::OpenAsrDecoderStateClass,
+        declared: crate::arch::OpenAsrDecoderStateTopology,
+        actual: crate::arch::OpenAsrDecoderStateTopology,
     },
 }
 
@@ -77,21 +77,21 @@ pub(crate) fn materialize_builtin_executors_by_model_architecture(
             }
         })?;
         let family_descriptor = descriptor.ggml_family_adapter_descriptor();
-        let actual_state_class = executor
+        let actual_state_topology = executor
             .decoder_state_contract(&family_descriptor)
-            .map(decoder_state_class)
+            .map(decoder_state_topology)
             .map_err(
                 |error| BuiltinExecutorComponentRegistryError::DecoderStateContractFailed {
                     model_architecture: descriptor.model_architecture.to_string(),
                     reason: error.to_string(),
                 },
             )?;
-        if actual_state_class != descriptor.decoder_state_class {
+        if actual_state_topology != descriptor.decoder_state_topology {
             return Err(
-                BuiltinExecutorComponentRegistryError::DecoderStateClassMismatch {
+                BuiltinExecutorComponentRegistryError::DecoderStateTopologyMismatch {
                     model_architecture: descriptor.model_architecture.to_string(),
-                    declared: descriptor.decoder_state_class,
-                    actual: actual_state_class,
+                    declared: descriptor.decoder_state_topology,
+                    actual: actual_state_topology,
                 },
             );
         }
@@ -101,15 +101,39 @@ pub(crate) fn materialize_builtin_executors_by_model_architecture(
     Ok(executors_by_model_architecture)
 }
 
-fn decoder_state_class(
+fn decoder_state_topology(
     contract: super::ggml_asr_executor::GgmlAsrDecoderStateContract,
-) -> crate::arch::OpenAsrDecoderStateClass {
+) -> crate::arch::OpenAsrDecoderStateTopology {
+    use crate::arch::OpenAsrDecoderStateTopology;
+    use crate::capacity::topology::StateKind;
+
     match contract {
         super::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState => {
-            crate::arch::OpenAsrDecoderStateClass::None
+            OpenAsrDecoderStateTopology::None
+        }
+        super::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned {
+            streams:
+                [
+                    super::ggml_asr_executor::GgmlAsrDecoderStateStreamContract {
+                        kind: StateKind::SelfAttentionKv,
+                        ..
+                    },
+                ],
+            ..
+        } => OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
+        super::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned { streams, .. }
+            if streams.len() == 2
+                && streams
+                    .iter()
+                    .any(|stream| stream.kind == StateKind::SelfAttentionKv)
+                && streams
+                    .iter()
+                    .any(|stream| stream.kind == StateKind::CrossAttentionKv) =>
+        {
+            OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv
         }
         super::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned { .. } => {
-            crate::arch::OpenAsrDecoderStateClass::TokenScaledPersistent
+            OpenAsrDecoderStateTopology::FamilyDefinedTokenScaledPersistent
         }
     }
 }
@@ -382,7 +406,7 @@ mod tests {
 
     #[test]
     fn every_builtin_executor_declares_its_decoder_state_topology() {
-        use crate::arch::OpenAsrDecoderStateClass;
+        use crate::arch::OpenAsrDecoderStateTopology;
         use crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract;
 
         let executors = materialize_test_executors().expect("executor map");
@@ -398,8 +422,8 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("{} contract failed: {error}", descriptor.model_family)
                 });
-            let actual_class = match contract {
-                GgmlAsrDecoderStateContract::NoPersistentState => OpenAsrDecoderStateClass::None,
+            let actual_topology = match contract {
+                GgmlAsrDecoderStateContract::NoPersistentState => OpenAsrDecoderStateTopology::None,
                 GgmlAsrDecoderStateContract::Planned { planner, streams } => {
                     assert_ne!(
                         planner as usize, 0,
@@ -411,11 +435,14 @@ mod tests {
                         "{} returned an empty decoder-state stream contract",
                         descriptor.model_architecture
                     );
-                    OpenAsrDecoderStateClass::TokenScaledPersistent
+                    decoder_state_topology(GgmlAsrDecoderStateContract::Planned {
+                        planner,
+                        streams,
+                    })
                 }
             };
             assert_eq!(
-                actual_class, descriptor.decoder_state_class,
+                actual_topology, descriptor.decoder_state_topology,
                 "family '{}' ({}) executor decoder-state contract disagrees with its mandatory architecture declaration",
                 descriptor.model_family, descriptor.model_architecture
             );

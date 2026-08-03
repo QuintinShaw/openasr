@@ -1,13 +1,15 @@
 #[cfg(test)]
 use std::path::Path;
 
-#[cfg(test)]
-use crate::ggml_runtime::validate_ggml_runtime_source_path;
 use crate::ggml_runtime::{
     AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession,
-    GgmlRuntimeSource, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReader,
-    read_gguf_metadata_from_runtime_source,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, GgufTensorDataReader,
+    build_runtime_tensor_reader_from_preflight,
+};
+#[cfg(test)]
+use crate::ggml_runtime::{
+    load_runtime_source_metadata_and_tensor_index_from_source, validate_ggml_runtime_source_path,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -90,17 +92,22 @@ struct DiariZenPersistentGraph {
 
 impl DiariZenRuntime {
     pub(crate) fn quote_candidate_system_memory(
-        source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
     ) -> Result<
         crate::models::system_memory_owner::SystemMemoryAllocationQuote,
         DiariZenSegmenterError,
     > {
-        let (_, retained_bytes, peak_bytes) = system_memory_shape(super::config::WINDOW_SAMPLES)?;
+        let (_, retained_bytes, materialization_peak_bytes) =
+            system_memory_shape(super::config::WINDOW_SAMPLES)?;
+        let peak_bytes = preflight
+            .runtime_source
+            .immutable_snapshot_construction_peak_bytes(materialization_peak_bytes)
+            .map_err(|error| DiariZenSegmenterError::Capacity(error.to_string()))?;
         crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
             format!(
                 "aux.{}.{}.host-state",
                 super::DIARIZEN_GGML_ARCHITECTURE_ID,
-                source.content_id()
+                preflight.runtime_source.content_id()
             ),
             peak_bytes,
             retained_bytes,
@@ -110,21 +117,26 @@ impl DiariZenRuntime {
 
     pub(crate) fn try_allocate_inside_parent_candidate(
         quote: crate::models::system_memory_owner::SystemMemoryAllocationQuote,
-        source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<crate::models::system_memory_owner::SystemMemoryOwner<Self>, DiariZenSegmenterError>
     {
         match crate::models::system_memory_owner::SystemMemoryOwner::try_allocate_transaction(
             quote,
             || {
-                let runtime = Self::from_runtime_source(
-                    source,
+                let runtime = Self::from_preflight(
+                    preflight,
                     super::config::WINDOW_SAMPLES,
                     false,
                     Some(backend),
                 )?;
                 let retained = runtime.retained_system_memory_bytes()?;
-                let requested_peak = retained.max(runtime.construction_requested_peak_bytes);
+                let requested_peak = preflight
+                    .runtime_source
+                    .immutable_snapshot_construction_peak_bytes(
+                        runtime.construction_requested_peak_bytes,
+                    )
+                    .map_err(|error| DiariZenSegmenterError::Capacity(error.to_string()))?;
                 Ok::<_, DiariZenSegmenterError>(
                     crate::models::system_memory_owner::SystemMemoryAllocationOutcome::new(
                         runtime,
@@ -151,22 +163,19 @@ impl DiariZenRuntime {
     ) -> Result<Self, DiariZenSegmenterError> {
         let source = validate_ggml_runtime_source_path(path)
             .map_err(|error| DiariZenSegmenterError::PackSource(error.to_string()))?;
-        Self::from_runtime_source(&source, samples, trace, backend)
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&source)
+            .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
+        Self::from_preflight(&preflight, samples, trace, backend)
     }
 
-    /// Build from the same already-open mapping used to derive the cache key.
-    /// This prevents an in-place path replacement from pairing the old key
-    /// with weights re-opened from the new file (or vice versa).
-    pub(super) fn from_runtime_source(
-        source: &GgmlRuntimeSource,
+    pub(super) fn from_preflight(
+        preflight: &GgufRuntimeSourcePreflight,
         samples: usize,
         trace: bool,
         backend: Option<GgmlCpuGraphBackend>,
     ) -> Result<Self, DiariZenSegmenterError> {
-        let metadata = read_gguf_metadata_from_runtime_source(source)
-            .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
-        super::config::validate_metadata(&metadata)?;
-        let reader = GgufTensorDataReader::from_runtime_source(source)
+        super::config::validate_metadata(&preflight.metadata)?;
+        let reader = build_runtime_tensor_reader_from_preflight(preflight)
             .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
         validate_tensor_contract(reader.tensor_index())?;
 
@@ -194,7 +203,7 @@ impl DiariZenRuntime {
         let mut runner =
             GgmlCpuGraphRunner::new(runner_config).map_err(graph_error("create_runtime"))?;
         let loaded_weights = runner
-            .load_gguf_weight_context(source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(graph_error("bind_resident_weights"))?;
         let mut static_arena = runner
             .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(

@@ -130,7 +130,7 @@ impl GgufTensorDataReader {
     /// Reuses the metadata and tensor index produced by the sandboxed runtime
     /// preflight instead of parsing the same open mapping a second time.
     ///
-    /// The caller must pass parts from one `GgmlAsrRuntimeSourcePreflight`.
+    /// The caller must pass parts from one `GgufRuntimeSourcePreflight`.
     /// Keeping this constructor crate-private makes that provenance contract
     /// enforceable while avoiding a potentially large unadmitted parser
     /// transient immediately before a model materialization transaction.

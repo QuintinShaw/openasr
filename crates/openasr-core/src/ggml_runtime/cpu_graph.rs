@@ -6,7 +6,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
-    ffi::{CStr, CString, c_int, c_void},
+    ffi::{CStr, c_int, c_void},
     marker::PhantomData,
     path::Path,
     ptr::{self, NonNull},
@@ -1480,6 +1480,33 @@ impl GgmlCpuGraphRunner {
         &self,
         source: &GgmlRuntimeSource,
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
+        self.load_gguf_weight_context_with_reader(source, || {
+            GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
+                GgmlCpuGraphError::LoadedWeightContextFailed {
+                    reason: error.to_string(),
+                }
+            })
+        })
+    }
+
+    pub(crate) fn load_gguf_weight_context_from_preflight(
+        &self,
+        preflight: &super::GgufRuntimeSourcePreflight,
+    ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
+        self.load_gguf_weight_context_with_reader(&preflight.runtime_source, || {
+            super::build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+                GgmlCpuGraphError::LoadedWeightContextFailed {
+                    reason: error.to_string(),
+                }
+            })
+        })
+    }
+
+    fn load_gguf_weight_context_with_reader(
+        &self,
+        source: &GgmlRuntimeSource,
+        build_reader: impl FnOnce() -> Result<GgufTensorDataReader, GgmlCpuGraphError>,
+    ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
         let require_direct_backend_matmul_support =
             self.backend_kind.is_gpu_class() && self.scheduler.is_none();
         let cache_key = LoadedWeightContextCacheKey {
@@ -1504,8 +1531,10 @@ impl GgmlCpuGraphRunner {
             return Ok(GgmlLoadedWeightContext { inner });
         }
 
-        let loaded = GgmlLoadedWeightContext::from_runtime_source_with_backend(
+        let reader = build_reader()?;
+        let loaded = GgmlLoadedWeightContext::from_runtime_source_with_backend_and_reader(
             source,
+            &reader,
             self.backend.raw,
             require_direct_backend_matmul_support,
         )?;
@@ -1685,47 +1714,46 @@ impl GgmlLoadedWeightContext {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Builds a loaded weight context from `source`'s own already-open
-    /// mapping. The ggml/gguf metadata skeleton (`gguf_init_from_file`) still
-    /// reads `source.path()` directly -- that ggml-side C call only parses
-    /// tensor shapes/types (`no_alloc: true`, no weight bytes), a separate,
-    /// narrower concern from the tensor *data* read below, which is what this
-    /// contract requires to share `source`'s open handle. The weight bytes
-    /// bound into the graph, and therefore the only bytes actually executed,
-    /// come from [`GgufTensorDataReader::from_runtime_source`] -- the same
-    /// mapping the caller's runtime cache key was built from, never a second
-    /// `File::open` of `source.path()`.
-    fn from_runtime_source_with_backend(
+    /// Builds the metadata skeleton and weight reader from the exact same held
+    /// mapping. Reopening `source.path()` for the skeleton would allow an
+    /// atomic path replacement to pair one generation's shapes with another
+    /// generation's bytes, which can reach backend assertions before Rust has
+    /// a chance to fail closed.
+    fn from_runtime_source_with_backend_and_reader(
         source: &GgmlRuntimeSource,
+        reader: &GgufTensorDataReader,
         backend: NonNull<c_void>,
         require_direct_backend_matmul_support: bool,
     ) -> Result<Self, GgmlCpuGraphError> {
         let path = source.path();
-        let path_cstring = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
-            GgmlCpuGraphError::LoadedWeightContextFailed {
-                reason: format!("path contains interior NUL bytes: {}", path.display()),
-            }
-        })?;
+        let mmap = source.backing_mmap();
         let mut ggml_ctx_raw: ffi::GgmlContextRaw = ptr::null_mut();
+        let mut parse_error = ffi::GGUF_PARSE_ERROR_NONE;
         let gguf_ctx_raw = unsafe {
-            ffi::gguf_init_from_file(
-                path_cstring.as_ptr(),
+            ffi::gguf_init_from_buffer_with_limits(
+                mmap.as_ptr().cast(),
+                mmap.len(),
                 ffi::GgufInitParams {
                     no_alloc: true,
                     ctx: &mut ggml_ctx_raw,
                 },
+                super::runtime_gguf_parse_limits(),
+                &mut parse_error,
             )
         };
         let Some(gguf_ctx_raw) = NonNull::new(gguf_ctx_raw) else {
             return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
-                reason: format!("gguf_init_from_file failed for {}", path.display()),
+                reason: format!(
+                    "bounded gguf skeleton parse failed for {} (error={parse_error})",
+                    path.display()
+                ),
             });
         };
         let gguf_ctx = GgufContextGuard { raw: gguf_ctx_raw };
         let Some(ggml_ctx_raw) = NonNull::new(ggml_ctx_raw) else {
             return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
                 reason: format!(
-                    "gguf_init_from_file did not return ggml context for {}",
+                    "gguf_init_from_buffer did not return ggml context for {}",
                     path.display()
                 ),
             });
@@ -1734,12 +1762,7 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
-            GgmlCpuGraphError::LoadedWeightContextFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        let (buffer, mmap) = match maybe_allocate_weight_buffer_from_host_ptr(backend, &reader)? {
+        let (buffer, mmap) = match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
             Some((buffer, mmap)) => (buffer, Some(mmap)),
             None => (
                 GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
@@ -6301,21 +6324,6 @@ fn take_test_graph_compute_status_override() -> Option<c_int> {
 #[cfg(test)]
 pub(crate) fn install_test_graph_compute_status_override(status: c_int) {
     TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
-}
-
-#[cfg(test)]
-pub(crate) fn install_test_graph_compute_abort() {
-    install_test_graph_compute_status_override(ffi::GGML_STATUS_ABORTED);
-}
-
-#[cfg(test)]
-pub(crate) fn install_test_graph_compute_device_lost() {
-    install_test_graph_compute_status_override(ffi::GGML_STATUS_DEVICE_LOST);
-}
-
-#[cfg(test)]
-pub(crate) fn clear_test_graph_compute_status_override() {
-    TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take());
 }
 
 #[cfg(test)]

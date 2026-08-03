@@ -9,10 +9,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Deserialize;
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlRuntimeSource, GgufTensorDataReader};
+use crate::ggml_runtime::GgmlRuntimeSource;
 
 #[derive(Debug, Error)]
 pub enum WeightsError {
@@ -47,13 +46,6 @@ pub enum WeightsError {
     Gguf(String),
 }
 
-#[derive(Deserialize)]
-struct TensorInfo {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: [usize; 2],
-}
-
 struct Tensor {
     shape: Vec<usize>,
     data: Vec<f32>,
@@ -64,61 +56,13 @@ pub(crate) struct Weights {
     tensors: BTreeMap<String, Tensor>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SafetensorsWeightsQuote {
+    pub(crate) retained_bytes: u64,
+    pub(crate) parser_peak_bytes: u64,
+}
+
 impl Weights {
-    /// Logical f32 resident size from the already-open GGUF tensor index.
-    /// This performs only header/index/range validation and never copies or
-    /// dequantizes tensor payloads, so admission can run before materializing
-    /// the ReDimNet model while retaining the exact same mapped source.
-    pub(crate) fn logical_f32_bytes_from_runtime_source(
-        runtime_source: &GgmlRuntimeSource,
-    ) -> Result<u64, WeightsError> {
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(|error| WeightsError::Gguf(error.to_string()))?;
-        if reader.tensor_index().tensors().is_empty() {
-            return Err(WeightsError::InvalidInput(
-                "speaker-embedder pack contains no tensors".to_string(),
-            ));
-        }
-        reader.tensor_index().tensors().iter().enumerate().try_fold(
-            0_u64,
-            |total, (tensor_id, tensor)| {
-                // Validate that this tensor index entry addresses bytes inside
-                // the held mmap without copying those bytes.
-                reader
-                    .host_tensor_bytes_by_id(tensor_id)
-                    .map_err(|error| WeightsError::Gguf(error.to_string()))?;
-                let elements = tensor.num_elements().ok_or_else(|| {
-                    WeightsError::InvalidInput(format!(
-                        "tensor '{}' logical element count overflows",
-                        tensor.name
-                    ))
-                })?;
-                total
-                    .checked_add(elements.checked_mul(4).ok_or_else(|| {
-                        WeightsError::InvalidInput(format!(
-                            "tensor '{}' logical f32 byte count overflows",
-                            tensor.name
-                        ))
-                    })?)
-                    .ok_or_else(|| {
-                        WeightsError::InvalidInput(
-                            "speaker-embedder logical f32 byte total overflows".to_string(),
-                        )
-                    })
-            },
-        )
-    }
-
-    pub(crate) fn logical_f32_bytes(&self) -> u64 {
-        self.tensors.values().fold(0u64, |total, tensor| {
-            total.saturating_add(
-                u64::try_from(tensor.data.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(std::mem::size_of::<f32>() as u64),
-            )
-        })
-    }
-
     pub(crate) fn quoted_persistent_host_commitment_bytes(
         tensor_index: &crate::GgufTensorIndex,
     ) -> Result<u64, WeightsError> {
@@ -162,62 +106,85 @@ impl Weights {
         Ok(bytes)
     }
 
+    pub(crate) fn quoted_safetensors_materialization(
+        bytes: &[u8],
+    ) -> Result<SafetensorsWeightsQuote, WeightsError> {
+        let path = Path::new("<raw-safetensors-runtime-source>");
+        let (_, header) = crate::models::local_source_import::parse_safetensors_header(path, bytes)
+            .map_err(|error| WeightsError::Header(error.to_string()))?;
+        let retained_bytes = quote_safetensors_header(&header)?;
+        // Header parsing has two non-overlapping phases: duplicate-key
+        // validation and the typed descriptor tree. A page per descriptor
+        // sub-allocation (top-level node, name/dtype, shape and offsets), plus
+        // two copies of the serialized header, is an allocator-independent
+        // upper commitment without tying admission to serde_json internals.
+        let descriptor_bytes = u64::try_from(header.tensors.len())
+            .unwrap_or(u64::MAX)
+            .checked_mul(HOST_ALLOCATION_PAGE_BYTES.saturating_mul(4))
+            .ok_or_else(|| {
+                WeightsError::InvalidInput(
+                    "safetensors descriptor parser byte quote overflow".to_string(),
+                )
+            })?;
+        let parser_peak_bytes = header
+            .header_length_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(descriptor_bytes))
+            .ok_or_else(|| {
+                WeightsError::InvalidInput(
+                    "safetensors parser peak byte quote overflow".to_string(),
+                )
+            })?;
+        Ok(SafetensorsWeightsQuote {
+            retained_bytes,
+            parser_peak_bytes,
+        })
+    }
+
     /// Parse a safetensors byte buffer.
     pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
-        if bytes.len() < 8 {
-            return Err(WeightsError::Truncated {
-                len: bytes.len(),
-                need: 8,
-            });
-        }
-        let header_len = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")) as usize;
-        let header_end = 8usize
-            .checked_add(header_len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or(WeightsError::Truncated {
-                len: bytes.len(),
-                need: 8 + header_len,
-            })?;
-        let header: BTreeMap<String, serde_json::Value> =
-            serde_json::from_slice(&bytes[8..header_end])
-                .map_err(|e| WeightsError::Header(e.to_string()))?;
-        let data = &bytes[header_end..];
-
+        let path = Path::new("<raw-safetensors-runtime-source>");
+        let (data_offset, header) =
+            crate::models::local_source_import::parse_safetensors_header(path, bytes)
+                .map_err(|error| WeightsError::Header(error.to_string()))?;
         let mut tensors = BTreeMap::new();
-        for (name, value) in header {
-            if name == "__metadata__" {
-                continue;
-            }
-            let info: TensorInfo =
-                TensorInfo::deserialize(value).map_err(|e| WeightsError::Header(e.to_string()))?;
+        for info in header.tensors {
+            let name = info.name;
             if info.dtype != "F32" {
                 return Err(WeightsError::Dtype {
                     name,
                     dtype: info.dtype,
                 });
             }
-            let [start, end] = info.data_offsets;
-            if end < start || end > data.len() || (end - start) % 4 != 0 {
-                return Err(WeightsError::Bounds { name });
-            }
-            let want: usize = info.shape.iter().product();
-            let got = (end - start) / 4;
-            if got != want {
-                return Err(WeightsError::SizeMismatch {
-                    name,
-                    got,
-                    want,
-                    shape: info.shape,
-                });
-            }
-            let floats = data[start..end]
+            let start = usize::try_from(info.data_offsets[0])
+                .ok()
+                .and_then(|offset| data_offset.checked_add(offset))
+                .ok_or_else(|| WeightsError::Bounds { name: name.clone() })?;
+            let end = usize::try_from(info.data_offsets[1])
+                .ok()
+                .and_then(|offset| data_offset.checked_add(offset))
+                .ok_or_else(|| WeightsError::Bounds { name: name.clone() })?;
+            let payload = bytes
+                .get(start..end)
+                .ok_or_else(|| WeightsError::Bounds { name: name.clone() })?;
+            let shape = info
+                .shape
+                .into_iter()
+                .map(usize::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    WeightsError::InvalidInput(format!(
+                        "tensor '{name}' shape does not fit platform usize"
+                    ))
+                })?;
+            let floats = payload
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             tensors.insert(
                 name,
                 Tensor {
-                    shape: info.shape,
+                    shape,
                     data: floats,
                 },
             );
@@ -247,7 +214,18 @@ impl Weights {
     pub(crate) fn from_runtime_source(
         runtime_source: &GgmlRuntimeSource,
     ) -> Result<Self, WeightsError> {
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+        let preflight =
+            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
+                runtime_source,
+            )
+            .map_err(|error| WeightsError::Gguf(error.to_string()))?;
+        Self::from_preflight(&preflight)
+    }
+
+    pub(crate) fn from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+    ) -> Result<Self, WeightsError> {
+        let reader = crate::ggml_runtime::build_runtime_tensor_reader_from_preflight(preflight)
             .map_err(|e| WeightsError::Gguf(e.to_string()))?;
         let mut tensors = BTreeMap::new();
         for metadata in reader.tensor_index().tensors() {
@@ -316,6 +294,47 @@ impl Weights {
     }
 }
 
+fn quote_safetensors_header(
+    header: &crate::models::local_source_import::SafetensorsHeader,
+) -> Result<u64, WeightsError> {
+    let mut bytes = allocation_commitment(std::mem::size_of::<Weights>())?;
+    for tensor in &header.tensors {
+        if tensor.dtype != "F32" {
+            return Err(WeightsError::Dtype {
+                name: tensor.name.clone(),
+                dtype: tensor.dtype.clone(),
+            });
+        }
+        let data_bytes = tensor.data_offsets[1]
+            .checked_sub(tensor.data_offsets[0])
+            .ok_or_else(|| WeightsError::Bounds {
+                name: tensor.name.clone(),
+            })?;
+        let shape_bytes = u64::try_from(tensor.shape.len())
+            .unwrap_or(u64::MAX)
+            .checked_mul(std::mem::size_of::<usize>() as u64)
+            .ok_or_else(|| {
+                WeightsError::InvalidInput(format!(
+                    "tensor '{}' shape byte quote overflow",
+                    tensor.name
+                ))
+            })?;
+        for commitment in [
+            allocation_commitment_u64(tensor.name.len() as u64)?,
+            allocation_commitment_u64(shape_bytes)?,
+            allocation_commitment_u64(data_bytes)?,
+            HOST_ALLOCATION_PAGE_BYTES,
+        ] {
+            bytes = bytes.checked_add(commitment).ok_or_else(|| {
+                WeightsError::InvalidInput(
+                    "safetensors retained weight byte quote overflow".to_string(),
+                )
+            })?;
+        }
+    }
+    Ok(bytes)
+}
+
 pub(crate) const HOST_ALLOCATION_PAGE_BYTES: u64 = 4096;
 
 pub(crate) fn allocation_commitment(requested_bytes: usize) -> Result<u64, WeightsError> {
@@ -340,5 +359,47 @@ pub(crate) fn allocation_commitment_u64(requested: u64) -> Result<u64, WeightsEr
             .ok_or_else(|| {
                 WeightsError::InvalidInput("redimnet allocation rounding overflow".to_string())
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_f32_safetensors() -> Vec<u8> {
+        let header = br#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"long_tensor_name":{"dtype":"F32","shape":[1,2],"data_offsets":[8,16]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header);
+        for value in [1.0_f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn raw_safetensors_quote_bounds_measured_retained_capacity() {
+        let bytes = raw_f32_safetensors();
+        let quote = Weights::quoted_safetensors_materialization(&bytes).expect("quote");
+        let weights = Weights::from_safetensors(&bytes).expect("materialize");
+        let measured = weights
+            .persistent_host_commitment_bytes()
+            .expect("measure retained");
+        assert!(quote.retained_bytes >= measured);
+        assert!(quote.parser_peak_bytes > 0);
+    }
+
+    #[test]
+    fn raw_safetensors_loader_reuses_shared_duplicate_key_hardening() {
+        let header = br#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        let error = match Weights::from_safetensors(&bytes) {
+            Ok(_) => panic!("duplicate key must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("duplicate JSON object key"));
     }
 }

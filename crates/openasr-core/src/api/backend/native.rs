@@ -1323,8 +1323,12 @@ fn build_native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRunt
 pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), String> {
     let runtime_source = native_path::validate_local_native_runtime_source(path)
         .map_err(|error| error.to_string())?;
-    let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
-        .map_err(|error| format!("metadata read failed: {error}"))?;
+    let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
+        &runtime_source,
+    )
+    .map_err(|error| format!("GGUF preflight failed: {error}"))?;
+    let metadata = preflight.metadata.as_ref();
+    let tensor_index = preflight.tensor_index.as_ref();
     // Auxiliary (non-ASR) packs -- diarization support (speaker embedder,
     // speaker segmenter), translation (Hy-MT2), punctuation (FireRedPunc) --
     // never select an ASR runtime adapter; their contract is "this family's own
@@ -1334,11 +1338,15 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
     // selection is below: an aux pack with no ASR-shaped selection metadata
     // never reaches (and is never rejected by) ASR adapter selection.
     if let Some((kind, result)) =
-        crate::models::aux_pack_registry::validate_aux_runtime_pack_contract(path, &metadata)
+        crate::models::aux_pack_registry::validate_aux_runtime_pack_contract(
+            path,
+            metadata,
+            tensor_index,
+        )
     {
         return result.map_err(|error| format!("{}: {error}", kind.validation_failure_label()));
     }
-    let selection_metadata = selection_metadata_from_gguf(&metadata);
+    let selection_metadata = selection_metadata_from_gguf(metadata);
     let registry = GgmlFamilyRegistry::with_builtin_adapters();
     let descriptor = registry
         .select_from_gguf_metadata_v1(&selection_metadata)
@@ -1347,12 +1355,10 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         descriptor.model_architecture,
         QWEN3_ASR_GGML_ARCHITECTURE_ID | COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID
     ) {
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
-            .map_err(|error| format!("tensor index read failed: {error}"))?;
         return validate_builtin_runtime_tensor_contract_for_architecture(
             descriptor.model_architecture,
-            &metadata,
-            &tensor_index,
+            metadata,
+            tensor_index,
         )
         .map(|_| ())
         .map_err(|error| format!("runtime tensor contract validation failed: {error}"));
@@ -1371,7 +1377,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
     match descriptor.model_architecture {
         WHISPER_GGML_ARCHITECTURE_ID => {
             crate::models::whisper::runtime_contract::validate_whisper_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1382,7 +1388,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         MOONSHINE_GGML_ARCHITECTURE_ID => {
             crate::models::moonshine::runtime_contract::parse_moonshine_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1393,7 +1399,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         PARAKEET_CTC_GGML_ARCHITECTURE_ID => {
             crate::models::parakeet_ctc::runtime_contract::parse_parakeet_ctc_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1404,7 +1410,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID => {
             crate::models::parakeet_tdt::runtime_contract::parse_parakeet_tdt_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1415,7 +1421,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => {
             crate::models::wav2vec2_ctc::runtime_contract::parse_wav2vec2_ctc_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1426,7 +1432,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => {
             crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1440,11 +1446,9 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
             // position-table tensor's own shape is authoritative over the
             // metadata scalar when present); see
             // `runtime_contract::resolve_position_table_max_ctx`.
-            let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
-                .map_err(|error| format!("tensor index read failed: {error}"))?;
             crate::models::dolphin::runtime_contract::parse_dolphin_execution_metadata(
-                &metadata,
-                &tensor_index,
+                metadata,
+                tensor_index,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1455,7 +1459,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => {
             crate::models::sensevoice::runtime_contract::parse_sensevoice_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1466,7 +1470,7 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => {
             crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .map_err(|error| {
@@ -1477,18 +1481,18 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => {
             crate::models::firered_llm::runtime_contract::parse_firered_llm_encoder_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .and_then(|()| {
                 crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(
-                    &metadata,
+                    metadata,
                 )
                 .map(|_| ())
             })
             .and_then(|()| {
                 crate::models::firered_llm::runtime_contract::parse_firered_llm_decoder_metadata(
-                    &metadata,
+                    metadata,
                 )
                 .map(|_| ())
             })
@@ -1500,18 +1504,18 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         }
         crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID => {
             crate::models::funasr_nano::runtime_contract::parse_funasr_nano_encoder_metadata(
-                &metadata,
+                metadata,
             )
             .map(|_| ())
             .and_then(|()| {
                 crate::models::funasr_nano::runtime_contract::parse_funasr_nano_adapter_metadata(
-                    &metadata,
+                    metadata,
                 )
                 .map(|_| ())
             })
             .and_then(|()| {
                 crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(
-                    &metadata,
+                    metadata,
                 )
                 .map(|_| ())
             })
@@ -1522,22 +1526,22 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
             })
         }
         crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => {
-            crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(&metadata)
+            crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(metadata)
                 .map(|_| ())
                 .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(&metadata)
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(metadata)
                         .map(|_| ())
                 })
                 .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(&metadata)
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(metadata)
                         .map(|_| ())
                 })
                 .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(&metadata)
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(metadata)
                         .map(|_| ())
                 })
                 .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_special_tokens(&metadata)
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_special_tokens(metadata)
                         .map(|_| ())
                 })
                 .map_err(|error| {
@@ -1547,17 +1551,17 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                 })
         }
         crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
-            crate::models::moss_transcribe_diarize::runtime_contract::parse_encoder_metadata(&metadata)
+            crate::models::moss_transcribe_diarize::runtime_contract::parse_encoder_metadata(metadata)
                 .map(|_| ())
                 .and_then(|()| {
                     crate::models::moss_transcribe_diarize::runtime_contract::parse_adaptor_metadata(
-                        &metadata,
+                        metadata,
                     )
                     .map(|_| ())
                 })
                 .and_then(|()| {
                     crate::models::moss_transcribe_diarize::runtime_contract::parse_decoder_metadata(
-                        &metadata,
+                        metadata,
                     )
                     .map(|_| ())
                 })
@@ -1568,17 +1572,17 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                 })
         }
         crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID => {
-            crate::models::granite_speech::runtime_contract::parse_encoder_metadata(&metadata)
+            crate::models::granite_speech::runtime_contract::parse_encoder_metadata(metadata)
                 .map(|_| ())
                 .and_then(|()| {
                     crate::models::granite_speech::runtime_contract::parse_projector_metadata(
-                        &metadata,
+                        metadata,
                     )
                     .map(|_| ())
                 })
                 .and_then(|()| {
                     crate::models::granite_speech::runtime_contract::parse_decoder_metadata(
-                        &metadata,
+                        metadata,
                     )
                     .map(|_| ())
                 })
@@ -2215,6 +2219,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn native_streaming_rejects_voice_id_and_keeps_speakers_out_of_decode_options() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-redimnet-only-streaming.gguf");
@@ -2256,6 +2261,7 @@ mod tests {
             runtime_path,
         );
         let error = match adapter.start_streaming_session(
+            native_execution_services_for_test(),
             &pack,
             NativeAsrHardwareTarget::Cpu,
             NativeAsrSessionContext::new("rt_voice_id_rejected"),

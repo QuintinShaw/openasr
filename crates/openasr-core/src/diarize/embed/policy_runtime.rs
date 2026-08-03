@@ -7,10 +7,7 @@
 //! no process-global or thread-local owner exists outside the injected service
 //! root.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
@@ -40,7 +37,7 @@ use super::{
     EmbedError, REDIMNET_MAX_BATCH_WORKERS, RedimNet2Embedder, RedimNetResidentRuntime,
     SpeakerEmbedder, SpeakerEmbedderIdentity, SpeakerEmbeddingExecutionPlan,
     abort_successful_results_after_terminal_failure, cancel_requested, pack::redimnet_pack_path,
-    redimnet::config::EMBED_DIM, weights::allocation_commitment_u64,
+    redimnet::config::EMBED_DIM,
 };
 use crate::diarize::{
     calibration::{REDIMNET_CALIBRATION, SpeakerCalibrationProfile},
@@ -133,10 +130,9 @@ impl PolicySpeakerCandidate {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
         let actor = self.checkout_actor(threads, None)?;
-        let result = actor
+        actor
             .call_mut_fallible(move |runtime| forward_one(runtime, features, frames, Some(threads)))
-            .map_err(map_actor_error)??;
-        result
+            .map_err(map_actor_error)??
     }
 
     fn embed_batch(
@@ -345,17 +341,16 @@ impl PolicyResolvedSpeakerRuntime {
         };
         let source = crate::validate_ggml_runtime_source_path(&pack_path)
             .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
-        let content_id = source.content_id().to_string();
-        let tensor_index = crate::read_gguf_tensor_index_from_runtime_source(&source)
-            .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
+        let preflight =
+            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(&source)
+                .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
+        let content_id = preflight.runtime_source.content_id().to_string();
         let retained_quote =
-            RedimNet2Embedder::quoted_persistent_host_commitment_bytes(&tensor_index)?;
-        let mapped_quote = allocation_commitment_u64(source.backing_mmap().len() as u64)
+            RedimNet2Embedder::quoted_persistent_host_commitment_bytes(&preflight.tensor_index)?;
+        let peak_quote = preflight
+            .runtime_source
+            .immutable_snapshot_construction_peak_bytes(retained_quote)
             .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
-        let peak_quote = retained_quote.checked_add(mapped_quote).ok_or_else(|| {
-            EmbedError::Unavailable("redimnet construction peak byte sum overflow".to_string())
-        })?;
-        drop(source);
 
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
@@ -366,7 +361,7 @@ impl PolicyResolvedSpeakerRuntime {
 
         let services_for_builder = Arc::clone(&execution_services);
         let content_for_builder = content_id.clone();
-        let path_for_builder = pack_path.clone();
+        let preflight_for_builder = preflight.clone();
         let builder = Arc::new(
             move |_candidate: &crate::device::execution_policy::ExecutionCandidate| {
                 let key = AuxiliaryRuntimeCacheKey::for_current_lane::<RedimNet2Embedder>(
@@ -382,7 +377,7 @@ impl PolicyResolvedSpeakerRuntime {
                         retained_quote,
                         || {
                             build_admitted_embedder(
-                                &path_for_builder,
+                                &preflight_for_builder,
                                 &content_for_builder,
                                 peak_quote,
                                 retained_quote,
@@ -460,7 +455,7 @@ impl PolicyResolvedSpeakerRuntime {
 }
 
 fn build_admitted_embedder(
-    pack_path: &PathBuf,
+    preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     expected_content_id: &str,
     peak_quote: u64,
     retained_quote: u64,
@@ -472,24 +467,18 @@ fn build_admitted_embedder(
     )
     .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
     SystemMemoryOwner::try_allocate(quote, || {
-        let source = crate::validate_ggml_runtime_source_path(pack_path)
+        let snapshot = preflight
+            .immutable_snapshot_matching_content_id(expected_content_id)
             .map_err(|error| error.to_string())?;
-        let actual_content_id = source.content_id();
-        if actual_content_id != expected_content_id {
-            return Err(format!(
-                "redimnet pack changed between quote and construction: expected {expected_content_id}, got {actual_content_id}"
-            ));
-        }
-        let mapped_commitment = allocation_commitment_u64(source.backing_mmap().len() as u64)
-            .map_err(|error| error.to_string())?;
-        let embedder = RedimNet2Embedder::from_runtime_source(&source)
-            .map_err(|error| error.to_string())?;
+        let embedder =
+            RedimNet2Embedder::from_preflight(&snapshot).map_err(|error| error.to_string())?;
         let actual_retained = embedder
             .persistent_host_commitment_bytes()
             .map_err(|error| error.to_string())?;
-        let actual_peak = actual_retained
-            .checked_add(mapped_commitment)
-            .ok_or_else(|| "redimnet measured construction peak overflow".to_string())?;
+        let actual_peak = snapshot
+            .runtime_source
+            .immutable_snapshot_construction_peak_bytes(actual_retained)
+            .map_err(|error| error.to_string())?;
         Ok(SystemMemoryAllocationOutcome::new(
             embedder,
             actual_peak,

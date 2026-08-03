@@ -55,6 +55,9 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
 };
+use crate::models::lora_adapter::{
+    ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle, resolved_lora_adapter,
+};
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
@@ -77,10 +80,8 @@ use crate::{
 #[cfg(test)]
 use super::runtime_contract::parse_qwen3_execution_metadata;
 #[cfg(test)]
-use crate::GgmlAsrRuntimeSourcePreflight;
-use crate::GgmlRuntimeSource;
-#[cfg(test)]
 use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
+use crate::{GgmlAsrRuntimeSourcePreflight, GgmlRuntimeSource};
 
 const QWEN3_EXECUTOR_ID: &str = "qwen3-asr-ggml-executor-v1";
 const QWEN3_STREAMING_EXECUTOR_ID: &str = "qwen3-asr-ggml-snapshot-streaming-executor-v1";
@@ -232,6 +233,7 @@ pub(crate) struct Qwen3AsrGgmlExecutor {
     audio_encoder_runtimes: Arc<Qwen3AsrAudioEncoderRuntimePool>,
     decoder_runtimes: Arc<Qwen3AsrDecoderRuntimePool>,
     serve_batch_engines: Qwen3AsrServeBatchEngineRegistry,
+    lora_adapters: ResolvedLoraAdapterCache,
 }
 
 impl Default for Qwen3AsrGgmlExecutor {
@@ -254,6 +256,7 @@ impl Default for Qwen3AsrGgmlExecutor {
                 limits,
             )),
             serve_batch_engines: Qwen3AsrServeBatchEngineRegistry::default(),
+            lora_adapters: ResolvedLoraAdapterCache::default(),
         }
     }
 }
@@ -334,7 +337,7 @@ impl Qwen3AsrGgmlExecutor {
         &self,
         runtime_source: &GgmlRuntimeSource,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
-        adapter: Option<Arc<super::lora::QwenLoraAdapter>>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
         kv_capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Qwen3AsrDecoderRuntimeActor, Qwen3AsrGgmlExecutorError> {
@@ -342,7 +345,7 @@ impl Qwen3AsrGgmlExecutor {
         let key = (
             PackContentKey::for_runtime_source(runtime_source),
             current_execution_lane_key(decoder_backend),
-            qwen_adapter_cache_fingerprint(adapter.as_deref()),
+            qwen_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
             kv_capacity.resident_positions(),
         );
         let source = runtime_source.clone();
@@ -362,7 +365,7 @@ impl Qwen3AsrGgmlExecutor {
                     &prepared_runtime.decoder_plan,
                     &source,
                     prepared_runtime.logits_head.fused_top1_spec(),
-                    adapter.as_deref(),
+                    adapter.as_ref().map(resolved_lora_adapter),
                     backend,
                 )
                 .map_err(|error| {
@@ -426,7 +429,7 @@ impl Qwen3AsrGgmlExecutor {
             .and_then(|prepared_runtime_owner| {
                 self.execute_with_prepared_runtime(
                     request,
-                    &preflight.runtime_source,
+                    preflight.as_ref(),
                     &prepared_runtime_owner,
                     skip_serve_batch,
                 )
@@ -439,7 +442,7 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_prepared_runtime(
         &self,
         request: &GgmlAsrExecutionViewRequest,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared_runtime_owner: &PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
@@ -452,9 +455,19 @@ impl Qwen3AsrGgmlExecutor {
                     request.selected_family.model_architecture
                 ),
             })?;
+        let adapter = resolve_qwen_lora_adapter(
+            &self.lora_adapters,
+            request.request_options.adapter_path.as_deref(),
+            preflight,
+        )
+        .map_err(
+            |error| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+                reason: format!("qwen3-asr lora adapter rejected: {error}"),
+            },
+        )?;
         self.execute_with_runtime_assets(
             request,
-            runtime_source,
+            &preflight.runtime_source,
             prepared_runtime.metadata,
             prepared_runtime.tokenizer.as_ref(),
             &prepared_runtime.mel_frontend_plan,
@@ -462,6 +475,7 @@ impl Qwen3AsrGgmlExecutor {
             prepared_runtime.token_embedding_table.clone(),
             prepared_runtime.decoder_plan.clone(),
             Arc::clone(prepared_runtime_owner),
+            adapter,
             skip_serve_batch,
         )
     }
@@ -478,6 +492,7 @@ impl Qwen3AsrGgmlExecutor {
         token_embedding_table: Arc<super::token_embedding::Qwen3AsrTokenEmbeddingTable>,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         let profile_started_at = qwen_decode_profile_start();
@@ -499,6 +514,7 @@ impl Qwen3AsrGgmlExecutor {
             &mel_features,
             decoder_plan,
             prepared_runtime_owner,
+            adapter,
             skip_serve_batch,
         );
         qwen_decode_profile_log_opt("execute_with_runtime_assets_total", profile_started_at);
@@ -517,6 +533,7 @@ impl Qwen3AsrGgmlExecutor {
         mel_features: &Qwen3AsrMelFeatures,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         let profile_started_at = qwen_decode_profile_start();
@@ -620,10 +637,7 @@ impl Qwen3AsrGgmlExecutor {
         // weights before this point and has no adapter plumbing, so it would
         // silently run on base weights. Resolve the active source up front and fail
         // closed onto the serial lane below, matching moonshine's adapter bypass.
-        let adapter_active = crate::adapter_pack::active_adapter_path(
-            request.request_options.adapter_path.as_deref(),
-        )
-        .is_some();
+        let adapter_active = adapter.is_some();
         if let Some(serve_batch_config) =
             Qwen3AsrServeBatchConfig::from_policy(request.request_options.serve_batch)
                 // Serve-batch needs the unified GPU lane on the direct reusable graph.
@@ -699,26 +713,6 @@ impl Qwen3AsrGgmlExecutor {
             qwen_decode_profile_log_opt("serve_batch_submit", serve_batch_started_at);
             return result;
         }
-        // OADP Phase 0: resolve the active LoRA adapter (request-level path,
-        // env fallback). Any mismatch (base binding, content change, non-target
-        // tensor) is fail-closed — adapters are never silently ignored.
-        let preflight_for_adapter =
-            request
-                .resolve_runtime_source_preflight()
-                .map_err(
-                    |error| Qwen3AsrGgmlExecutorError::RuntimeMetadataReadFailed {
-                        reason: error.to_string(),
-                    },
-                )?;
-        let adapter = resolve_qwen_lora_adapter(
-            request.request_options.adapter_path.as_deref(),
-            preflight_for_adapter.as_ref(),
-        )
-        .map_err(
-            |error| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
-                reason: format!("qwen3-asr lora adapter rejected: {error}"),
-            },
-        )?;
         let decoder_backend = qwen_runtime_graph_config(backend).backend;
         let whole_decoder_started_at = qwen_decode_profile_start();
         let decoder_actor = self.checkout_decoder_runtime(
@@ -1014,6 +1008,7 @@ impl Qwen3AsrGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.decoder_runtimes
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
     }
 
@@ -1813,6 +1808,7 @@ impl GgmlAsrViewExecutor for Qwen3AsrGgmlExecutor {
         shutdown_qwen_serve_batch_engines(&self.serve_batch_engines);
         self.audio_encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -1869,6 +1865,7 @@ impl GgmlAsrStreamingExecutor for Qwen3AsrGgmlExecutor {
         shutdown_qwen_serve_batch_engines(&self.serve_batch_engines);
         self.audio_encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
 }

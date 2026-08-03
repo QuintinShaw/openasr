@@ -47,14 +47,17 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GGML_TYPE_F16, GGML_TYPE_F32, GgufTensorDataReader, GgufWriteTensor, GgufWriteTensorType,
-    GgufWriteValue, read_gguf_metadata_from_runtime_source,
-    read_gguf_tensor_index_from_runtime_source, write_gguf_file_v0,
+    GGML_TYPE_F16, GGML_TYPE_F32, GgmlRuntimeSource, GgufTensorDataReader, GgufWriteTensor,
+    GgufWriteTensorType, GgufWriteValue, bounded_gguf_parser_payload_wire_multiplier,
+    bounded_gguf_parser_structural_bytes, read_gguf_metadata_from_runtime_source,
+    read_gguf_metadata_from_runtime_source_with_limits, read_gguf_tensor_index_from_runtime_source,
+    read_gguf_tensor_index_from_runtime_source_with_limits, write_gguf_file_v0,
 };
 use crate::nn::half::f32_to_f16_bits;
 use crate::{GgufMetadata, validate_ggml_runtime_source_path};
@@ -96,6 +99,16 @@ pub const OADP_KEY_MIN_OPENASR_VERSION: &str = "openasr.adapter.min_openasr_vers
 
 const OADP_TENSOR_SUFFIX_A: &str = ".lora_a";
 const OADP_TENSOR_SUFFIX_B: &str = ".lora_b";
+
+/// OADP is a small sidecar format, not a second base-model container. These
+/// format limits bound parser structure before the C GGUF parser allocates.
+/// 4,096 targets is already well beyond any supported decoder's projection
+/// count while keeping a corrupt file from turning tiny descriptors into a
+/// multi-gigabyte parser arena.
+pub(crate) const OADP_MAX_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const OADP_MAX_TARGETS: u64 = 4_096;
+pub(crate) const OADP_MAX_TENSORS: u64 = OADP_MAX_TARGETS * 2;
+pub(crate) const OADP_MAX_KV: u64 = 256;
 
 /// `openasr.model.id` — the identity key burned into every base `.oasr` pack.
 const BASE_PACK_MODEL_ID_KEY: &str = "openasr.model.id";
@@ -220,6 +233,17 @@ pub enum AdapterPackError {
     NoTargets { path: PathBuf },
     #[error("adapter pack '{path}' declares duplicate target tensor '{name}'")]
     DuplicateTarget { path: PathBuf, name: String },
+    #[error(
+        "adapter pack '{path}' exceeds the {resource} limit: declared {found}, maximum {maximum}"
+    )]
+    ResourceLimitExceeded {
+        path: PathBuf,
+        resource: &'static str,
+        found: u64,
+        maximum: u64,
+    },
+    #[error("adapter pack '{path}' has an invalid GGUF header: {reason}")]
+    InvalidContainerHeader { path: PathBuf, reason: String },
     #[error("adapter pack '{path}' is missing adapter tensor '{name}'")]
     AdapterTensorMissing { path: PathBuf, name: String },
     #[error("adapter tensor '{name}' in '{path}' has invalid shape {dims:?}: {reason}")]
@@ -279,11 +303,25 @@ pub fn read_lora_adapter_pack(path: impl AsRef<Path>) -> Result<LoraAdapterPack,
             path: path.to_path_buf(),
             reason: error.to_string(),
         })?;
-    let metadata = read_gguf_metadata_from_runtime_source(&runtime_source).map_err(|error| {
-        AdapterPackError::Unreadable {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
-        }
+    read_lora_adapter_pack_from_runtime_source(&runtime_source)
+}
+
+/// Read one adapter from the exact already-open file generation supplied by
+/// the caller. Metadata, tensor descriptors, tensor bytes, and the content
+/// fingerprint all derive from the same mapping; no path is reopened.
+pub(crate) fn read_lora_adapter_pack_from_runtime_source(
+    runtime_source: &GgmlRuntimeSource,
+) -> Result<LoraAdapterPack, AdapterPackError> {
+    let _ = plan_lora_adapter_resources(runtime_source)?;
+    let path = runtime_source.path();
+    let metadata = read_gguf_metadata_from_runtime_source_with_limits(
+        runtime_source,
+        OADP_MAX_TENSORS,
+        OADP_MAX_KV,
+    )
+    .map_err(|error| AdapterPackError::Unreadable {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
     })?;
 
     let manifest = parse_manifest(path, &metadata)?;
@@ -292,11 +330,23 @@ pub fn read_lora_adapter_pack(path: impl AsRef<Path>) -> Result<LoraAdapterPack,
     // same one `metadata` above was read from. A second, independent open of
     // `path` would let an adapter pack replaced in between pair a manifest
     // with bytes from a different file generation.
-    let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).map_err(|error| {
-        AdapterPackError::Unreadable {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
-        }
+    let tensor_index = read_gguf_tensor_index_from_runtime_source_with_limits(
+        runtime_source,
+        OADP_MAX_TENSORS,
+        OADP_MAX_KV,
+    )
+    .map_err(|error| AdapterPackError::Unreadable {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let reader = GgufTensorDataReader::from_preflight_parts(
+        runtime_source,
+        &metadata,
+        Arc::new(tensor_index),
+    )
+    .map_err(|error| AdapterPackError::Unreadable {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
     })?;
 
     let rank = manifest.rank as usize;
@@ -332,10 +382,7 @@ pub fn read_lora_adapter_pack(path: impl AsRef<Path>) -> Result<LoraAdapterPack,
         });
     }
 
-    let file_sha256 = file_sha256_hex(path).map_err(|reason| AdapterPackError::Unreadable {
-        path: path.to_path_buf(),
-        reason,
-    })?;
+    let file_sha256 = sha256_hex_from_content_id(path, runtime_source.content_id())?;
 
     Ok(LoraAdapterPack {
         source_path: path.to_path_buf(),
@@ -343,6 +390,96 @@ pub fn read_lora_adapter_pack(path: impl AsRef<Path>) -> Result<LoraAdapterPack,
         manifest,
         targets,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoraAdapterResourcePlan {
+    pub(crate) source_bytes: u64,
+    pub(crate) declared_tensors: u64,
+    pub(crate) declared_kv: u64,
+    pub(crate) bounded_parser_structural_bytes: u64,
+    pub(crate) bounded_parser_payload_wire_multiplier: u64,
+}
+
+/// Count-only OADP preflight. This touches only the fixed 24-byte GGUF
+/// preamble and performs no input-sized allocation, so it is safe to run
+/// before memory admission.
+pub(crate) fn plan_lora_adapter_resources(
+    runtime_source: &GgmlRuntimeSource,
+) -> Result<LoraAdapterResourcePlan, AdapterPackError> {
+    let path = runtime_source.path();
+    let source_bytes = runtime_source.byte_len();
+    enforce_resource_limit(path, "file bytes", source_bytes, OADP_MAX_SOURCE_BYTES)?;
+
+    let bytes = runtime_source.backing_mmap();
+    let preamble = bytes
+        .get(..24)
+        .ok_or_else(|| AdapterPackError::InvalidContainerHeader {
+            path: path.to_path_buf(),
+            reason: format!("expected at least 24 bytes, got {}", bytes.len()),
+        })?;
+    if &preamble[..4] != b"GGUF" {
+        return Err(AdapterPackError::InvalidContainerHeader {
+            path: path.to_path_buf(),
+            reason: "magic is not GGUF".to_string(),
+        });
+    }
+    let version = u32::from_le_bytes(preamble[4..8].try_into().expect("fixed preamble slice"));
+    if !matches!(version, 2 | 3) {
+        return Err(AdapterPackError::InvalidContainerHeader {
+            path: path.to_path_buf(),
+            reason: format!("unsupported GGUF version {version}"),
+        });
+    }
+    let declared_tensors =
+        u64::from_le_bytes(preamble[8..16].try_into().expect("fixed preamble slice"));
+    let declared_kv =
+        u64::from_le_bytes(preamble[16..24].try_into().expect("fixed preamble slice"));
+    enforce_resource_limit(
+        path,
+        "tensor descriptor count",
+        declared_tensors,
+        OADP_MAX_TENSORS,
+    )?;
+    enforce_resource_limit(path, "metadata entry count", declared_kv, OADP_MAX_KV)?;
+
+    let bounded_parser_structural_bytes =
+        bounded_gguf_parser_structural_bytes(declared_kv, declared_tensors)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| AdapterPackError::InvalidContainerHeader {
+                path: path.to_path_buf(),
+                reason: "bounded GGUF parser returned an invalid structural byte count".to_string(),
+            })?;
+    let bounded_parser_payload_wire_multiplier = bounded_gguf_parser_payload_wire_multiplier()
+        .filter(|multiplier| *multiplier >= 2)
+        .ok_or_else(|| AdapterPackError::InvalidContainerHeader {
+            path: path.to_path_buf(),
+            reason: "bounded GGUF parser returned an invalid payload multiplier".to_string(),
+        })?;
+    Ok(LoraAdapterResourcePlan {
+        source_bytes,
+        declared_tensors,
+        declared_kv,
+        bounded_parser_structural_bytes,
+        bounded_parser_payload_wire_multiplier,
+    })
+}
+
+fn enforce_resource_limit(
+    path: &Path,
+    resource: &'static str,
+    found: u64,
+    maximum: u64,
+) -> Result<(), AdapterPackError> {
+    if found > maximum {
+        return Err(AdapterPackError::ResourceLimitExceeded {
+            path: path.to_path_buf(),
+            resource,
+            found,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 /// Fail-closed base binding: the installed base pack must match the adapter's
@@ -355,6 +492,8 @@ pub fn validate_lora_adapter_base_binding(
 ) -> Result<(), AdapterPackError> {
     let base_pack_path = base_pack_path.as_ref();
 
+    // Version incompatibility is independent of the base pack and should be
+    // rejected before opening or parsing a potentially multi-gigabyte model.
     check_min_openasr_version(&pack.manifest.min_openasr_version)?;
 
     let runtime_source = validate_ggml_runtime_source_path(base_pack_path).map_err(|error| {
@@ -370,6 +509,20 @@ pub fn validate_lora_adapter_base_binding(
                 reason: error.to_string(),
             }
         })?;
+    validate_lora_adapter_base_binding_from_runtime_source(pack, &runtime_source, &base_metadata)
+}
+
+/// Validate a LoRA manifest against the exact base-pack generation already
+/// admitted by the ASR request. This is the inference-path counterpart to
+/// [`validate_lora_adapter_base_binding`]: it must not reopen the base path.
+pub(crate) fn validate_lora_adapter_base_binding_from_runtime_source(
+    pack: &LoraAdapterPack,
+    base_runtime_source: &GgmlRuntimeSource,
+    base_metadata: &GgufMetadata,
+) -> Result<(), AdapterPackError> {
+    let base_pack_path = base_runtime_source.path();
+    check_min_openasr_version(&pack.manifest.min_openasr_version)?;
+
     let installed_model_id = base_metadata.get_string(BASE_PACK_MODEL_ID_KEY);
     if installed_model_id != Some(pack.manifest.base_model_id.as_str()) {
         return Err(AdapterPackError::BaseModelIdMismatch {
@@ -380,10 +533,12 @@ pub fn validate_lora_adapter_base_binding(
     }
 
     let installed_sha256 =
-        file_sha256_hex(base_pack_path).map_err(|reason| AdapterPackError::BasePackUnreadable {
-            base_pack: base_pack_path.to_path_buf(),
-            reason,
-        })?;
+        sha256_hex_from_content_id(base_pack_path, base_runtime_source.content_id()).map_err(
+            |error| AdapterPackError::BasePackUnreadable {
+                base_pack: base_pack_path.to_path_buf(),
+                reason: error.to_string(),
+            },
+        )?;
     if installed_sha256 != pack.manifest.base_pack_sha256 {
         return Err(AdapterPackError::BasePackSha256Mismatch {
             adapter_base_sha256: pack.manifest.base_pack_sha256.clone(),
@@ -392,6 +547,17 @@ pub fn validate_lora_adapter_base_binding(
         });
     }
     Ok(())
+}
+
+fn sha256_hex_from_content_id(path: &Path, content_id: &str) -> Result<String, AdapterPackError> {
+    content_id
+        .strip_prefix("sha256:")
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .ok_or_else(|| AdapterPackError::Unreadable {
+            path: path.to_path_buf(),
+            reason: format!("runtime source returned non-sha256 content id '{content_id}'"),
+        })
 }
 
 /// One write-side LoRA target. Dims are explicit so hand-made/test adapters
@@ -431,6 +597,12 @@ pub fn write_lora_adapter_pack(request: &LoraAdapterWriteRequest) -> Result<(), 
     };
     if request.targets.is_empty() {
         return Err(write_failed("at least one target is required".to_string()));
+    }
+    if request.targets.len() as u64 > OADP_MAX_TARGETS {
+        return Err(write_failed(format!(
+            "target count {} exceeds OADP maximum {OADP_MAX_TARGETS}",
+            request.targets.len()
+        )));
     }
     let rank = request.rank as usize;
     if rank == 0 {
@@ -762,6 +934,12 @@ fn parse_manifest(
             path: path.to_path_buf(),
         });
     }
+    enforce_resource_limit(
+        path,
+        "LoRA target count",
+        target_tensors.len() as u64,
+        OADP_MAX_TARGETS,
+    )?;
     let mut seen = std::collections::BTreeSet::new();
     for name in &target_tensors {
         if !seen.insert(name.as_str()) {
@@ -939,6 +1117,57 @@ mod tests {
     use super::*;
     use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 
+    fn write_declared_counts_fixture(path: &Path, tensors: u64, kv: u64) {
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&tensors.to_le_bytes());
+        bytes.extend_from_slice(&kv.to_le_bytes());
+        std::fs::write(path, bytes).expect("write declared-count fixture");
+    }
+
+    #[test]
+    fn count_only_plan_rejects_descriptor_amplification_before_c_parsing() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("descriptor-bomb.oadp");
+        write_declared_counts_fixture(&path, OADP_MAX_TENSORS + 1, 1);
+        let source = validate_ggml_runtime_source_path(&path).expect("open fixture");
+        let error = plan_lora_adapter_resources(&source).expect_err("count limit must reject");
+        assert!(matches!(
+            error,
+            AdapterPackError::ResourceLimitExceeded {
+                resource: "tensor descriptor count",
+                found,
+                maximum,
+                ..
+            } if found == OADP_MAX_TENSORS + 1 && maximum == OADP_MAX_TENSORS
+        ));
+    }
+
+    #[test]
+    fn count_only_plan_uses_backend_abi_structural_quote() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("bounded-layout.oadp");
+        write_declared_counts_fixture(&path, 2, 11);
+        let source = validate_ggml_runtime_source_path(&path).expect("open fixture");
+        let plan = plan_lora_adapter_resources(&source).expect("plan fixed preamble");
+        assert_eq!(plan.declared_tensors, 2);
+        assert_eq!(plan.declared_kv, 11);
+        assert!(plan.bounded_parser_structural_bytes > 0);
+        assert!(plan.bounded_parser_payload_wire_multiplier >= 2);
+    }
+
+    #[test]
+    fn bounded_c_parser_rejects_a_valid_pack_above_the_callers_limit() {
+        let dir = TempDir::new().expect("tempdir");
+        let request = base_request(dir.path());
+        write_lora_adapter_pack(&request).expect("write adapter");
+        let source = validate_ggml_runtime_source_path(&request.output_path).expect("open adapter");
+        let error = read_gguf_metadata_from_runtime_source_with_limits(&source, 1, OADP_MAX_KV)
+            .expect_err("two-tensor adapter must exceed one-tensor parser limit");
+        assert!(error.to_string().contains("initialization failed"));
+    }
+
     #[test]
     fn qwen3_asr_lora_target_name_contract() {
         // LLM-decoder 2-D linears are targets.
@@ -1034,6 +1263,36 @@ mod tests {
         assert_eq!(pack.manifest.dtype, LoraAdapterDtype::F16);
         assert_eq!(pack.targets[0].a_values, request.targets[0].a_values);
         assert_eq!(pack.targets[0].b_values, vec![1.5; 10]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_source_adapter_read_is_bound_to_one_file_generation() {
+        let dir = TempDir::new().expect("tempdir");
+        let original_path = dir.path().join("adapter.oadp");
+        let replacement_path = dir.path().join("replacement.oadp");
+        let mut original = base_request(dir.path());
+        original.output_path = original_path.clone();
+        original.id = "original-adapter".to_string();
+        write_lora_adapter_pack(&original).expect("write original adapter");
+        let runtime_source =
+            validate_ggml_runtime_source_path(&original_path).expect("validate original source");
+
+        let mut replacement = base_request(dir.path());
+        replacement.output_path = replacement_path.clone();
+        replacement.id = "replacement-adapter".to_string();
+        replacement.targets[0].a_values.fill(0.75);
+        write_lora_adapter_pack(&replacement).expect("write replacement adapter");
+        std::fs::rename(&replacement_path, &original_path).expect("atomically replace path");
+
+        let held = read_lora_adapter_pack_from_runtime_source(&runtime_source)
+            .expect("read held adapter source");
+        assert_eq!(held.manifest.id, "original-adapter");
+        assert_eq!(held.targets[0].a_values, vec![0.5; 6]);
+
+        let current = read_lora_adapter_pack(&original_path).expect("read replacement path");
+        assert_eq!(current.manifest.id, "replacement-adapter");
+        assert_eq!(current.targets[0].a_values, vec![0.75; 6]);
     }
 
     #[test]

@@ -71,6 +71,20 @@ pub(crate) struct GgufInitParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(crate) struct GgufParseLimits {
+    pub max_tensors: u64,
+    pub max_kv: u64,
+    pub max_string_bytes: u64,
+    pub max_array_elements: u64,
+    pub max_header_bytes: u64,
+}
+
+pub(crate) const GGUF_PARSE_ERROR_NONE: c_int = 0;
+pub(crate) const GGUF_PARSE_ERROR_INVALID_DATA: c_int = 1;
+pub(crate) const GGUF_PARSE_ERROR_ALLOCATION: c_int = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct GgmlInitParams {
     pub mem_size: usize,
     pub mem_buffer: *mut c_void,
@@ -827,10 +841,19 @@ unsafe extern "C" {
     // core. GgmlCpuFeatures::detect() reads CPU features via the Rust stdlib
     // instead (build-mode-agnostic).
 
-    pub(crate) fn gguf_init_from_file(
-        fname: *const c_char,
+    pub(crate) fn gguf_init_from_buffer_with_limits(
+        data: *const c_void,
+        size: usize,
         params: GgufInitParams,
+        limits: GgufParseLimits,
+        error: *mut c_int,
     ) -> GgufContextRaw;
+    pub(crate) fn gguf_bounded_parser_structural_bytes(
+        n_kv: u64,
+        n_tensors: u64,
+        result: *mut usize,
+    ) -> bool;
+    pub(crate) fn gguf_bounded_parser_payload_wire_multiplier() -> usize;
     pub(crate) fn gguf_free(ctx: GgufContextRaw);
     pub(crate) fn gguf_get_n_kv(ctx: *const c_void) -> i64;
     pub(crate) fn gguf_get_key(ctx: *const c_void, key_id: i64) -> *const c_char;

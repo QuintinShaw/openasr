@@ -1,6 +1,36 @@
 use super::PyannetModel;
 
 #[test]
+fn segmenter_working_set_geometry_pins_provider_inference_concurrency() {
+    let pyannote = super::segmenter_working_set_geometry(super::SegmenterProvider::Segmentation3_0);
+    assert_eq!(
+        pyannote.max_parallel_windows,
+        super::pyannote_window_worker_count()
+    );
+    assert_eq!(
+        pyannote.inference_peak_bytes_per_window,
+        super::pyannet::quoted_forward_peak_bytes(10 * super::SAMPLE_RATE_HZ as usize)
+    );
+    assert!(
+        pyannote.inference_peak_bytes_per_window
+            > (pyannote.frames_per_window * super::NUM_CLASSES * std::mem::size_of::<f32>()) as u64
+    );
+
+    let diarizen = super::segmenter_working_set_geometry(super::SegmenterProvider::DiariZen);
+    assert_eq!(diarizen.max_parallel_windows, 1);
+    assert!(diarizen.inference_peak_bytes_per_window > 0);
+
+    assert_eq!(pyannote.window_count(30 * 16_000), 21);
+    assert_eq!(diarizen.window_count(30 * 16_000), 10);
+    assert_eq!(
+        pyannote.activity_frame_count(30 * 16_000),
+        super::activity_frame_clock().frame_count_for_samples(30 * 16_000)
+    );
+    assert_eq!(pyannote.padded_tail_bytes(30 * 16_000), 0);
+    assert!(pyannote.padded_tail_bytes(30 * 16_000 + 1) > 0);
+}
+
+#[test]
 fn bounded_pyannote_window_pool_preserves_order_and_worker_cap() {
     let starts: Vec<usize> = (0..17).collect();
     let output = super::bounded_pyannote_window_map(&starts, &|| false, |start| {
@@ -47,10 +77,11 @@ fn parallel_pyannote_windows_match_serial_reference() {
             (t * 127.0).sin() * 0.21 + (t * 391.0).cos() * 0.09
         })
         .collect();
+    let pcm_samples = samples.clone().into();
 
     let parallel = super::LocalActivitySegmenter::segment_local_activity(
         &segmenter,
-        &samples,
+        pcm_samples,
         16_000,
         &|| false,
     )

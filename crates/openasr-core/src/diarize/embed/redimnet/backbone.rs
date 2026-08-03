@@ -1161,6 +1161,15 @@ impl RedimNet2Model {
         })
     }
 
+    pub(crate) fn from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+    ) -> Result<Self, RedimNetBackboneError> {
+        Ok(Self {
+            weights: Arc::new(Weights::from_preflight(preflight)?),
+            pack_content_id: preflight.runtime_source.content_id().to_string(),
+        })
+    }
+
     pub(crate) fn pack_content_id(&self) -> &str {
         &self.pack_content_id
     }
@@ -1182,34 +1191,8 @@ impl RedimNet2Model {
         config::EMBED_DIM
     }
 
-    pub(crate) fn logical_f32_weight_bytes(&self) -> u64 {
-        self.weights.logical_f32_bytes()
-    }
-
     pub(crate) fn shared_weights(&self) -> Arc<Weights> {
         Arc::clone(&self.weights)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn forward_uncached_for_bench(
-        &self,
-        feats: &[f32],
-        frames: usize,
-    ) -> Result<Vec<f32>, RedimNetBackboneError> {
-        let mut runner = GgmlCpuGraphRunner::new(runner_config())?;
-        let arena = runner.start_static_tensor_arena(arena_context_bytes())?;
-        let mut builder = WBuilder::new(&self.weights);
-        let weights = load_weights(&mut builder, &arena)?;
-        let mut arena = arena;
-        builder.upload(&mut arena)?;
-        let mut graph = runner.start_graph();
-        let spec = graph.new_tensor_2d_f32(frames, config::F, "redimnet_spec_input")?;
-        let taps = forward(&mut graph, spec, frames, &weights)?;
-        graph.set_input(spec)?;
-        graph.set_output(taps.embedding)?;
-        graph.prepare_outputs_for_upload(&[taps.embedding])?;
-        graph.set_f32_slice(spec, feats, "redimnet_spec_input")?;
-        Ok(graph.compute_output_f32(taps.embedding, config::EMBED_DIM)?)
     }
 }
 

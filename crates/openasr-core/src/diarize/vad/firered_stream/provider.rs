@@ -39,6 +39,20 @@ impl FireRedStreamVadProvider {
         self.model.probabilities(samples)
     }
 
+    /// Recording-length-independent peak for the bounded one-second offline
+    /// streaming step. The raw buffer can contain one chunk plus the fbank
+    /// overlap tail; geometric Vec growth is bounded by twice that payload.
+    pub(crate) fn invocation_scratch_peak_bytes(&self) -> u64 {
+        let buffered_samples = SAMPLE_RATE_HZ as usize + super::frontend::FRAME_LENGTH;
+        let raw_buffer_bytes = (buffered_samples as u64)
+            .saturating_mul(std::mem::size_of::<f32>() as u64)
+            .saturating_mul(2);
+        raw_buffer_bytes.saturating_add(
+            self.model
+                .quoted_streaming_chunk_peak_bytes(buffered_samples),
+        )
+    }
+
     /// Offline speech slicing with bounded cancellation latency. One second
     /// of PCM is frontended and scored at a time while the causal DFSMN cache
     /// and the fbank overlap tail remain continuous, so output matches the

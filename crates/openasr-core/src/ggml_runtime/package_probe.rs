@@ -94,6 +94,16 @@ pub fn probe_ggml_package_path(
         source,
     })?;
 
+    probe_ggml_package_file(path, &mut file)
+}
+
+/// Probe the exact descriptor generation a runtime source will map. The file
+/// cursor is advanced by four bytes; callers that retain the descriptor seek
+/// explicitly before any later sequential read.
+pub(crate) fn probe_ggml_package_file(
+    path: &Path,
+    file: &mut File,
+) -> Result<GgmlPackageProbe, GgmlPackageProbeError> {
     let mut magic = [0_u8; MAGIC_SIZE];
     let mut read_bytes = 0usize;
     while read_bytes < MAGIC_SIZE {

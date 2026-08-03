@@ -169,9 +169,7 @@ impl PcmBuffer {
         self.backing.is_empty()
     }
 
-    /// Bytes reserved by the normalized PCM sample allocation. This is the
-    /// owner-side number used by request memory admission, so callers do not
-    /// duplicate sample-count arithmetic at orchestration sites.
+    /// Bytes reserved by the normalized PCM sample allocation.
     pub(crate) fn resident_bytes(&self) -> u64 {
         u64::try_from(self.backing.capacity())
             .unwrap_or(u64::MAX)

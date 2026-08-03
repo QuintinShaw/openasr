@@ -1152,7 +1152,7 @@ mod tests {
             let mut request = runtime_ready_request(runtime_path);
             plan_request_decoder_state(&mut request, Some(60 * 16_000));
             let result = executor
-                .execute(&request)
+                .execute_view(&request)
                 .expect("resident headroom must not change the active logical decode");
             assert!(result.transcription.text.is_ascii() || !result.transcription.text.is_empty());
         });

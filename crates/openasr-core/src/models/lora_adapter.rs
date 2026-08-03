@@ -17,25 +17,36 @@
 //!   node. Pre-scaling is mathematically identical to scaling the delta and keeps
 //!   the zero-adapter case exact (0 * s == 0).
 //!
-//! Resolution results are cached per (adapter path, base pack path) with the
-//! adapter file re-hashed (sha256) on every hit — adapters are small, so the hash
-//! is cheap next to a decode and leaves no mtime-granularity TOCTOU window;
-//! installed base packs are immutable by contract. The adapter fingerprint
-//! participates in every runtime/cgraph cache key, so prepared graphs are never
-//! reused across different adapters (or between adapter and no-adapter runs).
+//! Resolution results are cached by `(family contract, adapter content, base
+//! content)` in a service-root-owned, byte-bounded single-flight cache. Cold
+//! loads take an immutable snapshot of the already-open adapter generation;
+//! metadata, tensors and sha256 identity therefore cannot cross file versions.
+//! The admitted host owner and its lease share a lifetime, and the adapter
+//! fingerprint participates in every runtime/cgraph cache key, so prepared
+//! graphs are never reused across adapters (or adapter/no-adapter runs).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::adapter_pack::{
-    AdapterPackError, LoraAdapterPack, OPENASR_ADAPTER_ENV, active_adapter_path, file_sha256_hex,
-    read_lora_adapter_pack, validate_lora_adapter_base_binding,
+    AdapterPackError, LoraAdapterPack, OPENASR_ADAPTER_ENV, active_adapter_path,
+    plan_lora_adapter_resources, read_lora_adapter_pack_from_runtime_source,
+    validate_lora_adapter_base_binding_from_runtime_source,
 };
-use crate::ggml_runtime::{GgmlCpuGraphError, GgmlStaticTensor, GgmlStaticTensorArena};
+use crate::ggml_runtime::{
+    GgmlCpuGraphError, GgmlStaticTensor, GgmlStaticTensorArena, validate_ggml_runtime_source_path,
+};
+use crate::models::admitted_host_object_cache::{
+    AdmittedHostObjectCache, AdmittedHostObjectCacheLimits,
+};
 use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+use crate::models::system_memory_owner::{
+    AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryCapacity, SystemMemoryOwner,
+    SystemMemoryOwnerError,
+};
 
 /// In-arena A / pre-scaled-B factors for one LoRA-decorated linear:
 /// `y = W@x + B_scaled@(A@x)` (`alpha/rank` is folded into B at load time).
@@ -77,13 +88,44 @@ pub(crate) struct LoraTarget {
 pub(crate) struct ResolvedLoraAdapter {
     /// Cache-key identity: adapter id + .oadp sha256 + rank + alpha + targets.
     pub fingerprint: String,
-    targets_by_base_tensor: HashMap<String, LoraTarget>,
+    targets_by_base_tensor: Vec<(String, LoraTarget)>,
 }
 
 impl ResolvedLoraAdapter {
     pub(crate) fn target(&self, base_tensor_name: &str) -> Option<&LoraTarget> {
-        self.targets_by_base_tensor.get(base_tensor_name)
+        self.targets_by_base_tensor
+            .binary_search_by(|(name, _)| name.as_str().cmp(base_tensor_name))
+            .ok()
+            .map(|index| &self.targets_by_base_tensor[index].1)
     }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, LoraResolveError> {
+        let mut capacity = SystemMemoryCapacity::default();
+        capacity
+            .add_string(&self.fingerprint, "lora fingerprint")
+            .map_err(LoraResolveError::MemoryAccounting)?;
+        capacity
+            .add_vec(&self.targets_by_base_tensor, "lora target table")
+            .map_err(LoraResolveError::MemoryAccounting)?;
+        for (name, target) in &self.targets_by_base_tensor {
+            capacity
+                .add_string(name, "lora target name")
+                .map_err(LoraResolveError::MemoryAccounting)?;
+            capacity
+                .add_vec(&target.a_values, "lora A values")
+                .map_err(LoraResolveError::MemoryAccounting)?;
+            capacity
+                .add_vec(&target.b_scaled_values, "lora scaled B values")
+                .map_err(LoraResolveError::MemoryAccounting)?;
+        }
+        Ok(capacity.finish())
+    }
+}
+
+pub(crate) type ResolvedLoraAdapterHandle = AdmittedHostObject<ResolvedLoraAdapter>;
+
+pub(crate) fn resolved_lora_adapter(handle: &ResolvedLoraAdapterHandle) -> &ResolvedLoraAdapter {
+    handle.as_ref()
 }
 
 /// Cache-key component for the runtime caches: empty when no adapter is active.
@@ -125,26 +167,55 @@ pub(crate) enum LoraResolveError {
         adapter_out: usize,
         rank: usize,
     },
-    #[error("adapter '{path}' changed on disk since it was loaded; fail-closed")]
-    AdapterFileChanged { path: PathBuf },
     #[error("adapter resolution cache is poisoned")]
     CachePoisoned,
+    #[error("adapter system-memory accounting failed: {0}")]
+    MemoryAccounting(String),
+    #[error("adapter system-memory admission failed: {0}")]
+    MemoryAdmission(String),
 }
 
-type AdapterCacheKey = (
-    Option<crate::models::native_execution_services::NativeExecutionScopeId>,
-    PathBuf,
-    PathBuf,
-);
-
-struct CachedAdapter {
-    /// sha256 (lowercase hex) of the `.oadp` file at load time; every cache hit
-    /// re-hashes the file and must match this exactly.
-    file_sha256: String,
-    adapter: Arc<ResolvedLoraAdapter>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AdapterCacheKey {
+    contract_id: &'static str,
+    adapter_content_id: String,
+    base_content_id: String,
 }
 
-static RESOLVED_ADAPTERS: Mutex<Option<HashMap<AdapterCacheKey, CachedAdapter>>> = Mutex::new(None);
+/// Service-root-owned, single-flight and byte-bounded cache. Dropping the
+/// executor drops every idle adapter owner; an in-flight handle retains its
+/// own SystemMemory admission lease until graph construction finishes.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedLoraAdapterCache {
+    owners: AdmittedHostObjectCache<AdapterCacheKey, ResolvedLoraAdapter>,
+}
+
+impl Default for ResolvedLoraAdapterCache {
+    fn default() -> Self {
+        Self {
+            owners: AdmittedHostObjectCache::new(AdmittedHostObjectCacheLimits::new(
+                4,
+                crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+            )),
+        }
+    }
+}
+
+impl ResolvedLoraAdapterCache {
+    pub(crate) fn clear(&self) {
+        self.owners.clear();
+    }
+
+    pub(crate) fn evict_base_content_id(&self, base_content_id: &str) {
+        self.owners
+            .evict_where(|key| key.base_content_id == base_content_id);
+    }
+
+    #[cfg(test)]
+    fn usage_for_test(&self) -> (usize, u64) {
+        self.owners.usage_for_test()
+    }
+}
 
 /// Resolve the active adapter (request-level `--adapter` path, falling back to
 /// the server-side `OPENASR_ADAPTER` env var) for an execution. Returns
@@ -154,81 +225,167 @@ static RESOLVED_ADAPTERS: Mutex<Option<HashMap<AdapterCacheKey, CachedAdapter>>>
 /// LoRA targets for this model family; `model_label` / `allowed` shape the
 /// fail-closed [`LoraResolveError::TargetNotAllowed`] message.
 pub(crate) fn resolve_lora_adapter(
+    cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
     preflight: &GgmlAsrRuntimeSourcePreflight,
+    contract_id: &'static str,
     is_target: fn(&str) -> bool,
     model_label: &'static str,
     allowed: &'static str,
-) -> Result<Option<Arc<ResolvedLoraAdapter>>, LoraResolveError> {
+) -> Result<Option<ResolvedLoraAdapterHandle>, LoraResolveError> {
     let Some(adapter_path) = active_adapter_path(request_adapter_path) else {
         return Ok(None);
     };
     if adapter_path.as_os_str().is_empty() {
         return Err(LoraResolveError::EmptyAdapterPath);
     }
-    let base_pack_path = preflight.runtime_source.path().to_path_buf();
-    let key = (
-        crate::models::native_execution_services::current_native_execution_scope_id(),
-        adapter_path.clone(),
-        base_pack_path.clone(),
-    );
-
-    // Content identity: hash the file up front. Adapters are a few MB at most, so
-    // the sha256 is cheap next to a decode, and (unlike len+mtime) it leaves no
-    // mtime-granularity TOCTOU window.
-    let file_sha256 = adapter_file_sha256(&adapter_path)?;
-
-    {
-        let cache = RESOLVED_ADAPTERS
-            .lock()
-            .map_err(|_| LoraResolveError::CachePoisoned)?;
-        if let Some(cached) = cache.as_ref().and_then(|map| map.get(&key))
-            && cached.file_sha256 == file_sha256
-        {
-            return Ok(Some(Arc::clone(&cached.adapter)));
+    let adapter_source = validate_ggml_runtime_source_path(&adapter_path).map_err(|error| {
+        AdapterPackError::Unreadable {
+            path: adapter_path.clone(),
+            reason: error.to_string(),
         }
-    }
+    })?;
+    let adapter_content_id = adapter_source.freshly_hashed_content_id();
+    let base_content_id = preflight.runtime_source.content_id().to_owned();
+    let key = AdapterCacheKey {
+        contract_id,
+        adapter_content_id: adapter_content_id.clone(),
+        base_content_id: base_content_id.clone(),
+    };
 
-    let pack = read_lora_adapter_pack(&adapter_path)?;
-    // Fail closed if the file mutated while we were reading it: the reader hashes
-    // the file AFTER reading metadata/tensors, so a mismatch with the pre-read
-    // hash means the loaded tensors cannot be trusted.
-    if pack.file_sha256 != file_sha256 {
-        return Err(LoraResolveError::AdapterFileChanged { path: adapter_path });
-    }
-    validate_lora_adapter_base_binding(&pack, &base_pack_path)?;
-    let adapter = Arc::new(convert_validated_pack(
-        &pack,
-        preflight,
-        is_target,
-        model_label,
-        allowed,
-    )?);
-
-    let mut cache = RESOLVED_ADAPTERS
-        .lock()
-        .map_err(|_| LoraResolveError::CachePoisoned)?;
-    cache.get_or_insert_with(HashMap::new).insert(
-        key,
-        CachedAdapter {
-            file_sha256,
-            adapter: Arc::clone(&adapter),
-        },
-    );
-    Ok(Some(adapter))
+    cache
+        .owners
+        .get_or_try_insert_with(
+            key,
+            || {
+                let resource_plan = plan_lora_adapter_resources(&adapter_source)?;
+                let (materialization_peak, retained_bound) =
+                    lora_materialization_memory_bounds(resource_plan)?;
+                let peak_bound = adapter_source
+                    .immutable_snapshot_construction_peak_bytes(materialization_peak)
+                    .map_err(|error| capacity_quote_failure(error.to_string()))?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!("lora:{contract_id}:{adapter_content_id}:{base_content_id}"),
+                    peak_bound,
+                    retained_bound,
+                )
+                .map_err(|error| LoraResolveError::MemoryAdmission(error.to_string()))?;
+                Ok((retained_bound, (adapter_source, adapter_content_id, quote)))
+            },
+            |(adapter_source, expected_content_id, quote)| {
+                let transaction =
+                    SystemMemoryOwner::try_allocate_transaction(quote.clone(), || {
+                        let snapshot = adapter_source
+                            .immutable_snapshot_matching_content_id(&expected_content_id)
+                            .map_err(|error| AdapterPackError::Unreadable {
+                                path: adapter_path.clone(),
+                                reason: error.to_string(),
+                            })?;
+                        drop(adapter_source);
+                        let pack = read_lora_adapter_pack_from_runtime_source(&snapshot)?;
+                        validate_lora_adapter_base_binding_from_runtime_source(
+                            &pack,
+                            &preflight.runtime_source,
+                            &preflight.metadata,
+                        )?;
+                        let adapter = convert_validated_pack(
+                            pack,
+                            preflight,
+                            is_target,
+                            model_label,
+                            allowed,
+                        )?;
+                        let retained = adapter.retained_system_memory_bytes()?;
+                        Ok(SystemMemoryAllocationOutcome::new(
+                            adapter,
+                            quote.peak_bytes,
+                            retained,
+                        ))
+                    });
+                match transaction {
+                    Ok(owner) => Ok(Arc::new(owner)),
+                    Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                    Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                        Err(LoraResolveError::MemoryAdmission(error.to_string()))
+                    }
+                }
+            },
+            || LoraResolveError::CachePoisoned,
+        )
+        .map(Some)
 }
 
-fn adapter_file_sha256(path: &Path) -> Result<String, LoraResolveError> {
-    file_sha256_hex(path)
-        .map_err(|reason| AdapterPackError::Unreadable {
-            path: path.to_path_buf(),
-            reason,
+fn lora_materialization_memory_bounds(
+    plan: crate::adapter_pack::LoraAdapterResourcePlan,
+) -> Result<(u64, u64), LoraResolveError> {
+    // A valid target owns two tensors. Using ceil here also bounds malformed
+    // odd descriptor counts until structural validation rejects them.
+    let possible_targets = plan.declared_tensors.div_ceil(2);
+    let target_table_bytes = possible_targets
+        .checked_mul(std::mem::size_of::<(String, LoraTarget)>() as u64)
+        .ok_or_else(|| capacity_quote_failure("LoRA target table byte count overflowed"))?;
+
+    // Retained form: each serialized f16 payload expands by at most 2x to f32;
+    // f32 is unchanged. Target names are bytes already present in the GGUF
+    // header, so `2 * source` bounds payload + names. Inline Vec/String fields
+    // and the fixed-size content fingerprint are added explicitly.
+    let retained_bound = plan
+        .source_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(target_table_bytes))
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or_else(|| capacity_quote_failure("LoRA retained byte bound overflowed"))?;
+
+    // Bounded GGUF parsing admits descriptor vectors exactly. Variable parser
+    // payload is wire-derived: every string object corresponds to an eight-byte
+    // serialized length slot. The C ABI reports its own temporary + retained
+    // std::string ratio; Rust adds one ratio each for the simultaneously-live
+    // metadata and tensor-index views. This is architecture/STL aware instead
+    // of assuming a 24-byte string. The later f32 expansion is no larger than
+    // this parser phase. Snapshot copying is a separate phase composed by the
+    // caller with max(), not addition.
+    let rust_string_wire_multiplier =
+        (std::mem::size_of::<String>() as u64).div_ceil(std::mem::size_of::<u64>() as u64) + 1;
+    let wire_multiplier = plan
+        .bounded_parser_payload_wire_multiplier
+        .checked_add(
+            rust_string_wire_multiplier
+                .checked_mul(2)
+                .ok_or_else(|| capacity_quote_failure("Rust string byte ratio overflowed"))?,
+        )
+        .ok_or_else(|| capacity_quote_failure("GGUF wire byte ratio overflowed"))?;
+    // A page per logical descriptor is the same allocator-independent upper
+    // commitment used by the pure-Rust weight owners. It covers BTree/vector
+    // node layout, allocator headers and size-class rounding without relying
+    // on private std/STL implementation details.
+    const HOST_DESCRIPTOR_COMMITMENT_BYTES: u64 = 4096;
+    let rust_descriptor_bytes = plan
+        .declared_tensors
+        .checked_mul(HOST_DESCRIPTOR_COMMITMENT_BYTES)
+        .and_then(|bytes| {
+            plan.declared_kv
+                .checked_mul(HOST_DESCRIPTOR_COMMITMENT_BYTES)
+                .and_then(|kv| bytes.checked_add(kv))
         })
-        .map_err(LoraResolveError::from)
+        .and_then(|bytes| bytes.checked_add(target_table_bytes))
+        .ok_or_else(|| capacity_quote_failure("LoRA descriptor byte bound overflowed"))?;
+    let materialization_peak = plan
+        .source_bytes
+        .checked_mul(wire_multiplier)
+        .and_then(|bytes| bytes.checked_add(plan.bounded_parser_structural_bytes))
+        .and_then(|bytes| bytes.checked_add(rust_descriptor_bytes))
+        .ok_or_else(|| capacity_quote_failure("LoRA materialization peak overflowed"))?;
+    Ok((materialization_peak.max(retained_bound), retained_bound))
+}
+
+fn capacity_quote_failure(reason: impl Into<String>) -> LoraResolveError {
+    LoraResolveError::MemoryAdmission(
+        SystemMemoryOwnerError::capacity_failure("lora_memory_quote", reason).to_string(),
+    )
 }
 
 fn convert_validated_pack(
-    pack: &LoraAdapterPack,
+    pack: LoraAdapterPack,
     preflight: &GgmlAsrRuntimeSourcePreflight,
     is_target: fn(&str) -> bool,
     model_label: &'static str,
@@ -238,9 +395,10 @@ fn convert_validated_pack(
     let alpha = pack.manifest.alpha as f32;
     let rank = pack.manifest.rank as f32;
     let scale = alpha / rank;
+    let fingerprint = pack.fingerprint();
 
-    let mut targets_by_base_tensor = HashMap::with_capacity(pack.targets.len());
-    for target in &pack.targets {
+    let mut targets_by_base_tensor = Vec::with_capacity(pack.targets.len());
+    for mut target in pack.targets {
         if !is_target(&target.base_tensor) {
             return Err(LoraResolveError::TargetNotAllowed {
                 name: target.base_tensor.clone(),
@@ -270,22 +428,24 @@ fn convert_validated_pack(
                 rank: target.rank,
             });
         }
-        let b_scaled_values: Vec<f32> =
-            target.b_values.iter().map(|&value| value * scale).collect();
-        targets_by_base_tensor.insert(
-            target.base_tensor.clone(),
+        for value in &mut target.b_values {
+            *value *= scale;
+        }
+        targets_by_base_tensor.push((
+            target.base_tensor,
             LoraTarget {
                 rank: target.rank,
                 input_dim: target.input_dim,
                 output_dim: target.output_dim,
-                a_values: target.a_values.clone(),
-                b_scaled_values,
+                a_values: target.a_values,
+                b_scaled_values: target.b_values,
             },
-        );
+        ));
     }
+    targets_by_base_tensor.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
     Ok(ResolvedLoraAdapter {
-        fingerprint: pack.fingerprint(),
+        fingerprint,
         targets_by_base_tensor,
     })
 }
@@ -295,8 +455,117 @@ pub(crate) fn lora_adapter_for_test(
     fingerprint: String,
     targets: Vec<(String, LoraTarget)>,
 ) -> ResolvedLoraAdapter {
+    let mut targets = targets;
+    targets.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     ResolvedLoraAdapter {
         fingerprint,
-        targets_by_base_tensor: targets.into_iter().collect(),
+        targets_by_base_tensor: targets,
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn adapter(fingerprint: &str) -> ResolvedLoraAdapter {
+        ResolvedLoraAdapter {
+            fingerprint: fingerprint.to_string(),
+            targets_by_base_tensor: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lora_memory_bounds_are_monotonic_and_phase_safe() {
+        let plan = crate::adapter_pack::LoraAdapterResourcePlan {
+            source_bytes: 1_024,
+            declared_tensors: 14,
+            declared_kv: 11,
+            bounded_parser_structural_bytes: 4_096,
+            bounded_parser_payload_wire_multiplier: 6,
+        };
+        let (peak, retained) = lora_materialization_memory_bounds(plan).expect("memory bounds");
+        assert!(peak >= retained);
+
+        let larger = crate::adapter_pack::LoraAdapterResourcePlan {
+            source_bytes: 2_048,
+            ..plan
+        };
+        let (larger_peak, larger_retained) =
+            lora_materialization_memory_bounds(larger).expect("larger memory bounds");
+        assert!(larger_peak > peak);
+        assert!(larger_retained > retained);
+    }
+
+    #[test]
+    fn lora_memory_bound_overflow_is_a_typed_capacity_failure() {
+        let error =
+            lora_materialization_memory_bounds(crate::adapter_pack::LoraAdapterResourcePlan {
+                source_bytes: u64::MAX,
+                declared_tensors: 0,
+                declared_kv: 0,
+                bounded_parser_structural_bytes: 0,
+                bounded_parser_payload_wire_multiplier: 6,
+            })
+            .expect_err("overflow must fail");
+        assert!(matches!(error, LoraResolveError::MemoryAdmission(_)));
+    }
+
+    fn insert(
+        cache: &ResolvedLoraAdapterCache,
+        contract_id: &'static str,
+        fingerprint: &str,
+    ) -> ResolvedLoraAdapterHandle {
+        let key = AdapterCacheKey {
+            contract_id,
+            adapter_content_id: format!("sha256:{fingerprint}"),
+            base_content_id: "sha256:base".to_string(),
+        };
+        cache
+            .owners
+            .get_or_try_insert_with(
+                key,
+                || Ok::<_, ()>((1, ())),
+                |()| {
+                    Ok::<_, ()>(Arc::new(
+                        SystemMemoryOwner::with_committed_requested_bytes_for_test(
+                            adapter(fingerprint),
+                            1,
+                        ),
+                    ))
+                },
+                || (),
+            )
+            .expect("cache insert")
+    }
+
+    #[test]
+    fn cache_drop_releases_idle_adapter_owner() {
+        let cache = ResolvedLoraAdapterCache::default();
+        let handle = insert(&cache, "qwen", "adapter-a");
+        let weak = Arc::downgrade(&handle);
+        drop(handle);
+        assert_eq!(cache.usage_for_test(), (1, 1));
+
+        drop(cache);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn clear_drops_idle_entry_but_preserves_in_flight_handle() {
+        let cache = ResolvedLoraAdapterCache::default();
+        let handle = insert(&cache, "qwen", "adapter-a");
+        cache.clear();
+
+        assert_eq!(cache.usage_for_test(), (0, 0));
+        assert_eq!(handle.fingerprint, "adapter-a");
+    }
+
+    #[test]
+    fn target_contract_is_part_of_cache_identity() {
+        let cache = ResolvedLoraAdapterCache::default();
+        drop(insert(&cache, "qwen", "same-content"));
+        drop(insert(&cache, "moonshine", "same-content"));
+
+        assert_eq!(cache.usage_for_test(), (2, 2));
     }
 }

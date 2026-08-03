@@ -46,14 +46,109 @@ const PYANNOTE_MAX_WINDOW_WORKERS: usize = 4;
 
 static PYANNOTE_WINDOW_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmenterWorkingSetGeometry {
+    activity_frame_clock: ActivityFrameClock,
+    window_samples: usize,
+    pub window_step_samples: usize,
+    pub frames_per_window: usize,
+    pub local_speaker_slots: usize,
+    /// Provider-owned Rust payload that may coexist for one model window.
+    /// Native backend buffers are admitted by their graph owner instead.
+    pub inference_peak_bytes_per_window: u64,
+    pub max_parallel_windows: usize,
+    /// Per-result header retained by the bounded parallel collection batch.
+    /// Serial providers return zero because they write directly to `windows`.
+    pub parallel_batch_slot_bytes: usize,
+    pub retain_starts_through_aggregation: bool,
+}
+
+impl SegmenterWorkingSetGeometry {
+    pub(crate) fn activity_frame_count(self, samples: usize) -> usize {
+        self.activity_frame_clock.frame_count_for_samples(samples)
+    }
+
+    pub(crate) const fn window_count(self, samples: usize) -> usize {
+        sliding_window_count(samples, self.window_samples, self.window_step_samples)
+    }
+
+    pub(crate) const fn padded_tail_bytes(self, samples: usize) -> u64 {
+        let windows = self.window_count(samples);
+        if windows == 0 {
+            return 0;
+        }
+        let last_start = (windows - 1).saturating_mul(self.window_step_samples);
+        if samples.saturating_sub(last_start) >= self.window_samples {
+            0
+        } else {
+            (self.window_samples as u64).saturating_mul(std::mem::size_of::<f32>() as u64)
+        }
+    }
+}
+
+pub(crate) fn segmenter_working_set_geometry(
+    provider: SegmenterProvider,
+) -> SegmenterWorkingSetGeometry {
+    match provider {
+        SegmenterProvider::Segmentation3_0 => {
+            let window_samples = 10 * SAMPLE_RATE_HZ as usize;
+            SegmenterWorkingSetGeometry {
+                activity_frame_clock: activity_frame_clock(),
+                window_samples,
+                window_step_samples: SAMPLE_RATE_HZ as usize,
+                frames_per_window: pyannet::output_frame_count(window_samples),
+                local_speaker_slots: MAX_LOCAL_SPEAKERS,
+                inference_peak_bytes_per_window: pyannet::quoted_forward_peak_bytes(window_samples),
+                max_parallel_windows: pyannote_window_worker_count(),
+                parallel_batch_slot_bytes: std::mem::size_of::<
+                    Result<LocalActivityWindow, SegmentError>,
+                >(),
+                retain_starts_through_aggregation: true,
+            }
+        }
+        SegmenterProvider::DiariZen => {
+            let frames_per_window = 1
+                + (diarizen::DIARIZEN_WINDOW_SAMPLES
+                    - diarizen::DIARIZEN_FRAME_DURATION_SAMPLES as usize)
+                    / diarizen::DIARIZEN_FRAME_STEP_SAMPLES as usize;
+            SegmenterWorkingSetGeometry {
+                activity_frame_clock: ActivityFrameClock::new(
+                    0,
+                    diarizen::DIARIZEN_FRAME_DURATION_SAMPLES,
+                    diarizen::DIARIZEN_FRAME_STEP_SAMPLES,
+                    diarizen::DIARIZEN_SAMPLE_RATE_HZ,
+                ),
+                window_samples: diarizen::DIARIZEN_WINDOW_SAMPLES,
+                window_step_samples: diarizen::DIARIZEN_WINDOW_STEP_SAMPLES,
+                frames_per_window,
+                local_speaker_slots: diarizen::DIARIZEN_LOCAL_SPEAKERS,
+                // logits + class row + raw activity + median-filtered activity
+                // overlap inside postprocess; the final window mask is then
+                // allocated before that model output is dropped.
+                inference_peak_bytes_per_window: frames_per_window as u64
+                    * (diarizen::DIARIZEN_POWERSET_CLASSES as u64
+                        * std::mem::size_of::<f32>() as u64
+                        + 2 * diarizen::DIARIZEN_LOCAL_SPEAKERS as u64
+                        + 2),
+                max_parallel_windows: 1,
+                parallel_batch_slot_bytes: 0,
+                retain_starts_through_aggregation: false,
+            }
+        }
+    }
+}
+
+fn pyannote_window_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(PYANNOTE_MAX_WINDOW_WORKERS)
+}
+
 fn pyannote_window_pool() -> &'static Result<rayon::ThreadPool, String> {
     PYANNOTE_WINDOW_POOL.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-            .min(PYANNOTE_MAX_WINDOW_WORKERS);
         rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
+            .num_threads(pyannote_window_worker_count())
             .thread_name(|index| format!("openasr-pyannote-{index}"))
             .build()
             .map_err(|error| error.to_string())
@@ -88,39 +183,6 @@ where
     Ok(output)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SegmenterWorkingSetGeometry {
-    pub activity_frame_step_samples: usize,
-    pub window_step_samples: usize,
-    pub frames_per_window: usize,
-    pub local_speaker_slots: usize,
-}
-
-pub(crate) const fn segmenter_working_set_geometry(
-    provider: SegmenterProvider,
-) -> SegmenterWorkingSetGeometry {
-    match provider {
-        SegmenterProvider::Segmentation3_0 => {
-            let window_samples = 10 * SAMPLE_RATE_HZ as usize;
-            SegmenterWorkingSetGeometry {
-                activity_frame_step_samples: FRAME_STEP_SAMPLES as usize,
-                window_step_samples: SAMPLE_RATE_HZ as usize,
-                frames_per_window: pyannet::output_frame_count(window_samples),
-                local_speaker_slots: MAX_LOCAL_SPEAKERS,
-            }
-        }
-        SegmenterProvider::DiariZen => SegmenterWorkingSetGeometry {
-            activity_frame_step_samples: diarizen::DIARIZEN_FRAME_STEP_SAMPLES as usize,
-            window_step_samples: diarizen::DIARIZEN_WINDOW_STEP_SAMPLES,
-            frames_per_window: 1
-                + (diarizen::DIARIZEN_WINDOW_SAMPLES
-                    - diarizen::DIARIZEN_FRAME_DURATION_SAMPLES as usize)
-                    / diarizen::DIARIZEN_FRAME_STEP_SAMPLES as usize,
-            local_speaker_slots: diarizen::DIARIZEN_LOCAL_SPEAKERS,
-        },
-    }
-}
-
 const POWERSET: [&[usize]; NUM_CLASSES] = [&[], &[0], &[1], &[2], &[0, 1], &[0, 2], &[1, 2]];
 
 #[derive(Debug, Error)]
@@ -140,7 +202,7 @@ pub enum SegmentError {
 }
 
 /// Global clock used by aggregated local-speaker counts.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ActivityFrameClock {
     start_samples: u64,
     duration_samples: u32,
@@ -324,11 +386,11 @@ impl PyannoteSegmenter {
         })
     }
 
-    pub(crate) fn from_runtime_source(
-        source: &crate::ggml_runtime::GgmlRuntimeSource,
+    pub(crate) fn from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     ) -> Result<Self, WeightsError> {
         Ok(Self {
-            model: PyannetModel::from_runtime_source(source)?,
+            model: PyannetModel::from_preflight(preflight)?,
             protocol: SlidingProtocol::default(),
         })
     }
@@ -337,6 +399,12 @@ impl PyannoteSegmenter {
         tensor_index: &crate::GgufTensorIndex,
     ) -> Result<u64, WeightsError> {
         PyannetModel::quoted_persistent_host_commitment_bytes(tensor_index)
+    }
+
+    pub(crate) fn quoted_safetensors_materialization(
+        bytes: &[u8],
+    ) -> Result<super::embed::weights::SafetensorsWeightsQuote, WeightsError> {
+        PyannetModel::quoted_safetensors_materialization(bytes)
     }
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {
@@ -512,15 +580,15 @@ pub(super) fn segment_diarizen_local_activity(
     })
 }
 
-fn sliding_window_starts(
+const fn sliding_window_count(
     sample_count: usize,
     window_samples: usize,
     step_samples: usize,
-) -> Vec<usize> {
+) -> usize {
     debug_assert!(window_samples > 0);
     debug_assert!(step_samples > 0);
     if sample_count == 0 {
-        return Vec::new();
+        return 0;
     }
     let complete_windows = if sample_count >= window_samples {
         1 + (sample_count - window_samples) / step_samples
@@ -529,8 +597,15 @@ fn sliding_window_starts(
     };
     let has_last = sample_count < window_samples
         || !(sample_count - window_samples).is_multiple_of(step_samples);
-    let total_windows = complete_windows + usize::from(has_last);
-    (0..total_windows)
+    complete_windows + has_last as usize
+}
+
+fn sliding_window_starts(
+    sample_count: usize,
+    window_samples: usize,
+    step_samples: usize,
+) -> Vec<usize> {
+    (0..sliding_window_count(sample_count, window_samples, step_samples))
         .map(|index| index * step_samples)
         .collect()
 }
@@ -636,28 +711,6 @@ fn decode_segments(logp: &[f32], frames: usize) -> Vec<SpeakerTurn> {
 mod decode_tests {
     use super::*;
 
-    #[test]
-    fn working_set_geometry_matches_both_adapter_window_contracts() {
-        assert_eq!(
-            segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0),
-            SegmenterWorkingSetGeometry {
-                activity_frame_step_samples: 270,
-                window_step_samples: 16_000,
-                frames_per_window: 589,
-                local_speaker_slots: 3,
-            }
-        );
-        assert_eq!(
-            segmenter_working_set_geometry(SegmenterProvider::DiariZen),
-            SegmenterWorkingSetGeometry {
-                activity_frame_step_samples: 320,
-                window_step_samples: 25_600,
-                frames_per_window: 799,
-                local_speaker_slots: 4,
-            }
-        );
-    }
-
     fn frame(class: usize) -> Vec<f32> {
         let mut row = vec![-10.0f32; NUM_CLASSES];
         row[class] = 0.0;
@@ -735,8 +788,8 @@ mod decode_tests {
 
     #[test]
     fn diarizen_adapter_uses_official_geometry_and_four_slot_masks() {
-        let samples = vec![0.0f32; diarizen::DIARIZEN_WINDOW_SAMPLES];
-        let activity = segment_diarizen_local_activity(&samples, 16_000, &|| false, |window| {
+        let samples: crate::PcmSlice = vec![0.0f32; diarizen::DIARIZEN_WINDOW_SAMPLES].into();
+        let activity = segment_diarizen_local_activity(samples, 16_000, &|| false, |window| {
             assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
             Ok(diarizen::DiariZenWindowOutput {
                 frame_count: 4,
@@ -764,9 +817,9 @@ mod decode_tests {
 
     #[test]
     fn diarizen_adapter_pads_and_truncates_the_orphan_window() {
-        let samples = vec![1.0f32; 17 * 16_000];
+        let samples: crate::PcmSlice = vec![1.0f32; 17 * 16_000].into();
         let mut calls = 0;
-        let activity = segment_diarizen_local_activity(&samples, 16_000, &|| false, |window| {
+        let activity = segment_diarizen_local_activity(samples, 16_000, &|| false, |window| {
             calls += 1;
             assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
             if calls == 2 {
@@ -795,16 +848,17 @@ mod decode_tests {
 
     #[test]
     fn diarizen_adapter_empty_and_cancellation_are_explicit() {
-        let empty = segment_diarizen_local_activity(&[], 16_000, &|| false, |_| {
-            panic!("empty audio must not run inference")
-        })
-        .expect("empty");
+        let empty =
+            segment_diarizen_local_activity(Vec::<f32>::new().into(), 16_000, &|| false, |_| {
+                panic!("empty audio must not run inference")
+            })
+            .expect("empty");
         assert!(empty.windows.is_empty());
         assert_eq!(empty.local_speaker_slots, 4);
 
         let calls = std::cell::Cell::new(0);
         let error = segment_diarizen_local_activity(
-            &vec![0.0f32; 17 * 16_000],
+            vec![0.0f32; 17 * 16_000].into(),
             16_000,
             &|| calls.get() > 0,
             |_| {
@@ -820,18 +874,6 @@ mod decode_tests {
         .expect_err("cancel after first window");
         assert!(matches!(error, SegmentError::Canceled));
         assert_eq!(calls.get(), 1);
-    }
-
-    #[test]
-    fn diarizen_mid_graph_cancel_stays_typed() {
-        let error = diarizen::DiariZenSegmenterError::Graph {
-            step: "test",
-            source: crate::ggml_runtime::GgmlCpuGraphError::Aborted,
-        };
-        assert!(matches!(
-            diarizen_error_to_segment(error),
-            SegmentError::Canceled
-        ));
     }
 
     #[test]

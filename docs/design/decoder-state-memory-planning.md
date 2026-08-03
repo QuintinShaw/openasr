@@ -110,13 +110,15 @@ state, arithmetic overflows, or a family/model cap is exceeded.
 
 Families without token-scaled persistent state affirmatively return
 `NoPersistentState`; absence of a plan is never interpreted as that result.
-Every architecture descriptor also declares
-`OpenAsrDecoderStateClass::{None, TokenScaledPersistent}`. Runtime
-materialization and CI compare that declaration with the executor contract.
-Each planned contract additionally declares the complete stable ID +
-`StateKind` stream schema; dispatch rejects a plan with a missing, extra,
-renamed, or misclassified stream. A newly added causal/seq2seq family therefore
-cannot silently opt out or satisfy the check with an arbitrary non-empty plan.
+Every architecture descriptor also declares an
+`OpenAsrDecoderStateTopology`: no persistent state, causal self-attention KV,
+encoder-decoder self + cross-attention KV, or an explicit family-defined
+multi-stream topology. Runtime materialization and CI compare that semantic
+declaration with the executor contract. Each planned contract additionally
+declares the complete stable ID + `StateKind` stream schema; dispatch rejects a
+plan with a missing, extra, renamed, or misclassified stream. A newly added
+causal/seq2seq family therefore cannot silently opt out, omit cross state, or
+satisfy the check with an arbitrary non-empty plan.
 
 Sequence concurrency is an allocation-owner property, not a synonym for serve
 batch size. If one arena truly owns `N` simultaneous sequences, the invocation
@@ -269,6 +271,38 @@ the cache's `Arc` clone, so an in-flight request keeps the object and its lease
 alive. Per-key slots preserve cold-build single-flight, and a clear or eviction
 during a build cannot republish the detached slot.
 
+Small auxiliary packs that are parsed after deferred admission use an immutable
+anonymous snapshot of the already-open file generation. Snapshot copying writes
+directly into the anonymous mapping and hashes each copied block, avoiding an
+additional pack-sized `Vec`. The policy retains the original preflight mapping
+for semantics-preserving candidate fallback, so materialization overlaps that
+mapping, the anonymous snapshot, and the parser/runtime construction peak. The
+safe bound is therefore `2S + M`, where `S` is the pack byte length and `M` is
+the materializer's own construction peak. The snapshot content id must equal the
+preflight key before any graph is built. Multi-GiB ASR packs remain mmap-backed
+and do not take this auxiliary-only copy path.
+
+Every runtime GGUF parse uses the same engine-wide C parser limits for tensor
+count, metadata count, individual string bytes, array elements, and total header
+bytes. The parser validates declared counts before reserving descriptor storage
+and reports allocation exhaustion as a typed capacity failure. A generic
+`GgufRuntimeSourcePreflight` binds the already-open generation, bounded metadata,
+and bounded tensor index; validation, quote, and materialization reuse that one
+provenance unit rather than reopening or reparsing the path. Auxiliary OADP
+admission additionally derives a tighter pack-specific quote from fixed-header
+counts, ABI-reported native container sizes, and string wire multipliers. Normal
+multi-GiB model payloads remain mmap-backed; the parser limits constrain only
+header structure, never tensor payload bytes or model context length.
+
+Recording-scoped auxiliary pipelines reserve transient system memory with the
+same phase rule. Their provider contract exposes integer shape oracles for the
+actual sliding-window count, activity-frame count, bounded inference
+concurrency, padded tail, and model/frontend payload. The planner also charges
+the window/result headers and retained outputs that coexist with each phase,
+then reserves only the maximum of segmentation, VAD, embedding, clustering,
+reconstruction, and centroid phases. It does not multiply duration by a nominal
+floating-point FPS and it does not sum buffers whose lifetimes cannot overlap.
+
 ## Layer 4: execution policy
 
 The policy resolver orders semantics-preserving candidates only:
@@ -386,8 +420,8 @@ For every new decoder family:
 4. implement both `ExactInvocation` and `StableEnvelope` branches of the one
    `demands(scope)` oracle, returning stable-ID `StateDemand` streams with
    explicit logical/resident bytes and a family-owned maximum proof;
-5. declare `OpenAsrDecoderStateClass` and pass the executor/descriptor startup
-   cross-check;
+5. declare the precise `OpenAsrDecoderStateTopology` and pass the
+   executor/descriptor startup cross-check;
 6. allocate reusable state from `DecoderStatePlan`, validating the actual
    logical and resident shapes;
 7. declare provider/placement capabilities truthfully;

@@ -86,6 +86,10 @@ impl FireRedVadFbankFrontend {
             },
         }
     }
+
+    pub(crate) fn quoted_compute_payload_bytes(&self, samples: usize) -> (u64, u64) {
+        self.inner.quoted_compute_payload_bytes(samples)
+    }
 }
 
 /// Apply the vendored global CMVN `(x - mean) * inv_stddev` in place, per mel

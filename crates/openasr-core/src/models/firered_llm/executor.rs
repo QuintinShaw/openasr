@@ -41,9 +41,8 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
 use crate::models::ggml_asr_executor::{
-    GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionResult,
-    GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
-    GgmlAsrViewExecutor,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,

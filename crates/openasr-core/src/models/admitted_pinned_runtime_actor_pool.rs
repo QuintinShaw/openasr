@@ -368,6 +368,7 @@ impl<R: 'static> PinnedRuntimeActor<R> {
             return Err(PinnedRuntimeActorError::WorkerTerminated);
         }
         let context = current_native_execution_context();
+        let alive = Arc::clone(&self.inner.alive);
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         let job = Box::new(move |runtime: &mut R| {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -380,6 +381,11 @@ impl<R: 'static> PinnedRuntimeActor<R> {
                     true
                 }
                 Err(payload) => {
+                    // Publish poisoning before waking the caller. The caller
+                    // may immediately drop an exclusive checkout, whose pool
+                    // return path consults `is_reusable`; responding first
+                    // creates a race that can cache a poisoned actor.
+                    alive.store(false, Ordering::Release);
                     let _ = response_tx.send(ActorCallResponse::Panicked(describe_panic_payload(
                         payload.as_ref(),
                     )));

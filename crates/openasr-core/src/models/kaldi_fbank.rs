@@ -120,6 +120,34 @@ impl KaldiFbankFrontend {
         }
     }
 
+    /// Exact logical payload quote for one `compute` call. The feature row is
+    /// returned to the caller; `peak_bytes` also includes every FFT/frame
+    /// workspace Vec that remains live until the call returns.
+    pub(crate) fn quoted_compute_payload_bytes(&self, samples: usize) -> (u64, u64) {
+        let frames = self.config.frame_count(samples);
+        let output_bytes = (frames as u64)
+            .saturating_mul(self.config.num_mel_bins as u64)
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        let workspace_bytes =
+            (self.fft.len() as u64)
+                .saturating_mul(std::mem::size_of::<f32>() as u64)
+                .saturating_add((self.fft.complex_len() as u64).saturating_mul(
+                    std::mem::size_of::<realfft::num_complex::Complex<f32>>() as u64,
+                ))
+                .saturating_add((self.fft.get_scratch_len() as u64).saturating_mul(
+                    std::mem::size_of::<realfft::num_complex::Complex<f32>>() as u64,
+                ))
+                .saturating_add(
+                    ((self.config.fft_size / 2 + 1) as u64)
+                        .saturating_mul(std::mem::size_of::<f32>() as u64),
+                )
+                .saturating_add(
+                    (self.config.frame_length as u64)
+                        .saturating_mul(std::mem::size_of::<f32>() as u64),
+                );
+        (output_bytes, output_bytes.saturating_add(workspace_bytes))
+    }
+
     /// Compute pre-CMVN kaldi log-mel features for mono `samples` (float in
     /// `[-1, 1]`). `snip_edges=true`: frame count is
     /// `1 + (len - frame_length) / frame_shift`, frame `i` starts at

@@ -264,6 +264,21 @@ impl Qwen3AsrAudioEncoderRuntime {
         runtime_source: Option<&GgmlRuntimeSource>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3AsrAudioEncoderError> {
+        Self::new_internal(runtime_source, None, backend)
+    }
+
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
+        Self::new_internal(Some(&preflight.runtime_source), Some(preflight), backend)
+    }
+
+    fn new_internal(
+        runtime_source: Option<&GgmlRuntimeSource>,
+        preflight: Option<&crate::ggml_runtime::GgufRuntimeSourcePreflight>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
         // See `qwen_audio_encoder_runtime_graph_config` for the `EncoderPrelude`
         // threading tier and the right-sized metadata-context rationale.
         let config = qwen_audio_encoder_runtime_graph_config(backend);
@@ -277,7 +292,12 @@ impl Qwen3AsrAudioEncoderRuntime {
         // the mmap'd pack (native q8/f16) instead of dequantizing them to f32. The
         // loader (1b) does not materialize f32 for these — `loaded` is the only
         // source. `None` (no path) only happens off the production executor path.
-        let loaded = runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded = match preflight {
+            Some(preflight) => runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok(),
+            None => runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok()),
+        };
         Ok(Self { runner, loaded })
     }
 

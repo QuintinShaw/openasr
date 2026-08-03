@@ -603,16 +603,22 @@ pub(crate) struct OpenAsrFamilyIntegrationDescriptor {
     pub reference_dumper_source: Option<&'static str>,
 }
 
-/// Whether an architecture owns token-scaled persistent decoder state.
+/// Semantic topology of an architecture's token-scaled persistent decoder state.
 ///
 /// This is an onboarding declaration, not a formula registry. The executor
-/// still owns the family topology, while startup/CI cross-checks that a new
-/// autoregressive family cannot accidentally claim `NoPersistentState` and
-/// bypass capacity planning.
+/// still owns the family-specific position oracle and stable stream ids, while
+/// startup/CI cross-checks the complete semantic shape. A new autoregressive
+/// family therefore cannot accidentally omit cross-attention state, claim a
+/// causal-only layout, or bypass capacity planning entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrDecoderStateClass {
+pub(crate) enum OpenAsrDecoderStateTopology {
     None,
-    TokenScaledPersistent,
+    CausalSelfAttentionKv,
+    EncoderDecoderSelfAndCrossAttentionKv,
+    /// Escape hatch for a genuinely different, explicitly family-owned
+    /// multi-stream topology. Built-in ASR families should prefer a precise
+    /// shared variant whenever one describes their state.
+    FamilyDefinedTokenScaledPersistent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -628,7 +634,7 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub tokenizer_id: &'static str,
     pub decode_policy_id: &'static str,
     pub executor_component_id: &'static str,
-    pub decoder_state_class: OpenAsrDecoderStateClass,
+    pub decoder_state_topology: OpenAsrDecoderStateTopology,
     pub integration: OpenAsrFamilyIntegrationDescriptor,
     pub execution_capability: GgmlExecutionCapability,
     /// Provider + placement shapes this concrete family/runtime can actually
@@ -1549,7 +1555,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: COHERE_TRANSCRIBE_TOKENIZER_ID,
         decode_policy_id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "cohere",
             supports_phrase_bias: true,
@@ -1612,7 +1618,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: WHISPER_TOKENIZER_ID,
         decode_policy_id: WHISPER_DECODE_POLICY_ID,
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "whisper",
             supports_phrase_bias: true,
@@ -1659,7 +1665,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: QWEN3_ASR_TOKENIZER_ID,
         decode_policy_id: QWEN3_ASR_DECODE_POLICY_ID,
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "qwen",
             supports_phrase_bias: true,
@@ -1719,7 +1725,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: PARAKEET_CTC_TOKENIZER_ID,
         decode_policy_id: PARAKEET_CTC_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::None,
+        decoder_state_topology: OpenAsrDecoderStateTopology::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "parakeet",
             supports_phrase_bias: true,
@@ -1779,7 +1785,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: PARAKEET_TDT_TOKENIZER_ID,
         decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::None,
+        decoder_state_topology: OpenAsrDecoderStateTopology::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "parakeet-tdt",
             supports_phrase_bias: false,
@@ -1827,7 +1833,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: WAV2VEC2_CTC_TOKENIZER_ID,
         decode_policy_id: WAV2VEC2_CTC_DECODE_POLICY_ID,
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::None,
+        decoder_state_topology: OpenAsrDecoderStateTopology::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "wav2vec2",
             supports_phrase_bias: true,
@@ -1878,7 +1884,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: XASR_ZIPFORMER_TOKENIZER_ID,
         decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::None,
+        decoder_state_topology: OpenAsrDecoderStateTopology::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "xasr-zipformer",
             supports_phrase_bias: false,
@@ -1937,7 +1943,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MOONSHINE_TOKENIZER_ID,
         decode_policy_id: MOONSHINE_DECODE_POLICY_ID,
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "moonshine",
             supports_phrase_bias: true,
@@ -1987,7 +1993,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: DOLPHIN_TOKENIZER_ID,
         decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::None,
+        decoder_state_topology: OpenAsrDecoderStateTopology::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "dolphin",
             supports_phrase_bias: true,
@@ -2045,7 +2051,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: SENSEVOICE_TOKENIZER_ID,
         decode_policy_id: SENSEVOICE_DECODE_POLICY_ID,
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::None,
+        decoder_state_topology: OpenAsrDecoderStateTopology::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "sensevoice",
             supports_phrase_bias: true,
@@ -2098,7 +2104,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FIRERED_AED_TOKENIZER_ID,
         decode_policy_id: FIRERED_AED_DECODE_POLICY_ID,
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "firered-aed",
             supports_phrase_bias: false,
@@ -2155,7 +2161,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FIRERED_LLM_TOKENIZER_ID,
         decode_policy_id: FIRERED_LLM_DECODE_POLICY_ID,
         executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "firered2-llm",
             supports_phrase_bias: false,
@@ -2210,7 +2216,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FUNASR_NANO_TOKENIZER_ID,
         decode_policy_id: FUNASR_NANO_DECODE_POLICY_ID,
         executor_component_id: FUNASR_NANO_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "funasr-nano",
             supports_phrase_bias: false,
@@ -2263,7 +2269,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MIMO_ASR_TOKENIZER_ID,
         decode_policy_id: MIMO_ASR_DECODE_POLICY_ID,
         executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "mimo-asr",
             supports_phrase_bias: false,
@@ -2316,7 +2322,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MOSS_TD_TOKENIZER_ID,
         decode_policy_id: MOSS_TD_DECODE_POLICY_ID,
         executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "moss-transcribe-diarize",
             supports_phrase_bias: false,
@@ -2404,7 +2410,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: GRANITE_SPEECH_TOKENIZER_ID,
         decode_policy_id: GRANITE_SPEECH_DECODE_POLICY_ID,
         executor_component_id: GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
-        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
+        decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "granite-speech",
             // Native keyword biasing via the prompt convention (see

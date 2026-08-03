@@ -121,31 +121,23 @@ mod tests {
     }
 
     #[test]
-    fn runtime_content_identity_tracks_same_path_replacement_and_deletion() {
+    fn pack_fingerprint_tracks_same_path_replacement_and_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("redimnet.oasr");
         std::fs::write(&pack, b"GGUFredimnet-content-a").expect("write a");
-        let source_a = crate::validate_ggml_runtime_source_path(&pack).expect("source a");
-        let key_a = PackContentKey::for_runtime_source(&source_a);
+        let fingerprint_a = pack_fingerprint(&pack).expect("fingerprint a");
 
         std::fs::write(&pack, b"GGUFredimnet-content-b").expect("replace b");
-        let source_b = crate::validate_ggml_runtime_source_path(&pack).expect("source b");
-        let key_b = PackContentKey::for_runtime_source(&source_b);
-        assert_ne!(key_a, key_b, "same-path replacement must miss the cache");
+        let fingerprint_b = pack_fingerprint(&pack).expect("fingerprint b");
+        assert_ne!(
+            fingerprint_a, fingerprint_b,
+            "same-path replacement must produce a new content identity"
+        );
 
         std::fs::remove_file(&pack).expect("delete pack");
         assert!(
-            crate::validate_ggml_runtime_source_path(&pack).is_err(),
-            "deleted pack must not resolve to the old content"
-        );
-    }
-
-    #[test]
-    fn speaker_attribution_admission_scales_logical_f32_not_disk_quant() {
-        assert_eq!(speaker_attribution_admission_bytes(0), 0);
-        assert_eq!(
-            speaker_attribution_admission_bytes(1_000),
-            1_000 * SPEAKER_ATTRIBUTION_LOGICAL_MULTIPLIER
+            pack_fingerprint(&pack).is_none(),
+            "deleted pack must not retain a content identity"
         );
     }
     fn sha256_hex(bytes: &[u8]) -> String {

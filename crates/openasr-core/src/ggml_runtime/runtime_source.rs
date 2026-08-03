@@ -9,12 +9,15 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{GgmlPackageFormat, GgmlPackageProbe, GgmlPackageProbeError, probe_ggml_package_path};
+use super::{GgmlPackageFormat, GgmlPackageProbe, GgmlPackageProbeError, probe_ggml_package_file};
 
 /// Strong OS file identity: device, inode, length, and the *full*
 /// nanosecond mtime of an already-opened file. Never truncated to whole
@@ -28,16 +31,19 @@ use super::{GgmlPackageFormat, GgmlPackageProbe, GgmlPackageProbeError, probe_gg
 /// replaces the path in between, which is exactly the class of race this
 /// contract exists to close.
 ///
-/// `dev`/`ino` are only available through `std::os::unix::fs::MetadataExt`;
-/// non-unix targets fall back to `(len, mtime)` alone, which is narrower
-/// (two different files could theoretically share a length and mtime) but
-/// still nanosecond-precise, unlike the bug being fixed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Unix uses `(dev, ino)` and Windows uses `(volume serial, file index)` so a
+/// same-length/same-mtime replacement cannot alias the held generation.
+/// Unsupported native targets fail closed instead of weakening the identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct StrongFileIdentity {
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
     len: u64,
     mtime_secs: u64,
     mtime_nanos: u32,
@@ -48,6 +54,11 @@ impl StrongFileIdentity {
     /// pre-1970 mtime, which cannot be represented here) -- callers must fail
     /// closed rather than trust a partial identity.
     pub(crate) fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = metadata;
+            return None;
+        }
         let modified = metadata.modified().ok()?;
         let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
         Some(Self {
@@ -55,6 +66,10 @@ impl StrongFileIdentity {
             dev: metadata.dev(),
             #[cfg(unix)]
             ino: metadata.ino(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number()?,
+            #[cfg(windows)]
+            file_index: metadata.file_index()?,
             len: metadata.len(),
             mtime_secs: since_epoch.as_secs(),
             mtime_nanos: since_epoch.subsec_nanos(),
@@ -79,6 +94,8 @@ fn content_id_memo() -> &'static Mutex<HashMap<PathBuf, (StrongFileIdentity, Str
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+const MAX_CONTENT_ID_MEMO_ENTRIES: usize = 1024;
 
 /// Resolves a `sha256:<hex>` content id for `canonical_path`, memoized by
 /// [`StrongFileIdentity`].
@@ -110,6 +127,12 @@ pub(crate) fn resolve_content_id(
     if content_id.starts_with("sha256:")
         && let Ok(mut guard) = cache.lock()
     {
+        if guard.len() >= MAX_CONTENT_ID_MEMO_ENTRIES
+            && !guard.contains_key(canonical_path)
+            && let Some(victim) = guard.keys().next().cloned()
+        {
+            guard.remove(&victim);
+        }
         guard.insert(canonical_path.to_path_buf(), (identity, content_id.clone()));
     }
     content_id
@@ -305,18 +328,38 @@ impl GgmlRuntimeSource {
     pub fn content_id(&self) -> &str {
         self.content_id.get_or_init(|| {
             if let Some(models_root) = crate::content_store::default_models_root()
-                && let Some(digest) = crate::content_store::trusted_object_digest(
-                    &self.path,
-                    self.opened_read_only,
-                    &models_root,
-                )
+                && let Some(content_id) = self.trusted_object_content_id(&models_root)
             {
-                return format!("sha256:{digest}");
+                return content_id;
             }
             resolve_content_id(&self.path, self.stat_identity, || {
                 Some(format!("{:x}", Sha256::digest(&self.mmap[..])))
             })
         })
+    }
+
+    fn trusted_object_content_id(&self, models_root: &Path) -> Option<String> {
+        let canonical_path = fs::canonicalize(&self.path).ok()?;
+        let canonical_models_root = fs::canonicalize(models_root).ok()?;
+        let current_identity = StrongFileIdentity::of(&fs::metadata(&canonical_path).ok()?)?;
+        if current_identity != self.stat_identity {
+            return None;
+        }
+        crate::content_store::trusted_object_digest(
+            &canonical_path,
+            self.opened_read_only,
+            &canonical_models_root,
+        )
+        .map(|digest| format!("sha256:{digest}"))
+    }
+
+    /// Hash the exact held mapping without consulting the process identity
+    /// memo. Mutable, user-supplied sidecar formats (for example `.oadp`)
+    /// call this on every cache lookup so an adversary cannot restore inode
+    /// length/mtime and obtain a stale content-key hit. Large immutable model
+    /// packs should continue to use [`Self::content_id`].
+    pub(crate) fn freshly_hashed_content_id(&self) -> String {
+        format!("sha256:{:x}", Sha256::digest(&self.mmap[..]))
     }
 
     /// The open mapping backing this source. Sharing this `Arc` (rather than
@@ -334,6 +377,48 @@ impl GgmlRuntimeSource {
     /// potentially expensive full-file `content_id()` hash.
     pub(crate) fn backing_mmap_identity(&self) -> usize {
         Arc::as_ptr(&self.mmap) as usize
+    }
+
+    pub(crate) fn prefix_content_id(&self, byte_len: usize) -> Option<String> {
+        let prefix = self.mmap.get(..byte_len)?;
+        Some(format!("sha256:{:x}", Sha256::digest(prefix)))
+    }
+
+    pub(crate) const fn strong_file_identity(&self) -> StrongFileIdentity {
+        self.stat_identity
+    }
+
+    pub(crate) fn current_strong_file_identity(&self) -> Option<StrongFileIdentity> {
+        let Some(file) = self.file.as_ref() else {
+            return Some(self.stat_identity);
+        };
+        let file = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        StrongFileIdentity::of(&file.metadata().ok()?)
+    }
+
+    /// Return the exact engine-requested host-memory peak for making an
+    /// immutable snapshot and then materializing an owner whose own peak is
+    /// `materialization_peak_bytes`.
+    ///
+    /// Snapshot creation has two live byte streams (the file mapping and the
+    /// anonymous mapping). The original preflight mapping remains live while
+    /// a candidate is built because policy fallback may need it for the next
+    /// candidate. Materialization therefore overlaps both mappings, and the
+    /// exact engine-requested bound is
+    /// `2 * source_bytes + materialization_peak_bytes`.
+    pub(crate) fn immutable_snapshot_construction_peak_bytes(
+        &self,
+        materialization_peak_bytes: u64,
+    ) -> Result<u64, GgmlRuntimeSourcePathError> {
+        let source_bytes = self.byte_len();
+        source_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(materialization_peak_bytes))
+            .ok_or_else(|| GgmlRuntimeSourcePathError::SnapshotSizeOverflow {
+                path: self.path.clone(),
+            })
     }
 
     /// Copy this source's currently held file generation into an anonymous,
@@ -360,29 +445,62 @@ impl GgmlRuntimeSource {
                 source,
             }
         })?;
-        let mut bytes = Vec::with_capacity(self.mmap.len());
-        file.read_to_end(&mut bytes).map_err(|source| {
-            GgmlRuntimeSourcePathError::SnapshotFile {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
-        if bytes.len() != self.mmap.len() {
-            return Err(GgmlRuntimeSourcePathError::SnapshotLengthChanged {
-                path: self.path.clone(),
-                expected: self.mmap.len(),
-                actual: bytes.len(),
-            });
-        }
-        drop(file);
-
-        let mut owned = memmap2::MmapMut::map_anon(bytes.len()).map_err(|source| {
+        let expected = self.mmap.len();
+        let mut owned = memmap2::MmapMut::map_anon(expected).map_err(|source| {
+            crate::models::native_execution_services::record_current_execution_candidate_failure(
+                crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                    "runtime-source-immutable-snapshot",
+                    format!(
+                        "could not reserve {expected} anonymous bytes for {}: {source}",
+                        self.path.display()
+                    ),
+                ),
+            );
             GgmlRuntimeSourcePathError::MapFile {
                 path: self.path.clone(),
                 source,
             }
         })?;
-        owned.copy_from_slice(&bytes);
+        let mut digest = Sha256::new();
+        let mut copied = 0;
+        while copied < expected {
+            let read = file.read(&mut owned[copied..]).map_err(|source| {
+                GgmlRuntimeSourcePathError::SnapshotFile {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+            if read == 0 {
+                return Err(GgmlRuntimeSourcePathError::SnapshotLengthChanged {
+                    path: self.path.clone(),
+                    expected,
+                    actual: copied,
+                });
+            }
+            digest.update(&owned[copied..copied + read]);
+            copied += read;
+        }
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = file.read(&mut trailing).map_err(|source| {
+            GgmlRuntimeSourcePathError::SnapshotFile {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        if trailing_bytes != 0 {
+            let actual = file
+                .metadata()
+                .ok()
+                .and_then(|metadata| usize::try_from(metadata.len()).ok())
+                .unwrap_or_else(|| expected.saturating_add(trailing_bytes));
+            return Err(GgmlRuntimeSourcePathError::SnapshotLengthChanged {
+                path: self.path.clone(),
+                expected,
+                actual,
+            });
+        }
+        drop(file);
+
         let mmap =
             owned
                 .make_read_only()
@@ -392,7 +510,7 @@ impl GgmlRuntimeSource {
                 })?;
         let content_id = OnceLock::new();
         content_id
-            .set(format!("sha256:{:x}", Sha256::digest(&mmap[..])))
+            .set(format!("sha256:{:x}", digest.finalize()))
             .expect("fresh immutable runtime snapshot content id");
         Ok(Self {
             path: self.path.clone(),
@@ -482,6 +600,8 @@ pub enum GgmlRuntimeSourcePathError {
         expected: String,
         actual: String,
     },
+    #[error("ggml runtime source '{path}' is too large to quote an immutable request snapshot")]
+    SnapshotSizeOverflow { path: PathBuf },
     #[error(
         "ggml runtime source '{path}' has a file identity this platform cannot represent (e.g. a pre-1970 mtime)"
     )]
@@ -525,13 +645,6 @@ pub fn validate_ggml_runtime_source_path(
         });
     }
 
-    let package_probe = probe_ggml_package_path(path)?;
-    if package_probe.format == GgmlPackageFormat::UnsupportedOpenAsrContainerReserved {
-        return Err(GgmlRuntimeSourcePathError::ReservedOpenAsrContainer {
-            path: path.to_path_buf(),
-        });
-    }
-
     // Open and map once. Every later reader of this source (metadata,
     // tensor-index cross-checks, tensor data, and a lazily-computed
     // `content_id`) shares this `Arc<Mmap>` instead of re-opening `path` --
@@ -539,7 +652,7 @@ pub fn validate_ggml_runtime_source_path(
     // actually reads, not just of whatever happened to be at `path` at
     // validation time. Mapping is a cheap `mmap(2)` (no read); the expensive
     // full-file hash only happens if/when `content_id()` is called.
-    let file = File::open(path).map_err(|source| GgmlRuntimeSourcePathError::OpenFile {
+    let mut file = File::open(path).map_err(|source| GgmlRuntimeSourcePathError::OpenFile {
         path: path.to_path_buf(),
         source,
     })?;
@@ -552,6 +665,17 @@ pub fn validate_ggml_runtime_source_path(
             path: path.display().to_string(),
             source,
         })?;
+    if !fd_metadata.is_file() {
+        return Err(GgmlRuntimeSourcePathError::NotARegularFile {
+            path: path.display().to_string(),
+        });
+    }
+    let package_probe = probe_ggml_package_file(path, &mut file)?;
+    if package_probe.format == GgmlPackageFormat::UnsupportedOpenAsrContainerReserved {
+        return Err(GgmlRuntimeSourcePathError::ReservedOpenAsrContainer {
+            path: path.to_path_buf(),
+        });
+    }
     let stat_identity = StrongFileIdentity::of(&fd_metadata).ok_or_else(|| {
         GgmlRuntimeSourcePathError::UnsupportedFileIdentity {
             path: path.to_path_buf(),
@@ -816,6 +940,32 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn fresh_content_id_ignores_an_exact_stat_identity_memo_collision() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mutable-sidecar.oadp");
+        let content_a = b"GGUFmutable-content-a";
+        let content_b = b"GGUFmutable-content-b";
+        assert_eq!(content_a.len(), content_b.len());
+        const MTIME_SECONDS: i64 = 1_700_000_123;
+        const MTIME_NANOS: i64 = 456_789_123;
+
+        write_magic_file(&path, content_a);
+        set_mtime(&path, MTIME_SECONDS, MTIME_NANOS);
+        let source_a = validate_ggml_runtime_source_path(&path).expect("open content a");
+        let id_a = source_a.content_id().to_string();
+
+        // Rewrite the same inode with the same length, then restore the exact
+        // nanosecond mtime. This deliberately collides with every memo field.
+        write_magic_file(&path, content_b);
+        set_mtime(&path, MTIME_SECONDS, MTIME_NANOS);
+        let source_b = validate_ggml_runtime_source_path(&path).expect("open content b");
+        let expected_b = format!("sha256:{:x}", Sha256::digest(content_b));
+        assert_eq!(source_b.freshly_hashed_content_id(), expected_b);
+        assert_ne!(id_a, expected_b);
+    }
+
     /// Identity and bytes must come from the same open handle. Holds a
     /// `GgmlRuntimeSource` open, replaces the file at
     /// its path via a rename (the same swap-the-directory-entry pattern
@@ -908,6 +1058,29 @@ mod tests {
             error,
             super::GgmlRuntimeSourcePathError::SnapshotContentChanged { .. }
         ));
+    }
+
+    #[test]
+    fn immutable_snapshot_peak_keeps_the_retryable_preflight_mapping_live() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("auxiliary-pack.gguf");
+        let bytes = b"GGUFauxiliary-content";
+        write_magic_file(&path, bytes);
+        let source = validate_ggml_runtime_source_path(&path).expect("validate source");
+        let source_bytes = u64::try_from(bytes.len()).expect("fixture length");
+
+        assert_eq!(
+            source
+                .immutable_snapshot_construction_peak_bytes(source_bytes / 2)
+                .expect("snapshot-dominant peak"),
+            source_bytes * 2 + source_bytes / 2
+        );
+        assert_eq!(
+            source
+                .immutable_snapshot_construction_peak_bytes(source_bytes * 3)
+                .expect("materialization-dominant peak"),
+            source_bytes * 5
+        );
     }
 
     /// Performance guardrail: the whole point of family TLS caches switching
@@ -1039,6 +1212,29 @@ mod tests {
         assert_eq!(source.content_id(), format!("sha256:{named_digest}"));
 
         set_mode(&object, false); // let the temp dir clean up on all platforms
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sealed_content_id_canonicalizes_the_object_and_models_root_together() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let real_home = dir.path().join("real-home");
+        fs::create_dir(&real_home).expect("create real home");
+        let alias_home = dir.path().join("alias-home");
+        symlink(&real_home, &alias_home).expect("create home alias");
+        unsafe { std::env::set_var("OPENASR_HOME", &alias_home) };
+
+        let named_digest = "ef".repeat(32);
+        let bytes = b"GGUFcanonical-root-alias-fixture";
+        let object = write_object_at_layout(&alias_home, &named_digest, bytes);
+        set_mode(&object, true);
+
+        let source = validate_ggml_runtime_source_path(&object).expect("validate aliased object");
+        assert_eq!(source.content_id(), format!("sha256:{named_digest}"));
+
+        set_mode(&object, false);
     }
 
     /// The fail-closed half of the trusted tier: the same mismatched object,

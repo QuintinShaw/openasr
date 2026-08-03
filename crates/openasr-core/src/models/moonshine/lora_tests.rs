@@ -403,7 +403,7 @@ fn lora_cross_v_target_changes_decoder_logits() {
 }
 
 fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveformFeatures {
-    let samples = (0..sample_count)
+    let samples: Vec<f32> = (0..sample_count)
         .map(|index| (index as f32 * 0.011).sin() * 0.4)
         .collect();
     super::frontend::MoonshineWaveformFeatures {

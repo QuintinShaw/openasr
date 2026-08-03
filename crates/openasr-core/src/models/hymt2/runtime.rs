@@ -8,8 +8,9 @@ use thiserror::Error;
 use crate::arch::HYMT2_DECODE_POLICY_ID;
 use crate::capacity::topology::{DecoderStatePlan, StateKind};
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgufMetadataReadError, GgufTensorDataReadError,
-    GgufTensorDataReader, GgufTensorIndexReadError,
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgufMetadataReadError, GgufRuntimeSourcePreflight,
+    GgufTensorDataReadError, GgufTensorIndexReadError, build_runtime_tensor_reader_from_preflight,
+    load_runtime_source_metadata_and_tensor_index_from_source,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -33,10 +34,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
-use crate::{
-    GgmlRuntimeSourcePathError, NativeAsrError, read_gguf_metadata_from_runtime_source,
-    read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
-};
+use crate::{GgmlRuntimeSourcePathError, NativeAsrError, validate_ggml_runtime_source_path};
 
 use super::capacity::{
     HYMT2_DECODE_SCRATCH_STATE_ID, HYMT2_PREFIX_CACHE_STATE_ID, Hymt2DecoderCapacityContract,
@@ -253,6 +251,8 @@ pub enum Hymt2RuntimeError {
         #[source]
         source: GgufTensorIndexReadError,
     },
+    #[error("hymt2 GGUF preflight failed: {reason}")]
+    Preflight { reason: String },
     #[error("hymt2 config invalid: {source}")]
     Config {
         #[source]
@@ -305,16 +305,16 @@ pub enum Hymt2RuntimeError {
 impl Hymt2RuntimeSession {
     fn new(
         decoder_plan: &QwenWholeDecoderPlan,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: Hymt2ExecutionMetadata,
         logits_head: &Qwen3AsrLlmLogitsHead,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Hymt2RuntimeError> {
         let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
                 decoder_plan,
-                runtime_source,
+                preflight,
                 metadata.rms_norm_epsilon,
                 fused_logits_head,
                 backend,
@@ -398,18 +398,17 @@ impl Hymt2Runtime {
     /// the execution-memory planner, not this SystemMemory owner.
     #[allow(dead_code)] // Consumed by the thread-affine translation owner integration.
     pub(crate) fn quote_candidate_system_memory(
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         max_source_clause_chars: usize,
     ) -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, Hymt2RuntimeError>
     {
-        let metadata = read_gguf_metadata_from_runtime_source(runtime_source)
-            .map_err(|source| Hymt2RuntimeError::MetadataRead { source })?;
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(runtime_source)
-            .map_err(|source| Hymt2RuntimeError::TensorIndexRead { source })?;
-        let execution = parse_hymt2_execution_metadata(&metadata)
+        let runtime_source = &preflight.runtime_source;
+        let metadata = preflight.metadata.as_ref();
+        let tensor_index = preflight.tensor_index.as_ref();
+        let execution = parse_hymt2_execution_metadata(metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
-        validate_hymt2_runtime_tensors_with_index(&tensor_index, execution)
+        validate_hymt2_runtime_tensors_with_index(tensor_index, execution)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
         let kv_spec =
             resolve_qwen_family_production_kv_cache_policy(backend, execution.head_dim).to_spec();
@@ -436,7 +435,7 @@ impl Hymt2Runtime {
             Self,
         >(runtime_source.content_id());
         quote
-            .add_tokenizer_metadata(&metadata, true)
+            .add_tokenizer_metadata(metadata, true)
             .map_err(map_capacity)?;
         quote
             .add_stable_owned_bytes(
@@ -450,23 +449,23 @@ impl Hymt2Runtime {
             .map_err(map_capacity)?;
         // Token gather owns one metadata view of the tied table.
         quote
-            .add_owned_tensor_payload_metadata(&tensor_index, TOKEN_EMBD_WEIGHT)
+            .add_owned_tensor_payload_metadata(tensor_index, TOKEN_EMBD_WEIGHT)
             .map_err(map_capacity)?;
         quote
-            .add_tensor_f32(&tensor_index, OUTPUT_NORM_WEIGHT)
+            .add_tensor_f32(tensor_index, OUTPUT_NORM_WEIGHT)
             .map_err(map_capacity)?;
         if logits_head_ggml_enabled(backend) {
             // Logits owns a second metadata view, but the bytes remain the same
             // mmap range. Its wrapper also owns one extra platform dims Vec.
             quote
-                .add_owned_tensor_payload_metadata(&tensor_index, TOKEN_EMBD_WEIGHT)
+                .add_owned_tensor_payload_metadata(tensor_index, TOKEN_EMBD_WEIGHT)
                 .map_err(map_capacity)?;
             quote
                 .add_owned_elements::<usize>(2, "hymt2 logits dims")
                 .map_err(map_capacity)?;
         } else {
             quote
-                .add_tensor_f32(&tensor_index, TOKEN_EMBD_WEIGHT)
+                .add_tensor_f32(tensor_index, TOKEN_EMBD_WEIGHT)
                 .map_err(map_capacity)?;
         }
         quote
@@ -592,18 +591,19 @@ impl Hymt2Runtime {
     ) -> Result<Self, Hymt2RuntimeError> {
         let runtime_source = validate_ggml_runtime_source_path(path.as_ref())
             .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        Self::from_runtime_source(&runtime_source, backend)
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .map_err(|source| Hymt2RuntimeError::Preflight {
+                reason: source.to_string(),
+            })?;
+        Self::from_preflight(&preflight, backend)
     }
 
-    /// Construct from one already-admitted mapping so content identity,
-    /// metadata, tensor offsets, and materialized weights cannot observe
-    /// different file generations.
-    pub(crate) fn from_runtime_source(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn from_preflight(
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, Hymt2RuntimeError> {
-        Self::from_runtime_source_with_capacity(
-            runtime_source,
+        Self::from_preflight_with_capacity(
+            preflight,
             backend,
             Hymt2CapacityMode::FullContext,
             Hymt2HostLeaseOwnership::Standalone,
@@ -616,43 +616,45 @@ impl Hymt2Runtime {
     /// one provisional [`crate::models::system_memory_owner::SystemMemoryOwner`]
     /// transaction.
     #[allow(dead_code)] // Consumed by the thread-affine translation owner integration.
-    pub(crate) fn from_runtime_source_with_clause_envelope_inside_parent_transaction(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn from_preflight_with_clause_envelope_inside_parent_transaction(
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         max_source_clause_chars: usize,
     ) -> Result<Self, Hymt2RuntimeError> {
-        Self::from_runtime_source_with_capacity(
-            runtime_source,
+        Self::from_preflight_with_capacity(
+            preflight,
             backend,
             Hymt2CapacityMode::ClauseChars(max_source_clause_chars),
             Hymt2HostLeaseOwnership::ParentCandidateTransaction,
         )
     }
 
-    fn from_runtime_source_with_capacity(
-        runtime_source: &crate::GgmlRuntimeSource,
+    fn from_preflight_with_capacity(
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         capacity_mode: Hymt2CapacityMode,
         host_lease_ownership: Hymt2HostLeaseOwnership,
     ) -> Result<Self, Hymt2RuntimeError> {
-        let metadata = read_gguf_metadata_from_runtime_source(runtime_source)
-            .map_err(|source| Hymt2RuntimeError::MetadataRead { source })?;
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(runtime_source)
-            .map_err(|source| Hymt2RuntimeError::TensorIndexRead { source })?;
-        let hymt2_metadata = parse_hymt2_execution_metadata(&metadata)
+        let runtime_source = &preflight.runtime_source;
+        let metadata = preflight.metadata.as_ref();
+        let tensor_index = preflight.tensor_index.as_ref();
+        let hymt2_metadata = parse_hymt2_execution_metadata(metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
-        validate_hymt2_runtime_tensors_with_index(&tensor_index, hymt2_metadata)
+        validate_hymt2_runtime_tensors_with_index(tensor_index, hymt2_metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
 
-        let tokenizer = Hymt2Tokenizer::from_gguf_metadata(&metadata)
+        let tokenizer = Hymt2Tokenizer::from_gguf_metadata(metadata)
             .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?;
         // Tensor data must come from `runtime_source`'s already-open mapping
         // rather than a fresh open of its path. `tensor_index` above was only
         // needed for the tensor-contract check; the reader re-derives an
         // equivalent index from that same mapping, so the index and the bytes
         // it describes cannot come from different file generations.
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(|source| Hymt2RuntimeError::TensorReader { source })?;
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|source| {
+            Hymt2RuntimeError::Preflight {
+                reason: source.to_string(),
+            }
+        })?;
         let qwen_metadata = hymt2_metadata.qwen_llm_metadata();
         let token_embedding_table =
             load_qwen3_token_embedding_table_from_reader(&reader, qwen_metadata).map_err(
@@ -694,7 +696,7 @@ impl Hymt2Runtime {
         }
         let mut session = Hymt2RuntimeSession::new(
             &decoder_plan,
-            runtime_source,
+            preflight,
             hymt2_metadata,
             &logits_head,
             logits_head.fused_top1_spec(),
@@ -743,13 +745,23 @@ impl Hymt2Runtime {
     pub fn probe_path(path: impl AsRef<Path>) -> Result<Hymt2ExecutionMetadata, Hymt2RuntimeError> {
         let runtime_source = validate_ggml_runtime_source_path(path.as_ref())
             .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
-            .map_err(|source| Hymt2RuntimeError::MetadataRead { source })?;
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
-            .map_err(|source| Hymt2RuntimeError::TensorIndexRead { source })?;
-        let hymt2_metadata = parse_hymt2_execution_metadata(&metadata)
+        let preflight =
+            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
+                &runtime_source,
+            )
+            .map_err(|source| Hymt2RuntimeError::Preflight {
+                reason: source.to_string(),
+            })?;
+        Self::probe_preflight_parts(&preflight.metadata, &preflight.tensor_index)
+    }
+
+    pub(crate) fn probe_preflight_parts(
+        metadata: &crate::GgufMetadata,
+        tensor_index: &crate::GgufTensorIndex,
+    ) -> Result<Hymt2ExecutionMetadata, Hymt2RuntimeError> {
+        let hymt2_metadata = parse_hymt2_execution_metadata(metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
-        validate_hymt2_runtime_tensors_with_index(&tensor_index, hymt2_metadata)
+        validate_hymt2_runtime_tensors_with_index(tensor_index, hymt2_metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
         Ok(hymt2_metadata)
     }

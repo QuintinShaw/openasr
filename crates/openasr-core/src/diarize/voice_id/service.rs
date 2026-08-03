@@ -58,7 +58,7 @@ pub(crate) fn load_person_matcher_for_embedder(
     embedder: &dyn SpeakerEmbedder,
 ) -> Result<PersonMatcher, VoiceIdLibraryError> {
     let calibration = embedder.calibration_profile();
-    let space = EmbeddingSpace::for_active_embedder(&identity, calibration);
+    let space = EmbeddingSpace::for_active_embedder(identity, calibration);
     let threshold = calibration.voice_id_accept_threshold();
     let margin = calibration.voice_id_margin();
     let store = VoiceIdStore::open_default()?;
@@ -301,9 +301,11 @@ mod tests {
                 ),
             ],
             || {
+                let embedder = IdentifiedEmbedder;
+                let identity = embedder.identity().expect("identified embedder");
                 assert!(!person_library_is_non_empty().expect("fresh store"));
                 assert!(
-                    load_person_matcher_for_embedder(&IdentifiedEmbedder)
+                    load_person_matcher_for_embedder(&identity, &embedder)
                         .expect("fresh store matcher")
                         .is_empty()
                 );
@@ -318,7 +320,7 @@ mod tests {
                     ))
                 ));
                 assert!(matches!(
-                    load_person_matcher_for_embedder(&IdentifiedEmbedder),
+                    load_person_matcher_for_embedder(&identity, &embedder),
                     Err(VoiceIdLibraryError::Store(
                         VoiceIdStoreError::OpenDatabase { .. }
                     ))
@@ -345,8 +347,13 @@ mod tests {
             }
         }
 
+        let embedder = IdentitylessEmbedder;
+        let result = embedder
+            .identity()
+            .ok_or(VoiceIdLibraryError::EmbedderIdentityUnavailable)
+            .and_then(|identity| load_person_matcher_for_embedder(&identity, &embedder));
         assert!(matches!(
-            load_person_matcher_for_embedder(&IdentitylessEmbedder),
+            result,
             Err(VoiceIdLibraryError::EmbedderIdentityUnavailable)
         ));
     }

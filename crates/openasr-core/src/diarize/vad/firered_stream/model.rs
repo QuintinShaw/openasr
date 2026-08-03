@@ -122,6 +122,35 @@ impl FireRedStreamVadModel {
         (data, n_frames)
     }
 
+    pub(crate) fn quoted_streaming_chunk_peak_bytes(&self, samples: usize) -> u64 {
+        let (feature_bytes, frontend_peak_bytes) =
+            self.frontend.quoted_compute_payload_bytes(samples);
+        let bytes_per_frame =
+            (NUM_MEL_BINS as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
+        let frames = usize::try_from(feature_bytes / bytes_per_frame).unwrap_or(usize::MAX);
+        let cache_elements = (NUM_BLOCKS + 1)
+            .saturating_mul(CACHE_FRAMES)
+            .saturating_mul(PROJ);
+        let base = frames.saturating_mul(HIDDEN.saturating_add(PROJ));
+        let block_inputs = frames.saturating_mul(PROJ.saturating_add(HIDDEN).saturating_add(PROJ));
+        let fsmn = frames
+            .saturating_add(CACHE_FRAMES)
+            .saturating_mul(PROJ)
+            .saturating_add(frames.saturating_mul(PROJ))
+            .saturating_add(
+                frames
+                    .saturating_add(CACHE_FRAMES.saturating_mul(2))
+                    .saturating_mul(PROJ),
+            )
+            .saturating_add(CACHE_FRAMES.saturating_mul(PROJ));
+        let model_peak_bytes = (cache_elements
+            .saturating_add(base)
+            .saturating_add(block_inputs)
+            .saturating_add(fsmn) as u64)
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        frontend_peak_bytes.max(feature_bytes.saturating_add(model_peak_bytes))
+    }
+
     /// Causal forward over one chunk of `t` CMVN'd feature frames
     /// (`[t, NUM_MEL_BINS]`, row-major), updating `cache` in place so a
     /// following call continues the lookback history exactly (no future

@@ -20,7 +20,6 @@ use super::ops::{
 };
 use crate::diarize::embed::ops::conv1d;
 use crate::diarize::embed::weights::{Weights, WeightsError};
-use crate::ggml_runtime::GgmlRuntimeSource;
 
 const EPS: f32 = 1e-5;
 const ALPHA: f32 = 0.01;
@@ -44,12 +43,62 @@ pub(crate) const fn output_frame_count(samples: usize) -> usize {
     valid_output_count(frames, 3, 3)
 }
 
+/// Exact shape-derived upper bound for f32 payloads simultaneously owned by
+/// one pure-Rust PyanNet forward. The input waveform belongs to the caller and
+/// is excluded. This mirrors the actual conv/pool, transpose, four BiLSTM, and
+/// classifier lifetimes; no nominal frames-per-second approximation is used.
+pub(crate) const fn quoted_forward_peak_bytes(samples: usize) -> u64 {
+    let conv0 = valid_output_count(samples, 251, 10);
+    let pool0 = valid_output_count(conv0, 3, 3);
+    let conv1 = valid_output_count(pool0, 5, 1);
+    let pool1 = valid_output_count(conv1, 3, 3);
+    let conv2 = valid_output_count(pool1, 5, 1);
+    let frames = valid_output_count(conv2, 3, 3);
+
+    let sinc0 = samples
+        .saturating_add(80usize.saturating_mul(conv0))
+        .saturating_add(80usize.saturating_mul(pool0));
+    let sinc1 = samples
+        .saturating_add(80usize.saturating_mul(pool0))
+        .saturating_add(60usize.saturating_mul(conv1))
+        .saturating_add(60usize.saturating_mul(pool1));
+    let sinc2 = samples
+        .saturating_add(60usize.saturating_mul(pool1))
+        .saturating_add(60usize.saturating_mul(conv2))
+        .saturating_add(60usize.saturating_mul(frames));
+
+    // `h` from SincNet remains live while it is transposed. An LSTM call
+    // overlaps the previous and next feature rows plus output, h/c, and
+    // new_h/new_c. Classifier shadow bindings overlap both 128-wide hidden
+    // rows, logits, and log-softmax output.
+    let recurrent = 60usize
+        .saturating_mul(frames)
+        .saturating_add(256usize.saturating_mul(frames))
+        .saturating_add(256usize.saturating_mul(frames))
+        .saturating_add(4usize.saturating_mul(HIDDEN));
+    let classifier = 60usize
+        .saturating_mul(frames)
+        .saturating_add(256usize.saturating_mul(frames))
+        .saturating_add(128usize.saturating_mul(frames).saturating_mul(2))
+        .saturating_add(NUM_CLASSES.saturating_mul(frames).saturating_mul(2));
+
+    let elements = max_usize(
+        max_usize(max_usize(sinc0, sinc1), max_usize(sinc2, recurrent)),
+        classifier,
+    );
+    (elements as u64).saturating_mul(std::mem::size_of::<f32>() as u64)
+}
+
 const fn valid_output_count(input: usize, kernel: usize, stride: usize) -> usize {
     if input < kernel {
         0
     } else {
         (input - kernel) / stride + 1
     }
+}
+
+const fn max_usize(lhs: usize, rhs: usize) -> usize {
+    if lhs > rhs { lhs } else { rhs }
 }
 
 /// Per-layer LSTM weight names (W input, R recurrent, B bias) in the exported
@@ -79,11 +128,11 @@ impl PyannetModel {
         })
     }
 
-    /// Load from the same already-open mapping whose content id keys the
-    /// resident segmenter snapshot.
-    pub(crate) fn from_runtime_source(source: &GgmlRuntimeSource) -> Result<Self, WeightsError> {
+    pub(crate) fn from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+    ) -> Result<Self, WeightsError> {
         Ok(Self {
-            w: Weights::from_runtime_source(source)?,
+            w: Weights::from_preflight(preflight)?,
         })
     }
 
@@ -91,6 +140,12 @@ impl PyannetModel {
         tensor_index: &crate::GgufTensorIndex,
     ) -> Result<u64, WeightsError> {
         Weights::quoted_persistent_host_commitment_bytes(tensor_index)
+    }
+
+    pub(crate) fn quoted_safetensors_materialization(
+        bytes: &[u8],
+    ) -> Result<crate::diarize::embed::weights::SafetensorsWeightsQuote, WeightsError> {
+        Weights::quoted_safetensors_materialization(bytes)
     }
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {

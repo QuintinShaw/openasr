@@ -14,10 +14,11 @@ use std::path::Path;
 
 use thiserror::Error;
 
+#[cfg(test)]
 use crate::diarize::contract::{SpeakerId, SpeakerTurn, TimeRange};
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgufTensorDataReader, read_gguf_metadata_from_runtime_source,
-    validate_ggml_runtime_source_path,
+    GgmlCpuGraphError, GgufMetadata, GgufTensorIndex,
+    load_runtime_source_metadata_and_tensor_index_from_source, validate_ggml_runtime_source_path,
 };
 
 pub use config::ARCHITECTURE_ID as DIARIZEN_GGML_ARCHITECTURE_ID;
@@ -31,10 +32,11 @@ pub(crate) const DIARIZEN_WINDOW_STEP_SAMPLES: usize = config::WINDOW_STEP_SAMPL
 pub(crate) const DIARIZEN_FRAME_DURATION_SAMPLES: u32 = 400;
 pub(crate) const DIARIZEN_FRAME_STEP_SAMPLES: u32 = config::FRAME_STRIDE_SAMPLES as u32;
 pub(crate) const DIARIZEN_LOCAL_SPEAKERS: usize = config::LOCAL_SPEAKERS;
+pub(crate) const DIARIZEN_POWERSET_CLASSES: usize = config::POWERSET_CLASSES;
 
-use config::{
-    FRAME_STRIDE_SAMPLES, LOCAL_SPEAKERS, POWERSET_CLASSES, SAMPLE_RATE_HZ, WINDOW_SAMPLES,
-};
+#[cfg(test)]
+use config::{FRAME_STRIDE_SAMPLES, SAMPLE_RATE_HZ};
+use config::{LOCAL_SPEAKERS, POWERSET_CLASSES};
 pub(crate) use runtime::DiariZenRuntime;
 use weights::validate_tensor_contract;
 
@@ -107,26 +109,6 @@ impl DiariZenSegmenterError {
             }
         )
     }
-
-    pub(super) fn is_terminal_backend_failure(&self) -> bool {
-        matches!(
-            self,
-            Self::Graph {
-                source: GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned,
-                ..
-            }
-        )
-    }
-
-    pub(super) fn is_route_initialization_failure(&self) -> bool {
-        matches!(
-            self,
-            Self::Graph {
-                source: GgmlCpuGraphError::ExecutionRoute(_),
-                ..
-            }
-        )
-    }
 }
 
 /// One model-window result. Logits are frame-major (`[frame, class]`) and
@@ -157,15 +139,21 @@ impl DiariZenSegmenter {
     pub(super) fn probe_runtime_source(
         source: &crate::ggml_runtime::GgmlRuntimeSource,
     ) -> Result<(), DiariZenSegmenterError> {
-        let metadata = read_gguf_metadata_from_runtime_source(source)
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(source)
             .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
-        config::validate_metadata(&metadata)?;
-        let reader = GgufTensorDataReader::from_runtime_source(source)
-            .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
-        validate_tensor_contract(reader.tensor_index())
+        Self::probe_preflight_parts(&preflight.metadata, &preflight.tensor_index)
+    }
+
+    pub(crate) fn probe_preflight_parts(
+        metadata: &GgufMetadata,
+        tensor_index: &GgufTensorIndex,
+    ) -> Result<(), DiariZenSegmenterError> {
+        config::validate_metadata(metadata)?;
+        validate_tensor_contract(tensor_index)
     }
 }
 
+#[cfg(test)]
 fn decode_segments(activity: &[u8], frames: usize) -> Vec<SpeakerTurn> {
     debug_assert_eq!(activity.len(), frames * LOCAL_SPEAKERS);
     let time = |frame: usize| frame as f64 * FRAME_STRIDE_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;

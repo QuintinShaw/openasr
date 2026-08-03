@@ -6,14 +6,13 @@
 //! arena slot bundles are built directly from [`LoraSlot`] in the encoder/decoder
 //! graph modules.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use crate::adapter_pack::is_moonshine_lora_target_tensor_name;
 use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::lora_adapter::{
-    LoraResolveError, ResolvedLoraAdapter, adapter_cache_fingerprint, resolve_lora_adapter,
+    LoraResolveError, ResolvedLoraAdapter, ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle,
+    adapter_cache_fingerprint, resolve_lora_adapter,
 };
+use std::path::Path;
 
 pub(crate) use crate::models::lora_adapter::{LoraSlot, new_lora_slot_tensors};
 // Only named outside this module in tests; the inference path flows
@@ -41,12 +40,15 @@ pub(crate) fn moonshine_adapter_cache_fingerprint(
 /// when no adapter is configured; otherwise the adapter must load AND bind to
 /// this exact base pack or the whole transcription fails (fail-closed).
 pub(crate) fn resolve_moonshine_lora_adapter(
+    cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
     preflight: &GgmlAsrRuntimeSourcePreflight,
-) -> Result<Option<Arc<MoonshineLoraAdapter>>, MoonshineLoraError> {
+) -> Result<Option<ResolvedLoraAdapterHandle>, MoonshineLoraError> {
     resolve_lora_adapter(
+        cache,
         request_adapter_path,
         preflight,
+        "moonshine-lora-v1",
         is_moonshine_lora_target_tensor_name,
         "moonshine",
         MOONSHINE_LORA_ALLOWED_TARGETS,

@@ -2163,6 +2163,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             DEFAULT_RMS_NORM_EPSILON,
             None,
             None,
+            None,
             backend,
         )
     }
@@ -2179,6 +2180,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             runtime_source,
             rms_norm_epsilon,
             fused_logits_head,
+            None,
             None,
             backend,
         )
@@ -2197,6 +2199,41 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             DEFAULT_RMS_NORM_EPSILON,
             fused_logits_head,
             adapter,
+            None,
+            backend,
+        )
+    }
+
+    pub(crate) fn new_from_plan_with_preflight(
+        plan: &QwenWholeDecoderPlan,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter(
+            plan,
+            &preflight.runtime_source,
+            DEFAULT_RMS_NORM_EPSILON,
+            None,
+            None,
+            Some(preflight),
+            backend,
+        )
+    }
+
+    pub(crate) fn new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
+        plan: &QwenWholeDecoderPlan,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        rms_norm_epsilon: f32,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter(
+            plan,
+            &preflight.runtime_source,
+            rms_norm_epsilon,
+            fused_logits_head,
+            None,
+            Some(preflight),
             backend,
         )
     }
@@ -2208,6 +2245,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         rms_norm_epsilon: f32,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
+        preflight: Option<&crate::ggml_runtime::GgufRuntimeSourcePreflight>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
         if plan.layers.is_empty() {
@@ -2220,14 +2258,35 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: "whole-decoder rms norm epsilon must be finite and positive",
             });
         }
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(map_tensor_read_error_to_graph)?;
+        let reader = match preflight {
+            Some(preflight) => {
+                if preflight.runtime_source.backing_mmap_identity()
+                    != runtime_source.backing_mmap_identity()
+                {
+                    return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: "qwen decoder preflight/source generation mismatch".to_string(),
+                    });
+                }
+                crate::ggml_runtime::build_runtime_tensor_reader_from_preflight(preflight).map_err(
+                    |error| GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: error.to_string(),
+                    },
+                )?
+            }
+            None => GgufTensorDataReader::from_runtime_source(runtime_source)
+                .map_err(map_tensor_read_error_to_graph)?,
+        };
         plan.validate_materialization_reader(&reader)?;
         let mut config = qwen_decoder_graph_config(backend);
         config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
         let runner = GgmlCpuGraphRunner::new(config)?;
-        let loaded = runner.load_gguf_weight_context(runtime_source).ok();
+        let loaded = match preflight {
+            Some(preflight) => runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok(),
+            None => runner.load_gguf_weight_context(runtime_source).ok(),
+        };
         let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
         let mut layers = Vec::with_capacity(plan.layers.len());
         let mut dims = None;

@@ -17,8 +17,7 @@ use super::encoder_graph::{MoonshineEncoderGraphRuntime, MoonshineEncoderOutput}
 use super::frontend::{MoonshineFrontendError, moonshine_waveform_from_prepared_audio};
 use super::graph_config::{moonshine_decoder_graph_config, moonshine_encoder_graph_config};
 use super::lora::{
-    MoonshineLoraAdapter, MoonshineLoraError, moonshine_adapter_cache_fingerprint,
-    resolve_moonshine_lora_adapter,
+    MoonshineLoraError, moonshine_adapter_cache_fingerprint, resolve_moonshine_lora_adapter,
 };
 use super::prepared_runtime::{
     MoonshinePreparedRuntime, MoonshinePreparedRuntimeError, build_moonshine_prepared_runtime,
@@ -37,6 +36,9 @@ use crate::models::ggml_asr_executor::{
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT, build_seq2seq_streaming_session,
+};
+use crate::models::lora_adapter::{
+    ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle, resolved_lora_adapter,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::prepared_runtime_cache::{
@@ -126,6 +128,7 @@ pub(crate) struct MoonshineGgmlExecutor {
     serve_batch_engines: MoonshineServeBatchEngineRegistry,
     encoder_runtimes: Arc<MoonshineEncoderRuntimePool>,
     decoder_runtimes: Arc<MoonshineDecoderRuntimePool>,
+    lora_adapters: ResolvedLoraAdapterCache,
 }
 
 impl std::fmt::Debug for MoonshineGgmlExecutor {
@@ -155,6 +158,7 @@ impl Default for MoonshineGgmlExecutor {
                 "openasr-moonshine-decoder-owner",
                 limits,
             )),
+            lora_adapters: ResolvedLoraAdapterCache::default(),
         }
     }
 }
@@ -211,6 +215,7 @@ impl MoonshineGgmlExecutor {
         // fallback — if any) against THIS base pack. Any mismatch fails the
         // whole transcription — adapters are never silently ignored.
         let adapter = resolve_moonshine_lora_adapter(
+            &self.lora_adapters,
             request.request_options.adapter_path.as_deref(),
             preflight.as_ref(),
         )
@@ -353,6 +358,7 @@ impl MoonshineGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.decoder_runtimes
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
     }
 
@@ -370,14 +376,14 @@ impl MoonshineGgmlExecutor {
         &self,
         runtime_source: &GgmlRuntimeSource,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
-        adapter: Option<Arc<MoonshineLoraAdapter>>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<MoonshineEncoderRuntimeActor, MoonshineGgmlExecutorError> {
         let encoder_backend = moonshine_encoder_graph_config(backend).backend;
         let key = (
             PackContentKey::for_runtime_source(runtime_source),
             current_execution_lane_key(encoder_backend),
-            moonshine_adapter_cache_fingerprint(adapter.as_deref()),
+            moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
         );
         let source = runtime_source.clone();
         self.encoder_runtimes.checkout_or_try_build_with(
@@ -388,7 +394,7 @@ impl MoonshineGgmlExecutor {
                     &prepared.encoder_weights,
                     prepared.metadata,
                     Some(&source),
-                    adapter.as_deref(),
+                    adapter.as_ref().map(resolved_lora_adapter),
                     backend,
                 )
                 .map_err(|error| MoonshineGgmlExecutorError::EncoderFailed {
@@ -409,7 +415,7 @@ impl MoonshineGgmlExecutor {
         &self,
         runtime_source: &GgmlRuntimeSource,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
-        adapter: Option<Arc<MoonshineLoraAdapter>>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
     ) -> Result<MoonshineDecoderRuntimeActor, MoonshineGgmlExecutorError> {
@@ -418,7 +424,7 @@ impl MoonshineGgmlExecutor {
             PackContentKey::for_runtime_source(runtime_source),
             current_execution_lane_key(decoder_backend),
             decoder_state.resident_capacity(),
-            moonshine_adapter_cache_fingerprint(adapter.as_deref()),
+            moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
         );
         let source = runtime_source.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
@@ -434,7 +440,7 @@ impl MoonshineGgmlExecutor {
                     },
                     false,
                     Some(&source),
-                    adapter.as_deref(),
+                    adapter.as_ref().map(resolved_lora_adapter),
                 )
                 .map_err(|error| MoonshineGgmlExecutorError::DecoderFailed {
                     reason: error.to_string(),
@@ -455,7 +461,7 @@ impl MoonshineGgmlExecutor {
         runtime_source: &GgmlRuntimeSource,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         features: super::frontend::MoonshineWaveformFeatures,
-        adapter: Option<Arc<MoonshineLoraAdapter>>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<MoonshineEncoderOutput, MoonshineGgmlExecutorError> {
         let runtime = self.checkout_encoder_runtime(runtime_source, prepared, adapter, backend)?;
@@ -477,7 +483,7 @@ impl MoonshineGgmlExecutor {
         backend: GgmlCpuGraphBackend,
         word_timestamps: bool,
         audio_duration_seconds: f32,
-        adapter: Option<Arc<MoonshineLoraAdapter>>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         control: Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
@@ -561,6 +567,7 @@ impl GgmlAsrViewExecutor for MoonshineGgmlExecutor {
         shutdown_moonshine_serve_batch_engines(&self.serve_batch_engines);
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -618,6 +625,7 @@ impl GgmlAsrStreamingExecutor for MoonshineGgmlExecutor {
         shutdown_moonshine_serve_batch_engines(&self.serve_batch_engines);
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
 }

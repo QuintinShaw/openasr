@@ -10,14 +10,13 @@
 //! in-graph side branch is exactly `y = W@x + B_scaled@(A@x)` with two `mul_mat`
 //! + one `add` — no extra scale node.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use crate::adapter_pack::is_qwen3_asr_lora_target_tensor_name;
 use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::lora_adapter::{
-    LoraResolveError, ResolvedLoraAdapter, adapter_cache_fingerprint, resolve_lora_adapter,
+    LoraResolveError, ResolvedLoraAdapter, ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle,
+    adapter_cache_fingerprint, resolve_lora_adapter,
 };
+use std::path::Path;
 
 pub(crate) use crate::models::lora_adapter::{
     LoraSlot as QwenLoraSlot, new_lora_slot_tensors as new_qwen_lora_slot,
@@ -54,12 +53,15 @@ pub(crate) fn qwen_adapter_cache_fingerprint(adapter: Option<&QwenLoraAdapter>) 
 /// Resolve the active adapter for a qwen execution. Returns `Ok(None)` when no
 /// adapter is configured. Fail-closed on every mismatch class.
 pub(crate) fn resolve_qwen_lora_adapter(
+    cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
     preflight: &GgmlAsrRuntimeSourcePreflight,
-) -> Result<Option<Arc<QwenLoraAdapter>>, QwenLoraError> {
+) -> Result<Option<ResolvedLoraAdapterHandle>, QwenLoraError> {
     resolve_lora_adapter(
+        cache,
         request_adapter_path,
         preflight,
+        "qwen3-asr-lora-v1",
         is_qwen3_asr_lora_target_tensor_name,
         "qwen3-asr LLM",
         QWEN_LORA_ALLOWED_TARGETS,

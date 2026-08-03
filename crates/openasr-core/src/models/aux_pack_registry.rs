@@ -24,13 +24,13 @@
 
 use std::path::Path;
 
-use crate::GgufMetadata;
 use crate::arch::GENERAL_ARCHITECTURE_KEY;
 use crate::device::{
     execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
     execution_route::ExecutionProvider,
 };
 use crate::ggml_runtime::AutoGpuPolicy;
+use crate::{GgufMetadata, GgufTensorIndex};
 
 /// Runtime placement contract for a non-ASR model stage.
 ///
@@ -149,32 +149,55 @@ struct AuxPackDescriptor {
     /// Cheap pull-time contract probe: constructs/parses just enough of the
     /// pack to prove the runtime loader can build from it, without
     /// materializing full weights for execution.
-    validate: fn(&Path, &GgufMetadata) -> Result<(), String>,
+    validate: fn(&Path, &GgufMetadata, &GgufTensorIndex) -> Result<(), String>,
 }
 
-fn validate_pyannote(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::segment::PyannoteSegmenter::from_oasr(path)
+fn validate_pyannote(
+    _path: &Path,
+    _metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::segment::PyannoteSegmenter::quoted_persistent_host_commitment_bytes(
+        tensor_index,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn validate_diarizen(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::segment::DiariZenSegmenter::probe_preflight_parts(metadata, tensor_index)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_hymt2(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::models::hymt2::Hymt2Runtime::probe_preflight_parts(metadata, tensor_index)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn validate_diarizen(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::segment::DiariZenSegmenter::probe_oasr(path).map_err(|error| error.to_string())
-}
-
-fn validate_hymt2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::models::hymt2::Hymt2Runtime::probe_path(path)
+fn validate_redimnet2(
+    _path: &Path,
+    _metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::embed::RedimNet2Embedder::quoted_persistent_host_commitment_bytes(tensor_index)
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn validate_redimnet2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::embed::RedimNet2Embedder::from_oasr(path)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), String> {
+fn validate_firered_punc(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    _tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
     crate::models::firered_punc::runtime_contract::parse_and_validate_firered_punc_metadata(
         metadata,
     )
@@ -182,7 +205,11 @@ fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), St
     .map_err(|error| error.to_string())
 }
 
-fn validate_forced_aligner(_path: &Path, metadata: &GgufMetadata) -> Result<(), String> {
+fn validate_forced_aligner(
+    _path: &Path,
+    metadata: &GgufMetadata,
+    _tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
     crate::models::qwen::validate_forced_aligner_runtime_pack_contract(metadata)
         .map_err(|error| error.to_string())
 }
@@ -298,18 +325,28 @@ pub(crate) fn aux_pack_architecture_ids() -> impl Iterator<Item = &'static str> 
 pub(crate) fn validate_aux_runtime_pack_contract(
     path: &Path,
     metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
 ) -> Option<(AuxPackKind, Result<(), String>)> {
     let architecture = metadata.get_string(GENERAL_ARCHITECTURE_KEY)?.trim();
     let descriptor = AUX_PACK_DESCRIPTORS
         .iter()
         .find(|descriptor| descriptor.architecture_id == architecture)?;
-    Some((descriptor.kind, (descriptor.validate)(path, metadata)))
+    Some((
+        descriptor.kind,
+        (descriptor.validate)(path, metadata, tensor_index),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::arch::OpenAsrArchitectureRegistry;
+
+    fn empty_tensor_index() -> GgufTensorIndex {
+        GgufTensorIndex::empty_for_test(PathBuf::from("/nonexistent"))
+    }
 
     /// Fail-closed safety net the previous hand-rolled `if let Some(...)` chain
     /// in `api::backend::native` never had: every aux `general.architecture`
@@ -363,7 +400,14 @@ mod tests {
             crate::ggml_runtime::GgufMetadataValue::String("totally-unknown-arch".to_string()),
         );
         let metadata = GgufMetadata::from_values_for_test(values);
-        assert!(validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata).is_none());
+        assert!(
+            validate_aux_runtime_pack_contract(
+                Path::new("/nonexistent"),
+                &metadata,
+                &empty_tensor_index(),
+            )
+            .is_none()
+        );
     }
 
     /// A complete, minimal set of `qwen3_forced_aligner.*` + tokenizer keys --
@@ -424,9 +468,12 @@ mod tests {
     #[test]
     fn forced_aligner_pack_with_complete_metadata_is_accepted() {
         let metadata = valid_forced_aligner_metadata();
-        let (kind, result) =
-            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata)
-                .expect("forced-aligner architecture must be claimed by the aux table");
+        let (kind, result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata,
+            &empty_tensor_index(),
+        )
+        .expect("forced-aligner architecture must be claimed by the aux table");
         assert_eq!(kind, AuxPackKind::ForcedAlignment);
         assert!(result.is_ok(), "got: {result:?}");
     }
@@ -445,9 +492,12 @@ mod tests {
         values.remove("qwen3_forced_aligner.llm.classify_num");
         let metadata = GgufMetadata::from_values_for_test(values);
 
-        let (kind, result) =
-            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata)
-                .expect("forced-aligner architecture must still be claimed by the aux table");
+        let (kind, result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata,
+            &empty_tensor_index(),
+        )
+        .expect("forced-aligner architecture must still be claimed by the aux table");
         assert_eq!(kind, AuxPackKind::ForcedAlignment);
         let error = result.expect_err("pack missing a required metadata key must be rejected");
         assert!(
@@ -461,9 +511,12 @@ mod tests {
         let mut values_no_tokens = valid_forced_aligner_metadata().values().clone();
         values_no_tokens.remove("tokenizer.ggml.tokens");
         let metadata_no_tokens = GgufMetadata::from_values_for_test(values_no_tokens);
-        let (_, result_no_tokens) =
-            validate_aux_runtime_pack_contract(Path::new("/nonexistent"), &metadata_no_tokens)
-                .expect("forced-aligner architecture must still be claimed by the aux table");
+        let (_, result_no_tokens) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata_no_tokens,
+            &empty_tensor_index(),
+        )
+        .expect("forced-aligner architecture must still be claimed by the aux table");
         let error_no_tokens =
             result_no_tokens.expect_err("pack missing the BPE tokenizer array must be rejected");
         assert!(

@@ -12,8 +12,12 @@ use thiserror::Error;
 
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadata, GgufMetadataReadError,
-    GgufTensorIndex, GgufTensorIndexReadError, gguf_tensor_index::GgufTensorIndexSnapshot,
-    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
+    GgufTensorIndex, GgufTensorIndexReadError,
+    gguf_metadata::{
+        GgufBoundedParseFailure, parse_bounded_gguf_context, read_gguf_metadata_from_context,
+    },
+    gguf_tensor_index::{GgufTensorIndexSnapshot, read_gguf_tensor_index_from_context},
+    runtime_source::StrongFileIdentity,
     validate_ggml_runtime_source_path,
 };
 
@@ -24,11 +28,33 @@ const SANDBOX_TIMEOUT_MS_ENV: &str = "OPENASR_GGUF_C_PARSER_SANDBOX_TIMEOUT_MS";
 const DEFAULT_SANDBOX_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CHILD_STDOUT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CHILD_STDERR_BYTES: usize = 1024 * 1024;
+const SANDBOX_CAPACITY_OPERATION: &str = "gguf-base-preflight-parse";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct GgufCParserProbeOutput {
+    source_identity: StrongFileIdentity,
+    metadata_prefix_content_id: String,
     metadata: GgufMetadata,
     tensor_index: GgufTensorIndexSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct GgufCParserCapacityFailure {
+    kind: String,
+    operation: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct GgufCParserFailureEnvelope {
+    openasr_error: GgufCParserCapacityFailure,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum GgufCParserProbeWireOutput {
+    Success(GgufCParserProbeOutput),
+    Failure(GgufCParserFailureEnvelope),
 }
 
 #[derive(Debug, Error)]
@@ -79,11 +105,15 @@ pub enum GgufCParserSandboxError {
         status: String,
         stderr: String,
     },
+    #[error("sandboxed gguf C parser exhausted host capacity at {operation}: {detail}")]
+    Capacity { operation: String, detail: String },
     #[error("could not decode sandboxed gguf C parser output: {source}")]
     Decode {
         #[source]
         source: serde_json::Error,
     },
+    #[error("sandboxed gguf C parser observed a different file generation for '{path}'")]
+    SourceGenerationChanged { path: PathBuf },
     #[error("could not rebuild sandboxed gguf tensor index: {source}")]
     RebuildTensorIndex {
         #[source]
@@ -120,8 +150,35 @@ pub fn render_gguf_c_parser_sandbox_child_output(
         apply_child_limits().map_err(|source| GgufCParserSandboxError::ChildLimit { source })?;
     }
     let runtime_source = validate_ggml_runtime_source_path(path)?;
-    let (metadata, tensor_index) = direct_load(&runtime_source)?;
+    let source_identity = runtime_source.strong_file_identity();
+    let (metadata, tensor_index) = match direct_load_with_allocation_tracking(&runtime_source) {
+        Ok(output) => output,
+        Err(error) if sandbox_error_is_allocation(&error) => {
+            return serde_json::to_string(&GgufCParserFailureEnvelope {
+                openasr_error: GgufCParserCapacityFailure {
+                    kind: "capacity".to_string(),
+                    operation: SANDBOX_CAPACITY_OPERATION.to_string(),
+                    detail: error.to_string(),
+                },
+            })
+            .map_err(|source| GgufCParserSandboxError::Serialize { source });
+        }
+        Err(error) => return Err(error),
+    };
+    if runtime_source.current_strong_file_identity() != Some(source_identity) {
+        return Err(GgufCParserSandboxError::SourceGenerationChanged {
+            path: runtime_source.path().to_path_buf(),
+        });
+    }
     let output = GgufCParserProbeOutput {
+        source_identity,
+        metadata_prefix_content_id: runtime_source
+            .prefix_content_id(
+                usize::try_from(tensor_index.data_section_offset_bytes()).unwrap_or(usize::MAX),
+            )
+            .ok_or_else(|| GgufCParserSandboxError::SourceGenerationChanged {
+                path: runtime_source.path().to_path_buf(),
+            })?,
         metadata,
         tensor_index: tensor_index.to_snapshot(),
     };
@@ -131,20 +188,65 @@ pub fn render_gguf_c_parser_sandbox_child_output(
 fn direct_load(
     runtime_source: &GgmlRuntimeSource,
 ) -> Result<(GgufMetadata, GgufTensorIndex), GgufCParserSandboxError> {
-    let metadata = read_gguf_metadata_from_runtime_source(runtime_source).map_err(|source| {
+    let path = runtime_source.path();
+    let context = parse_bounded_gguf_context(runtime_source, super::runtime_gguf_parse_limits())
+        .map_err(|failure| {
+            let source = if failure == GgufBoundedParseFailure::Allocation {
+                crate::models::native_execution_services::record_current_execution_candidate_failure(
+                    crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                        SANDBOX_CAPACITY_OPERATION,
+                        format!("allocation failed while parsing {}", path.display()),
+                    ),
+                );
+                GgufMetadataReadError::AllocationFailed {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                GgufMetadataReadError::InitFailed {
+                    path: path.to_path_buf(),
+                }
+            };
+            GgufCParserSandboxError::MetadataRead {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            }
+        })?;
+    let metadata = read_gguf_metadata_from_context(runtime_source, &context).map_err(|source| {
         GgufCParserSandboxError::MetadataRead {
-            path: runtime_source.path().to_path_buf(),
+            path: path.to_path_buf(),
             source: Box::new(source),
         }
     })?;
     let tensor_index =
-        read_gguf_tensor_index_from_runtime_source(runtime_source).map_err(|source| {
+        read_gguf_tensor_index_from_context(runtime_source, &context).map_err(|source| {
             GgufCParserSandboxError::TensorIndexRead {
-                path: runtime_source.path().to_path_buf(),
+                path: path.to_path_buf(),
                 source: Box::new(source),
             }
         })?;
     Ok((metadata, tensor_index))
+}
+
+fn direct_load_with_allocation_tracking(
+    runtime_source: &GgmlRuntimeSource,
+) -> Result<(GgufMetadata, GgufTensorIndex), GgufCParserSandboxError> {
+    direct_load(runtime_source)
+}
+
+fn sandbox_error_is_allocation(error: &GgufCParserSandboxError) -> bool {
+    match error {
+        GgufCParserSandboxError::MetadataRead { source, .. } => {
+            matches!(
+                source.as_ref(),
+                GgufMetadataReadError::AllocationFailed { .. }
+            )
+        }
+        GgufCParserSandboxError::TensorIndexRead { source, .. } => matches!(
+            source.as_ref(),
+            GgufTensorIndexReadError::AllocationFailed { .. }
+        ),
+        _ => false,
+    }
 }
 
 fn load_with_child(
@@ -201,14 +303,59 @@ fn load_with_child(
         });
     }
 
-    let output: GgufCParserProbeOutput = serde_json::from_slice(&stdout)
-        .map_err(|source| GgufCParserSandboxError::Decode { source })?;
+    let output = decode_child_output(&stdout)?;
+    if output.source_identity != runtime_source.strong_file_identity()
+        || runtime_source.current_strong_file_identity() != Some(output.source_identity)
+        || runtime_source
+            .prefix_content_id(
+                usize::try_from(output.tensor_index.data_section_offset_bytes)
+                    .unwrap_or(usize::MAX),
+            )
+            .as_deref()
+            != Some(output.metadata_prefix_content_id.as_str())
+    {
+        return Err(GgufCParserSandboxError::SourceGenerationChanged {
+            path: runtime_source.path().to_path_buf(),
+        });
+    }
     let tensor_index = GgufTensorIndex::from_snapshot(output.tensor_index).map_err(|source| {
         GgufCParserSandboxError::RebuildTensorIndex {
             source: Box::new(source),
         }
     })?;
     Ok((output.metadata, tensor_index))
+}
+
+fn decode_child_output(stdout: &[u8]) -> Result<GgufCParserProbeOutput, GgufCParserSandboxError> {
+    match serde_json::from_slice::<GgufCParserProbeWireOutput>(stdout)
+        .map_err(|source| GgufCParserSandboxError::Decode { source })?
+    {
+        GgufCParserProbeWireOutput::Success(output) => Ok(output),
+        GgufCParserProbeWireOutput::Failure(envelope)
+            if envelope.openasr_error.kind == "capacity" =>
+        {
+            crate::models::native_execution_services::record_current_execution_candidate_failure(
+                crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                    SANDBOX_CAPACITY_OPERATION,
+                    format!(
+                        "child operation '{}': {}",
+                        envelope.openasr_error.operation, envelope.openasr_error.detail
+                    ),
+                ),
+            );
+            Err(GgufCParserSandboxError::Capacity {
+                operation: envelope.openasr_error.operation,
+                detail: envelope.openasr_error.detail,
+            })
+        }
+        GgufCParserProbeWireOutput::Failure(envelope) => {
+            Err(GgufCParserSandboxError::HelperFailed {
+                path: PathBuf::from("<sandbox-child>"),
+                status: "reported-error".to_string(),
+                stderr: envelope.openasr_error.detail,
+            })
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -411,5 +558,24 @@ mod tests {
         );
         assert!(!tensor_index.tensors().is_empty());
         assert_eq!(tensor_index.path(), path.as_path());
+    }
+
+    #[test]
+    fn child_capacity_envelope_is_not_collapsed_into_generic_helper_failure() {
+        let wire = serde_json::to_vec(&GgufCParserFailureEnvelope {
+            openasr_error: GgufCParserCapacityFailure {
+                kind: "capacity".to_string(),
+                operation: "gguf-base-preflight-parse".to_string(),
+                detail: "fixture allocation failed".to_string(),
+            },
+        })
+        .expect("serialize envelope");
+        let error = decode_child_output(&wire).expect_err("capacity must remain typed");
+        assert!(matches!(
+            error,
+            GgufCParserSandboxError::Capacity { operation, detail }
+                if operation == "gguf-base-preflight-parse"
+                    && detail == "fixture allocation failed"
+        ));
     }
 }

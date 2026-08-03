@@ -261,18 +261,21 @@ re-derive state that never changes between requests against the same pack — th
 is what mimo-asr did before its `MimoAsrPreparedRuntime` cache, and what granite
 did before it was caught.
 
-**The seam** (keep the built runtime alive; take it out, use it, put it back):
+**The seam** is the explicitly injected `Arc<NativeExecutionServices>`:
 
-- Cache the prepared runtime in a thread-local generation-tagged map keyed by
-  `(PackContentKey, backend)` (`models::thread_local_runtime_cache`:
-  `take_generation_tagged` / store), the shared `PreparedRuntimeCache`, or a
-  content-id-keyed process weights pool (dolphin). Tag entries with
-  `current_unload_generation()` so the central idle-unload clock can evict the
-  resident runtime under memory pressure.
-- **Reference families:** `firered_llm` (resident decoder), `mimo_asr` (whole
-  resident encoder + input-local + decoder pipeline), `dolphin` (process weights
-  pool). All AED / autoregressive families and all encoder families already do
-  this.
+- Send-safe parsed state belongs in its content/representation/lane-keyed
+  admitted host cache. Mutable or thread-confined ggml state belongs in an
+  admitted pinned-runtime actor or checkout pool. Cache identity includes the
+  verified pack content id and exact execution lane; a bare path is never a
+  runtime identity.
+- Every owner carries the memory lease that admitted its allocation. Idle
+  unload and pack replacement evict through the service root, then synchronously
+  destroy owner-thread runtimes before refunding bytes. Do not add family-global
+  maps, thread-local model owners, generation clocks, or no-op compatibility
+  cleanup hooks.
+- **Reference families:** `firered_llm`, `mimo_asr`, and `dolphin` for ASR
+  runtimes; ReDimNet and DiariZen for auxiliary parsed-host plus pinned-actor
+  ownership. New families must reuse these shared ownership primitives.
 
 ### CI gate (K2) — every ggml-executor family is checked
 
