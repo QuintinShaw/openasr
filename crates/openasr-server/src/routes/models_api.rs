@@ -75,8 +75,10 @@ pub(crate) async fn import_local_model(
     let path = resolve_local_pull_source_path(request.path)?;
     let catalog = load_catalog_for_optional_source(distribution.catalog_source(), &home)
         .map_err(ApiError::Catalog)?;
+    let resolved = resolve_catalog_model_pack_from_path(&catalog, &path).map_err(ApiError::Pull)?;
+    ensure_explicit_model_license_acceptance(&resolved, request.accept_license == Some(true))?;
     let mut progress = |_| {};
-    let installed = install_catalog_model_pack_from_path(&catalog, path, &home, &mut progress)
+    let installed = install_model_pack_from_path(&resolved, path, &home, &mut progress)
         .map_err(ApiError::Pull)?;
     Ok(Json(ImportLocalModelResponse {
         object: "model.local_import",

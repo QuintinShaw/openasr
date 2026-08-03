@@ -3,11 +3,11 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use openasr_core::{
     CatalogPullRequest, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID, DownloadSourcePref,
-    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, OpenAsrConfig,
-    PullModelPackRequest, QuantPreference, ResolvedCatalogPull, host_quant_recommendation_profile,
-    install_model_pack_from_path, list_installed_packs, load_config, load_model_catalog,
-    openasr_home, remove_model_pack, resolve_catalog_pull_with_profile, resolve_chain,
-    resolve_launch_pack,
+    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, ModelInstallLicenseDecision,
+    OpenAsrConfig, PullModelPackRequest, QuantPreference, ResolvedCatalogPull,
+    host_quant_recommendation_profile, install_model_pack_from_path, list_installed_packs,
+    load_config, load_model_catalog, model_install_license_decision, openasr_home,
+    remove_model_pack, resolve_catalog_pull_with_profile, resolve_chain, resolve_launch_pack,
 };
 
 use crate::PullCommandOptions;
@@ -34,11 +34,7 @@ pub(crate) fn pull(options: PullCommandOptions<'_>) -> Result<()> {
         );
     }
 
-    ensure_explicit_pull_license_acceptance(
-        &resolved,
-        options.accept_license,
-        options.from.is_some(),
-    )?;
+    ensure_explicit_pull_license_acceptance(&resolved, options.accept_license)?;
 
     let mut reporter = crate::progress::PullReporter::new(&resolved.pull);
     let progress = |event| reporter.on(event);
@@ -111,55 +107,52 @@ fn should_update_default_asr_model(catalog: &ModelCatalog, model_id: &str) -> bo
 fn ensure_explicit_pull_license_acceptance(
     resolved: &ResolvedCatalogPull,
     accepted: bool,
-    from_local_pack: bool,
 ) -> Result<()> {
-    if matches!(resolved.license_class, LicenseClass::Unknown) {
-        bail!(
+    match model_install_license_decision(&resolved.license_class, accepted) {
+        ModelInstallLicenseDecision::Allowed => Ok(()),
+        ModelInstallLicenseDecision::Unsupported => bail!(
             "Model '{}' has an unsupported license class and cannot be installed by this OpenASR version.",
             resolved.model_id
-        );
-    }
-    if accepted {
-        return Ok(());
-    }
-    match resolved.license_class {
-        LicenseClass::Noncommercial => bail!(
-            "Model '{}' is licensed for non-commercial use only ({}).\nReview {} and rerun with --accept-license{}.",
+        ),
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+            if resolved.license_class == LicenseClass::Noncommercial =>
+        {
+            bail!(
+                "Model '{}' is licensed for non-commercial use only ({}).\nReview {} and rerun with --accept-license.",
+                resolved.model_id,
+                resolved.license,
+                resolved.license_url,
+            )
+        }
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired => bail!(
+            "Model '{}' requires vendor license acceptance before installation.\nOpen vendor site: {}\nThen rerun with --accept-license.",
             resolved.model_id,
-            resolved.license,
             resolved.license_url,
-            if from_local_pack {
-                " together with the same --from <local-pack>"
-            } else {
-                ""
-            }
         ),
-        LicenseClass::Gated if !from_local_pack => bail!(
-            "Model '{}' requires vendor license acceptance before download.\nOpen vendor site: {}\nThen rerun with --accept-license or --from <local-pack>.",
-            resolved.model_id,
-            resolved.license_url
-        ),
-        LicenseClass::Permissive | LicenseClass::Gated | LicenseClass::Unknown => Ok(()),
     }
 }
 
 /// Automatic CLI convenience pulls must never stand in for accepting a
 /// restricted license. Returns a user-facing route to the explicit pull flow.
 pub(crate) fn automatic_pull_license_refusal(resolved: &ResolvedCatalogPull) -> Option<String> {
-    match resolved.license_class {
-        LicenseClass::Noncommercial => Some(format!(
-            "Model '{}' is licensed for non-commercial use only ({}) and cannot be downloaded automatically.\nReview {} then run: openasr pull {} --accept-license",
-            resolved.model_id, resolved.license, resolved.license_url, resolved.pull
-        )),
-        LicenseClass::Gated => Some(format!(
+    match model_install_license_decision(&resolved.license_class, false) {
+        ModelInstallLicenseDecision::Allowed => None,
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+            if resolved.license_class == LicenseClass::Noncommercial =>
+        {
+            Some(format!(
+                "Model '{}' is licensed for non-commercial use only ({}) and cannot be downloaded automatically.\nReview {} then run: openasr pull {} --accept-license",
+                resolved.model_id, resolved.license, resolved.license_url, resolved.pull
+            ))
+        }
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired => Some(format!(
             "Model '{}' requires accepting a vendor license and cannot be downloaded automatically.\nReview {} then run: openasr pull {} --accept-license",
             resolved.model_id, resolved.license_url, resolved.pull
         )),
-        LicenseClass::Unknown => Some(format!(
+        ModelInstallLicenseDecision::Unsupported => Some(format!(
             "Model '{}' has an unsupported license class and cannot be downloaded automatically.",
             resolved.model_id
         )),
-        LicenseClass::Permissive => None,
     }
 }
 
@@ -404,9 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn noncommercial_pull_requires_explicit_acceptance_even_for_local_import() {
-        let resolved = resolved_pull(LicenseClass::Noncommercial);
-        let download_error = ensure_explicit_pull_license_acceptance(&resolved, false, false)
+    fn restricted_pull_requires_explicit_acceptance_even_for_local_import() {
+        let mut resolved = resolved_pull(LicenseClass::Noncommercial);
+        let download_error = ensure_explicit_pull_license_acceptance(&resolved, false)
             .expect_err("download needs explicit license confirmation");
         assert!(
             download_error
@@ -414,11 +407,17 @@ mod tests {
                 .contains("non-commercial use only")
         );
 
-        let import_error = ensure_explicit_pull_license_acceptance(&resolved, false, true)
+        let import_error = ensure_explicit_pull_license_acceptance(&resolved, false)
             .expect_err("local import still needs explicit license confirmation");
-        assert!(import_error.to_string().contains("same --from"));
-        ensure_explicit_pull_license_acceptance(&resolved, true, false)
+        assert!(import_error.to_string().contains("--accept-license"));
+        ensure_explicit_pull_license_acceptance(&resolved, true)
             .expect("explicit confirmation permits the pull");
+
+        resolved.license_class = LicenseClass::Gated;
+        ensure_explicit_pull_license_acceptance(&resolved, false)
+            .expect_err("a local gated pack is not proof of license acceptance");
+        ensure_explicit_pull_license_acceptance(&resolved, true)
+            .expect("explicit confirmation permits a gated local pack");
     }
 
     #[test]

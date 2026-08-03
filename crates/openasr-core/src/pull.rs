@@ -586,6 +586,24 @@ pub fn install_catalog_model_pack_from_path(
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
     let source_path = source_path.as_ref();
+    let resolved = resolve_catalog_model_pack_from_path(catalog, source_path)?;
+    install_model_pack_from_path(&resolved, source_path, home, progress)
+}
+
+/// Resolve a local `.oasr` pack to the immutable signed-catalog entry whose
+/// size and digest it matches, without installing it.
+///
+/// Installation frontends use this preflight to obtain the catalog-owned
+/// license metadata before asking the shared install-license policy for an
+/// admission decision. [`install_model_pack_from_path`] verifies the bytes
+/// again while admitting them to the content store, so replacing the source
+/// path between this preflight and installation cannot install different
+/// content under the admitted identity.
+pub fn resolve_catalog_model_pack_from_path(
+    catalog: &ModelCatalog,
+    source_path: impl AsRef<Path>,
+) -> Result<ResolvedCatalogPull, PullError> {
+    let source_path = source_path.as_ref();
     if !has_openasr_runtime_pack_extension(source_path) {
         return Err(PullError::InvalidTarget {
             field: "path",
@@ -598,8 +616,7 @@ pub fn install_catalog_model_pack_from_path(
     // store re-hashes the bytes it actually copies and
     // `install_admitted_model_pack` rejects any drift against this target.
     let (size_bytes, sha256) = file_size_and_sha256(source_path)?;
-    let resolved = resolve_catalog_pull_by_file_digest(catalog, size_bytes, &sha256)?;
-    install_model_pack_from_path(&resolved, source_path, home, progress)
+    resolve_catalog_pull_by_file_digest(catalog, size_bytes, &sha256)
 }
 
 fn admit_model_content(

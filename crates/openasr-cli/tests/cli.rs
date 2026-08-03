@@ -1831,7 +1831,7 @@ fn pull_installs_local_pack_from_catalog_reference() {
 }
 
 #[test]
-fn pull_gated_catalog_entry_requires_license_acceptance_or_local_pack() {
+fn pull_gated_catalog_entry_requires_explicit_license_acceptance() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
     let catalog = temp.path().join("catalog.json");
@@ -1848,11 +1848,11 @@ fn pull_gated_catalog_entry_requires_license_acceptance_or_local_pack() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "requires vendor license acceptance before download",
+            "requires vendor license acceptance before installation",
         ))
         .stderr(predicate::str::contains("Open vendor site:"))
         .stderr(predicate::str::contains(
-            "Then rerun with --accept-license or --from <local-pack>.",
+            "Then rerun with --accept-license.",
         ));
 
     openasr_with_home(home.path())

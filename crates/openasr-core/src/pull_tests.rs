@@ -676,6 +676,29 @@ fn install_catalog_model_pack_from_path_requires_signed_catalog_digest_match() {
 }
 
 #[test]
+fn resolve_catalog_model_pack_from_path_exposes_catalog_policy_before_install() {
+    let bytes = tiny_pack_bytes();
+    let mut resolved = resolved_for(&bytes);
+    resolved.license_class = LicenseClass::Noncommercial;
+    resolved.license = "CC-BY-NC-4.0".to_string();
+    resolved.license_url = "https://example.invalid/license".to_string();
+    let catalog = catalog_for_resolved(&resolved);
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("moonshine-tiny-q8_0.oasr");
+    fs::write(&source_path, bytes).unwrap();
+
+    let observed = resolve_catalog_model_pack_from_path(&catalog, &source_path).unwrap();
+
+    assert_eq!(observed.pull, resolved.pull);
+    assert_eq!(observed.license_class, LicenseClass::Noncommercial);
+    assert_eq!(observed.license_url, resolved.license_url);
+    assert!(
+        list_installed_packs(temp.path()).unwrap().is_empty(),
+        "license preflight must not install the local pack"
+    );
+}
+
+#[test]
 fn install_catalog_model_pack_from_path_reuses_catalog_target_and_marks_local_source() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);

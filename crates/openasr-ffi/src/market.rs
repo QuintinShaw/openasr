@@ -24,7 +24,7 @@
 //! - **Downloaded packs are verified in the core.** [`openasr_pull_model`] runs
 //!   [`openasr_core::PullModelPackRequest`], which enforces https-only URLs,
 //!   streams a sha256 checked against the catalog-pinned digest, runs the GGUF /
-//!   runtime preflight, and installs atomically. [`openasr_install_local_pack`]
+//!   runtime preflight, and installs atomically. [`openasr_install_local_pack_v2`]
 //!   verifies a user-provided `.oasr`'s sha256/size against the signed catalog
 //!   before installing. The app never gets to hand over a URL or a hash -- only a
 //!   catalog reference (`model:quant`), so it cannot redirect the download or
@@ -38,17 +38,20 @@ use std::ffi::{CString, c_char, c_void};
 use std::ptr;
 
 use openasr_core::{
-    CatalogPullRequest, DownloadSourcePref, InstalledPack, LicenseClass, ModelCatalog, PullError,
-    PullModelPackRequest, PullProgress, install_catalog_model_pack_from_path, list_installed_packs,
-    load_model_catalog, remove_model_pack, resolve_catalog_pull_with_profile, resolve_chain,
+    CatalogPullRequest, DownloadSourcePref, InstalledPack, LicenseClass, ModelCatalog,
+    ModelInstallLicenseDecision, PullError, PullModelPackRequest, PullProgress,
+    ResolvedCatalogPull, install_model_pack_from_path, list_installed_packs, load_model_catalog,
+    model_install_license_decision, remove_model_pack, resolve_catalog_model_pack_from_path,
+    resolve_catalog_pull_with_profile, resolve_chain,
 };
 
 use crate::{OpenAsrStatus, c_str_to_path, catch, set_last_error};
 
 /// Opaque handle to a fetched-and-verified model catalog. Obtained from
 /// [`openasr_catalog_fetch`], read as JSON with [`openasr_catalog_json`], passed
-/// to [`openasr_pull_model`] / [`openasr_install_local_pack`] as the verified
-/// source of every model/quant/url/sha the pull may resolve, and released with
+/// to [`openasr_pull_model`], [`openasr_install_local_pack`], or
+/// [`openasr_install_local_pack_v2`] as the verified source of every
+/// model/quant/url/sha the pull may resolve, and released with
 /// [`openasr_catalog_free`].
 ///
 /// The catalog JSON is serialized once, at fetch time, from the verified +
@@ -59,8 +62,9 @@ pub struct OpenAsrCatalog {
     json: CString,
 }
 
-/// The stage a [`openasr_pull_model`] / [`openasr_install_local_pack`] progress
-/// callback is reporting, mirroring [`openasr_core::PullProgress`].
+/// The stage a [`openasr_pull_model`], [`openasr_install_local_pack`], or
+/// [`openasr_install_local_pack_v2`] progress callback is reporting, mirroring
+/// [`openasr_core::PullProgress`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAsrPullPhase {
@@ -80,11 +84,12 @@ pub enum OpenAsrPullPhase {
 }
 
 /// Progress callback for a pull/install. Invoked synchronously on the calling
-/// thread (the thread that called [`openasr_pull_model`] /
-/// [`openasr_install_local_pack`]), so `user_data` need not be thread-safe. Pass
-/// a null function pointer to receive no progress. The callback must not unwind
-/// (a panic across it is undefined behavior); do the app-side marshalling to
-/// another thread inside it, not around it.
+/// thread (the thread that called [`openasr_pull_model`],
+/// [`openasr_install_local_pack`], or [`openasr_install_local_pack_v2`]), so
+/// `user_data` need not be thread-safe. Pass a null function pointer to receive
+/// no progress. The callback must not unwind (a panic across it is undefined
+/// behavior); do the app-side marshalling to another thread inside it, not
+/// around it.
 pub type OpenAsrPullProgressCallback = Option<
     unsafe extern "C" fn(
         user_data: *mut c_void,
@@ -219,10 +224,10 @@ pub unsafe extern "C" fn openasr_catalog_free(catalog: *mut OpenAsrCatalog) {
 ///   `"global"`. `"china"`/`"global"` pin the region-aware chain's direction
 ///   explicitly (for callers, like the desktop app, that judge the region
 ///   themselves) instead of `"auto"` judging it from locale/timezone.
-/// - `accept_license` must be true to pull a gated-license model; a gated model
-///   pulled without it fails closed with [`OpenAsrStatus::PullFailed`], so
-///   consent cannot silently become a license bypass (mirrors the CLI's
-///   `--accept-license`).
+/// - `accept_license` must be true to pull a non-commercial or gated-license
+///   model. Missing acceptance and unknown license classes fail closed with
+///   [`OpenAsrStatus::PullFailed`], so download consent cannot silently become
+///   license acceptance (mirrors the CLI's `--accept-license`).
 /// - `progress_cb` / `cancel_cb` (both optional) are invoked synchronously on
 ///   this thread; return `true` from `cancel_cb` to abort.
 /// - `out_installed_json`, if non-null, receives a freshly-allocated
@@ -301,11 +306,8 @@ pub unsafe extern "C" fn openasr_pull_model(
             }
         };
 
-        if matches!(resolved.license_class, LicenseClass::Gated) && !accept_license {
-            set_last_error(format!(
-                "openasr_pull_model: model '{}' requires accepting a vendor license (review {}); call again with accept_license=true",
-                resolved.model_id, resolved.license_url
-            ));
+        if let Some(message) = model_install_license_refusal(&resolved, accept_license) {
+            set_last_error(format!("openasr_pull_model: {message}"));
             return OpenAsrStatus::PullFailed;
         }
 
@@ -353,6 +355,11 @@ pub unsafe extern "C" fn openasr_pull_model(
 /// if non-null, receives a JSON object for the installed pack (free with
 /// [`openasr_string_free`]).
 ///
+/// This ABI predates restricted local packs and therefore carries no explicit
+/// license-acceptance bit. It remains source/binary compatible for permissive
+/// packs, but fails closed for non-commercial, gated, or unknown license
+/// classes. Use [`openasr_install_local_pack_v2`] for a restricted pack.
+///
 /// # Safety
 /// `catalog` must be a live handle from [`openasr_catalog_fetch`]. `oasr_path`
 /// and `home_dir` must be valid, non-empty, NUL-terminated UTF-8 C strings.
@@ -367,10 +374,70 @@ pub unsafe extern "C" fn openasr_install_local_pack(
     progress_user_data: *mut c_void,
     out_installed_json: *mut *mut c_char,
 ) -> OpenAsrStatus {
+    // No acceptance proof exists in the v1 ABI. Never infer it from possession
+    // of the local file.
+    unsafe {
+        install_local_pack_impl(
+            catalog,
+            oasr_path,
+            false,
+            home_dir,
+            progress_cb,
+            progress_user_data,
+            out_installed_json,
+            "openasr_install_local_pack",
+        )
+    }
+}
+
+/// License-aware version of [`openasr_install_local_pack`].
+///
+/// `accept_license` must be true for non-commercial and vendor-gated packs.
+/// Permissive packs do not require it, and unknown/future license classes are
+/// always rejected. The decision comes from the same open-core policy used by
+/// the CLI and HTTP server.
+///
+/// # Safety
+/// The pointer requirements are identical to [`openasr_install_local_pack`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_install_local_pack_v2(
+    catalog: *const OpenAsrCatalog,
+    oasr_path: *const c_char,
+    accept_license: bool,
+    home_dir: *const c_char,
+    progress_cb: OpenAsrPullProgressCallback,
+    progress_user_data: *mut c_void,
+    out_installed_json: *mut *mut c_char,
+) -> OpenAsrStatus {
+    unsafe {
+        install_local_pack_impl(
+            catalog,
+            oasr_path,
+            accept_license,
+            home_dir,
+            progress_cb,
+            progress_user_data,
+            out_installed_json,
+            "openasr_install_local_pack_v2",
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn install_local_pack_impl(
+    catalog: *const OpenAsrCatalog,
+    oasr_path: *const c_char,
+    accept_license: bool,
+    home_dir: *const c_char,
+    progress_cb: OpenAsrPullProgressCallback,
+    progress_user_data: *mut c_void,
+    out_installed_json: *mut *mut c_char,
+    context: &'static str,
+) -> OpenAsrStatus {
     catch(OpenAsrStatus::PullFailed, || {
         clear_out_string(out_installed_json);
         if catalog.is_null() {
-            set_last_error("openasr_install_local_pack: catalog handle must not be null");
+            set_last_error(format!("{context}: catalog handle must not be null"));
             return OpenAsrStatus::InvalidArgument;
         }
         // SAFETY: caller contract requires a live catalog handle.
@@ -386,10 +453,39 @@ pub unsafe extern "C" fn openasr_install_local_pack(
         let progress = |event: PullProgress| {
             report_progress(progress_cb, progress_user_data, &event);
         };
-        let result =
-            install_catalog_model_pack_from_path(&catalog.inner, &source_path, &home, progress);
-        finish_install(result, out_installed_json, "openasr_install_local_pack")
+        let resolved = match resolve_catalog_model_pack_from_path(&catalog.inner, &source_path) {
+            Ok(resolved) => resolved,
+            Err(error) => return finish_install(Err(error), out_installed_json, context),
+        };
+        if let Some(message) = model_install_license_refusal(&resolved, accept_license) {
+            set_last_error(format!("{context}: {message}"));
+            return OpenAsrStatus::PullFailed;
+        }
+        let result = install_model_pack_from_path(&resolved, &source_path, &home, progress);
+        finish_install(result, out_installed_json, context)
     })
+}
+
+fn model_install_license_refusal(resolved: &ResolvedCatalogPull, accepted: bool) -> Option<String> {
+    match model_install_license_decision(&resolved.license_class, accepted) {
+        ModelInstallLicenseDecision::Allowed => None,
+        ModelInstallLicenseDecision::Unsupported => Some(format!(
+            "model '{}' has an unsupported license class and cannot be installed by this OpenASR version",
+            resolved.model_id
+        )),
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+            if resolved.license_class == LicenseClass::Noncommercial =>
+        {
+            Some(format!(
+                "model '{}' is licensed for non-commercial use only ({}; review {}); call again with accept_license=true",
+                resolved.model_id, resolved.license, resolved.license_url
+            ))
+        }
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired => Some(format!(
+            "model '{}' requires accepting a vendor license (review {}); call again with accept_license=true",
+            resolved.model_id, resolved.license_url
+        )),
+    }
 }
 
 /// Lists the installed model packs under `home_dir`, writing a
@@ -483,10 +579,11 @@ pub unsafe extern "C" fn openasr_remove_model(
 }
 
 /// Frees a string returned through an `out_*_json` out-parameter by
-/// [`openasr_pull_model`], [`openasr_install_local_pack`], or
-/// [`openasr_list_installed_json`]. Null is accepted and is a no-op. Do not call
-/// this on [`openasr_catalog_json`]'s return value (that is owned by the catalog
-/// handle) or on [`openasr_last_error_message`]'s.
+/// [`openasr_pull_model`], [`openasr_install_local_pack`],
+/// [`openasr_install_local_pack_v2`], or [`openasr_list_installed_json`]. Null
+/// is accepted and is a no-op. Do not call this on [`openasr_catalog_json`]'s
+/// return value (that is owned by the catalog handle) or on
+/// [`openasr_last_error_message`]'s.
 ///
 /// # Safety
 /// `string`, if non-null, must be a pointer previously produced by one of the
@@ -503,8 +600,8 @@ pub unsafe extern "C" fn openasr_string_free(string: *mut c_char) {
     });
 }
 
-/// Shared tail for [`openasr_pull_model`] / [`openasr_install_local_pack`]: turn
-/// the core pull `Result` into a typed status, serializing the installed pack to
+/// Shared tail for the pull/local-install entrypoints: turn the core pull
+/// `Result` into a typed status, serializing the installed pack to
 /// `out_installed_json` on success and mapping a cancellation to its own status.
 fn finish_install(
     result: Result<InstalledPack, PullError>,
@@ -642,6 +739,48 @@ mod tests {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    fn resolved_with_license(license_class: LicenseClass) -> ResolvedCatalogPull {
+        ResolvedCatalogPull {
+            requested: "test-model:q8".to_string(),
+            model_id: "test-model".to_string(),
+            display_name: "Test Model".to_string(),
+            quant: "q8_0".to_string(),
+            suffix: "q8".to_string(),
+            pull: "test-model:q8".to_string(),
+            filename: "test-model-q8.oasr".to_string(),
+            url: "https://example.invalid/test-model.oasr".to_string(),
+            mirrors: Vec::new(),
+            hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 123,
+            license: "Test license".to_string(),
+            license_url: "https://example.invalid/license".to_string(),
+            license_class,
+        }
+    }
+
+    #[test]
+    fn ffi_pull_and_local_install_share_fail_closed_license_policy() {
+        assert!(
+            model_install_license_refusal(&resolved_with_license(LicenseClass::Permissive), false)
+                .is_none()
+        );
+        for license_class in [LicenseClass::Noncommercial, LicenseClass::Gated] {
+            let resolved = resolved_with_license(license_class);
+            assert!(
+                model_install_license_refusal(&resolved, false)
+                    .expect("restricted model must be refused")
+                    .contains("accept_license=true")
+            );
+            assert!(model_install_license_refusal(&resolved, true).is_none());
+        }
+        assert!(
+            model_install_license_refusal(&resolved_with_license(LicenseClass::Unknown), true)
+                .expect("unknown license must fail closed")
+                .contains("unsupported license class")
+        );
     }
 
     #[test]

@@ -120,8 +120,9 @@ pub enum OpenAsrStatus {
     CatalogFailed = 6,
     /// A model-pack pull or local-pack install failed: a network/transport
     /// error, a size/sha256 mismatch against the signed catalog, a failed
-    /// GGUF/runtime preflight, a gated license not accepted, or an install I/O
-    /// error. Never a partially-installed or unverified pack.
+    /// GGUF/runtime preflight, a restricted license not explicitly accepted,
+    /// an unsupported license class, or an install I/O error. Never a
+    /// partially-installed or unverified pack.
     PullFailed = 7,
     /// A pull was stopped because the caller's cancel callback returned true.
     /// Any partial download is cleaned up; nothing is installed.

@@ -15,6 +15,12 @@ pub(crate) struct PullJobSnapshot {
     pub(crate) pull: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resolved: Option<PullJobResolvedSpec>,
+    /// Proof that the request which created this immutable job snapshot
+    /// explicitly accepted a restricted model license. Old snapshots decode
+    /// as `false`: permissive jobs remain resumable, while restricted jobs
+    /// fail closed instead of inventing consent during migration.
+    #[serde(default)]
+    pub(crate) license_accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_path: Option<PathBuf>,
     pub(crate) bytes_done: u64,
@@ -125,6 +131,7 @@ impl PullJobSnapshot {
         job_id: String,
         resolved: &ResolvedCatalogPull,
         source_path: Option<PathBuf>,
+        license_accepted: bool,
     ) -> Self {
         Self {
             job_id,
@@ -134,6 +141,7 @@ impl PullJobSnapshot {
             quant: resolved.quant.clone(),
             pull: resolved.pull.clone(),
             resolved: Some(PullJobResolvedSpec::from_resolved(resolved)),
+            license_accepted,
             source_path,
             bytes_done: 0,
             bytes_total: resolved.size_bytes,
@@ -153,6 +161,7 @@ impl PullJobSnapshot {
         job_id: String,
         resolved: &ResolvedCatalogPull,
         pack: InstalledPack,
+        license_accepted: bool,
     ) -> Self {
         Self {
             job_id,
@@ -162,6 +171,7 @@ impl PullJobSnapshot {
             quant: resolved.quant.clone(),
             pull: resolved.pull.clone(),
             resolved: Some(PullJobResolvedSpec::from_resolved(resolved)),
+            license_accepted,
             source_path: None,
             bytes_done: resolved.size_bytes,
             bytes_total: resolved.size_bytes,
@@ -347,7 +357,8 @@ pub(crate) async fn start_pull_job(
     )
     .map_err(ApiError::Catalog)?;
 
-    ensure_explicit_pull_license_acceptance(&resolved, request.accept_license == Some(true))?;
+    let license_accepted = request.accept_license == Some(true);
+    ensure_explicit_model_license_acceptance(&resolved, license_accepted)?;
 
     distribution.ensure_restart_resumes_started();
     if let Some(snapshot) = distribution.nonterminal_snapshot_for_pull(&resolved) {
@@ -356,7 +367,8 @@ pub(crate) async fn start_pull_job(
 
     let job_id = distribution.next_job_id();
     if let Some(pack) = matching_installed_pack(&home, &resolved).map_err(ApiError::Pull)? {
-        let snapshot = PullJobSnapshot::already_installed(job_id, &resolved, pack);
+        let snapshot =
+            PullJobSnapshot::already_installed(job_id, &resolved, pack, license_accepted);
         distribution.insert_job(snapshot.clone())?;
         return Ok((StatusCode::OK, Json(snapshot)).into_response());
     }
@@ -365,7 +377,12 @@ pub(crate) async fn start_pull_job(
         .from
         .map(resolve_local_pull_source_path)
         .transpose()?;
-    let snapshot = PullJobSnapshot::queued(job_id.clone(), &resolved, source_path.clone());
+    let snapshot = PullJobSnapshot::queued(
+        job_id.clone(),
+        &resolved,
+        source_path.clone(),
+        license_accepted,
+    );
     distribution.insert_job(snapshot.clone())?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let pause_flag = Arc::new(AtomicBool::new(false));
@@ -381,24 +398,30 @@ pub(crate) async fn start_pull_job(
     Ok((StatusCode::ACCEPTED, Json(snapshot)).into_response())
 }
 
-pub(crate) fn ensure_explicit_pull_license_acceptance(
+pub(crate) fn ensure_explicit_model_license_acceptance(
     resolved: &ResolvedCatalogPull,
     accepted: bool,
 ) -> Result<(), ApiError> {
-    match &resolved.license_class {
-        LicenseClass::Unknown => Err(ApiError::BadRequest(format!(
+    match model_install_license_decision(&resolved.license_class, accepted) {
+        ModelInstallLicenseDecision::Allowed => Ok(()),
+        ModelInstallLicenseDecision::Unsupported => Err(ApiError::BadRequest(format!(
             "Model '{}' has an unsupported license class and cannot be installed by this OpenASR version.",
             resolved.model_id
         ))),
-        LicenseClass::Noncommercial if !accepted => Err(ApiError::BadRequest(format!(
-            "Model '{}' is licensed for non-commercial use only ({}). Review {} and retry with accept_license=true.",
-            resolved.model_id, resolved.license, resolved.license_url
-        ))),
-        LicenseClass::Gated if !accepted => Err(ApiError::BadRequest(format!(
-            "Model '{}' requires accepting the vendor license before download. Review {} and retry with accept_license=true.",
-            resolved.model_id, resolved.license_url
-        ))),
-        LicenseClass::Permissive | LicenseClass::Noncommercial | LicenseClass::Gated => Ok(()),
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+            if resolved.license_class == LicenseClass::Noncommercial =>
+        {
+            Err(ApiError::BadRequest(format!(
+                "Model '{}' is licensed for non-commercial use only ({}). Review {} and retry with accept_license=true.",
+                resolved.model_id, resolved.license, resolved.license_url
+            )))
+        }
+        ModelInstallLicenseDecision::ExplicitAcceptanceRequired => {
+            Err(ApiError::BadRequest(format!(
+                "Model '{}' requires accepting the vendor license before installation. Review {} and retry with accept_license=true.",
+                resolved.model_id, resolved.license_url
+            )))
+        }
     }
 }
 
@@ -561,7 +584,7 @@ pub(crate) async fn resume_pull_job(
 pub(crate) fn resolved_pull_from_snapshot(
     snapshot: &PullJobSnapshot,
 ) -> Result<ResolvedCatalogPull, ApiError> {
-    snapshot
+    let resolved = snapshot
         .resolved
         .clone()
         .ok_or_else(|| {
@@ -570,7 +593,9 @@ pub(crate) fn resolved_pull_from_snapshot(
                 snapshot.job_id
             ))
         })
-        .map(ResolvedCatalogPull::from)
+        .map(ResolvedCatalogPull::from)?;
+    ensure_explicit_model_license_acceptance(&resolved, snapshot.license_accepted)?;
+    Ok(resolved)
 }
 
 pub(crate) fn resolve_local_pull_source_path(path: PathBuf) -> Result<PathBuf, ApiError> {

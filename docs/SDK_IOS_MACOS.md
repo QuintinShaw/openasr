@@ -21,7 +21,7 @@ plus a generated header, not a Rust-shaped API.
 - **Model market**: fetch and verify the signed model catalog, then (under
   explicit consent) download + sha256-verify + install a model pack, list
   installed packs, and remove one (`openasr_catalog_*` / `openasr_pull_model` /
-  `openasr_install_local_pack` / `openasr_list_installed_json` /
+  `openasr_install_local_pack[_v2]` / `openasr_list_installed_json` /
   `openasr_remove_model`). This is the on-device equivalent of `openasr pull`,
   for a native app that has no CLI or local server to lean on.
 - Error codes + last-error text; every call is panic-safe (no unwind crosses
@@ -244,11 +244,21 @@ OpenAsrStatus openasr_pull_model(const OpenAsrCatalog *catalog,
                                  OpenAsrPullCancelCallback cancel_cb, void *cancel_user_data,
                                  char **out_installed_json);   // free with openasr_string_free
 
-// Verify + install a .oasr the app already has on disk (sha256/size must match catalog).
+// Verify + install a permissively licensed .oasr the app already has on disk
+// (sha256/size must match catalog). Restricted packs fail closed in this v1 ABI.
 OpenAsrStatus openasr_install_local_pack(const OpenAsrCatalog *catalog, const char *oasr_path,
                                          const char *home_dir,
                                          OpenAsrPullProgressCallback progress_cb, void *progress_user_data,
                                          char **out_installed_json);
+
+// License-aware local install. Set accept_license=true only after displaying
+// the signed-catalog license disclosure and obtaining explicit acceptance.
+OpenAsrStatus openasr_install_local_pack_v2(const OpenAsrCatalog *catalog,
+                                            const char *oasr_path, bool accept_license,
+                                            const char *home_dir,
+                                            OpenAsrPullProgressCallback progress_cb,
+                                            void *progress_user_data,
+                                            char **out_installed_json);
 
 OpenAsrStatus openasr_list_installed_json(const char *home_dir, char **out_json);  // JSON array
 OpenAsrStatus openasr_remove_model(const char *home_dir, const char *reference, bool *out_removed);

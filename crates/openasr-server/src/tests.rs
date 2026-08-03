@@ -158,6 +158,60 @@ fn distribution_context_with_pull_license_for_test(
     (distribution, home)
 }
 
+fn local_import_fixture_with_license(
+    root: &std::path::Path,
+    license_class: LicenseClass,
+) -> (DistributionContext, PathBuf, PathBuf) {
+    let pack_path = root.join("moonshine-tiny-q8_0.oasr");
+    write_mock_gguf_runtime_source(&pack_path, Some("moonshine-tiny"));
+    let pack_bytes = fs::read(&pack_path).expect("read local import fixture");
+    let pack_sha256 = format!("{:x}", Sha256::digest(&pack_bytes));
+
+    let source_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/catalog.json");
+    let contents = fs::read_to_string(source_path).expect("read bundled catalog fixture");
+    let mut catalog: serde_json::Value =
+        serde_json::from_str(&contents).expect("parse bundled catalog fixture");
+    let model = catalog["models"]
+        .as_array_mut()
+        .expect("catalog models array")
+        .iter_mut()
+        .find(|model| model["id"] == "moonshine-tiny")
+        .expect("moonshine-tiny catalog fixture");
+    model["license"] = serde_json::Value::String(
+        match &license_class {
+            LicenseClass::Permissive => "MIT",
+            LicenseClass::Noncommercial => "CC-BY-NC-4.0",
+            LicenseClass::Gated => "Vendor gated license",
+            LicenseClass::Unknown => "Unknown",
+        }
+        .to_string(),
+    );
+    model["license_url"] =
+        serde_json::Value::String("https://example.invalid/model-license".to_string());
+    model["license_class"] =
+        serde_json::to_value(&license_class).expect("serialize license class fixture");
+    let quant = model["quants"]
+        .as_array_mut()
+        .expect("model quants array")
+        .iter_mut()
+        .find(|quant| quant["quant"] == "q8_0")
+        .expect("moonshine q8 catalog fixture");
+    quant["sha256"] = serde_json::Value::String(pack_sha256);
+    quant["size_bytes"] = serde_json::Value::Number(pack_bytes.len().into());
+
+    let catalog_path = root.join("catalog.json");
+    let contents = serde_json::to_string(&catalog).expect("serialize catalog fixture");
+    openasr_core::testing::write_local_dev_signed_catalog(&catalog_path, &contents, 1);
+    let home = root.join("home");
+    let distribution = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(home.clone()),
+        catalog_url: Some(format!("file://{}", catalog_path.display())),
+        catalog_local_override: None,
+    });
+    (distribution, home, pack_path)
+}
+
 /// Copies the real, committed `model-registry/catalog.json` into `dir` and
 /// re-signs the copy with the public local-dev key for the exact `file://`
 /// path the test will pass as `catalog_url`. The committed catalog's own
@@ -1868,7 +1922,8 @@ fn pull_progress_speed_is_smoothed_across_jittery_samples() {
     // lower variance than the instantaneous speed each tick implies.
     let resolved = resolved_pull_fixture();
     let bytes_total = 200 * 1024 * 1024;
-    let mut snapshot = PullJobSnapshot::queued("pull-smooth-test".to_string(), &resolved, None);
+    let mut snapshot =
+        PullJobSnapshot::queued("pull-smooth-test".to_string(), &resolved, None, false);
     snapshot.apply_progress(PullProgress::DownloadStarted {
         bytes_total,
         resume_from: 0,
@@ -1981,19 +2036,19 @@ fn explicit_pull_license_acceptance_covers_every_license_class() {
     let mut resolved = resolved_pull_fixture();
 
     resolved.license_class = LicenseClass::Permissive;
-    ensure_explicit_pull_license_acceptance(&resolved, false)
+    ensure_explicit_model_license_acceptance(&resolved, false)
         .expect("permissive models do not require acceptance");
 
     for license_class in [LicenseClass::Noncommercial, LicenseClass::Gated] {
         resolved.license_class = license_class;
-        let error = ensure_explicit_pull_license_acceptance(&resolved, false).unwrap_err();
+        let error = ensure_explicit_model_license_acceptance(&resolved, false).unwrap_err();
         assert!(error.to_string().contains("accept_license=true"), "{error}");
-        ensure_explicit_pull_license_acceptance(&resolved, true)
+        ensure_explicit_model_license_acceptance(&resolved, true)
             .expect("explicit acceptance permits a restricted model pull");
     }
 
     resolved.license_class = LicenseClass::Unknown;
-    let error = ensure_explicit_pull_license_acceptance(&resolved, true).unwrap_err();
+    let error = ensure_explicit_model_license_acceptance(&resolved, true).unwrap_err();
     assert!(
         error.to_string().contains("unsupported license class"),
         "{error}"
@@ -2080,12 +2135,104 @@ async fn restricted_local_pulls_require_acceptance_before_source_access() {
     assert!(gated.contains("vendor license"));
 }
 
+async fn assert_local_import_license_policy(
+    license_class: LicenseClass,
+    accepted: Option<bool>,
+) -> Result<ImportLocalModelResponse, ApiError> {
+    let temp = tempfile::tempdir().unwrap();
+    let (distribution, home, pack_path) =
+        local_import_fixture_with_license(temp.path(), license_class);
+    let result = import_local_model(
+        Extension(distribution),
+        Json(ImportLocalModelRequest {
+            path: pack_path,
+            accept_license: accepted,
+        }),
+    )
+    .await;
+    if result.is_err() {
+        assert!(
+            list_installed_packs(&home).unwrap().is_empty(),
+            "license refusal must happen before installing local pack content"
+        );
+    }
+    result.map(|response| response.0)
+}
+
+#[tokio::test]
+async fn local_import_uses_the_shared_install_license_policy() {
+    assert_local_import_license_policy(LicenseClass::Permissive, None)
+        .await
+        .expect("permissive local import needs no acceptance");
+
+    for license_class in [LicenseClass::Noncommercial, LicenseClass::Gated] {
+        let error = assert_local_import_license_policy(license_class.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("accept_license=true"), "{error}");
+        assert_local_import_license_policy(license_class, Some(true))
+            .await
+            .expect("explicit acceptance permits restricted local import");
+    }
+
+    let error = assert_local_import_license_policy(LicenseClass::Unknown, Some(true))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not present in the signed model catalog"),
+        "{error}"
+    );
+}
+
+#[test]
+fn persisted_pull_license_proof_migrates_fail_closed() {
+    let mut resolved = resolved_pull_fixture();
+
+    // Simulate a pre-field snapshot by removing `license_accepted` from its
+    // serialized form. Serde's default keeps old permissive jobs resumable.
+    let permissive = PullJobSnapshot::queued("old-permissive".into(), &resolved, None, false);
+    let mut old_json = serde_json::to_value(permissive).unwrap();
+    old_json.as_object_mut().unwrap().remove("license_accepted");
+    let migrated: PullJobSnapshot = serde_json::from_value(old_json).unwrap();
+    assert!(!migrated.license_accepted);
+    resolved_pull_from_snapshot(&migrated).expect("old permissive job remains resumable");
+
+    for license_class in [LicenseClass::Noncommercial, LicenseClass::Gated] {
+        resolved.license_class = license_class;
+        let old_restricted =
+            PullJobSnapshot::queued("old-restricted".into(), &resolved, None, false);
+        let mut old_json = serde_json::to_value(old_restricted).unwrap();
+        old_json.as_object_mut().unwrap().remove("license_accepted");
+        let migrated: PullJobSnapshot = serde_json::from_value(old_json).unwrap();
+        let error = resolved_pull_from_snapshot(&migrated).unwrap_err();
+        assert!(error.to_string().contains("accept_license=true"), "{error}");
+
+        let accepted = PullJobSnapshot::queued("accepted-restricted".into(), &resolved, None, true);
+        assert!(
+            serde_json::to_value(&accepted).unwrap()["license_accepted"] == true,
+            "new restricted snapshots must persist acceptance proof"
+        );
+        resolved_pull_from_snapshot(&accepted)
+            .expect("persisted explicit acceptance permits resume");
+    }
+
+    resolved.license_class = LicenseClass::Unknown;
+    let unknown = PullJobSnapshot::queued("unknown".into(), &resolved, None, true);
+    let error = resolved_pull_from_snapshot(&unknown).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported license class"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn pull_job_events_notify_paused_snapshot_and_reconnect_terminal_state() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
     let resolved = resolved_pull_fixture();
-    let snapshot = PullJobSnapshot::queued("pull-test".to_string(), &resolved, None);
+    let snapshot = PullJobSnapshot::queued("pull-test".to_string(), &resolved, None, false);
     distribution.insert_job(snapshot).unwrap();
 
     let mut receiver = distribution.subscribe_job("pull-test").unwrap();
@@ -2110,7 +2257,7 @@ async fn pull_job_control_ack_sets_flag_without_terminal_state_flip() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
     let resolved = resolved_pull_fixture();
-    let snapshot = PullJobSnapshot::queued("pull-control".to_string(), &resolved, None);
+    let snapshot = PullJobSnapshot::queued("pull-control".to_string(), &resolved, None, false);
     distribution.insert_job(snapshot).unwrap();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let pause_flag = Arc::new(AtomicBool::new(false));
@@ -2206,9 +2353,11 @@ fn pull_job_reuses_existing_nonterminal_snapshot_for_same_pull() {
             "pull-existing".to_string(),
             &resolved,
             None,
+            false,
         ))
         .unwrap();
-    let mut completed = PullJobSnapshot::queued("pull-completed".to_string(), &resolved, None);
+    let mut completed =
+        PullJobSnapshot::queued("pull-completed".to_string(), &resolved, None, false);
     completed.state = PullJobState::Completed;
     distribution.insert_job(completed).unwrap();
 
@@ -2231,7 +2380,8 @@ fn nonterminal_snapshot_for_pull_skips_a_job_being_canceled() {
     let distribution = distribution_context_for_test(temp.path());
     let resolved = resolved_pull_fixture();
 
-    let mut canceling = PullJobSnapshot::queued("pull-canceling".to_string(), &resolved, None);
+    let mut canceling =
+        PullJobSnapshot::queued("pull-canceling".to_string(), &resolved, None, false);
     canceling.state = PullJobState::Downloading;
     canceling.control_requested = Some(PullControlRequest::Cancel);
     distribution.insert_job(canceling).unwrap();
@@ -2244,7 +2394,7 @@ fn nonterminal_snapshot_for_pull_skips_a_job_being_canceled() {
     );
 
     // A still-live (non-canceling) download for the same pack is still reused.
-    let mut downloading = PullJobSnapshot::queued("pull-live".to_string(), &resolved, None);
+    let mut downloading = PullJobSnapshot::queued("pull-live".to_string(), &resolved, None, false);
     downloading.state = PullJobState::Downloading;
     distribution.insert_job(downloading).unwrap();
 
@@ -2276,7 +2426,8 @@ async fn list_pull_jobs_surfaces_persisted_nonterminal_jobs_after_restart_withou
 
     // A prior daemon process was killed mid-download and had persisted this
     // job to disk before exiting (mirrors what `persist_snapshot` writes).
-    let mut downloading = PullJobSnapshot::queued("pull-inflight".to_string(), &resolved, None);
+    let mut downloading =
+        PullJobSnapshot::queued("pull-inflight".to_string(), &resolved, None, false);
     downloading.state = PullJobState::Downloading;
     downloading.bytes_done = 1;
     downloading.bytes_total = resolved.size_bytes;
@@ -2287,7 +2438,7 @@ async fn list_pull_jobs_surfaces_persisted_nonterminal_jobs_after_restart_withou
     .unwrap();
 
     // A job that already finished before the restart must not resurface.
-    let mut completed = PullJobSnapshot::queued("pull-done".to_string(), &resolved, None);
+    let mut completed = PullJobSnapshot::queued("pull-done".to_string(), &resolved, None, false);
     completed.state = PullJobState::Completed;
     std::fs::write(
         pulls_dir.join("pull-done.json"),
@@ -2334,7 +2485,8 @@ fn pull_job_insert_failure_does_not_publish_in_memory_snapshot() {
     std::fs::write(&home_file, b"not a directory").unwrap();
     let distribution = distribution_context_for_test(&home_file);
     let resolved = resolved_pull_fixture();
-    let snapshot = PullJobSnapshot::queued("pull-persist-fails".to_string(), &resolved, None);
+    let snapshot =
+        PullJobSnapshot::queued("pull-persist-fails".to_string(), &resolved, None, false);
 
     let error = distribution.insert_job(snapshot).unwrap_err().to_string();
 
@@ -2352,8 +2504,12 @@ fn pull_job_update_failure_does_not_publish_in_memory_snapshot() {
     let distribution = distribution_context_for_test(temp.path());
     let pulls_dir = temp.path().join("pulls");
     let resolved = resolved_pull_fixture();
-    let snapshot =
-        PullJobSnapshot::queued("pull-update-persist-fails".to_string(), &resolved, None);
+    let snapshot = PullJobSnapshot::queued(
+        "pull-update-persist-fails".to_string(),
+        &resolved,
+        None,
+        false,
+    );
     distribution.insert_job(snapshot).unwrap();
     std::fs::remove_dir_all(&pulls_dir).unwrap();
     std::fs::write(&pulls_dir, b"not a directory").unwrap();

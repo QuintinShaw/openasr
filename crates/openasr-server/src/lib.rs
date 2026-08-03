@@ -53,14 +53,15 @@ pub use openasr_core::pairing_safety_code_for_certificate_fingerprint;
 use openasr_core::realtime::history::{DaemonHistoryEntry, DaemonHistoryStoreError};
 use openasr_core::{
     AudioPreparationError, BackendKind, CatalogError, CatalogMirror, CatalogPullRequest,
-    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, NativeRuntimeShutdownGuard,
-    OpenAsrHomeError, PullError, PullModelPackRequest, PullProgress, QuantPreference,
-    RealtimeBackendCapabilities, ResolvedCatalogPull, certificate_fingerprint_sha256,
-    host_quant_recommendation_profile, install_catalog_model_pack_from_path,
+    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, ModelInstallLicenseDecision,
+    NativeRuntimeShutdownGuard, OpenAsrHomeError, PullError, PullModelPackRequest, PullProgress,
+    QuantPreference, RealtimeBackendCapabilities, ResolvedCatalogPull,
+    certificate_fingerprint_sha256, host_quant_recommendation_profile,
     install_model_pack_from_path, list_installed_packs, load_local_catalog_file_with_identity,
-    load_model_catalog, native_runtime_realtime_capabilities_for_path,
+    load_model_catalog, model_install_license_decision,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, openasr_home, remove_model_pack,
-    resolve_catalog_pull, resolve_installed_pack_reference,
+    resolve_catalog_model_pack_from_path, resolve_catalog_pull, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog, resolve_launch_pack, resolve_runtime_catalog,
     runtime_registry,
 };
@@ -2222,9 +2223,11 @@ struct DeleteModelResponse {
 #[derive(Debug, Deserialize)]
 struct ImportLocalModelRequest {
     path: PathBuf,
+    #[serde(default)]
+    accept_license: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ImportLocalModelResponse {
     object: &'static str,
     installed: InstalledPack,

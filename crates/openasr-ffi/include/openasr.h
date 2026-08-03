@@ -58,8 +58,9 @@ typedef enum OpenAsrStatus {
   /**
    * A model-pack pull or local-pack install failed: a network/transport
    * error, a size/sha256 mismatch against the signed catalog, a failed
-   * GGUF/runtime preflight, a gated license not accepted, or an install I/O
-   * error. Never a partially-installed or unverified pack.
+   * GGUF/runtime preflight, a restricted license not explicitly accepted,
+   * an unsupported license class, or an install I/O error. Never a
+   * partially-installed or unverified pack.
    */
   OPEN_ASR_STATUS_PULL_FAILED = 7,
   /**
@@ -122,8 +123,9 @@ typedef enum OpenAsrStreamingEventKind {
 } OpenAsrStreamingEventKind;
 
 /**
- * The stage a [`openasr_pull_model`] / [`openasr_install_local_pack`] progress
- * callback is reporting, mirroring [`openasr_core::PullProgress`].
+ * The stage a [`openasr_pull_model`], [`openasr_install_local_pack`], or
+ * [`openasr_install_local_pack_v2`] progress callback is reporting, mirroring
+ * [`openasr_core::PullProgress`].
  */
 typedef enum OpenAsrPullPhase {
   /**
@@ -154,8 +156,9 @@ typedef enum OpenAsrPullPhase {
 /**
  * Opaque handle to a fetched-and-verified model catalog. Obtained from
  * [`openasr_catalog_fetch`], read as JSON with [`openasr_catalog_json`], passed
- * to [`openasr_pull_model`] / [`openasr_install_local_pack`] as the verified
- * source of every model/quant/url/sha the pull may resolve, and released with
+ * to [`openasr_pull_model`], [`openasr_install_local_pack`], or
+ * [`openasr_install_local_pack_v2`] as the verified source of every
+ * model/quant/url/sha the pull may resolve, and released with
  * [`openasr_catalog_free`].
  *
  * The catalog JSON is serialized once, at fetch time, from the verified +
@@ -244,11 +247,12 @@ typedef struct OpenAsrStreamingConfig {
 
 /**
  * Progress callback for a pull/install. Invoked synchronously on the calling
- * thread (the thread that called [`openasr_pull_model`] /
- * [`openasr_install_local_pack`]), so `user_data` need not be thread-safe. Pass
- * a null function pointer to receive no progress. The callback must not unwind
- * (a panic across it is undefined behavior); do the app-side marshalling to
- * another thread inside it, not around it.
+ * thread (the thread that called [`openasr_pull_model`],
+ * [`openasr_install_local_pack`], or [`openasr_install_local_pack_v2`]), so
+ * `user_data` need not be thread-safe. Pass a null function pointer to receive
+ * no progress. The callback must not unwind (a panic across it is undefined
+ * behavior); do the app-side marshalling to another thread inside it, not
+ * around it.
  */
 typedef void (*OpenAsrPullProgressCallback)(void *user_data,
                                             enum OpenAsrPullPhase phase,
@@ -621,10 +625,10 @@ void openasr_catalog_free(struct OpenAsrCatalog *catalog);
  *   `"global"`. `"china"`/`"global"` pin the region-aware chain's direction
  *   explicitly (for callers, like the desktop app, that judge the region
  *   themselves) instead of `"auto"` judging it from locale/timezone.
- * - `accept_license` must be true to pull a gated-license model; a gated model
- *   pulled without it fails closed with [`OpenAsrStatus::PullFailed`], so
- *   consent cannot silently become a license bypass (mirrors the CLI's
- *   `--accept-license`).
+ * - `accept_license` must be true to pull a non-commercial or gated-license
+ *   model. Missing acceptance and unknown license classes fail closed with
+ *   [`OpenAsrStatus::PullFailed`], so download consent cannot silently become
+ *   license acceptance (mirrors the CLI's `--accept-license`).
  * - `progress_cb` / `cancel_cb` (both optional) are invoked synchronously on
  *   this thread; return `true` from `cancel_cb` to abort.
  * - `out_installed_json`, if non-null, receives a freshly-allocated
@@ -668,6 +672,11 @@ enum OpenAsrStatus openasr_pull_model(const struct OpenAsrCatalog *catalog,
  * if non-null, receives a JSON object for the installed pack (free with
  * [`openasr_string_free`]).
  *
+ * This ABI predates restricted local packs and therefore carries no explicit
+ * license-acceptance bit. It remains source/binary compatible for permissive
+ * packs, but fails closed for non-commercial, gated, or unknown license
+ * classes. Use [`openasr_install_local_pack_v2`] for a restricted pack.
+ *
  * # Safety
  * `catalog` must be a live handle from [`openasr_catalog_fetch`]. `oasr_path`
  * and `home_dir` must be valid, non-empty, NUL-terminated UTF-8 C strings.
@@ -680,6 +689,25 @@ enum OpenAsrStatus openasr_install_local_pack(const struct OpenAsrCatalog *catal
                                               OpenAsrPullProgressCallback progress_cb,
                                               void *progress_user_data,
                                               char **out_installed_json);
+
+/**
+ * License-aware version of [`openasr_install_local_pack`].
+ *
+ * `accept_license` must be true for non-commercial and vendor-gated packs.
+ * Permissive packs do not require it, and unknown/future license classes are
+ * always rejected. The decision comes from the same open-core policy used by
+ * the CLI and HTTP server.
+ *
+ * # Safety
+ * The pointer requirements are identical to [`openasr_install_local_pack`].
+ */
+enum OpenAsrStatus openasr_install_local_pack_v2(const struct OpenAsrCatalog *catalog,
+                                                 const char *oasr_path,
+                                                 bool accept_license,
+                                                 const char *home_dir,
+                                                 OpenAsrPullProgressCallback progress_cb,
+                                                 void *progress_user_data,
+                                                 char **out_installed_json);
 
 /**
  * Lists the installed model packs under `home_dir`, writing a
@@ -712,10 +740,11 @@ enum OpenAsrStatus openasr_remove_model(const char *home_dir,
 
 /**
  * Frees a string returned through an `out_*_json` out-parameter by
- * [`openasr_pull_model`], [`openasr_install_local_pack`], or
- * [`openasr_list_installed_json`]. Null is accepted and is a no-op. Do not call
- * this on [`openasr_catalog_json`]'s return value (that is owned by the catalog
- * handle) or on [`openasr_last_error_message`]'s.
+ * [`openasr_pull_model`], [`openasr_install_local_pack`],
+ * [`openasr_install_local_pack_v2`], or [`openasr_list_installed_json`]. Null
+ * is accepted and is a no-op. Do not call this on [`openasr_catalog_json`]'s
+ * return value (that is owned by the catalog handle) or on
+ * [`openasr_last_error_message`]'s.
  *
  * # Safety
  * `string`, if non-null, must be a pointer previously produced by one of the

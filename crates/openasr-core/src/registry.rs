@@ -430,6 +430,44 @@ pub enum LicenseClass {
     Unknown,
 }
 
+/// Install-time admission decision for a catalog model's license class.
+///
+/// Every installation surface (CLI, HTTP server, and FFI) must use this
+/// decision rather than interpreting [`LicenseClass`] independently. That
+/// keeps local files and remote downloads under the same consent policy:
+/// possession of a pack is not evidence that its license was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ModelInstallLicenseDecision {
+    /// The model may be installed without an explicit license acknowledgement.
+    Allowed,
+    /// Installation is blocked until this request carries explicit acceptance.
+    ExplicitAcceptanceRequired,
+    /// This build cannot interpret the license class, so installation is
+    /// always blocked even if the caller claims acceptance.
+    Unsupported,
+}
+
+/// Return the authoritative install-license decision for one request.
+///
+/// Non-commercial and vendor-gated packs both require an explicit acceptance
+/// bit on the installation request. Unknown/future license classes fail closed.
+pub fn model_install_license_decision(
+    license_class: &LicenseClass,
+    explicitly_accepted: bool,
+) -> ModelInstallLicenseDecision {
+    match license_class {
+        LicenseClass::Permissive => ModelInstallLicenseDecision::Allowed,
+        LicenseClass::Noncommercial | LicenseClass::Gated if explicitly_accepted => {
+            ModelInstallLicenseDecision::Allowed
+        }
+        LicenseClass::Noncommercial | LicenseClass::Gated => {
+            ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+        }
+        LicenseClass::Unknown => ModelInstallLicenseDecision::Unsupported,
+    }
+}
+
 /// Whether the running build can use a catalog model, derived from its
 /// `min_cli_version`. Models needing a newer OpenASR than the current build are
 /// surfaced in listings as [`ModelAvailability::RequiresUpdate`] (not hidden) and

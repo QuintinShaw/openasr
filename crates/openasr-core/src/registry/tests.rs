@@ -46,6 +46,38 @@ fn assert_card_validation_error(card: ModelCard, expected: &str) {
     assert!(error.contains(expected), "{error}");
 }
 
+#[test]
+fn model_install_license_policy_is_fail_closed_and_source_agnostic() {
+    assert_eq!(
+        model_install_license_decision(&LicenseClass::Permissive, false),
+        ModelInstallLicenseDecision::Allowed
+    );
+    assert_eq!(
+        model_install_license_decision(&LicenseClass::Permissive, true),
+        ModelInstallLicenseDecision::Allowed
+    );
+
+    for license_class in [LicenseClass::Noncommercial, LicenseClass::Gated] {
+        assert_eq!(
+            model_install_license_decision(&license_class, false),
+            ModelInstallLicenseDecision::ExplicitAcceptanceRequired
+        );
+        assert_eq!(
+            model_install_license_decision(&license_class, true),
+            ModelInstallLicenseDecision::Allowed
+        );
+    }
+
+    assert_eq!(
+        model_install_license_decision(&LicenseClass::Unknown, false),
+        ModelInstallLicenseDecision::Unsupported
+    );
+    assert_eq!(
+        model_install_license_decision(&LicenseClass::Unknown, true),
+        ModelInstallLicenseDecision::Unsupported
+    );
+}
+
 // On every platform that ships a RAM probe (macOS sysctl, Linux /proc/meminfo,
 // Windows GlobalMemoryStatusEx) the host total must come back positive, so the
 // quant recommender budgets against real memory instead of falling back to the
