@@ -1,5 +1,5 @@
 use crate::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest, GgmlAsrViewExecutor,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -7,14 +7,14 @@ const COMPOSED_EXECUTOR_ID: &str = "openasr-ggml-composed-executor-v1";
 
 #[derive(Default)]
 pub(crate) struct ComposedGgmlAsrExecutor {
-    executors_by_model_architecture: BTreeMap<&'static str, Arc<dyn GgmlAsrExecutor>>,
+    executors_by_model_architecture: BTreeMap<&'static str, Arc<dyn GgmlAsrViewExecutor>>,
 }
 
 impl ComposedGgmlAsrExecutor {
     pub(crate) fn with_architecture_executors(
         mut self,
         executors_by_model_architecture: impl IntoIterator<
-            Item = (&'static str, Arc<dyn GgmlAsrExecutor>),
+            Item = (&'static str, Arc<dyn GgmlAsrViewExecutor>),
         >,
     ) -> Self {
         for (model_architecture, executor) in executors_by_model_architecture {
@@ -26,7 +26,7 @@ impl ComposedGgmlAsrExecutor {
     pub(crate) fn with_architecture_executor(
         mut self,
         model_architecture: &'static str,
-        executor: Arc<dyn GgmlAsrExecutor>,
+        executor: Arc<dyn GgmlAsrViewExecutor>,
     ) -> Self {
         self.executors_by_model_architecture
             .insert(model_architecture, executor);
@@ -34,7 +34,7 @@ impl ComposedGgmlAsrExecutor {
     }
 }
 
-impl GgmlAsrExecutor for ComposedGgmlAsrExecutor {
+impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
     fn executor_id(&self) -> &'static str {
         COMPOSED_EXECUTOR_ID
     }
@@ -47,9 +47,9 @@ impl GgmlAsrExecutor for ComposedGgmlAsrExecutor {
                 .all(|executor| executor.supports_phrase_bias())
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest<'_>,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         let Some(executor) = self
             .executors_by_model_architecture
@@ -61,7 +61,7 @@ impl GgmlAsrExecutor for ComposedGgmlAsrExecutor {
                 capability: "model-architecture-executor",
             });
         };
-        executor.execute(request)
+        executor.execute_view(request)
     }
 
     fn unload_idle_state(&self) {
@@ -82,7 +82,7 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     use crate::{
-        GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudio, Transcription,
+        GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudioView, Transcription,
         qwen3_asr_runtime_descriptor_v1, whisper_runtime_descriptor_v1,
     };
 
@@ -92,7 +92,7 @@ mod tests {
         text: &'static str,
     }
 
-    impl GgmlAsrExecutor for StubExecutor {
+    impl GgmlAsrViewExecutor for StubExecutor {
         fn executor_id(&self) -> &'static str {
             self.text
         }
@@ -101,9 +101,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            _request: &GgmlAsrExecutionRequest,
+            _request: &GgmlAsrExecutionViewRequest<'_>,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             Ok(GgmlAsrExecutionResult {
                 transcription: Transcription {
@@ -120,12 +120,12 @@ mod tests {
         }
     }
 
-    fn qwen_request() -> GgmlAsrExecutionRequest {
-        GgmlAsrExecutionRequest {
+    fn qwen_request() -> GgmlAsrExecutionViewRequest<'static> {
+        GgmlAsrExecutionViewRequest {
             runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -146,7 +146,7 @@ mod tests {
         );
 
         let result = executor
-            .execute(&qwen_request())
+            .execute_view(&qwen_request())
             .expect("qwen should dispatch");
         assert_eq!(result.transcription.text, "qwen");
     }
@@ -161,7 +161,7 @@ mod tests {
         );
 
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("missing architecture executor must fail closed");
         assert!(matches!(
             error,
@@ -183,16 +183,16 @@ mod tests {
         // `unload_idle_state` to the wrapped per-architecture executors, the
         // inner executor's cached prepared runtime is never evicted.
         struct CountingExecutor(Arc<AtomicUsize>);
-        impl GgmlAsrExecutor for CountingExecutor {
+        impl GgmlAsrViewExecutor for CountingExecutor {
             fn executor_id(&self) -> &'static str {
                 "counting-architecture-stub"
             }
             fn supports_phrase_bias(&self) -> bool {
                 true
             }
-            fn execute(
+            fn execute_view(
                 &self,
-                _request: &GgmlAsrExecutionRequest,
+                _request: &GgmlAsrExecutionViewRequest<'_>,
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 unreachable!("this test never executes a request")
             }

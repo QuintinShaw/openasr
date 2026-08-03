@@ -60,9 +60,9 @@ use crate::models::thread_local_runtime_cache::{
     with_thread_local_cached_mut_by_key,
 };
 use crate::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrPreparedAudio, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
-    NativeAsrSession, QWEN3_ASR_GGML_ADAPTER_ID, Segment, Transcription,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrViewExecutor, NativeAsrSession, QWEN3_ASR_GGML_ADAPTER_ID, Segment, Transcription,
 };
 
 #[cfg(test)]
@@ -242,7 +242,7 @@ pub(crate) struct Qwen3AsrGgmlExecutor {
 impl Qwen3AsrGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         if request.selected_family.adapter_id != QWEN3_ASR_GGML_ADAPTER_ID {
@@ -295,7 +295,7 @@ impl Qwen3AsrGgmlExecutor {
 
     fn execute_with_prepared_runtime(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         runtime_source: &GgmlRuntimeSource,
         prepared_runtime: &Qwen3AsrPreparedRuntime,
         skip_serve_batch: bool,
@@ -317,7 +317,7 @@ impl Qwen3AsrGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_with_runtime_assets(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         runtime_source: &GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
@@ -356,7 +356,7 @@ impl Qwen3AsrGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_runtime_assets(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         runtime_source: &GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
@@ -783,7 +783,7 @@ impl Qwen3AsrGgmlExecutor {
     fn validate_prepared_audio_shape(
         &self,
         metadata: Qwen3AsrExecutionMetadata,
-        prepared_audio: &GgmlAsrPreparedAudio,
+        prepared_audio: &GgmlAsrPreparedAudioView,
     ) -> Result<(), Qwen3AsrGgmlExecutorError> {
         if prepared_audio.sample_rate_hz != metadata.sample_rate_hz || prepared_audio.channels != 1
         {
@@ -893,7 +893,7 @@ fn qwen_runtime_cache_slot_unavailable() -> Qwen3AsrGgmlExecutorError {
 }
 
 fn qwen3_generated_token_budget(
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
     prompt_tokens: usize,
     metadata: Qwen3AsrExecutionMetadata,
 ) -> Result<usize, Qwen3AsrGgmlExecutorError> {
@@ -932,7 +932,7 @@ fn qwen3_generated_token_budget(
     Ok(desired.min(context_remaining))
 }
 
-fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
+fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
 
@@ -1598,7 +1598,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
     }
 }
 
-impl GgmlAsrExecutor for Qwen3AsrGgmlExecutor {
+impl GgmlAsrViewExecutor for Qwen3AsrGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         QWEN3_EXECUTOR_ID
     }
@@ -1607,9 +1607,9 @@ impl GgmlAsrExecutor for Qwen3AsrGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         // Offline decode: no token observer, batch worker allowed.
         self.execute_inner(request, false)
@@ -1627,7 +1627,7 @@ impl Qwen3AsrGgmlExecutor {
     /// direct greedy loop. The FINAL transcript remains byte-identical to `execute`.
     pub(crate) fn execute_streaming(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request, true)
             .map_err(|error| qwen_execute_error_to_ggml(error, request.selected_family.adapter_id))
@@ -1694,8 +1694,8 @@ mod tests {
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
     use crate::{
-        GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrExecutionRequest,
-        GgmlAsrPreparedAudio, LongFormOptions, qwen3_asr_runtime_descriptor_v1,
+        GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrExecutionViewRequest,
+        GgmlAsrPreparedAudioView, LongFormOptions, qwen3_asr_runtime_descriptor_v1,
         whisper_runtime_descriptor_v1,
     };
 
@@ -1827,12 +1827,12 @@ mod tests {
         qwen_tensor_ready_fixture_spec_with_llm_layers(2)
     }
 
-    fn qwen_request(runtime_source_path: PathBuf) -> GgmlAsrExecutionRequest {
-        GgmlAsrExecutionRequest {
+    fn qwen_request(runtime_source_path: PathBuf) -> GgmlAsrExecutionViewRequest<'static> {
+        GgmlAsrExecutionViewRequest {
             runtime_source_path,
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 160]),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0; 160]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -1848,8 +1848,8 @@ mod tests {
     #[test]
     fn decode_token_budget_scales_with_audio_and_context() {
         let metadata = parse_qwen3_execution_metadata(&qwen_metadata()).expect("metadata");
-        let short_audio = GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 16_000]);
-        let long_audio = GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 240_000]);
+        let short_audio = GgmlAsrPreparedAudioView::mono_16khz(vec![0.0; 16_000]);
+        let long_audio = GgmlAsrPreparedAudioView::mono_16khz(vec![0.0; 240_000]);
 
         let short_budget =
             qwen3_generated_token_budget(&short_audio, 32, metadata).expect("short budget");
@@ -1866,7 +1866,7 @@ mod tests {
     #[test]
     fn decode_token_budget_rejects_full_prompt_context() {
         let metadata = parse_qwen3_execution_metadata(&qwen_metadata()).expect("metadata");
-        let audio = GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 16_000]);
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(vec![0.0; 16_000]);
 
         let error = qwen3_generated_token_budget(&audio, metadata.llm_max_positions, metadata)
             .expect_err("full context should fail");
@@ -1880,7 +1880,7 @@ mod tests {
         request.selected_family = whisper_runtime_descriptor_v1();
         let executor = Qwen3AsrGgmlExecutor::default();
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("wrong adapter must fail");
         match error {
             GgmlAsrExecutionError::ExecutorFailed { reason, .. } => {
@@ -1901,7 +1901,7 @@ mod tests {
         let request = qwen_request(runtime_path);
         let executor = Qwen3AsrGgmlExecutor::default();
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("missing metadata must fail");
         match error {
             GgmlAsrExecutionError::ExecutorFailed { reason, .. } => {
@@ -1921,7 +1921,7 @@ mod tests {
 
         let executor = Qwen3AsrGgmlExecutor::default();
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("missing required tensor must fail");
         match error {
             GgmlAsrExecutionError::ExecutorFailed { reason, .. } => {
@@ -1935,7 +1935,7 @@ mod tests {
     fn assert_qwen_executor_runs(runtime_path: PathBuf) {
         let request = qwen_request(runtime_path);
         let executor = Qwen3AsrGgmlExecutor::default();
-        with_forced_cpu_backend_for_test(|| match executor.execute(&request) {
+        with_forced_cpu_backend_for_test(|| match executor.execute_view(&request) {
             Ok(_) => {}
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
                 if reason.contains("reached max_generated_tokens") => {}
@@ -1964,7 +1964,7 @@ mod tests {
 
         with_forced_cpu_backend_for_test(|| {
             for _ in 0..2 {
-                match executor.execute(&request) {
+                match executor.execute_view(&request) {
                     Ok(_) => {}
                     Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
                         if reason.contains("reached max_generated_tokens") => {}
@@ -1991,7 +1991,7 @@ mod tests {
 
         with_forced_cpu_backend_for_test(|| {
             for _ in 0..2 {
-                match executor.execute(&request) {
+                match executor.execute_view(&request) {
                     Ok(_) => {}
                     Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
                         if reason.contains("reached max_generated_tokens") => {}
@@ -2058,7 +2058,7 @@ mod tests {
         let request = qwen_request(PathBuf::from("/tmp/does-not-exist-qwen3.gguf"));
         let executor = Qwen3AsrGgmlExecutor::default();
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("missing runtime source must fail");
         match error {
             GgmlAsrExecutionError::ExecutorFailed { reason, .. } => {
@@ -2079,7 +2079,7 @@ mod tests {
 
         let executor = Qwen3AsrGgmlExecutor::default();
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("non-empty prompt must fail closed");
         match error {
             GgmlAsrExecutionError::ExecutorFailed { reason, .. } => {
@@ -2137,11 +2137,11 @@ mod tests {
         .expect("load wav fixture");
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
 
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -2155,7 +2155,9 @@ mod tests {
 
         let executor = Qwen3AsrGgmlExecutor::default();
         let started_at = std::time::Instant::now();
-        let result = executor.execute(&request).expect("qwen3-asr transcribe");
+        let result = executor
+            .execute_view(&request)
+            .expect("qwen3-asr transcribe");
         let elapsed = started_at.elapsed();
         let rtf = elapsed.as_secs_f32() / audio_duration_seconds.max(0.001);
         eprintln!(

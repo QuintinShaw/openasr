@@ -42,9 +42,9 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
 use crate::models::ggml_asr_executor::{
-    GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionRequest,
-    GgmlAsrExecutionResult, GgmlAsrExecutor, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionResult,
+    GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
@@ -269,7 +269,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
 impl FireRedLlmGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, FireRedLlmExecutorError> {
         let expected_adapter = crate::arch::FIRERED_LLM_GGML_ADAPTER_ID;
         if request.selected_family.adapter_id != expected_adapter {
@@ -652,7 +652,7 @@ fn resolve_decoder_backend(
     }
 }
 
-impl GgmlAsrExecutor for FireRedLlmGgmlExecutor {
+impl GgmlAsrViewExecutor for FireRedLlmGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         FIRERED_LLM_EXECUTOR_ID
     }
@@ -661,13 +661,13 @@ impl GgmlAsrExecutor for FireRedLlmGgmlExecutor {
         false
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
@@ -690,7 +690,7 @@ impl GgmlAsrStreamingExecutor for FireRedLlmGgmlExecutor {
             "firered-llm",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
-            FireRedLlmGgmlExecutor::execute,
+            FireRedLlmGgmlExecutor::execute_view,
         )
     }
 }
@@ -700,7 +700,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
+    use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
     use crate::models::ggml_family_registry::firered_llm_runtime_descriptor_v1;
 
     use super::*;
@@ -788,11 +788,11 @@ mod tests {
                 crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
             ),
         );
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_llm_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
             resolved_runtime,
@@ -810,7 +810,9 @@ mod tests {
 
         let executor = FireRedLlmGgmlExecutor;
         let started_at = Instant::now();
-        let result = executor.execute(&request).expect("firered-llm transcribe");
+        let result = executor
+            .execute_view(&request)
+            .expect("firered-llm transcribe");
         let elapsed = started_at.elapsed();
         Some((result.transcription.text, elapsed, audio_duration_seconds))
     }

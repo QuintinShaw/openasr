@@ -1,4 +1,4 @@
-//! Whisper GGUF execution runtime on top of `GgmlAsrExecutor`.
+//! Whisper GGUF execution runtime on top of `GgmlAsrViewExecutor`.
 //!
 //! Hands-off: single-responsibility ggml graph transcription, guarded by
 //! golden/parity tests. Do not split this module for "tidiness" -- the tensor
@@ -52,11 +52,11 @@ use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_suppo
 use crate::nn::half::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::{
-    GgmlAsrExecutionError, GgmlAsrExecutionOptions, GgmlAsrExecutionRequest,
-    GgmlAsrExecutionResult, GgmlAsrExecutor, GgmlAsrPreparedAudio, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, GgufMetadata,
-    GgufTensorDataReadError, GgufTensorDataReader, GgufTensorIndex, NativeAsrSession, Segment,
-    Transcription, WHISPER_GGML_ADAPTER_ID,
+    GgmlAsrExecutionError, GgmlAsrExecutionOptions, GgmlAsrExecutionResult,
+    GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor, GgmlFamilyAdapterDescriptor,
+    GgmlRuntimeSource, GgufMetadata, GgufTensorDataReadError, GgufTensorDataReader,
+    GgufTensorIndex, NativeAsrSession, Segment, Transcription, WHISPER_GGML_ADAPTER_ID,
 };
 #[cfg(test)]
 use crate::{GgufTensorIndexReadError, read_gguf_tensor_index_from_runtime_source};
@@ -483,7 +483,7 @@ trait WhisperMelFeatureInputProvider: Send + Sync {
     fn prepare_mel_feature_input(
         &self,
         execution: &WhisperGgmlExecutionMetadata,
-        prepared_audio: &GgmlAsrPreparedAudio,
+        prepared_audio: &GgmlAsrPreparedAudioView,
     ) -> Result<WhisperMelFeatureInput, WhisperGgmlExecutorError>;
 }
 
@@ -2825,7 +2825,7 @@ impl WhisperMelFeatureInputProvider for WhisperMelFeatureInputProviderFrontendV0
     fn prepare_mel_feature_input(
         &self,
         execution: &WhisperGgmlExecutionMetadata,
-        prepared_audio: &GgmlAsrPreparedAudio,
+        prepared_audio: &GgmlAsrPreparedAudioView,
     ) -> Result<WhisperMelFeatureInput, WhisperGgmlExecutorError> {
         if prepared_audio.sample_rate_hz != WHISPER_SAMPLE_RATE_HZ {
             return Err(WhisperGgmlExecutorError::MelFeatureInputPreparationFailed {
@@ -3074,7 +3074,7 @@ fn whisper_runtime_cache_slot_unavailable() -> WhisperGgmlExecutorError {
     }
 }
 
-impl GgmlAsrExecutor for WhisperGgmlExecutor {
+impl GgmlAsrViewExecutor for WhisperGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         "whisper-ggml-executor-v1"
     }
@@ -3083,9 +3083,9 @@ impl GgmlAsrExecutor for WhisperGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         // Offline decode: batch worker allowed.
         self.execute_whisper_inner(request, false)
@@ -3102,20 +3102,20 @@ impl WhisperGgmlExecutor {
     /// direct greedy loop. The FINAL transcript remains byte-identical to `execute`.
     pub(crate) fn execute_streaming(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_whisper_inner(request, true)
     }
 
     fn execute_whisper_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })?;
@@ -3124,7 +3124,7 @@ impl WhisperGgmlExecutor {
             let prepared_runtime = self
                 .prepared_runtime_for_preflight(preflight.as_ref())
                 .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                    executor_id: GgmlAsrExecutor::executor_id(self),
+                    executor_id: GgmlAsrViewExecutor::executor_id(self),
                     adapter_id: request.selected_family.adapter_id,
                     reason: error.to_string(),
                 })?;
@@ -3173,7 +3173,7 @@ impl WhisperGgmlExecutor {
                 GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
             }
             error => GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             },
@@ -3666,7 +3666,7 @@ fn store_whisper_decoder_persistent_static_session(
 fn execute_whisper_with_prepared_runtime(
     adapter: &GgmlFamilyAdapterDescriptor,
     runtime_source: &GgmlRuntimeSource,
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
     runtime: &WhisperPreparedRuntime,
     request_options: &GgmlAsrExecutionOptions,
     mel_feature_input_provider: &dyn WhisperMelFeatureInputProvider,
@@ -4049,7 +4049,7 @@ fn execute_whisper_ggml_non_streaming_cpu(
     runtime_source: &GgmlRuntimeSource,
     metadata: &GgufMetadata,
     tensor_index: &GgufTensorIndex,
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
     mel_feature_input_provider: &dyn WhisperMelFeatureInputProvider,
     prelude_runner: &dyn WhisperEncoderPreludeRunner,
     encoder_graph_runner: &dyn WhisperEncoderGraphRunner,
@@ -4081,7 +4081,7 @@ fn execute_whisper_ggml_non_streaming_cpu(
 fn prepare_mel_feature_input_seam(
     provider: &dyn WhisperMelFeatureInputProvider,
     execution: &WhisperGgmlExecutionMetadata,
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
 ) -> Result<WhisperMelFeatureInput, WhisperGgmlExecutorError> {
     provider.prepare_mel_feature_input(execution, prepared_audio)
 }
@@ -4694,7 +4694,7 @@ fn decode_generated_token_step_cap(
         .map(|budget| budget.min(WHISPER_DEFAULT_DECODE_MAX_GENERATED_TOKENS_CAP))
 }
 
-fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
+fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
 

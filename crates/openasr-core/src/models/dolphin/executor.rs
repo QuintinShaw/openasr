@@ -26,8 +26,8 @@ use crate::ggml_runtime::{
     GgufTensorDataReader, GgufWeightTensorElementType,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
@@ -641,11 +641,11 @@ pub(crate) fn run_dolphin_pipeline(
     })
 }
 
-/// Dedicated `GgmlAsrExecutor` for the Dolphin family (DedicatedRuntimeExecutorV1).
+/// Dedicated `GgmlAsrViewExecutor` for the Dolphin family (DedicatedRuntimeExecutorV1).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DolphinGgmlExecutor;
 
-impl GgmlAsrExecutor for DolphinGgmlExecutor {
+impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         crate::arch::DOLPHIN_EXECUTOR_COMPONENT_ID
     }
@@ -658,9 +658,9 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         let fail = |reason: String| GgmlAsrExecutionError::ExecutorFailed {
             executor_id: crate::arch::DOLPHIN_EXECUTOR_COMPONENT_ID,
@@ -828,7 +828,7 @@ impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
             "dolphin",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT.with_minimum_encodable_samples(min_samples),
-            <DolphinGgmlExecutor as GgmlAsrExecutor>::execute,
+            <DolphinGgmlExecutor as GgmlAsrViewExecutor>::execute_view,
         )
     }
 }
@@ -957,7 +957,7 @@ mod tests {
             .insert(key.clone(), Arc::new(DolphinRuntimeWeights::default()));
         assert_eq!(dolphin_pool_len(), 1);
 
-        <DolphinGgmlExecutor as GgmlAsrExecutor>::unload_idle_state(&DolphinGgmlExecutor);
+        <DolphinGgmlExecutor as GgmlAsrViewExecutor>::unload_idle_state(&DolphinGgmlExecutor);
         assert_eq!(dolphin_pool_len(), 0);
         assert!(!dolphin_pool_contains(&key));
     }

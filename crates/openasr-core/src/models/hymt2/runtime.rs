@@ -319,7 +319,7 @@ impl Hymt2Runtime {
                     reason: error.to_string(),
                 },
             )?;
-        // hymt2 is not (yet) wired into the shared `GgmlAsrExecutionRequest`
+        // hymt2 is not (yet) wired into the shared `GgmlAsrExecutionViewRequest`
         // dispatch, so there is no `resolved_runtime` to inherit here -- the
         // resolved backend is instead a required, explicit parameter on this
         // constructor, resolved by the caller (the realtime translation

@@ -104,7 +104,12 @@ fn external_diarization_working_set_estimate(
     ));
     let vad_bytes = bytes_for_count(vad_frames, std::mem::size_of::<f32>());
 
+    // During batched embedding the original chunk schedule and the successful
+    // output schedule coexist. Both are exact-capacity Vecs (see
+    // `embedding_chunks` / `embed_chunks`), so charge two TimeRange values per
+    // possible window alongside the embedding payload.
     let per_embedding_bytes = std::mem::size_of::<TimeRange>()
+        .saturating_mul(2)
         .saturating_add(std::mem::size_of::<SpeakerEmbedding>())
         .saturating_add(REDIMNET_EMBEDDING_DIM.saturating_mul(std::mem::size_of::<f32>()));
     let persistent_embedding_bytes = bytes_for_count(embedding_count, per_embedding_bytes);
@@ -698,7 +703,10 @@ fn union_regions(regions: impl IntoIterator<Item = TimeRange>) -> Vec<TimeRange>
 }
 
 fn embedding_chunks(speech: &[TimeRange]) -> Vec<TimeRange> {
-    let mut chunks = Vec::new();
+    let capacity = speech.iter().fold(0usize, |total, region| {
+        total.saturating_add(embedding_chunk_count(*region))
+    });
+    let mut chunks = Vec::with_capacity(capacity);
     for region in speech {
         let mut start_s = region.start_s;
         while start_s + EMBEDDING_WINDOW_S < region.end_s + EMBEDDING_STEP_S {
@@ -710,6 +718,16 @@ fn embedding_chunks(speech: &[TimeRange]) -> Vec<TimeRange> {
         }
     }
     chunks
+}
+
+fn embedding_chunk_count(region: TimeRange) -> usize {
+    let mut count = 0usize;
+    let mut start_s = region.start_s;
+    while start_s + EMBEDDING_WINDOW_S < region.end_s + EMBEDDING_STEP_S {
+        count = count.saturating_add(1);
+        start_s += EMBEDDING_STEP_S;
+    }
+    count
 }
 
 fn embed_chunks(
@@ -1268,8 +1286,10 @@ mod tests {
 
     #[test]
     fn embedding_protocol_is_one_point_five_by_zero_point_seven_five() {
+        let chunks = embedding_chunks(&[TimeRange::new(0.0, 3.0)]);
+        assert_eq!(chunks.capacity(), chunks.len());
         assert_eq!(
-            embedding_chunks(&[TimeRange::new(0.0, 3.0)]),
+            chunks,
             vec![
                 TimeRange::new(0.0, 1.5),
                 TimeRange::new(0.75, 2.25),

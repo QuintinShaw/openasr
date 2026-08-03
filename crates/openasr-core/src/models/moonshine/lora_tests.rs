@@ -382,17 +382,19 @@ fn lora_cross_v_target_changes_decoder_logits() {
     );
 }
 
-fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveformFeatures {
+fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveformFeatures<'static> {
     let samples = (0..sample_count)
         .map(|index| (index as f32 * 0.011).sin() * 0.4)
         .collect();
-    super::frontend::MoonshineWaveformFeatures { samples }
+    super::frontend::MoonshineWaveformFeatures {
+        samples: std::borrow::Cow::Owned(samples),
+    }
 }
 
 fn encoder_rows(
     prepared: &MoonshinePreparedRuntime,
     runtime_source: &crate::GgmlRuntimeSource,
-    features: &super::frontend::MoonshineWaveformFeatures,
+    features: &super::frontend::MoonshineWaveformFeatures<'_>,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
     let mut runtime = super::encoder_graph::MoonshineEncoderGraphRuntime::new(

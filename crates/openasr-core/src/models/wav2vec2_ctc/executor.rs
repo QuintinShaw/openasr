@@ -24,8 +24,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutor, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
@@ -285,14 +285,14 @@ pub(crate) fn wav2vec2_ctc_result_to_transcription(
     })
 }
 
-/// Dedicated GgmlAsrExecutor for wav2vec2-ctc (DedicatedRuntimeExecutorV1).
+/// Dedicated GgmlAsrViewExecutor for wav2vec2-ctc (DedicatedRuntimeExecutorV1).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Wav2Vec2CtcGgmlExecutor;
 
 impl Wav2Vec2CtcGgmlExecutor {
     fn execute_ctc_result(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError> {
         let fail = |reason: String| GgmlAsrExecutionError::ExecutorFailed {
             executor_id: crate::arch::WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
@@ -312,7 +312,7 @@ impl Wav2Vec2CtcGgmlExecutor {
     }
 }
 
-impl GgmlAsrExecutor for Wav2Vec2CtcGgmlExecutor {
+impl GgmlAsrViewExecutor for Wav2Vec2CtcGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         crate::arch::WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID
     }
@@ -321,9 +321,9 @@ impl GgmlAsrExecutor for Wav2Vec2CtcGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &crate::models::ggml_asr_executor::GgmlAsrExecutionRequest,
+        request: &crate::models::ggml_asr_executor::GgmlAsrExecutionViewRequest,
     ) -> Result<
         crate::models::ggml_asr_executor::GgmlAsrExecutionResult,
         crate::models::ggml_asr_executor::GgmlAsrExecutionError,
@@ -407,7 +407,7 @@ impl GgmlAsrStreamingExecutor for Wav2Vec2CtcGgmlExecutor {
             request,
             STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
             Wav2Vec2CtcGgmlExecutor::execute_ctc_result,
-            <Wav2Vec2CtcGgmlExecutor as GgmlAsrExecutor>::execute,
+            <Wav2Vec2CtcGgmlExecutor as GgmlAsrViewExecutor>::execute_view,
         );
         let session = GgmlAsrStreamingTranscriptSession::new(
             WAV2VEC2_CTC_STREAMING_EXECUTOR_ID,

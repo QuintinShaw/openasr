@@ -14,4 +14,7 @@ pub use slicing::{
     AudioSlice, AudioSliceKind, LongFormBenchmarkMetadata, LongFormSlicePlan, LongFormSliceStats,
     LongFormVadProvider, LongFormVadProviderKind, LongFormVadSlice, plan_longform_slices,
 };
+pub(crate) use slicing::{
+    LongFormSlicePlanningError, plan_longform_slices_with_materialization_gate,
+};
 pub use timeline::{TimelineAnchor, TimelineMap};

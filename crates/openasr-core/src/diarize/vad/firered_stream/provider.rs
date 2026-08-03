@@ -60,7 +60,7 @@ impl FireRedStreamVadProvider {
             return Ok(Vec::new());
         }
         let mut streaming = FireRedStreamingVad::from_model(self.model);
-        let mut probabilities = Vec::new();
+        let mut probabilities = Vec::with_capacity(samples.len().div_ceil(FRAME_SAMPLES));
         for chunk in samples.chunks(SAMPLE_RATE_HZ as usize) {
             if canceled() {
                 return Err(FireRedStreamVadError::Canceled);

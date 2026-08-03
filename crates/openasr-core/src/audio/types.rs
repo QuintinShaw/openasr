@@ -138,18 +138,18 @@ pub(crate) enum PreparedAudioSamples {
 /// recording-level Voice ID, and forced alignment share it through
 /// [`PcmSlice`] ranges.
 #[derive(Clone)]
-pub struct PcmBuffer {
+pub(crate) struct PcmBuffer {
     backing: Arc<Vec<f32>>,
 }
 
 impl PcmBuffer {
-    pub fn from_vec(samples: Vec<f32>) -> Self {
+    pub(crate) fn from_vec(samples: Vec<f32>) -> Self {
         Self {
             backing: Arc::new(samples),
         }
     }
 
-    pub fn from_shared(samples: Arc<Vec<f32>>) -> Self {
+    pub(crate) fn from_shared(samples: Arc<Vec<f32>>) -> Self {
         Self { backing: samples }
     }
 
@@ -157,28 +157,28 @@ impl PcmBuffer {
         Arc::clone(&self.backing)
     }
 
-    pub fn as_slice(&self) -> &[f32] {
+    pub(crate) fn as_slice(&self) -> &[f32] {
         self.backing.as_slice()
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.backing.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.backing.is_empty()
     }
 
     /// Bytes reserved by the normalized PCM sample allocation. This is the
     /// owner-side number used by request memory admission, so callers do not
     /// duplicate sample-count arithmetic at orchestration sites.
-    pub fn resident_bytes(&self) -> u64 {
+    pub(crate) fn resident_bytes(&self) -> u64 {
         u64::try_from(self.backing.capacity())
             .unwrap_or(u64::MAX)
             .saturating_mul(std::mem::size_of::<f32>() as u64)
     }
 
-    pub fn full_slice(&self) -> PcmSlice {
+    pub(crate) fn full_slice(&self) -> PcmSlice {
         PcmSlice {
             backing: Arc::clone(&self.backing),
             range: 0..self.backing.len(),
@@ -188,7 +188,7 @@ impl PcmBuffer {
     /// Creates a range relative to this full backing. This follows ordinary
     /// slice indexing semantics and panics for an invalid range; native
     /// long-form ranges have already been validated by the planner.
-    pub fn slice(&self, range: Range<usize>) -> PcmSlice {
+    pub(crate) fn slice(&self, range: Range<usize>) -> PcmSlice {
         assert!(range.start <= range.end, "PCM range start exceeds end");
         assert!(range.end <= self.backing.len(), "PCM range exceeds backing");
         PcmSlice {
@@ -253,22 +253,14 @@ impl PartialEq for PcmBuffer {
 /// A view is `Arc + Range`: cloning or sending it to a long-form worker never
 /// copies samples, and its public surface only exposes `&[f32]`.
 #[derive(Clone)]
-pub struct PcmSlice {
+pub(crate) struct PcmSlice {
     backing: Arc<Vec<f32>>,
     range: Range<usize>,
 }
 
 impl PcmSlice {
-    pub fn as_slice(&self) -> &[f32] {
+    pub(crate) fn as_slice(&self) -> &[f32] {
         &self.backing[self.range.clone()]
-    }
-
-    pub fn len(&self) -> usize {
-        self.range.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.range.is_empty()
     }
 
     #[cfg(test)]
@@ -282,7 +274,8 @@ impl PcmSlice {
     }
 
     /// Creates a sub-view with a range relative to this view.
-    pub fn slice(&self, range: Range<usize>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn slice(&self, range: Range<usize>) -> Self {
         assert!(range.start <= range.end, "PCM sub-range start exceeds end");
         assert!(range.end <= self.range.len(), "PCM sub-range exceeds view");
         let start = self.range.start + range.start;

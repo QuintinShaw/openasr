@@ -16,7 +16,7 @@
 //! thread ends up running the decode already has it in hand.
 //!
 //! Every dispatch surface that can run a decode requires one (never
-//! `Option`): [`crate::models::ggml_asr_executor::GgmlAsrExecutionRequest`],
+//! `Option`): [`crate::models::ggml_asr_executor::GgmlAsrExecutionViewRequest`],
 //! the generic seq2seq serve-batch `Envelope`, each family's serve-batch job,
 //! and [`crate::realtime::RealtimeBackendWorkItem`]. A caller with nothing to
 //! cancel (a CLI single-shot transcribe, an internal test) still constructs a

@@ -7,8 +7,8 @@ use crate::GgmlRuntimeSource;
 use crate::api::backend::WordTimestamp;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutor, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT, build_seq2seq_streaming_session,
@@ -157,11 +157,11 @@ pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
     )
 }
 
-/// Dedicated GgmlAsrExecutor for parakeet-tdt (DedicatedRuntimeExecutorV1).
+/// Dedicated GgmlAsrViewExecutor for parakeet-tdt (DedicatedRuntimeExecutorV1).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ParakeetTdtGgmlExecutor;
 
-impl GgmlAsrExecutor for ParakeetTdtGgmlExecutor {
+impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         crate::arch::PARAKEET_TDT_EXECUTOR_COMPONENT_ID
     }
@@ -172,9 +172,9 @@ impl GgmlAsrExecutor for ParakeetTdtGgmlExecutor {
         false
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<
         crate::models::ggml_asr_executor::GgmlAsrExecutionResult,
         crate::models::ggml_asr_executor::GgmlAsrExecutionError,
@@ -252,7 +252,7 @@ impl GgmlAsrStreamingExecutor for ParakeetTdtGgmlExecutor {
             "parakeet-tdt",
             request,
             STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
-            <ParakeetTdtGgmlExecutor as GgmlAsrExecutor>::execute,
+            <ParakeetTdtGgmlExecutor as GgmlAsrViewExecutor>::execute_view,
         )
     }
 }

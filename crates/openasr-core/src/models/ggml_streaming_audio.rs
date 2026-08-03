@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::{GgmlAsrPreparedAudio, RealtimeAudioFrame};
+use crate::{GgmlAsrPreparedAudioView, RealtimeAudioFrame};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum FrameTimelineError {
@@ -103,8 +103,8 @@ impl GgmlStreamingAudioBuffer {
         }
     }
 
-    pub(crate) fn prepared_audio_snapshot(&self) -> GgmlAsrPreparedAudio {
-        GgmlAsrPreparedAudio::mono_16khz(
+    pub(crate) fn prepared_audio_snapshot(&self) -> GgmlAsrPreparedAudioView<'static> {
+        GgmlAsrPreparedAudioView::mono_16khz(
             self.samples_i16
                 .iter()
                 .map(|sample| f32::from(*sample) / 32768.0)
@@ -149,10 +149,13 @@ impl GgmlStreamingAudioBuffer {
     /// buffer if shorter). Used by windowed streaming to bound a PARTIAL decode to
     /// O(window) instead of O(buffer); the FINAL still uses
     /// [`prepared_audio_snapshot`] over the whole buffer.
-    pub(crate) fn prepared_audio_window(&self, window_ms: u64) -> GgmlAsrPreparedAudio {
+    pub(crate) fn prepared_audio_window(
+        &self,
+        window_ms: u64,
+    ) -> GgmlAsrPreparedAudioView<'static> {
         let window_samples = window_ms.saturating_mul(SAMPLES_PER_MS_16KHZ) as usize;
         let start = self.samples_i16.len().saturating_sub(window_samples);
-        GgmlAsrPreparedAudio::mono_16khz(
+        GgmlAsrPreparedAudioView::mono_16khz(
             self.samples_i16[start..]
                 .iter()
                 .map(|sample| f32::from(*sample) / 32768.0)

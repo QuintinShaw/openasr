@@ -13,8 +13,8 @@ use crate::api::backend::{Segment, Transcription, WordTimestamp};
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
 use crate::models::frame_sync_streaming_driver::FrameSyncStreamingTranscriptDriver;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::thread_local_runtime_cache::{
@@ -150,7 +150,7 @@ fn reject_xasr_phrase_bias(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct XasrZipformerGgmlExecutor;
 
-impl GgmlAsrExecutor for XasrZipformerGgmlExecutor {
+impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         crate::arch::XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID
     }
@@ -159,9 +159,9 @@ impl GgmlAsrExecutor for XasrZipformerGgmlExecutor {
         false
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         if request
             .request_options

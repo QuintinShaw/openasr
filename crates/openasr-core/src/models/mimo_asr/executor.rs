@@ -27,8 +27,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
@@ -382,7 +382,7 @@ impl MimoAsrPreparedRuntime {
 impl MimoAsrGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, MimoAsrExecutorError> {
         let expected_adapter = crate::arch::MIMO_ASR_GGML_ADAPTER_ID;
         if request.selected_family.adapter_id != expected_adapter {
@@ -472,7 +472,7 @@ impl MimoAsrGgmlExecutor {
     fn transcribe_with_prepared(
         &self,
         prepared: &mut MimoAsrPreparedRuntime,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         samples: &[f32],
     ) -> Result<Seq2SeqGreedyDecodeResult, MimoAsrExecutorError> {
         // The OpenASR pipeline delivers 16kHz mono to every executor, but
@@ -643,7 +643,7 @@ fn strip_mimo_language_tags(text: &str) -> String {
         .to_string()
 }
 
-impl GgmlAsrExecutor for MimoAsrGgmlExecutor {
+impl GgmlAsrViewExecutor for MimoAsrGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         MIMO_ASR_EXECUTOR_ID
     }
@@ -652,13 +652,13 @@ impl GgmlAsrExecutor for MimoAsrGgmlExecutor {
         false
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
@@ -681,7 +681,7 @@ impl GgmlAsrStreamingExecutor for MimoAsrGgmlExecutor {
             "mimo-asr",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
-            MimoAsrGgmlExecutor::execute,
+            MimoAsrGgmlExecutor::execute_view,
         )
     }
 }
@@ -691,7 +691,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudio};
+    use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
     use crate::models::ggml_family_registry::mimo_asr_runtime_descriptor_v1;
 
     use super::*;
@@ -798,11 +798,11 @@ mod tests {
         .expect("load wav fixture");
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
 
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: mimo_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -816,7 +816,9 @@ mod tests {
 
         let executor = MimoAsrGgmlExecutor;
         let started_at = Instant::now();
-        let result = executor.execute(&request).expect("mimo-asr transcribe");
+        let result = executor
+            .execute_view(&request)
+            .expect("mimo-asr transcribe");
         let elapsed = started_at.elapsed();
         Some((result.transcription.text, elapsed, audio_duration_seconds))
     }

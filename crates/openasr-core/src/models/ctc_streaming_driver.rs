@@ -11,8 +11,8 @@ use std::time::Instant;
 use crate::ggml_runtime::install_request_backend_override;
 use crate::models::ctc_greedy_decode::CtcGreedyDecodeResult;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrPreparedAudio,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrPreparedAudioView, GgmlAsrStreamingSessionRequest,
 };
 use crate::models::ggml_streaming_audio::{FrameTimelineError, GgmlStreamingAudioBuffer};
 use crate::models::ggml_streaming_session::{
@@ -26,10 +26,12 @@ use crate::{RealtimeAudioFrame, TranscriptUpdate, Transcription};
 const STREAMING_WARM_UP_AUDIO_MS: usize = 1_000;
 const SAMPLES_PER_MS_16KHZ: usize = 16;
 
-type CtcPartialTranscriber =
-    dyn FnMut(&GgmlAsrPreparedAudio) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError> + Send;
-type CtcFinalTranscriber =
-    dyn FnMut(&GgmlAsrPreparedAudio) -> Result<Transcription, GgmlAsrExecutionError> + Send;
+type CtcPartialTranscriber = dyn FnMut(
+        &GgmlAsrPreparedAudioView<'static>,
+    ) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError>
+    + Send;
+type CtcFinalTranscriber = dyn FnMut(&GgmlAsrPreparedAudioView<'static>) -> Result<Transcription, GgmlAsrExecutionError>
+    + Send;
 
 pub(crate) fn build_ctc_streaming_driver<E, FPartial, FFinal>(
     executor: E,
@@ -42,10 +44,13 @@ pub(crate) fn build_ctc_streaming_driver<E, FPartial, FFinal>(
 ) -> Box<dyn GgmlAsrStreamingTranscriptDriver>
 where
     E: Clone + Send + 'static,
-    FPartial: Fn(&E, &GgmlAsrExecutionRequest) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError>
+    FPartial: Fn(&E, &GgmlAsrExecutionViewRequest) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError>
         + Send
         + 'static,
-    FFinal: Fn(&E, &GgmlAsrExecutionRequest) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>
+    FFinal: Fn(
+            &E,
+            &GgmlAsrExecutionViewRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>
         + Send
         + 'static,
 {
@@ -67,32 +72,33 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
-    let make_request = move |audio: &GgmlAsrPreparedAudio| GgmlAsrExecutionRequest {
-        runtime_source_path: runtime_source_path.clone(),
-        runtime_source_preflight: runtime_source_preflight.clone(),
-        selected_family: selected_family.clone(),
-        prepared_audio: audio.clone(),
-        request_options: request_options.clone(),
-        backend_preference,
-        resolved_runtime,
-        // Per-frame streaming partials/finals have no client-visible
-        // transcription id and no cancel/pause control surface today (a live
-        // session ends by the caller dropping it, not by canceling a
-        // transcription id) -- an uncancellable context is a real,
-        // well-formed context that simply has no other holder, not an
-        // omitted one.
-        execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-            "per-frame streaming partial decode: this request type carries no \
+    let make_request =
+        move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
+            runtime_source_path: runtime_source_path.clone(),
+            runtime_source_preflight: runtime_source_preflight.clone(),
+            selected_family: selected_family.clone(),
+            prepared_audio: audio.clone(),
+            request_options: request_options.clone(),
+            backend_preference,
+            resolved_runtime,
+            // Per-frame streaming partials/finals have no client-visible
+            // transcription id and no cancel/pause control surface today (a live
+            // session ends by the caller dropping it, not by canceling a
+            // transcription id) -- an uncancellable context is a real,
+            // well-formed context that simply has no other holder, not an
+            // omitted one.
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "per-frame streaming partial decode: this request type carries no \
              execution-context field of its own yet, and a live session ends by the \
              caller dropping it rather than canceling a transcription id",
-        )),
-    };
+            )),
+        };
 
     let partial_executor = executor.clone();
-    let partial_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudio| {
+    let partial_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudioView<'static>| {
         let _thread_override = install_request_inference_threads_override(inference_threads);
         // This closure calls the per-family decode fn directly instead of
-        // going through GgmlAsrExecutionDispatch::execute, so the request's
+        // going through GgmlAsrExecutionDispatch::execute_view, so the request's
         // backend_preference must be installed here or an explicit
         // CpuOnly/Accelerated choice is silently dropped for streaming
         // partials by the few remaining thread-local readers unrelated to
@@ -109,25 +115,26 @@ where
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
     let backend_preference = request.backend_preference;
-    let make_final_request = move |audio: &GgmlAsrPreparedAudio| GgmlAsrExecutionRequest {
-        runtime_source_path: runtime_source_path.clone(),
-        runtime_source_preflight: runtime_source_preflight.clone(),
-        selected_family: selected_family.clone(),
-        prepared_audio: audio.clone(),
-        request_options: request_options.clone(),
-        backend_preference,
-        resolved_runtime,
-        // Same reasoning as the partial-decode request above: no
-        // execution-context field on this request type yet, and a live
-        // session ends by the caller dropping it rather than canceling a
-        // transcription id.
-        execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-            "per-frame streaming final decode: this request type carries no \
+    let make_final_request =
+        move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
+            runtime_source_path: runtime_source_path.clone(),
+            runtime_source_preflight: runtime_source_preflight.clone(),
+            selected_family: selected_family.clone(),
+            prepared_audio: audio.clone(),
+            request_options: request_options.clone(),
+            backend_preference,
+            resolved_runtime,
+            // Same reasoning as the partial-decode request above: no
+            // execution-context field on this request type yet, and a live
+            // session ends by the caller dropping it rather than canceling a
+            // transcription id.
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "per-frame streaming final decode: this request type carries no \
              execution-context field of its own yet, and a live session ends by the \
              caller dropping it rather than canceling a transcription id",
-        )),
-    };
-    let final_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudio| {
+            )),
+        };
+    let final_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudioView<'static>| {
         let _thread_override = install_request_inference_threads_override(inference_threads);
         let _backend_override =
             install_request_backend_override(backend_preference.request_backend_override());
@@ -217,7 +224,7 @@ impl CtcWindowedStreamingTranscriptDriver {
     }
 
     fn decode_warm_up_silence(&mut self) -> Result<(), GgmlAsrExecutionError> {
-        let audio = GgmlAsrPreparedAudio::mono_16khz(vec![
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(vec![
             0.0;
             STREAMING_WARM_UP_AUDIO_MS
                 * SAMPLES_PER_MS_16KHZ
@@ -501,14 +508,14 @@ mod tests {
                 crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
                 &request,
                 crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
-                move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
+                move |_executor: &(), _request: &GgmlAsrExecutionViewRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
                         _request.resolved_runtime.backend(),
                     ));
                     Ok(ctc_result("", 0))
                 },
-                move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
+                move |_executor: &(), _request: &GgmlAsrExecutionViewRequest| {
                     Ok(GgmlAsrExecutionResult {
                         transcription: Transcription {
                             truncated_decodes: Vec::new(),

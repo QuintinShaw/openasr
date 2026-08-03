@@ -1,4 +1,4 @@
-//! `GgmlAsrExecutor` implementation for granite-speech, wiring the already-
+//! `GgmlAsrViewExecutor` implementation for granite-speech, wiring the already-
 //! validated pipeline (`frontend` -> `encoder_graph` -> `qformer` -> `prompt`
 //! -> `decode_executor` -> shared greedy-decode driver -> `tokenizer`)
 //! against a real `.oasr` pack via `runtime_provider::load_tensors_from_oasr_pack`.
@@ -54,8 +54,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrPreparedAudio, GgmlAsrRuntimeSourcePreflight,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlAsrViewExecutor,
 };
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
@@ -303,7 +303,7 @@ pub(crate) struct GraniteSpeechGgmlExecutor;
 impl GraniteSpeechGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GraniteSpeechGgmlExecutorError> {
         if request.selected_family.adapter_id != GRANITE_SPEECH_GGML_ADAPTER_ID {
             return Err(GraniteSpeechGgmlExecutorError::AdapterMismatch {
@@ -484,9 +484,9 @@ impl GraniteSpeechGgmlExecutor {
     }
 }
 
-fn downmix_prepared_audio(audio: &GgmlAsrPreparedAudio) -> Cow<'_, [f32]> {
+fn downmix_prepared_audio<'a>(audio: &'a GgmlAsrPreparedAudioView<'_>) -> Cow<'a, [f32]> {
     if audio.channels <= 1 {
-        return Cow::Borrowed(audio.samples_f32.as_slice());
+        return Cow::Borrowed(audio.samples_f32.as_ref());
     }
     let channels = audio.channels as usize;
     Cow::Owned(
@@ -498,7 +498,7 @@ fn downmix_prepared_audio(audio: &GgmlAsrPreparedAudio) -> Cow<'_, [f32]> {
     )
 }
 
-impl GgmlAsrExecutor for GraniteSpeechGgmlExecutor {
+impl GgmlAsrViewExecutor for GraniteSpeechGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         GRANITE_SPEECH_EXECUTOR_ID
     }
@@ -511,9 +511,9 @@ impl GgmlAsrExecutor for GraniteSpeechGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| granite_speech_execute_error_to_ggml(self, error, request))
@@ -523,10 +523,10 @@ impl GgmlAsrExecutor for GraniteSpeechGgmlExecutor {
 fn granite_speech_execute_error_to_ggml(
     executor: &GraniteSpeechGgmlExecutor,
     error: GraniteSpeechGgmlExecutorError,
-    request: &GgmlAsrExecutionRequest,
+    request: &GgmlAsrExecutionViewRequest,
 ) -> GgmlAsrExecutionError {
     GgmlAsrExecutionError::ExecutorFailed {
-        executor_id: GgmlAsrExecutor::executor_id(executor),
+        executor_id: GgmlAsrViewExecutor::executor_id(executor),
         adapter_id: request.selected_family.adapter_id,
         reason: error.to_string(),
     }
@@ -547,7 +547,7 @@ impl GraniteSpeechGgmlExecutor {
     /// byte-identical to `execute()`.
     fn execute_streaming(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| granite_speech_execute_error_to_ggml(self, error, request))
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn mono_frontend_borrows_the_prepared_pcm_backing() {
         let backing = crate::PcmBuffer::from_vec(vec![0.25, -0.5, 0.75]);
-        let prepared = GgmlAsrPreparedAudio::mono_16khz_view(backing.full_slice());
+        let prepared = GgmlAsrPreparedAudioView::mono_16khz_shared(backing.full_slice());
         let samples = downmix_prepared_audio(&prepared);
 
         assert!(matches!(samples, Cow::Borrowed(_)));
@@ -657,10 +657,10 @@ mod tests {
     #[test]
     fn multichannel_frontend_owns_only_the_required_downmix() {
         let backing = crate::PcmBuffer::from_vec(vec![1.0, 3.0, -1.0, 1.0]);
-        let prepared = GgmlAsrPreparedAudio {
+        let prepared = GgmlAsrPreparedAudioView {
             sample_rate_hz: 16_000,
             channels: 2,
-            samples_f32: backing.full_slice(),
+            samples_f32: backing.full_slice().into(),
         };
         let samples = downmix_prepared_audio(&prepared);
 
@@ -736,11 +736,11 @@ mod tests {
                 "macOS Granite Metal acceptance must not silently run another backend"
             );
         }
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: granite_speech_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
             resolved_runtime,
@@ -754,7 +754,7 @@ mod tests {
 
         let executor = GraniteSpeechGgmlExecutor;
         let result = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect("granite-speech transcribe");
         // Single-pass path: a clean EOT leaves decode_truncation unset. If the
         // driver ever trips the budget/guard on short JFK audio, surface it

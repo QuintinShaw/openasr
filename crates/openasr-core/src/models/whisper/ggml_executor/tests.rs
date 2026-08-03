@@ -149,13 +149,18 @@ impl WhisperMelFeatureInputProvider for TestMelFeatureInputProvider {
     fn prepare_mel_feature_input(
         &self,
         execution: &WhisperGgmlExecutionMetadata,
-        prepared_audio: &GgmlAsrPreparedAudio,
+        prepared_audio: &GgmlAsrPreparedAudioView,
     ) -> Result<WhisperMelFeatureInput, WhisperGgmlExecutorError> {
         self.called.store(true, Ordering::SeqCst);
         match &self.outcome {
             TestMelFeatureInputProviderOutcome::RealFrontend => {
+                let prepared_audio = crate::GgmlAsrPreparedAudio {
+                    sample_rate_hz: prepared_audio.sample_rate_hz,
+                    channels: prepared_audio.channels,
+                    samples_f32: prepared_audio.samples_f32.to_vec(),
+                };
                 let mel_input = tiny_whisper_encoder_smoke_real_mel_input(
-                    prepared_audio,
+                    &prepared_audio,
                     execution.encoder_mels_count,
                 )
                 .map_err(|reason| {
@@ -181,8 +186,13 @@ impl WhisperMelFeatureInputProvider for TestMelFeatureInputProvider {
     }
 }
 
-fn default_prepared_audio() -> GgmlAsrPreparedAudio {
-    tiny_whisper_encoder_smoke_prepared_audio()
+fn default_prepared_audio() -> GgmlAsrPreparedAudioView<'static> {
+    let prepared = tiny_whisper_encoder_smoke_prepared_audio();
+    GgmlAsrPreparedAudioView {
+        sample_rate_hz: prepared.sample_rate_hz,
+        channels: prepared.channels,
+        samples_f32: prepared.samples_f32.into(),
+    }
 }
 
 fn whisper_execution_and_tokenizer_fixture() -> (WhisperGgmlExecutionMetadata, WhisperTokenizer) {
@@ -841,7 +851,7 @@ fn nan_audio_fails_closed_before_encoder_execution() {
     };
     let mut nan_samples = default_prepared_audio().samples_f32.to_vec();
     nan_samples[5] = f32::NAN;
-    let nan_audio = GgmlAsrPreparedAudio::mono_16khz(nan_samples);
+    let nan_audio = GgmlAsrPreparedAudioView::mono_16khz(nan_samples);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
         &whisper_runtime_descriptor_v1(),

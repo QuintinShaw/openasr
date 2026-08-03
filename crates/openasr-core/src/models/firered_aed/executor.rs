@@ -35,8 +35,8 @@ use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_AED_GGML_ADAPTER_ID;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
@@ -168,7 +168,7 @@ pub(crate) struct FireRedAedGgmlExecutor;
 impl FireRedAedGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, FireRedAedExecutorError> {
         if request.selected_family.adapter_id != FIRERED_AED_GGML_ADAPTER_ID {
             return Err(FireRedAedExecutorError::AdapterMismatch {
@@ -323,7 +323,7 @@ impl FireRedAedGgmlExecutor {
     }
 }
 
-impl GgmlAsrExecutor for FireRedAedGgmlExecutor {
+impl GgmlAsrViewExecutor for FireRedAedGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         FIRERED_AED_EXECUTOR_ID
     }
@@ -332,13 +332,13 @@ impl GgmlAsrExecutor for FireRedAedGgmlExecutor {
         false
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
@@ -361,7 +361,7 @@ impl GgmlAsrStreamingExecutor for FireRedAedGgmlExecutor {
             "firered-aed",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
-            FireRedAedGgmlExecutor::execute,
+            FireRedAedGgmlExecutor::execute_view,
         )
     }
 }
@@ -370,7 +370,7 @@ impl GgmlAsrStreamingExecutor for FireRedAedGgmlExecutor {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudio};
+    use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
     use crate::models::ggml_family_registry::firered_aed_runtime_descriptor_v1;
 
     use super::*;
@@ -416,11 +416,11 @@ mod tests {
         )
         .expect("load wav fixture");
 
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -433,7 +433,9 @@ mod tests {
         };
 
         let executor = FireRedAedGgmlExecutor;
-        let result = executor.execute(&request).expect("firered-aed transcribe");
+        let result = executor
+            .execute_view(&request)
+            .expect("firered-aed transcribe");
         Some(result.transcription.text)
     }
 
@@ -478,11 +480,11 @@ mod tests {
             "firered-aed reuse-parity test",
         )
         .expect("load jfk.wav");
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples.clone()),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -651,11 +653,11 @@ mod tests {
         )
         .expect("load jfk.wav");
 
-        let build_request = || GgmlAsrExecutionRequest {
+        let build_request = || GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path.clone(),
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples.clone()),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -670,13 +672,13 @@ mod tests {
 
         let first_start = std::time::Instant::now();
         let first = executor
-            .execute(&build_request())
+            .execute_view(&build_request())
             .expect("firered-aed transcribe (first, cold runtime cache)");
         let first_elapsed = first_start.elapsed();
 
         let second_start = std::time::Instant::now();
         let second = executor
-            .execute(&build_request())
+            .execute_view(&build_request())
             .expect("firered-aed transcribe (second, warm runtime cache)");
         let second_elapsed = second_start.elapsed();
 
@@ -713,11 +715,11 @@ mod tests {
                 "firered-aed cache-reuse test",
             )
             .expect("load wav fixture");
-            GgmlAsrExecutionRequest {
+            GgmlAsrExecutionViewRequest {
                 runtime_source_path: pack_path.clone(),
                 runtime_source_preflight: None,
                 selected_family: firered_aed_runtime_descriptor_v1(),
-                prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+                prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
                 resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -738,7 +740,7 @@ mod tests {
         assert_eq!(decoder_cache_len(), 0, "cache must start empty");
 
         let jfk = executor
-            .execute(&build_request(jfk_wav_path()))
+            .execute_view(&build_request(jfk_wav_path()))
             .expect("firered-aed transcribe jfk.wav");
         assert_eq!(jfk.transcription.text, GOLDEN_JFK_TEXT);
         eprintln!(
@@ -749,7 +751,7 @@ mod tests {
         assert_eq!(decoder_cache_len(), 1, "first chunk must build one slot");
 
         let zh = executor
-            .execute(&build_request(zh_wav_path()))
+            .execute_view(&build_request(zh_wav_path()))
             .expect("firered-aed transcribe zh_sample.wav");
         assert_eq!(zh.transcription.text, GOLDEN_ZH_TEXT);
         eprintln!(
@@ -791,11 +793,11 @@ mod tests {
         // matter -- the guard trips on shape (predicted encoder frame count)
         // before any real encoding is attempted.
         let samples = vec![0.0_f32; 210 * 16_000];
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -808,7 +810,7 @@ mod tests {
         };
         let executor = FireRedAedGgmlExecutor;
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("a 210s window must fail closed, not transcribe");
         let message = error.to_string();
         assert!(
@@ -854,11 +856,11 @@ mod tests {
             "firered-aed mode=off grow test",
         )
         .expect("load wav fixture");
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -871,7 +873,7 @@ mod tests {
         };
         let executor = FireRedAedGgmlExecutor;
         let result = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect("mode=off single-window transcribe must succeed, not fail closed");
         assert_eq!(result.transcription.text, BASELINE_TEXT);
     }

@@ -21,7 +21,7 @@ use super::dolphin::executor::DolphinGgmlExecutor;
 use super::firered_aed::executor::FireRedAedGgmlExecutor;
 use super::firered_llm::executor::FireRedLlmGgmlExecutor;
 use super::funasr_nano::executor::FunasrNanoGgmlExecutor;
-use super::ggml_asr_executor::GgmlAsrExecutor;
+use super::ggml_asr_executor::GgmlAsrViewExecutor;
 use super::granite_speech::executor::GraniteSpeechGgmlExecutor;
 use super::mimo_asr::executor::MimoAsrGgmlExecutor;
 use super::moonshine::MoonshineGgmlExecutor;
@@ -45,8 +45,10 @@ pub(crate) enum BuiltinExecutorComponentRegistryError {
     },
 }
 
-pub(crate) fn materialize_builtin_executors_by_model_architecture()
--> Result<BTreeMap<&'static str, Arc<dyn GgmlAsrExecutor>>, BuiltinExecutorComponentRegistryError> {
+pub(crate) fn materialize_builtin_executors_by_model_architecture() -> Result<
+    BTreeMap<&'static str, Arc<dyn GgmlAsrViewExecutor>>,
+    BuiltinExecutorComponentRegistryError,
+> {
     let mut executors_by_model_architecture = BTreeMap::new();
 
     for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
@@ -79,22 +81,22 @@ pub(crate) fn builtin_executor_supports_phrase_bias_for_model_architecture(
 
 fn materialize_builtin_executor_component(
     executor_component_id: &str,
-) -> Option<Arc<dyn GgmlAsrExecutor>> {
+) -> Option<Arc<dyn GgmlAsrViewExecutor>> {
     match executor_component_id {
         COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID => {
-            Some(shared_cohere_transcribe_executor() as Arc<dyn GgmlAsrExecutor>)
+            Some(shared_cohere_transcribe_executor() as Arc<dyn GgmlAsrViewExecutor>)
         }
         WHISPER_EXECUTOR_COMPONENT_ID => {
-            Some(shared_whisper_executor() as Arc<dyn GgmlAsrExecutor>)
+            Some(shared_whisper_executor() as Arc<dyn GgmlAsrViewExecutor>)
         }
         QWEN3_ASR_EXECUTOR_COMPONENT_ID => {
-            Some(shared_qwen3_asr_executor() as Arc<dyn GgmlAsrExecutor>)
+            Some(shared_qwen3_asr_executor() as Arc<dyn GgmlAsrViewExecutor>)
         }
         PARAKEET_CTC_EXECUTOR_COMPONENT_ID => Some(Arc::new(ParakeetCtcGgmlExecutor)),
         PARAKEET_TDT_EXECUTOR_COMPONENT_ID => Some(Arc::new(ParakeetTdtGgmlExecutor)),
         WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID => Some(Arc::new(Wav2Vec2CtcGgmlExecutor)),
         MOONSHINE_EXECUTOR_COMPONENT_ID => {
-            Some(shared_moonshine_executor() as Arc<dyn GgmlAsrExecutor>)
+            Some(shared_moonshine_executor() as Arc<dyn GgmlAsrViewExecutor>)
         }
         XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID => Some(Arc::new(XasrZipformerGgmlExecutor)),
         DOLPHIN_EXECUTOR_COMPONENT_ID => Some(Arc::new(DolphinGgmlExecutor)),
@@ -111,7 +113,7 @@ fn materialize_builtin_executor_component(
 
 // Process-wide single instances for the "has-state, host-materializes-weights"
 // families (qwen / cohere / whisper / moonshine). Each family's builtin
-// executor struct implements *both* `GgmlAsrExecutor` (offline dispatch) and
+// executor struct implements *both* `GgmlAsrViewExecutor` (offline dispatch) and
 // `GgmlAsrStreamingExecutor` (streaming dispatch) already; historically the two
 // dispatch builders each called `<Family>Executor::default()` independently,
 // so the offline and streaming stacks held two separate instances with two
@@ -120,7 +122,7 @@ fn materialize_builtin_executor_component(
 //
 // These accessors hand out one `Arc<ConcreteExecutor>` per family per process,
 // unsized-coerced independently into each dispatch's own trait-object map
-// (`Arc<dyn GgmlAsrExecutor>` here, `Arc<dyn GgmlAsrStreamingExecutor>` at the
+// (`Arc<dyn GgmlAsrViewExecutor>` here, `Arc<dyn GgmlAsrStreamingExecutor>` at the
 // streaming registration site in `builtin_execution_dispatch.rs`). Both
 // coercions point at the same heap allocation, so both dispatches share the
 // same `runtime_cache_by_path`: a cold load on either stack populates the one
@@ -296,25 +298,25 @@ mod tests {
         let qwen_offline = executors
             .get(crate::QWEN3_ASR_GGML_ARCHITECTURE_ID)
             .expect("qwen executor");
-        let qwen_shared: Arc<dyn GgmlAsrExecutor> = shared_qwen3_asr_executor();
+        let qwen_shared: Arc<dyn GgmlAsrViewExecutor> = shared_qwen3_asr_executor();
         assert!(Arc::ptr_eq(qwen_offline, &qwen_shared));
 
         let cohere_offline = executors
             .get(crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
             .expect("cohere executor");
-        let cohere_shared: Arc<dyn GgmlAsrExecutor> = shared_cohere_transcribe_executor();
+        let cohere_shared: Arc<dyn GgmlAsrViewExecutor> = shared_cohere_transcribe_executor();
         assert!(Arc::ptr_eq(cohere_offline, &cohere_shared));
 
         let whisper_offline = executors
             .get(crate::WHISPER_GGML_ARCHITECTURE_ID)
             .expect("whisper executor");
-        let whisper_shared: Arc<dyn GgmlAsrExecutor> = shared_whisper_executor();
+        let whisper_shared: Arc<dyn GgmlAsrViewExecutor> = shared_whisper_executor();
         assert!(Arc::ptr_eq(whisper_offline, &whisper_shared));
 
         let moonshine_offline = executors
             .get(crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID)
             .expect("moonshine executor");
-        let moonshine_shared: Arc<dyn GgmlAsrExecutor> = shared_moonshine_executor();
+        let moonshine_shared: Arc<dyn GgmlAsrViewExecutor> = shared_moonshine_executor();
         assert!(Arc::ptr_eq(moonshine_offline, &moonshine_shared));
     }
 }

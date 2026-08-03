@@ -51,7 +51,7 @@ use super::token_embedding::{
     Qwen3AsrTokenEmbeddingError, Qwen3AsrTokenEmbeddingTable,
     load_qwen3_token_embedding_table_from_reader,
 };
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
+use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 
 /// Same rope theta as the shared qwen3-asr LLM stack (`QWEN_ROPE_THETA` in
 /// `batched_decode.rs`); the forced aligner's LM shares that architecture
@@ -514,8 +514,8 @@ pub(crate) fn align_forced(
 
 fn forced_aligner_prepared_audio(
     audio_samples_16khz_mono: crate::PcmSlice,
-) -> GgmlAsrPreparedAudio {
-    GgmlAsrPreparedAudio::mono_16khz_view(audio_samples_16khz_mono)
+) -> GgmlAsrPreparedAudioView<'static> {
+    GgmlAsrPreparedAudioView::mono_16khz_shared(audio_samples_16khz_mono)
 }
 
 /// Matches Python's `round(x, 3)` (round-half-to-even on the underlying f64

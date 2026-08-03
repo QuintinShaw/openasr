@@ -88,7 +88,7 @@ mod tests {
     use crate::testing::with_forced_cpu_backend_for_test;
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionOptions,
-        GgmlAsrExecutionRequest, GgmlAsrExecutor, GgmlAsrPreparedAudio,
+        GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
         qwen3_asr_runtime_descriptor_v1,
     };
 
@@ -143,11 +143,11 @@ mod tests {
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(audio_path, "test", "clip")
             .map_err(|e| e.to_string())?;
         let executor = crate::models::qwen::ggml_executor::Qwen3AsrGgmlExecutor::default();
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: runtime_path.to_path_buf(),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions {
                 adapter_path,
                 ..Default::default()
@@ -161,7 +161,7 @@ mod tests {
                 "test fixture",
             )),
         };
-        match executor.execute(&request) {
+        match executor.execute_view(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
                 if reason.contains("reached max_generated_tokens") =>
@@ -316,11 +316,11 @@ mod tests {
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(audio_path, "test", "clip")
             .map_err(|e| e.to_string())?;
         let executor = crate::models::qwen::ggml_executor::Qwen3AsrGgmlExecutor::default();
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: runtime_path.to_path_buf(),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions {
                 adapter_path,
                 ..Default::default()
@@ -334,7 +334,7 @@ mod tests {
                 "test fixture",
             )),
         };
-        match executor.execute(&request) {
+        match executor.execute_view(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
                 if reason.contains("reached max_generated_tokens") =>

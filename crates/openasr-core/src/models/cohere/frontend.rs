@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
 use crate::models::audio_frontend::{PadMode, StftFramer, center_embed_window};
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
+use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 use super::tensor_names::{
@@ -96,7 +96,7 @@ pub(crate) fn load_cohere_transcribe_frontend_plan_from_reader(
 }
 
 pub(crate) fn cohere_transcribe_features_from_prepared_audio(
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
     plan: &CohereTranscribeFrontendPlan,
 ) -> Result<CohereTranscribeMelFeatures, CohereTranscribeFrontendError> {
     if prepared_audio.sample_rate_hz != plan.sample_rate_hz
@@ -251,7 +251,7 @@ mod tests {
     fn frontend_rejects_invalid_audio() {
         let plan = test_plan();
         let error = cohere_transcribe_features_from_prepared_audio(
-            &GgmlAsrPreparedAudio {
+            &GgmlAsrPreparedAudioView {
                 sample_rate_hz: 8_000,
                 channels: 1,
                 samples_f32: vec![0.0, 1.0].into(),

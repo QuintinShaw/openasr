@@ -27,8 +27,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
@@ -231,7 +231,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
 impl FunasrNanoGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, FunasrNanoExecutorError> {
         let expected_adapter = crate::arch::FUNASR_NANO_GGML_ADAPTER_ID;
         if request.selected_family.adapter_id != expected_adapter {
@@ -525,7 +525,7 @@ fn map_registry_error(
     }
 }
 
-impl GgmlAsrExecutor for FunasrNanoGgmlExecutor {
+impl GgmlAsrViewExecutor for FunasrNanoGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         FUNASR_NANO_EXECUTOR_ID
     }
@@ -534,13 +534,13 @@ impl GgmlAsrExecutor for FunasrNanoGgmlExecutor {
         false
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
@@ -563,7 +563,7 @@ impl GgmlAsrStreamingExecutor for FunasrNanoGgmlExecutor {
             "funasr-nano",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
-            FunasrNanoGgmlExecutor::execute,
+            FunasrNanoGgmlExecutor::execute_view,
         )
     }
 }

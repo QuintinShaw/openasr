@@ -26,8 +26,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutor, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
@@ -291,7 +291,7 @@ pub(crate) fn parakeet_ctc_result_to_transcription(
     })
 }
 
-/// Dedicated GgmlAsrExecutor for parakeet-ctc (DedicatedRuntimeExecutorV1).
+/// Dedicated GgmlAsrViewExecutor for parakeet-ctc (DedicatedRuntimeExecutorV1).
 /// Reuses a prepared runtime by `(canonical path, backend)`, runs the CTC
 /// pipeline, returns a single-segment transcription.
 #[derive(Debug, Clone, Default)]
@@ -300,7 +300,7 @@ pub(crate) struct ParakeetCtcGgmlExecutor;
 impl ParakeetCtcGgmlExecutor {
     fn execute_ctc_result(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError> {
         let fail = |reason: String| GgmlAsrExecutionError::ExecutorFailed {
             executor_id: crate::arch::PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
@@ -320,7 +320,7 @@ impl ParakeetCtcGgmlExecutor {
     }
 }
 
-impl GgmlAsrExecutor for ParakeetCtcGgmlExecutor {
+impl GgmlAsrViewExecutor for ParakeetCtcGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         crate::arch::PARAKEET_CTC_EXECUTOR_COMPONENT_ID
     }
@@ -329,9 +329,9 @@ impl GgmlAsrExecutor for ParakeetCtcGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &crate::models::ggml_asr_executor::GgmlAsrExecutionRequest,
+        request: &crate::models::ggml_asr_executor::GgmlAsrExecutionViewRequest,
     ) -> Result<
         crate::models::ggml_asr_executor::GgmlAsrExecutionResult,
         crate::models::ggml_asr_executor::GgmlAsrExecutionError,
@@ -415,7 +415,7 @@ impl GgmlAsrStreamingExecutor for ParakeetCtcGgmlExecutor {
             request,
             STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
             ParakeetCtcGgmlExecutor::execute_ctc_result,
-            <ParakeetCtcGgmlExecutor as GgmlAsrExecutor>::execute,
+            <ParakeetCtcGgmlExecutor as GgmlAsrViewExecutor>::execute_view,
         );
         let session = GgmlAsrStreamingTranscriptSession::new(
             PARAKEET_CTC_STREAMING_EXECUTOR_ID,

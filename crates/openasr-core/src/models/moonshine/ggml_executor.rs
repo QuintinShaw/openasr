@@ -27,9 +27,9 @@ use crate::MOONSHINE_GGML_ADAPTER_ID;
 use crate::NativeAsrSession;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrPreparedAudio, GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT, build_seq2seq_streaming_session,
@@ -93,7 +93,7 @@ pub(crate) struct MoonshineGgmlExecutor {
 impl MoonshineGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, MoonshineGgmlExecutorError> {
         if request.selected_family.adapter_id != MOONSHINE_GGML_ADAPTER_ID {
@@ -260,14 +260,14 @@ fn can_use_moonshine_serve_batch(
     !skip_serve_batch && !adapter_active && decoder_backend_is_gpu_class && !decoder_uses_scheduler
 }
 
-fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
+fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
 
 fn encode_with_cached_runtime(
     runtime_source: &GgmlRuntimeSource,
     prepared_runtime: &MoonshinePreparedRuntime,
-    features: &super::frontend::MoonshineWaveformFeatures,
+    features: &super::frontend::MoonshineWaveformFeatures<'_>,
     adapter: Option<&MoonshineLoraAdapter>,
     backend: GgmlCpuGraphBackend,
 ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
@@ -294,7 +294,7 @@ fn encode_with_cached_runtime(
     )
 }
 
-impl GgmlAsrExecutor for MoonshineGgmlExecutor {
+impl GgmlAsrViewExecutor for MoonshineGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         MOONSHINE_EXECUTOR_ID
     }
@@ -303,9 +303,9 @@ impl GgmlAsrExecutor for MoonshineGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         // Offline decode: batch worker allowed.
         self.execute_inner(request, false)
@@ -323,7 +323,7 @@ impl MoonshineGgmlExecutor {
     /// direct greedy loop. The FINAL transcript remains byte-identical to `execute`.
     pub(crate) fn execute_streaming(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request, true)
             .map_err(|error| moonshine_execute_error_to_ggml(self, error, request))
@@ -333,14 +333,14 @@ impl MoonshineGgmlExecutor {
 fn moonshine_execute_error_to_ggml(
     executor: &MoonshineGgmlExecutor,
     error: MoonshineGgmlExecutorError,
-    request: &GgmlAsrExecutionRequest,
+    request: &GgmlAsrExecutionViewRequest,
 ) -> GgmlAsrExecutionError {
     match error {
         MoonshineGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
             GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
         }
         error => GgmlAsrExecutionError::ExecutorFailed {
-            executor_id: GgmlAsrExecutor::executor_id(executor),
+            executor_id: GgmlAsrViewExecutor::executor_id(executor),
             adapter_id: request.selected_family.adapter_id,
             reason: error.to_string(),
         },

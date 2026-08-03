@@ -677,8 +677,8 @@ pub(crate) mod source_tree_audit {
     fn minimal_fake_family_passes_wiring_and_runs_through_dispatch_with_no_extra_code() {
         use crate::models::ggml_asr_executor::{
             GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
-            GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult,
-            GgmlAsrExecutor, GgmlAsrPreparedAudio,
+            GgmlAsrExecutionOptions, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+            GgmlAsrExecutor, GgmlAsrPreparedAudioView,
         };
         use std::path::PathBuf;
         use std::sync::Arc;
@@ -726,7 +726,7 @@ pub(crate) mod source_tree_audit {
 
             fn execute(
                 &self,
-                _request: &GgmlAsrExecutionRequest,
+                _request: &crate::GgmlAsrExecutionRequest,
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 // Proves the resolved-input channel is populated without
                 // this executor ever calling a backend resolver itself: it
@@ -750,11 +750,11 @@ pub(crate) mod source_tree_audit {
 
         let dispatch = GgmlAsrExecutionDispatch::default()
             .with_executor_for_adapter(FAKE_ADAPTER_ID, Arc::new(MinimalFakeExecutor));
-        let request = GgmlAsrExecutionRequest {
+        let request = GgmlAsrExecutionViewRequest {
             runtime_source_path: PathBuf::from("fixtures/synthetic-fake-family.gguf"),
             runtime_source_preflight: None,
             selected_family: descriptor.ggml_family_adapter_descriptor(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::Auto,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -766,7 +766,7 @@ pub(crate) mod source_tree_audit {
             )),
         };
         let result = dispatch
-            .execute(&request)
+            .execute_view(&request)
             .expect("minimal executor must run end to end through the shared dispatch");
         assert_eq!(result.transcription.text, "ok");
     }

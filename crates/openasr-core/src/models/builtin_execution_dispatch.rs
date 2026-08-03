@@ -93,8 +93,8 @@ pub(crate) fn build_builtin_ggml_execution_dispatch()
         };
         match descriptor.execution_capability {
             GgmlExecutionCapability::DedicatedRuntimeExecutorV1 => {
-                dispatch =
-                    dispatch.with_executor_for_adapter(descriptor.adapter_id, Arc::clone(executor));
+                dispatch = dispatch
+                    .with_view_executor_for_adapter(descriptor.adapter_id, Arc::clone(executor));
             }
             GgmlExecutionCapability::NativeGraphLoweringV1 => {
                 native_graph_lowering_executors
@@ -104,7 +104,7 @@ pub(crate) fn build_builtin_ggml_execution_dispatch()
     }
 
     if !native_graph_lowering_executors.is_empty() {
-        dispatch = dispatch.with_executor_for_capability(
+        dispatch = dispatch.with_view_executor_for_capability(
             GgmlExecutionCapability::NativeGraphLoweringV1,
             Arc::new(
                 ComposedGgmlAsrExecutor::default()
@@ -256,19 +256,19 @@ mod tests {
 
     use super::*;
     use crate::{
-        GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionRequest,
-        GgmlAsrPreparedAudio, GgmlAsrStreamingSessionRequest, NativeAsrSessionContext,
+        GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionViewRequest,
+        GgmlAsrPreparedAudioView, GgmlAsrStreamingSessionRequest, NativeAsrSessionContext,
         NativeAsrStreamingSessionConfig, parakeet_ctc_runtime_descriptor_v1,
         qwen3_asr_runtime_descriptor_v1, wav2vec2_ctc_runtime_descriptor_v1,
         whisper_runtime_descriptor_v1, xasr_zipformer_runtime_descriptor_v1,
     };
 
-    fn missing_runtime_request() -> GgmlAsrExecutionRequest {
-        GgmlAsrExecutionRequest {
+    fn missing_runtime_request() -> GgmlAsrExecutionViewRequest<'static> {
+        GgmlAsrExecutionViewRequest {
             runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: crate::GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -338,7 +338,7 @@ mod tests {
     fn builtin_dispatch_routes_qwen_native_graph_lowering_capability() {
         let dispatch = build_builtin_ggml_execution_dispatch().expect("builtin dispatch");
         let error = dispatch
-            .execute(&missing_runtime_request())
+            .execute_view(&missing_runtime_request())
             .expect_err("missing runtime should fail inside qwen executor");
 
         match error {
@@ -364,7 +364,7 @@ mod tests {
         request.selected_family = whisper_runtime_descriptor_v1();
         let dispatch = build_builtin_ggml_execution_dispatch().expect("builtin dispatch");
         let error = dispatch
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("missing runtime should fail inside whisper executor");
 
         match error {
@@ -390,7 +390,7 @@ mod tests {
         request.selected_family = xasr_zipformer_runtime_descriptor_v1();
         let dispatch = build_builtin_ggml_execution_dispatch().expect("builtin dispatch");
         let error = dispatch
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("missing runtime should fail inside xasr executor");
 
         match error {

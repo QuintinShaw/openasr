@@ -12,11 +12,8 @@ use std::path::Path;
 use crate::BackendKind;
 
 pub use errors::{AudioInputError, AudioPreparationError};
-pub(crate) use types::RECOGNIZED_EXTENSIONS;
-pub use types::{
-    AudioInputInfo, AudioInputIssue, AudioPreparationOptions, PcmBuffer, PcmSlice,
-    PreparedAudioInput,
-};
+pub use types::{AudioInputInfo, AudioInputIssue, AudioPreparationOptions, PreparedAudioInput};
+pub(crate) use types::{PcmBuffer, PcmSlice, RECOGNIZED_EXTENSIONS};
 
 pub fn recognized_audio_extensions() -> &'static [&'static str] {
     RECOGNIZED_EXTENSIONS

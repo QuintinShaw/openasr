@@ -34,8 +34,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutor, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
@@ -289,14 +289,14 @@ fn transcribe_sensevoice_pcm_cached(
     )
 }
 
-/// Dedicated GgmlAsrExecutor for sensevoice (DedicatedRuntimeExecutorV1).
+/// Dedicated GgmlAsrViewExecutor for sensevoice (DedicatedRuntimeExecutorV1).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SenseVoiceGgmlExecutor;
 
 impl SenseVoiceGgmlExecutor {
     fn execute_ctc_result(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<CtcGreedyDecodeResult, GgmlAsrExecutionError> {
         let fail = |reason: String| GgmlAsrExecutionError::ExecutorFailed {
             executor_id: crate::arch::SENSEVOICE_EXECUTOR_COMPONENT_ID,
@@ -318,7 +318,7 @@ impl SenseVoiceGgmlExecutor {
     }
 }
 
-impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
+impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         crate::arch::SENSEVOICE_EXECUTOR_COMPONENT_ID
     }
@@ -327,9 +327,9 @@ impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<
         crate::models::ggml_asr_executor::GgmlAsrExecutionResult,
         crate::models::ggml_asr_executor::GgmlAsrExecutionError,
@@ -410,7 +410,7 @@ impl GgmlAsrStreamingExecutor for SenseVoiceGgmlExecutor {
             request,
             STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
             SenseVoiceGgmlExecutor::execute_ctc_result,
-            <SenseVoiceGgmlExecutor as GgmlAsrExecutor>::execute,
+            <SenseVoiceGgmlExecutor as GgmlAsrViewExecutor>::execute_view,
         );
         let session = GgmlAsrStreamingTranscriptSession::new(
             SENSEVOICE_STREAMING_EXECUTOR_ID,

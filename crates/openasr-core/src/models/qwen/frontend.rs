@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
 use crate::models::audio_frontend::{PadMode, StftFramer, center_embed_window};
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
+use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::{AUDIO_MEL_FILTERS, AUDIO_MEL_WINDOW};
@@ -99,7 +99,7 @@ pub(crate) fn load_qwen3_mel_frontend_plan_from_reader(
 }
 
 pub(crate) fn qwen3_mel_features_from_prepared_audio(
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
     plan: &Qwen3AsrMelFrontendPlan,
 ) -> Result<Qwen3AsrMelFeatures, Qwen3AsrMelFrontendError> {
     if prepared_audio.sample_rate_hz != plan.sample_rate_hz
@@ -231,7 +231,7 @@ fn normalize_log_mel_in_place(values: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
+    use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 
     #[test]
     fn mel_frontend_emits_expected_frame_count_for_center_padded_stft() {
@@ -248,7 +248,7 @@ mod tests {
             mel_filters: vec![0.0; n_mels * fft_bins],
         };
         let samples = vec![0.0_f32; 3_200];
-        let prepared = GgmlAsrPreparedAudio::mono_16khz(samples);
+        let prepared = GgmlAsrPreparedAudioView::mono_16khz(samples);
         let features =
             qwen3_mel_features_from_prepared_audio(&prepared, &plan).expect("mel features");
         assert_eq!(features.n_frames, 20);

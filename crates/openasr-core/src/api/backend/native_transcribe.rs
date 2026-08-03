@@ -18,9 +18,12 @@ use crate::arch::{
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override, read_gguf_metadata,
 };
+#[cfg(test)]
+use crate::longform::plan_longform_slices;
 use crate::longform::{
-    AudioSliceKind, LongFormMode, LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain,
-    SliceTranscript, TranscriptAssembler, plan_longform_slices,
+    AudioSliceKind, LongFormMode, LongFormSlicePlanningError, LongFormVadProvider,
+    SegmentMergePolicy, SegmentTimeDomain, SliceTranscript, TranscriptAssembler,
+    plan_longform_slices_with_materialization_gate,
 };
 use crate::models::builtin_execution_dispatch::build_builtin_ggml_execution_dispatch;
 use crate::models::decode_policy_component_registry::{
@@ -32,9 +35,10 @@ use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_in
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::{
     ExecutionTarget, GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
-    GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrPreparedAudio,
-    GgmlAsrRuntimeSourcePreflight, GgmlFamilyAdapterDescriptor, GgmlFamilyRegistry,
-    GgmlFamilyRegistrySelectionError, OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
+    GgmlAsrExecutionOptions, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlFamilyAdapterDescriptor,
+    GgmlFamilyRegistry, GgmlFamilyRegistrySelectionError, OasrV1MetadataError, PcmBuffer, PcmSlice,
+    parse_model_ref,
 };
 
 use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
@@ -1206,7 +1210,6 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::DiarizationSegmenterUnavailable
         | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
-        | BackendError::DiarizeSpeakersOutOfRange { .. }
         | BackendError::PhraseBiasNotSupported { .. }
         | BackendError::AdapterNotSupported { .. }
         | BackendError::PhraseBiasUnsupportedByModel { .. }
@@ -1239,7 +1242,11 @@ fn run_native_transcription_fallible(
     if let Some(requested) = request.diarize_speakers {
         let max = crate::diarize::contract::MAX_DIARIZATION_SPEAKERS;
         if !(1..=max).contains(&requested) {
-            return Err(BackendError::DiarizeSpeakersOutOfRange { requested, max });
+            return Err(BackendError::NativeFailClosed {
+                reason: format!(
+                    "The speakers hint must be between 1 and {max}, got {requested}. The request was rejected instead of silently clamping it to a different diarization workload."
+                ),
+            });
         }
     }
     if request.voice_id && !request.source.supports_recording_voice_id() {
@@ -1274,7 +1281,7 @@ fn run_native_transcription_fallible(
     let punctuate = request.punctuate;
     // Captured before the move below: the punctuation post-process is a
     // separate pack from the main ASR family (never carries a
-    // `GgmlAsrExecutionRequest`/`resolved_runtime`), so it resolves its own
+    // `GgmlAsrExecutionViewRequest`/`resolved_runtime`), so it resolves its own
     // backend explicitly here from this request's own execution target,
     // rather than reaching for the implicit generic default.
     let punctuation_backend = execution_target_backend_preference(request.execution_target)
@@ -1875,14 +1882,29 @@ fn run_native_transcription_impl(
     let mut truncated_decodes: Vec<TruncatedDecode> = Vec::new();
     if run_longform {
         let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options)?;
-        let mut plan = plan_longform_slices(
+        let mut plan = plan_longform_slices_with_materialization_gate(
             &prepared_audio,
             16_000,
             &longform_options,
             Some(vad_provider.as_ref()),
+            |packed_samples| {
+                enforce_native_host_memory_admission(
+                    selected_family.model_architecture,
+                    &runtime_preflight.metadata,
+                    runtime_source.byte_len(),
+                    audio_duration_seconds,
+                    admission_backend,
+                    request_working_set
+                        .with_additional_unified_bytes(pcm_sample_capacity_bytes(packed_samples)),
+                    decoder_discrete_vram_budget_bytes,
+                )
+            },
         )
-        .map_err(|error| BackendError::NativeFailClosed {
-            reason: format!("could not build longform slice plan: {error}"),
+        .map_err(|error| match error {
+            LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
+                reason: format!("could not build longform slice plan: {error}"),
+            },
+            LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
         })?;
         let plan_stats = plan.stats.clone();
         let mut longform_provenance =
@@ -1937,13 +1959,10 @@ fn run_native_transcription_impl(
                 prepared_audio,
             ));
         }
-        // Packed longform owns a second PCM allocation while the original
-        // normalized recording stays alive for Voice ID, forced alignment,
-        // and original-timeline assembly. The initial gate above runs before
-        // planning and charges the original once; now that the planner has
-        // materialized the exact packed Vec, repeat the decoder gate with its
-        // actual capacity before building any decode graph. Identity plans
-        // and all-silent plans that dispatch no decoder need no second gate.
+        // The planner called the materialization gate before allocating this
+        // second PCM owner. Repeat with Vec's observed capacity as a defensive
+        // allocator check before any decode graph; identity and all-silent
+        // plans need neither packed charge.
         if let Some(processed_audio) = plan.processed_audio.as_ref() {
             enforce_native_host_memory_admission(
                 selected_family.model_architecture,
@@ -3108,7 +3127,11 @@ impl NativeRequestWorkingSetAdmission {
 }
 
 fn pcm_vec_resident_bytes(samples: &Vec<f32>) -> u64 {
-    u64::try_from(samples.capacity())
+    pcm_sample_capacity_bytes(samples.capacity())
+}
+
+fn pcm_sample_capacity_bytes(samples: usize) -> u64 {
+    u64::try_from(samples)
         .unwrap_or(u64::MAX)
         .saturating_mul(std::mem::size_of::<f32>() as u64)
 }
@@ -3941,11 +3964,11 @@ fn run_dispatch_once(
             selected_family.model_architecture,
         ),
     );
-    let execution_request = GgmlAsrExecutionRequest {
+    let execution_request = GgmlAsrExecutionViewRequest {
         runtime_source_path: runtime_preflight.runtime_source.path().to_path_buf(),
         runtime_source_preflight: Some(runtime_preflight.clone()),
         selected_family: selected_family.clone(),
-        prepared_audio: GgmlAsrPreparedAudio::mono_16khz_view(samples),
+        prepared_audio: GgmlAsrPreparedAudioView::mono_16khz_shared(samples),
         request_options,
         backend_preference,
         resolved_runtime,
@@ -3955,7 +3978,7 @@ fn run_dispatch_once(
         execution_request.request_options.inference_threads,
     );
     let result = dispatch
-        .execute(&execution_request)
+        .execute_view(&execution_request)
         .map_err(|error| dispatch_error_to_backend(error, execution_context))?;
     Ok(result)
 }
@@ -4306,14 +4329,13 @@ mod tests {
                 .expect_err("an out-of-range hint must fail closed at the request boundary");
             assert!(matches!(
                 &error,
-                BackendError::DiarizeSpeakersOutOfRange {
-                    requested: rejected,
-                    max: contract_max,
-                } if *rejected == requested && *contract_max == max
+                BackendError::NativeFailClosed { reason }
+                    if reason.contains(&format!("between 1 and {max}"))
+                        && reason.contains(&format!("got {requested}"))
             ));
             assert_eq!(
                 classify_backend_error_for_failure_log(&error),
-                FailureCategory::UnsupportedCapability
+                FailureCategory::Decode
             );
         }
 
@@ -4328,7 +4350,7 @@ mod tests {
             ));
         }
     }
-    use crate::GgmlAsrExecutor;
+    use crate::GgmlAsrViewExecutor;
     use crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
     use std::sync::Mutex;
 
@@ -4373,8 +4395,8 @@ mod tests {
         assert!(forced_aligner_audio_view(&prepared, false).is_none());
         let align = forced_aligner_audio_view(&prepared, true)
             .expect("enabled forced aligner must borrow normalized PCM");
-        let dispatch = GgmlAsrPreparedAudio::mono_16khz_view(prepared.slice(8..24));
-        let align_request = GgmlAsrPreparedAudio::mono_16khz_view(align);
+        let dispatch = GgmlAsrPreparedAudioView::mono_16khz_shared(prepared.slice(8..24));
+        let align_request = GgmlAsrPreparedAudioView::mono_16khz_shared(align);
         assert_eq!(dispatch.samples_f32.backing_identity(), identity);
         assert_eq!(align_request.samples_f32.backing_identity(), identity);
         assert_eq!(
@@ -7475,7 +7497,7 @@ mod tests {
         );
     }
 
-    /// A stub `GgmlAsrExecutor` for the GPU-fallback wrapper tests: records
+    /// A stub `GgmlAsrViewExecutor` for the GPU-fallback wrapper tests: records
     /// every `backend_preference` it was invoked with, and fails with a
     /// configurable error whenever the request does *not* ask for `CpuOnly`
     /// (mimicking a GPU-class compute-buffer allocation that fails no matter
@@ -7505,7 +7527,7 @@ mod tests {
         }
     }
 
-    impl GgmlAsrExecutor for GpuAllocFallbackStubExecutor {
+    impl GgmlAsrViewExecutor for GpuAllocFallbackStubExecutor {
         fn executor_id(&self) -> &'static str {
             "gpu-alloc-fallback-stub"
         }
@@ -7514,9 +7536,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            request: &GgmlAsrExecutionRequest,
+            request: &GgmlAsrExecutionViewRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             self.calls.lock().unwrap().push(request.backend_preference);
             self.backing_identities
@@ -7554,7 +7576,7 @@ mod tests {
         calls: Mutex<usize>,
     }
 
-    impl GgmlAsrExecutor for AlwaysFailsUnrelatedStubExecutor {
+    impl GgmlAsrViewExecutor for AlwaysFailsUnrelatedStubExecutor {
         fn executor_id(&self) -> &'static str {
             "always-fails-unrelated-stub"
         }
@@ -7563,9 +7585,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            request: &GgmlAsrExecutionRequest,
+            request: &GgmlAsrExecutionViewRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             *self.calls.lock().unwrap() += 1;
             Err(GgmlAsrExecutionError::ExecutorFailed {
@@ -7596,14 +7618,15 @@ mod tests {
 
     fn gpu_fallback_test_fixture(
         dir: &Path,
-        executor: std::sync::Arc<dyn GgmlAsrExecutor>,
+        executor: std::sync::Arc<dyn GgmlAsrViewExecutor>,
     ) -> (
         GgmlAsrExecutionDispatch,
         GgmlAsrRuntimeSourcePreflight,
         GgmlFamilyAdapterDescriptor,
     ) {
         let preflight = tiny_whisper_preflight(dir);
-        let dispatch = GgmlAsrExecutionDispatch::default().with_whisper_non_streaming_cpu(executor);
+        let dispatch = GgmlAsrExecutionDispatch::default()
+            .with_view_executor_for_adapter(crate::WHISPER_GGML_ADAPTER_ID, executor);
         (dispatch, preflight, crate::whisper_runtime_descriptor_v1())
     }
 
@@ -7704,16 +7727,16 @@ mod tests {
         struct AlwaysFailsCpuAllocExecutor {
             calls: Mutex<usize>,
         }
-        impl GgmlAsrExecutor for AlwaysFailsCpuAllocExecutor {
+        impl GgmlAsrViewExecutor for AlwaysFailsCpuAllocExecutor {
             fn executor_id(&self) -> &'static str {
                 "always-fails-cpu-alloc-stub"
             }
             fn supports_phrase_bias(&self) -> bool {
                 true
             }
-            fn execute(
+            fn execute_view(
                 &self,
-                request: &GgmlAsrExecutionRequest,
+                request: &GgmlAsrExecutionViewRequest,
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 *self.calls.lock().unwrap() += 1;
                 Err(GgmlAsrExecutionError::ExecutorFailed {
@@ -7963,7 +7986,7 @@ mod tests {
             }
         }
 
-        fn marker_of(request: &GgmlAsrExecutionRequest) -> i32 {
+        fn marker_of(request: &GgmlAsrExecutionViewRequest) -> i32 {
             request
                 .prepared_audio
                 .samples_f32
@@ -7974,7 +7997,7 @@ mod tests {
         }
     }
 
-    impl GgmlAsrExecutor for ConcurrentPipelineStubExecutor {
+    impl GgmlAsrViewExecutor for ConcurrentPipelineStubExecutor {
         fn executor_id(&self) -> &'static str {
             "concurrent-pipeline-stub"
         }
@@ -7983,9 +8006,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            request: &GgmlAsrExecutionRequest,
+            request: &GgmlAsrExecutionViewRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             if let Some(observed) = self.observed_views.as_ref() {
                 observed.lock().unwrap().push((
@@ -8052,7 +8075,7 @@ mod tests {
         width: usize,
         audio: &[f32],
         slices: Vec<crate::longform::AudioSlice>,
-        executor: Arc<dyn GgmlAsrExecutor>,
+        executor: Arc<dyn GgmlAsrViewExecutor>,
         execution_context: &Arc<crate::RequestExecutionContext>,
         longform_options: &crate::LongFormOptions,
         progress_id: Option<String>,
@@ -8224,7 +8247,7 @@ mod tests {
     /// slice it was handed.
     struct SegmentEchoStubExecutor;
 
-    impl GgmlAsrExecutor for SegmentEchoStubExecutor {
+    impl GgmlAsrViewExecutor for SegmentEchoStubExecutor {
         fn executor_id(&self) -> &'static str {
             "segment-echo-stub"
         }
@@ -8233,9 +8256,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            request: &GgmlAsrExecutionRequest,
+            request: &GgmlAsrExecutionViewRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             let marker = ConcurrentPipelineStubExecutor::marker_of(request);
             Ok(GgmlAsrExecutionResult {
@@ -8404,7 +8427,7 @@ mod tests {
         gate: Arc<DecodeGate>,
     }
 
-    impl GgmlAsrExecutor for PauseGateExecutor {
+    impl GgmlAsrViewExecutor for PauseGateExecutor {
         fn executor_id(&self) -> &'static str {
             "pause-gate-stub"
         }
@@ -8413,9 +8436,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            request: &GgmlAsrExecutionRequest,
+            request: &GgmlAsrExecutionViewRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             let marker = ConcurrentPipelineStubExecutor::marker_of(request);
             self.gate.mark_entered();
@@ -8446,7 +8469,7 @@ mod tests {
         gate: Arc<DecodeGate>,
     }
 
-    impl GgmlAsrExecutor for CancelGateExecutor {
+    impl GgmlAsrViewExecutor for CancelGateExecutor {
         fn executor_id(&self) -> &'static str {
             "cancel-gate-stub"
         }
@@ -8455,9 +8478,9 @@ mod tests {
             true
         }
 
-        fn execute(
+        fn execute_view(
             &self,
-            request: &GgmlAsrExecutionRequest,
+            request: &GgmlAsrExecutionViewRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             self.gate.mark_entered();
             let started = Instant::now();
@@ -8489,7 +8512,7 @@ mod tests {
         width: usize,
         audio: Vec<f32>,
         slices: Vec<crate::longform::AudioSlice>,
-        executor: Arc<dyn GgmlAsrExecutor>,
+        executor: Arc<dyn GgmlAsrViewExecutor>,
         execution_context: Arc<crate::RequestExecutionContext>,
         longform: crate::LongFormOptions,
     ) -> mpsc::Receiver<Result<ConcurrentPipelineOutcome, BackendError>> {

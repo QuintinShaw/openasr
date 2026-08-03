@@ -18,8 +18,8 @@ use std::time::Instant;
 
 use crate::ggml_runtime::install_request_backend_override;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrPreparedAudio,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrPreparedAudioView, GgmlAsrStreamingSessionRequest,
 };
 use crate::models::ggml_streaming_audio::{FrameTimelineError, GgmlStreamingAudioBuffer};
 use crate::models::ggml_streaming_session::{
@@ -151,7 +151,7 @@ pub(crate) const STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT: StreamingPartialTuning
     StreamingPartialTuning::new(300, 500, None);
 
 /// Build the streaming driver for a runtime family's `start_streaming_session`.
-/// Each decode rebuilds [`GgmlAsrExecutionRequest`] from `request` plus the
+/// Each decode rebuilds [`GgmlAsrExecutionViewRequest`] from `request` plus the
 /// current audio and installs the request's thread-count override on the decode
 /// thread.
 pub(crate) fn build_streaming_driver<E, FDecode>(
@@ -164,7 +164,10 @@ pub(crate) fn build_streaming_driver<E, FDecode>(
 ) -> Box<dyn GgmlAsrStreamingTranscriptDriver>
 where
     E: Clone + Send + 'static,
-    FDecode: Fn(&E, &GgmlAsrExecutionRequest) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>
+    FDecode: Fn(
+            &E,
+            &GgmlAsrExecutionViewRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>
         + Send
         + 'static,
 {
@@ -188,7 +191,8 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
-    let make_request = move |audio: &GgmlAsrPreparedAudio, partial_prompt: Option<&str>| {
+    let make_request = move |audio: &GgmlAsrPreparedAudioView<'static>,
+                             partial_prompt: Option<&str>| {
         let mut request_options = request_options.clone();
         if let Some(prompt) =
             merge_partial_prompt(request_options.prompt.as_deref(), partial_prompt)
@@ -196,7 +200,7 @@ where
             request_options.prompt = Some(prompt);
             request_options.prompt_token_ids = None;
         }
-        GgmlAsrExecutionRequest {
+        GgmlAsrExecutionViewRequest {
             runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
@@ -217,7 +221,7 @@ where
     };
 
     let transcribe = Box::new(
-        move |audio: &GgmlAsrPreparedAudio, partial_prompt: Option<&str>| {
+        move |audio: &GgmlAsrPreparedAudioView<'static>, partial_prompt: Option<&str>| {
             let _thread_override = install_request_inference_threads_override(inference_threads);
             // Mirror GgmlAsrExecutionDispatch::execute's override install (the
             // offline/batch entry point): the streaming path calls the
@@ -267,7 +271,10 @@ pub(crate) fn build_seq2seq_streaming_session<E, FDecode>(
 ) -> Result<Box<dyn NativeAsrSession>, GgmlAsrExecutionError>
 where
     E: Clone + Send + 'static,
-    FDecode: Fn(&E, &GgmlAsrExecutionRequest) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>
+    FDecode: Fn(
+            &E,
+            &GgmlAsrExecutionViewRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>
         + Send
         + 'static,
 {
@@ -291,7 +298,10 @@ where
 /// Decode the accumulated audio for a streaming partial/final. Family-specific
 /// streaming decode keeps live-session semantics such as serve-batch bypass, while
 /// the returned FINAL remains byte-identical to offline `execute()`.
-type StreamingTranscriber = dyn FnMut(&GgmlAsrPreparedAudio, Option<&str>) -> Result<Transcription, GgmlAsrExecutionError>
+type StreamingTranscriber = dyn FnMut(
+        &GgmlAsrPreparedAudioView<'static>,
+        Option<&str>,
+    ) -> Result<Transcription, GgmlAsrExecutionError>
     + Send;
 
 /// Whether a character is sentence-terminal (Chinese or ASCII), used to cut a
@@ -524,7 +534,7 @@ impl IncrementalStreamingTranscriptDriver {
     }
 
     fn decode_warm_up_silence(&mut self) -> Result<(), GgmlAsrExecutionError> {
-        let audio = GgmlAsrPreparedAudio::mono_16khz(vec![
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(vec![
             0.0;
             STREAMING_WARM_UP_AUDIO_MS
                 * SAMPLES_PER_MS_16KHZ
@@ -1005,7 +1015,7 @@ mod tests {
 
     /// A windowed driver whose decode returns one word per 20 ms of the audio it is
     /// given (`w0 w1 …`), with timestamps — modelling a real windowed re-decode.
-    fn windowed_transcription(audio: &GgmlAsrPreparedAudio) -> Transcription {
+    fn windowed_transcription(audio: &GgmlAsrPreparedAudioView) -> Transcription {
         let dur_ms = (audio.samples_f32.len() / 16) as u64;
         let n = (dur_ms / 20) as usize;
         let start_word = (audio.samples_f32[0] * 32768.0).round() as usize - 1;
@@ -1675,7 +1685,7 @@ mod tests {
                 crate::QWEN3_ASR_GGML_ADAPTER_ID,
                 &request,
                 STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
-                move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
+                move |_executor: &(), _request: &GgmlAsrExecutionViewRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
                         _request.resolved_runtime.backend(),

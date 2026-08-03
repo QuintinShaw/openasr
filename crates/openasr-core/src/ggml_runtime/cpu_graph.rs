@@ -474,7 +474,7 @@ impl GgmlCpuGraphConfig {
 
 /// Resolved, request-scoped execution input handed down to family code as an
 /// explicit value -- a required field on the work object that reaches family
-/// code (`GgmlAsrExecutionRequest`, `GgmlAsrStreamingSessionRequest`, and the
+/// code (`GgmlAsrExecutionViewRequest`, `GgmlAsrStreamingSessionRequest`, and the
 /// serve-batch job types), never a thread-local. Computed once, from the
 /// family's declared [`AutoGpuPolicy`] and the request's own
 /// `backend_preference` field (see [`Self::resolve`]), so every graph-build

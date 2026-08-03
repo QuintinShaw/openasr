@@ -1,7 +1,7 @@
 use crate::NativeAsrError;
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale};
 use crate::models::audio_frontend::{PadMode, StftFramer, hann_window_periodic_scale_first};
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
+use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 use crate::tensor::{TensorOwnedF32, TensorViewF32, linear_f32};
 
 pub const WHISPER_SAMPLE_RATE_HZ: u32 = 16_000;
@@ -94,7 +94,7 @@ pub fn build_whisper_mel_frontend_plan_v0(
 }
 
 pub fn whisper_mel_features_from_prepared_audio_v0(
-    prepared_audio: &GgmlAsrPreparedAudio,
+    prepared_audio: &GgmlAsrPreparedAudioView,
     n_mels: usize,
     target_frames: usize,
 ) -> Result<WhisperMelFeatures, NativeAsrError> {
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn silence_features_are_finite_with_expected_shape() {
-        let audio = GgmlAsrPreparedAudio::mono_16khz(vec![0.0_f32; 16_000]);
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(vec![0.0_f32; 16_000]);
         let mel = whisper_mel_features_from_prepared_audio_v0(&audio, 80, 32).unwrap();
         assert_eq!(mel.n_mels, 80);
         assert_eq!(mel.n_frames, 32);
@@ -283,7 +283,7 @@ mod tests {
     fn impulse_features_are_finite_with_expected_shape() {
         let mut samples = vec![0.0_f32; 16_000];
         samples[0] = 1.0;
-        let audio = GgmlAsrPreparedAudio::mono_16khz(samples);
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(samples);
         let mel = whisper_mel_features_from_prepared_audio_v0(&audio, 80, 64).unwrap();
         assert_eq!(mel.n_mels, 80);
         assert_eq!(mel.n_frames, 64);
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn reject_invalid_sample_rate_fail_closed() {
-        let audio = GgmlAsrPreparedAudio {
+        let audio = GgmlAsrPreparedAudioView {
             sample_rate_hz: 8_000,
             channels: 1,
             samples_f32: vec![0.0, 0.1, 0.2].into(),
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn reject_non_finite_input_fail_closed() {
-        let audio = GgmlAsrPreparedAudio::mono_16khz(vec![0.0, f32::NAN, 0.2]);
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, f32::NAN, 0.2]);
         let error = whisper_mel_features_from_prepared_audio_v0(&audio, 80, 16)
             .unwrap_err()
             .to_string();

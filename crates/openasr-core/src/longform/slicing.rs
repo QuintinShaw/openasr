@@ -113,20 +113,57 @@ pub enum LongFormSliceError {
     VadFailed { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LongFormSlicePlanningError<E> {
+    Planning(LongFormSliceError),
+    PackedAudioAdmission(E),
+}
+
+impl<E> From<LongFormSliceError> for LongFormSlicePlanningError<E> {
+    fn from(error: LongFormSliceError) -> Self {
+        Self::Planning(error)
+    }
+}
+
 pub fn plan_longform_slices(
     samples: &[f32],
     sample_rate_hz: u32,
     options: &LongFormOptions,
     vad_provider: Option<&dyn LongFormVadProvider>,
 ) -> Result<LongFormSlicePlan, LongFormSliceError> {
+    match plan_longform_slices_with_materialization_gate(
+        samples,
+        sample_rate_hz,
+        options,
+        vad_provider,
+        |_| Ok::<(), std::convert::Infallible>(()),
+    ) {
+        Ok(plan) => Ok(plan),
+        Err(LongFormSlicePlanningError::Planning(error)) => Err(error),
+        Err(LongFormSlicePlanningError::PackedAudioAdmission(never)) => match never {},
+    }
+}
+
+/// Plans long-form slices and calls `admit_packed_samples` before allocating a
+/// packed PCM timeline. The public planner uses an infallible gate; native
+/// execution supplies its memory admission check so a known-impossible packed
+/// request is rejected before the second recording-sized allocation exists.
+pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
+    samples: &[f32],
+    sample_rate_hz: u32,
+    options: &LongFormOptions,
+    vad_provider: Option<&dyn LongFormVadProvider>,
+    admit_packed_samples: impl FnOnce(usize) -> Result<(), E>,
+) -> Result<LongFormSlicePlan, LongFormSlicePlanningError<E>> {
     if sample_rate_hz == 0 {
-        return Err(LongFormSliceError::InvalidSampleRate);
+        return Err(LongFormSliceError::InvalidSampleRate.into());
     }
     options
         .validate()
         .map_err(|error| LongFormSliceError::InvalidOptions {
             reason: error.to_string(),
-        })?;
+        })
+        .map_err(LongFormSlicePlanningError::Planning)?;
     if samples.is_empty() {
         return Ok(LongFormSlicePlan {
             sample_rate_hz,
@@ -168,6 +205,8 @@ pub fn plan_longform_slices(
     log_dropped_audible_regions(samples, sample_rate_hz, &layout);
     if layout.processed_audio.is_none() {
         if let Some(materialization_plan) = layout.packed_audio_plan.take() {
+            admit_packed_samples(materialization_plan.processed_samples)
+                .map_err(LongFormSlicePlanningError::PackedAudioAdmission)?;
             layout.processed_audio = Some(materialize_packed_audio(samples, &materialization_plan));
         } else {
             apply_padding(
@@ -3472,6 +3511,38 @@ mod tests {
         assert!(plan.processed_audio.is_some());
         assert!(plan.slices.len() <= 3);
         assert!(plan.processed_audio.as_ref().expect("processed").len() < samples.len() / 2);
+    }
+
+    #[test]
+    fn packed_materialization_gate_runs_before_the_pcm_allocation() {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            samples.extend(tone(16_000 * 4));
+            samples.extend(vec![0.0; 16_000 * 12]);
+        }
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        let mut proposed_samples = None;
+
+        let error = plan_longform_slices_with_materialization_gate(
+            &samples,
+            16_000,
+            &options,
+            None,
+            |count| {
+                proposed_samples = Some(count);
+                Err("memory rejected")
+            },
+        )
+        .expect_err("the gate must stop packed materialization");
+
+        assert!(matches!(
+            error,
+            LongFormSlicePlanningError::PackedAudioAdmission("memory rejected")
+        ));
+        let proposed_samples = proposed_samples.expect("packed candidate reached admission");
+        assert!(proposed_samples > 0);
+        assert!(proposed_samples < samples.len() / 2);
     }
 
     #[test]

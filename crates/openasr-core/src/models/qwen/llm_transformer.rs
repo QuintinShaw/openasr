@@ -1577,7 +1577,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// graph lives in one backend buffer) and uploaded in the same pass.
     ///
     /// `backend` is this family's already-resolved backend (see
-    /// `GgmlAsrExecutionRequest::resolved_runtime`'s doc comment) -- the
+    /// `GgmlAsrExecutionViewRequest::resolved_runtime`'s doc comment) -- the
     /// caller's explicit value, never re-derived here. `runtime_source` is
     /// the same already-open, already-validated source the caller's tensor
     /// reader was built from -- the zero-copy resident-weight bind below

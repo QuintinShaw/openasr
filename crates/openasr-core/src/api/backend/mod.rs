@@ -956,10 +956,6 @@ pub enum BackendError {
     )]
     DiarizeSpeakersRequiresDiarization,
     #[error(
-        "The speakers hint must be between 1 and {max}, got {requested}.\nThe request was rejected instead of silently clamping it to a different diarization workload."
-    )]
-    DiarizeSpeakersOutOfRange { requested: u8, max: u8 },
-    #[error(
         "Phrase bias / hotword boosting is not supported by the {backend} backend yet.\nThe request was rejected instead of silently ignoring phrase_bias."
     )]
     PhraseBiasNotSupported { backend: &'static str },

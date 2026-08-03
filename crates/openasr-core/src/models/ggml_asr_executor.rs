@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use thiserror::Error;
 
@@ -148,20 +154,103 @@ pub trait RuntimeBuildIdentitySource {
 pub struct GgmlAsrPreparedAudio {
     pub sample_rate_hz: u32,
     pub channels: u16,
-    pub samples_f32: PcmSlice,
+    pub samples_f32: Vec<f32>,
 }
 
 impl GgmlAsrPreparedAudio {
     pub fn mono_16khz(samples_f32: Vec<f32>) -> Self {
-        Self::mono_16khz_view(samples_f32.into())
-    }
-
-    pub fn mono_16khz_view(samples_f32: PcmSlice) -> Self {
         Self {
             sample_rate_hz: 16_000,
             channels: 1,
             samples_f32,
         }
+    }
+
+    fn as_view(&self) -> GgmlAsrPreparedAudioView<'_> {
+        GgmlAsrPreparedAudioView {
+            sample_rate_hz: self.sample_rate_hz,
+            channels: self.channels,
+            samples_f32: GgmlAsrSamplesView::Borrowed(&self.samples_f32),
+        }
+    }
+}
+
+/// Zero-copy audio view used only inside the native runtime.
+///
+/// The public [`GgmlAsrPreparedAudio`] remains the stable owned DTO. Native
+/// long-form requests use the shared variant below so every slice and retry
+/// references one immutable PCM allocation; an out-of-tree executor sees this
+/// only through the dispatch's owned compatibility adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GgmlAsrPreparedAudioView<'a> {
+    pub(crate) sample_rate_hz: u32,
+    pub(crate) channels: u16,
+    pub(crate) samples_f32: GgmlAsrSamplesView<'a>,
+}
+
+impl GgmlAsrPreparedAudioView<'static> {
+    pub(crate) fn mono_16khz(samples_f32: Vec<f32>) -> Self {
+        Self::mono_16khz_shared(samples_f32.into())
+    }
+
+    pub(crate) fn mono_16khz_shared(samples_f32: PcmSlice) -> Self {
+        Self {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            samples_f32: GgmlAsrSamplesView::Shared(samples_f32),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GgmlAsrSamplesView<'a> {
+    Borrowed(&'a [f32]),
+    Shared(PcmSlice),
+}
+
+impl Deref for GgmlAsrSamplesView<'_> {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(samples) => samples,
+            Self::Shared(samples) => samples.as_slice(),
+        }
+    }
+}
+
+impl AsRef<[f32]> for GgmlAsrSamplesView<'_> {
+    fn as_ref(&self) -> &[f32] {
+        self
+    }
+}
+
+#[cfg(test)]
+impl GgmlAsrSamplesView<'_> {
+    pub(crate) fn range(&self) -> std::ops::Range<usize> {
+        match self {
+            Self::Borrowed(samples) => 0..samples.len(),
+            Self::Shared(samples) => samples.range(),
+        }
+    }
+
+    pub(crate) fn backing_identity(&self) -> usize {
+        match self {
+            Self::Borrowed(samples) => samples.as_ptr() as usize,
+            Self::Shared(samples) => samples.backing_identity(),
+        }
+    }
+}
+
+impl From<Vec<f32>> for GgmlAsrSamplesView<'static> {
+    fn from(samples: Vec<f32>) -> Self {
+        Self::Shared(samples.into())
+    }
+}
+
+impl From<PcmSlice> for GgmlAsrSamplesView<'static> {
+    fn from(samples: PcmSlice) -> Self {
+        Self::Shared(samples)
     }
 }
 
@@ -298,6 +387,24 @@ pub struct GgmlAsrExecutionRequest {
     pub execution_context: Arc<RequestExecutionContext>,
 }
 
+/// Runtime request used inside the built-in dispatch.
+///
+/// This is a deep internal seam: all non-audio request state keeps the same
+/// shape as [`GgmlAsrExecutionRequest`], while audio may either borrow the
+/// public owned DTO or retain a shared native PCM range. Keeping that choice
+/// here prevents storage ownership from leaking into every model adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GgmlAsrExecutionViewRequest<'a> {
+    pub(crate) runtime_source_path: PathBuf,
+    pub(crate) runtime_source_preflight: Option<GgmlAsrRuntimeSourcePreflight>,
+    pub(crate) selected_family: GgmlFamilyAdapterDescriptor,
+    pub(crate) prepared_audio: GgmlAsrPreparedAudioView<'a>,
+    pub(crate) request_options: GgmlAsrExecutionOptions,
+    pub(crate) backend_preference: GgmlAsrBackendPreference,
+    pub(crate) resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    pub(crate) execution_context: Arc<RequestExecutionContext>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgmlAsrStreamingSessionConfig {
     pub audio_format: RealtimeAudioFormat,
@@ -363,25 +470,79 @@ pub(crate) enum GgmlAsrExecutionRequestPreflightError {
 }
 
 impl GgmlAsrExecutionRequest {
+    pub(crate) fn as_view(&self) -> GgmlAsrExecutionViewRequest<'_> {
+        GgmlAsrExecutionViewRequest {
+            runtime_source_path: self.runtime_source_path.clone(),
+            runtime_source_preflight: self.runtime_source_preflight.clone(),
+            selected_family: self.selected_family.clone(),
+            prepared_audio: self.prepared_audio.as_view(),
+            request_options: self.request_options.clone(),
+            backend_preference: self.backend_preference,
+            resolved_runtime: self.resolved_runtime,
+            execution_context: Arc::clone(&self.execution_context),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn resolve_runtime_source_preflight(
         &self,
     ) -> Result<Cow<'_, GgmlAsrRuntimeSourcePreflight>, GgmlAsrExecutionRequestPreflightError> {
-        if let Some(preflight) = self.runtime_source_preflight.as_ref() {
-            if preflight.runtime_source.path() != self.runtime_source_path.as_path() {
-                return Err(GgmlAsrExecutionRequestPreflightError::PathMismatch {
-                    preflight_path: preflight.runtime_source.path().display().to_string(),
-                    request_path: self.runtime_source_path.display().to_string(),
-                });
-            }
-            return Ok(Cow::Borrowed(preflight));
-        }
-        let preflight = load_runtime_source_metadata_and_tensor_index(&self.runtime_source_path)
-            .map_err(|source| GgmlAsrExecutionRequestPreflightError::LoadFailed {
-                request_path: self.runtime_source_path.display().to_string(),
-                source: Box::new(source),
-            })?;
-        Ok(Cow::Owned(preflight))
+        resolve_runtime_source_preflight(
+            &self.runtime_source_path,
+            self.runtime_source_preflight.as_ref(),
+        )
     }
+}
+
+impl GgmlAsrExecutionViewRequest<'_> {
+    fn to_owned_request(&self) -> GgmlAsrExecutionRequest {
+        GgmlAsrExecutionRequest {
+            runtime_source_path: self.runtime_source_path.clone(),
+            runtime_source_preflight: self.runtime_source_preflight.clone(),
+            selected_family: self.selected_family.clone(),
+            prepared_audio: GgmlAsrPreparedAudio {
+                sample_rate_hz: self.prepared_audio.sample_rate_hz,
+                channels: self.prepared_audio.channels,
+                samples_f32: self.prepared_audio.samples_f32.to_vec(),
+            },
+            request_options: self.request_options.clone(),
+            backend_preference: self.backend_preference,
+            resolved_runtime: self.resolved_runtime,
+            execution_context: Arc::clone(&self.execution_context),
+        }
+    }
+
+    pub(crate) fn resolve_runtime_source_preflight(
+        &self,
+    ) -> Result<Cow<'_, GgmlAsrRuntimeSourcePreflight>, GgmlAsrExecutionRequestPreflightError> {
+        resolve_runtime_source_preflight(
+            &self.runtime_source_path,
+            self.runtime_source_preflight.as_ref(),
+        )
+    }
+}
+
+fn resolve_runtime_source_preflight<'a>(
+    runtime_source_path: &Path,
+    runtime_source_preflight: Option<&'a GgmlAsrRuntimeSourcePreflight>,
+) -> Result<Cow<'a, GgmlAsrRuntimeSourcePreflight>, GgmlAsrExecutionRequestPreflightError> {
+    if let Some(preflight) = runtime_source_preflight {
+        if preflight.runtime_source.path() != runtime_source_path {
+            return Err(GgmlAsrExecutionRequestPreflightError::PathMismatch {
+                preflight_path: preflight.runtime_source.path().display().to_string(),
+                request_path: runtime_source_path.display().to_string(),
+            });
+        }
+        return Ok(Cow::Borrowed(preflight));
+    }
+    let preflight =
+        load_runtime_source_metadata_and_tensor_index(runtime_source_path).map_err(|source| {
+            GgmlAsrExecutionRequestPreflightError::LoadFailed {
+                request_path: runtime_source_path.display().to_string(),
+                source: Box::new(source),
+            }
+        })?;
+    Ok(Cow::Owned(preflight))
 }
 
 impl GgmlAsrStreamingSessionRequest {
@@ -538,6 +699,58 @@ pub trait GgmlAsrExecutor: Send + Sync {
     fn unload_idle_state(&self) {}
 }
 
+/// Required zero-copy contract for executors owned by the built-in runtime.
+///
+/// This trait deliberately stays crate-private. Public extensions continue to
+/// implement the unchanged owned [`GgmlAsrExecutor`] contract; dispatch stores
+/// those in a compatibility slot and materializes owned PCM only when an
+/// internal shared view must cross that extension boundary. Built-ins cannot
+/// enter the native registry without implementing this view contract.
+pub(crate) trait GgmlAsrViewExecutor: Send + Sync {
+    fn executor_id(&self) -> &'static str;
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn supports_phrase_bias(&self) -> bool;
+    fn execute_view(
+        &self,
+        request: &GgmlAsrExecutionViewRequest<'_>,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>;
+    fn unload_idle_state(&self) {}
+}
+
+enum GgmlAsrExecutorSlot {
+    OwnedCompatibility(Arc<dyn GgmlAsrExecutor>),
+    SharedView(Arc<dyn GgmlAsrViewExecutor>),
+}
+
+impl GgmlAsrExecutorSlot {
+    fn execute_owned(
+        &self,
+        request: &GgmlAsrExecutionRequest,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        match self {
+            Self::OwnedCompatibility(executor) => executor.execute(request),
+            Self::SharedView(executor) => executor.execute_view(&request.as_view()),
+        }
+    }
+
+    fn execute_view(
+        &self,
+        request: &GgmlAsrExecutionViewRequest<'_>,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        match self {
+            Self::OwnedCompatibility(executor) => executor.execute(&request.to_owned_request()),
+            Self::SharedView(executor) => executor.execute_view(request),
+        }
+    }
+
+    fn unload_idle_state(&self) {
+        match self {
+            Self::OwnedCompatibility(executor) => executor.unload_idle_state(),
+            Self::SharedView(executor) => executor.unload_idle_state(),
+        }
+    }
+}
+
 pub trait GgmlAsrStreamingExecutor: Send + Sync {
     fn executor_id(&self) -> &'static str;
     fn start_streaming_session(
@@ -558,8 +771,8 @@ pub use crate::arch::StreamingPartialGranularity;
 
 #[derive(Default)]
 pub struct GgmlAsrExecutionDispatch {
-    executors_by_adapter_id: BTreeMap<&'static str, Arc<dyn GgmlAsrExecutor>>,
-    executors_by_capability: BTreeMap<&'static str, Arc<dyn GgmlAsrExecutor>>,
+    executors_by_adapter_id: BTreeMap<&'static str, GgmlAsrExecutorSlot>,
+    executors_by_capability: BTreeMap<&'static str, GgmlAsrExecutorSlot>,
     streaming_executors_by_adapter_id: BTreeMap<&'static str, Arc<dyn GgmlAsrStreamingExecutor>>,
     streaming_executors_by_capability: BTreeMap<&'static str, Arc<dyn GgmlAsrStreamingExecutor>>,
     streaming_partial_granularity_by_adapter_id:
@@ -574,7 +787,20 @@ impl GgmlAsrExecutionDispatch {
         adapter_id: &'static str,
         executor: Arc<dyn GgmlAsrExecutor>,
     ) -> Self {
-        self.executors_by_adapter_id.insert(adapter_id, executor);
+        self.executors_by_adapter_id.insert(
+            adapter_id,
+            GgmlAsrExecutorSlot::OwnedCompatibility(executor),
+        );
+        self
+    }
+
+    pub(crate) fn with_view_executor_for_adapter(
+        mut self,
+        adapter_id: &'static str,
+        executor: Arc<dyn GgmlAsrViewExecutor>,
+    ) -> Self {
+        self.executors_by_adapter_id
+            .insert(adapter_id, GgmlAsrExecutorSlot::SharedView(executor));
         self
     }
 
@@ -583,8 +809,22 @@ impl GgmlAsrExecutionDispatch {
         capability: GgmlExecutionCapability,
         executor: Arc<dyn GgmlAsrExecutor>,
     ) -> Self {
-        self.executors_by_capability
-            .insert(capability_label(capability), executor);
+        self.executors_by_capability.insert(
+            capability_label(capability),
+            GgmlAsrExecutorSlot::OwnedCompatibility(executor),
+        );
+        self
+    }
+
+    pub(crate) fn with_view_executor_for_capability(
+        mut self,
+        capability: GgmlExecutionCapability,
+        executor: Arc<dyn GgmlAsrViewExecutor>,
+    ) -> Self {
+        self.executors_by_capability.insert(
+            capability_label(capability),
+            GgmlAsrExecutorSlot::SharedView(executor),
+        );
         self
     }
 
@@ -669,13 +909,44 @@ impl GgmlAsrExecutionDispatch {
             .executors_by_adapter_id
             .get(request.selected_family.adapter_id)
         {
-            return executor.execute(request);
+            return executor.execute_owned(request);
         }
 
         if let Some(executor) = self.executors_by_capability.get(capability_label(
             request.selected_family.execution_capability,
         )) {
-            return executor.execute(request);
+            return executor.execute_owned(request);
+        }
+
+        Err(GgmlAsrExecutionError::ExecutorUnavailable {
+            adapter_id: request.selected_family.adapter_id,
+            model_family: request.selected_family.model_family,
+            capability: capability_label(request.selected_family.execution_capability),
+        })
+    }
+
+    pub(crate) fn execute_view(
+        &self,
+        request: &GgmlAsrExecutionViewRequest<'_>,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        ensure_adapter_supported_for_family(
+            &request.selected_family,
+            request.request_options.adapter_path.as_deref(),
+        )?;
+        let _backend_guard =
+            install_request_backend_override(request.backend_preference.request_backend_override());
+
+        if let Some(executor) = self
+            .executors_by_adapter_id
+            .get(request.selected_family.adapter_id)
+        {
+            return executor.execute_view(request);
+        }
+
+        if let Some(executor) = self.executors_by_capability.get(capability_label(
+            request.selected_family.execution_capability,
+        )) {
+            return executor.execute_view(request);
         }
 
         Err(GgmlAsrExecutionError::ExecutorUnavailable {
@@ -943,6 +1214,139 @@ mod tests {
                 "test fixture",
             )),
         }
+    }
+
+    fn successful_execution_result(text: &str) -> GgmlAsrExecutionResult {
+        GgmlAsrExecutionResult {
+            transcription: Transcription {
+                truncated_decodes: Vec::new(),
+                unnamed_speakers: Vec::new(),
+                text: text.to_string(),
+                segments: Vec::new(),
+                longform: None,
+                language: None,
+            },
+            carry_context: None,
+            decode_truncation: None,
+        }
+    }
+
+    #[test]
+    fn public_prepared_audio_retains_the_mutable_vec_contract() {
+        let mut audio = GgmlAsrPreparedAudio {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            samples_f32: vec![0.25],
+        };
+        audio.samples_f32.push(-0.5);
+        assert_eq!(audio.samples_f32, vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn shared_view_materializes_only_at_an_owned_extension_boundary() {
+        struct OwnedExtension {
+            observed: Arc<std::sync::Mutex<(usize, Vec<f32>)>>,
+        }
+
+        impl GgmlAsrExecutor for OwnedExtension {
+            fn executor_id(&self) -> &'static str {
+                "owned-extension"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute(
+                &self,
+                request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                *self.observed.lock().unwrap() = (
+                    request.prepared_audio.samples_f32.as_ptr() as usize,
+                    request.prepared_audio.samples_f32.clone(),
+                );
+                Ok(successful_execution_result("owned"))
+            }
+        }
+
+        let backing = crate::PcmBuffer::from_vec(vec![0.25, -0.5, 0.75]);
+        let shared_pointer = backing.as_ptr() as usize;
+        let owned = whisper_request(GgmlAsrBackendPreference::CpuOnly);
+        let mut view = owned.as_view();
+        view.prepared_audio = GgmlAsrPreparedAudioView::mono_16khz_shared(backing.full_slice());
+        let observed = Arc::new(std::sync::Mutex::new((0, Vec::new())));
+        let dispatch = GgmlAsrExecutionDispatch::default().with_executor_for_adapter(
+            WHISPER_GGML_ADAPTER_ID,
+            Arc::new(OwnedExtension {
+                observed: Arc::clone(&observed),
+            }),
+        );
+
+        let result = dispatch
+            .execute_view(&view)
+            .expect("compatibility dispatch");
+        assert_eq!(result.transcription.text, "owned");
+        let (observed_pointer, observed_samples) = observed.lock().unwrap().clone();
+        assert_eq!(observed_samples, backing.as_slice());
+        assert_ne!(
+            observed_pointer, shared_pointer,
+            "the owned extension boundary must receive its own Vec"
+        );
+    }
+
+    #[test]
+    fn native_view_slot_preserves_pcm_for_shared_and_public_owned_requests() {
+        struct ViewExecutor {
+            observed_pointers: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+
+        impl GgmlAsrViewExecutor for ViewExecutor {
+            fn executor_id(&self) -> &'static str {
+                "view-executor"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute_view(
+                &self,
+                request: &GgmlAsrExecutionViewRequest<'_>,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                self.observed_pointers
+                    .lock()
+                    .unwrap()
+                    .push(request.prepared_audio.samples_f32.as_ptr() as usize);
+                Ok(successful_execution_result("view"))
+            }
+        }
+
+        let observed_pointers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch = GgmlAsrExecutionDispatch::default().with_view_executor_for_adapter(
+            WHISPER_GGML_ADAPTER_ID,
+            Arc::new(ViewExecutor {
+                observed_pointers: Arc::clone(&observed_pointers),
+            }),
+        );
+
+        let backing = crate::PcmBuffer::from_vec(vec![0.1, 0.2, 0.3]);
+        let shared_pointer = backing.as_ptr() as usize;
+        let holder = whisper_request(GgmlAsrBackendPreference::CpuOnly);
+        let mut shared_request = holder.as_view();
+        shared_request.prepared_audio =
+            GgmlAsrPreparedAudioView::mono_16khz_shared(backing.full_slice());
+        dispatch
+            .execute_view(&shared_request)
+            .expect("shared view dispatch");
+
+        let owned_request = whisper_request(GgmlAsrBackendPreference::CpuOnly);
+        let owned_pointer = owned_request.prepared_audio.samples_f32.as_ptr() as usize;
+        dispatch.execute(&owned_request).expect("owned dispatch");
+
+        assert_eq!(
+            observed_pointers.lock().unwrap().as_slice(),
+            &[shared_pointer, owned_pointer]
+        );
     }
 
     fn whisper_streaming_request(

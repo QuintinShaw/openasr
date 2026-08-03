@@ -315,7 +315,7 @@ impl MoonshineEncoderGraphRuntime {
 
     pub(crate) fn encode(
         &mut self,
-        features: &MoonshineWaveformFeatures,
+        features: &MoonshineWaveformFeatures<'_>,
     ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
         let n_samples = features.samples.len();
         let l1 = conv_out_len(n_samples, CONV1_KERNEL, CONV1_STRIDE)?;

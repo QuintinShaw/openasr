@@ -39,9 +39,9 @@ use crate::models::decode_token_history::{
     build_longform_token_history_carry, trim_prompt_token_tail,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrCarryContext, GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult,
-    GgmlAsrExecutor, GgmlAsrPreparedAudio, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest,
+    GgmlAsrCarryContext, GgmlAsrExecutionError, GgmlAsrExecutionResult,
+    GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
@@ -152,7 +152,7 @@ pub(crate) struct CohereTranscribeGgmlExecutor {
 impl CohereTranscribeGgmlExecutor {
     fn execute_inner(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, CohereTranscribeGgmlExecutorError> {
         if request.selected_family.adapter_id != COHERE_TRANSCRIBE_GGML_ADAPTER_ID {
@@ -223,7 +223,7 @@ impl CohereTranscribeGgmlExecutor {
     fn decode_with_prepared_runtime(
         &self,
         runtime_source: &GgmlRuntimeSource,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
         prepared_runtime: &CoherePreparedRuntime,
         features: &CohereTranscribeMelFeatures,
         skip_serve_batch: bool,
@@ -452,7 +452,7 @@ fn cohere_runtime_cache_slot_unavailable() -> CohereTranscribeGgmlExecutorError 
     }
 }
 
-fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
+fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
 
@@ -539,7 +539,7 @@ fn decode_with_cached_cohere_decoder_runtime(
     )
 }
 
-impl GgmlAsrExecutor for CohereTranscribeGgmlExecutor {
+impl GgmlAsrViewExecutor for CohereTranscribeGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         COHERE_EXECUTOR_ID
     }
@@ -548,9 +548,9 @@ impl GgmlAsrExecutor for CohereTranscribeGgmlExecutor {
         true
     }
 
-    fn execute(
+    fn execute_view(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         // Offline decode: no token observer, batch worker allowed.
         self.execute_inner(request, false)
@@ -568,7 +568,7 @@ impl CohereTranscribeGgmlExecutor {
     /// direct greedy loop. The FINAL transcript remains byte-identical to `execute`.
     pub(crate) fn execute_streaming(
         &self,
-        request: &GgmlAsrExecutionRequest,
+        request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request, true)
             .map_err(|error| cohere_execute_error_to_ggml(self, error, request))
@@ -578,14 +578,14 @@ impl CohereTranscribeGgmlExecutor {
 fn cohere_execute_error_to_ggml(
     executor: &CohereTranscribeGgmlExecutor,
     error: CohereTranscribeGgmlExecutorError,
-    request: &GgmlAsrExecutionRequest,
+    request: &GgmlAsrExecutionViewRequest,
 ) -> GgmlAsrExecutionError {
     match error {
         CohereTranscribeGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
             GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
         }
         error => GgmlAsrExecutionError::ExecutorFailed {
-            executor_id: GgmlAsrExecutor::executor_id(executor),
+            executor_id: GgmlAsrViewExecutor::executor_id(executor),
             adapter_id: request.selected_family.adapter_id,
             reason: error.to_string(),
         },
@@ -842,8 +842,8 @@ mod tests {
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
     use crate::{
-        GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudio, LongFormOptions,
-        TranscriptionRequest, cohere_transcribe_runtime_descriptor_v1,
+        GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudioView,
+        LongFormOptions, TranscriptionRequest, cohere_transcribe_runtime_descriptor_v1,
     };
 
     fn sample_wav_fixture_path() -> PathBuf {
@@ -853,12 +853,12 @@ mod tests {
             .expect("sample wav fixture path must exist")
     }
 
-    fn runtime_ready_request(runtime_path: PathBuf) -> GgmlAsrExecutionRequest {
-        GgmlAsrExecutionRequest {
+    fn runtime_ready_request(runtime_path: PathBuf) -> GgmlAsrExecutionViewRequest<'static> {
+        GgmlAsrExecutionViewRequest {
             runtime_source_path: runtime_path,
             runtime_source_preflight: None,
             selected_family: cohere_transcribe_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(
                 crate::api::audio_io::load_wav_16khz_mono_f32_v0(
                     sample_wav_fixture_path(),
                     "cohere test",
@@ -888,7 +888,7 @@ mod tests {
 
             let executor = CohereTranscribeGgmlExecutor::default();
             let result = executor
-                .execute(&runtime_ready_request(runtime_path))
+                .execute_view(&runtime_ready_request(runtime_path))
                 .expect("executor should produce a best-effort transcription");
             assert!(result.transcription.text.is_ascii() || !result.transcription.text.is_empty());
             assert!(result.transcription.segments.is_empty());
@@ -926,7 +926,7 @@ mod tests {
 
             // First execute() against pack A builds both caches once.
             executor
-                .execute(&runtime_ready_request(path_a.clone()))
+                .execute_view(&runtime_ready_request(path_a.clone()))
                 .expect("pack a first execute");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -939,7 +939,7 @@ mod tests {
             // the request) -- must still hit both caches: content id, not
             // source-instance identity, is what the key carries.
             executor
-                .execute(&runtime_ready_request(path_a.clone()))
+                .execute_view(&runtime_ready_request(path_a.clone()))
                 .expect("pack a second execute");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -951,7 +951,7 @@ mod tests {
             // Pack B is a genuinely different pack (different content id).
             // Building its runtimes must not disturb pack A's cached slot.
             executor
-                .execute(&runtime_ready_request(path_b.clone()))
+                .execute_view(&runtime_ready_request(path_b.clone()))
                 .expect("pack b first execute");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -963,7 +963,7 @@ mod tests {
             // Pack A must still be a cache hit: pack B's distinct key never
             // evicted or clobbered pack A's healthy, resident sibling entry.
             executor
-                .execute(&runtime_ready_request(path_a))
+                .execute_view(&runtime_ready_request(path_a))
                 .expect("pack a third execute");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -974,7 +974,7 @@ mod tests {
 
             // And pack B must likewise still be resident.
             executor
-                .execute(&runtime_ready_request(path_b))
+                .execute_view(&runtime_ready_request(path_b))
                 .expect("pack b second execute");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -1017,7 +1017,7 @@ mod tests {
             let mut request = runtime_ready_request(path.clone());
             request.runtime_source_preflight = Some(old_preflight.clone());
             executor
-                .execute(&request)
+                .execute_view(&request)
                 .expect("first execute against old pack via held preflight");
             assert_eq!(cohere_runtime_build_counts_for_test(), (1, 1));
 
@@ -1041,7 +1041,7 @@ mod tests {
             let mut old_request = runtime_ready_request(path.clone());
             old_request.runtime_source_preflight = Some(old_preflight);
             executor
-                .execute(&old_request)
+                .execute_view(&old_request)
                 .expect("second execute reusing the held old preflight after replacement");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -1064,7 +1064,7 @@ mod tests {
             );
             let fresh_request = runtime_ready_request(path);
             executor
-                .execute(&fresh_request)
+                .execute_view(&fresh_request)
                 .expect("execute against freshly-resolved replaced pack");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -1101,7 +1101,7 @@ mod tests {
             // Fill the capacity-4 cache with packs 1..4, oldest first.
             for path in &paths[0..4] {
                 executor
-                    .execute(&runtime_ready_request(path.clone()))
+                    .execute_view(&runtime_ready_request(path.clone()))
                     .expect("fill cache execute");
             }
             assert_eq!(cohere_runtime_build_counts_for_test(), (4, 4));
@@ -1110,7 +1110,7 @@ mod tests {
             // the least recently used entry (never touched since its
             // initial insert), and build its own runtimes.
             executor
-                .execute(&runtime_ready_request(paths[4].clone()))
+                .execute_view(&runtime_ready_request(paths[4].clone()))
                 .expect("fifth pack execute");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -1122,7 +1122,7 @@ mod tests {
             // The three siblings that were never evicted must still hit.
             for path in &paths[1..4] {
                 executor
-                    .execute(&runtime_ready_request(path.clone()))
+                    .execute_view(&runtime_ready_request(path.clone()))
                     .expect("surviving sibling execute");
             }
             assert_eq!(
@@ -1134,7 +1134,7 @@ mod tests {
 
             // Pack 1, the evicted entry, must be a genuine miss and rebuild.
             executor
-                .execute(&runtime_ready_request(paths[0].clone()))
+                .execute_view(&runtime_ready_request(paths[0].clone()))
                 .expect("re-request evicted pack");
             assert_eq!(
                 cohere_runtime_build_counts_for_test(),
@@ -1147,7 +1147,7 @@ mod tests {
             // evicts pack 5, now the least recently used).
             for path in &paths[1..4] {
                 executor
-                    .execute(&runtime_ready_request(path.clone()))
+                    .execute_view(&runtime_ready_request(path.clone()))
                     .expect("surviving sibling execute after evicted pack returns");
             }
             assert_eq!(
@@ -1179,7 +1179,7 @@ mod tests {
 
                 let executor = CohereTranscribeGgmlExecutor::default();
                 let result = executor
-                    .execute(&runtime_ready_request(runtime_path))
+                    .execute_view(&runtime_ready_request(runtime_path))
                     .expect("CPU path should remain available when serve batch is enabled");
                 assert!(
                     result.transcription.text.is_ascii() || !result.transcription.text.is_empty()
@@ -1258,7 +1258,7 @@ mod tests {
             let mut request = runtime_ready_request(runtime_path);
             request.request_options.longform = Some(LongFormOptions::default());
             let result = executor
-                .execute(&request)
+                .execute_view(&request)
                 .expect("executor should produce a best-effort transcription");
             let carry = result
                 .carry_context
@@ -1421,7 +1421,7 @@ mod tests {
         let mut request = runtime_ready_request(runtime_path);
         request.selected_family = crate::whisper_runtime_descriptor_v1();
         let error = executor
-            .execute(&request)
+            .execute_view(&request)
             .expect_err("adapter mismatch must fail closed")
             .to_string();
         assert!(error.contains(COHERE_EXECUTOR_ID), "{error}");
@@ -1490,7 +1490,7 @@ mod tests {
 
             let mut req_jfk = runtime_ready_request(pack_path.clone());
             req_jfk.backend_preference = GgmlAsrBackendPreference::CpuOnly;
-            let jfk = executor.execute(&req_jfk).expect("jfk transcribe");
+            let jfk = executor.execute_view(&req_jfk).expect("jfk transcribe");
             assert_eq!(jfk.transcription.text, COHERE_GOLDEN_JFK_TEXT);
             eprintln!("cohere cache slots after chunk 1: {}", decoder_cache_len());
             assert_eq!(decoder_cache_len(), 1, "first chunk must build one slot");
@@ -1501,11 +1501,11 @@ mod tests {
                 "cohere cache-reuse test",
             )
             .expect("load zh_sample.wav");
-            let req_zh = GgmlAsrExecutionRequest {
+            let req_zh = GgmlAsrExecutionViewRequest {
                 runtime_source_path: pack_path,
                 runtime_source_preflight: None,
                 selected_family: cohere_transcribe_runtime_descriptor_v1(),
-                prepared_audio: GgmlAsrPreparedAudio::mono_16khz(zh_samples),
+                prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(zh_samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
                 resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
@@ -1519,7 +1519,7 @@ mod tests {
             // Content/language mismatch (zh_sample.wav vs cohere's English-first
             // prompt) is irrelevant here -- only decode-succeeds + cache-slot
             // count matter for this structural check.
-            executor.execute(&req_zh).expect("zh transcribe");
+            executor.execute_view(&req_zh).expect("zh transcribe");
             eprintln!(
                 "cohere cache slots after chunk 2 (different frame count): {}",
                 decoder_cache_len()
@@ -1563,7 +1563,7 @@ mod tests {
         with_forced_cpu_backend_for_test(|| {
             let executor = CohereTranscribeGgmlExecutor::default();
             let mut request = runtime_ready_request(pack_path);
-            request.prepared_audio = GgmlAsrPreparedAudio::mono_16khz(
+            request.prepared_audio = GgmlAsrPreparedAudioView::mono_16khz(
                 crate::api::audio_io::load_wav_16khz_mono_f32_v0(
                     wav_path,
                     "cohere mode=off grow test",
@@ -1573,7 +1573,7 @@ mod tests {
             );
             request.backend_preference = GgmlAsrBackendPreference::CpuOnly;
             let result = executor
-                .execute(&request)
+                .execute_view(&request)
                 .expect("mode=off single-window transcribe must succeed, not fail closed");
             assert_eq!(result.transcription.text, BASELINE_TEXT);
         });

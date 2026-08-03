@@ -94,9 +94,10 @@ pub use api::streaming::{StreamingConfig, StreamingEvent, StreamingEventKind, St
 pub use atomic_file::write_owner_only_file_atomically;
 pub use audio::{
     AudioInputError, AudioInputInfo, AudioInputIssue, AudioPreparationError,
-    AudioPreparationOptions, PcmBuffer, PcmSlice, PreparedAudioInput, prepare_audio_input,
-    probe_audio_input, probe_wav_duration, recognized_audio_extensions, validate_audio_input,
+    AudioPreparationOptions, PreparedAudioInput, prepare_audio_input, probe_audio_input,
+    probe_wav_duration, recognized_audio_extensions, validate_audio_input,
 };
+pub(crate) use audio::{PcmBuffer, PcmSlice};
 pub use backends_manifest_security::{
     BACKENDS_MANIFEST_PRODUCTION_KEY_ID, BACKENDS_MANIFEST_SIGNATURE_ALGORITHM,
     BACKENDS_MANIFEST_SIGNATURE_FILE_NAME, BACKENDS_MANIFEST_SIGNATURE_SCHEMA_VERSION,
@@ -193,6 +194,9 @@ pub use longform::{
 pub use model_store_gc::{
     ModelStoreEntry, ModelStoreGcReport, ModelStoreRefVerification, ModelStoreUsage,
     ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
+};
+pub(crate) use models::ggml_asr_executor::{
+    GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
