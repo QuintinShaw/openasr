@@ -13,7 +13,10 @@ use crate::BackendKind;
 
 pub use errors::{AudioInputError, AudioPreparationError};
 pub(crate) use types::RECOGNIZED_EXTENSIONS;
-pub use types::{AudioInputInfo, AudioInputIssue, AudioPreparationOptions, PreparedAudioInput};
+pub use types::{
+    AudioInputInfo, AudioInputIssue, AudioPreparationOptions, PcmBuffer, PcmSlice,
+    PreparedAudioInput,
+};
 
 pub fn recognized_audio_extensions() -> &'static [&'static str] {
     RECOGNIZED_EXTENSIONS

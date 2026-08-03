@@ -387,7 +387,10 @@ pub struct TranscriptionRequest {
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
     /// Exact speaker count to force during diarization clustering (the
-    /// `DiarizeHint::NumSpeakers` hint); `None` lets the threshold decide.
+    /// `DiarizeHint::NumSpeakers` hint), in
+    /// `1..=crate::diarize::contract::MAX_DIARIZATION_SPEAKERS`; `None` lets
+    /// the automatic strategy decide. The native request boundary rejects an
+    /// out-of-range value instead of silently clamping it.
     pub diarize_speakers: Option<u8>,
     /// Whether the punctuation-restoration post-processing stage may run.
     /// Defaults to `true` (auto-on): the stage itself is separately gated on
@@ -952,6 +955,10 @@ pub enum BackendError {
         "The speakers hint requires diarize=true.\nThe request was rejected instead of silently ignoring speakers."
     )]
     DiarizeSpeakersRequiresDiarization,
+    #[error(
+        "The speakers hint must be between 1 and {max}, got {requested}.\nThe request was rejected instead of silently clamping it to a different diarization workload."
+    )]
+    DiarizeSpeakersOutOfRange { requested: u8, max: u8 },
     #[error(
         "Phrase bias / hotword boosting is not supported by the {backend} backend yet.\nThe request was rejected instead of silently ignoring phrase_bias."
     )]

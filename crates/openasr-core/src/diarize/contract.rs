@@ -3,6 +3,12 @@
 //! which keeps "who said what" a pure interval computation decoupled from any
 //! model.
 
+/// Product and spectral-algorithm contract for an explicit recording-local
+/// speaker count. Request boundaries reject values outside
+/// `1..=MAX_DIARIZATION_SPEAKERS` instead of silently clamping them into a
+/// different workload.
+pub const MAX_DIARIZATION_SPEAKERS: u8 = 15;
+
 /// A half-open time span on the original-audio clock, in seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeRange {

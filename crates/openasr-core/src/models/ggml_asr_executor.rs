@@ -11,7 +11,7 @@ use crate::models::runtime_preflight::{
 };
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, GgufMetadata,
-    GgufTensorIndex, LongFormOptions, NativeAsrBackpressurePolicy, NativeAsrSession,
+    GgufTensorIndex, LongFormOptions, NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice,
     PhraseBiasConfig, RealtimeAudioFormat, RequestExecutionContext, Transcription,
     TranscriptionTask,
 };
@@ -148,11 +148,15 @@ pub trait RuntimeBuildIdentitySource {
 pub struct GgmlAsrPreparedAudio {
     pub sample_rate_hz: u32,
     pub channels: u16,
-    pub samples_f32: Vec<f32>,
+    pub samples_f32: PcmSlice,
 }
 
 impl GgmlAsrPreparedAudio {
     pub fn mono_16khz(samples_f32: Vec<f32>) -> Self {
+        Self::mono_16khz_view(samples_f32.into())
+    }
+
+    pub fn mono_16khz_view(samples_f32: PcmSlice) -> Self {
         Self {
             sample_rate_hz: 16_000,
             channels: 1,

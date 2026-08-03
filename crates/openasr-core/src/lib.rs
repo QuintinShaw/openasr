@@ -94,8 +94,8 @@ pub use api::streaming::{StreamingConfig, StreamingEvent, StreamingEventKind, St
 pub use atomic_file::write_owner_only_file_atomically;
 pub use audio::{
     AudioInputError, AudioInputInfo, AudioInputIssue, AudioPreparationError,
-    AudioPreparationOptions, PreparedAudioInput, prepare_audio_input, probe_audio_input,
-    probe_wav_duration, recognized_audio_extensions, validate_audio_input,
+    AudioPreparationOptions, PcmBuffer, PcmSlice, PreparedAudioInput, prepare_audio_input,
+    probe_audio_input, probe_wav_duration, recognized_audio_extensions, validate_audio_input,
 };
 pub use backends_manifest_security::{
     BACKENDS_MANIFEST_PRODUCTION_KEY_ID, BACKENDS_MANIFEST_SIGNATURE_ALGORITHM,

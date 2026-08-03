@@ -1,4 +1,6 @@
 use std::{
+    fmt,
+    ops::{Deref, Range},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -118,18 +120,220 @@ impl AudioPreparationOptions {
 /// memory, so callers never have to write them to a temporary WAV and
 /// immediately re-read + re-parse it back into the exact same samples.
 ///
-/// Deliberately `Arc<Vec<f32>>`, not `Arc<[f32]>`: wrapping the already-owned
-/// `Vec<f32>` the symphonia decode produced is a plain pointer move (`Arc::new`
-/// only allocates the small refcount header), whereas `Arc<[f32]>::from(vec)`
-/// would copy every sample into a new combined allocation. It also lets the
-/// sole consumer (`native_transcribe::resolve_prepared_audio_samples`) reclaim
-/// the exact same `Vec<f32>` via `Arc::try_unwrap` with zero copy whenever it
-/// is the last handle, instead of always cloning the samples out from behind
-/// a shared reference.
+/// The in-memory variant is an immutable [`PcmBuffer`]. Cloning it only bumps
+/// an `Arc` refcount; downstream consumers derive [`PcmSlice`] views into the
+/// same allocation instead of cloning a whole recording or each long-form
+/// chunk.
 #[derive(Debug)]
 pub(crate) enum PreparedAudioSamples {
     Path(PathBuf),
-    InMemory(Arc<Vec<f32>>),
+    InMemory(PcmBuffer),
+}
+
+/// Immutable, shared normalized PCM backing.
+///
+/// `Arc<Vec<f32>>` is intentional rather than `Arc<[f32]>`: decoded audio is
+/// already a `Vec`, so this wraps it without moving every sample into a second
+/// allocation. The vector is never exposed mutably. Long-form decode,
+/// recording-level Voice ID, and forced alignment share it through
+/// [`PcmSlice`] ranges.
+#[derive(Clone)]
+pub struct PcmBuffer {
+    backing: Arc<Vec<f32>>,
+}
+
+impl PcmBuffer {
+    pub fn from_vec(samples: Vec<f32>) -> Self {
+        Self {
+            backing: Arc::new(samples),
+        }
+    }
+
+    pub fn from_shared(samples: Arc<Vec<f32>>) -> Self {
+        Self { backing: samples }
+    }
+
+    pub(crate) fn shared_backing(&self) -> Arc<Vec<f32>> {
+        Arc::clone(&self.backing)
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        self.backing.as_slice()
+    }
+
+    pub fn len(&self) -> usize {
+        self.backing.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.backing.is_empty()
+    }
+
+    /// Bytes reserved by the normalized PCM sample allocation. This is the
+    /// owner-side number used by request memory admission, so callers do not
+    /// duplicate sample-count arithmetic at orchestration sites.
+    pub fn resident_bytes(&self) -> u64 {
+        u64::try_from(self.backing.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<f32>() as u64)
+    }
+
+    pub fn full_slice(&self) -> PcmSlice {
+        PcmSlice {
+            backing: Arc::clone(&self.backing),
+            range: 0..self.backing.len(),
+        }
+    }
+
+    /// Creates a range relative to this full backing. This follows ordinary
+    /// slice indexing semantics and panics for an invalid range; native
+    /// long-form ranges have already been validated by the planner.
+    pub fn slice(&self, range: Range<usize>) -> PcmSlice {
+        assert!(range.start <= range.end, "PCM range start exceeds end");
+        assert!(range.end <= self.backing.len(), "PCM range exceeds backing");
+        PcmSlice {
+            backing: Arc::clone(&self.backing),
+            range,
+        }
+    }
+
+    /// Stable test identity for one allocation. It deliberately identifies
+    /// the backing object rather than a slice's first sample (empty and offset
+    /// slices still share an identity).
+    #[cfg(test)]
+    pub(crate) fn backing_identity(&self) -> usize {
+        Arc::as_ptr(&self.backing) as usize
+    }
+}
+
+impl From<Vec<f32>> for PcmBuffer {
+    fn from(samples: Vec<f32>) -> Self {
+        Self::from_vec(samples)
+    }
+}
+
+impl From<Arc<Vec<f32>>> for PcmBuffer {
+    fn from(samples: Arc<Vec<f32>>) -> Self {
+        Self::from_shared(samples)
+    }
+}
+
+impl Deref for PcmBuffer {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[f32]> for PcmBuffer {
+    fn as_ref(&self) -> &[f32] {
+        self.as_slice()
+    }
+}
+
+impl fmt::Debug for PcmBuffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PcmBuffer")
+            .field("samples", &self.len())
+            .field("resident_bytes", &self.resident_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PcmBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+/// Immutable owned view into a [`PcmBuffer`].
+///
+/// A view is `Arc + Range`: cloning or sending it to a long-form worker never
+/// copies samples, and its public surface only exposes `&[f32]`.
+#[derive(Clone)]
+pub struct PcmSlice {
+    backing: Arc<Vec<f32>>,
+    range: Range<usize>,
+}
+
+impl PcmSlice {
+    pub fn as_slice(&self) -> &[f32] {
+        &self.backing[self.range.clone()]
+    }
+
+    pub fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backing_identity(&self) -> usize {
+        Arc::as_ptr(&self.backing) as usize
+    }
+
+    /// Creates a sub-view with a range relative to this view.
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        assert!(range.start <= range.end, "PCM sub-range start exceeds end");
+        assert!(range.end <= self.range.len(), "PCM sub-range exceeds view");
+        let start = self.range.start + range.start;
+        let end = self.range.start + range.end;
+        Self {
+            backing: Arc::clone(&self.backing),
+            range: start..end,
+        }
+    }
+}
+
+impl From<Vec<f32>> for PcmSlice {
+    fn from(samples: Vec<f32>) -> Self {
+        PcmBuffer::from_vec(samples).full_slice()
+    }
+}
+
+impl From<PcmBuffer> for PcmSlice {
+    fn from(buffer: PcmBuffer) -> Self {
+        buffer.full_slice()
+    }
+}
+
+impl Deref for PcmSlice {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[f32]> for PcmSlice {
+    fn as_ref(&self) -> &[f32] {
+        self.as_slice()
+    }
+}
+
+impl fmt::Debug for PcmSlice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PcmSlice")
+            .field("range", &self.range)
+            .field("backing_samples", &self.backing.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PcmSlice {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 #[derive(Debug)]
@@ -176,7 +380,7 @@ impl PreparedAudioInput {
     /// [`Self::path`] from disk.
     pub fn shared_samples(&self) -> Option<Arc<Vec<f32>>> {
         match &self.samples {
-            PreparedAudioSamples::InMemory(samples) => Some(Arc::clone(samples)),
+            PreparedAudioSamples::InMemory(samples) => Some(samples.shared_backing()),
             PreparedAudioSamples::Path(_) => None,
         }
     }
@@ -204,5 +408,39 @@ impl PreparedAudioInput {
             }
             PreparedAudioSamples::Path(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod pcm_tests {
+    use super::*;
+
+    #[test]
+    fn pcm_views_keep_one_backing_and_only_shift_the_sample_pointer() {
+        let buffer = PcmBuffer::from_vec((0..32).map(|sample| sample as f32).collect());
+        let first = buffer.slice(4..20);
+        let nested = first.slice(3..9);
+
+        assert_eq!(buffer.backing_identity(), first.backing_identity());
+        assert_eq!(first.backing_identity(), nested.backing_identity());
+        assert_eq!(first.range(), 4..20);
+        assert_eq!(nested.range(), 7..13);
+        assert_eq!(nested.as_slice(), &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(first.as_ptr(), buffer.as_ptr().wrapping_add(4));
+        assert_eq!(nested.as_ptr(), buffer.as_ptr().wrapping_add(7));
+    }
+
+    #[test]
+    fn pcm_clones_do_not_duplicate_resident_sample_bytes() {
+        let mut samples = Vec::with_capacity(64);
+        samples.extend([0.0, 1.0, 2.0]);
+        let buffer = PcmBuffer::from_vec(samples);
+        let clone = buffer.clone();
+        let view = buffer.full_slice();
+
+        assert_eq!(buffer.backing_identity(), clone.backing_identity());
+        assert_eq!(buffer.backing_identity(), view.backing_identity());
+        assert_eq!(buffer.resident_bytes(), 64 * 4);
+        assert_eq!(clone.resident_bytes(), buffer.resident_bytes());
     }
 }

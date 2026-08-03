@@ -79,7 +79,7 @@ mod tests {
         let audio = GgmlAsrPreparedAudio {
             sample_rate_hz: 16_000,
             channels: 2,
-            samples_f32: vec![1.0, 3.0, 0.0, 4.0],
+            samples_f32: vec![1.0, 3.0, 0.0, 4.0].into(),
         };
         let features = moonshine_waveform_from_prepared_audio(&audio, 16_000).expect("features");
         assert_eq!(features.samples, vec![2.0, 2.0]);

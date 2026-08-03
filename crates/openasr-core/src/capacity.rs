@@ -524,9 +524,9 @@ pub(crate) struct HostMemoryCapacityRejection {
     /// Resident decode-state bytes charged beyond the positional KV model and
     /// the pack file: fixed-size arena caches an AED-family decoder allocates
     /// at its full ceiling regardless of the request, and co-resident
-    /// auxiliary models a request is known to load (the VAD +
-    /// speaker-embedder attribution pass). Zero for families/requests with
-    /// neither.
+    /// request-owned decoded PCM plus auxiliary models/pipeline scratch a
+    /// request is known to retain (the VAD + speaker-embedder attribution
+    /// pass). Zero only when the caller has no known request working set.
     pub auxiliary_resident_bytes: u64,
     pub required_positions: usize,
     /// Which memory pool the budget was formed from -- so the message can name
@@ -568,7 +568,7 @@ impl HostMemoryCapacityRejection {
         let budget_gib = self.budget_bytes as f64 / GIB;
         let host_gib = self.host_total_memory_bytes as f64 / GIB;
         let workload = if self.required_positions == 0 && self.auxiliary_resident_bytes > 0 {
-            "the model pack plus the Voice ID working set".to_string()
+            "the model pack plus the decoded-audio and auxiliary working set".to_string()
         } else {
             format!(
                 "the model pack plus its decode context for {} decoder positions",
@@ -658,7 +658,7 @@ pub(crate) fn evaluate_host_memory_admission(
 }
 
 /// Admission for a family without positional KV facts when this request still
-/// has a known co-resident auxiliary working set (Voice ID). This preserves
+/// has a known co-resident decoded-audio/auxiliary working set. This preserves
 /// fail-open behavior for unknown decoder geometry while no longer dropping a
 /// deterministic pack + auxiliary charge on model families outside the KV
 /// registry.
@@ -1085,7 +1085,11 @@ mod tests {
                 .expect_err("known Voice ID state must be charged even without KV geometry");
         assert_eq!(rejection.required_positions, 0);
         assert_eq!(rejection.auxiliary_resident_bytes, auxiliary);
-        assert!(rejection.user_message().contains("Voice ID working set"));
+        assert!(
+            rejection
+                .user_message()
+                .contains("decoded-audio and auxiliary working set")
+        );
     }
 
     /// Discrete VRAM cannot page: swap never enters its budget, and the

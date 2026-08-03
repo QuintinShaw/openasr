@@ -1,10 +1,11 @@
-use std::{fs, path::PathBuf, process::Command, sync::Arc};
+use std::{fs, path::PathBuf, process::Command};
 
 use crate::{
     BackendKind,
     audio::{
-        AudioInputInfo, AudioPreparationError, AudioPreparationOptions, PreparedAudioInput,
-        RECOGNIZED_EXTENSIONS, decode, symphonia_decode, types::PreparedAudioSamples,
+        AudioInputInfo, AudioPreparationError, AudioPreparationOptions, PcmBuffer,
+        PreparedAudioInput, RECOGNIZED_EXTENSIONS, decode, symphonia_decode,
+        types::PreparedAudioSamples,
     },
 };
 
@@ -199,10 +200,9 @@ fn try_symphonia_prepare(info: &AudioInputInfo) -> Result<SymphoniaAttempt, Audi
 
     Ok(SymphoniaAttempt::Prepared(PreparedAudioInput {
         original,
-        // `Arc::new` (not `.into()`/`Arc::from`): wraps the already-allocated
-        // `Vec<f32>` in a new refcount header without copying its samples --
-        // see `PreparedAudioSamples`'s doc comment for why this matters.
-        samples: PreparedAudioSamples::InMemory(Arc::new(samples)),
+        // Wrap the already-allocated Vec without copying its samples. Every
+        // downstream stage receives immutable shared views from this owner.
+        samples: PreparedAudioSamples::InMemory(PcmBuffer::from_vec(samples)),
         temp_dir: None,
     }))
 }

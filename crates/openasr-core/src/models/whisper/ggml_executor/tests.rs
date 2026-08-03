@@ -839,8 +839,9 @@ fn nan_audio_fails_closed_before_encoder_execution() {
         called: Arc::clone(&mel_called),
         outcome: TestMelFeatureInputProviderOutcome::RealFrontend,
     };
-    let mut nan_audio = default_prepared_audio();
-    nan_audio.samples_f32[5] = f32::NAN;
+    let mut nan_samples = default_prepared_audio().samples_f32.to_vec();
+    nan_samples[5] = f32::NAN;
+    let nan_audio = GgmlAsrPreparedAudio::mono_16khz(nan_samples);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
         &whisper_runtime_descriptor_v1(),

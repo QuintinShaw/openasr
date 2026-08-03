@@ -411,7 +411,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
 pub(crate) fn align_forced(
     runtime_source: &GgmlRuntimeSource,
     assets: &Qwen3ForcedAlignerPreparedAssets,
-    audio_samples_16khz_mono: &[f32],
+    audio_samples_16khz_mono: crate::PcmSlice,
     text: &str,
     language: &str,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
@@ -421,7 +421,7 @@ pub(crate) fn align_forced(
     let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let mel_plan = load_qwen3_mel_frontend_plan_from_reader(&reader, embedding_metadata)?;
-    let prepared_audio = GgmlAsrPreparedAudio::mono_16khz(audio_samples_16khz_mono.to_vec());
+    let prepared_audio = forced_aligner_prepared_audio(audio_samples_16khz_mono);
     let mel_features = qwen3_mel_features_from_prepared_audio(&prepared_audio, &mel_plan)?;
 
     let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source), backend)
@@ -512,6 +512,12 @@ pub(crate) fn align_forced(
     Ok(items)
 }
 
+fn forced_aligner_prepared_audio(
+    audio_samples_16khz_mono: crate::PcmSlice,
+) -> GgmlAsrPreparedAudio {
+    GgmlAsrPreparedAudio::mono_16khz_view(audio_samples_16khz_mono)
+}
+
 /// Matches Python's `round(x, 3)` (round-half-to-even on the underlying f64
 /// representation is close enough here: timestamps are integer milliseconds
 /// divided by 1000, i.e. always an exact multiple of 0.001, so there is no
@@ -529,7 +535,7 @@ fn round_to_millis(value: f64) -> f64 {
 /// [`Qwen3ForcedAlignerRuntimeError::TextFailed`] rather than mis-tokenizing.
 pub(crate) fn refine_word_timestamps_with_forced_aligner(
     pack_path: &std::path::Path,
-    audio_samples_16khz_mono: &[f32],
+    audio_samples_16khz_mono: crate::PcmSlice,
     text: &str,
     language: &str,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
@@ -572,6 +578,16 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_aligner_frontend_keeps_the_callers_pcm_backing() {
+        let audio = crate::PcmBuffer::from_vec(vec![0.0; 32_000]);
+        let identity = audio.backing_identity();
+        let prepared = forced_aligner_prepared_audio(audio.full_slice());
+
+        assert_eq!(prepared.samples_f32.backing_identity(), identity);
+        assert_eq!(prepared.samples_f32.as_ptr(), audio.as_ptr());
+    }
 
     /// Stage 5 gate: run the full NAR pipeline end-to-end against the real
     /// Qwen3-ForcedAligner-0.6B checkpoint for both fixtures (`jfk.wav`
@@ -679,7 +695,7 @@ mod tests {
             let items = align_forced(
                 &runtime_source,
                 &assets,
-                &samples,
+                crate::PcmBuffer::from_vec(samples).full_slice(),
                 case.text,
                 case.language,
                 crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,

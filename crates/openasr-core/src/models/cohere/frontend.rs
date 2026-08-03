@@ -254,7 +254,7 @@ mod tests {
             &GgmlAsrPreparedAudio {
                 sample_rate_hz: 8_000,
                 channels: 1,
-                samples_f32: vec![0.0, 1.0],
+                samples_f32: vec![0.0, 1.0].into(),
             },
             &plan,
         )

@@ -30,6 +30,7 @@
 
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -328,7 +329,7 @@ impl GraniteSpeechGgmlExecutor {
             samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
         ensure_audio_within_capacity(audio_duration_seconds)?;
         let frontend = super::frontend::GraniteSpeechMelFrontend::new();
-        let (features, frames) = frontend.extract(&samples).map_err(|error| {
+        let (features, frames) = frontend.extract(samples.as_ref()).map_err(|error| {
             GraniteSpeechGgmlExecutorError::FrontendFailed {
                 reason: error.to_string(),
             }
@@ -483,16 +484,18 @@ impl GraniteSpeechGgmlExecutor {
     }
 }
 
-fn downmix_prepared_audio(audio: &GgmlAsrPreparedAudio) -> Vec<f32> {
+fn downmix_prepared_audio(audio: &GgmlAsrPreparedAudio) -> Cow<'_, [f32]> {
     if audio.channels <= 1 {
-        return audio.samples_f32.clone();
+        return Cow::Borrowed(audio.samples_f32.as_slice());
     }
     let channels = audio.channels as usize;
-    audio
-        .samples_f32
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
+    Cow::Owned(
+        audio
+            .samples_f32
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect(),
+    )
 }
 
 impl GgmlAsrExecutor for GraniteSpeechGgmlExecutor {
@@ -639,6 +642,30 @@ mod tests {
             assert!(GRANITE_SPEECH_MAX_GENERATED_TOKENS == 256);
             assert!(GRANITE_SPEECH_MAX_GENERATED_TOKENS < 1024);
         }
+    }
+
+    #[test]
+    fn mono_frontend_borrows_the_prepared_pcm_backing() {
+        let backing = crate::PcmBuffer::from_vec(vec![0.25, -0.5, 0.75]);
+        let prepared = GgmlAsrPreparedAudio::mono_16khz_view(backing.full_slice());
+        let samples = downmix_prepared_audio(&prepared);
+
+        assert!(matches!(samples, Cow::Borrowed(_)));
+        assert_eq!(samples.as_ptr(), prepared.samples_f32.as_ptr());
+    }
+
+    #[test]
+    fn multichannel_frontend_owns_only_the_required_downmix() {
+        let backing = crate::PcmBuffer::from_vec(vec![1.0, 3.0, -1.0, 1.0]);
+        let prepared = GgmlAsrPreparedAudio {
+            sample_rate_hz: 16_000,
+            channels: 2,
+            samples_f32: backing.full_slice(),
+        };
+        let samples = downmix_prepared_audio(&prepared);
+
+        assert!(matches!(samples, Cow::Owned(_)));
+        assert_eq!(samples.as_ref(), &[2.0, 0.0]);
     }
 
     /// The executor lifts every driver stop reason through

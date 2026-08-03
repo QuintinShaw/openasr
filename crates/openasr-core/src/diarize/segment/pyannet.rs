@@ -32,6 +32,26 @@ const MIN_SAMPLES: usize = 911;
 /// Number of powerset classes in the segmentation output.
 pub(crate) const NUM_CLASSES: usize = 7;
 
+/// Exact SincNet output-frame geometry used by the segmentation adapter and
+/// its request-memory estimator. Keeping the valid conv/pool chain here with
+/// the model prevents admission from guessing a frame count.
+pub(crate) const fn output_frame_count(samples: usize) -> usize {
+    let mut frames = valid_output_count(samples, 251, 10);
+    frames = valid_output_count(frames, 3, 3);
+    frames = valid_output_count(frames, 5, 1);
+    frames = valid_output_count(frames, 3, 3);
+    frames = valid_output_count(frames, 5, 1);
+    valid_output_count(frames, 3, 3)
+}
+
+const fn valid_output_count(input: usize, kernel: usize, stride: usize) -> usize {
+    if input < kernel {
+        0
+    } else {
+        (input - kernel) / stride + 1
+    }
+}
+
 /// Per-layer LSTM weight names (W input, R recurrent, B bias) in the exported
 /// ONNX graph.
 const LSTM_WEIGHTS: [(&str, &str, &str); 4] = [
@@ -121,6 +141,7 @@ impl PyannetModel {
             self.norm(&mut h, c_out, l, &format!("sincnet.norm1d.{}", idx + 1))?;
             leaky_relu_inplace(&mut h, ALPHA);
         }
+        debug_assert_eq!(l, output_frame_count(n));
         Ok((h, l))
     }
 

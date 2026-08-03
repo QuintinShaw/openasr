@@ -39,6 +39,39 @@ const MAX_LOCAL_SPEAKERS: usize = 3;
 const DEFAULT_WINDOW_S: f64 = 10.0;
 const DEFAULT_STEP_S: f64 = 1.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmenterWorkingSetGeometry {
+    pub activity_frame_step_samples: usize,
+    pub window_step_samples: usize,
+    pub frames_per_window: usize,
+    pub local_speaker_slots: usize,
+}
+
+pub(crate) const fn segmenter_working_set_geometry(
+    provider: SegmenterProvider,
+) -> SegmenterWorkingSetGeometry {
+    match provider {
+        SegmenterProvider::Segmentation3_0 => {
+            let window_samples = 10 * SAMPLE_RATE_HZ as usize;
+            SegmenterWorkingSetGeometry {
+                activity_frame_step_samples: FRAME_STEP_SAMPLES as usize,
+                window_step_samples: SAMPLE_RATE_HZ as usize,
+                frames_per_window: pyannet::output_frame_count(window_samples),
+                local_speaker_slots: MAX_LOCAL_SPEAKERS,
+            }
+        }
+        SegmenterProvider::DiariZen => SegmenterWorkingSetGeometry {
+            activity_frame_step_samples: diarizen::DIARIZEN_FRAME_STEP_SAMPLES as usize,
+            window_step_samples: diarizen::DIARIZEN_WINDOW_STEP_SAMPLES,
+            frames_per_window: 1
+                + (diarizen::DIARIZEN_WINDOW_SAMPLES
+                    - diarizen::DIARIZEN_FRAME_DURATION_SAMPLES as usize)
+                    / diarizen::DIARIZEN_FRAME_STEP_SAMPLES as usize,
+            local_speaker_slots: diarizen::DIARIZEN_LOCAL_SPEAKERS,
+        },
+    }
+}
+
 const POWERSET: [&[usize]; NUM_CLASSES] = [&[], &[0], &[1], &[2], &[0, 1], &[0, 2], &[1, 2]];
 
 #[derive(Debug, Error)]
@@ -568,6 +601,28 @@ fn decode_segments(logp: &[f32], frames: usize) -> Vec<SpeakerTurn> {
 #[cfg(test)]
 mod decode_tests {
     use super::*;
+
+    #[test]
+    fn working_set_geometry_matches_both_adapter_window_contracts() {
+        assert_eq!(
+            segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0),
+            SegmenterWorkingSetGeometry {
+                activity_frame_step_samples: 270,
+                window_step_samples: 16_000,
+                frames_per_window: 589,
+                local_speaker_slots: 3,
+            }
+        );
+        assert_eq!(
+            segmenter_working_set_geometry(SegmenterProvider::DiariZen),
+            SegmenterWorkingSetGeometry {
+                activity_frame_step_samples: 320,
+                window_step_samples: 25_600,
+                frames_per_window: 799,
+                local_speaker_slots: 4,
+            }
+        );
+    }
 
     fn frame(class: usize) -> Vec<f32> {
         let mut row = vec![-10.0f32; NUM_CLASSES];

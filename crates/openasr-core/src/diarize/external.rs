@@ -13,12 +13,15 @@ use thiserror::Error;
 use super::clustering::{AutomaticClusterer, AutomaticClusteringError};
 #[cfg(test)]
 use super::clustering::{AutomaticClusteringDiagnostics, AutomaticClusteringStrategy};
-use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
+use super::contract::{
+    DiarizeHint, MAX_DIARIZATION_SPEAKERS, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange,
+};
 use super::embed::{EmbedError, SpeakerEmbedder};
 use super::pipeline::Diarization;
 use super::segment::{
-    ActivityFrameClock, LocalActivity, PreparedSelectedSegmenter, SegmentError, SegmenterProvider,
-    SegmenterRuntimeInput, SelectedSegmenter,
+    ActivityFrameClock, LocalActivity, LocalActivityWindow, PreparedSelectedSegmenter,
+    SegmentError, SegmenterProvider, SegmenterRuntimeInput, SegmenterWorkingSetGeometry,
+    SelectedSegmenter, segmenter_working_set_geometry,
 };
 use crate::config::VoiceIdSegmenterPreference;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, RequestBackendPreference};
@@ -33,6 +36,271 @@ const EMBEDDING_STEP_S: f64 = 0.75;
 const EMBEDDING_WINDOWS_PER_BATCH_WORKER: usize = 4;
 const EMBEDDING_BATCH_SIZE: usize =
     super::embed::REDIMNET_MAX_BATCH_WORKERS * EMBEDDING_WINDOWS_PER_BATCH_WORKER;
+
+// Admission geometry for the request-owned buffers below. These live beside
+// the allocator-owning pipeline rather than in native_transcribe, so model or
+// window changes have one owner. Model weights are deliberately excluded:
+// PreparedExternalDiarizer already reports those separately by memory domain.
+const VAD_FRAME_STEP_SAMPLES: usize = 160;
+const REDIMNET_EMBEDDING_DIM: usize = 192;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ExternalDiarizationWorkingSetEstimate {
+    pub embedding_count: usize,
+    pub activity_bytes: u64,
+    pub vad_bytes: u64,
+    pub embedding_bytes: u64,
+    pub clustering_bytes: u64,
+    pub reconstruction_bytes: u64,
+}
+
+impl ExternalDiarizationWorkingSetEstimate {
+    pub(crate) fn total_bytes(self) -> u64 {
+        self.activity_bytes
+            .saturating_add(self.vad_bytes)
+            .saturating_add(self.embedding_bytes)
+            .saturating_add(self.clustering_bytes)
+            .saturating_add(self.reconstruction_bytes)
+    }
+}
+
+/// Duration-derived host-memory charge for the request-owned external
+/// diarization pipeline. The normalized PCM itself is not included here: its
+/// [`crate::PcmBuffer`] owner reports that exact allocation once to native
+/// admission, and every stage here borrows it.
+fn external_diarization_working_set_estimate(
+    audio_samples: usize,
+    segmenter: SegmenterWorkingSetGeometry,
+    forced_speakers: Option<u8>,
+) -> ExternalDiarizationWorkingSetEstimate {
+    if audio_samples == 0 {
+        return ExternalDiarizationWorkingSetEstimate::default();
+    }
+
+    let activity_frames = audio_samples.div_ceil(segmenter.activity_frame_step_samples);
+    let segmentation_windows = audio_samples.div_ceil(segmenter.window_step_samples);
+    let vad_frames = audio_samples.div_ceil(VAD_FRAME_STEP_SAMPLES);
+
+    // `union_regions` returns non-overlapping regions and `embedding_chunks`
+    // emits no window for a region <= one 0.75 s step. For longer regions it
+    // advances exactly one step per emitted window. Therefore fragmentation
+    // cannot create more windows than one continuous full-speech recording:
+    // ceil(total samples / step samples) is a geometric global upper bound.
+    let embedding_step_samples = (EMBEDDING_STEP_S * SAMPLE_RATE_HZ as f64) as usize;
+    let embedding_count = audio_samples.div_ceil(embedding_step_samples);
+
+    // `aggregate_speaker_count` builds f32 sums and u16 observation counts
+    // while all window masks remain live, then grows the final u8 count Vec
+    // before those two iterator-owned allocations are dropped.
+    let activity_bytes = bytes_for_count(
+        activity_frames,
+        std::mem::size_of::<f32>()
+            .saturating_add(std::mem::size_of::<u16>())
+            .saturating_add(std::mem::size_of::<u8>()),
+    )
+    .saturating_add(bytes_for_count(
+        segmentation_windows,
+        std::mem::size_of::<LocalActivityWindow>().saturating_add(segmenter.frames_per_window),
+    ));
+    let vad_bytes = bytes_for_count(vad_frames, std::mem::size_of::<f32>());
+
+    let per_embedding_bytes = std::mem::size_of::<TimeRange>()
+        .saturating_add(std::mem::size_of::<SpeakerEmbedding>())
+        .saturating_add(REDIMNET_EMBEDDING_DIM.saturating_mul(std::mem::size_of::<f32>()));
+    let persistent_embedding_bytes = bytes_for_count(embedding_count, per_embedding_bytes);
+    let bounded_embedding_batch_bytes = bytes_for_count(
+        EMBEDDING_BATCH_SIZE,
+        (EMBEDDING_WINDOW_S * SAMPLE_RATE_HZ as f64) as usize * std::mem::size_of::<f32>(),
+    );
+    let embedding_bytes = persistent_embedding_bytes.saturating_add(bounded_embedding_batch_bytes);
+
+    let automatic_speaker_bound = if embedding_count < 40 {
+        // Automatic short-recording AHC may retain every embedding as its own
+        // cluster. The spectral route below has the product-wide 15-speaker
+        // ceiling, but pretending that ceiling also applied to AHC would
+        // undercharge its reconstruction buffers for sub-30-second inputs.
+        embedding_count
+    } else {
+        usize::from(MAX_DIARIZATION_SPEAKERS).min(embedding_count)
+    };
+    let reconstruction_speakers = forced_speakers
+        .map(usize::from)
+        .unwrap_or(automatic_speaker_bound)
+        .min(embedding_count);
+
+    // The sparse spectral route retains max(ceil(1.2% * n), 6) neighbors.
+    // 1/80 (1.25%) is a small conservative round-up. During affinity build,
+    // directed rows coexist with at most two symmetrized entries per directed
+    // candidate. During eigensolve, affinity coexists with four n*16 f64 work
+    // matrices (basis/next/Laplacian/eigenvectors). Those phases do not
+    // coexist, so admission takes their maximum. Short recordings take the
+    // dense f32 AHC route instead.
+    let clustering_bytes = if embedding_count <= 1 {
+        0
+    } else if forced_speakers.is_none() && embedding_count < 40 {
+        let similarities = bytes_for_count(
+            embedding_count.saturating_mul(embedding_count),
+            std::mem::size_of::<f32>(),
+        );
+        let clusters = bytes_for_count(
+            embedding_count,
+            std::mem::size_of::<Vec<usize>>().saturating_add(std::mem::size_of::<usize>()),
+        );
+        similarities.saturating_add(clusters)
+    } else {
+        let retained = embedding_count.div_ceil(80).max(6).min(embedding_count);
+        let retained_entries = embedding_count.saturating_mul(retained);
+        let directed_payload =
+            bytes_for_count(retained_entries, std::mem::size_of::<(f32, usize)>());
+        let affinity_initialized_payload = bytes_for_count(
+            retained_entries.saturating_mul(2),
+            std::mem::size_of::<(usize, f64)>(),
+        );
+        // Symmetrization pushes into initially empty per-row Vecs. Geometric
+        // Vec growth can leave capacity just under twice the initialized edge
+        // count; the extra four entries per row also covers Vec's minimum
+        // non-zero allocation for sparse one-edge rows. Charge allocator
+        // capacity rather than only `len`.
+        let affinity_payload = affinity_initialized_payload
+            .saturating_mul(2)
+            .saturating_add(bytes_for_count(
+                embedding_count.saturating_mul(4),
+                std::mem::size_of::<(usize, f64)>(),
+            ));
+        let both_row_headers = bytes_for_count(
+            embedding_count.saturating_mul(2),
+            std::mem::size_of::<Vec<(usize, f64)>>(),
+        );
+        let degree = bytes_for_count(embedding_count, std::mem::size_of::<f64>());
+        let affinity_build_peak = directed_payload
+            .saturating_add(affinity_payload)
+            .saturating_add(both_row_headers)
+            .saturating_add(degree);
+        let one_row_header =
+            bytes_for_count(embedding_count, std::mem::size_of::<Vec<(usize, f64)>>());
+        let spectral_vector_count = forced_speakers
+            .map(usize::from)
+            .unwrap_or(usize::from(MAX_DIARIZATION_SPEAKERS) + 1)
+            .min(embedding_count);
+        let eigensolver_matrices = bytes_for_count(
+            embedding_count.saturating_mul(spectral_vector_count),
+            4usize.saturating_mul(std::mem::size_of::<f64>()),
+        );
+        let eigensolver_peak = affinity_payload
+            .saturating_add(one_row_header)
+            .saturating_add(degree)
+            .saturating_add(eigensolver_matrices);
+        affinity_build_peak.max(eigensolver_peak)
+    };
+
+    let reconstruction_bytes = reconstruction_working_set_bytes(
+        activity_frames,
+        reconstruction_speakers,
+        segmenter.local_speaker_slots,
+    );
+    ExternalDiarizationWorkingSetEstimate {
+        embedding_count,
+        activity_bytes,
+        vad_bytes,
+        embedding_bytes,
+        clustering_bytes,
+        reconstruction_bytes,
+    }
+}
+
+/// Peak of `reconstruct_global_turns`, including the output vector grown by
+/// `binary_to_turns`. The three large phases are mutually exclusive: window
+/// assignment owns overlap/Hungarian scratch before `binary` exists; per-frame
+/// selection owns its speaker-index scratch; then `binary_to_turns` grows the
+/// final turns while all three frame matrices remain live. Taking the maximum
+/// of those phase peaks is conservative without adding buffers that never
+/// coexist.
+fn reconstruction_working_set_bytes(
+    activity_frames: usize,
+    speaker_count: usize,
+    local_speaker_slots: usize,
+) -> u64 {
+    if activity_frames == 0 || speaker_count == 0 {
+        return 0;
+    }
+
+    let cells = activity_frames.saturating_mul(speaker_count);
+    let cluster_and_activations = bytes_for_count(
+        cells,
+        std::mem::size_of::<u8>().saturating_add(std::mem::size_of::<u16>()),
+    );
+
+    let overlap_payload = bytes_for_count(
+        local_speaker_slots.saturating_mul(speaker_count),
+        std::mem::size_of::<i64>(),
+    );
+    let overlap_rows = bytes_for_count(local_speaker_slots, std::mem::size_of::<Vec<i64>>());
+    // `hungarian_maximize` transposes rectangular input when rows > columns;
+    // both matrices coexist across that recursive call.
+    let transpose = if local_speaker_slots > speaker_count {
+        bytes_for_count(
+            speaker_count.saturating_mul(local_speaker_slots),
+            std::mem::size_of::<i64>(),
+        )
+        .saturating_add(bytes_for_count(
+            speaker_count,
+            std::mem::size_of::<Vec<i64>>(),
+        ))
+    } else {
+        0
+    };
+    let hungarian_rows = local_speaker_slots.min(speaker_count);
+    let hungarian_columns = local_speaker_slots.max(speaker_count);
+    let hungarian_scratch =
+        bytes_for_count(hungarian_rows.saturating_add(1), std::mem::size_of::<i64>())
+            .saturating_add(bytes_for_count(
+                hungarian_columns.saturating_add(1),
+                std::mem::size_of::<i64>()
+                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(2)),
+            ))
+            .saturating_add(bytes_for_count(
+                hungarian_columns.saturating_add(1),
+                std::mem::size_of::<i64>().saturating_add(std::mem::size_of::<bool>()),
+            ))
+            .saturating_add(bytes_for_count(
+                hungarian_rows,
+                std::mem::size_of::<(usize, usize)>(),
+            ));
+    let window_assignment_peak = cluster_and_activations
+        .saturating_add(overlap_payload)
+        .saturating_add(overlap_rows)
+        .saturating_add(transpose)
+        .saturating_add(hungarian_scratch);
+
+    let binary_bytes = bytes_for_count(cells, std::mem::size_of::<bool>());
+    let frame_selection_peak = cluster_and_activations
+        .saturating_add(binary_bytes)
+        .saturating_add(bytes_for_count(speaker_count, std::mem::size_of::<usize>()));
+
+    // Alternating active/inactive frames can emit ceil(frames/2) turns for
+    // every speaker. `Vec` grows geometrically from an empty allocation; 2x
+    // the final length (and at least four entries for a non-empty vector) is a
+    // conservative capacity charge rather than counting only initialized
+    // elements.
+    let worst_turn_count = activity_frames.div_ceil(2).saturating_mul(speaker_count);
+    let turn_capacity = worst_turn_count.saturating_mul(2).max(4);
+    let output_peak = cluster_and_activations
+        .saturating_add(binary_bytes)
+        .saturating_add(bytes_for_count(
+            turn_capacity,
+            std::mem::size_of::<SpeakerTurn>(),
+        ));
+
+    window_assignment_peak
+        .max(frame_selection_peak)
+        .max(output_peak)
+}
+
+fn bytes_for_count(count: usize, element_bytes: usize) -> u64 {
+    u64::try_from(count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(element_bytes).unwrap_or(u64::MAX))
+}
 
 #[derive(Debug, Error)]
 pub enum ExternalDiarizationError {
@@ -79,6 +347,19 @@ impl PreparedExternalDiarizer {
 
     pub(crate) fn segmenter_discrete_vram_budget_bytes(&self) -> Option<u64> {
         self.segmenter.discrete_vram_budget_bytes()
+    }
+
+    pub(crate) fn working_set_admission_bytes(
+        &self,
+        audio_samples: usize,
+        forced_speakers: Option<u8>,
+    ) -> u64 {
+        external_diarization_working_set_estimate(
+            audio_samples,
+            segmenter_working_set_geometry(self.segmenter.provider),
+            forced_speakers,
+        )
+        .total_bytes()
     }
 
     #[cfg(test)]
@@ -766,8 +1047,96 @@ fn speaker_centroids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diarize::segment::LocalActivityWindow;
     use sha2::Digest;
+
+    #[test]
+    fn working_set_admission_uses_the_global_embedding_window_bound() {
+        let one_hour_samples = SAMPLE_RATE_HZ as usize * 60 * 60;
+        let segmentation3 = segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0);
+        let diarizen = segmenter_working_set_geometry(SegmenterProvider::DiariZen);
+        let estimate =
+            external_diarization_working_set_estimate(one_hour_samples, segmentation3, None);
+        let diarizen_estimate =
+            external_diarization_working_set_estimate(one_hour_samples, diarizen, None);
+
+        assert_eq!(estimate.embedding_count, 4_800);
+        assert_eq!(diarizen_estimate.embedding_count, 4_800);
+        assert!(estimate.total_bytes() > 0);
+        assert!(estimate.reconstruction_bytes > estimate.activity_bytes);
+        assert!(estimate.reconstruction_bytes > estimate.clustering_bytes);
+        assert!(
+            estimate.total_bytes() < 256 * 1024 * 1024,
+            "one hour of ordinary geometry must not be inflated into a multi-GiB admission charge: {estimate:?}"
+        );
+        assert!(
+            diarizen_estimate.total_bytes() < 256 * 1024 * 1024,
+            "DiariZen's exact 799-frame window geometry must stay duration-bounded: {diarizen_estimate:?}"
+        );
+        assert_ne!(
+            estimate.activity_bytes, diarizen_estimate.activity_bytes,
+            "provider-specific frame/window geometry must affect admission"
+        );
+
+        let forced_one =
+            external_diarization_working_set_estimate(one_hour_samples, segmentation3, Some(1));
+        let forced_max = external_diarization_working_set_estimate(
+            one_hour_samples,
+            segmentation3,
+            Some(MAX_DIARIZATION_SPEAKERS),
+        );
+        assert!(forced_one.reconstruction_bytes < forced_max.reconstruction_bytes);
+        assert_eq!(
+            forced_max.reconstruction_bytes,
+            estimate.reconstruction_bytes
+        );
+    }
+
+    #[test]
+    fn working_set_admission_is_zero_for_empty_and_monotonic_with_duration() {
+        assert_eq!(
+            external_diarization_working_set_estimate(
+                0,
+                segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0),
+                None,
+            ),
+            ExternalDiarizationWorkingSetEstimate::default()
+        );
+
+        let geometry = segmenter_working_set_geometry(SegmenterProvider::Segmentation3_0);
+        let totals: Vec<_> = [60usize, 10 * 60, 60 * 60, 2 * 60 * 60]
+            .into_iter()
+            .map(|seconds| {
+                external_diarization_working_set_estimate(
+                    seconds.saturating_mul(SAMPLE_RATE_HZ as usize),
+                    geometry,
+                    None,
+                )
+                .total_bytes()
+            })
+            .collect();
+        assert!(
+            totals.windows(2).all(|pair| pair[0] < pair[1]),
+            "{totals:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruction_admission_includes_worst_case_turn_capacity() {
+        let frames = 101usize;
+        let speakers = usize::from(MAX_DIARIZATION_SPEAKERS);
+        let matrix_bytes = bytes_for_count(
+            frames.saturating_mul(speakers),
+            std::mem::size_of::<u8>() + std::mem::size_of::<u16>() + std::mem::size_of::<bool>(),
+        );
+        let worst_turns = frames.div_ceil(2).saturating_mul(speakers);
+        let initialized_turn_bytes =
+            bytes_for_count(worst_turns, std::mem::size_of::<SpeakerTurn>());
+        let estimate = reconstruction_working_set_bytes(frames, speakers, 4);
+
+        assert!(estimate >= matrix_bytes.saturating_add(initialized_turn_bytes));
+        assert_eq!(reconstruction_working_set_bytes(0, speakers, 4), 0);
+        assert_eq!(reconstruction_working_set_bytes(frames, 0, 4), 0);
+    }
 
     #[derive(serde::Deserialize)]
     struct NativeDiarizationFixture {

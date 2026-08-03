@@ -308,7 +308,7 @@ mod tests {
         let audio = GgmlAsrPreparedAudio {
             sample_rate_hz: 8_000,
             channels: 1,
-            samples_f32: vec![0.0, 0.1, 0.2],
+            samples_f32: vec![0.0, 0.1, 0.2].into(),
         };
         let error = whisper_mel_features_from_prepared_audio_v0(&audio, 80, 16)
             .unwrap_err()

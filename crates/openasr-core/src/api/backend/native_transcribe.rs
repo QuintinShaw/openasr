@@ -34,7 +34,7 @@ use crate::{
     ExecutionTarget, GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
     GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrPreparedAudio,
     GgmlAsrRuntimeSourcePreflight, GgmlFamilyAdapterDescriptor, GgmlFamilyRegistry,
-    GgmlFamilyRegistrySelectionError, OasrV1MetadataError, parse_model_ref,
+    GgmlFamilyRegistrySelectionError, OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
 };
 
 use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
@@ -435,7 +435,7 @@ fn run_dispatch_once_with_progress(
     dispatch: &GgmlAsrExecutionDispatch,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     selected_family: &GgmlFamilyAdapterDescriptor,
-    chunk: Vec<f32>,
+    chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
     execution_context: &Arc<crate::RequestExecutionContext>,
@@ -601,7 +601,7 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
     dispatch: &GgmlAsrExecutionDispatch,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     selected_family: &GgmlFamilyAdapterDescriptor,
-    chunk: Vec<f32>,
+    chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
     execution_context: &Arc<crate::RequestExecutionContext>,
@@ -844,7 +844,7 @@ struct DecodedSlice {
 struct ConcurrentSlicePipeline<'a> {
     width: usize,
     slices: Vec<crate::longform::AudioSlice>,
-    plan_audio: &'a [f32],
+    plan_audio: &'a PcmBuffer,
     dispatch: &'a GgmlAsrExecutionDispatch,
     runtime_preflight: &'a GgmlAsrRuntimeSourcePreflight,
     selected_family: &'a GgmlFamilyAdapterDescriptor,
@@ -997,7 +997,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                         // path trades away for overlap).
                         let slice_options = request_options.clone();
                         let chunk =
-                            plan_audio[item.slice.start_sample..item.slice.end_sample].to_vec();
+                            plan_audio.slice(item.slice.start_sample..item.slice.end_sample);
                         let outcome = run_dispatch_once_with_progress_and_gpu_fallback(
                             dispatch,
                             runtime_preflight,
@@ -1206,6 +1206,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::DiarizationSegmenterUnavailable
         | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
+        | BackendError::DiarizeSpeakersOutOfRange { .. }
         | BackendError::PhraseBiasNotSupported { .. }
         | BackendError::AdapterNotSupported { .. }
         | BackendError::PhraseBiasUnsupportedByModel { .. }
@@ -1235,6 +1236,12 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
 fn run_native_transcription_fallible(
     request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
+    if let Some(requested) = request.diarize_speakers {
+        let max = crate::diarize::contract::MAX_DIARIZATION_SPEAKERS;
+        if !(1..=max).contains(&requested) {
+            return Err(BackendError::DiarizeSpeakersOutOfRange { requested, max });
+        }
+    }
     if request.voice_id && !request.source.supports_recording_voice_id() {
         return Err(BackendError::VoiceIdUnsupportedForRealtime {
             request_source: request.source.as_log_label(),
@@ -1262,15 +1269,6 @@ fn run_native_transcription_fallible(
     // entry is removed on every exit and the align phase advances the same
     // monotonic bar rather than running uncounted.
     let _progress = ProgressRegistryHandle::new(execution_context.request_id.clone());
-    let input_path = request.input_path.clone();
-    // Only clone the in-memory samples' `Arc` when the (opt-in, uncommon)
-    // forced-aligner refine stage will actually need to re-read them after
-    // the main decode below has consumed `request`: cloning unconditionally
-    // would keep a second strong reference alive for the whole decode,
-    // permanently defeating the zero-copy `Arc::try_unwrap` reclaim in
-    // `resolve_prepared_audio_samples` (see its doc comment) for every
-    // request, not just refine ones.
-    let prepared_samples_for_refine = refine.then(|| request.prepared_samples.clone()).flatten();
     let language_hint = request.language.clone();
     let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
@@ -1298,7 +1296,7 @@ fn run_native_transcription_fallible(
     // finer `audio_prep` sub-stage nests inside `inference`'s span rather than
     // being disjoint from it, which is called out in both log lines' names.
     let inference_started = Instant::now();
-    let transcription = run_native_transcription_impl(request)?;
+    let (transcription, prepared_audio) = run_native_transcription_impl(request)?;
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
@@ -1318,8 +1316,8 @@ fn run_native_transcription_fallible(
         publish_align_progress(execution_context.request_id.as_deref());
         refine_transcription_word_timestamps_with_forced_aligner(
             transcription,
-            &input_path,
-            prepared_samples_for_refine,
+            forced_aligner_audio_view(&prepared_audio, refine)
+                .expect("enabled forced alignment retains the normalized PCM view"),
             language_hint.as_deref(),
         )
     } else {
@@ -1418,50 +1416,39 @@ fn punctuate_transcription_segments(
 /// conversion paths leave `prepared_samples` unset, so this falls back to the
 /// WAV load exactly as before for those.
 ///
-/// Takes `prepared_samples` by value (not by reference) so that when the
-/// caller passes its *only* remaining `Arc` handle, `Arc::try_unwrap` below
-/// reclaims the underlying `Vec<f32>` with zero copy instead of cloning it
-/// out from behind a shared reference -- avoiding the double-memory window
-/// (the `Arc`'s buffer plus a freshly cloned `Vec` of the same audio) this
-/// would otherwise cost for the whole decode. Only falls back to an actual
-/// clone when another reference is still alive (the opt-in forced-aligner
-/// refine path, which legitimately needs the samples a second time after the
-/// main decode has consumed them -- see `run_native_transcription_fallible`).
+/// The result is an immutable shared PCM owner. Both an already-prepared input
+/// and a WAV loaded here enter the same representation; every later consumer
+/// receives a cheap range view, so a second reference can never trigger a
+/// whole-recording clone.
 fn resolve_prepared_audio_samples(
     input_path: &Path,
     prepared_samples: Option<Arc<Vec<f32>>>,
-) -> Result<Vec<f32>, crate::NativeAsrError> {
+) -> Result<PcmBuffer, crate::NativeAsrError> {
     if let Some(samples) = prepared_samples {
-        return Ok(Arc::try_unwrap(samples).unwrap_or_else(|shared| (*shared).clone()));
+        return Ok(PcmBuffer::from_shared(samples));
     }
     load_wav_16khz_mono_f32_v0(
         input_path,
         "Native ASR Core backend",
         "Native ASR Core backend",
     )
+    .map(PcmBuffer::from_vec)
 }
 
-/// Re-decodes `input_path` (or reuses `prepared_samples` when already
-/// resident in memory) and calls the installed Qwen3-ForcedAligner pack once
-/// over the whole finished transcript, then reassigns each segment's `words`
+/// Reuses the exact normalized PCM backing decoded by the main request and
+/// calls the installed Qwen3-ForcedAligner pack once over the whole finished
+/// transcript, then reassigns each segment's `words`
 /// from the aligner's own per-word spans (dropping the family's approximate
 /// per-word confidence -- the aligner does not produce one; never inventing a
 /// value is preferred to fabricating one). Segments/text/speaker attribution
 /// from the ordinary decode path are left untouched; only `words` changes.
 fn refine_transcription_word_timestamps_with_forced_aligner(
     mut transcription: Transcription,
-    input_path: &Path,
-    prepared_samples: Option<Arc<Vec<f32>>>,
+    prepared_audio: PcmSlice,
     language_hint: Option<&str>,
 ) -> Result<Transcription, BackendError> {
     let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
         .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
-    let prepared_audio =
-        resolve_prepared_audio_samples(input_path, prepared_samples).map_err(|error| {
-            BackendError::NativeUnsupportedInputFormat {
-                reason: error.to_string(),
-            }
-        })?;
     let language = transcription
         .language
         .clone()
@@ -1469,7 +1456,7 @@ fn refine_transcription_word_timestamps_with_forced_aligner(
         .unwrap_or_else(|| "en".to_string());
     let items = refine_word_timestamps_with_forced_aligner(
         &pack_path,
-        &prepared_audio,
+        prepared_audio,
         &transcription.text,
         &language,
     )
@@ -1548,19 +1535,24 @@ impl SpeakerPlan {
     }
 }
 
+fn voice_id_audio_view(audio: &PcmBuffer, speaker_plan: SpeakerPlan) -> Option<PcmSlice> {
+    (speaker_plan != SpeakerPlan::Off).then(|| audio.full_slice())
+}
+
+fn forced_aligner_audio_view(audio: &PcmBuffer, refine: bool) -> Option<PcmSlice> {
+    refine.then(|| audio.full_slice())
+}
+
 fn run_native_transcription_impl(
     mut request: TranscriptionRequest,
-) -> Result<Transcription, BackendError> {
+) -> Result<(Transcription, PcmBuffer), BackendError> {
     // Captured up front and threaded explicitly through the dispatch calls
     // below (never a thread-local): every cooperative cancel checkpoint in
     // this function and the shared decode driver reads this same `Arc`.
     let execution_context = Arc::clone(&request.execution_context);
-    // Taken up front (before `requested_model_id` below borrows `request` for
-    // the rest of this function): leaves `request.prepared_samples` as
-    // `None` and hands `resolve_prepared_audio_samples` the only `Arc`
-    // strong reference in the common (non-refine) case, so it can reclaim
-    // the underlying `Vec<f32>` with zero copy instead of cloning it -- see
-    // that function's doc comment.
+    // Taken up front before `requested_model_id` borrows `request`. The value
+    // is already an immutable shared owner; moving it here preserves the
+    // exact backing while later ASR/Voice-ID/aligner stages clone only views.
     let prepared_samples = request.prepared_samples.take();
     let model_resolve_started = Instant::now();
     let requested_model_id = normalize_and_validate_model_id(&request)?;
@@ -1724,29 +1716,34 @@ fn run_native_transcription_impl(
     // separately because Auto may legitimately place DiariZen on a GPU even
     // when this ASR family gates its own Auto path to CPU.
     let admission_backend = resolved_runtime_for_request.backend();
+    let request_working_set = native_request_working_set_admission(
+        speaker_plan,
+        prepared_audio.resident_bytes(),
+        voice_id_embedder_plan
+            .as_ref()
+            .map_or(0, |embedder| embedder.admission_bytes()),
+        external_diarizer_plan.as_ref().map(|diarizer| {
+            (
+                diarizer.segmenter_admission_bytes(),
+                diarizer.segmenter_admission_backend(),
+                diarizer.segmenter_discrete_vram_budget_bytes(),
+                diarizer
+                    .working_set_admission_bytes(prepared_audio.len(), request.diarize_speakers),
+            )
+        }),
+    );
+    let decoder_discrete_vram_budget_bytes = minimum_discrete_vram_budget_for_preference(
+        admission_backend,
+        request_backend_preference.as_ref(),
+    );
     enforce_native_host_memory_admission(
         selected_family.model_architecture,
         &runtime_preflight.metadata,
         runtime_source.byte_len(),
         audio_duration_seconds,
         admission_backend,
-        voice_id_auxiliary_admission(
-            speaker_plan,
-            voice_id_embedder_plan
-                .as_ref()
-                .map_or(0, |embedder| embedder.admission_bytes()),
-            external_diarizer_plan.as_ref().map(|diarizer| {
-                (
-                    diarizer.segmenter_admission_bytes(),
-                    diarizer.segmenter_admission_backend(),
-                    diarizer.segmenter_discrete_vram_budget_bytes(),
-                )
-            }),
-        ),
-        minimum_discrete_vram_budget_for_preference(
-            admission_backend,
-            request_backend_preference.as_ref(),
-        ),
+        request_working_set,
+        decoder_discrete_vram_budget_bytes,
     )?;
 
     let voice_id_embedder = if speaker_plan == SpeakerPlan::Off {
@@ -1777,21 +1774,24 @@ fn run_native_transcription_impl(
 
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
+    let voice_id_audio = voice_id_audio_view(&prepared_audio, speaker_plan);
     let speaker_turns = if let Some(diarizer) = external_diarizer.as_ref() {
         let hint = match request.diarize_speakers {
             Some(speakers) => crate::diarize::contract::DiarizeHint::NumSpeakers(speakers),
             None => crate::diarize::contract::DiarizeHint::Auto,
         };
-        compute_speaker_attribution(diarizer, &prepared_audio, hint, &execution_context)?
+        compute_speaker_attribution(
+            diarizer,
+            voice_id_audio
+                .as_ref()
+                .expect("external speaker plan retains a Voice ID PCM view")
+                .as_slice(),
+            hint,
+            &execution_context,
+        )?
     } else {
         SpeakerAttribution::default()
     };
-    // The executor consumes its input buffer on the short-form path. Retain a
-    // copy for either Voice ID source: both converge on the shared acoustic
-    // evidence and enrolled-person matcher after their turns are normalized.
-    // Voice ID-off transcriptions keep the zero-copy path.
-    let voice_id_audio = (speaker_plan != SpeakerPlan::Off).then(|| prepared_audio.clone());
-
     let dispatch = shared_native_ggml_execution_dispatch();
     let longform_resolution = resolve_native_longform_policy(
         request.longform.as_ref(),
@@ -1875,7 +1875,7 @@ fn run_native_transcription_impl(
     let mut truncated_decodes: Vec<TruncatedDecode> = Vec::new();
     if run_longform {
         let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options)?;
-        let plan = plan_longform_slices(
+        let mut plan = plan_longform_slices(
             &prepared_audio,
             16_000,
             &longform_options,
@@ -1909,31 +1909,54 @@ fn run_native_transcription_impl(
             );
         }
         let slice_kind_summary = summarize_slice_kinds(&plan.slices);
-        let timeline_kind = if plan.processed_audio.is_some() {
+        let has_processed_audio = plan.processed_audio.is_some();
+        let timeline_kind = if has_processed_audio {
             "packed"
         } else {
             "identity"
         };
         if plan.slices.is_empty() {
-            return Ok(Transcription {
-                truncated_decodes: Vec::new(),
-                unnamed_speakers: Vec::new(),
-                text: String::new(),
-                segments: Vec::new(),
-                longform: Some(build_longform_metadata(
-                    &longform_options,
-                    plan_stats.chunk_count,
-                    plan_stats.skipped_silent_chunks,
-                    plan_stats.duplicate_merge_count,
-                    slice_kind_summary,
-                    timeline_kind,
-                    &longform_provenance,
-                    resolved_runtime_for_request.backend(),
-                )),
-                language: reported_language.clone(),
-            });
+            return Ok((
+                Transcription {
+                    truncated_decodes: Vec::new(),
+                    unnamed_speakers: Vec::new(),
+                    text: String::new(),
+                    segments: Vec::new(),
+                    longform: Some(build_longform_metadata(
+                        &longform_options,
+                        plan_stats.chunk_count,
+                        plan_stats.skipped_silent_chunks,
+                        plan_stats.duplicate_merge_count,
+                        slice_kind_summary,
+                        timeline_kind,
+                        &longform_provenance,
+                        resolved_runtime_for_request.backend(),
+                    )),
+                    language: reported_language.clone(),
+                },
+                prepared_audio,
+            ));
         }
-        if plan.processed_audio.is_some() || plan.slices.len() > 1 {
+        // Packed longform owns a second PCM allocation while the original
+        // normalized recording stays alive for Voice ID, forced alignment,
+        // and original-timeline assembly. The initial gate above runs before
+        // planning and charges the original once; now that the planner has
+        // materialized the exact packed Vec, repeat the decoder gate with its
+        // actual capacity before building any decode graph. Identity plans
+        // and all-silent plans that dispatch no decoder need no second gate.
+        if let Some(processed_audio) = plan.processed_audio.as_ref() {
+            enforce_native_host_memory_admission(
+                selected_family.model_architecture,
+                &runtime_preflight.metadata,
+                runtime_source.byte_len(),
+                audio_duration_seconds,
+                admission_backend,
+                request_working_set
+                    .with_additional_unified_bytes(pcm_vec_resident_bytes(processed_audio)),
+                decoder_discrete_vram_budget_bytes,
+            )?;
+        }
+        if has_processed_audio || plan.slices.len() > 1 {
             let mut assembler =
                 TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default());
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
@@ -1942,10 +1965,15 @@ fn run_native_transcription_impl(
                 longform_prompt_carry_mode(&longform_options, selected_family.model_architecture);
             let mut ran_any_slice = false;
             let mut suppressed_slice_count = 0usize;
+            // Silence packing necessarily creates different samples; move
+            // that Vec into one new immutable backing. Identity plans clone
+            // only the original backing handle. Every slice below is a range
+            // view into whichever one applies.
             let plan_audio = plan
                 .processed_audio
-                .as_deref()
-                .unwrap_or(prepared_audio.as_slice());
+                .take()
+                .map(PcmBuffer::from_vec)
+                .unwrap_or_else(|| prepared_audio.clone());
             // Publish per-slice decode progress for the UI, weighted by each
             // slice's audio samples so the bar tracks decode time rather than slice
             // number. The forced-align refine (if any) continues the same monotonic
@@ -2018,7 +2046,7 @@ fn run_native_transcription_impl(
                 run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
                     width: pipeline_width,
                     slices: plan.slices,
-                    plan_audio,
+                    plan_audio: &plan_audio,
                     dispatch,
                     runtime_preflight: &runtime_preflight,
                     selected_family: &selected_family,
@@ -2051,7 +2079,7 @@ fn run_native_transcription_impl(
                         .content_end_sample
                         .saturating_sub(slice.start_sample)
                         .min(slice.duration_samples());
-                    let chunk = plan_audio[slice.start_sample..slice.end_sample].to_vec();
+                    let chunk = plan_audio.slice(slice.start_sample..slice.end_sample);
                     if longform_options.suppress_silent_slices
                         && is_effectively_silent(
                             &chunk[relative_start..relative_end],
@@ -2240,7 +2268,7 @@ fn run_native_transcription_impl(
                     dispatch,
                     &runtime_preflight,
                     &selected_family,
-                    prepared_audio.clone(),
+                    prepared_audio.full_slice(),
                     fallback_options,
                     backend_preference,
                     &execution_context,
@@ -2256,33 +2284,35 @@ fn run_native_transcription_impl(
                     })
                     .into_iter()
                     .collect();
-                return finalize_native_transcription(
+                let transcription = finalize_native_transcription(
                     fallback.into_transcription(),
                     audio_duration_seconds,
                     Some(run_metadata),
                     &speaker_turns,
-                    voice_id_audio.as_deref().unwrap_or(&[]),
+                    voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
                     voice_id_embedder.as_deref(),
                     speaker_plan,
                     &[],
                     strip_forced_word_timestamps,
                     reported_language.clone(),
                     fallback_truncated_decodes,
-                );
+                )?;
+                return Ok((transcription, prepared_audio));
             }
-            return finalize_native_transcription(
+            let transcription = finalize_native_transcription(
                 assembled,
                 audio_duration_seconds,
                 Some(run_metadata),
                 &speaker_turns,
-                voice_id_audio.as_deref().unwrap_or(&[]),
+                voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
                 voice_id_embedder.as_deref(),
                 speaker_plan,
                 &speaker_scope_by_segment,
                 strip_forced_word_timestamps,
                 reported_language.clone(),
                 truncated_decodes,
-            );
+            )?;
+            return Ok((transcription, prepared_audio));
         }
         longform_metadata = Some(build_longform_metadata(
             &longform_options,
@@ -2320,7 +2350,7 @@ fn run_native_transcription_impl(
         dispatch,
         &runtime_preflight,
         &selected_family,
-        prepared_audio,
+        prepared_audio.full_slice(),
         request_options,
         backend_preference,
         &execution_context,
@@ -2354,19 +2384,20 @@ fn run_native_transcription_impl(
             truncation,
         });
     }
-    finalize_native_transcription(
+    let transcription = finalize_native_transcription(
         transcription.into_transcription(),
         audio_duration_seconds,
         longform_metadata,
         &speaker_turns,
-        voice_id_audio.as_deref().unwrap_or(&[]),
+        voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
         voice_id_embedder.as_deref(),
         speaker_plan,
         &[],
         strip_forced_word_timestamps,
         reported_language,
         truncated_decodes,
-    )
+    )?;
+    Ok((transcription, prepared_audio))
 }
 
 /// Render one truncated slice for the `core.native.decode.truncated`
@@ -3055,33 +3086,60 @@ fn native_capacity_admission_facts(
     }
 }
 
-/// Auxiliary resident bytes for the exact preflighted Voice ID plan, split by
-/// physical memory pool. ReDim and segmentation-3.0 are CPU/unified-memory;
-/// DiariZen follows its independently resolved request backend and therefore
-/// occupies discrete VRAM only on the generic CUDA/HIP/Vulkan lane.
+/// Request-owned resident bytes split by physical memory pool. Normalized PCM
+/// and pipeline scratch live in host/unified memory. ReDim and
+/// segmentation-3.0 are also CPU/unified-memory; DiariZen follows its
+/// independently resolved request backend and therefore occupies discrete
+/// VRAM only on the generic CUDA/HIP/Vulkan lane.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct VoiceIdAuxiliaryAdmission {
+struct NativeRequestWorkingSetAdmission {
     unified_bytes: u64,
     discrete_bytes: u64,
     discrete_vram_budget_bytes: Option<u64>,
 }
 
-fn voice_id_auxiliary_admission(
-    speaker_plan: SpeakerPlan,
-    embedder_bytes: u64,
-    selected_segmenter: Option<(u64, crate::ggml_runtime::GgmlCpuGraphBackend, Option<u64>)>,
-) -> VoiceIdAuxiliaryAdmission {
-    if speaker_plan == SpeakerPlan::Off {
-        return VoiceIdAuxiliaryAdmission::default();
+impl NativeRequestWorkingSetAdmission {
+    fn with_additional_unified_bytes(self, bytes: u64) -> Self {
+        Self {
+            unified_bytes: self.unified_bytes.saturating_add(bytes),
+            ..self
+        }
     }
-    let mut admission = VoiceIdAuxiliaryAdmission {
-        unified_bytes: embedder_bytes,
+}
+
+fn pcm_vec_resident_bytes(samples: &Vec<f32>) -> u64 {
+    u64::try_from(samples.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(std::mem::size_of::<f32>() as u64)
+}
+
+fn native_request_working_set_admission(
+    speaker_plan: SpeakerPlan,
+    normalized_pcm_bytes: u64,
+    embedder_bytes: u64,
+    selected_segmenter: Option<(
+        u64,
+        crate::ggml_runtime::GgmlCpuGraphBackend,
+        Option<u64>,
+        u64,
+    )>,
+) -> NativeRequestWorkingSetAdmission {
+    let mut admission = NativeRequestWorkingSetAdmission {
+        unified_bytes: normalized_pcm_bytes,
         discrete_bytes: 0,
         discrete_vram_budget_bytes: None,
     };
+    if speaker_plan == SpeakerPlan::Off {
+        return admission;
+    }
+    admission.unified_bytes = admission.unified_bytes.saturating_add(embedder_bytes);
     if speaker_plan == SpeakerPlan::External
-        && let Some((bytes, backend, discrete_vram_budget_bytes)) = selected_segmenter
+        && let Some((bytes, backend, discrete_vram_budget_bytes, working_set_bytes)) =
+            selected_segmenter
     {
+        // Activity/VAD/embedding/clustering/reconstruction buffers stay on
+        // the host even when the selected DiariZen graph itself uses VRAM.
+        admission.unified_bytes = admission.unified_bytes.saturating_add(working_set_bytes);
         if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Gpu) {
             admission.discrete_bytes = admission.discrete_bytes.saturating_add(bytes);
             admission.discrete_vram_budget_bytes = discrete_vram_budget_bytes;
@@ -3098,10 +3156,9 @@ fn voice_id_auxiliary_admission(
 /// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
 /// of an actionable error (issue #159 on CPU). Wired per family through
 /// [`native_capacity_admission_facts`]; families without a wired deriver stay
-/// unchecked. `voice_id_auxiliary` is the extra resident
-/// charge for a request that will run the shared Voice ID stack
-/// ([`voice_id_auxiliary_admission`]; both domains are `0` when Voice ID is
-/// off). Fails
+/// unchecked. `request_working_set` charges normalized PCM exactly once and,
+/// when selected, the shared Voice ID models plus external diarization
+/// working set ([`native_request_working_set_admission`]). Fails
 /// OPEN whenever the answer is uncertain rather than
 /// definite -- an unresolvable family, unprobeable host RAM, or an
 /// unreadable pack file all fall through to "allow" (`crate::capacity`'s
@@ -3113,7 +3170,7 @@ fn enforce_native_host_memory_admission(
     pack_bytes: u64,
     audio_duration_seconds: f32,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    voice_id_auxiliary: VoiceIdAuxiliaryAdmission,
+    request_working_set: NativeRequestWorkingSetAdmission,
     decoder_discrete_vram_budget_bytes: Option<u64>,
 ) -> Result<(), BackendError> {
     let facts = native_capacity_admission_facts(
@@ -3135,11 +3192,11 @@ fn enforce_native_host_memory_admission(
                 .then_some(decoder_discrete_vram_budget_bytes)
                 .flatten()
                 .filter(|budget| *budget > 0);
-            let auxiliary_budget = (voice_id_auxiliary.discrete_bytes > 0)
-                .then_some(voice_id_auxiliary.discrete_vram_budget_bytes)
+            let auxiliary_budget = (request_working_set.discrete_bytes > 0)
+                .then_some(request_working_set.discrete_vram_budget_bytes)
                 .flatten()
                 .filter(|budget| *budget > 0);
-            let budget = match (facts.is_some(), voice_id_auxiliary.discrete_bytes > 0) {
+            let budget = match (facts.is_some(), request_working_set.discrete_bytes > 0) {
                 (true, true) => match (decoder_budget, auxiliary_budget) {
                     (Some(decoder), Some(auxiliary)) => decoder.min(auxiliary),
                     _ => {
@@ -3171,16 +3228,16 @@ fn enforce_native_host_memory_admission(
     };
     let (auxiliary_in_decode_domain, auxiliary_in_other_domain, other_domain) = match domain {
         crate::capacity::MemoryAdmissionDomain::DiscreteVram { .. } => (
-            voice_id_auxiliary.discrete_bytes,
-            voice_id_auxiliary.unified_bytes,
+            request_working_set.discrete_bytes,
+            request_working_set.unified_bytes,
             unified_domain,
         ),
         crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. } => (
-            voice_id_auxiliary.unified_bytes,
-            voice_id_auxiliary.discrete_bytes,
+            request_working_set.unified_bytes,
+            request_working_set.discrete_bytes,
             crate::capacity::MemoryAdmissionDomain::DiscreteVram {
-                budget_bytes: if voice_id_auxiliary.discrete_bytes > 0 {
-                    voice_id_auxiliary
+                budget_bytes: if request_working_set.discrete_bytes > 0 {
+                    request_working_set
                         .discrete_vram_budget_bytes
                         .filter(|budget| *budget > 0)
                         .ok_or_else(|| BackendError::NativeInsufficientHostMemory {
@@ -3873,7 +3930,7 @@ fn run_dispatch_once(
     dispatch: &GgmlAsrExecutionDispatch,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     selected_family: &GgmlFamilyAdapterDescriptor,
-    samples: Vec<f32>,
+    samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
     execution_context: &Arc<crate::RequestExecutionContext>,
@@ -3888,7 +3945,7 @@ fn run_dispatch_once(
         runtime_source_path: runtime_preflight.runtime_source.path().to_path_buf(),
         runtime_source_preflight: Some(runtime_preflight.clone()),
         selected_family: selected_family.clone(),
-        prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+        prepared_audio: GgmlAsrPreparedAudio::mono_16khz_view(samples),
         request_options,
         backend_preference,
         resolved_runtime,
@@ -4238,6 +4295,39 @@ mod tests {
             Err(BackendError::NativeModelPackPathRequired)
         ));
     }
+
+    #[test]
+    fn native_boundary_rejects_out_of_range_speaker_hints_before_model_resolution() {
+        let max = crate::diarize::contract::MAX_DIARIZATION_SPEAKERS;
+        for requested in [0, max + 1] {
+            let mut request = TranscriptionRequest::new("unused.wav", "unused-model");
+            request.diarize_speakers = Some(requested);
+            let error = run_native_transcription_fallible(request)
+                .expect_err("an out-of-range hint must fail closed at the request boundary");
+            assert!(matches!(
+                &error,
+                BackendError::DiarizeSpeakersOutOfRange {
+                    requested: rejected,
+                    max: contract_max,
+                } if *rejected == requested && *contract_max == max
+            ));
+            assert_eq!(
+                classify_backend_error_for_failure_log(&error),
+                FailureCategory::UnsupportedCapability
+            );
+        }
+
+        for requested in [1, max] {
+            let mut request = TranscriptionRequest::new("unused.wav", "unused-model");
+            request.voice_id = true;
+            request.source = crate::RequestSource::CliTranscribe;
+            request.diarize_speakers = Some(requested);
+            assert!(matches!(
+                run_native_transcription_fallible(request),
+                Err(BackendError::NativeModelPackPathRequired)
+            ));
+        }
+    }
     use crate::GgmlAsrExecutor;
     use crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
     use std::sync::Mutex;
@@ -4265,6 +4355,52 @@ mod tests {
             SpeakerPlan::InDecoder
         );
         assert_eq!(SpeakerPlan::resolve(true, External), SpeakerPlan::External);
+    }
+
+    #[test]
+    fn native_asr_voice_id_and_forced_align_views_share_one_pcm_backing() {
+        let prepared = PcmBuffer::from_vec((0..64).map(|sample| sample as f32).collect());
+        let identity = prepared.backing_identity();
+
+        assert!(voice_id_audio_view(&prepared, SpeakerPlan::Off).is_none());
+        for plan in [SpeakerPlan::InDecoder, SpeakerPlan::External] {
+            let voice_id = voice_id_audio_view(&prepared, plan)
+                .expect("enabled Voice ID must borrow normalized PCM");
+            assert_eq!(voice_id.backing_identity(), identity);
+            assert_eq!(voice_id.as_ptr(), prepared.as_ptr());
+        }
+
+        assert!(forced_aligner_audio_view(&prepared, false).is_none());
+        let align = forced_aligner_audio_view(&prepared, true)
+            .expect("enabled forced aligner must borrow normalized PCM");
+        let dispatch = GgmlAsrPreparedAudio::mono_16khz_view(prepared.slice(8..24));
+        let align_request = GgmlAsrPreparedAudio::mono_16khz_view(align);
+        assert_eq!(dispatch.samples_f32.backing_identity(), identity);
+        assert_eq!(align_request.samples_f32.backing_identity(), identity);
+        assert_eq!(
+            dispatch.samples_f32.as_ptr(),
+            prepared.as_ptr().wrapping_add(8)
+        );
+        assert_eq!(align_request.samples_f32.as_ptr(), prepared.as_ptr());
+    }
+
+    #[test]
+    fn resolving_an_already_shared_pcm_buffer_never_copies_the_recording() {
+        let prepared = Arc::new(vec![0.25; 16_000]);
+        let retained_by_preparer = Arc::clone(&prepared);
+        let identity = Arc::as_ptr(&prepared) as usize;
+        let samples_ptr = prepared.as_ptr();
+
+        let resolved =
+            resolve_prepared_audio_samples(Path::new("must-not-be-read.wav"), Some(prepared))
+                .expect("in-memory PCM bypasses the path");
+
+        assert_eq!(resolved.backing_identity(), identity);
+        assert_eq!(
+            resolved.backing_identity(),
+            Arc::as_ptr(&retained_by_preparer) as usize
+        );
+        assert_eq!(resolved.as_ptr(), samples_ptr);
     }
 
     /// Synthetic GGUF metadata carrying the real shipped checkpoint's decoder
@@ -4482,7 +4618,7 @@ mod tests {
                     0,
                     3600.0,
                     crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-                    VoiceIdAuxiliaryAdmission::default(),
+                    NativeRequestWorkingSetAdmission::default(),
                     None,
                 )
                 .is_ok(),
@@ -5148,7 +5284,7 @@ mod tests {
                 1 << 40,
                 30.0,
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-                VoiceIdAuxiliaryAdmission::default(),
+                NativeRequestWorkingSetAdmission::default(),
                 None,
             )
             .expect_err("a 1 TiB pack cannot fit any host");
@@ -5171,7 +5307,7 @@ mod tests {
                 4096,
                 30.0,
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-                VoiceIdAuxiliaryAdmission::default(),
+                NativeRequestWorkingSetAdmission::default(),
                 None,
             )
             .unwrap_or_else(|error| {
@@ -5180,56 +5316,82 @@ mod tests {
         }
     }
 
-    /// Both segmentation sources converge on the same ReDim identity stage,
-    /// so every explicit Voice ID request is charged its resident footprint.
+    /// Normalized PCM is charged for every request. Both segmentation sources
+    /// additionally converge on ReDim, while the external source also owns a
+    /// duration-derived host working set and a backend-routed segmenter.
     #[test]
-    fn voice_id_bytes_charge_embedder_and_selected_external_segmenter() {
+    fn request_working_set_charges_pcm_and_selected_voice_id_pipeline_once() {
         assert_eq!(
-            voice_id_auxiliary_admission(
+            native_request_working_set_admission(
                 SpeakerPlan::Off,
+                64,
                 456,
                 Some((
                     123,
                     crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
                     Some(900),
+                    789,
                 )),
             ),
-            VoiceIdAuxiliaryAdmission::default()
-        );
-        assert_eq!(
-            voice_id_auxiliary_admission(SpeakerPlan::InDecoder, 456, None),
-            VoiceIdAuxiliaryAdmission {
-                unified_bytes: 456,
+            NativeRequestWorkingSetAdmission {
+                unified_bytes: 64,
                 discrete_bytes: 0,
                 discrete_vram_budget_bytes: None,
             }
         );
         assert_eq!(
-            voice_id_auxiliary_admission(
+            native_request_working_set_admission(SpeakerPlan::InDecoder, 64, 456, None),
+            NativeRequestWorkingSetAdmission {
+                unified_bytes: 520,
+                discrete_bytes: 0,
+                discrete_vram_budget_bytes: None,
+            }
+        );
+        assert_eq!(
+            native_request_working_set_admission(
                 SpeakerPlan::External,
+                64,
                 456,
-                Some((123, crate::ggml_runtime::GgmlCpuGraphBackend::Metal, None,)),
+                Some((
+                    123,
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+                    None,
+                    789,
+                )),
             ),
-            VoiceIdAuxiliaryAdmission {
-                unified_bytes: 579,
+            NativeRequestWorkingSetAdmission {
+                unified_bytes: 1_432,
                 discrete_bytes: 0,
                 discrete_vram_budget_bytes: None,
             }
         );
         assert_eq!(
-            voice_id_auxiliary_admission(
+            native_request_working_set_admission(
                 SpeakerPlan::External,
+                64,
                 456,
                 Some((
                     123,
                     crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
                     Some(900),
+                    789,
                 )),
             ),
-            VoiceIdAuxiliaryAdmission {
-                unified_bytes: 456,
+            NativeRequestWorkingSetAdmission {
+                unified_bytes: 1_309,
                 discrete_bytes: 123,
                 discrete_vram_budget_bytes: Some(900),
+            }
+        );
+
+        let packed_peak = native_request_working_set_admission(SpeakerPlan::Off, 64, 0, None)
+            .with_additional_unified_bytes(128);
+        assert_eq!(
+            packed_peak,
+            NativeRequestWorkingSetAdmission {
+                unified_bytes: 192,
+                discrete_bytes: 0,
+                discrete_vram_budget_bytes: None,
             }
         );
     }
@@ -7321,6 +7483,7 @@ mod tests {
     /// once actually run on CPU -- the real-world shape of issue #158).
     struct GpuAllocFallbackStubExecutor {
         calls: Mutex<Vec<GgmlAsrBackendPreference>>,
+        backing_identities: Mutex<Vec<usize>>,
         gpu_failure_reason: String,
     }
 
@@ -7328,12 +7491,17 @@ mod tests {
         fn new(gpu_failure_reason: impl Into<String>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                backing_identities: Mutex::new(Vec::new()),
                 gpu_failure_reason: gpu_failure_reason.into(),
             }
         }
 
         fn calls_snapshot(&self) -> Vec<GgmlAsrBackendPreference> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn backing_identities_snapshot(&self) -> Vec<usize> {
+            self.backing_identities.lock().unwrap().clone()
         }
     }
 
@@ -7351,6 +7519,10 @@ mod tests {
             request: &GgmlAsrExecutionRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
             self.calls.lock().unwrap().push(request.backend_preference);
+            self.backing_identities
+                .lock()
+                .unwrap()
+                .push(request.prepared_audio.samples_f32.backing_identity());
             if matches!(
                 request.backend_preference,
                 GgmlAsrBackendPreference::CpuOnly
@@ -7444,12 +7616,14 @@ mod tests {
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
         let decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
+        let audio = PcmBuffer::from_vec(vec![0.0; 1_000]);
+        let backing_identity = audio.backing_identity();
 
         let (result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
             &dispatch,
             &preflight,
             &family,
-            vec![0.0; 1_000],
+            audio.full_slice(),
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
             &uncancellable_execution_context_for_test(),
@@ -7475,6 +7649,11 @@ mod tests {
             ],
             "exactly one GPU attempt, then exactly one CPU retry"
         );
+        assert_eq!(
+            executor.backing_identities_snapshot(),
+            vec![backing_identity, backing_identity],
+            "GPU failure and CPU retry must reuse the exact same PCM backing"
+        );
     }
 
     #[test]
@@ -7491,7 +7670,7 @@ mod tests {
             &dispatch,
             &preflight,
             &family,
-            vec![0.0; 1_000],
+            vec![0.0; 1_000].into(),
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
             &uncancellable_execution_context_for_test(),
@@ -7556,7 +7735,7 @@ mod tests {
             &dispatch,
             &preflight,
             &family,
-            vec![0.0; 1_000],
+            vec![0.0; 1_000].into(),
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::CpuOnly,
             &uncancellable_execution_context_for_test(),
@@ -7594,7 +7773,7 @@ mod tests {
                 &dispatch,
                 &preflight,
                 &family,
-                vec![0.0; 1_000],
+                vec![0.0; 1_000].into(),
                 GgmlAsrExecutionOptions::default(),
                 GgmlAsrBackendPreference::Auto,
                 &uncancellable_execution_context_for_test(),
@@ -7757,18 +7936,30 @@ mod tests {
     /// exercise error routing.
     struct ConcurrentPipelineStubExecutor {
         fail_markers: std::collections::BTreeSet<i32>,
+        observed_views: Option<Arc<Mutex<Vec<(usize, std::ops::Range<usize>)>>>>,
     }
 
     impl ConcurrentPipelineStubExecutor {
         fn echoing() -> Self {
             Self {
                 fail_markers: std::collections::BTreeSet::new(),
+                observed_views: None,
             }
         }
 
         fn failing_on(markers: &[i32]) -> Self {
             Self {
                 fail_markers: markers.iter().copied().collect(),
+                observed_views: None,
+            }
+        }
+
+        fn recording_views(
+            observed_views: Arc<Mutex<Vec<(usize, std::ops::Range<usize>)>>>,
+        ) -> Self {
+            Self {
+                fail_markers: std::collections::BTreeSet::new(),
+                observed_views: Some(observed_views),
             }
         }
 
@@ -7796,6 +7987,12 @@ mod tests {
             &self,
             request: &GgmlAsrExecutionRequest,
         ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            if let Some(observed) = self.observed_views.as_ref() {
+                observed.lock().unwrap().push((
+                    request.prepared_audio.samples_f32.backing_identity(),
+                    request.prepared_audio.samples_f32.range(),
+                ));
+            }
             let marker = Self::marker_of(request);
             if self.fail_markers.contains(&marker) {
                 return Err(GgmlAsrExecutionError::ExecutorFailed {
@@ -7860,6 +8057,7 @@ mod tests {
         longform_options: &crate::LongFormOptions,
         progress_id: Option<String>,
     ) -> Result<ConcurrentPipelineOutcome, BackendError> {
+        let audio = PcmBuffer::from_vec(audio.to_vec());
         let dir = tempfile::tempdir().unwrap();
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor);
         let timeline = crate::longform::TimelineMap::identity();
@@ -7877,7 +8075,7 @@ mod tests {
         run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
             width,
             slices,
-            plan_audio: audio,
+            plan_audio: &audio,
             dispatch: &dispatch,
             runtime_preflight: &preflight,
             selected_family: &family,
@@ -7930,6 +8128,43 @@ mod tests {
             (progress.fraction - DECODE_CEIL_NO_ALIGN).abs() < 1e-6,
             "decode progress should reach the ceiling, got {}",
             progress.fraction
+        );
+    }
+
+    #[test]
+    fn concurrent_pipeline_dispatches_range_views_from_one_pcm_backing() {
+        let (audio, slices) = concurrent_pipeline_slices(6);
+        let expected_ranges: Vec<_> = slices
+            .iter()
+            .map(|slice| slice.start_sample..slice.end_sample)
+            .collect();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        run_concurrent_pipeline_for_test(
+            4,
+            &audio,
+            slices,
+            Arc::new(ConcurrentPipelineStubExecutor::recording_views(Arc::clone(
+                &observed,
+            ))),
+            &uncancellable_execution_context_for_test(),
+            &crate::LongFormOptions::default(),
+            None,
+        )
+        .expect("all slices decode successfully");
+
+        let mut observed = observed.lock().unwrap().clone();
+        let identity = observed
+            .first()
+            .expect("every decoded slice records a view")
+            .0;
+        assert!(observed.iter().all(|(candidate, _)| *candidate == identity));
+        observed.sort_by_key(|(_, range)| range.start);
+        assert_eq!(
+            observed
+                .into_iter()
+                .map(|(_, range)| range)
+                .collect::<Vec<_>>(),
+            expected_ranges
         );
     }
 
