@@ -117,6 +117,47 @@ fn distribution_context_for_test(home: &std::path::Path) -> DistributionContext 
     })
 }
 
+fn distribution_context_with_pull_license_for_test(
+    root: &std::path::Path,
+    license_class: LicenseClass,
+) -> (DistributionContext, PathBuf) {
+    let source_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/catalog.json");
+    let contents = fs::read_to_string(source_path).expect("read bundled catalog fixture");
+    let mut catalog: serde_json::Value =
+        serde_json::from_str(&contents).expect("parse bundled catalog fixture");
+    let model = catalog["models"]
+        .as_array_mut()
+        .expect("catalog models array")
+        .iter_mut()
+        .find(|model| model["id"] == "moonshine-tiny")
+        .expect("moonshine-tiny catalog fixture");
+    model["license"] = serde_json::Value::String(
+        match &license_class {
+            LicenseClass::Permissive => "MIT",
+            LicenseClass::Noncommercial => "CC-BY-NC-4.0",
+            LicenseClass::Gated => "Vendor gated license",
+            LicenseClass::Unknown => "Unknown",
+        }
+        .to_string(),
+    );
+    model["license_url"] =
+        serde_json::Value::String("https://example.invalid/model-license".to_string());
+    model["license_class"] =
+        serde_json::to_value(&license_class).expect("serialize license class fixture");
+
+    let catalog_path = root.join("catalog.json");
+    let contents = serde_json::to_string(&catalog).expect("serialize catalog fixture");
+    openasr_core::testing::write_local_dev_signed_catalog(&catalog_path, &contents, 1);
+    let home = root.join("home");
+    let distribution = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(home.clone()),
+        catalog_url: Some(format!("file://{}", catalog_path.display())),
+        catalog_local_override: None,
+    });
+    (distribution, home)
+}
+
 /// Copies the real, committed `model-registry/catalog.json` into `dir` and
 /// re-signs the copy with the public local-dev key for the exact `file://`
 /// path the test will pass as `catalog_url`. The committed catalog's own
@@ -1933,6 +1974,110 @@ fn pull_progress_persistence_is_throttled_between_boundaries() {
         &mut last_bytes,
         &mut last_at,
     ));
+}
+
+#[test]
+fn explicit_pull_license_acceptance_covers_every_license_class() {
+    let mut resolved = resolved_pull_fixture();
+
+    resolved.license_class = LicenseClass::Permissive;
+    ensure_explicit_pull_license_acceptance(&resolved, false)
+        .expect("permissive models do not require acceptance");
+
+    for license_class in [LicenseClass::Noncommercial, LicenseClass::Gated] {
+        resolved.license_class = license_class;
+        let error = ensure_explicit_pull_license_acceptance(&resolved, false).unwrap_err();
+        assert!(error.to_string().contains("accept_license=true"), "{error}");
+        ensure_explicit_pull_license_acceptance(&resolved, true)
+            .expect("explicit acceptance permits a restricted model pull");
+    }
+
+    resolved.license_class = LicenseClass::Unknown;
+    let error = ensure_explicit_pull_license_acceptance(&resolved, true).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported license class"),
+        "{error}"
+    );
+}
+
+async fn assert_restricted_pull_is_rejected_before_side_effects(
+    license_class: LicenseClass,
+    from: Option<PathBuf>,
+) -> String {
+    let temp = tempfile::tempdir().unwrap();
+    let (distribution, home) =
+        distribution_context_with_pull_license_for_test(temp.path(), license_class);
+    let source_path = from.map(|path| temp.path().join(path));
+
+    let error = start_pull_job(
+        AxumPath("moonshine-tiny".to_string()),
+        Extension(distribution.clone()),
+        Json(StartPullRequest {
+            quant: Some("q8".to_string()),
+            size: None,
+            from: source_path.clone(),
+            accept_license: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        distribution.jobs.next.load(Ordering::Relaxed),
+        0,
+        "license refusal must happen before allocating a job id"
+    );
+    assert!(
+        distribution.jobs.snapshots.lock().unwrap().is_empty(),
+        "license refusal must not publish a pull job"
+    );
+    assert!(
+        distribution.jobs.active.lock().unwrap().is_empty(),
+        "license refusal must not spawn a pull worker"
+    );
+    assert!(
+        !home.join("pulls").exists(),
+        "license refusal must happen before persisting a pull job"
+    );
+    if let Some(source_path) = source_path {
+        assert!(
+            !source_path.exists(),
+            "the rejected local source must not be opened or created"
+        );
+    }
+
+    match error {
+        ApiError::BadRequest(message) => message,
+        other => panic!("expected a bad-request license refusal, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn restricted_remote_pulls_require_acceptance_before_job_creation() {
+    let noncommercial =
+        assert_restricted_pull_is_rejected_before_side_effects(LicenseClass::Noncommercial, None)
+            .await;
+    assert!(noncommercial.contains("non-commercial use only"));
+
+    let gated =
+        assert_restricted_pull_is_rejected_before_side_effects(LicenseClass::Gated, None).await;
+    assert!(gated.contains("vendor license"));
+}
+
+#[tokio::test]
+async fn restricted_local_pulls_require_acceptance_before_source_access() {
+    let local_source = || Some(PathBuf::from("source-must-not-be-read.oasr"));
+    let noncommercial = assert_restricted_pull_is_rejected_before_side_effects(
+        LicenseClass::Noncommercial,
+        local_source(),
+    )
+    .await;
+    assert!(noncommercial.contains("non-commercial use only"));
+
+    let gated =
+        assert_restricted_pull_is_rejected_before_side_effects(LicenseClass::Gated, local_source())
+            .await;
+    assert!(gated.contains("vendor license"));
 }
 
 #[tokio::test]

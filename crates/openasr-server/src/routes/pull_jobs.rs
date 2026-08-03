@@ -347,12 +347,7 @@ pub(crate) async fn start_pull_job(
     )
     .map_err(ApiError::Catalog)?;
 
-    if resolved.license_class == LicenseClass::Gated && request.accept_license != Some(true) {
-        return Err(ApiError::BadRequest(format!(
-            "Model '{}' requires accepting the license before download: {}",
-            resolved.model_id, resolved.license_url
-        )));
-    }
+    ensure_explicit_pull_license_acceptance(&resolved, request.accept_license == Some(true))?;
 
     distribution.ensure_restart_resumes_started();
     if let Some(snapshot) = distribution.nonterminal_snapshot_for_pull(&resolved) {
@@ -384,6 +379,27 @@ pub(crate) async fn start_pull_job(
         pause_flag,
     );
     Ok((StatusCode::ACCEPTED, Json(snapshot)).into_response())
+}
+
+pub(crate) fn ensure_explicit_pull_license_acceptance(
+    resolved: &ResolvedCatalogPull,
+    accepted: bool,
+) -> Result<(), ApiError> {
+    match &resolved.license_class {
+        LicenseClass::Unknown => Err(ApiError::BadRequest(format!(
+            "Model '{}' has an unsupported license class and cannot be installed by this OpenASR version.",
+            resolved.model_id
+        ))),
+        LicenseClass::Noncommercial if !accepted => Err(ApiError::BadRequest(format!(
+            "Model '{}' is licensed for non-commercial use only ({}). Review {} and retry with accept_license=true.",
+            resolved.model_id, resolved.license, resolved.license_url
+        ))),
+        LicenseClass::Gated if !accepted => Err(ApiError::BadRequest(format!(
+            "Model '{}' requires accepting the vendor license before download. Review {} and retry with accept_license=true.",
+            resolved.model_id, resolved.license_url
+        ))),
+        LicenseClass::Permissive | LicenseClass::Noncommercial | LicenseClass::Gated => Ok(()),
+    }
 }
 
 pub(crate) async fn pull_job(
