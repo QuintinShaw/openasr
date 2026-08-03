@@ -26,6 +26,13 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, RequestBackendPreference};
 const SAMPLE_RATE_HZ: u32 = 16_000;
 const EMBEDDING_WINDOW_S: f64 = 1.5;
 const EMBEDDING_STEP_S: f64 = 0.75;
+/// ReDimNet's bounded pool supports four persistent workers. Keeping four
+/// queued windows per worker saturates that pool without retaining an
+/// unbounded meeting-length waveform expansion: the resulting 16-window batch
+/// caps 16 kHz padded clip storage at about 1.5 MiB.
+const EMBEDDING_WINDOWS_PER_BATCH_WORKER: usize = 4;
+const EMBEDDING_BATCH_SIZE: usize =
+    super::embed::REDIMNET_MAX_BATCH_WORKERS * EMBEDDING_WINDOWS_PER_BATCH_WORKER;
 
 #[derive(Debug, Error)]
 pub enum ExternalDiarizationError {
@@ -417,42 +424,44 @@ fn embed_chunks(
     chunks: &[TimeRange],
     canceled: &dyn Fn() -> bool,
 ) -> Result<(Vec<TimeRange>, Vec<SpeakerEmbedding>), ExternalDiarizationError> {
-    cancel_checkpoint(canceled)?;
-    let raw: Vec<Vec<f32>> = chunks
-        .iter()
-        .map(|range| {
-            let start = (range.start_s * sample_rate_hz as f64).max(0.0) as usize;
-            let end = ((range.end_s * sample_rate_hz as f64) as usize).min(samples.len());
-            samples[start.min(end)..end].to_vec()
-        })
-        .collect();
-    let target_len = (EMBEDDING_WINDOW_S * sample_rate_hz as f64).round() as usize;
-    let padded: Vec<Vec<f32>> = raw
-        .iter()
-        .map(|chunk| circle_pad(chunk, target_len))
-        .collect();
-    let borrowed: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();
-    let results = embedder.embed_batch(&borrowed, sample_rate_hz);
-    if results.len() != chunks.len() {
-        return Err(ExternalDiarizationError::Embedding(format!(
-            "embedder returned {} results for {} diarization windows",
-            results.len(),
-            chunks.len()
-        )));
+    if chunks.is_empty() {
+        cancel_checkpoint(canceled)?;
+        return Ok((Vec::new(), Vec::new()));
     }
-    cancel_checkpoint(canceled)?;
-    let mut successful_chunks = Vec::new();
-    let mut embeddings = Vec::new();
-    for (range, result) in chunks.iter().copied().zip(results) {
-        match result {
-            Ok(embedding) => {
-                successful_chunks.push(range);
-                embeddings.push(embedding);
-            }
-            Err(EmbedError::TooShort) => {}
-            Err(EmbedError::Canceled) => return Err(ExternalDiarizationError::Canceled),
-            Err(error) => {
-                return Err(ExternalDiarizationError::Embedding(error.to_string()));
+    let target_len = (EMBEDDING_WINDOW_S * sample_rate_hz as f64).round() as usize;
+    let mut successful_chunks = Vec::with_capacity(chunks.len());
+    let mut embeddings = Vec::with_capacity(chunks.len());
+    for batch in chunks.chunks(EMBEDDING_BATCH_SIZE) {
+        cancel_checkpoint(canceled)?;
+        let padded: Vec<Vec<f32>> = batch
+            .iter()
+            .map(|range| {
+                let start = (range.start_s * sample_rate_hz as f64).max(0.0) as usize;
+                let end = ((range.end_s * sample_rate_hz as f64) as usize).min(samples.len());
+                circle_pad(&samples[start.min(end)..end], target_len)
+            })
+            .collect();
+        let borrowed: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();
+        let results = embedder.embed_batch(&borrowed, sample_rate_hz);
+        if results.len() != batch.len() {
+            return Err(ExternalDiarizationError::Embedding(format!(
+                "embedder returned {} results for {} diarization windows",
+                results.len(),
+                batch.len()
+            )));
+        }
+        cancel_checkpoint(canceled)?;
+        for (range, result) in batch.iter().copied().zip(results) {
+            match result {
+                Ok(embedding) => {
+                    successful_chunks.push(range);
+                    embeddings.push(embedding);
+                }
+                Err(EmbedError::TooShort) => {}
+                Err(EmbedError::Canceled) => return Err(ExternalDiarizationError::Canceled),
+                Err(error) => {
+                    return Err(ExternalDiarizationError::Embedding(error.to_string()));
+                }
             }
         }
     }
@@ -792,6 +801,71 @@ mod tests {
         }
     }
 
+    struct InstrumentedBatchEmbedder {
+        expected_clip_len: usize,
+        batch_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl InstrumentedBatchEmbedder {
+        fn new(expected_clip_len: usize) -> Self {
+            Self {
+                expected_clip_len,
+                batch_sizes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn batch_sizes(&self) -> Vec<usize> {
+            self.batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl SpeakerEmbedder for InstrumentedBatchEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, EmbedError> {
+            unreachable!("the instrumented batch seam is overridden")
+        }
+
+        fn embed_batch(
+            &self,
+            clips: &[&[f32]],
+            _sample_rate_hz: u32,
+        ) -> Vec<Result<SpeakerEmbedding, EmbedError>> {
+            self.batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(clips.len());
+            clips
+                .iter()
+                .map(|clip| {
+                    assert_eq!(clip.len(), self.expected_clip_len);
+                    Ok(SpeakerEmbedding(vec![clip[0]]))
+                })
+                .collect()
+        }
+
+        fn embedding_dim(&self) -> usize {
+            1
+        }
+    }
+
+    /// A 1 Hz synthetic clock represents arbitrary meeting duration while
+    /// keeping the test waveform to one scalar per embedding window.
+    fn compact_embedding_fixture(chunk_count: usize) -> (Vec<f32>, Vec<TimeRange>) {
+        let samples = (0..=chunk_count)
+            .map(|index| (index % 997 + 1) as f32)
+            .collect();
+        let chunks = (0..chunk_count)
+            .map(|index| TimeRange::new(index as f64, (index + 1) as f64))
+            .collect();
+        (samples, chunks)
+    }
+
     fn clock() -> ActivityFrameClock {
         ActivityFrameClock::new(0, 2, 1, 10)
     }
@@ -858,6 +932,48 @@ mod tests {
             ExternalDiarizationError::Embedding(reason)
                 if reason.contains("0 results for 1 diarization windows")
         ));
+    }
+
+    #[test]
+    fn six_hour_scale_embedding_is_bounded_and_complete() {
+        let chunk_count = 6 * 60 * 60 * 4 / 3 + 7;
+        let (samples, chunks) = compact_embedding_fixture(chunk_count);
+        let embedder = InstrumentedBatchEmbedder::new(2);
+
+        let (successful_chunks, embeddings) =
+            embed_chunks(&embedder, &samples, 1, &chunks, &|| false)
+                .expect("bounded long-meeting embedding");
+
+        assert_eq!(successful_chunks, chunks);
+        assert_eq!(embeddings.len(), chunk_count);
+        for index in [0, EMBEDDING_BATCH_SIZE, chunk_count - 1] {
+            assert_eq!(embeddings[index].0, vec![samples[index]]);
+        }
+        let batch_sizes = embedder.batch_sizes();
+        assert_eq!(
+            batch_sizes.len(),
+            chunk_count.div_ceil(EMBEDDING_BATCH_SIZE)
+        );
+        assert_eq!(batch_sizes.iter().sum::<usize>(), chunk_count);
+        assert!(batch_sizes.iter().all(|&size| size <= EMBEDDING_BATCH_SIZE));
+        assert_eq!(batch_sizes.last().copied(), Some(7));
+    }
+
+    #[test]
+    fn embedding_cancellation_stops_between_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (samples, chunks) = compact_embedding_fixture(EMBEDDING_BATCH_SIZE * 3);
+        let embedder = InstrumentedBatchEmbedder::new(2);
+        let checkpoints = AtomicUsize::new(0);
+        let error = embed_chunks(&embedder, &samples, 1, &chunks, &|| {
+            checkpoints.fetch_add(1, Ordering::SeqCst) >= 2
+        })
+        .expect_err("the second batch must observe cancellation before allocation");
+
+        assert!(matches!(error, ExternalDiarizationError::Canceled));
+        assert_eq!(embedder.batch_sizes(), vec![EMBEDDING_BATCH_SIZE]);
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 3);
     }
 
     #[test]
