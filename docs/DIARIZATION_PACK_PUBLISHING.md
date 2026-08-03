@@ -55,24 +55,29 @@ duration-weighted DER, a 0.25 s collar, and overlap scoring:
 
 | Path | DER | Scope |
 | --- | ---: | --- |
-| FireRed + DiariZen Large-s80-md-v2 + ReDimNet2-B6 research adapter | 8.13% | Locked six-file research comparison; not a native or fp16 release claim |
+| OpenASR native + DiariZen Large-s80-md-v2 fp16 + ReDimNet2-B6 fp16 | **7.9491%** | Production runtime path on the locked fixtures; source-only qualification, not a release/distribution claim |
+| FireRed + DiariZen Large-s80-md-v2 fp16 + ReDimNet2-B6 research adapter | 8.1232% | Qualified pack reconstructed in the locked Python adapter |
+| FireRed + DiariZen Large-s80-md-v2 F32 + ReDimNet2-B6 research adapter | 8.1274% | Upstream-checkpoint precision reference |
 | FireRed + DiariZen Base-s80 + ReDimNet2-B6 research adapter | 9.0481% | Historical Base-s80 F32 reference configuration; not a current product model or native release claim |
 | FireRed + segmentation-3.0 + ReDimNet2-B6 research adapter | 12.4466% | Research reference pipeline; not a native release claim |
 | MOSS in-decoder diarization | 18.6787% | Native ASR speaker source baseline |
 
-The Large-s80-md-v2 comparison recorded 3.87% miss, 1.16% false alarm, and
-3.11% speaker error within its 8.13% DER. The protocol is duration-weighted
-across six 10-minute excerpts; it is neither an fp16-pack parity result nor a
-native production-runtime result.
+The native Large-s80-md-v2 result recorded 3.8806% miss, 1.1348% false alarm,
+and 2.9336% speaker error. Its collar-zero DER was 12.1879%. The fp16 adapter
+result differs from the F32 reference by -0.0042 percentage point, establishing
+no material precision loss; it does not establish that fp16 improves quality.
 
 These results qualify the architecture on that fixed Mandarin meeting slice;
-they are not a cross-language or cross-domain accuracy guarantee. Neither
-external-pipeline number is current product DER. The native frontend now follows
-the same stage shape -- VAD/activity union, 1.5/0.75 s embedding windows,
-automatic AHC/spectral clustering, and count/Hungarian overlap reconstruction --
-but the locked scores were produced by the research adapters. A native
-end-to-end claim requires rerunning the same six-file scorer through the
-production runtime.
+they are not a cross-language, cross-domain, or cross-recording Voice ID
+guarantee. The native aggregate combines A1-M2 from the original full-manifest
+process with M3 from an independently completed supplement after the external
+test harness output pipe disappeared before M3 started. Both sources used the
+same core revision, segmenter/embedder content IDs and Metal backend, and the
+composition preserves per-source provenance. It is valid as a stateless
+per-recording micro aggregate, but must not be described as one uninterrupted
+six-file process. The AISHELL excerpts also remain a speaker-count weakness
+(4/6, 4/6, and 3/6 hypotheses), so DER alone is not an enrollment or
+unknown-rejection acceptance gate.
 
 ## Build and publish overview
 

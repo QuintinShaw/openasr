@@ -39,16 +39,20 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   Large-s80-md-v2 is staged as an optional CC BY-NC 4.0 provider, but no
   DiariZen pack is present in the signed full/public catalogs and it is not
   currently an `openasr pull` target. The qualified candidate is fp16-only. Its
-  locked research-adapter result is 8.13% DER (3.87% miss, 1.16% false alarm,
-  3.11% speaker error), not yet a native or fp16 product-quality claim. Under
-  the same six-file, duration-weighted protocol (0.25 s collar, overlap scored),
-  the historical Base-s80 F32 reference measured 9.0481% DER, the FireRed +
-  segmentation-3.0 research adapter measured 12.4466% DER, and MOSS measured
-  18.6787%. The native external frontend now
-  follows the same union/windowing/automatic-clustering/overlap stage shape, but
-  those locked numbers have not been reproduced through its full six-file runtime
-  path. They are therefore architecture targets, not shipped product DER or a
-  cross-domain accuracy guarantee.
+  locked six-file F32/Python reference measured 8.1274% DER, and reconstructing
+  the qualified mixed-precision pack in the same adapter measured 8.1232%, with
+  no material precision loss. The native OpenASR path measured 7.9491% DER
+  (3.8806% miss, 1.1348% false alarm, 2.9336% speaker error) under the same
+  duration-weighted protocol (0.25 s collar, overlap scored); all six recordings
+  beat MOSS, whose aggregate was 18.6787%. That native aggregate transparently
+  combines A1-M2 from one process with an identical-runtime M3 supplement after
+  the external test harness output pipe failed before M3 started; it is not a
+  claim of one uninterrupted six-file process. The historical Base-s80 F32
+  reference was 9.0481%, and the segmentation-3.0 research adapter was 12.4466%.
+  These fixed Mandarin meeting-slice results qualify the implementation, not a
+  shipped product DER, cross-domain guarantee, or cross-recording Voice ID
+  enrollment/unknown-rejection guarantee; the AISHELL excerpts still
+  underestimate speaker count.
 - Phrase bias / hotword boosting is implemented for the native runtime decode
   path. Requests still fail closed when the selected model tokenizer cannot
   encode a requested phrase, and the mock backend still rejects non-empty
