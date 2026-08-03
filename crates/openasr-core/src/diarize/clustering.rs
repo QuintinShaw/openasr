@@ -899,21 +899,9 @@ fn deterministic_kmeans(
     if clusters <= 1 {
         return vec![0; rows];
     }
-    let mut centers = Vec::with_capacity(clusters);
-    centers.push(0usize);
-    while centers.len() < clusters {
-        let next = (0..rows)
-            .filter(|index| !centers.contains(index))
-            .max_by(|&left, &right| {
-                nearest_center_distance(points, dimensions, left, &centers)
-                    .total_cmp(&nearest_center_distance(
-                        points, dimensions, right, &centers,
-                    ))
-                    .then_with(|| right.cmp(&left))
-            })
-            .unwrap_or(centers.len() % rows);
-        centers.push(next);
-    }
+    debug_assert_eq!(points.len(), rows * dimensions);
+    debug_assert!(clusters <= rows);
+    let centers = deterministic_greedy_kmeans_plus_plus(points, rows, dimensions, clusters);
     let mut centroids: Vec<f64> = centers
         .iter()
         .flat_map(|&row| {
@@ -923,9 +911,10 @@ fn deterministic_kmeans(
         })
         .collect();
     let mut labels = vec![usize::MAX; rows];
-    for _ in 0..100 {
+    for _ in 0..300 {
         let mut changed = false;
         for row in 0..rows {
+            let previous = labels[row];
             let label = (0..clusters)
                 .min_by(|&left, &right| {
                     squared_distance(
@@ -936,84 +925,165 @@ fn deterministic_kmeans(
                         &points[row * dimensions..(row + 1) * dimensions],
                         &centroids[right * dimensions..(right + 1) * dimensions],
                     ))
+                    .then_with(|| {
+                        usize::from(left != previous).cmp(&usize::from(right != previous))
+                    })
                     .then_with(|| left.cmp(&right))
                 })
                 .unwrap_or(0);
             changed |= labels[row] != label;
             labels[row] = label;
         }
-        if !changed {
-            break;
-        }
-        centroids.fill(0.0);
+        let mut sums = vec![0.0f64; clusters * dimensions];
         let mut counts = vec![0usize; clusters];
         for row in 0..rows {
             counts[labels[row]] += 1;
             for dimension in 0..dimensions {
-                centroids[labels[row] * dimensions + dimension] +=
-                    points[row * dimensions + dimension];
+                sums[labels[row] * dimensions + dimension] += points[row * dimensions + dimension];
             }
         }
         for cluster in 0..clusters {
             if counts[cluster] == 0 {
                 let replacement = (0..rows)
+                    .filter(|&row| counts[labels[row]] > 1)
                     .max_by(|&left, &right| {
-                        nearest_centroid_distance(points, dimensions, left, &centroids, &counts)
-                            .total_cmp(&nearest_centroid_distance(
-                                points, dimensions, right, &centroids, &counts,
-                            ))
-                            .then_with(|| right.cmp(&left))
+                        let left_label = labels[left];
+                        let right_label = labels[right];
+                        squared_distance(
+                            &points[left * dimensions..(left + 1) * dimensions],
+                            &centroids[left_label * dimensions..(left_label + 1) * dimensions],
+                        )
+                        .total_cmp(&squared_distance(
+                            &points[right * dimensions..(right + 1) * dimensions],
+                            &centroids[right_label * dimensions..(right_label + 1) * dimensions],
+                        ))
+                        .then_with(|| right.cmp(&left))
                     })
-                    .unwrap_or(0);
-                centroids[cluster * dimensions..(cluster + 1) * dimensions].copy_from_slice(
-                    &points[replacement * dimensions..(replacement + 1) * dimensions],
-                );
+                    .expect("clusters <= rows guarantees a donor for every empty cluster");
+                let donor = labels[replacement];
+                counts[donor] -= 1;
                 counts[cluster] = 1;
-            } else {
+                labels[replacement] = cluster;
                 for dimension in 0..dimensions {
-                    centroids[cluster * dimensions + dimension] /= counts[cluster] as f64;
+                    let value = points[replacement * dimensions + dimension];
+                    sums[donor * dimensions + dimension] -= value;
+                    sums[cluster * dimensions + dimension] = value;
                 }
+                changed = true;
             }
         }
+        for cluster in 0..clusters {
+            debug_assert!(counts[cluster] > 0);
+            for dimension in 0..dimensions {
+                centroids[cluster * dimensions + dimension] =
+                    sums[cluster * dimensions + dimension] / counts[cluster] as f64;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
+    debug_assert_eq!(label_count(&labels), clusters);
     compact_labels(&labels)
 }
 
-fn nearest_center_distance(
+/// Fixed-seed greedy k-means++ initialization, matching the reference
+/// 3D-Speaker/sklearn algorithm class without depending on process-global RNG.
+fn deterministic_greedy_kmeans_plus_plus(
     points: &[f64],
+    rows: usize,
     dimensions: usize,
-    row: usize,
-    centers: &[usize],
-) -> f64 {
+    clusters: usize,
+) -> Vec<usize> {
+    let mut rng = SplitMix64::new(0);
+    let mut centers = Vec::with_capacity(clusters);
+    centers.push(rng.index(rows));
+    let mut closest: Vec<f64> = (0..rows)
+        .map(|row| point_distance(points, dimensions, row, centers[0]))
+        .collect();
+    let local_trials = 2 + (clusters as f64).ln() as usize;
+
+    while centers.len() < clusters {
+        let potential: f64 = closest.iter().sum();
+        let next = if potential <= f64::EPSILON {
+            (0..rows)
+                .find(|row| !centers.contains(row))
+                .expect("clusters <= rows guarantees an unused center")
+        } else {
+            let mut cumulative = Vec::with_capacity(rows);
+            let mut total = 0.0;
+            for &distance in &closest {
+                total += distance;
+                cumulative.push(total);
+            }
+            (0..local_trials)
+                .map(|_| {
+                    let target = rng.unit_f64() * potential;
+                    cumulative
+                        .partition_point(|&value| value <= target)
+                        .min(rows - 1)
+                })
+                .min_by(|&left, &right| {
+                    kmeans_candidate_potential(points, dimensions, &closest, left)
+                        .total_cmp(&kmeans_candidate_potential(
+                            points, dimensions, &closest, right,
+                        ))
+                        .then_with(|| left.cmp(&right))
+                })
+                .expect("greedy k-means++ always evaluates a candidate")
+        };
+        centers.push(next);
+        for (row, distance) in closest.iter_mut().enumerate() {
+            *distance = distance.min(point_distance(points, dimensions, row, next));
+        }
+    }
     centers
-        .iter()
-        .map(|&center| {
-            squared_distance(
-                &points[row * dimensions..(row + 1) * dimensions],
-                &points[center * dimensions..(center + 1) * dimensions],
-            )
-        })
-        .fold(f64::INFINITY, f64::min)
 }
 
-fn nearest_centroid_distance(
+fn kmeans_candidate_potential(
     points: &[f64],
     dimensions: usize,
-    row: usize,
-    centroids: &[f64],
-    counts: &[usize],
+    closest: &[f64],
+    candidate: usize,
 ) -> f64 {
-    counts
+    closest
         .iter()
         .enumerate()
-        .filter(|(_, count)| **count > 0)
-        .map(|(cluster, _)| {
-            squared_distance(
-                &points[row * dimensions..(row + 1) * dimensions],
-                &centroids[cluster * dimensions..(cluster + 1) * dimensions],
-            )
-        })
-        .fold(f64::INFINITY, f64::min)
+        .map(|(row, &distance)| distance.min(point_distance(points, dimensions, row, candidate)))
+        .sum()
+}
+
+fn point_distance(points: &[f64], dimensions: usize, left: usize, right: usize) -> f64 {
+    squared_distance(
+        &points[left * dimensions..(left + 1) * dimensions],
+        &points[right * dimensions..(right + 1) * dimensions],
+    )
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn index(&mut self, upper: usize) -> usize {
+        (self.next_u64() % upper as u64) as usize
+    }
+
+    fn unit_f64(&mut self) -> f64 {
+        ((self.next_u64() >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
 }
 
 fn squared_distance(left: &[f64], right: &[f64]) -> f64 {
@@ -1286,6 +1356,17 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(clusterer.cluster(&embeddings, DiarizeHint::Auto), expected);
         }
+    }
+
+    #[test]
+    fn deterministic_kmeans_preserves_the_requested_nonempty_count() {
+        // Identical points force the empty-cluster path. The old implementation
+        // copied a centroid without moving its label, then compacted k=3 to k=1.
+        let points = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let labels = deterministic_kmeans(&points, 4, 2, 3);
+
+        assert_eq!(label_count(&labels), 3);
+        assert_eq!(labels, deterministic_kmeans(&points, 4, 2, 3));
     }
 
     #[test]
