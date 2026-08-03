@@ -144,6 +144,9 @@ mod tests {
             .map_err(|e| e.to_string())?;
         let executor = crate::models::qwen::ggml_executor::Qwen3AsrGgmlExecutor::default();
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: runtime_path.to_path_buf(),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
@@ -317,6 +320,9 @@ mod tests {
             .map_err(|e| e.to_string())?;
         let executor = crate::models::qwen::ggml_executor::Qwen3AsrGgmlExecutor::default();
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: runtime_path.to_path_buf(),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),

@@ -1,3 +1,8 @@
+#![cfg_attr(test, allow(dead_code))]
+// Production dead-code remains linted. Test builds retain the old all-layer
+// host materializer only as a numerical parity oracle, so some oracle helpers
+// are intentionally exercised by a subset of feature/test combinations.
+
 //! Hands-off: single-responsibility ggml graph transcription, guarded by
 //! golden/parity tests. Do not split this module for "tidiness" -- the tensor
 //! wiring is validated as a whole and refactoring here risks silent numeric
@@ -15,7 +20,7 @@ use crate::ggml_runtime::{
 };
 
 use super::graph_config::qwen_decoder_graph_config;
-use super::kv_cache::Qwen3AsrLayerKvCacheState;
+use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
 use super::logits_head::{
     Qwen3AsrLlmFusedLogitsHeadSpec, first_max_argmax_reverse_indices,
     first_max_token_id_from_reversed_argmax,
@@ -25,7 +30,7 @@ use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::llm_layer_tensor_names;
 use crate::nn::decoder::{
     LlmDecoderStackConfig, LlmDecoderStackInputs, LlmKvCachePolicy, LlmKvCacheSpec,
-    LlmLayerWeights, LlmResidentKvArena, LlmReusableDecodeGraph,
+    LlmLayerWeights, LlmQkvWeights, LlmResidentKvArena, LlmReusableDecodeGraph,
     allocate_zeroed_llm_resident_kv_arena, build_fixed_kv_attention_mask_bits,
     build_fixed_kv_attention_mask_bits_for_query_rows,
     build_fixed_kv_attention_mask_bits_for_sequences, compose_llm_decoder_layer_stack,
@@ -65,6 +70,7 @@ const QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS: usize = 8;
 /// wider path (`run_prefill_into_reused_batched`) and is not limited by this.
 const QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS: usize = 8;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Qwen3AsrLlmAttentionCoreOutput {
     pub attn_hidden: Vec<f32>,
@@ -76,6 +82,7 @@ pub(crate) struct Qwen3AsrLlmAttentionCoreOutput {
     pub v_width: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Qwen3AsrLlmDecodeAttentionHistory<'a> {
     pub key_rows: &'a [f32],
@@ -85,6 +92,7 @@ pub(crate) struct Qwen3AsrLlmDecodeAttentionHistory<'a> {
     pub rope_theta: f32,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DenseProjectionWeight {
     input_width: usize,
@@ -94,6 +102,7 @@ struct DenseProjectionWeight {
     raw_ggml: Option<OwnedGgmlProjectionWeight>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct OwnedGgmlProjectionWeight {
     ggml_type: i32,
@@ -101,6 +110,34 @@ struct OwnedGgmlProjectionWeight {
     bytes: Vec<u8>,
 }
 
+#[cfg(test)]
+impl OwnedGgmlProjectionWeight {
+    fn add_retained_system_memory(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_vec(&self.dims, label)?;
+        bytes.add_vec(&self.bytes, label)
+    }
+}
+
+#[cfg(test)]
+impl DenseProjectionWeight {
+    fn add_retained_system_memory(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_vec(&self.values, label)?;
+        if let Some(raw) = &self.raw_ggml {
+            raw.add_retained_system_memory(bytes, label)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct FusedQkvProjectionWeight {
     input_width: usize,
@@ -117,6 +154,7 @@ enum DenseProjectionLayout {
 
 #[derive(Debug, Error)]
 pub(crate) enum Qwen3AsrLlmTransformerError {
+    #[cfg(test)]
     #[error("qwen3-asr llm transformer tensor read failed: {reason}")]
     TensorReadFailed { reason: String },
     #[error("qwen3-asr llm transformer tensor '{tensor_name}' has invalid shape {shape}: {reason}")]
@@ -125,18 +163,23 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
         shape: String,
         reason: String,
     },
+    #[cfg(test)]
     #[error(
         "qwen3-asr llm transformer hidden state has invalid shape: got {got}, expected hidden_size={expected}"
     )]
     InvalidHiddenStateShape { got: usize, expected: usize },
+    #[cfg(test)]
     #[error("qwen3-asr llm transformer tensor '{tensor_name}' contains non-finite values")]
     NonFiniteTensorValues { tensor_name: String },
+    #[cfg(test)]
     #[error("qwen3-asr llm transformer projection values contain non-finite numbers")]
     NonFiniteProjectionValues,
+    #[cfg(test)]
     #[error(
         "qwen3-asr llm transformer projection values are unavailable for tensor '{tensor_name}'"
     )]
     ProjectionValuesUnavailable { tensor_name: String },
+    #[cfg(test)]
     #[error("qwen3-asr llm transformer tensor '{tensor_name}' projection overflowed allocation")]
     AllocationOverflow { tensor_name: String },
     #[error(
@@ -146,10 +189,13 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
         vector_width: usize,
         norm_width: usize,
     },
+    #[cfg(test)]
     #[error("qwen3-asr llm transformer attention core has incompatible q/k widths")]
     IncompatibleQkWidths,
+    #[cfg(test)]
     #[error("qwen3-asr llm transformer attention core produced non-finite score")]
     NonFiniteAttentionScore,
+    #[cfg(test)]
     #[error(
         "qwen3-asr llm transformer decode history shape is invalid: key_len={key_len} (expected {expected_key_len}), value_len={value_len} (expected {expected_value_len}), token_count={token_count}"
     )]
@@ -166,11 +212,13 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
     FfnProjectionWidthMismatch { gate_width: usize, up_width: usize },
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum Qwen3AsrLlmLayerAttentionProjection {
     Generic(Qwen3AsrLlmLayerAttentionProjectionGeneric),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLlmLayerAttentionProjectionGeneric {
     d_model: usize,
@@ -216,8 +264,110 @@ pub(crate) struct Qwen3AsrLlmLayerAttentionProjectionGeneric {
     v_bias: Vec<f32>,
 }
 
-#[allow(dead_code)]
+/// Metadata-only declaration of a Qwen-shaped whole decoder.
+///
+/// The plan deliberately owns no tensor payload. It is safe to retain in a
+/// host prepared-runtime cache: resident construction reuses the exact
+/// [`GgufTensorDataReader`] that validated the plan and streams one tensor (or
+/// the three mmap-backed Q/K/V byte ranges) directly into the already-declared
+/// arena before moving to the next layer.
+#[derive(Debug, Clone)]
+pub(crate) struct QwenWholeDecoderPlan {
+    layers: Vec<QwenWholeDecoderLayerPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct QwenWholeDecoderLayerPlan {
+    d_model: usize,
+    head_dim: usize,
+    attn_norm: VectorWeightPlan,
+    q: ProjectionWeightPlan,
+    k: ProjectionWeightPlan,
+    v: ProjectionWeightPlan,
+    q_bias: Option<VectorWeightPlan>,
+    k_bias: Option<VectorWeightPlan>,
+    v_bias: Option<VectorWeightPlan>,
+    output: ProjectionWeightPlan,
+    q_norm: Option<VectorWeightPlan>,
+    k_norm: Option<VectorWeightPlan>,
+    ffn_norm: VectorWeightPlan,
+    gate: ProjectionWeightPlan,
+    up: ProjectionWeightPlan,
+    down: ProjectionWeightPlan,
+}
+
+#[derive(Debug, Clone)]
+struct VectorWeightPlan {
+    tensor_name: String,
+    len: usize,
+    ggml_type: i32,
+    size_bytes: u64,
+    offset_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionWeightPlan {
+    tensor_name: String,
+    input_width: usize,
+    output_width: usize,
+    storage_dims: [usize; 2],
+    ggml_type: i32,
+    size_bytes: u64,
+    offset_bytes: u64,
+    layout: DenseProjectionLayout,
+}
+
+/// The resident arena contains exactly one QKV representation per layer.
+/// Per-projection LoRA requires split leaves; otherwise compatible native
+/// rows are concatenated directly into one fused tensor during upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QkvStorageMode {
+    Fused { ggml_type: i32 },
+    Split,
+}
+
+#[cfg(test)]
 impl Qwen3AsrLlmLayerAttentionProjection {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        let Self::Generic(inner) = self;
+        for name in [
+            &inner.attn_norm_name,
+            &inner.attn_q_name,
+            &inner.attn_k_name,
+            &inner.attn_v_name,
+            &inner.attn_output_name,
+            &inner.ffn_gate_name,
+            &inner.ffn_up_name,
+            &inner.ffn_down_name,
+        ] {
+            bytes.add_string(name, "qwen llm tensor name")?;
+        }
+        for values in [
+            &inner.attn_norm_weight,
+            &inner.ffn_norm_weight,
+            &inner.q_norm_weight,
+            &inner.k_norm_weight,
+            &inner.q_bias,
+            &inner.k_bias,
+            &inner.v_bias,
+        ] {
+            bytes.add_vec(values, "qwen llm vector weight")?;
+        }
+        for weight in [
+            &inner.q_weight,
+            &inner.k_weight,
+            &inner.v_weight,
+            &inner.attn_output_weight,
+            &inner.ffn_gate_weight,
+            &inner.ffn_up_weight,
+            &inner.ffn_down_weight,
+        ] {
+            weight.add_retained_system_memory(&mut bytes, "qwen llm projection")?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn run_attention_core_for_decode_boundary(
         &self,
         hidden: &[f32],
@@ -228,6 +378,7 @@ impl Qwen3AsrLlmLayerAttentionProjection {
     }
 }
 
+#[cfg(test)]
 impl Qwen3AsrLlmLayerAttentionProjectionGeneric {
     pub(crate) fn run_attention_core_for_decode_boundary(
         &self,
@@ -252,6 +403,7 @@ impl Qwen3AsrLlmLayerAttentionProjectionGeneric {
     }
 }
 
+#[cfg(test)]
 fn run_attention_core(
     d_model: usize,
     hidden: &[f32],
@@ -293,6 +445,7 @@ fn run_attention_core(
     )
 }
 
+#[cfg(test)]
 fn run_attention_core_with_history(
     d_model: usize,
     hidden: &[f32],
@@ -509,6 +662,7 @@ fn run_attention_core_with_history(
     })
 }
 
+#[cfg(test)]
 fn head_dim_from_norm(norm_weight: &[f32]) -> Result<usize, Qwen3AsrLlmTransformerError> {
     if norm_weight.is_empty() || !norm_weight.len().is_multiple_of(2) {
         return Err(Qwen3AsrLlmTransformerError::IncompatibleQkWidths);
@@ -516,6 +670,7 @@ fn head_dim_from_norm(norm_weight: &[f32]) -> Result<usize, Qwen3AsrLlmTransform
     Ok(norm_weight.len())
 }
 
+#[cfg(test)]
 fn apply_rope_neox_in_place(
     values: &mut [f32],
     head_dim: usize,
@@ -546,6 +701,7 @@ fn apply_rope_neox_in_place(
     Ok(())
 }
 
+#[cfg(test)]
 impl DenseProjectionWeight {
     #[cfg(test)]
     fn from_tensor(
@@ -682,6 +838,7 @@ impl DenseProjectionWeight {
     }
 }
 
+#[cfg(test)]
 impl FusedQkvProjectionWeight {
     fn new(
         q_weight: &DenseProjectionWeight,
@@ -829,12 +986,18 @@ impl LlmWeightHandle {
 }
 
 /// Resident weight handles for one decode layer, allocated into a shared arena.
+enum QwenQkvWeightHandles {
+    Fused(GgmlStaticTensor),
+    Split {
+        q: GgmlStaticTensor,
+        k: GgmlStaticTensor,
+        v: GgmlStaticTensor,
+    },
+}
+
 struct Qwen3AsrLlmLayerWeightHandles {
     attn_norm_weight: GgmlStaticTensor,
-    qkv_weight: Option<GgmlStaticTensor>,
-    q_weight: GgmlStaticTensor,
-    k_weight: GgmlStaticTensor,
-    v_weight: GgmlStaticTensor,
+    qkv: QwenQkvWeightHandles,
     /// `Some` only for a Qwen2-shaped projection (attention bias); Qwen3-ASR
     /// leaves these `None`.
     q_bias: Option<GgmlStaticTensor>,
@@ -927,10 +1090,14 @@ fn qwen_llm_layer_weights_with_lora<'a>(
     };
     LlmLayerWeights {
         attn_norm_weight: arena.graph_tensor(layer.attn_norm_weight),
-        qkv_weight: layer.qkv_weight.map(|weight| weight.as_graph_tensor()),
-        q_weight: layer.q_weight.as_graph_tensor(),
-        k_weight: layer.k_weight.as_graph_tensor(),
-        v_weight: layer.v_weight.as_graph_tensor(),
+        qkv: match layer.qkv {
+            QwenQkvWeightHandles::Fused(weight) => LlmQkvWeights::Fused(weight.as_graph_tensor()),
+            QwenQkvWeightHandles::Split { q, k, v } => LlmQkvWeights::Split {
+                q: q.as_graph_tensor(),
+                k: k.as_graph_tensor(),
+                v: v.as_graph_tensor(),
+            },
+        },
         q_bias: layer.q_bias.map(|t| arena.graph_tensor(t)),
         k_bias: layer.k_bias.map(|t| arena.graph_tensor(t)),
         v_bias: layer.v_bias.map(|t| arena.graph_tensor(t)),
@@ -967,11 +1134,430 @@ pub(crate) struct Qwen3AsrLlmWholeStepTop1Output {
     pub compute_micros: u128,
 }
 
+impl QwenWholeDecoderLayerPlan {
+    fn dims(&self) -> Result<Qwen3AsrLlmDecodeDims, GgmlCpuGraphError> {
+        if self.q.input_width != self.d_model
+            || self.k.input_width != self.d_model
+            || self.v.input_width != self.d_model
+            || self.gate.input_width != self.d_model
+            || self.up.input_width != self.d_model
+            || self.k.output_width != self.v.output_width
+            || !self.q.output_width.is_multiple_of(self.head_dim)
+            || !self.k.output_width.is_multiple_of(self.head_dim)
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "qwen whole-decoder plan has inconsistent layer geometry",
+            });
+        }
+        let q_heads = self.q.output_width / self.head_dim;
+        let kv_heads = self.k.output_width / self.head_dim;
+        if q_heads == 0 || kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "qwen whole-decoder plan has invalid q/kv head ratio",
+            });
+        }
+        Ok(Qwen3AsrLlmDecodeDims {
+            d_model: self.d_model,
+            q_width: self.q.output_width,
+            k_width: self.k.output_width,
+            v_width: self.v.output_width,
+            head_dim: self.head_dim,
+            q_heads,
+            kv_heads,
+        })
+    }
+
+    fn qkv_storage_mode(&self, force_split: bool) -> QkvStorageMode {
+        if !force_split
+            && self.q.layout == DenseProjectionLayout::OutputByInput
+            && self.k.layout == DenseProjectionLayout::OutputByInput
+            && self.v.layout == DenseProjectionLayout::OutputByInput
+            && self.q.ggml_type == self.k.ggml_type
+            && self.q.ggml_type == self.v.ggml_type
+            && self.q.storage_dims[0] == self.k.storage_dims[0]
+            && self.q.storage_dims[0] == self.v.storage_dims[0]
+        {
+            QkvStorageMode::Fused {
+                ggml_type: self.q.ggml_type,
+            }
+        } else {
+            QkvStorageMode::Split
+        }
+    }
+}
+
+fn new_projection_tensor_from_plan(
+    arena: &GgmlStaticTensorArena,
+    plan: &ProjectionWeightPlan,
+    tensor_name: &'static str,
+) -> Result<GgmlStaticTensor, GgmlCpuGraphError> {
+    match plan.layout {
+        DenseProjectionLayout::OutputByInput => arena.new_matmul_weight_2d_typed(
+            plan.storage_dims[0],
+            plan.storage_dims[1],
+            plan.ggml_type,
+            tensor_name,
+        ),
+        DenseProjectionLayout::InputByOutput => {
+            arena.new_tensor_2d_f32(plan.input_width, plan.output_width, tensor_name)
+        }
+    }
+}
+
+fn bind_or_arena_llm_plan(
+    arena: &GgmlStaticTensorArena,
+    loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
+    plan: &ProjectionWeightPlan,
+    tensor_name: &'static str,
+) -> Result<LlmWeightHandle, GgmlCpuGraphError> {
+    if plan.layout == DenseProjectionLayout::OutputByInput {
+        return loaded
+            .and_then(|context| context.tensor(&plan.tensor_name))
+            .map(LlmWeightHandle::Loaded)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "decode native 2D weight could not be bound zero-copy from the planned runtime source",
+            });
+    }
+    Ok(LlmWeightHandle::Arena(new_projection_tensor_from_plan(
+        arena,
+        plan,
+        tensor_name,
+    )?))
+}
+
+fn allocate_decode_layer_from_plan(
+    arena: &mut GgmlStaticTensorArena,
+    loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
+    plan: &QwenWholeDecoderLayerPlan,
+    force_split_qkv: bool,
+) -> Result<(Qwen3AsrLlmLayerWeightHandles, Qwen3AsrLlmDecodeDims), GgmlCpuGraphError> {
+    let dims = plan.dims()?;
+    let has_qk_norm = plan.q_norm.is_some();
+    if has_qk_norm != plan.k_norm.is_some() {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "qwen whole-decoder plan has asymmetric q/k norm",
+        });
+    }
+    let has_qkv_bias = plan.q_bias.is_some();
+    if has_qkv_bias != plan.k_bias.is_some() || has_qkv_bias != plan.v_bias.is_some() {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "qwen whole-decoder plan has asymmetric q/k/v bias",
+        });
+    }
+    let attn_norm = arena.new_tensor_2d_f32(plan.d_model, 1, "qwen_llm_decode_attn_norm_weight")?;
+    let q_norm = has_qk_norm
+        .then(|| arena.new_tensor_2d_f32(plan.head_dim, 1, "qwen_llm_decode_q_norm_weight"))
+        .transpose()?;
+    let k_norm = has_qk_norm
+        .then(|| arena.new_tensor_2d_f32(plan.head_dim, 1, "qwen_llm_decode_k_norm_weight"))
+        .transpose()?;
+    let q_bias = has_qkv_bias
+        .then(|| arena.new_tensor_2d_f32(plan.q.output_width, 1, "qwen_llm_decode_q_bias"))
+        .transpose()?;
+    let k_bias = has_qkv_bias
+        .then(|| arena.new_tensor_2d_f32(plan.k.output_width, 1, "qwen_llm_decode_k_bias"))
+        .transpose()?;
+    let v_bias = has_qkv_bias
+        .then(|| arena.new_tensor_2d_f32(plan.v.output_width, 1, "qwen_llm_decode_v_bias"))
+        .transpose()?;
+    let ffn_norm = arena.new_tensor_2d_f32(plan.d_model, 1, "qwen_llm_decode_ffn_norm_weight")?;
+    let qkv = match plan.qkv_storage_mode(force_split_qkv) {
+        QkvStorageMode::Fused { ggml_type } => {
+            let output_width = plan
+                .q
+                .output_width
+                .checked_add(plan.k.output_width)
+                .and_then(|width| width.checked_add(plan.v.output_width))
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "fused qkv projection width overflow",
+                })?;
+            QwenQkvWeightHandles::Fused(arena.new_matmul_weight_2d_typed(
+                plan.d_model,
+                output_width,
+                ggml_type,
+                "qwen_llm_decode_qkv_weight",
+            )?)
+        }
+        QkvStorageMode::Split => QwenQkvWeightHandles::Split {
+            q: new_projection_tensor_from_plan(arena, &plan.q, "qwen_llm_decode_q_weight")?,
+            k: new_projection_tensor_from_plan(arena, &plan.k, "qwen_llm_decode_k_weight")?,
+            v: new_projection_tensor_from_plan(arena, &plan.v, "qwen_llm_decode_v_weight")?,
+        },
+    };
+    Ok((
+        Qwen3AsrLlmLayerWeightHandles {
+            attn_norm_weight: attn_norm,
+            qkv,
+            q_bias,
+            k_bias,
+            v_bias,
+            output_weight: bind_or_arena_llm_plan(
+                arena,
+                loaded,
+                &plan.output,
+                "qwen_llm_decode_output_weight",
+            )?,
+            q_norm_weight: q_norm,
+            k_norm_weight: k_norm,
+            ffn_norm_weight: ffn_norm,
+            gate_weight: bind_or_arena_llm_plan(
+                arena,
+                loaded,
+                &plan.gate,
+                "qwen_llm_decode_gate_weight",
+            )?,
+            up_weight: bind_or_arena_llm_plan(
+                arena,
+                loaded,
+                &plan.up,
+                "qwen_llm_decode_up_weight",
+            )?,
+            down_weight: bind_or_arena_llm_plan(
+                arena,
+                loaded,
+                &plan.down,
+                "qwen_llm_decode_down_weight",
+            )?,
+            lora: QwenLayerLoraSlots::default(),
+        },
+        dims,
+    ))
+}
+
+fn upload_vector_from_plan(
+    reader: &GgufTensorDataReader,
+    arena: &mut GgmlStaticTensorArena,
+    handle: GgmlStaticTensor,
+    plan: &VectorWeightPlan,
+    upload_name: &'static str,
+) -> Result<usize, GgmlCpuGraphError> {
+    let expected_shape = [plan.len as u64];
+    let values = reader
+        .host_tensor_f32_copy_dequantized_by_name(&plan.tensor_name, &expected_shape)
+        .map_err(map_tensor_read_error_to_graph)?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "qwen vector weight contains non-finite values",
+        });
+    }
+    // The plan records the pack type so a same-name/same-shape source drift
+    // cannot silently swap representations between validation and upload.
+    let actual_type = required_tensor_metadata(reader, &plan.tensor_name)
+        .map_err(map_transformer_error_to_graph)?
+        .ggml_type;
+    if actual_type != plan.ggml_type {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "qwen vector weight type changed after planning",
+        });
+    }
+    let staging_bytes = values.capacity().saturating_mul(std::mem::size_of::<f32>());
+    arena.set_f32_slice(handle, &values, upload_name)?;
+    Ok(staging_bytes)
+}
+
+fn checked_projection_payload<'a>(
+    reader: &'a GgufTensorDataReader,
+    plan: &ProjectionWeightPlan,
+) -> Result<crate::ggml_runtime::GgufWeightTensorPayload<'a>, GgmlCpuGraphError> {
+    let payload = reader
+        .weight_tensor_payload_by_name(&plan.tensor_name)
+        .map_err(map_tensor_read_error_to_graph)?;
+    if payload.dims.as_slice() != plan.storage_dims
+        || payload.element_type.ggml_type() != plan.ggml_type
+    {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "qwen projection payload disagrees with metadata plan",
+        });
+    }
+    Ok(payload)
+}
+
+fn upload_projection_from_plan(
+    reader: &GgufTensorDataReader,
+    arena: &mut GgmlStaticTensorArena,
+    handle: GgmlStaticTensor,
+    plan: &ProjectionWeightPlan,
+    upload_name: &'static str,
+) -> Result<usize, GgmlCpuGraphError> {
+    match plan.layout {
+        DenseProjectionLayout::OutputByInput => {
+            let payload = checked_projection_payload(reader, plan)?;
+            arena.set_bytes_slice(handle, payload.bytes, upload_name)?;
+            Ok(0)
+        }
+        DenseProjectionLayout::InputByOutput => {
+            let expected_shape = [plan.storage_dims[0] as u64, plan.storage_dims[1] as u64];
+            let values = reader
+                .host_tensor_f32_copy_dequantized_by_name(&plan.tensor_name, &expected_shape)
+                .map_err(map_tensor_read_error_to_graph)?;
+            let transposed = projection_values_for_ggml(
+                plan.input_width,
+                plan.output_width,
+                &values,
+                plan.layout,
+            )?;
+            let staging_bytes = values
+                .capacity()
+                .saturating_add(transposed.capacity())
+                .saturating_mul(std::mem::size_of::<f32>());
+            arena.set_f32_slice(handle, &transposed, upload_name)?;
+            Ok(staging_bytes)
+        }
+    }
+}
+
+fn upload_fused_qkv_from_plan(
+    reader: &GgufTensorDataReader,
+    arena: &mut GgmlStaticTensorArena,
+    handle: GgmlStaticTensor,
+    plan: &QwenWholeDecoderLayerPlan,
+) -> Result<(), GgmlCpuGraphError> {
+    let mut offset = 0usize;
+    for projection in [&plan.q, &plan.k, &plan.v] {
+        let payload = checked_projection_payload(reader, projection)?;
+        arena.set_bytes_slice_with_offset(
+            handle,
+            offset,
+            payload.bytes,
+            "qwen_llm_decode_qkv_weight",
+        )?;
+        offset = offset.checked_add(payload.bytes.len()).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "fused qkv upload byte offset overflow",
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn upload_decode_layer_from_plan(
+    reader: &GgufTensorDataReader,
+    arena: &mut GgmlStaticTensorArena,
+    handles: &Qwen3AsrLlmLayerWeightHandles,
+    plan: &QwenWholeDecoderLayerPlan,
+) -> Result<usize, GgmlCpuGraphError> {
+    let mut peak_staging_bytes = 0usize;
+    peak_staging_bytes = peak_staging_bytes.max(upload_vector_from_plan(
+        reader,
+        arena,
+        handles.attn_norm_weight,
+        &plan.attn_norm,
+        "qwen_llm_decode_attn_norm_weight",
+    )?);
+    for (handle, vector, name) in [
+        (
+            handles.q_norm_weight,
+            plan.q_norm.as_ref(),
+            "qwen_llm_decode_q_norm_weight",
+        ),
+        (
+            handles.k_norm_weight,
+            plan.k_norm.as_ref(),
+            "qwen_llm_decode_k_norm_weight",
+        ),
+        (
+            handles.q_bias,
+            plan.q_bias.as_ref(),
+            "qwen_llm_decode_q_bias",
+        ),
+        (
+            handles.k_bias,
+            plan.k_bias.as_ref(),
+            "qwen_llm_decode_k_bias",
+        ),
+        (
+            handles.v_bias,
+            plan.v_bias.as_ref(),
+            "qwen_llm_decode_v_bias",
+        ),
+    ] {
+        match (handle, vector) {
+            (Some(handle), Some(vector)) => {
+                peak_staging_bytes = peak_staging_bytes.max(upload_vector_from_plan(
+                    reader, arena, handle, vector, name,
+                )?);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "qwen vector resident handle disagrees with metadata plan",
+                });
+            }
+        }
+    }
+    peak_staging_bytes = peak_staging_bytes.max(upload_vector_from_plan(
+        reader,
+        arena,
+        handles.ffn_norm_weight,
+        &plan.ffn_norm,
+        "qwen_llm_decode_ffn_norm_weight",
+    )?);
+    match handles.qkv {
+        QwenQkvWeightHandles::Fused(handle) => {
+            upload_fused_qkv_from_plan(reader, arena, handle, plan)?;
+        }
+        QwenQkvWeightHandles::Split { q, k, v } => {
+            for (handle, projection, name) in [
+                (q, &plan.q, "qwen_llm_decode_q_weight"),
+                (k, &plan.k, "qwen_llm_decode_k_weight"),
+                (v, &plan.v, "qwen_llm_decode_v_weight"),
+            ] {
+                peak_staging_bytes = peak_staging_bytes.max(upload_projection_from_plan(
+                    reader, arena, handle, projection, name,
+                )?);
+            }
+        }
+    }
+    for (handle, projection, name) in [
+        (
+            handles.output_weight.arena_handle(),
+            &plan.output,
+            "qwen_llm_decode_output_weight",
+        ),
+        (
+            handles.gate_weight.arena_handle(),
+            &plan.gate,
+            "qwen_llm_decode_gate_weight",
+        ),
+        (
+            handles.up_weight.arena_handle(),
+            &plan.up,
+            "qwen_llm_decode_up_weight",
+        ),
+        (
+            handles.down_weight.arena_handle(),
+            &plan.down,
+            "qwen_llm_decode_down_weight",
+        ),
+    ] {
+        if let Some(handle) = handle {
+            peak_staging_bytes = peak_staging_bytes.max(upload_projection_from_plan(
+                reader, arena, handle, projection, name,
+            )?);
+        }
+    }
+    Ok(peak_staging_bytes)
+}
+
+fn map_tensor_read_error_to_graph(error: GgufTensorDataReadError) -> GgmlCpuGraphError {
+    let _ = error;
+    GgmlCpuGraphError::UnsupportedInputs {
+        reason: "qwen whole-decoder planned tensor materialization failed",
+    }
+}
+
+fn map_transformer_error_to_graph(_error: Qwen3AsrLlmTransformerError) -> GgmlCpuGraphError {
+    GgmlCpuGraphError::UnsupportedInputs {
+        reason: "qwen whole-decoder tensor metadata changed after planning",
+    }
+}
+
 /// Validate and ALLOCATE (but do not upload) one decode layer's weight tensors
 /// into `arena`. All layers must be allocated before ANY upload, because the
 /// first upload freezes the arena's backend buffer (no further new_tensor). The
 /// returned FusedQkvProjectionWeight is carried to the upload phase.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn allocate_decode_layer_tensors(
     arena: &mut GgmlStaticTensorArena,
     loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
@@ -1001,6 +1587,7 @@ fn allocate_decode_layer_tensors(
     ffn_gate_tensor_name: &str,
     ffn_up_tensor_name: &str,
     ffn_down_tensor_name: &str,
+    force_split_qkv: bool,
 ) -> Result<
     (
         Qwen3AsrLlmLayerWeightHandles,
@@ -1096,21 +1683,23 @@ fn allocate_decode_layer_tensors(
         .then(|| arena.new_tensor_2d_f32(v_weight.output_width, 1, "qwen_llm_decode_v_bias"))
         .transpose()?;
     let ffn_norm = arena.new_tensor_2d_f32(d_model, 1, "qwen_llm_decode_ffn_norm_weight")?;
-    let fused_qkv_weight = if allow_fused_qkv {
+    let fused_qkv_weight = if allow_fused_qkv && !force_split_qkv {
         FusedQkvProjectionWeight::new(q_weight, k_weight, v_weight)?
     } else {
         None
     };
-    let qkv_weight_tensor = fused_qkv_weight
-        .as_ref()
-        .map(|weight| new_fused_qkv_tensor_in_arena(arena, weight, "qwen_llm_decode_qkv_weight"))
-        .transpose()?;
-    let q_weight_tensor =
-        new_projection_tensor_in_arena(arena, q_weight, "qwen_llm_decode_q_weight")?;
-    let k_weight_tensor =
-        new_projection_tensor_in_arena(arena, k_weight, "qwen_llm_decode_k_weight")?;
-    let v_weight_tensor =
-        new_projection_tensor_in_arena(arena, v_weight, "qwen_llm_decode_v_weight")?;
+    let qkv = match fused_qkv_weight.as_ref() {
+        Some(weight) => QwenQkvWeightHandles::Fused(new_fused_qkv_tensor_in_arena(
+            arena,
+            weight,
+            "qwen_llm_decode_qkv_weight",
+        )?),
+        None => QwenQkvWeightHandles::Split {
+            q: new_projection_tensor_in_arena(arena, q_weight, "qwen_llm_decode_q_weight")?,
+            k: new_projection_tensor_in_arena(arena, k_weight, "qwen_llm_decode_k_weight")?,
+            v: new_projection_tensor_in_arena(arena, v_weight, "qwen_llm_decode_v_weight")?,
+        },
+    };
     // Bind output/gate/up/down zero-copy from the mmap'd pack when present
     // (native q8/f16, no arena copy); else allocate an arena tensor. These four
     // are unentangled with the fused-QKV path. q/k/v stay arena (they feed the
@@ -1147,10 +1736,7 @@ fn allocate_decode_layer_tensors(
     Ok((
         Qwen3AsrLlmLayerWeightHandles {
             attn_norm_weight: attn_norm,
-            qkv_weight: qkv_weight_tensor,
-            q_weight: q_weight_tensor,
-            k_weight: k_weight_tensor,
-            v_weight: v_weight_tensor,
+            qkv,
             q_bias: q_bias_tensor,
             k_bias: k_bias_tensor,
             v_bias: v_bias_tensor,
@@ -1180,6 +1766,7 @@ fn allocate_decode_layer_tensors(
 /// Bind a decode 2D projection zero-copy from `loaded` (mmap'd pack, native
 /// type) when present; else allocate an arena tensor. A `Loaded` handle carries
 /// its mmap'd data already (no upload); an `Arena` handle is uploaded later.
+#[cfg(test)]
 fn bind_or_arena_llm(
     arena: &GgmlStaticTensorArena,
     loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
@@ -1206,9 +1793,10 @@ fn bind_or_arena_llm(
     )?))
 }
 
-/// Allocate LoRA A/B slots for one layer into the arena, collecting upload
-/// payloads in `pending_uploads`.  Returns a `QwenLayerLoraSlots` with all
-/// slots populated for matching targets, or `None` slots for non-targeted ones.
+/// Allocate LoRA A/B slots for one layer into the arena. Payloads remain owned
+/// by the adapter and are uploaded by reference only after every arena tensor
+/// has been declared; construction never clones all layer payloads into a
+/// second pending-upload collection.
 ///
 /// This must run during Pass 1 (before any upload), because allocating tensors
 /// after the first upload freezes the backend buffer.
@@ -1231,21 +1819,18 @@ fn allocate_layer_lora_slots(
     ffn_gate_name: &str,
     ffn_up_name: &str,
     ffn_down_name: &str,
-    pending_uploads: &mut Vec<(GgmlStaticTensor, Vec<f32>, &'static str)>,
 ) -> Result<QwenLayerLoraSlots, GgmlCpuGraphError> {
     let Some(adapter) = adapter else {
         return Ok(QwenLayerLoraSlots::default());
     };
     let mut slots = QwenLayerLoraSlots::default();
     // Allocate one LoRA slot for `target_name`, pushing the upload payload.
-    let mut maybe_slot =
+    let maybe_slot =
         |target_name: &str| -> Result<Option<super::lora::QwenLoraSlot>, GgmlCpuGraphError> {
             let Some(target) = adapter.target(target_name) else {
                 return Ok(None);
             };
             let slot = new_qwen_lora_slot(arena, target, "qwen_lora_a", "qwen_lora_b")?;
-            pending_uploads.push((slot.a, target.a_values.clone(), "qwen_lora_a"));
-            pending_uploads.push((slot.b_scaled, target.b_scaled_values.clone(), "qwen_lora_b"));
             Ok(Some(slot))
         };
     slots.attn_q = maybe_slot(attn_q_name)?;
@@ -1256,6 +1841,43 @@ fn allocate_layer_lora_slots(
     slots.ffn_up = maybe_slot(ffn_up_name)?;
     slots.ffn_down = maybe_slot(ffn_down_name)?;
     Ok(slots)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_layer_lora_slots(
+    arena: &mut GgmlStaticTensorArena,
+    adapter: Option<&QwenLoraAdapter>,
+    slots: &QwenLayerLoraSlots,
+    attn_q_name: &str,
+    attn_k_name: &str,
+    attn_v_name: &str,
+    attn_output_name: &str,
+    ffn_gate_name: &str,
+    ffn_up_name: &str,
+    ffn_down_name: &str,
+) -> Result<(), GgmlCpuGraphError> {
+    let Some(adapter) = adapter else {
+        return Ok(());
+    };
+    for (slot, target_name) in [
+        (slots.attn_q, attn_q_name),
+        (slots.attn_k, attn_k_name),
+        (slots.attn_v, attn_v_name),
+        (slots.attn_output, attn_output_name),
+        (slots.ffn_gate, ffn_gate_name),
+        (slots.ffn_up, ffn_up_name),
+        (slots.ffn_down, ffn_down_name),
+    ] {
+        let Some(slot) = slot else { continue };
+        let target = adapter
+            .target(target_name)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "allocated qwen LoRA slot lost its adapter target",
+            })?;
+        arena.set_f32_slice(slot.a, &target.a_values, "qwen_lora_a")?;
+        arena.set_f32_slice(slot.b_scaled, &target.b_scaled_values, "qwen_lora_b")?;
+    }
+    Ok(())
 }
 
 fn allocate_fused_logits_head_tensors(
@@ -1374,6 +1996,7 @@ fn validate_fused_top1_token_id(
 /// handles. Must run AFTER all layers' tensors are allocated (the first upload
 /// freezes the arena's backend buffer).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn upload_decode_layer_weights(
     arena: &mut GgmlStaticTensorArena,
     handles: &Qwen3AsrLlmLayerWeightHandles,
@@ -1418,27 +2041,21 @@ fn upload_decode_layer_weights(
         ffn_norm_weight,
         "qwen_llm_decode_ffn_norm_weight",
     )?;
-    if let (Some(tensor), Some(weight)) = (handles.qkv_weight, fused_qkv_weight) {
-        upload_fused_qkv_weight_to_arena(arena, tensor, weight, "qwen_llm_decode_qkv_weight")?;
+    match (&handles.qkv, fused_qkv_weight) {
+        (QwenQkvWeightHandles::Fused(tensor), Some(weight)) => {
+            upload_fused_qkv_weight_to_arena(arena, *tensor, weight, "qwen_llm_decode_qkv_weight")?;
+        }
+        (QwenQkvWeightHandles::Split { q, k, v }, None) => {
+            upload_projection_weight_to_arena(arena, *q, q_weight, "qwen_llm_decode_q_weight")?;
+            upload_projection_weight_to_arena(arena, *k, k_weight, "qwen_llm_decode_k_weight")?;
+            upload_projection_weight_to_arena(arena, *v, v_weight, "qwen_llm_decode_v_weight")?;
+        }
+        _ => {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "QKV resident handle/payload modes disagree",
+            });
+        }
     }
-    upload_projection_weight_to_arena(
-        arena,
-        handles.q_weight,
-        q_weight,
-        "qwen_llm_decode_q_weight",
-    )?;
-    upload_projection_weight_to_arena(
-        arena,
-        handles.k_weight,
-        k_weight,
-        "qwen_llm_decode_k_weight",
-    )?;
-    upload_projection_weight_to_arena(
-        arena,
-        handles.v_weight,
-        v_weight,
-        "qwen_llm_decode_v_weight",
-    )?;
     // output/gate/up/down: only `Arena` handles need an upload; `Loaded` ones
     // already carry their mmap'd data (zero-copy).
     if let Some(handle) = handles.output_weight.arena_handle() {
@@ -1500,6 +2117,8 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     use_native_gqa: bool,
     rms_norm_epsilon: f32,
     kv_cache_spec: LlmKvCacheSpec,
+    #[cfg(test)]
+    materialization_peak_staging_bytes: usize,
 }
 
 impl fmt::Debug for Qwen3AsrLlmWholeDecoderGraphExecutor {
@@ -1514,6 +2133,196 @@ impl fmt::Debug for Qwen3AsrLlmWholeDecoderGraphExecutor {
 }
 
 impl Qwen3AsrLlmWholeDecoderGraphExecutor {
+    #[allow(dead_code)] // Used by aggregate candidate memory quotes.
+    pub(crate) fn quoted_retained_system_memory_bytes(layer_count: usize) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            layer_count
+                .checked_mul(std::mem::size_of::<Qwen3AsrLlmLayerWeightHandles>())
+                .ok_or_else(|| "qwen decoder layer-handle quote overflowed".to_string())?,
+            "qwen resident decoder layer handles",
+        )?;
+        Ok(bytes.finish())
+    }
+
+    #[allow(dead_code)] // Reconciled by aggregate candidate owners.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "qwen resident decoder layer handles")?;
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn new_from_plan(
+        plan: &QwenWholeDecoderPlan,
+        runtime_source: &GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter(
+            plan,
+            runtime_source,
+            DEFAULT_RMS_NORM_EPSILON,
+            None,
+            None,
+            backend,
+        )
+    }
+
+    pub(crate) fn new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+        plan: &QwenWholeDecoderPlan,
+        runtime_source: &GgmlRuntimeSource,
+        rms_norm_epsilon: f32,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter(
+            plan,
+            runtime_source,
+            rms_norm_epsilon,
+            fused_logits_head,
+            None,
+            backend,
+        )
+    }
+
+    pub(crate) fn new_from_plan_with_lora(
+        plan: &QwenWholeDecoderPlan,
+        runtime_source: &GgmlRuntimeSource,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        adapter: Option<&QwenLoraAdapter>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter(
+            plan,
+            runtime_source,
+            DEFAULT_RMS_NORM_EPSILON,
+            fused_logits_head,
+            adapter,
+            backend,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_from_plan_with_adapter(
+        plan: &QwenWholeDecoderPlan,
+        runtime_source: &GgmlRuntimeSource,
+        rms_norm_epsilon: f32,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        adapter: Option<&QwenLoraAdapter>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        if plan.layers.is_empty() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder plan requires at least one layer",
+            });
+        }
+        if !rms_norm_epsilon.is_finite() || rms_norm_epsilon <= 0.0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder rms norm epsilon must be finite and positive",
+            });
+        }
+        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+            .map_err(map_tensor_read_error_to_graph)?;
+        plan.validate_materialization_reader(&reader)?;
+        let mut config = qwen_decoder_graph_config(backend);
+        config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
+        let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
+        let runner = GgmlCpuGraphRunner::new(config)?;
+        let loaded = runner.load_gguf_weight_context(runtime_source).ok();
+        let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
+        let mut layers = Vec::with_capacity(plan.layers.len());
+        let mut dims = None;
+
+        // Declaration pass. No payload is read and no backend buffer is
+        // allocated until every base, LoRA and fused-head tensor exists.
+        for layer_plan in &plan.layers {
+            let layer_lora = allocate_layer_lora_slots(
+                &arena,
+                adapter,
+                &layer_plan.q.tensor_name,
+                &layer_plan.k.tensor_name,
+                &layer_plan.v.tensor_name,
+                &layer_plan.output.tensor_name,
+                &layer_plan.gate.tensor_name,
+                &layer_plan.up.tensor_name,
+                &layer_plan.down.tensor_name,
+            )?;
+            let force_split_qkv = layer_lora.attn_q.is_some()
+                || layer_lora.attn_k.is_some()
+                || layer_lora.attn_v.is_some();
+            let (mut handles, layer_dims) = allocate_decode_layer_from_plan(
+                &mut arena,
+                loaded.as_ref(),
+                layer_plan,
+                force_split_qkv,
+            )?;
+            handles.lora = layer_lora;
+            match dims {
+                None => dims = Some(layer_dims),
+                Some(existing) if existing != layer_dims => {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder plan layers have inconsistent dimensions",
+                    });
+                }
+                Some(_) => {}
+            }
+            layers.push(handles);
+        }
+        let dims = dims.expect("non-empty whole-decoder plan sets dimensions");
+        let fused_logits_head = fused_logits_head
+            .map(|spec| {
+                let handles =
+                    allocate_fused_logits_head_tensors(&mut arena, loaded.as_ref(), dims, &spec)?;
+                upload_fused_logits_head_weights(&mut arena, &handles, &spec)?;
+                Ok::<_, GgmlCpuGraphError>(handles)
+            })
+            .transpose()?;
+
+        // Materialization pass. Direct projections are borrowed from the mmap
+        // and uploaded without a host copy. Fallback projections and vectors
+        // are loaded one at a time and dropped before advancing to the next
+        // tensor/layer. LoRA values remain owned by `adapter` and are likewise
+        // uploaded by reference, never cloned into a pending list.
+        let mut materialization_peak_staging_bytes = 0usize;
+        for (layer_plan, handles) in plan.layers.iter().zip(&layers) {
+            materialization_peak_staging_bytes = materialization_peak_staging_bytes.max(
+                upload_decode_layer_from_plan(&reader, &mut arena, handles, layer_plan)?,
+            );
+            upload_layer_lora_slots(
+                &mut arena,
+                adapter,
+                &handles.lora,
+                &layer_plan.q.tensor_name,
+                &layer_plan.k.tensor_name,
+                &layer_plan.v.tensor_name,
+                &layer_plan.output.tensor_name,
+                &layer_plan.gate.tensor_name,
+                &layer_plan.up.tensor_name,
+                &layer_plan.down.tensor_name,
+            )?;
+        }
+        let mut executor = Self {
+            reuse: None,
+            loaded,
+            runner,
+            arena,
+            layers,
+            fused_logits_head,
+            dims,
+            use_native_gqa,
+            rms_norm_epsilon,
+            kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+            #[cfg(test)]
+            materialization_peak_staging_bytes,
+        };
+        let policy = resolve_qwen_family_production_kv_cache_policy(
+            executor.runner.backend_kind(),
+            executor.dims.head_dim,
+        );
+        executor.set_kv_cache_policy(policy)?;
+        Ok(executor)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
         runtime_source: Option<&GgmlRuntimeSource>,
@@ -1538,6 +2347,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// [`super::logits_head::Qwen3AsrLlmLogitsHead`] the spec is derived from
     /// is likewise loaded from the base pack only -- both selection paths see
     /// the identical head weights whether or not an adapter is active.
+    #[cfg(test)]
     pub(crate) fn new_with_lora(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
         runtime_source: Option<&GgmlRuntimeSource>,
@@ -1555,6 +2365,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_rms_norm_epsilon_and_fused_logits_head(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
         runtime_source: Option<&GgmlRuntimeSource>,
@@ -1584,6 +2395,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// shares that one open mapping instead of a second `File::open` of the
     /// pack, so identity and weight bytes cannot come from different file
     /// generations.
+    #[cfg(test)]
     pub(crate) fn new_with_adapter(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
         runtime_source: Option<&GgmlRuntimeSource>,
@@ -1622,14 +2434,29 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
         let mut layers = Vec::with_capacity(projections.len());
         let mut fused_qkvs = Vec::with_capacity(projections.len());
-        // Pending LoRA uploads: (tensor, values, name). Collected in Pass 1,
-        // then uploaded in Pass 2 alongside the base weights.
-        let mut pending_lora_uploads: Vec<(GgmlStaticTensor, Vec<f32>, &'static str)> = Vec::new();
         let mut dims: Option<Qwen3AsrLlmDecodeDims> = None;
         // Pass 1: allocate ALL layers' tensors first — the first upload freezes
         // the arena's backend buffer, after which no new tensors may be created.
         for projection in projections.iter() {
             let Qwen3AsrLlmLayerAttentionProjection::Generic(inner) = projection;
+            // Allocate LoRA slots first so QKV storage can be selected once,
+            // before any base tensor is declared. Per-projection Q/K/V LoRA
+            // requires split weights; otherwise fused and split storage are
+            // mutually exclusive.
+            let layer_lora = allocate_layer_lora_slots(
+                &arena,
+                adapter,
+                &inner.attn_q_name,
+                &inner.attn_k_name,
+                &inner.attn_v_name,
+                &inner.attn_output_name,
+                &inner.ffn_gate_name,
+                &inner.ffn_up_name,
+                &inner.ffn_down_name,
+            )?;
+            let force_split_qkv = layer_lora.attn_q.is_some()
+                || layer_lora.attn_k.is_some()
+                || layer_lora.attn_v.is_some();
             // Zero-copy re-bind names MUST come from the loaded projection's own
             // recorded pack names (`inner.attn_output_name`/`ffn_*_name`), not a
             // family-fixed scheme like `llm_layer_tensor_names` -- the latter only
@@ -1659,23 +2486,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 &inner.ffn_gate_name,
                 &inner.ffn_up_name,
                 &inner.ffn_down_name,
+                force_split_qkv,
             )?;
-            // Allocate LoRA slots for this layer (if an adapter is active).
-            // Sourced from `inner`'s own recorded pack names -- see
-            // `allocate_layer_lora_slots`'s doc comment for why a family-fixed
-            // naming scheme must not be substituted here.
-            handles.lora = allocate_layer_lora_slots(
-                &arena,
-                adapter,
-                &inner.attn_q_name,
-                &inner.attn_k_name,
-                &inner.attn_v_name,
-                &inner.attn_output_name,
-                &inner.ffn_gate_name,
-                &inner.ffn_up_name,
-                &inner.ffn_down_name,
-                &mut pending_lora_uploads,
-            )?;
+            handles.lora = layer_lora;
             match dims {
                 None => {
                     dims = Some(layer_dims);
@@ -1722,10 +2535,18 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 &inner.ffn_up_weight,
                 &inner.ffn_down_weight,
             )?;
-        }
-        // Upload LoRA tensors (collected during Pass 1).
-        for (tensor, values, name) in pending_lora_uploads {
-            arena.set_f32_slice(tensor, &values, name)?;
+            upload_layer_lora_slots(
+                &mut arena,
+                adapter,
+                &layers[layer_index].lora,
+                &inner.attn_q_name,
+                &inner.attn_k_name,
+                &inner.attn_v_name,
+                &inner.attn_output_name,
+                &inner.ffn_gate_name,
+                &inner.ffn_up_name,
+                &inner.ffn_down_name,
+            )?;
         }
         let mut executor = Self {
             reuse: None,
@@ -1738,6 +2559,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             use_native_gqa,
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+            #[cfg(test)]
+            materialization_peak_staging_bytes: 0,
         };
         // Shared production policy for every family that builds this executor
         // (qwen/mimo/firered2/moss/hymt2/serve-batch). Discrete GPU and the
@@ -2046,19 +2869,17 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         hidden: &[f32],
         cache_position: usize,
         layer_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
         rope_theta: f32,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
-        let reuse_max_positions = layer_caches
-            .first()
-            .map(Qwen3AsrLayerKvCacheState::max_positions)
-            .filter(|_| self.supports_graph_reuse());
-        if let Some(max_positions) = reuse_max_positions {
+        self.validate_logical_cache_capacity(layer_caches, capacity)?;
+        if self.supports_graph_reuse() {
             self.run_step_reused(
                 hidden,
                 cache_position,
                 layer_caches,
                 rope_theta,
-                max_positions,
+                capacity.resident_positions(),
             )
         } else {
             self.run_step(hidden, cache_position, layer_caches, rope_theta)
@@ -2094,25 +2915,44 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         token_major_values: &[f32],
         token_count: usize,
         layer_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
         rope_theta: f32,
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Option<Vec<f32>>, GgmlCpuGraphError> {
-        let Some(max_positions) = layer_caches
-            .first()
-            .map(Qwen3AsrLayerKvCacheState::max_positions)
-            .filter(|_| self.supports_graph_reuse())
-        else {
+        self.validate_logical_cache_capacity(layer_caches, capacity)?;
+        if !self.supports_graph_reuse() {
             return Ok(None);
-        };
+        }
         let step = self.run_prefill_into_reused_batched(
             token_major_values,
             token_count,
             1,
-            max_positions,
+            capacity.resident_positions(),
             rope_theta,
             control,
         )?;
         Ok(Some(step.hidden))
+    }
+
+    fn validate_logical_cache_capacity(
+        &self,
+        layer_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if layer_caches.len() != self.layers.len() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder layer/cache count mismatch",
+            });
+        }
+        if layer_caches
+            .iter()
+            .any(|cache| cache.max_positions() != capacity.logical_positions())
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder host KV span does not match planned logical capacity",
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn run_step_top1(
@@ -3889,20 +4729,22 @@ fn seed_qwen_batched_resident_kv_arena(
                 let mut key_planes = vec![0.0_f32; tensor_elems];
                 let mut value_planes = vec![0.0_f32; tensor_elems];
                 for (sequence_index, sequence_layers) in layer_kv_by_sequence.iter().enumerate() {
+                    let prefix_length = prefix_lengths[sequence_index];
                     let history = sequence_layers[layer_index]
                         .full_history_storage()
                         .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV seed host cache storage invalid",
                         })?;
                     if history.head_dim != head_dim
-                        || history.max_positions != max_positions
                         || history.kv_heads != kv_heads
+                        || history.max_positions > max_positions
+                        || prefix_length > history.max_positions
                     {
                         return Err(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV seed host cache shape mismatch",
                         });
                     }
-                    if history.written_positions != prefix_lengths[sequence_index] {
+                    if history.written_positions != prefix_length {
                         return Err(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV seed written prefix mismatch",
                         });
@@ -3918,7 +4760,9 @@ fn seed_qwen_batched_resident_kv_arena(
                             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                                 reason: "batched resident KV seed missing f32 values",
                             })?;
-                    if keys.len() != plane_elems || values.len() != plane_elems {
+                    let host_plane_elems =
+                        qwen_resident_kv_plane_elems(head_dim, history.max_positions, kv_heads)?;
+                    if keys.len() != host_plane_elems || values.len() != host_plane_elems {
                         return Err(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV seed host cache plane length mismatch",
                         });
@@ -3928,13 +4772,51 @@ fn seed_qwen_batched_resident_kv_arena(
                             reason: "batched resident KV seed plane offset overflow",
                         },
                     )?;
-                    let plane_end = plane_start.checked_add(plane_elems).ok_or(
+                    let source_head_stride = history.max_positions.checked_mul(head_dim).ok_or(
                         GgmlCpuGraphError::UnsupportedInputs {
-                            reason: "batched resident KV seed plane offset overflow",
+                            reason: "batched resident KV seed source stride overflow",
                         },
                     )?;
-                    key_planes[plane_start..plane_end].copy_from_slice(keys);
-                    value_planes[plane_start..plane_end].copy_from_slice(values);
+                    let target_head_stride = max_positions.checked_mul(head_dim).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed target stride overflow",
+                        },
+                    )?;
+                    let prefix_elems = prefix_length.checked_mul(head_dim).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed prefix size overflow",
+                        },
+                    )?;
+                    for head in 0..kv_heads {
+                        let source_start = head.checked_mul(source_head_stride).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV seed source offset overflow",
+                            },
+                        )?;
+                        let source_end = source_start.checked_add(prefix_elems).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV seed source end overflow",
+                            },
+                        )?;
+                        let target_start = plane_start
+                            .checked_add(head.checked_mul(target_head_stride).ok_or(
+                                GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "batched resident KV seed target offset overflow",
+                                },
+                            )?)
+                            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV seed target offset overflow",
+                            })?;
+                        let target_end = target_start.checked_add(prefix_elems).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV seed target end overflow",
+                            },
+                        )?;
+                        key_planes[target_start..target_end]
+                            .copy_from_slice(&keys[source_start..source_end]);
+                        value_planes[target_start..target_end]
+                            .copy_from_slice(&values[source_start..source_end]);
+                    }
                 }
                 let layer = resident_kv_arena.layers[layer_index];
                 // Default path: host f32 -> resident f16.
@@ -3953,20 +4835,22 @@ fn seed_qwen_batched_resident_kv_arena(
                 let mut key_planes = vec![0_u8; tensor_nbytes];
                 let mut value_planes = vec![0_u8; tensor_nbytes];
                 for (sequence_index, sequence_layers) in layer_kv_by_sequence.iter().enumerate() {
+                    let prefix_length = prefix_lengths[sequence_index];
                     let history = sequence_layers[layer_index]
                         .full_history_storage()
                         .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV q8 seed host cache storage invalid",
                         })?;
                     if history.head_dim != head_dim
-                        || history.max_positions != max_positions
                         || history.kv_heads != kv_heads
+                        || history.max_positions > max_positions
+                        || prefix_length > history.max_positions
                     {
                         return Err(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV q8 seed host cache shape mismatch",
                         });
                     }
-                    if history.written_positions != prefix_lengths[sequence_index] {
+                    if history.written_positions != prefix_length {
                         return Err(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV q8 seed written prefix mismatch",
                         });
@@ -3981,7 +4865,18 @@ fn seed_qwen_batched_resident_kv_arena(
                         .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV q8 seed missing q8 values",
                         })?;
-                    if keys.len() != plane_nbytes || values.len() != plane_nbytes {
+                    let row_nbytes =
+                        GgmlKvElementType::Q8_0.row_nbytes(head_dim).map_err(|_| {
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV q8 seed row size overflow",
+                            }
+                        })?;
+                    let host_plane_nbytes = GgmlKvElementType::Q8_0
+                        .plane_nbytes(head_dim, history.max_positions, kv_heads)
+                        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed host plane size overflow",
+                        })?;
+                    if keys.len() != host_plane_nbytes || values.len() != host_plane_nbytes {
                         return Err(GgmlCpuGraphError::UnsupportedInputs {
                             reason: "batched resident KV q8 seed host cache plane length mismatch",
                         });
@@ -3991,13 +4886,51 @@ fn seed_qwen_batched_resident_kv_arena(
                             reason: "batched resident KV q8 seed plane offset overflow",
                         },
                     )?;
-                    let plane_end = plane_start.checked_add(plane_nbytes).ok_or(
+                    let source_head_stride = history.max_positions.checked_mul(row_nbytes).ok_or(
                         GgmlCpuGraphError::UnsupportedInputs {
-                            reason: "batched resident KV q8 seed plane offset overflow",
+                            reason: "batched resident KV q8 seed source stride overflow",
                         },
                     )?;
-                    key_planes[plane_start..plane_end].copy_from_slice(keys);
-                    value_planes[plane_start..plane_end].copy_from_slice(values);
+                    let target_head_stride = max_positions.checked_mul(row_nbytes).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed target stride overflow",
+                        },
+                    )?;
+                    let prefix_nbytes = prefix_length.checked_mul(row_nbytes).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed prefix size overflow",
+                        },
+                    )?;
+                    for head in 0..kv_heads {
+                        let source_start = head.checked_mul(source_head_stride).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV q8 seed source offset overflow",
+                            },
+                        )?;
+                        let source_end = source_start.checked_add(prefix_nbytes).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV q8 seed source end overflow",
+                            },
+                        )?;
+                        let target_start = plane_start
+                            .checked_add(head.checked_mul(target_head_stride).ok_or(
+                                GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "batched resident KV q8 seed target offset overflow",
+                                },
+                            )?)
+                            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV q8 seed target offset overflow",
+                            })?;
+                        let target_end = target_start.checked_add(prefix_nbytes).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV q8 seed target end overflow",
+                            },
+                        )?;
+                        key_planes[target_start..target_end]
+                            .copy_from_slice(&keys[source_start..source_end]);
+                        value_planes[target_start..target_end]
+                            .copy_from_slice(&values[source_start..source_end]);
+                    }
                 }
                 let layer = resident_kv_arena.layers[layer_index];
                 // Direct packed q8_0 upload: no full f32 staging.
@@ -4111,14 +5044,17 @@ fn seed_qwen_batched_resident_kv_slot(
                 },
             )?;
             for (layer_index, cache) in layer_kv.iter().enumerate() {
+                let mut key_plane = vec![0.0_f32; plane_elems];
+                let mut value_plane = vec![0.0_f32; plane_elems];
                 let history = cache.full_history_storage().map_err(|_| {
                     GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV slot seed host cache storage invalid",
                     }
                 })?;
                 if history.head_dim != head_dim
-                    || history.max_positions != max_positions
                     || history.kv_heads != kv_heads
+                    || history.max_positions > max_positions
+                    || cache_position > history.max_positions
                 {
                     return Err(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV slot seed host cache shape mismatch",
@@ -4139,22 +5075,65 @@ fn seed_qwen_batched_resident_kv_slot(
                     .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV slot seed missing f32 values",
                     })?;
-                if keys.len() != plane_elems || values.len() != plane_elems {
+                let host_plane_elems =
+                    qwen_resident_kv_plane_elems(head_dim, history.max_positions, kv_heads)?;
+                if keys.len() != host_plane_elems || values.len() != host_plane_elems {
                     return Err(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV slot seed host cache plane length mismatch",
                     });
+                }
+                let source_head_stride = history.max_positions.checked_mul(head_dim).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot source stride overflow",
+                    },
+                )?;
+                let target_head_stride = max_positions.checked_mul(head_dim).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot target stride overflow",
+                    },
+                )?;
+                let prefix_elems = cache_position.checked_mul(head_dim).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot prefix size overflow",
+                    },
+                )?;
+                for head in 0..kv_heads {
+                    let source_start = head.checked_mul(source_head_stride).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV slot source offset overflow",
+                        },
+                    )?;
+                    let source_end = source_start.checked_add(prefix_elems).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV slot source end overflow",
+                        },
+                    )?;
+                    let target_start = head.checked_mul(target_head_stride).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV slot target offset overflow",
+                        },
+                    )?;
+                    let target_end = target_start.checked_add(prefix_elems).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV slot target end overflow",
+                        },
+                    )?;
+                    key_plane[target_start..target_end]
+                        .copy_from_slice(&keys[source_start..source_end]);
+                    value_plane[target_start..target_end]
+                        .copy_from_slice(&values[source_start..source_end]);
                 }
                 let layer = resident_kv_arena.layers[layer_index];
                 resident_kv_arena.arena.set_f16_bits_slice_with_offset(
                     layer.key,
                     plane_offset,
-                    &f32_slice_to_f16_bits(keys),
+                    &f32_slice_to_f16_bits(&key_plane),
                     "qwen_llm_resident_kv_slot_seed_key",
                 )?;
                 resident_kv_arena.arena.set_f16_bits_slice_with_offset(
                     layer.value,
                     plane_offset,
-                    &f32_slice_to_f16_bits(values),
+                    &f32_slice_to_f16_bits(&value_plane),
                     "qwen_llm_resident_kv_slot_seed_value",
                 )?;
             }
@@ -4172,14 +5151,17 @@ fn seed_qwen_batched_resident_kv_slot(
                 },
             )?;
             for (layer_index, cache) in layer_kv.iter().enumerate() {
+                let mut key_plane = vec![0_u8; plane_nbytes];
+                let mut value_plane = vec![0_u8; plane_nbytes];
                 let history = cache.full_history_storage().map_err(|_| {
                     GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV q8 slot seed host cache storage invalid",
                     }
                 })?;
                 if history.head_dim != head_dim
-                    || history.max_positions != max_positions
                     || history.kv_heads != kv_heads
+                    || history.max_positions > max_positions
+                    || cache_position > history.max_positions
                 {
                     return Err(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV q8 slot seed host cache shape mismatch",
@@ -4200,22 +5182,73 @@ fn seed_qwen_batched_resident_kv_slot(
                     .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV q8 slot seed missing q8 values",
                     })?;
-                if keys.len() != plane_nbytes || values.len() != plane_nbytes {
+                let row_nbytes = GgmlKvElementType::Q8_0.row_nbytes(head_dim).map_err(|_| {
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot row size overflow",
+                    }
+                })?;
+                let host_plane_nbytes = GgmlKvElementType::Q8_0
+                    .plane_nbytes(head_dim, history.max_positions, kv_heads)
+                    .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot host plane size overflow",
+                    })?;
+                if keys.len() != host_plane_nbytes || values.len() != host_plane_nbytes {
                     return Err(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "batched resident KV q8 slot seed host cache plane length mismatch",
                     });
+                }
+                let source_head_stride = history.max_positions.checked_mul(row_nbytes).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot source stride overflow",
+                    },
+                )?;
+                let target_head_stride = max_positions.checked_mul(row_nbytes).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot target stride overflow",
+                    },
+                )?;
+                let prefix_nbytes = cache_position.checked_mul(row_nbytes).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot prefix size overflow",
+                    },
+                )?;
+                for head in 0..kv_heads {
+                    let source_start = head.checked_mul(source_head_stride).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 slot source offset overflow",
+                        },
+                    )?;
+                    let source_end = source_start.checked_add(prefix_nbytes).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 slot source end overflow",
+                        },
+                    )?;
+                    let target_start = head.checked_mul(target_head_stride).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 slot target offset overflow",
+                        },
+                    )?;
+                    let target_end = target_start.checked_add(prefix_nbytes).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 slot target end overflow",
+                        },
+                    )?;
+                    key_plane[target_start..target_end]
+                        .copy_from_slice(&keys[source_start..source_end]);
+                    value_plane[target_start..target_end]
+                        .copy_from_slice(&values[source_start..source_end]);
                 }
                 let layer = resident_kv_arena.layers[layer_index];
                 resident_kv_arena.arena.set_bytes_slice_with_offset(
                     layer.key,
                     plane_offset,
-                    keys,
+                    &key_plane,
                     "qwen_llm_resident_kv_slot_seed_key",
                 )?;
                 resident_kv_arena.arena.set_bytes_slice_with_offset(
                     layer.value,
                     plane_offset,
-                    values,
+                    &value_plane,
                     "qwen_llm_resident_kv_slot_seed_value",
                 )?;
             }
@@ -4265,6 +5298,7 @@ fn zero_qwen_batched_resident_kv_slot(
     Ok(())
 }
 
+#[cfg(test)]
 fn new_projection_tensor_in_arena(
     arena: &GgmlStaticTensorArena,
     weight: &DenseProjectionWeight,
@@ -4281,6 +5315,7 @@ fn new_projection_tensor_in_arena(
     arena.new_tensor_2d_f32(weight.input_width, weight.output_width, tensor_name)
 }
 
+#[cfg(test)]
 fn new_fused_qkv_tensor_in_arena(
     arena: &GgmlStaticTensorArena,
     weight: &FusedQkvProjectionWeight,
@@ -4297,6 +5332,7 @@ fn new_fused_qkv_tensor_in_arena(
     arena.new_tensor_2d_f32(weight.input_width, weight.output_width, tensor_name)
 }
 
+#[cfg(test)]
 fn upload_projection_weight_to_arena(
     arena: &mut GgmlStaticTensorArena,
     tensor: GgmlStaticTensor,
@@ -4321,6 +5357,7 @@ fn upload_projection_weight_to_arena(
     Ok(())
 }
 
+#[cfg(test)]
 fn upload_fused_qkv_weight_to_arena(
     arena: &mut GgmlStaticTensorArena,
     tensor: GgmlStaticTensor,
@@ -4340,6 +5377,7 @@ fn upload_fused_qkv_weight_to_arena(
     Ok(())
 }
 
+#[cfg(test)]
 fn fuse_raw_qkv_projection_weights(
     q_weight: &DenseProjectionWeight,
     k_weight: &DenseProjectionWeight,
@@ -4421,6 +5459,7 @@ fn projection_values_for_ggml(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_llm_layer_attention_projection(
     reader: &GgufTensorDataReader,
     metadata: Qwen3AsrExecutionMetadata,
@@ -4431,6 +5470,7 @@ pub(crate) fn load_qwen3_llm_layer_attention_projection(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_llm_attention_projections_from_reader(
     reader: &GgufTensorDataReader,
     metadata: Qwen3AsrExecutionMetadata,
@@ -4443,6 +5483,7 @@ pub(crate) fn load_qwen3_llm_attention_projections_from_reader(
     Ok(projections)
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv(
     reader: &GgufTensorDataReader,
     metadata: Qwen3AsrExecutionMetadata,
@@ -4456,6 +5497,7 @@ pub(crate) fn load_qwen3_llm_attention_projections_from_reader_with_materialized
     Ok(projections)
 }
 
+#[cfg(test)]
 fn load_qwen3_llm_layer_attention_projection_generic(
     reader: &GgufTensorDataReader,
     metadata: Qwen3AsrExecutionMetadata,
@@ -4512,6 +5554,483 @@ pub(crate) struct QwenFamilyLlmLayerTensorNames {
     pub ffn_down_name: String,
 }
 
+impl QwenWholeDecoderPlan {
+    #[allow(dead_code)] // Used by aggregate candidate memory quotes.
+    pub(crate) fn quoted_retained_system_memory_bytes_for_qwen3_asr(
+        layer_count: usize,
+    ) -> Result<u64, String> {
+        Self::quoted_retained_system_memory_bytes_for_family(layer_count, |layer_index| {
+            let names = llm_layer_tensor_names(layer_index);
+            QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_output_weight,
+                q_norm_name: Some(names.attn_q_norm_weight),
+                k_norm_name: Some(names.attn_k_norm_weight),
+                q_bias_name: None,
+                k_bias_name: None,
+                v_bias_name: None,
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            }
+        })
+    }
+
+    /// Count-only retained heap quote for any Qwen-shaped family decoder
+    /// plan. The family supplies exactly the same tensor-name topology used by
+    /// [`Self::for_qwen_family`], so planning and materialization cannot drift
+    /// merely because two families prefix their GGUF tensor names differently.
+    pub(crate) fn quoted_retained_system_memory_bytes_for_family(
+        layer_count: usize,
+        mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            layer_count
+                .checked_mul(std::mem::size_of::<QwenWholeDecoderLayerPlan>())
+                .ok_or_else(|| "qwen-family decoder-plan layer quote overflowed".to_string())?,
+            "qwen-family whole-decoder layer plans",
+        )?;
+        for layer_index in 0..layer_count {
+            let names = names_for_layer(layer_index);
+            for name in [
+                Some(names.attn_norm_name),
+                Some(names.attn_q_name),
+                Some(names.attn_k_name),
+                Some(names.attn_v_name),
+                Some(names.attn_output_name),
+                names.q_norm_name,
+                names.k_norm_name,
+                names.q_bias_name,
+                names.k_bias_name,
+                names.v_bias_name,
+                Some(names.ffn_norm_name),
+                Some(names.ffn_gate_name),
+                Some(names.ffn_up_name),
+                Some(names.ffn_down_name),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bytes.add_usize(name.len(), "qwen-family decoder-plan tensor name")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn for_qwen3_asr(
+        reader: &GgufTensorDataReader,
+        metadata: Qwen3AsrExecutionMetadata,
+    ) -> Result<Self, Qwen3AsrLlmTransformerError> {
+        Self::for_qwen_family(
+            reader,
+            metadata.llm_layers,
+            metadata.llm_d_model,
+            metadata.llm_heads,
+            metadata.llm_kv_heads,
+            metadata.llm_head_dim,
+            |layer_index| {
+                let names = llm_layer_tensor_names(layer_index);
+                QwenFamilyLlmLayerTensorNames {
+                    attn_norm_name: names.attn_norm_weight,
+                    attn_q_name: names.attn_q_weight,
+                    attn_k_name: names.attn_k_weight,
+                    attn_v_name: names.attn_v_weight,
+                    attn_output_name: names.attn_output_weight,
+                    q_norm_name: Some(names.attn_q_norm_weight),
+                    k_norm_name: Some(names.attn_k_norm_weight),
+                    q_bias_name: None,
+                    k_bias_name: None,
+                    v_bias_name: None,
+                    ffn_norm_name: names.ffn_norm_weight,
+                    ffn_gate_name: names.ffn_gate_weight,
+                    ffn_up_name: names.ffn_up_weight,
+                    ffn_down_name: names.ffn_down_weight,
+                }
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_qwen_family(
+        reader: &GgufTensorDataReader,
+        layer_count: usize,
+        d_model: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
+    ) -> Result<Self, Qwen3AsrLlmTransformerError> {
+        if layer_count == 0 {
+            return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<decoder layers>".to_string(),
+                shape: "[]".to_string(),
+                reason: "whole decoder requires at least one layer".to_string(),
+            });
+        }
+        let mut layers = Vec::with_capacity(layer_count);
+        for layer_index in 0..layer_count {
+            layers.push(plan_qwen_family_layer(
+                reader,
+                names_for_layer(layer_index),
+                d_model,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            )?);
+        }
+        Ok(Self { layers })
+    }
+
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        use crate::models::system_memory_owner::SystemMemoryCapacity;
+
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "qwen whole-decoder layer plans")?;
+        for layer in &self.layers {
+            for vector in [
+                Some(&layer.attn_norm),
+                layer.q_bias.as_ref(),
+                layer.k_bias.as_ref(),
+                layer.v_bias.as_ref(),
+                layer.q_norm.as_ref(),
+                layer.k_norm.as_ref(),
+                Some(&layer.ffn_norm),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                bytes.add_string(&vector.tensor_name, "qwen vector plan tensor name")?;
+            }
+            for projection in [
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.output,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ] {
+                bytes.add_string(&projection.tensor_name, "qwen projection plan tensor name")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+
+    fn validate_materialization_reader(
+        &self,
+        reader: &GgufTensorDataReader,
+    ) -> Result<(), GgmlCpuGraphError> {
+        for layer in &self.layers {
+            for vector in [
+                Some(&layer.attn_norm),
+                layer.q_bias.as_ref(),
+                layer.k_bias.as_ref(),
+                layer.v_bias.as_ref(),
+                layer.q_norm.as_ref(),
+                layer.k_norm.as_ref(),
+                Some(&layer.ffn_norm),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let tensor = reader.tensor_index().get(&vector.tensor_name).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "planned qwen vector is missing from materialization source",
+                    },
+                )?;
+                if tensor.dims.as_slice() != [vector.len as u64]
+                    || tensor.ggml_type != vector.ggml_type
+                    || tensor.size_bytes != vector.size_bytes
+                    || tensor.offset_bytes != vector.offset_bytes
+                {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "planned qwen vector metadata changed before materialization",
+                    });
+                }
+            }
+            for projection in [
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.output,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ] {
+                let tensor = reader.tensor_index().get(&projection.tensor_name).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "planned qwen projection is missing from materialization source",
+                    },
+                )?;
+                let planned_dims = projection
+                    .storage_dims
+                    .map(|dimension| u64::try_from(dimension).unwrap_or(u64::MAX));
+                if tensor.dims.as_slice() != planned_dims
+                    || tensor.ggml_type != projection.ggml_type
+                    || tensor.size_bytes != projection.size_bytes
+                    || tensor.offset_bytes != projection.offset_bytes
+                {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "planned qwen projection metadata changed before materialization",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn retained_weight_payload_bytes(&self) -> usize {
+        // The representation intentionally has no byte/f32 payload field.
+        0
+    }
+}
+
+fn plan_qwen_family_layer(
+    reader: &GgufTensorDataReader,
+    names: QwenFamilyLlmLayerTensorNames,
+    d_model: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<QwenWholeDecoderLayerPlan, Qwen3AsrLlmTransformerError> {
+    if d_model == 0 || head_dim == 0 {
+        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: "<decoder geometry>".to_string(),
+            shape: format!("d_model={d_model}, head_dim={head_dim}"),
+            reason: "decoder widths must be positive".to_string(),
+        });
+    }
+    let q_output_width = projection_output_width(n_heads, head_dim)?;
+    let kv_output_width = projection_output_width(n_kv_heads, head_dim)?;
+    let attn_norm = plan_vector_weight(reader, names.attn_norm_name, d_model)?;
+    let q = plan_projection_weight_with_input_output(
+        reader,
+        names.attn_q_name,
+        d_model,
+        q_output_width,
+    )?;
+    if q.layout != DenseProjectionLayout::OutputByInput {
+        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: q.tensor_name.clone(),
+            shape: format!("[output={q_output_width}, input={d_model}]"),
+            reason: "qwen-family projection weights must use the ggml [in, out] dim order; this pack stores them as [out, in], which indicates it was built by an older importer - re-pack from source with the current build".to_string(),
+        });
+    }
+    let k = plan_projection_weight_with_layout(
+        reader,
+        names.attn_k_name,
+        d_model,
+        kv_output_width,
+        q.layout,
+    )?;
+    let v = plan_projection_weight_with_layout(
+        reader,
+        names.attn_v_name,
+        d_model,
+        kv_output_width,
+        q.layout,
+    )?;
+    let q_bias = names
+        .q_bias_name
+        .map(|name| plan_vector_weight(reader, name, q.output_width))
+        .transpose()?;
+    let k_bias = names
+        .k_bias_name
+        .map(|name| plan_vector_weight(reader, name, k.output_width))
+        .transpose()?;
+    let v_bias = names
+        .v_bias_name
+        .map(|name| plan_vector_weight(reader, name, v.output_width))
+        .transpose()?;
+    let output = plan_projection_weight_with_input_output(
+        reader,
+        names.attn_output_name,
+        q.output_width,
+        d_model,
+    )?;
+    let q_norm = names
+        .q_norm_name
+        .map(|name| plan_vector_weight(reader, name, head_dim))
+        .transpose()?;
+    let k_norm = names
+        .k_norm_name
+        .map(|name| plan_vector_weight(reader, name, head_dim))
+        .transpose()?;
+    if q_norm.is_some() != k_norm.is_some() {
+        return Err(Qwen3AsrLlmTransformerError::QkNormWidthMismatch {
+            vector_width: q_norm.as_ref().map_or(0, |plan| plan.len),
+            norm_width: k_norm.as_ref().map_or(0, |plan| plan.len),
+        });
+    }
+    let ffn_norm = plan_vector_weight(reader, names.ffn_norm_name, d_model)?;
+    let gate = plan_projection_weight_for_input(reader, names.ffn_gate_name, d_model)?;
+    let up = plan_projection_weight_for_input(reader, names.ffn_up_name, d_model)?;
+    if gate.output_width != up.output_width {
+        return Err(Qwen3AsrLlmTransformerError::FfnProjectionWidthMismatch {
+            gate_width: gate.output_width,
+            up_width: up.output_width,
+        });
+    }
+    let down = plan_projection_weight_with_input_output(
+        reader,
+        names.ffn_down_name,
+        gate.output_width,
+        d_model,
+    )?;
+    Ok(QwenWholeDecoderLayerPlan {
+        d_model,
+        head_dim,
+        attn_norm,
+        q,
+        k,
+        v,
+        q_bias,
+        k_bias,
+        v_bias,
+        output,
+        q_norm,
+        k_norm,
+        ffn_norm,
+        gate,
+        up,
+        down,
+    })
+}
+
+fn required_tensor_metadata<'a>(
+    reader: &'a GgufTensorDataReader,
+    tensor_name: &str,
+) -> Result<&'a crate::GgufTensorMetadata, Qwen3AsrLlmTransformerError> {
+    reader.tensor_index().get(tensor_name).ok_or_else(|| {
+        Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: tensor_name.to_string(),
+            shape: "[]".to_string(),
+            reason: "tensor is missing from GGUF tensor index".to_string(),
+        }
+    })
+}
+
+fn plan_vector_weight(
+    reader: &GgufTensorDataReader,
+    tensor_name: String,
+    expected_len: usize,
+) -> Result<VectorWeightPlan, Qwen3AsrLlmTransformerError> {
+    let tensor = required_tensor_metadata(reader, &tensor_name)?;
+    if tensor.dims.as_slice() != [expected_len as u64] {
+        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name,
+            shape: render_shape(&tensor.dims),
+            reason: format!("expected [{expected_len}]"),
+        });
+    }
+    Ok(VectorWeightPlan {
+        tensor_name,
+        len: expected_len,
+        ggml_type: tensor.ggml_type,
+        size_bytes: tensor.size_bytes,
+        offset_bytes: tensor.offset_bytes,
+    })
+}
+
+fn plan_projection_weight_for_input(
+    reader: &GgufTensorDataReader,
+    tensor_name: String,
+    input_width: usize,
+) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
+    let tensor = required_tensor_metadata(reader, &tensor_name)?;
+    let (input_width, output_width, layout) =
+        parse_projection_shape_for_input(&tensor_name, &tensor.dims, input_width)?;
+    projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
+}
+
+fn plan_projection_weight_with_input_output(
+    reader: &GgufTensorDataReader,
+    tensor_name: String,
+    input_width: usize,
+    output_width: usize,
+) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
+    let tensor = required_tensor_metadata(reader, &tensor_name)?;
+    let layout = if tensor.dims.as_slice() == [input_width as u64, output_width as u64] {
+        DenseProjectionLayout::OutputByInput
+    } else if tensor.dims.as_slice() == [output_width as u64, input_width as u64] {
+        DenseProjectionLayout::InputByOutput
+    } else {
+        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name,
+            shape: render_shape(&tensor.dims),
+            reason: format!(
+                "expected [{input_width} x {output_width}] or [{output_width} x {input_width}]"
+            ),
+        });
+    };
+    projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
+}
+
+fn plan_projection_weight_with_layout(
+    reader: &GgufTensorDataReader,
+    tensor_name: String,
+    input_width: usize,
+    output_width: usize,
+    layout: DenseProjectionLayout,
+) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
+    let tensor = required_tensor_metadata(reader, &tensor_name)?;
+    let expected = match layout {
+        DenseProjectionLayout::OutputByInput => [input_width as u64, output_width as u64],
+        DenseProjectionLayout::InputByOutput => [output_width as u64, input_width as u64],
+    };
+    if tensor.dims.as_slice() != expected {
+        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name,
+            shape: render_shape(&tensor.dims),
+            reason: format!("expected {expected:?} for the layer's resolved projection layout"),
+        });
+    }
+    projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
+}
+
+fn projection_plan_from_metadata(
+    tensor_name: String,
+    tensor: &crate::GgufTensorMetadata,
+    input_width: usize,
+    output_width: usize,
+    layout: DenseProjectionLayout,
+) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
+    let dim0 = usize::try_from(tensor.dims[0]).map_err(|_| {
+        Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: tensor_name.clone(),
+            shape: render_shape(&tensor.dims),
+            reason: "dimension 0 does not fit usize".to_string(),
+        }
+    })?;
+    let dim1 = usize::try_from(tensor.dims[1]).map_err(|_| {
+        Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: tensor_name.clone(),
+            shape: render_shape(&tensor.dims),
+            reason: "dimension 1 does not fit usize".to_string(),
+        }
+    })?;
+    Ok(ProjectionWeightPlan {
+        tensor_name,
+        input_width,
+        output_width,
+        storage_dims: [dim0, dim1],
+        ggml_type: tensor.ggml_type,
+        size_bytes: tensor.size_bytes,
+        offset_bytes: tensor.offset_bytes,
+        layout,
+    })
+}
+
 /// Load one decoder-only LLM layer's projections from `reader`, parameterized
 /// over the two axes that differ between Qwen2 and Qwen3 (QK-norm,
 /// attention bias) via `names`' `Option` fields, rather than hard-coding
@@ -4519,6 +6038,7 @@ pub(crate) struct QwenFamilyLlmLayerTensorNames {
 /// (`load_qwen3_llm_layer_attention_projection_generic`, always QK-norm, never
 /// bias) and firered-llm (always bias, never QK-norm -- see
 /// `models::firered_llm::llm_transformer`).
+#[cfg(test)]
 pub(crate) fn load_qwen_family_llm_layer_attention_projection_generic(
     reader: &GgufTensorDataReader,
     names: QwenFamilyLlmLayerTensorNames,
@@ -4654,6 +6174,7 @@ pub(crate) fn load_qwen_family_llm_layer_attention_projection_generic(
 /// keeping its shape metadata (input/output width, layout, dims/type). Used for
 /// weights bound zero-copy at decode — the host copy is dead weight in the
 /// cached prepared-runtime projections.
+#[cfg(test)]
 fn dropped_projection_payload(mut weight: DenseProjectionWeight) -> DenseProjectionWeight {
     // Only native [in,out] weights (raw_ggml present) are bound zero-copy — drop
     // their host bytes. f32-fallback weights KEEP their `values`: the arena path
@@ -4664,6 +6185,7 @@ fn dropped_projection_payload(mut weight: DenseProjectionWeight) -> DenseProject
     weight
 }
 
+#[cfg(test)]
 fn load_projection_weight(
     reader: &GgufTensorDataReader,
     tensor_name: &str,
@@ -4703,6 +6225,7 @@ fn load_projection_weight(
     )
 }
 
+#[cfg(test)]
 fn load_projection_weight_with_input_output(
     reader: &GgufTensorDataReader,
     tensor_name: &str,
@@ -4795,6 +6318,7 @@ fn projection_output_width(
 /// their own, so the caller resolves the layout from the non-square q
 /// projection and forces it here. This keeps all three projections on one
 /// orientation, so the fused-QKV path cannot land on a mixed raw/dense state.
+#[cfg(test)]
 fn load_projection_weight_with_layout(
     reader: &GgufTensorDataReader,
     tensor_name: &str,
@@ -4888,6 +6412,7 @@ fn parse_projection_shape_for_input(
     })
 }
 
+#[cfg(test)]
 fn load_direct_projection_weight_payload(
     reader: &GgufTensorDataReader,
     tensor_name: &str,
@@ -4911,6 +6436,7 @@ fn load_direct_projection_weight_payload(
     }))
 }
 
+#[cfg(test)]
 fn load_vector_weight(
     reader: &GgufTensorDataReader,
     tensor_name: &str,
@@ -4928,6 +6454,7 @@ fn load_vector_weight(
     Ok(values)
 }
 
+#[cfg(test)]
 fn load_non_empty_vector_weight(
     reader: &GgufTensorDataReader,
     tensor_name: &str,
@@ -4959,6 +6486,7 @@ fn load_non_empty_vector_weight(
 
 /// Wraps `nn::norm::apply_rms_norm` for code paths that propagate `GgmlCpuGraphError` directly.
 #[inline(always)]
+#[cfg(test)]
 fn rms_norm_with_weight(
     hidden: &[f32],
     weight: &[f32],
@@ -4988,6 +6516,7 @@ fn rms_norm_with_weight(
     Ok(out)
 }
 
+#[cfg(test)]
 fn apply_segmented_rms_norm_with_weight(
     values: &mut [f32],
     weight: &[f32],
@@ -5013,6 +6542,7 @@ fn apply_segmented_rms_norm_with_weight(
     Ok(())
 }
 
+#[cfg(test)]
 fn map_tensor_read_error(error: GgufTensorDataReadError) -> Qwen3AsrLlmTransformerError {
     Qwen3AsrLlmTransformerError::TensorReadFailed {
         reason: error.to_string(),
@@ -5111,16 +6641,135 @@ pub(crate) fn even_prefill_chunk_len(remaining: usize, chunk_size: usize) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use crate::ggml_runtime::{GGML_TYPE_F32, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
     use crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata;
-    use crate::testing::with_forced_cpu_backend_for_test;
+    use crate::testing::{
+        TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
+    };
     use crate::{read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path};
 
     const QWEN_PREFILL_REAL_PACK_ENV: &str = "OPENASR_QWEN_PREFILL_REAL_PACK";
     const QWEN_PREFILL_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_TOKENS";
     const QWEN_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_CHUNK_TOKENS";
+
+    fn metadata_only_decoder_fixture(
+        k_as_f16: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::GgmlRuntimeSource,
+        Qwen3AsrExecutionMetadata,
+    ) {
+        let metadata = Qwen3AsrExecutionMetadata {
+            sample_rate_hz: 16_000,
+            n_mels: 8,
+            n_fft: 400,
+            win_length: 400,
+            hop_length: 160,
+            audio_layers: 1,
+            audio_d_model: 16,
+            audio_heads: 2,
+            llm_layers: 1,
+            llm_d_model: 16,
+            llm_heads: 2,
+            llm_kv_heads: 2,
+            llm_head_dim: 8,
+            vocab_size: 32,
+            llm_max_positions: 256,
+            audio_start_token_id: 2,
+            audio_end_token_id: 3,
+            audio_pad_token_id: 4,
+            eos_token_id: 0,
+            pad_token_id: 6,
+        };
+        let names = llm_layer_tensor_names(0);
+        let k_weight_name = names.attn_k_weight.clone();
+        let mut spec = TinyGgufFixtureSpec::new(BTreeMap::new())
+            .with_tensor_shape(names.attn_norm_weight, [16_u64])
+            .with_tensor_shape(names.attn_q_weight, [16_u64, 16_u64])
+            .with_tensor_shape(k_weight_name.clone(), [16_u64, 16_u64])
+            .with_tensor_shape(names.attn_v_weight, [16_u64, 16_u64])
+            .with_tensor_shape(names.attn_output_weight, [16_u64, 16_u64])
+            .with_tensor_shape(names.attn_q_norm_weight, [8_u64])
+            .with_tensor_shape(names.attn_k_norm_weight, [8_u64])
+            .with_tensor_shape(names.ffn_norm_weight, [16_u64])
+            .with_tensor_shape(names.ffn_gate_weight, [32_u64, 16_u64])
+            .with_tensor_shape(names.ffn_up_weight, [32_u64, 16_u64])
+            .with_tensor_shape(names.ffn_down_weight, [16_u64, 32_u64]);
+        if k_as_f16 {
+            spec = spec.with_tensor_f16(k_weight_name);
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("metadata-only-decoder.gguf");
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write decoder fixture");
+        let source = validate_ggml_runtime_source_path(&path).expect("validate decoder fixture");
+        (temp, source, metadata)
+    }
+
+    #[test]
+    fn whole_decoder_plan_retains_no_weight_payload_and_materializes_one_layer_at_a_time() {
+        let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
+        let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
+        let plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata).expect("decoder plan");
+        assert_eq!(plan.retained_weight_payload_bytes(), 0);
+        assert!(matches!(
+            plan.layers[0].qkv_storage_mode(false),
+            QkvStorageMode::Fused {
+                ggml_type: GGML_TYPE_F32
+            }
+        ));
+        assert!(matches!(
+            plan.layers[0].qkv_storage_mode(true),
+            QkvStorageMode::Split
+        ));
+
+        let executor = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan(
+            &plan,
+            &source,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("materialize planned decoder");
+        let one_layer_payload = [
+            Some(&plan.layers[0].attn_norm),
+            plan.layers[0].q_norm.as_ref(),
+            plan.layers[0].k_norm.as_ref(),
+            Some(&plan.layers[0].ffn_norm),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|weight| usize::try_from(weight.size_bytes).expect("vector size"))
+        .chain(
+            [
+                &plan.layers[0].q,
+                &plan.layers[0].k,
+                &plan.layers[0].v,
+                &plan.layers[0].output,
+                &plan.layers[0].gate,
+                &plan.layers[0].up,
+                &plan.layers[0].down,
+            ]
+            .into_iter()
+            .map(|weight| usize::try_from(weight.size_bytes).expect("projection size")),
+        )
+        .sum::<usize>();
+        assert!(
+            executor.materialization_peak_staging_bytes <= one_layer_payload,
+            "peak staging {} must fit within one layer payload {one_layer_payload}",
+            executor.materialization_peak_staging_bytes
+        );
+    }
+
+    #[test]
+    fn whole_decoder_plan_uses_split_qkv_when_storage_types_differ() {
+        let (_temp, source, metadata) = metadata_only_decoder_fixture(true);
+        let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
+        let plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata).expect("decoder plan");
+        assert!(matches!(
+            plan.layers[0].qkv_storage_mode(false),
+            QkvStorageMode::Split
+        ));
+    }
 
     #[test]
     fn resident_prefill_chunk_preserves_each_sequence_token_span() {
@@ -5654,12 +7303,14 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
         )
         .expect("resident kv arena should allocate");
-        let mut seq0 = Qwen3AsrLayerKvCacheState::new(3, 1, 2);
+        // Host planes follow each request's logical bound and may be narrower
+        // than the shared resident span.
+        let mut seq0 = Qwen3AsrLayerKvCacheState::new(2, 1, 2);
         seq0.write(0, &[1.0, 2.0], &[10.0, 20.0])
             .expect("seq0 row0");
         seq0.write(1, &[3.0, 4.0], &[30.0, 40.0])
             .expect("seq0 row1");
-        let mut seq1 = Qwen3AsrLayerKvCacheState::new(3, 1, 2);
+        let mut seq1 = Qwen3AsrLayerKvCacheState::new(1, 1, 2);
         seq1.write(0, &[5.0, 6.0], &[50.0, 60.0])
             .expect("seq1 row0");
         let seq0_layers = vec![seq0];
@@ -5716,7 +7367,9 @@ mod tests {
             LlmKvCacheSpec::DEFAULT,
         )
         .expect("resident kv arena should allocate");
-        let mut seq1 = Qwen3AsrLayerKvCacheState::new(3, 1, 2);
+        // The active slot's logical host plane is narrower than the stable
+        // three-position resident plane.
+        let mut seq1 = Qwen3AsrLayerKvCacheState::new(2, 1, 2);
         seq1.write(0, &[1.0, 2.0], &[10.0, 20.0])
             .expect("seq1 row0");
         seq1.write(1, &[3.0, 4.0], &[30.0, 40.0])

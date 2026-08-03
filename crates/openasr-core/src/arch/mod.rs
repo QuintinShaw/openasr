@@ -4,7 +4,10 @@ pub(crate) mod shape_orchestrator;
 
 use std::collections::BTreeMap;
 
-use crate::capacity::{CapacityAudioBound, CapacityModelDeclaration, CapacityModelDescriptor};
+use crate::device::{
+    execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
+    execution_route::ExecutionProvider,
+};
 use crate::ggml_runtime::AutoGpuPolicy;
 use crate::models::ggml_family_adapter::{
     GGML_TOKENIZER_ID_KEY, GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, LanguageFamilyHint,
@@ -31,6 +34,64 @@ use hparams::{
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
+
+/// Provider/placement rows shared by architecture descriptors. The field on
+/// every descriptor remains mandatory; these constants only remove repetitive
+/// provider spelling and do not infer support from a family name.
+const CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
+    .with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Cuda,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Hip,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Vulkan,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    );
+
+const CPU_AND_HYBRID_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
+    .with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::HYBRID,
+    )
+    .with_provider(
+        ExecutionProvider::Cuda,
+        AcceleratedPlacementCapabilities::HYBRID,
+    )
+    .with_provider(
+        ExecutionProvider::Hip,
+        AcceleratedPlacementCapabilities::HYBRID,
+    )
+    .with_provider(
+        ExecutionProvider::Vulkan,
+        AcceleratedPlacementCapabilities::HYBRID,
+    );
+
+const CPU_FULL_DEVICE_AND_HYBRID_EXECUTION: ExecutionCapabilities =
+    ExecutionCapabilities::new(true)
+        .with_provider(
+            ExecutionProvider::Metal,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Hip,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Vulkan,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        );
 
 pub(crate) const COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str =
     "cohere-transcribe-conformer-transformer";
@@ -220,6 +281,8 @@ pub(crate) const MIMO_ASR_EXECUTOR_COMPONENT_ID: &str = "mimo-asr.ggml-executor.
 pub(crate) const MOSS_TD_GGML_ARCHITECTURE_ID: &str = "moss-transcribe-diarize-whisper-qwen3";
 pub(crate) const MOSS_TD_GGML_ADAPTER_ID: &str = "ggml-family-moss-transcribe-diarize-runtime-v1";
 pub(crate) const MOSS_TD_MODEL_FAMILY: &str = "moss-transcribe-diarize";
+pub(crate) const MOSS_TD_TARGET_INVOCATION_SECONDS: u32 = 30;
+pub(crate) const MOSS_TD_MAX_INVOCATION_SECONDS: u32 = 60;
 pub(crate) const MOSS_TD_AUDIO_FRONTEND_ID: &str = "moss-transcribe-diarize.fbank80.16khz.mono.v0";
 pub(crate) const MOSS_TD_TOKENIZER_ID: &str = "moss-transcribe-diarize.qwen3-bpe.v0";
 pub(crate) const MOSS_TD_DECODE_POLICY_ID: &str = "moss-transcribe-diarize.greedy.seq2seq.v0";
@@ -241,6 +304,11 @@ pub(crate) const MOSS_TD_EXECUTOR_COMPONENT_ID: &str = "moss-transcribe-diarize.
 pub(crate) const GRANITE_SPEECH_GGML_ARCHITECTURE_ID: &str = "granite-speech";
 pub(crate) const GRANITE_SPEECH_GGML_ADAPTER_ID: &str = "ggml-family-granite-speech-runtime-v1";
 pub(crate) const GRANITE_SPEECH_MODEL_FAMILY: &str = "granite-speech";
+/// Largest whole-second direct invocation whose exact centered-STFT,
+/// frame-stack and padded Q-Former token shape fits the 4096-position decoder
+/// together with the shipped prompt and decode budget. The exact integer
+/// derivation is pinned in `models::granite_speech::capacity`.
+pub(crate) const GRANITE_SPEECH_MAX_INVOCATION_SECONDS: u32 = 381;
 pub(crate) const GRANITE_SPEECH_AUDIO_FRONTEND_ID: &str = "granite-speech.mel80x2.16khz.mono.v0";
 pub(crate) const GRANITE_SPEECH_TOKENIZER_ID: &str = "granite-speech.gpt2-bpe.v0";
 pub(crate) const GRANITE_SPEECH_DECODE_POLICY_ID: &str = "granite-speech.greedy.seq2seq.v0";
@@ -297,6 +365,18 @@ pub(crate) struct OpenAsrComponentDescriptor {
 /// that used to borrow this citation, and do not re-unify them.
 pub(crate) const DEFAULT_ENCODER_CHUNK_SECONDS: f32 = 30.0;
 
+/// Product envelope for VAD pause-seeking around the 30-second target.
+/// A segment may extend to a natural boundary, but one decoder invocation
+/// may never carry more than 60 seconds of content. This is semantic input to
+/// decoder-state planning, not a memory-pressure fallback: an execution
+/// candidate that cannot host the declared envelope is rejected or moved to
+/// another approved placement without changing the slice plan.
+///
+/// The 30/60 target/maximum pair is a release-quality contract. Changes must
+/// pass the long-form CER/DER/seam A/B gate; the capacity planner merely sizes
+/// the chosen contract exactly and does not choose it.
+pub(crate) const DEFAULT_ENCODER_MAX_CHUNK_SECONDS: f32 = 60.0;
+
 /// Default `GlobalQuadratic` **memory** ceiling (issue #68) -- the longest
 /// chunk a global-quadratic encoder may be handed before its attention
 /// activations are a risk on commodity RAM. Every new `GlobalQuadratic`
@@ -315,7 +395,7 @@ pub(crate) const DEFAULT_ENCODER_CHUNK_SECONDS: f32 = 30.0;
 /// concrete costs. The clamp's `chunk_seconds` arm became unreachable on the
 /// default path (the value being clamped *was* the ceiling), so the ceiling
 /// was never actually exercised as a ceiling. And the arm that does fire --
-/// `max_chunk_seconds`, 120s by default -- silently collapsed the slicer's
+/// `max_chunk_seconds` (then 120s by default) -- silently collapsed the slicer's
 /// entire elasticity band onto 30s, taking away its room to hunt for a real
 /// pause, on the authority of a memory argument that was never made.
 ///
@@ -399,36 +479,44 @@ pub(crate) enum OpenAsrLongformSliceShape {
     /// [`crate::diarize::voice_id::SpeakerScope`] and cross-slice identity is
     /// re-established from voice evidence alone.
     ///
-    /// Such a family also pins its own slice window: an autoregressive decoder
-    /// that folds the whole slice into one prompt has a hard position budget
-    /// (prompt + generation), so the window is a decoder-context fact the
-    /// family owns, not a generic default. `target_seconds` is the window the
-    /// slicer aims for and `max_seconds` the ceiling it may stretch a slice to
-    /// when no cut point is available earlier; both must leave room for the
-    /// family's decode budget inside its context.
+    /// Such a family also declares its own product-tested invocation envelope.
+    /// `target_seconds` is the window the slicer aims for and `max_seconds` is
+    /// the ceiling it may stretch a slice to while searching for a clean VAD
+    /// cut. The family decoder-state topology must prove that every invocation
+    /// through `max_seconds` fits its position ceilings. Memory availability
+    /// may select a different execution placement, but must never rewrite this
+    /// window and thereby change transcript semantics across machines.
     ///
-    /// `integral_seconds` is the longest recording this family can fold into a
-    /// SINGLE prompt and still be granted a decode budget that covers its
-    /// densest measured demand. Up to it, slicing is not applied at all.
-    /// Slicing is a degradation, not the normal path: every seam restarts the
-    /// in-decoder speaker numbering and forces cross-slice identity to be
-    /// re-established from voice evidence alone, and the shared slicer's
-    /// cut-point search can clip speech. Measured on Mandarin meeting audio,
-    /// decoding whole beat slice-and-stitch by a wide margin, so the family
-    /// takes the integral path whenever its context can honestly serve it and
-    /// falls back to `target_seconds` slices only past that point. It is a
-    /// derived quantity, not a tuning knob: it must equal the largest window
-    /// whose prompt plus required budget still fits the decoder's KV capacity,
-    /// and the owning family pins it against that arithmetic in a test. As of
-    /// Phase 0 the owning family also derives it in parallel from pack
-    /// metadata (`crate::capacity::derive_integral_seconds`) and pins derived
-    /// == declared; Phase 1 moves the derived value onto the loaded pack so
-    /// this literal becomes the derivation's resolved output.
+    /// `integral_seconds` is the largest recording decoded whole before the
+    /// slicer is engaged. It is a quality/product threshold inside the proven
+    /// envelope, not a value reverse-engineered from free memory or the RoPE
+    /// ceiling. Every seam restarts in-decoder speaker numbering; optional
+    /// Voice ID can reconcile those recording-local labels across scopes.
+    /// Changes to these three values therefore require CER/DER/seam-quality
+    /// evidence as well as a passing decoder-state capacity proof.
     ScopedSlices {
         integral_seconds: f32,
         target_seconds: f32,
         max_seconds: f32,
     },
+}
+
+/// Semantic audio span accepted by one family executor invocation.
+///
+/// This is deliberately independent of both long-form product preferences
+/// (`chunk_seconds` / `max_chunk_seconds`) and encoder activation-memory
+/// scaling ([`OpenAsrEncoderAttentionSpan`]). A bounded family must never be
+/// handed a larger buffer: some runtimes reject it, while a fixed-window
+/// frontend such as Whisper would otherwise silently trim real audio. The
+/// shared slicer clamps to this contract before dispatch; the family runtime
+/// remains the fail-closed backstop for direct `LongFormMode::Off` requests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OpenAsrInvocationSpan {
+    /// The architecture has no duration-only semantic bound. Token/position
+    /// ceilings and exact frontend shape oracles may still reject a request.
+    Elastic,
+    /// One invocation accepts at most this many seconds of prepared audio.
+    Bounded { max_seconds: f32 },
 }
 
 /// How this architecture's encoder attends over time -- the single
@@ -515,6 +603,18 @@ pub(crate) struct OpenAsrFamilyIntegrationDescriptor {
     pub reference_dumper_source: Option<&'static str>,
 }
 
+/// Whether an architecture owns token-scaled persistent decoder state.
+///
+/// This is an onboarding declaration, not a formula registry. The executor
+/// still owns the family topology, while startup/CI cross-checks that a new
+/// autoregressive family cannot accidentally claim `NoPersistentState` and
+/// bypass capacity planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAsrDecoderStateClass {
+    None,
+    TokenScaledPersistent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OpenAsrArchitectureDescriptor {
     pub runtime_architecture_aliases: &'static [&'static str],
@@ -528,8 +628,13 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub tokenizer_id: &'static str,
     pub decode_policy_id: &'static str,
     pub executor_component_id: &'static str,
+    pub decoder_state_class: OpenAsrDecoderStateClass,
     pub integration: OpenAsrFamilyIntegrationDescriptor,
     pub execution_capability: GgmlExecutionCapability,
+    /// Provider + placement shapes this concrete family/runtime can actually
+    /// execute. Mandatory so onboarding cannot accidentally inherit blanket
+    /// GPU/hybrid claims from another family.
+    pub execution_capabilities: ExecutionCapabilities,
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
     /// Which GPU-class backend(s) Auto execution may select automatically
     /// when available (see [`crate::ggml_runtime::AutoGpuPolicy`]). This can
@@ -577,16 +682,9 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// `ScopedSlices`), which
     /// `builtin_architectures_declare_longform_slice_shape` pins.
     pub(crate) longform_slice_shape: OpenAsrLongformSliceShape,
-    /// How this family's single-decode capacity is established. A mandatory
-    /// field (not `Option`, same reasoning as `encoder_attention_span` below)
-    /// forcing every new architecture to place itself in exactly one bucket
-    /// at compile time -- see [`crate::capacity::CapacityModelDeclaration`]
-    /// for the three buckets and why `None`-shaped ambiguity is not on
-    /// offer. `builtin_architectures_declare_capacity_model` pins the
-    /// per-family declarations and
-    /// `family_integration_audit` refuses a `Derived` family whose
-    /// `audio_frontend_id` has no `crate::capacity` frontend-registry row.
-    pub(crate) capacity_model: crate::capacity::CapacityModelDeclaration,
+    /// Maximum semantic span of one executor call, separate from product
+    /// slicing preferences and memory-pressure admission.
+    pub(crate) invocation_span: OpenAsrInvocationSpan,
     /// Whether this family's transcripts include punctuation -- an
     /// architecture/training-corpus property, not a per-release editorial
     /// choice (e.g. Dolphin's training corpus has no punctuation to learn
@@ -623,6 +721,13 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
 }
 
 impl OpenAsrArchitectureDescriptor {
+    pub(crate) fn max_single_invocation_seconds(self) -> Option<f32> {
+        match self.invocation_span {
+            OpenAsrInvocationSpan::Elastic => None,
+            OpenAsrInvocationSpan::Bounded { max_seconds } => Some(max_seconds),
+        }
+    }
+
     /// The longform chunk-length safety cap this architecture's encoder
     /// tolerates, if any (`None` when the encoder needs no additional cap --
     /// `FixedWindow`/`LocalChunked`). See [`OpenAsrEncoderAttentionSpan`].
@@ -652,6 +757,7 @@ impl OpenAsrArchitectureDescriptor {
             tokenizer_id: self.tokenizer_id,
             decode_policy_id: self.decode_policy_id,
             execution_capability: self.execution_capability,
+            execution_capabilities: self.execution_capabilities,
             speaker_segmentation: self.speaker_segmentation,
         }
     }
@@ -763,6 +869,17 @@ pub(crate) enum OpenAsrArchitectureRegistryError {
         model_architecture: &'static str,
         max_safe_chunk_seconds: f32,
     },
+    /// A bounded invocation contract must be usable as a slicer ceiling.
+    InvocationSpanNotFinitePositive {
+        model_architecture: &'static str,
+        max_seconds: f32,
+    },
+    /// A scoped-slice product envelope must also bound direct/off calls.
+    ScopedSliceInvocationSpanMismatch {
+        model_architecture: &'static str,
+        required_seconds: f32,
+        invocation_max_seconds: Option<f32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -856,6 +973,7 @@ impl OpenAsrArchitectureRegistry {
             )?;
             Self::validate_hparam_schema(*descriptor)?;
             Self::validate_block_stack(*descriptor)?;
+            Self::validate_invocation_span(*descriptor)?;
             Self::validate_encoder_attention_span(*descriptor)?;
         }
         Ok(())
@@ -952,6 +1070,40 @@ impl OpenAsrArchitectureRegistry {
                     max_safe_chunk_seconds,
                 },
             );
+        }
+        Ok(())
+    }
+
+    fn validate_invocation_span(
+        descriptor: OpenAsrArchitectureDescriptor,
+    ) -> Result<(), OpenAsrArchitectureRegistryError> {
+        if let OpenAsrInvocationSpan::Bounded { max_seconds } = descriptor.invocation_span
+            && !(max_seconds.is_finite() && max_seconds > 0.0)
+        {
+            return Err(
+                OpenAsrArchitectureRegistryError::InvocationSpanNotFinitePositive {
+                    model_architecture: descriptor.model_architecture,
+                    max_seconds,
+                },
+            );
+        }
+        if let OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds,
+            max_seconds,
+            ..
+        } = descriptor.longform_slice_shape
+        {
+            let required_seconds = integral_seconds.max(max_seconds);
+            let invocation_max_seconds = descriptor.max_single_invocation_seconds();
+            if invocation_max_seconds.is_none_or(|limit| limit < required_seconds) {
+                return Err(
+                    OpenAsrArchitectureRegistryError::ScopedSliceInvocationSpanMismatch {
+                        model_architecture: descriptor.model_architecture,
+                        required_seconds,
+                        invocation_max_seconds,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -1397,6 +1549,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: COHERE_TRANSCRIBE_TOKENIZER_ID,
         decode_policy_id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "cohere",
             supports_phrase_bias: true,
@@ -1408,6 +1561,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: true,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         // The decoder does have a speaker-token mode (`<|diarize|>` ->
@@ -1421,14 +1575,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // change that ships packs carrying the tokens.
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // GQA-free transformer decoder with a real self-KV cache, but audio
-        // length is bounded by the ENCODER positional table, not the decoder
-        // context (transcribe.cpp `LimitsBasis::audio_from_caps` bucket): the
-        // two constraints resolve separately, so the capacity model derives
-        // from pack metadata with the encoder named as the audio bound.
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::EncoderSpan,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         emits_punctuation: Some(true),
         hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -1465,6 +1612,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: WHISPER_TOKENIZER_ID,
         decode_policy_id: WHISPER_DECODE_POLICY_ID,
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "whisper",
             supports_phrase_bias: true,
@@ -1476,17 +1624,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // Architecture-fixed 30s log-mel window: the encoder never attends
-        // past its own 1500-position chunk and longform audio is looped over
-        // independent 30s windows, so audio length is bounded by that fixed
-        // window, not by the (448-position) decoder context.
-        capacity_model: CapacityModelDeclaration::BoundedElsewhere {
-            by: "fixed 30s encoder window",
-        },
+        invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 30.0 },
         emits_punctuation: Some(true),
         hparam_schema: WHISPER_HPARAM_SCHEMA,
         // whisper remains the hand-written bit-level regression gate and is
@@ -1516,6 +1659,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: QWEN3_ASR_TOKENIZER_ID,
         decode_policy_id: QWEN3_ASR_DECODE_POLICY_ID,
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "qwen",
             supports_phrase_bias: true,
@@ -1527,6 +1671,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
+        execution_capabilities: CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Left un-gated (`AllBackends`) for now: the measured 1.71x Metal
         // slowdown at qwen's recommended 1.7B @ q8_0 config looks like a
@@ -1539,13 +1684,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // GQA LLM decoder whose prompt carries the audio tokens, so the
-        // decoder KV context bounds audio length -- fully derivable from pack
-        // metadata (llm.n_layers / llm_kv_heads / head_dim / llm_max_positions
-        // are all required keys).
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::DecoderContext,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         emits_punctuation: Some(true),
         hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -1580,6 +1719,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: PARAKEET_CTC_TOKENIZER_ID,
         decode_policy_id: PARAKEET_CTC_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "parakeet",
             supports_phrase_bias: true,
@@ -1591,12 +1731,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // CTC: no autoregressive decoder, hence no decoder KV cache.
-        capacity_model: CapacityModelDeclaration::NoDecoderKv,
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         // Character/BPE CTC: whether an imported checkpoint's vocab includes
         // punctuation depends on that specific checkpoint's training corpus,
         // not the architecture, so this cannot be stated as a fixed
@@ -1639,6 +1779,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: PARAKEET_TDT_TOKENIZER_ID,
         decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "parakeet-tdt",
             supports_phrase_bias: false,
@@ -1650,13 +1791,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // Transducer with constant-size prediction state: no decoder KV
-        // cache to size.
-        capacity_model: CapacityModelDeclaration::NoDecoderKv,
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         // Verified on the imported pack: trained on transcripts that preserve
         // punctuation and capitalization (mirrors `_catalog.py`'s
         // `PUNCTUATION_BY_FAMILY["parakeet-tdt"]`).
@@ -1687,6 +1827,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: WAV2VEC2_CTC_TOKENIZER_ID,
         decode_policy_id: WAV2VEC2_CTC_DECODE_POLICY_ID,
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "wav2vec2",
             supports_phrase_bias: true,
@@ -1698,12 +1839,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // CTC: no autoregressive decoder, hence no decoder KV cache.
-        capacity_model: CapacityModelDeclaration::NoDecoderKv,
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
         emits_punctuation: None,
         hparam_schema: WAV2VEC2_CTC_HPARAM_SCHEMA,
@@ -1737,6 +1878,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: XASR_ZIPFORMER_TOKENIZER_ID,
         decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "xasr-zipformer",
             supports_phrase_bias: false,
@@ -1748,6 +1890,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Was measured CPU-favored on the M1 host, but that measurement
         // predates the encoder-weight-placement fix (#139): the encoder
@@ -1769,9 +1912,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // Streaming transducer with constant-size state: no decoder KV cache
-        // to size.
-        capacity_model: CapacityModelDeclaration::NoDecoderKv,
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
         // Zipformer2 uses multi-scale streaming cache topology plus RNN-T
@@ -1796,6 +1937,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MOONSHINE_TOKENIZER_ID,
         decode_policy_id: MOONSHINE_DECODE_POLICY_ID,
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "moonshine",
             supports_phrase_bias: true,
@@ -1807,16 +1949,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // MHA self-KV decoder, but the RoPE encoder span is not what a single
-        // decode runs into: the decoder's own output context (decoder.max_ctx,
-        // a required pack key) bounds the transcript one decode can produce.
-        capacity_model: CapacityModelDeclaration::BoundedElsewhere {
-            by: "decoder.max_ctx output bound",
-        },
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         emits_punctuation: Some(true),
         hparam_schema: MOONSHINE_HPARAM_SCHEMA,
         // Raw-waveform conv-stem + partial-RoPE seq2seq with a self-contained
@@ -1849,6 +1987,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: DOLPHIN_TOKENIZER_ID,
         decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "dolphin",
             supports_phrase_bias: true,
@@ -1860,6 +1999,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Auto prefers the accelerator: once the E-Branchformer encoder + CTC
         // head weights live in a WEIGHTS-usage static arena (so the ggml
@@ -1875,14 +2015,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // Attention decoder with self-KV, but audio length runs into the
-        // sinusoidal positional table (decoder.max_ctx), not the KV budget;
-        // the decoder head_dim is also not declared pack metadata, so the KV
-        // figure is not derivable without a pack revision this family does
-        // not need.
-        capacity_model: CapacityModelDeclaration::BoundedElsewhere {
-            by: "decoder.max_ctx positional span",
-        },
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         // DataoceanAI's cn-dialect-small training corpus is transcribed
         // without punctuation and the model has no punctuation-prediction
         // head/token to enable -- honestly unpunctuated, not "unknown".
@@ -1912,6 +2045,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: SENSEVOICE_TOKENIZER_ID,
         decode_policy_id: SENSEVOICE_DECODE_POLICY_ID,
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::None,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "sensevoice",
             supports_phrase_bias: true,
@@ -1923,12 +2057,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // CTC: no autoregressive decoder, hence no decoder KV cache.
-        capacity_model: CapacityModelDeclaration::NoDecoderKv,
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         emits_punctuation: Some(true),
         hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
         // Non-autoregressive CTC: SAN-M/FSMN encoder + CTC head, no decoder
@@ -1964,6 +2098,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FIRERED_AED_TOKENIZER_ID,
         decode_policy_id: FIRERED_AED_DECODE_POLICY_ID,
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "firered-aed",
             supports_phrase_bias: false,
@@ -1975,18 +2110,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_aed_encoder.py"),
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // Attention decoder with self-KV, but audio length runs into the
-        // encoder positional encoding (decoder.pe_len), not the KV budget;
-        // decoder heads/head_dim are also not declared pack metadata, so the
-        // KV figure is not derivable without a pack revision this family does
-        // not need.
-        capacity_model: CapacityModelDeclaration::BoundedElsewhere {
-            by: "decoder.pe_len positional encoding",
-        },
+        invocation_span: OpenAsrInvocationSpan::Elastic,
         // The reference tokenizer's dict.txt has no punctuation/<space>
         // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
         // corpora); verified on the golden-diff fixture transcript.
@@ -2026,6 +2155,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FIRERED_LLM_TOKENIZER_ID,
         decode_policy_id: FIRERED_LLM_DECODE_POLICY_ID,
         executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "firered2-llm",
             supports_phrase_bias: false,
@@ -2037,17 +2167,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_reference.py"),
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // GQA Qwen2 decoder whose prompt carries the adapted audio tokens, so
-        // the decoder KV context bounds audio length -- fully derivable from
-        // pack metadata (llm.n_layers / llm.n_kv_heads / llm.head_dim /
-        // llm.max_positions are all required keys).
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::DecoderContext,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 40.0 },
         // Qwen2's ChatML decode is a plain transcription completion -- no
         // learned punctuation-suppression behavior has been characterized
         // for this family yet (unlike firered-aed's punctuation-free
@@ -2085,6 +2210,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FUNASR_NANO_TOKENIZER_ID,
         decode_policy_id: FUNASR_NANO_DECODE_POLICY_ID,
         executor_component_id: FUNASR_NANO_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "funasr-nano",
             supports_phrase_bias: false,
@@ -2098,17 +2224,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             ),
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // GQA Qwen3 decoder whose prompt carries the adapted audio tokens, so
-        // the decoder KV context bounds audio length -- fully derivable from
-        // pack metadata (funasr.llm.n_layers / n_kv_heads / head_dim /
-        // max_positions are all required keys).
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::DecoderContext,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 40.0 },
         // The stock Qwen3 ChatML decode emits ordinary punctuation, but no
         // punctuation-suppression behavior has been separately characterized;
         // leave unclaimed rather than assert a capability beyond the two golden
@@ -2142,6 +2263,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MIMO_ASR_TOKENIZER_ID,
         decode_policy_id: MIMO_ASR_DECODE_POLICY_ID,
         executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "mimo-asr",
             supports_phrase_bias: false,
@@ -2153,17 +2275,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
         speaker_segmentation: SpeakerSegmentationSource::External,
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // GQA Qwen2 decoder whose prompt carries the audio tokens, so the
-        // decoder KV context bounds audio length -- fully derivable from pack
-        // metadata (mimo.llm.block_count / attention.head_count_kv /
-        // attention.key_length / context_length are all required keys).
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::DecoderContext,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 30.0 },
         // No characterized punctuation behavior for this family yet (unlike
         // firered-aed's punctuation-free vocab) -- leave unclaimed rather
         // than assert an unverified capability.
@@ -2199,6 +2316,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MOSS_TD_TOKENIZER_ID,
         decode_policy_id: MOSS_TD_DECODE_POLICY_ID,
         executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "moss-transcribe-diarize",
             supports_phrase_bias: false,
@@ -2210,6 +2328,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: Some("tooling/moss-reference-dumper/dump_golden.py"),
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Auto selects Metal/GPU when available. Correctness blockers that
         // once justified ExceptMetal are closed (encoder divergence falsified;
@@ -2226,59 +2345,29 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // instruction), so this family diarizes itself -- there is no
         // separate diarization pass to compose.
         speaker_segmentation: SpeakerSegmentationSource::InDecoder,
-        // Every slice is its own speaker scope (the decode restarts `[S01]`
-        // numbering per slice), and the window is a decoder-context fact: the
-        // Qwen3 decoder folds the whole slice into one prompt inside
-        // `MOSS_TD_MAX_KV_CACHE_POSITIONS` (8192) positions. Worst case at
-        // `max_seconds` = 240s: 86 fixed wrapper tokens (measured from the
-        // real tokenized prompt) + 375 audio tokens per 30s encoder chunk
-        // (8 chunks = 3000) + 124 time-marker digit tokens + the full
-        // `MOSS_TD_MAX_GENERATED_TOKENS` decode budget (4096) = 7306
-        // positions. The window is chosen so a slice-length request can always
-        // be granted that entire budget: dense overlapping meeting audio
-        // exhausts anything smaller, and exhausting the budget returns nothing
-        // at all rather than degrading.
+        // Product invocation envelope: ordinary VAD slicing aims at 30s and
+        // may stretch to 60s to reach a clean cut. Recordings at or below 60s
+        // decode whole. This bound is machine-independent, so a recording has
+        // identical slicing/transcript semantics on CPU and GPU; memory
+        // pressure changes only which execution candidate is admitted.
         //
-        // Wanting the window longer runs straight into that arithmetic; wanting
-        // it shorter costs identity. A slice is how much context the in-decoder
-        // diarizer gets to hold one speaker together, and every seam between
-        // slices is a place cross-slice identity has to be re-established from
-        // voice evidence alone. 180s is the target because it leaves the
-        // stretch room to 240s for finding a real pause to cut on.
-        // `integral_seconds` = 300s: the longest single-prompt request whose
-        // audio prompt (86 fixed wrapper tokens + 375 audio tokens per 30s
-        // encoder chunk + the marker track's digit tokens -- 160 at 300s)
-        // still leaves a budget covering the densest measured demand
-        // (12.7 tokens/s, so 3810) inside the 8192-position decoder context:
-        // 3996 + 3810 = 7806 <= 8192. 330s does not fit (4389 prompt + the
-        // 4096 generation backstop = 8485), so 300s is the ceiling, not a
-        // preference. Derived from the pack's own metadata by
-        // `crate::capacity::derive_integral_seconds` and pinned equal to this
-        // declared value by
-        // `moss_transcribe_diarize::capacity::tests::derived_integral_window_equals_the_declared_constant`
-        // (Phase 0: the derivation runs in parallel with zero production
-        // callers; Phase 1 moves the derived value onto the loaded pack), and
-        // pinned from both sides against the arithmetic by
-        // `the_integral_window_is_the_largest_one_the_context_can_serve`.
+        // The family topology proves the 60s reserve exactly from the real
+        // integer frontend/prompt/budget counters: 750 audio tokens + 23 time
+        // marker tokens + 86 fixed tokens + 1508 generated-token allowance =
+        // 2367 semantic positions. The shared greedy schedule never feeds its
+        // final sampled token back, so the exact physical self-KV span is
+        // 2366 rows. `MOSS_TD_MAX_KV_CACHE_POSITIONS` (8192)
+        // remains a fail-closed safety ceiling, never the allocation request.
+        // Every slice is still its own model speaker-label scope; optional
+        // Voice ID may reconcile labels across slices at the product layer.
         longform_slice_shape: OpenAsrLongformSliceShape::ScopedSlices {
-            integral_seconds: 300.0,
-            target_seconds: 180.0,
-            max_seconds: 240.0,
+            integral_seconds: MOSS_TD_MAX_INVOCATION_SECONDS as f32,
+            target_seconds: MOSS_TD_TARGET_INVOCATION_SECONDS as f32,
+            max_seconds: MOSS_TD_MAX_INVOCATION_SECONDS as f32,
         },
-        // GQA Qwen3 decoder whose prompt carries the audio span, so the
-        // decoder KV context bounds audio length -- fully derivable from pack
-        // metadata (moss_td.llm.n_layers / n_kv_heads / head_dim /
-        // max_positions and moss_td.adaptor.merge_size are all required
-        // keys). The ONLY family whose audio is decoded whole up to its
-        // integral window today, so it is also the only family that consumes
-        // the derived integral window: `moss_transcribe_diarize::capacity`
-        // derives it from the loaded pack's metadata and pins the result
-        // equal to the declared `integral_seconds: 300.0` above (Phase 0 --
-        // parallel derivation, zero production callers; Phase 1 moves the
-        // derived value onto the loaded pack).
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::DecoderContext,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Bounded {
+            max_seconds: MOSS_TD_MAX_INVOCATION_SECONDS as f32,
+        },
         // The fixed instruction asks for full punctuation-bearing prose
         // segments; no characterized counter-example has been observed yet,
         // but this has not been verified against enough real transcripts to
@@ -2315,6 +2404,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: GRANITE_SPEECH_TOKENIZER_ID,
         decode_policy_id: GRANITE_SPEECH_DECODE_POLICY_ID,
         executor_component_id: GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
+        decoder_state_class: OpenAsrDecoderStateClass::TokenScaledPersistent,
         integration: OpenAsrFamilyIntegrationDescriptor {
             catalog_family_id: "granite-speech",
             // Native keyword biasing via the prompt convention (see
@@ -2335,6 +2425,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             reference_dumper_source: Some("tooling/granite-speech-reference-dumper/dump_golden.py"),
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        execution_capabilities: CPU_AND_HYBRID_EXECUTION,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Perf/backend tuning is out of scope for this landing (the decoder
         // is still the O(n^2) recompute-per-step prefill executor, see
@@ -2351,16 +2442,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // single-prompt `ScopedSlices` case (only moss-transcribe-diarize is),
         // so no integral window is declared or consumed here.
         longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
-        // Projected audio tokens splice into the Granite decoder prompt, so the
-        // decoder's 4096-token trained context is the binding single-decode
-        // audio-length constraint (`CapacityAudioBound::DecoderContext`). The
-        // derived ceiling lives in `granite_speech::capacity` (382s for the
-        // shipped 4.1-2b geometry) and the executor fails closed above it with
-        // a typed `AudioTooLong`; ordinary longform work is further bounded by
-        // the shared 30s `SharedWindow` slice and never approaches that ceiling.
-        capacity_model: CapacityModelDeclaration::Derived(CapacityModelDescriptor {
-            audio_bound: CapacityAudioBound::DecoderContext,
-        }),
+        invocation_span: OpenAsrInvocationSpan::Bounded {
+            max_seconds: GRANITE_SPEECH_MAX_INVOCATION_SECONDS as f32,
+        },
         // The model card documents punctuation/truecasing as a real,
         // evaluated capability (a documented prompt variant + reported PER/
         // Cap-F1 metrics), and the family's own end-to-end golden samples
@@ -2593,159 +2677,34 @@ mod tests {
         );
     }
 
-    /// Pins the capacity-model bucket of every builtin architecture -- the
-    /// exhaustive companion to the field's compile-time enforcement. The
-    /// field being mandatory only forces SOME declaration; this test forces
-    /// the RIGHT one per family, so reclassifying a family (or onboarding a
-    /// fifteenth) lands as a deliberate diff here rather than a silent
-    /// `NoDecoderKv` on a family that very much has a decoder KV cache.
-    /// Buckets follow the design review's taxonomy: five LLM-decoder
-    /// families derive, five CTC/transducer families have no decoder KV, and
-    /// four are bounded elsewhere than their decoder context.
     #[test]
-    fn builtin_architectures_declare_capacity_model() {
-        use crate::capacity::{
-            CapacityAudioBound, CapacityModelDeclaration, CapacityModelDescriptor,
-        };
-
-        let derived = |audio_bound| {
-            CapacityModelDeclaration::Derived(CapacityModelDescriptor { audio_bound })
-        };
-        let expected: &[(&str, CapacityModelDeclaration)] = &[
-            (
-                COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::EncoderSpan),
-            ),
-            (
-                WHISPER_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::BoundedElsewhere {
-                    by: "fixed 30s encoder window",
-                },
-            ),
-            (
-                QWEN3_ASR_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::DecoderContext),
-            ),
-            (
-                PARAKEET_CTC_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::NoDecoderKv,
-            ),
-            (
-                PARAKEET_TDT_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::NoDecoderKv,
-            ),
-            (
-                WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::NoDecoderKv,
-            ),
-            (
-                XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::NoDecoderKv,
-            ),
-            (
-                MOONSHINE_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::BoundedElsewhere {
-                    by: "decoder.max_ctx output bound",
-                },
-            ),
-            (
-                DOLPHIN_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::BoundedElsewhere {
-                    by: "decoder.max_ctx positional span",
-                },
-            ),
-            (
-                SENSEVOICE_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::NoDecoderKv,
-            ),
-            (
-                FIRERED_AED_GGML_ARCHITECTURE_ID,
-                CapacityModelDeclaration::BoundedElsewhere {
-                    by: "decoder.pe_len positional encoding",
-                },
-            ),
-            (
-                FIRERED_LLM_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::DecoderContext),
-            ),
-            (
-                FUNASR_NANO_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::DecoderContext),
-            ),
-            (
-                MIMO_ASR_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::DecoderContext),
-            ),
-            (
-                MOSS_TD_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::DecoderContext),
-            ),
+    fn builtin_architectures_declare_semantic_invocation_spans() {
+        let expected = [
+            (WHISPER_GGML_ARCHITECTURE_ID, Some(30.0)),
+            (FIRERED_LLM_GGML_ARCHITECTURE_ID, Some(40.0)),
+            (FUNASR_NANO_GGML_ARCHITECTURE_ID, Some(40.0)),
+            (MIMO_ASR_GGML_ARCHITECTURE_ID, Some(30.0)),
+            (MOSS_TD_GGML_ARCHITECTURE_ID, Some(60.0)),
             (
                 GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
-                derived(CapacityAudioBound::DecoderContext),
+                Some(GRANITE_SPEECH_MAX_INVOCATION_SECONDS as f32),
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
-        let mut seen = std::collections::BTreeSet::new();
-
-        for (model_architecture, capacity_model) in expected.iter().copied() {
-            let descriptor = registry
-                .find_by_model_architecture(model_architecture)
-                .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
-            assert_eq!(
-                descriptor.capacity_model, capacity_model,
-                "'{model_architecture}' capacity_model mismatch"
-            );
-            if let CapacityModelDeclaration::BoundedElsewhere { by } = capacity_model {
-                assert!(
-                    !by.is_empty(),
-                    "'{model_architecture}' BoundedElsewhere must name its bound"
-                );
-            }
-            seen.insert(model_architecture);
-        }
-
-        assert_eq!(
-            seen.len(),
-            registry.descriptors().len(),
-            "expectation table must cover every builtin architecture, no more, no less"
-        );
-    }
-
-    /// Every family that declares a derived capacity model must have its
-    /// versioned frontend id registered in `crate::capacity`'s frontend
-    /// table, so derivation can never read a frontend fact that does not
-    /// exist. (The same check runs in the release-path family integration
-    /// audit; this test pins the builtin set specifically.)
-    #[test]
-    fn derived_capacity_families_have_registered_frontends() {
-        let registry = OpenAsrArchitectureRegistry::with_builtins();
-        let mut derived_count = 0usize;
         for descriptor in registry.descriptors() {
-            if matches!(
-                descriptor.capacity_model,
-                crate::capacity::CapacityModelDeclaration::Derived(_)
-            ) {
-                derived_count += 1;
-                assert!(
-                    crate::capacity::frontend_capacity_basis(descriptor.audio_frontend_id)
-                        .is_some(),
-                    "'{}' declares a derived capacity model but frontend id '{}' has no \
-                     capacity-frontend registry row",
-                    descriptor.model_architecture,
-                    descriptor.audio_frontend_id
-                );
-            }
+            let expected_max = expected
+                .iter()
+                .find_map(|(architecture, max)| {
+                    (*architecture == descriptor.model_architecture).then_some(*max)
+                })
+                .flatten();
+            assert_eq!(
+                descriptor.max_single_invocation_seconds(),
+                expected_max,
+                "'{}' invocation span mismatch",
+                descriptor.model_architecture
+            );
         }
-        // Guards the walk: the design review's taxonomy derives exactly seven
-        // builtin families (qwen3-asr, cohere, firered-llm, mimo-asr,
-        // funasr-nano, moss-td, granite-speech -- all DecoderContext-bound
-        // except cohere's EncoderSpan); a rename that stops matching would
-        // otherwise make this test vacuously pass.
-        assert_eq!(
-            derived_count, 7,
-            "expected exactly seven Derived builtin families"
-        );
     }
 
     /// Pins `auto_gpu_policy` per builtin architecture. Most builtins let
@@ -3169,6 +3128,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn validate_references_rejects_invalid_invocation_span_cap() {
+        let base = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(WHISPER_GGML_ARCHITECTURE_ID)
+            .expect("whisper architecture");
+
+        for bad_value in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let descriptor = OpenAsrArchitectureDescriptor {
+                invocation_span: OpenAsrInvocationSpan::Bounded {
+                    max_seconds: bad_value,
+                },
+                ..base
+            };
+            let error = OpenAsrArchitectureRegistry::validate_invocation_span(descriptor)
+                .expect_err("non-finite/non-positive invocation span must fail closed");
+            match error {
+                OpenAsrArchitectureRegistryError::InvocationSpanNotFinitePositive {
+                    model_architecture,
+                    max_seconds,
+                } => {
+                    assert_eq!(model_architecture, WHISPER_GGML_ARCHITECTURE_ID);
+                    assert!(
+                        max_seconds == bad_value || (max_seconds.is_nan() && bad_value.is_nan())
+                    );
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_slices_require_a_direct_invocation_bound_covering_the_envelope() {
+        let base = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(MOSS_TD_GGML_ARCHITECTURE_ID)
+            .expect("moss architecture");
+
+        for invocation_span in [
+            OpenAsrInvocationSpan::Elastic,
+            OpenAsrInvocationSpan::Bounded { max_seconds: 59.0 },
+        ] {
+            let descriptor = OpenAsrArchitectureDescriptor {
+                invocation_span,
+                ..base
+            };
+            assert!(matches!(
+                OpenAsrArchitectureRegistry::validate_invocation_span(descriptor),
+                Err(
+                    OpenAsrArchitectureRegistryError::ScopedSliceInvocationSpanMismatch {
+                        model_architecture: MOSS_TD_GGML_ARCHITECTURE_ID,
+                        required_seconds: 60.0,
+                        ..
+                    }
+                )
+            ));
+        }
+        OpenAsrArchitectureRegistry::validate_invocation_span(base)
+            .expect("MOSS 60-second direct bound covers its scoped-slice envelope");
     }
 
     #[test]

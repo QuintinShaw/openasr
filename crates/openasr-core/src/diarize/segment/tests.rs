@@ -144,9 +144,16 @@ fn pyannet_stage_gates() {
 #[test]
 #[ignore = "host-local bench: needs OPENASR_PYANNOTE_PACK; run with --release for catalog numbers"]
 fn segmenter_rtf_bench_when_pack_present() {
-    let Some(segmenter) = super::shared_segmenter() else {
+    let Some(pack) = std::env::var_os("OPENASR_PYANNOTE_PACK") else {
         eprintln!("skipping: pyannote pack absent");
         return;
+    };
+    let path = std::path::Path::new(&pack);
+    let segmenter = if crate::diarize::pack::is_gguf(path) {
+        super::PyannoteSegmenter::from_oasr(path).expect("load GGUF pyannote pack")
+    } else {
+        super::PyannoteSegmenter::from_safetensors(&std::fs::read(path).expect("read pack"))
+            .expect("load safetensors pyannote pack")
     };
     let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
     let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(

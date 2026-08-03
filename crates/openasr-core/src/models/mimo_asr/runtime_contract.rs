@@ -235,6 +235,17 @@ pub(crate) struct MimoAudiotokMetadata {
     pub codebook_sizes: Vec<u32>,
 }
 
+impl MimoAudiotokMetadata {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(
+            &self.codebook_sizes,
+            "mimo-asr audio-tokenizer codebook sizes",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) fn parse_mimo_audiotok_metadata(
     metadata: &GgufMetadata,
 ) -> Result<MimoAudiotokMetadata, MimoMetadataError> {

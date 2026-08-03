@@ -89,6 +89,60 @@ pub(crate) struct ParakeetTdtJointWeights {
     pub out_bias: NamedTensor,
 }
 
+impl ParakeetTdtEncoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        crate::models::parakeet_runtime_memory::fastconformer_weights_retained_bytes(
+            &self.subsampling,
+            &self.layers,
+            &[&self.enc_proj_weight, &self.enc_proj_bias],
+        )
+    }
+}
+
+impl ParakeetTdtPredictorWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        crate::models::parakeet_runtime_memory::add_named_tensor_capacity(
+            &self.embedding,
+            &mut bytes,
+            "parakeet-tdt predictor embedding",
+        )?;
+        bytes.add_vec(
+            &self.lstm_layers,
+            "parakeet-tdt predictor layer descriptors",
+        )?;
+        for layer in &self.lstm_layers {
+            for tensor in [&layer.w_ih, &layer.w_hh, &layer.b_ih, &layer.b_hh] {
+                crate::models::parakeet_runtime_memory::add_named_tensor_capacity(
+                    tensor,
+                    &mut bytes,
+                    "parakeet-tdt predictor tensor",
+                )?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+}
+
+impl ParakeetTdtJointWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for tensor in [
+            &self.pred_weight,
+            &self.pred_bias,
+            &self.out_weight,
+            &self.out_bias,
+        ] {
+            crate::models::parakeet_runtime_memory::add_named_tensor_capacity(
+                tensor,
+                &mut bytes,
+                "parakeet-tdt joint tensor",
+            )?;
+        }
+        Ok(bytes.finish())
+    }
+}
+
 fn expect_elements(
     tensor: NamedTensor,
     expected: usize,

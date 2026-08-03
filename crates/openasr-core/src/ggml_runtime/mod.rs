@@ -1,5 +1,7 @@
 mod arena_weight_pipeline;
 mod backend;
+pub(crate) mod backend_memory;
+pub(crate) mod backend_memory_admission;
 mod cpu_graph;
 mod env_flags;
 mod ffi;

@@ -6,6 +6,130 @@ use crate::{ModelSessionPermit, NativeExecutionSupervisor};
 
 use super::*;
 
+/// A model-backed stage whose successful initialization is required before a
+/// realtime session may accept its first audio byte.
+///
+/// Keep this list product-semantic rather than model-specific: family runtimes
+/// own how they prepare, while the session owns the single audio-admission
+/// boundary shared by native streaming, mock fallback, translation, and
+/// speaker features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RequiredStage {
+    Asr,
+    Translation,
+    SpeakerIdentity,
+}
+
+impl RequiredStage {
+    const ALL: [Self; 3] = [Self::Asr, Self::Translation, Self::SpeakerIdentity];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asr => "asr",
+            Self::Translation => "translation",
+            Self::SpeakerIdentity => "speaker_identity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequiredStageState {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+/// Session-local readiness barrier. It never stores audio and has no replay
+/// path: audio admission is a pure state check, so a pending stage cannot grow
+/// an implicit pre-ready buffer.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequiredStageReadinessBarrier {
+    stages: HashMap<RequiredStage, RequiredStageState>,
+}
+
+impl RequiredStageReadinessBarrier {
+    pub(crate) fn for_session(translation: bool, speaker_identity: bool) -> Self {
+        let mut barrier = Self::default();
+        barrier.require(RequiredStage::Asr);
+        if translation {
+            barrier.require(RequiredStage::Translation);
+        }
+        if speaker_identity {
+            barrier.require(RequiredStage::SpeakerIdentity);
+        }
+        barrier
+    }
+
+    fn require(&mut self, stage: RequiredStage) {
+        self.stages
+            .entry(stage)
+            .or_insert(RequiredStageState::Pending);
+    }
+
+    pub(crate) fn mark_ready(&mut self, stage: RequiredStage) -> Result<(), String> {
+        match self.stages.get_mut(&stage) {
+            Some(state @ RequiredStageState::Pending) => {
+                *state = RequiredStageState::Ready;
+                Ok(())
+            }
+            Some(RequiredStageState::Ready) => Ok(()),
+            Some(RequiredStageState::Failed(reason)) => Err(format!(
+                "required stage '{}' already failed: {reason}",
+                stage.as_str()
+            )),
+            None => Err(format!(
+                "stage '{}' was not declared by the session readiness contract",
+                stage.as_str()
+            )),
+        }
+    }
+
+    fn mark_failed(&mut self, stage: RequiredStage, reason: impl Into<String>) {
+        if let Some(state) = self.stages.get_mut(&stage) {
+            *state = RequiredStageState::Failed(reason.into());
+        }
+    }
+
+    pub(crate) fn ensure_audio_ready(&self) -> Result<(), String> {
+        let mut unavailable = Vec::new();
+        for stage in RequiredStage::ALL {
+            match self.stages.get(&stage) {
+                Some(RequiredStageState::Pending) => {
+                    unavailable.push(format!("{} is still preparing", stage.as_str()));
+                }
+                Some(RequiredStageState::Failed(reason)) => {
+                    unavailable.push(format!("{} failed: {reason}", stage.as_str()));
+                }
+                Some(RequiredStageState::Ready) | None => {}
+            }
+        }
+        if unavailable.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Realtime audio cannot start before every required stage is ready: {}.",
+                unavailable.join("; ")
+            ))
+        }
+    }
+}
+
+pub(crate) fn prepare_file_per_utterance_fallback_asr(
+    backend: openasr_core::BackendKind,
+) -> Result<(), &'static str> {
+    match backend {
+        // Mock inference has no delayed model allocation. Creating the bounded
+        // dispatch worker is its complete preparation contract.
+        openasr_core::BackendKind::Mock => Ok(()),
+        // A real native family without true streaming is a registry/wiring
+        // defect. Running its offline executor on the first utterance would
+        // move model allocation behind audio admission.
+        openasr_core::BackendKind::Native => Err(
+            "Native realtime model wiring did not provide the required true-streaming executor; session.start was rejected before audio admission.",
+        ),
+    }
+}
+
 pub(crate) struct WsSession {
     pub(crate) runtime: ServerRuntime,
     pub(crate) distribution: DistributionContext,
@@ -19,6 +143,10 @@ pub(crate) struct WsSession {
     pub(crate) emitted_event_ids: std::collections::HashMap<String, String>,
     pub(crate) emitted_event_id_order: VecDeque<String>,
     pub(crate) controller: Option<RealtimeSessionController>,
+    /// The only gate through which binary audio enters this session. An empty
+    /// barrier is ready for pre-start test fixtures; `session.start` replaces
+    /// it with the exact required-stage set before initializing any stage.
+    pub(crate) required_stage_readiness: RequiredStageReadinessBarrier,
     /// Dedicated-thread owner of the native streaming session, when this session
     /// is on the native streaming (Path B) route. The session itself lives on the
     /// worker thread; the WS task talks to it request/response.
@@ -127,6 +255,12 @@ pub(crate) struct WsSession {
     /// utterance the text was carved from).
     pub(crate) pending_split_tail_relabels: VecDeque<PendingSpeakerRevision>,
     pub(crate) translation: Option<RealtimeTranslationLane>,
+    /// Explicit test seam for protocol/lifecycle tests whose metadata-only
+    /// packs intentionally contain no executable tensors. Production builds
+    /// compile this field and its branch out entirely; runtime-readiness tests
+    /// use tensor-ready fixtures instead of this seam.
+    #[cfg(test)]
+    pub(crate) test_native_streaming_session_factory: Option<NativeStreamingSessionFactory>,
     #[cfg(test)]
     pub(crate) test_translation_worker: Option<TranslationWorkerHook>,
     /// When set together with `test_translation_worker`, the worker is built
@@ -144,6 +278,10 @@ pub(crate) type TranslationWorkerHook = Arc<
 
 pub(crate) type TranslationWorkerInitHook =
     Arc<dyn Fn() -> Result<(), TranslationQueueError> + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) type NativeStreamingSessionFactory =
+    Arc<dyn Fn() -> Result<Box<dyn NativeAsrSession>, openasr_core::NativeAsrError> + Send + Sync>;
 
 pub(crate) struct RealtimeTranslationLane {
     session: TranslationSession,
@@ -651,6 +789,7 @@ impl WsSession {
             emitted_event_id_order: VecDeque::new(),
             session_id,
             controller: None,
+            required_stage_readiness: RequiredStageReadinessBarrier::default(),
             native_streaming: None,
             native_had_speech_since_last_poll: false,
             native_poll_outstanding: 0,
@@ -701,6 +840,8 @@ impl WsSession {
             native_speakerless_finals: Vec::new(),
             pending_split_tail_relabels: VecDeque::new(),
             translation: None,
+            #[cfg(test)]
+            test_native_streaming_session_factory: None,
             #[cfg(test)]
             test_translation_worker: None,
             #[cfg(test)]
@@ -981,7 +1122,8 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        if session.diarize.unwrap_or(false) {
+        let diarize = session.diarize.unwrap_or(false);
+        if diarize {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 REALTIME_VOICE_ID_UNSUPPORTED_REASON,
@@ -990,6 +1132,18 @@ impl WsSession {
             .await?;
             return Err(());
         }
+        let translation_required = session
+            .translation
+            .as_ref()
+            .is_some_and(|options| options.enabled.unwrap_or(false));
+        self.required_stage_readiness =
+            RequiredStageReadinessBarrier::for_session(translation_required, diarize);
+        let execution_target = session.execution_target.or_else(|| {
+            self.distribution
+                .openasr_home()
+                .ok()
+                .and_then(|home| realtime_execution_target_preference(&home))
+        });
         #[cfg(test)]
         let test_translation_worker = self
             .test_translation_worker
@@ -1002,12 +1156,28 @@ impl WsSession {
             capabilities,
             self.distribution.clone(),
             self.runtime.native_execution.clone(),
+            execution_target.unwrap_or_default(),
             test_translation_worker,
         )
         .await
         {
-            Ok(result) => result,
+            Ok(result) => {
+                if translation_required
+                    && let Err(message) = self
+                        .required_stage_readiness
+                        .mark_ready(RequiredStage::Translation)
+                {
+                    self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                        .await?;
+                    return Err(());
+                }
+                result
+            }
             Err(error) => {
+                if translation_required {
+                    self.required_stage_readiness
+                        .mark_failed(RequiredStage::Translation, error.to_string());
+                }
                 let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
                 self.emit_error(
                     realtime_error_code_for_api_error(&error),
@@ -1114,12 +1284,7 @@ impl WsSession {
                     return Err(());
                 }
             };
-        self.execution_target = session.execution_target.or_else(|| {
-            self.distribution
-                .openasr_home()
-                .ok()
-                .and_then(|home| realtime_execution_target_preference(&home))
-        });
+        self.execution_target = execution_target;
         self.word_timestamps = word_timestamps;
         self.source_name = source_name;
         self.translation = translation;
@@ -1133,15 +1298,45 @@ impl WsSession {
                 )
                 .await;
             if result.is_err() {
+                self.required_stage_readiness.mark_failed(
+                    RequiredStage::Asr,
+                    "native streaming session preparation or warm-up failed",
+                );
+                if let Some(worker) = self.native_streaming.take() {
+                    worker.detach_cancel();
+                }
                 self.controller = None;
                 self.translation = None;
             }
             return result;
         }
-        // FilePerUtteranceFallback is still a live path for mock/default
-        // runtimes, keyless native packs, and native packs that intentionally do
-        // not self-declare true streaming.
+        // Every registered native family is required to expose a true-streaming
+        // executor. Falling through to per-utterance offline dispatch would
+        // postpone weights/arena/workspace allocation until after user audio,
+        // violating the readiness contract. Treat that route as registry/wiring
+        // corruption instead of silently accepting audio.
+        if let Err(message) = prepare_file_per_utterance_fallback_asr(self.runtime.backend) {
+            self.required_stage_readiness
+                .mark_failed(RequiredStage::Asr, message);
+            self.emit_error(RealtimeErrorCode::StartupConfigError, message, false)
+                .await?;
+            self.translation = None;
+            return Err(());
+        }
+        // The mock backend owns no model weights, arenas, or graph workspace;
+        // constructing its bounded dispatch worker therefore completes its ASR
+        // preparation contract synchronously.
         self.spawn_backend_worker();
+        if let Err(message) = self
+            .required_stage_readiness
+            .mark_ready(RequiredStage::Asr)
+            .and_then(|()| self.required_stage_readiness.ensure_audio_ready())
+        {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            self.translation = None;
+            return Err(());
+        }
 
         let created = controller.session_created_event(timestamp_now());
         self.emit_envelope(created).await?;
@@ -1185,6 +1380,7 @@ impl WsSession {
         capabilities: RealtimeBackendCapabilities,
         distribution: DistributionContext,
         native_execution: NativeExecutionSupervisor,
+        execution_target: openasr_core::ExecutionTarget,
         test_worker: Option<(TranslationWorkerHook, Option<TranslationWorkerInitHook>)>,
     ) -> Result<(Option<RealtimeTranslationLane>, SessionTranslationSummary), ApiError> {
         let Some(options) = session.translation.as_ref() else {
@@ -1242,13 +1438,26 @@ impl WsSession {
 
         let model_id = HYMT2_TRANSLATION_MODEL_ID.to_string();
         let requested_model = options.model.clone();
+        // One product envelope owns both segmentation and decoder capacity.
+        // Never let these paths independently choose a clause bound: every
+        // segment emitted below must fit the arenas admitted before the
+        // translation worker publishes its first candidate.
+        let segmentation_config = ClauseSegmentationConfig::default();
+        let max_source_clause_chars = segmentation_config.max_emitted_clause_chars();
         let translation_session = Self::build_translation_session(
             distribution,
             requested_model.as_deref(),
             native_execution,
+            execution_target,
+            max_source_clause_chars,
             test_worker,
         )
         .await?;
+        let ready_at_construction = matches!(
+            translation_session.worker_readiness(),
+            TranslationWorkerReadiness::Ready
+        );
+        let translation_session = Self::await_translation_worker_ready(translation_session).await?;
         let summary = SessionTranslationSummary {
             enabled: true,
             target_lang: Some(target_lang.as_str().to_string()),
@@ -1257,11 +1466,10 @@ impl WsSession {
                 openasr_core::RealtimeTranslationCapability::MODE_CLAUSE_RETRANSLATION.to_string(),
             ),
         };
-        let ready_announced = translation_session.worker_ready();
         Ok((
             Some(RealtimeTranslationLane {
                 session: translation_session,
-                segmenter: ClauseSegmenter::default(),
+                segmenter: ClauseSegmenter::new(segmentation_config),
                 gates: HashMap::new(),
                 clause_meta: HashMap::new(),
                 retired_clause_ids: HashSet::new(),
@@ -1270,16 +1478,52 @@ impl WsSession {
                 model_id,
                 target_lang,
                 provisional: options.provisional.unwrap_or(true),
-                ready_announced,
+                // A synchronously constructed test worker has never needed a
+                // status transition. A cold-loaded worker still announces one
+                // Ready transition after session lifecycle events, even though
+                // session.start now waits for that readiness before returning.
+                ready_announced: ready_at_construction,
             }),
             summary,
         ))
+    }
+
+    async fn await_translation_worker_ready(
+        session: TranslationSession,
+    ) -> Result<TranslationSession, ApiError> {
+        let timeout = backend_result_timeout();
+        let (session, readiness) = tokio::task::spawn_blocking(move || {
+            let readiness = session.wait_for_worker_readiness(timeout);
+            (session, readiness)
+        })
+        .await
+        .map_err(ApiError::BackendJoin)?;
+        match readiness {
+            TranslationWorkerReadiness::Ready => Ok(session),
+            TranslationWorkerReadiness::Failed { reason } => Err(ApiError::Backend(
+                openasr_core::BackendError::NativeFailClosed {
+                    reason: format!(
+                        "Realtime translation required-stage initialization failed: {reason}"
+                    ),
+                },
+            )),
+            TranslationWorkerReadiness::Initializing => Err(ApiError::Backend(
+                openasr_core::BackendError::NativeFailClosed {
+                    reason: format!(
+                        "Realtime translation required-stage initialization did not finish within {} seconds",
+                        timeout.as_secs()
+                    ),
+                },
+            )),
+        }
     }
 
     async fn build_translation_session(
         distribution: DistributionContext,
         requested_model: Option<&str>,
         native_execution: NativeExecutionSupervisor,
+        execution_target: openasr_core::ExecutionTarget,
+        max_source_clause_chars: usize,
         test_worker: Option<(TranslationWorkerHook, Option<TranslationWorkerInitHook>)>,
     ) -> Result<TranslationSession, ApiError> {
         if let Some((worker, init)) = test_worker {
@@ -1294,43 +1538,44 @@ impl WsSession {
 
         let selection = resolve_translation_pack_selection(&distribution, requested_model)
             .map_err(ApiError::BadRequest)?;
+        let execution_services = Arc::clone(native_execution.execution_services());
         let model_session_permit = native_execution
             .try_acquire(format!("hymt2:{HYMT2_TRANSLATION_MODEL_ID}"))
             .map_err(ApiError::ModelSessionCapacity)?;
         Ok(Self::load_hymt2_translation_session(
             selection,
             model_session_permit,
+            execution_services,
+            execution_target,
+            max_source_clause_chars,
         ))
     }
 
-    /// Spawns the Hy-MT2 translation worker with the (multi-second) model
-    /// cold load running on the worker thread, OFF the session-start critical
-    /// path. `session.start` is accepted immediately; readiness is announced
-    /// via a `translation.status` event from `drain_translation_outputs`, and
-    /// a load failure surfaces there as a session-fatal `error` event.
+    /// Spawns the Hy-MT2 translation worker with the (multi-second) model cold
+    /// load running on its dedicated thread. The async session-start task then
+    /// waits on the worker's readiness state without blocking the Tokio runtime;
+    /// no transcript/audio is accepted while initialization is pending.
     fn load_hymt2_translation_session(
         selection: TranslationPackSelection,
         model_session_permit: ModelSessionPermit,
+        execution_services: Arc<openasr_core::NativeExecutionServices>,
+        execution_target: openasr_core::ExecutionTarget,
+        max_source_clause_chars: usize,
     ) -> TranslationSession {
         let path = selection.path;
         Self::spawn_admitted_hymt2_translation_worker(model_session_permit, move || {
-            // Hy-MT2 is not wired into the shared ASR request dispatch (this
-            // is a translation session, not a transcription request), so
-            // there is no `resolved_runtime` to inherit -- resolve explicitly
-            // here, once, at session cold-load, the same way every ASR
-            // request-construction site does.
-            let backend = openasr_core::GgmlCpuGraphConfig::runtime_default().backend;
-            let runtime = Hymt2Runtime::from_path(path, backend).map_err(|error| {
-                TranslationQueueError::Worker {
-                    reason: format!(
-                        "Realtime translation Hy-MT2 runtime could not be loaded: {error}"
-                    ),
-                }
+            let mut runtime = PolicyResolvedHymt2TranslationRuntime::load(
+                execution_services,
+                path,
+                execution_target,
+                max_source_clause_chars,
+            )
+            .map_err(|error| TranslationQueueError::Worker {
+                reason: format!("Realtime translation Hy-MT2 runtime could not be loaded: {error}"),
             })?;
-            let mut cache = Hymt2TranslationSessionCache::default();
             Ok(move |request| {
                 runtime
-                    .translate_request_with_cache(&mut cache, &request)
+                    .translate_request(&request)
                     .map_err(|error| TranslationQueueError::Worker {
                         reason: error.to_string(),
                     })
@@ -1439,8 +1684,9 @@ impl WsSession {
         }
     }
 
-    /// Emits the one-shot `translation.status` ready event once the
-    /// asynchronously-initialized translation worker finishes its model load.
+    /// Emits the one-shot `translation.status` transition after session
+    /// lifecycle publication for a worker that required asynchronous setup.
+    /// The required-stage barrier guarantees the worker is already ready here.
     async fn announce_translation_ready(&mut self) -> Result<(), ()> {
         let ready = match self.translation.as_ref() {
             Some(lane) if !lane.ready_announced => lane.session.worker_ready(),
@@ -1635,9 +1881,25 @@ impl WsSession {
             .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz())
             .with_partial_results(partial_results)
             .with_word_timestamps(word_timestamps);
-        let executor = NativeBackendExecutor;
+        let executor = NativeBackendExecutor::new(Arc::clone(
+            self.runtime.native_execution.execution_services(),
+        ));
         let hardware_target = native_hardware_target_from_execution_target(self.execution_target);
-        let mut session = match NativeAsrExecutor::start_streaming_session(
+        #[cfg(test)]
+        let session_result = match self.test_native_streaming_session_factory.as_ref() {
+            Some(factory) => factory(),
+            None => NativeAsrExecutor::start_streaming_session(
+                &executor,
+                &adapter,
+                &model_pack,
+                hardware_target,
+                context,
+                options,
+                session_config,
+            ),
+        };
+        #[cfg(not(test))]
+        let session_result = NativeAsrExecutor::start_streaming_session(
             &executor,
             &adapter,
             &model_pack,
@@ -1645,7 +1907,8 @@ impl WsSession {
             context,
             options,
             session_config,
-        ) {
+        );
+        let mut session = match session_result {
             Ok(session) => session,
             Err(error) => {
                 self.emit_error(
@@ -1657,31 +1920,82 @@ impl WsSession {
                 return Err(());
             }
         };
-        let events = session.poll_events().map_err(|error| {
-            eprintln!("OpenASR native streaming poll failed during startup: {error}");
-        })?;
-        self.forward_native_streaming_events(NativeStreamingCommandKind::Poll, events)
-            .await?;
+        // Hold lifecycle events until warm-up has completed. In particular,
+        // `audio.input.started` must never race ahead of resident model/arena
+        // preparation and invite a client to send the first frame early.
+        let startup_events = match session.poll_events() {
+            Ok(events) => events,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &format!("Could not poll native streaming startup events: {error}"),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
         // The session moves onto its own decode thread; the WS task queues audio
         // and drains outcomes separately so a slow partial decode never blocks
         // socket ingest for this session.
-        self.attach_native_streaming_session_admitted(
-            NativeStreamingWorkerKey::with_route(
-                model_pack.root.clone(),
-                hardware_target,
-                resolved_route.as_ref(),
-                self.inference_threads,
-            ),
-            session,
-            model_session_permit,
-        )
-        .await
-        .map_err(|message| {
-            eprintln!("OpenASR native streaming worker attach failed: {message}");
-        })?;
-        self.send_native_streaming_command(NativeStreamingCommand::Warm)
+        if let Err(message) = self
+            .attach_native_streaming_session_admitted(
+                NativeStreamingWorkerKey::with_route(
+                    model_pack.root.clone(),
+                    hardware_target,
+                    resolved_route.as_ref(),
+                    self.inference_threads,
+                ),
+                session,
+                model_session_permit,
+            )
+            .await
+        {
+            self.emit_error(
+                RealtimeErrorCode::StartupConfigError,
+                &format!("Could not attach native streaming worker: {message}"),
+                false,
+            )
             .await?;
-        eprintln!("OpenASR native streaming worker warm-up queued");
+            return Err(());
+        }
+        self.complete_native_streaming_readiness(startup_events)
+            .await
+    }
+
+    pub(crate) async fn complete_native_streaming_readiness(
+        &mut self,
+        startup_events: Vec<RealtimeEventEnvelope>,
+    ) -> Result<(), ()> {
+        let (_, warm_events) = match self
+            .native_streaming_command(NativeStreamingCommand::Warm)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(()) => {
+                self.required_stage_readiness.mark_failed(
+                    RequiredStage::Asr,
+                    "native streaming warm-up failed before audio admission",
+                );
+                return Err(());
+            }
+        };
+        if let Err(message) = self
+            .required_stage_readiness
+            .mark_ready(RequiredStage::Asr)
+            .and_then(|()| self.required_stage_readiness.ensure_audio_ready())
+        {
+            self.required_stage_readiness
+                .mark_failed(RequiredStage::Asr, message.clone());
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
+        self.forward_native_streaming_events(NativeStreamingCommandKind::Poll, startup_events)
+            .await?;
+        self.forward_native_streaming_events(NativeStreamingCommandKind::Warm, warm_events)
+            .await?;
+        eprintln!("OpenASR native streaming worker warm-up completed before audio admission");
         Ok(())
     }
 
@@ -2614,6 +2928,11 @@ impl WsSession {
     }
 
     pub(crate) async fn handle_binary(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        if let Err(message) = self.required_stage_readiness.ensure_audio_ready() {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
         if self.is_native_streaming() {
             return self.handle_native_streaming_binary(bytes).await;
         }
@@ -2652,6 +2971,11 @@ impl WsSession {
     }
 
     pub(crate) async fn handle_native_streaming_binary(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        if let Err(message) = self.required_stage_readiness.ensure_audio_ready() {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
         self.ingest_binary_bytes(bytes).await?;
         while let Some(frame) = self.next_buffered_frame().await? {
             // No frame capture here: captured_audio_frames only feeds the

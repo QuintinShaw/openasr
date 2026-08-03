@@ -20,6 +20,25 @@ pub(crate) struct SenseVoiceTokenizer {
 }
 
 impl SenseVoiceTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.tokens, "sensevoice tokenizer token table")?;
+        for token in &self.tokens {
+            bytes.add_string(token, "sensevoice tokenizer token text")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "sensevoice tokenizer map bytes overflowed".to_string())?,
+            "sensevoice tokenizer map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "sensevoice tokenizer map key")?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn from_metadata(metadata: &GgufMetadata) -> Result<Self, String> {
         let tokens = metadata
             .get_string_array("tokenizer.ggml.tokens")

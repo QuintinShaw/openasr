@@ -59,6 +59,55 @@ pub(crate) struct GraniteSpeechTokenizer {
 }
 
 impl GraniteSpeechTokenizer {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &GgufMetadata,
+    ) -> Result<u64, NativeAsrError> {
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            GRANITE_SPEECH_TOKENIZER_FAMILY,
+        )?;
+        let merges = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_MERGES_KEY,
+            GRANITE_SPEECH_TOKENIZER_FAMILY,
+        )?;
+        tokenizer_capacity_from_lengths(tokens, merges).map_err(|reason| {
+            NativeAsrError::UnsupportedModelPack {
+                reason: format!("granite-speech tokenizer memory quote failed: {reason}"),
+            }
+        })
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "granite tokenizer id table")?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, "granite tokenizer id token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "granite tokenizer token map byte count overflowed".to_string())?,
+            "granite tokenizer token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "granite tokenizer token map key")?;
+        }
+        bytes.add_usize(
+            self.merge_rank
+                .len()
+                .checked_mul(std::mem::size_of::<(String, usize)>())
+                .ok_or_else(|| "granite tokenizer merge map byte count overflowed".to_string())?,
+            "granite tokenizer merge map entries",
+        )?;
+        for merge in self.merge_rank.keys() {
+            bytes.add_string(merge, "granite tokenizer merge map key")?;
+        }
+        Ok(bytes.finish())
+    }
+
     /// Dev/test constructor: loads `vocab.json` (token -> id) + `merges.txt`
     /// (BPE merge rules, `#version: ...` header line skipped) directly from
     /// an HF source checkout. See module doc for why this is not yet the
@@ -215,6 +264,53 @@ impl GraniteSpeechTokenizer {
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+fn tokenizer_capacity_from_lengths(tokens: &[String], merges: &[String]) -> Result<u64, String> {
+    let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+    bytes.add_usize(
+        tokens
+            .len()
+            .checked_mul(std::mem::size_of::<Option<String>>())
+            .ok_or_else(|| "granite tokenizer id table quote overflowed".to_string())?,
+        "granite tokenizer id table quote",
+    )?;
+    bytes.add_usize(
+        tokens
+            .iter()
+            .try_fold(0usize, |total, token| total.checked_add(token.len()))
+            .ok_or_else(|| "granite tokenizer id strings quote overflowed".to_string())?,
+        "granite tokenizer id strings quote",
+    )?;
+    bytes.add_usize(
+        tokens
+            .len()
+            .checked_mul(std::mem::size_of::<(String, u32)>())
+            .ok_or_else(|| "granite tokenizer token map quote overflowed".to_string())?,
+        "granite tokenizer token map quote",
+    )?;
+    bytes.add_usize(
+        tokens
+            .iter()
+            .try_fold(0usize, |total, token| total.checked_add(token.len()))
+            .ok_or_else(|| "granite tokenizer token keys quote overflowed".to_string())?,
+        "granite tokenizer token keys quote",
+    )?;
+    bytes.add_usize(
+        merges
+            .len()
+            .checked_mul(std::mem::size_of::<(String, usize)>())
+            .ok_or_else(|| "granite tokenizer merge map quote overflowed".to_string())?,
+        "granite tokenizer merge map quote",
+    )?;
+    bytes.add_usize(
+        merges
+            .iter()
+            .try_fold(0usize, |total, merge| total.checked_add(merge.len()))
+            .ok_or_else(|| "granite tokenizer merge keys quote overflowed".to_string())?,
+        "granite tokenizer merge keys quote",
+    )?;
+    Ok(bytes.finish())
 }
 
 #[cfg(test)]

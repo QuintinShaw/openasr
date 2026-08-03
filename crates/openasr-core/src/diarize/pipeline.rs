@@ -36,22 +36,6 @@ pub struct DiarizationRegion {
 /// Resolve speech regions plus optional pyannote local-speaker metadata for
 /// context-aware clustering.
 pub fn resolve_diarization_regions(samples: &[f32]) -> Option<Vec<DiarizationRegion>> {
-    if let Some(segmenter) = super::segment::shared_segmenter() {
-        let turns = segmenter.segment(samples, 16_000).unwrap_or_default();
-        if !turns.is_empty() {
-            return Some(
-                turns
-                    .iter()
-                    .map(|turn| DiarizationRegion {
-                        range: turn.range,
-                        local_speaker: Some(turn.speaker),
-                        overlap: turn.overlap,
-                    })
-                    .collect(),
-            );
-        }
-    }
-
     use crate::longform::LongFormVadProvider;
     let vad = super::vad::FireRedStreamVadProvider::shared()?;
     let options = crate::LongFormOptions::default();

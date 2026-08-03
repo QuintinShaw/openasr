@@ -5,28 +5,42 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, CString, c_int, c_void},
     marker::PhantomData,
     path::Path,
     ptr::{self, NonNull},
     rc::{Rc, Weak},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use memmap2::Mmap;
 use thiserror::Error;
 
+use super::backend_memory::{BackendMemoryAbi, BackendMemoryAbiError, SchedulerMemoryPlan};
+use super::backend_memory_admission::{
+    NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeMemoryAdmissionError,
+    NativeMemoryAdmissionPlan, NativeMemoryAllocation, NativeMemoryAllocationError,
+    NativeMemoryClaimSemantics, NativeOwnerAttachedMemoryError, NativeOwnerAttachedMemoryLease,
+    NativeQuotedBackendGroup, NativeRequestClass,
+};
 use super::ffi;
 use super::{
     GgmlBackendKind, GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader,
     GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
-use crate::device::execution_route::{
-    ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
-    ResolvedExecutionRoute, enumerate_compute_devices_from_ggml,
-    ranked_preferred_accelerated_devices, resolve_execution_route,
+use crate::device::execution_policy::ExecutionCandidateFailure;
+use crate::device::{
+    execution_memory::{AllocationLifetime, MemoryPlanningError, PhaseSet, PhysicalDeviceKey},
+    execution_route::{
+        ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
+        ResolvedExecutionRoute, enumerate_compute_devices_from_ggml,
+        ranked_preferred_accelerated_devices, resolve_execution_route,
+    },
 };
 
 const F32_WIDTH_BYTES: usize = std::mem::size_of::<f32>();
@@ -34,6 +48,16 @@ const F16_WIDTH_BYTES: usize = std::mem::size_of::<u16>();
 const I32_WIDTH_BYTES: usize = std::mem::size_of::<i32>();
 const DEFAULT_CONTEXT_BYTES: usize = 1024 * 1024;
 const DEFAULT_GRAPH_SIZE: usize = 4096;
+
+unsafe extern "C" {
+    #[link_name = "ggml_backend_buft_get_max_size"]
+    fn openasr_ggml_backend_buft_get_max_size(buft: ffi::GgmlBackendBufferTypeRaw) -> usize;
+    #[link_name = "ggml_backend_buft_get_alloc_size"]
+    fn openasr_ggml_backend_buft_get_alloc_size(
+        buft: ffi::GgmlBackendBufferTypeRaw,
+        tensor: ffi::GgmlTensorRaw,
+    ) -> usize;
+}
 
 /// `head_dim` (q/k/v ne0) values the Metal `GGML_OP_FLASH_ATTN_EXT` support
 /// check accepts, mirrored from `ggml-metal-device.m`'s
@@ -960,6 +984,11 @@ pub enum GgmlCpuGraphError {
     GpuBackendUnavailable { actual_backend: String },
     #[error(transparent)]
     ExecutionRoute(#[from] ExecutionRouteError),
+    #[error("native physical-memory admission failed during {operation}: {reason}")]
+    MemoryAdmission {
+        operation: &'static str,
+        reason: String,
+    },
     #[error("ggml cpu graph only supports add in this version, got {operation:?}")]
     UnsupportedOperation { operation: GgmlCpuBinaryOp },
     #[error("ggml cpu graph input tensors are unsupported: {reason}")]
@@ -1024,6 +1053,8 @@ pub enum GgmlCpuGraphError {
     GraphSessionPoisoned,
     #[error("ggml cpu graph backend scheduler initialization failed")]
     BackendSchedulerInitFailed,
+    #[error("ggml cpu graph backend scheduler is poisoned after an incomplete allocation commit")]
+    BackendSchedulerPoisoned,
     #[error("ggml backend returned an invalid graph cancellation mode: mode={mode}")]
     GraphCancellationContractFailed { mode: i32 },
     #[error("ggml cpu graph backend scheduler graph allocation failed")]
@@ -1193,6 +1224,7 @@ pub(crate) struct GgmlLoadedWeightContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LoadedWeightContextCacheKey {
+    execution_scope_id: Option<crate::models::native_execution_services::NativeExecutionScopeId>,
     runtime_mapping_address: usize,
     backend_address: usize,
 }
@@ -1244,6 +1276,8 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     backend: NonNull<c_void>,
     backend_kind: GgmlCpuGraphBackend,
     scheduler: Option<NonNull<c_void>>,
+    scheduler_memory_owner: Option<GgmlSchedulerMemoryOwner>,
+    backend_private_memory_owner: GgmlBackendPrivateLeaseOwner,
     graph_size: usize,
     buffer: Option<GgmlBackendBufferGuard>,
     /// `Some` only for plain `start_graph()` builders on the CPU backend with
@@ -1265,6 +1299,11 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     /// its owner must drop it and rebuild a fresh session. Backend handles are
     /// deliberately unaffected because they do not own those model tensors.
     poisoned_after_failed_compute: bool,
+    /// A direct Vulkan/CUDA graph holds a provisional domain-exclusive gate
+    /// from immediately before first compute until post-compute stats can price
+    /// the backend pool high water. Fixed-shape persistent graphs need this once.
+    direct_graph_private_prepared: bool,
+    direct_graph_private_pending: Vec<NativeBackendPrivateMemoryLease>,
     _runner_borrow: PhantomData<&'a mut GgmlCpuGraphRunner>,
 }
 
@@ -1339,25 +1378,41 @@ impl GgmlCpuGraphRunner {
         }
         let scheduler = if config.use_scheduler {
             let mut backends = Vec::new();
+            let mut backend_private_leases = BTreeMap::new();
             if matches!(
                 config.backend,
                 GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu
             ) {
                 backends.push(backend.raw.as_ptr());
+                backend_private_leases.insert(
+                    backend.raw.as_ptr() as usize,
+                    Rc::clone(&backend.private_memory_leases),
+                );
             }
-            backends.extend(
-                scheduler_accel_backends
-                    .iter()
-                    .map(|accel| accel.raw.as_ptr()),
-            );
+            for accel in &scheduler_accel_backends {
+                backends.push(accel.raw.as_ptr());
+                backend_private_leases.insert(
+                    accel.raw.as_ptr() as usize,
+                    Rc::clone(&accel.private_memory_leases),
+                );
+            }
             if matches!(config.backend, GgmlCpuGraphBackend::Cpu) {
                 backends.push(backend.raw.as_ptr());
+                backend_private_leases.insert(
+                    backend.raw.as_ptr() as usize,
+                    Rc::clone(&backend.private_memory_leases),
+                );
             }
             if let Some(cpu) = scheduler_cpu_fallback.as_ref() {
                 backends.push(cpu.raw.as_ptr());
+                backend_private_leases.insert(
+                    cpu.raw.as_ptr() as usize,
+                    Rc::clone(&cpu.private_memory_leases),
+                );
             }
             Some(GgmlBackendSchedulerGuard::new(
                 &mut backends,
+                backend_private_leases,
                 config.graph_size,
             )?)
         } else {
@@ -1428,6 +1483,8 @@ impl GgmlCpuGraphRunner {
         let require_direct_backend_matmul_support =
             self.backend_kind.is_gpu_class() && self.scheduler.is_none();
         let cache_key = LoadedWeightContextCacheKey {
+            execution_scope_id:
+                crate::models::native_execution_services::current_native_execution_scope_id(),
             runtime_mapping_address: source.backing_mmap_identity(),
             backend_address: self.backend.raw.as_ptr() as usize,
         };
@@ -1463,6 +1520,10 @@ impl GgmlCpuGraphRunner {
     pub(crate) fn start_graph(&mut self) -> GgmlCpuGraphBuilder<'_> {
         unsafe { ffi::ggml_reset(self.context.raw.as_ptr()) };
         let scheduler = self.scheduler.as_ref().map(|scheduler| scheduler.raw);
+        let scheduler_memory_owner = self
+            .scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.memory_owner.clone());
         // Grow-to-fit CPU step buffer only applies to the plain per-token
         // rebuild path (no scheduler); Metal/GPU already get the equivalent
         // behavior from the scheduler's own `ggml_gallocr`.
@@ -1474,6 +1535,8 @@ impl GgmlCpuGraphRunner {
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             scheduler,
+            scheduler_memory_owner,
+            backend_private_memory_owner: Rc::clone(&self.backend.private_memory_leases),
             graph_size: self.graph_size,
             buffer: None,
             step_buffer_pool,
@@ -1481,6 +1544,8 @@ impl GgmlCpuGraphRunner {
             prepared_graph: None,
             side_effect_roots: Vec::new(),
             poisoned_after_failed_compute: false,
+            direct_graph_private_prepared: false,
+            direct_graph_private_pending: Vec::new(),
             _runner_borrow: PhantomData,
         }
     }
@@ -1532,6 +1597,11 @@ impl GgmlCpuGraphRunner {
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             scheduler: self.scheduler.as_ref().map(|scheduler| scheduler.raw),
+            scheduler_memory_owner: self
+                .scheduler
+                .as_ref()
+                .map(|scheduler| scheduler.memory_owner.clone()),
+            backend_private_memory_owner: Rc::clone(&self.backend.private_memory_leases),
             graph_size: self.graph_size,
             buffer: None,
             // A persistent session already allocates its buffer once (via
@@ -1542,6 +1612,8 @@ impl GgmlCpuGraphRunner {
             prepared_graph: None,
             side_effect_roots: Vec::new(),
             poisoned_after_failed_compute: false,
+            direct_graph_private_prepared: false,
+            direct_graph_private_pending: Vec::new(),
             _runner_borrow: PhantomData,
         };
         Ok(GgmlPersistentGraphSession {
@@ -1591,6 +1663,15 @@ impl GgmlCpuGraphRunner {
         graph.set_f32_slice(lhs_tensor, lhs, "lhs")?;
         graph.set_f32_slice(rhs_tensor, rhs, "rhs")?;
         graph.compute_output_f32(output_tensor, lhs.len())
+    }
+}
+
+impl Drop for GgmlCpuGraphRunner {
+    fn drop(&mut self) {
+        // The scheduler references every backend passed to its constructor and
+        // owns its gallocr buffers. Destroy it (which also releases its
+        // owner-attached broker leases) before Rust drops any backend guard.
+        drop(self.scheduler.take());
     }
 }
 
@@ -1661,7 +1742,7 @@ impl GgmlLoadedWeightContext {
         let (buffer, mmap) = match maybe_allocate_weight_buffer_from_host_ptr(backend, &reader)? {
             Some((buffer, mmap)) => (buffer, Some(mmap)),
             None => (
-                GgmlBackendBufferGuard::allocate(context.raw, backend)?,
+                GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
                 None,
             ),
         };
@@ -1680,7 +1761,7 @@ impl GgmlLoadedWeightContext {
             if let Some(mmap) = mmap.as_ref() {
                 let addr = unsafe { mmap.as_ptr().add(payload.start).cast_mut().cast::<c_void>() };
                 let status = unsafe {
-                    ffi::ggml_backend_tensor_alloc(buffer.raw.as_ptr(), raw.as_ptr(), addr)
+                    ffi::ggml_backend_tensor_alloc(buffer.raw().as_ptr(), raw.as_ptr(), addr)
                 };
                 if status != ffi::GGML_STATUS_SUCCESS {
                     return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
@@ -4240,13 +4321,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             return Ok(());
         }
         let graph = self.build_forward_graph(outputs)?;
-        if let Some(scheduler) = self.scheduler {
-            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
-            let allocated =
-                unsafe { ffi::ggml_backend_sched_alloc_graph(scheduler.as_ptr(), graph.as_ptr()) };
-            if !allocated {
-                return Err(GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed);
-            }
+        if self.scheduler.is_some() {
+            self.allocate_scheduler_graph(graph)?;
         } else {
             self.ensure_backend_buffer()?;
         }
@@ -4265,13 +4341,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             });
         }
         let graph = self.build_forward_graph(&[])?;
-        if let Some(scheduler) = self.scheduler {
-            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
-            let allocated =
-                unsafe { ffi::ggml_backend_sched_alloc_graph(scheduler.as_ptr(), graph.as_ptr()) };
-            if !allocated {
-                return Err(GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed);
-            }
+        if self.scheduler.is_some() {
+            self.allocate_scheduler_graph(graph)?;
         } else {
             self.ensure_backend_buffer()?;
         }
@@ -4285,16 +4356,449 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     /// next compute.
     pub(crate) fn restore_prepared_graph_allocation(&mut self) -> Result<(), GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
-        let (Some(scheduler), Some(graph)) = (self.scheduler, self.prepared_graph) else {
+        let (Some(_scheduler), Some(graph)) = (self.scheduler, self.prepared_graph) else {
             return Ok(());
         };
-        unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
-        let allocated =
-            unsafe { ffi::ggml_backend_sched_alloc_graph(scheduler.as_ptr(), graph.as_ptr()) };
-        if !allocated {
-            return Err(GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed);
+        self.allocate_scheduler_graph(graph)
+    }
+
+    /// Allocates one scheduler graph through ggml's frozen measurement plan.
+    /// GRAPH_PRIVATE high-water memory is admitted first and attached to all
+    /// backend owners it spans. Scheduler BUFFER/TRANSFER memory is then
+    /// re-quoted against fresh post-private stats and committed atomically with
+    /// the native plan. No production path may fall through to ggml's implicit
+    /// `sched_alloc_graph` without the process broker.
+    fn allocate_scheduler_graph(
+        &mut self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
+        let scheduler = self
+            .scheduler
+            .expect("scheduler graph allocation requires a scheduler");
+        let memory_owner = self
+            .scheduler_memory_owner
+            .clone()
+            .expect("scheduler raw pointer and memory owner are installed together");
+
+        let plan = match unsafe { SchedulerMemoryPlan::create(scheduler.as_ptr(), graph.as_ptr()) }
+        {
+            Ok(plan) => plan,
+            Err(source) => {
+                return Err(self.scheduler_plan_error("scheduler-plan/create", source, false));
+            }
+        };
+        let batches = plan.requests_by_backend().map_err(|source| {
+            memory_admission_failure("scheduler-plan/describe", source.to_string())
+        })?;
+        if let Some(request) = batches
+            .iter()
+            .flat_map(|(_, requests)| requests)
+            .find(|request| {
+                !matches!(
+                    request.kind,
+                    ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER
+                        | ffi::GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE
+                        | ffi::GGML_BACKEND_MEMORY_REQUEST_TRANSFER
+                )
+            })
+        {
+            return Err(memory_admission_failure(
+                "scheduler-plan/describe",
+                format!("unsupported scheduler memory request kind {}", request.kind),
+            ));
+        }
+
+        let Some(broker) =
+            crate::models::native_execution_services::current_native_execution_memory_broker()
+        else {
+            #[cfg(test)]
+            {
+                return plan.commit().map_err(|source| {
+                    self.scheduler_plan_error("scheduler-plan/test-direct-commit", source, true)
+                });
+            }
+            #[cfg(not(test))]
+            {
+                return Err(memory_admission_failure(
+                    "scheduler-plan/broker",
+                    "process-wide native execution memory broker is not installed",
+                ));
+            }
+        };
+        let private_batches = filter_scheduler_request_batches(
+            &batches,
+            ffi::GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE,
+        );
+        let engine_batches = filter_scheduler_engine_request_batches(&batches);
+        let mut private_owners = Vec::with_capacity(private_batches.len());
+        for (backend, _) in &private_batches {
+            let owner = memory_owner
+                .backend_private_leases
+                .get(&(*backend as usize))
+                .cloned()
+                .ok_or_else(|| {
+                    memory_admission_failure(
+                        "scheduler-private/owner",
+                        format!(
+                            "scheduler plan named unknown backend owner 0x{:x}",
+                            *backend as usize
+                        ),
+                    )
+                })?;
+            if !private_owners
+                .iter()
+                .any(|existing: &GgmlBackendPrivateLeaseOwner| Rc::ptr_eq(existing, &owner))
+            {
+                private_owners.push(owner);
+            }
+        }
+
+        // Quote both ownership classes before any native mutation, then admit
+        // their combined physical-domain footprint once. The broker returns
+        // separate child batches so backend-private and scheduler-owned bytes
+        // retain their true owner lifetimes without a check-then-act gap.
+        let mut partition_kinds = Vec::new();
+        let mut partition_plans = Vec::new();
+        if !private_batches.is_empty() {
+            partition_kinds.push(NativeRequestClass::BackendPrivate);
+            partition_plans.push(
+                NativeMemoryAdmissionPlan::from_groups(quote_scheduler_groups(
+                    "scheduler-private",
+                    &private_batches,
+                )?)
+                .map_err(|source| memory_admission_error("scheduler-private", source))?,
+            );
+        }
+        if !engine_batches.is_empty() {
+            partition_kinds.push(NativeRequestClass::EngineOwned);
+            partition_plans.push(
+                NativeMemoryAdmissionPlan::from_groups(quote_scheduler_groups(
+                    "scheduler-engine",
+                    &engine_batches,
+                )?)
+                .map_err(|source| memory_admission_error("scheduler-engine", source))?,
+            );
+        }
+        let cohort_id =
+            crate::models::native_execution_services::current_memory_reservation_cohort_id();
+        let transactions =
+            NativeMemoryAdmissionPlan::try_reserve_partitioned(partition_plans, &broker, cohort_id)
+                .map_err(|source| memory_admission_error("scheduler-candidate", source))?;
+        let mut private_transaction = None;
+        let mut engine_transaction = None;
+        for (kind, transaction) in partition_kinds.into_iter().zip(transactions) {
+            match kind {
+                NativeRequestClass::BackendPrivate => private_transaction = Some(transaction),
+                NativeRequestClass::EngineOwned => engine_transaction = Some(transaction),
+            }
+        }
+
+        // Both child capacities are already reserved, so backend-private native
+        // reserve may now establish exact CPU workspace (or validate a deferred
+        // Vulkan/CUDA provisional gate) without risking a later engine admission
+        // failure. Its owner lease is attached before any subsequent mutation.
+        let mut private_lease = None;
+        if let Some(transaction) = private_transaction {
+            let provisional = transaction.requires_reconciliation();
+            let lease = match transaction.reserve_backend_private_deferred() {
+                Ok(lease) => lease,
+                Err(NativeBackendPrivateMemoryError::PrivateReserve {
+                    source,
+                    quarantined,
+                    ..
+                }) => {
+                    return Err(self.scheduler_plan_error(
+                        "scheduler-private/reserve",
+                        source,
+                        quarantined,
+                    ));
+                }
+                Err(source) => {
+                    return Err(memory_admission_failure(
+                        "scheduler-private/reserve",
+                        source.to_string(),
+                    ));
+                }
+            };
+            for owner in &private_owners {
+                owner.borrow_mut().push(lease.clone());
+            }
+            if provisional {
+                // Preserve any private growth performed by the transactional
+                // hook before the scheduler sibling changes the same device
+                // counters. Current Vulkan/CUDA hooks are validation-only,
+                // but this keeps the ABI contract correct for future providers.
+                if let Err(source) = lease.checkpoint_private_growth() {
+                    self.poison_scheduler_after_allocation_commit();
+                    return Err(memory_admission_failure(
+                        "scheduler-private/checkpoint",
+                        source.to_string(),
+                    ));
+                }
+            } else if let Err(source) = lease.finalize_pending() {
+                // `reserve_private` has already mutated backend-owned
+                // high-water state. A failed exact reconciliation is
+                // quarantined by the lease and this scheduler must never
+                // be reused as though that mutation did not happen.
+                self.poison_scheduler_after_allocation_commit();
+                return Err(memory_admission_failure(
+                    "scheduler-private/commit",
+                    source.to_string(),
+                ));
+            }
+            private_lease = Some(lease);
+        }
+
+        // Exact CPU private reserve changes the backend generation. Refresh the
+        // engine quote token after that mutation, but prove its new byte shape
+        // still fits the already-admitted engine child before native commit.
+        let mut engine_native_started = false;
+        let engine_commit = if let Some(transaction) = engine_transaction {
+            let fresh_transaction = NativeMemoryAdmissionPlan::from_groups(quote_scheduler_groups(
+                "scheduler-engine-refresh",
+                &engine_batches,
+            )?)
+            .and_then(|fresh| transaction.rebind_fresh_plan(fresh));
+            match fresh_transaction {
+                Ok(transaction) => match transaction.commit_owner_attached_with(|| {
+                    engine_native_started = true;
+                    plan.commit()
+                }) {
+                    Ok(lease) => {
+                        memory_owner
+                            .scheduler_leases
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(lease);
+                        Ok(())
+                    }
+                    Err(NativeOwnerAttachedMemoryError::NativeCommit { source }) => {
+                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, true))
+                    }
+                    Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
+                        self.poison_scheduler_after_allocation_commit();
+                        Err(memory_admission_error("scheduler-engine/reconcile", source))
+                    }
+                    Err(NativeOwnerAttachedMemoryError::BrokerCommit { source }) => {
+                        self.poison_scheduler_after_allocation_commit();
+                        Err(memory_admission_error(
+                            "scheduler-engine/reconcile",
+                            NativeMemoryAdmissionError::Planning(source),
+                        ))
+                    }
+                    Err(NativeOwnerAttachedMemoryError::PrivateReserve {
+                        source,
+                        quarantined,
+                        ..
+                    }) => Err(self.scheduler_plan_error(
+                        "scheduler-engine/validate",
+                        source,
+                        quarantined,
+                    )),
+                    Err(error) => Err(memory_admission_failure(
+                        "scheduler-engine/validate",
+                        error.to_string(),
+                    )),
+                },
+                Err(source) => Err(memory_admission_error("scheduler-engine/refresh", source)),
+            }
+        } else {
+            plan.commit()
+                .map_err(|source| self.scheduler_plan_error("scheduler-plan/commit", source, true))
+        };
+
+        if let Err(error) = engine_commit {
+            // A provisional provider has not computed yet, but its gate must not
+            // remain pinned in a cached backend after scheduler commit fails.
+            // Before native scheduler mutation, live private evidence can close
+            // it. Once mutation starts, quarantine both ownership children:
+            // their deltas can no longer be separated safely.
+            if let Some(lease) = &private_lease
+                && lease.is_pending()
+            {
+                if engine_native_started {
+                    // The enclosing scheduler may retain a partial arena and
+                    // its engine child is already quarantined. Do not relabel
+                    // that sibling growth as private or refund the private gate.
+                    lease.quarantine();
+                    self.poison_scheduler_after_allocation_commit();
+                } else if lease.finalize_pending().is_err() {
+                    self.poison_scheduler_after_allocation_commit();
+                }
+            }
+            return Err(error);
+        }
+        if let Some(lease) = &private_lease
+            && lease.is_pending()
+            && let Err(source) = lease.rebase_after_sibling_allocation()
+        {
+            self.poison_scheduler_after_allocation_commit();
+            return Err(memory_admission_failure(
+                "scheduler-private/sibling-rebase",
+                source.to_string(),
+            ));
         }
         Ok(())
+    }
+
+    fn scheduler_plan_error(
+        &mut self,
+        operation: &'static str,
+        source: BackendMemoryAbiError,
+        commit_started: bool,
+    ) -> GgmlCpuGraphError {
+        if commit_started {
+            self.poison_scheduler_after_allocation_commit();
+        }
+        match source {
+            BackendMemoryAbiError::Status { status, .. }
+                if status == ffi::GGML_STATUS_DEVICE_LOST
+                    || status == ffi::GGML_STATUS_BACKEND_POISONED =>
+            {
+                self.poison_scheduler_after_allocation_commit();
+                record_device_lost(operation, format!("ggml status {status}"));
+                if status == ffi::GGML_STATUS_DEVICE_LOST {
+                    GgmlCpuGraphError::DeviceLost
+                } else {
+                    GgmlCpuGraphError::BackendPoisoned
+                }
+            }
+            BackendMemoryAbiError::Status { status, .. }
+                if status == ffi::GGML_STATUS_ALLOC_FAILED =>
+            {
+                record_capacity_failure(operation, format!("ggml status {status}"));
+                GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed
+            }
+            source => memory_admission_failure(operation, source.to_string()),
+        }
+    }
+
+    fn poison_scheduler_after_allocation_commit(&mut self) {
+        self.poisoned_after_failed_compute = true;
+        if let Some(owner) = &self.scheduler_memory_owner {
+            owner.poisoned.store(true, Ordering::Release);
+        }
+    }
+
+    /// Preserve ggml's cancellation ordering: a request canceled before its
+    /// first compute must not grow scheduler/backend high-water memory merely
+    /// to discover the already-set flag inside the native compute call.
+    fn allocate_scheduler_graph_for_compute(
+        &mut self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
+        }
+        self.allocate_scheduler_graph(graph)
+    }
+
+    fn prepare_direct_graph_private_gate(
+        &mut self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if self.scheduler.is_some()
+            || !self.backend_kind.is_gpu_class()
+            || self.direct_graph_private_prepared
+        {
+            return Ok(());
+        }
+        let Some(broker) =
+            crate::models::native_execution_services::current_native_execution_memory_broker()
+        else {
+            #[cfg(test)]
+            {
+                self.direct_graph_private_prepared = true;
+                return Ok(());
+            }
+            #[cfg(not(test))]
+            {
+                return Err(memory_admission_failure(
+                    "direct-graph-private/broker",
+                    "process-wide native execution memory broker is not installed",
+                ));
+            }
+        };
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE,
+            request_id: 1,
+            backend: self.backend.as_ptr(),
+            graph: graph.as_ptr(),
+            ..Default::default()
+        };
+        let semantics = NativeMemoryClaimSemantics {
+            resource_id: "direct-graph-private-request-1".to_owned(),
+            lifetime: AllocationLifetime::RunnerRetainedHighWater,
+            phases: PhaseSet::ALL,
+        };
+        let abi = unsafe { BackendMemoryAbi::from_backend(self.backend.as_ptr()) }
+            .map_err(|source| memory_admission_error("direct-graph-private/abi", source.into()))?;
+        let group = NativeQuotedBackendGroup::quote(
+            "direct-graph-private",
+            backend_memory_identity(self.backend)?,
+            abi,
+            vec![request],
+            BTreeMap::from([(1, semantics.clone())]),
+            semantics,
+        )
+        .map_err(|source| memory_admission_error("direct-graph-private/quote", source))?;
+        let transaction = NativeMemoryAdmissionPlan::from_groups(vec![group])
+            .and_then(|plan| {
+                plan.try_reserve(
+                    &broker,
+                    crate::models::native_execution_services::current_memory_reservation_cohort_id(
+                    ),
+                )
+            })
+            .map_err(|source| memory_admission_error("direct-graph-private/admit", source))?;
+        let provisional = transaction.requires_reconciliation();
+        let lease = match transaction.reserve_backend_private_deferred() {
+            Ok(lease) => lease,
+            Err(NativeBackendPrivateMemoryError::PrivateReserve {
+                source,
+                quarantined,
+                ..
+            }) => {
+                return Err(self.scheduler_plan_error(
+                    "direct-graph-private/reserve",
+                    source,
+                    quarantined,
+                ));
+            }
+            Err(source) => {
+                return Err(memory_admission_failure(
+                    "direct-graph-private/reserve",
+                    source.to_string(),
+                ));
+            }
+        };
+        self.backend_private_memory_owner
+            .borrow_mut()
+            .push(lease.clone());
+        if provisional {
+            self.direct_graph_private_pending.push(lease);
+        } else if let Err(source) = lease.finalize_pending() {
+            self.poison_scheduler_after_allocation_commit();
+            return Err(memory_admission_failure(
+                "direct-graph-private/commit",
+                source.to_string(),
+            ));
+        }
+        self.direct_graph_private_prepared = true;
+        Ok(())
+    }
+
+    fn compute_graph_with_memory_gate(
+        &mut self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
+        }
+        self.prepare_direct_graph_private_gate(graph)?;
+        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
+        self.finish_compute_result(compute)
     }
 
     pub(crate) fn set_f16_bits_slice(
@@ -4422,13 +4926,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.build_forward_graph(&output_tensors)?
         };
 
-        if let Some(scheduler) = self.scheduler
-            && !graph_prepared
-        {
-            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
         }
-        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
-        self.finish_compute_result(compute)?;
+        self.compute_graph_with_memory_gate(graph)?;
 
         let mut results = Vec::with_capacity(outputs.len());
         for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
@@ -4445,6 +4946,70 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             results.push(values);
         }
         Ok(results)
+    }
+
+    /// Computes one graph and reads each f32 output directly into storage
+    /// admitted and allocated by the caller. This path never creates a
+    /// per-output payload `Vec`; it is intended for large decoder-state taps
+    /// whose host owner must exist before backend graph admission begins.
+    ///
+    /// Every tensor/target shape is validated before native compute. No target
+    /// is touched unless that one compute returns success, preserving the same
+    /// zero-readback-on-terminal-failure contract as `compute_outputs_f32`.
+    pub(crate) fn compute_outputs_into_f32(
+        &mut self,
+        outputs: &mut [(GgmlCpuTensor<'a>, &mut [f32])],
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
+        if outputs.is_empty() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "at least one output tensor is required",
+            });
+        }
+        for (output, target) in outputs.iter() {
+            self.ensure_tensor_type(
+                *output,
+                ffi::GGML_TYPE_F32,
+                "compute_outputs_into_f32 output",
+            )?;
+            let expected_nbytes = target.len().checked_mul(F32_WIDTH_BYTES).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "tensor byte width overflow",
+                },
+            )?;
+            let actual_nbytes = self.tensor_nbytes(*output);
+            if actual_nbytes != expected_nbytes {
+                return Err(GgmlCpuGraphError::OutputByteSizeMismatch {
+                    expected: expected_nbytes,
+                    actual: actual_nbytes,
+                });
+            }
+        }
+
+        let graph_prepared = self.prepared_graph.is_some();
+        let graph = if let Some(graph) = self.prepared_graph {
+            graph
+        } else {
+            self.ensure_backend_buffer()?;
+            self.build_forward_graph_iter(outputs.iter().map(|(output, _)| *output))?
+        };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
+        }
+        self.compute_graph_with_memory_gate(graph)?;
+
+        for (output, target) in outputs.iter_mut() {
+            let status = unsafe {
+                read_tensor_bytes(
+                    output.raw.as_ptr(),
+                    target.as_mut_ptr().cast::<c_void>(),
+                    0,
+                    target.len() * F32_WIDTH_BYTES,
+                )
+            };
+            map_compute_status(status)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn compute_outputs_f32_i32(
@@ -4514,13 +5079,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.build_forward_graph(&output_tensors)?
         };
 
-        if let Some(scheduler) = self.scheduler
-            && !graph_prepared
-        {
-            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
         }
-        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
-        self.finish_compute_result(compute)?;
+        self.compute_graph_with_memory_gate(graph)?;
 
         let mut f32_results = Vec::with_capacity(f32_outputs.len());
         for ((output, expected_len), output_nbytes) in f32_outputs.iter().zip(f32_output_nbytes) {
@@ -4570,13 +5132,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.build_forward_graph(&[])?
         };
 
-        if let Some(scheduler) = self.scheduler
-            && !graph_prepared
-        {
-            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
         }
-        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
-        self.finish_compute_result(compute)?;
+        self.compute_graph_with_memory_gate(graph)?;
         Ok(())
     }
 
@@ -4613,13 +5172,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             graph
         };
 
-        if let Some(scheduler) = self.scheduler
-            && !graph_prepared
-        {
-            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
         }
-        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
-        self.finish_compute_result(compute)?;
+        self.compute_graph_with_memory_gate(graph)?;
 
         let mut values = vec![0_i32; expected_len];
         let status = unsafe {
@@ -4652,7 +5208,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn ensure_not_poisoned(&self) -> Result<(), GgmlCpuGraphError> {
-        if self.poisoned_after_failed_compute {
+        if self
+            .scheduler_memory_owner
+            .as_ref()
+            .is_some_and(|owner| owner.poisoned.load(Ordering::Acquire))
+        {
+            Err(GgmlCpuGraphError::BackendSchedulerPoisoned)
+        } else if self.poisoned_after_failed_compute {
             Err(GgmlCpuGraphError::GraphSessionPoisoned)
         } else {
             Ok(())
@@ -4672,21 +5234,60 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         result: Result<c_int, GgmlCpuGraphError>,
     ) -> Result<(), GgmlCpuGraphError> {
+        // Vulkan/CUDA graph-private pools can first grow while encoding the
+        // first compute. Their provisional physical-domain gate deliberately
+        // survives scheduler allocation and is reconciled only now. On a
+        // failed compute the same call either accounts the observed high water
+        // or quarantines it; the gate is never silently refunded.
+        let mut private_finalize_error = self
+            .scheduler_memory_owner
+            .as_ref()
+            .and_then(|owner| owner.finalize_pending_backend_private_leases().err());
+        for lease in std::mem::take(&mut self.direct_graph_private_pending) {
+            if let Err(source) = lease.finalize_pending()
+                && private_finalize_error.is_none()
+            {
+                private_finalize_error = Some(source);
+            }
+        }
         match result {
-            Ok(status) if status == ffi::GGML_STATUS_SUCCESS => Ok(()),
+            Ok(status) if status == ffi::GGML_STATUS_SUCCESS => {
+                if let Some(source) = private_finalize_error {
+                    self.poison_scheduler_after_allocation_commit();
+                    Err(memory_admission_failure(
+                        "scheduler-private/first-compute-reconcile",
+                        source.to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             Ok(status) => {
                 self.poisoned_after_failed_compute = true;
+                if private_finalize_error.is_some()
+                    && let Some(owner) = &self.scheduler_memory_owner
+                {
+                    owner.poisoned.store(true, Ordering::Release);
+                }
                 let mapped = map_compute_status(status);
                 if matches!(
                     mapped,
                     Err(GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned)
                 ) {
                     mark_backend_poisoned_sticky(self.backend);
+                    if let Some(owner) = &self.scheduler_memory_owner {
+                        owner.poisoned.store(true, Ordering::Release);
+                    }
                 }
                 mapped
             }
             Err(error) => {
                 self.poisoned_after_failed_compute = true;
+                if private_finalize_error.is_some()
+                    && let Some(owner) = &self.scheduler_memory_owner
+                {
+                    owner.poisoned.store(true, Ordering::Release);
+                }
                 Err(error)
             }
         }
@@ -4694,6 +5295,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned_after_failed_compute
+            || self
+                .scheduler_memory_owner
+                .as_ref()
+                .is_some_and(|owner| owner.poisoned.load(Ordering::Acquire))
     }
 
     pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
@@ -4703,6 +5308,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     fn build_forward_graph(
         &self,
         outputs: &[GgmlCpuTensor<'a>],
+    ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
+        self.build_forward_graph_iter(outputs.iter().copied())
+    }
+
+    fn build_forward_graph_iter(
+        &self,
+        outputs: impl IntoIterator<Item = GgmlCpuTensor<'a>>,
     ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
         let graph = self.allocate_forward_graph("ggml_new_graph_custom")?;
         for root in &self.side_effect_roots {
@@ -5550,14 +6162,49 @@ impl Drop for GgufContextGuard {
 struct GgmlBackendGuard {
     raw: NonNull<c_void>,
     free_on_drop: bool,
+    /// Broker leases for backend-private retained high-water allocations.
+    /// Cached GPU handles share this owner with their cache entry; ordinary
+    /// CPU handles own it directly. The native backend is freed before these
+    /// leases drop, so the ledger never refunds bytes ahead of reality.
+    private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
 }
 
 struct GgmlCachedBackendGuard {
     raw: NonNull<c_void>,
+    private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
 }
 
 struct GgmlBackendSchedulerGuard {
     raw: NonNull<c_void>,
+    memory_owner: GgmlSchedulerMemoryOwner,
+}
+
+type GgmlBackendPrivateLeaseOwner = Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>;
+
+/// Shared Rust-side ownership for native allocations retained by a scheduler
+/// or by any backend participating in one scheduler plan. Builders only clone
+/// the Arcs; the scheduler/backend guards remain the actual lifetime owners.
+#[derive(Clone)]
+struct GgmlSchedulerMemoryOwner {
+    backend_private_leases: BTreeMap<usize, GgmlBackendPrivateLeaseOwner>,
+    scheduler_leases: Arc<Mutex<Vec<NativeOwnerAttachedMemoryLease>>>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl GgmlSchedulerMemoryOwner {
+    fn finalize_pending_backend_private_leases(
+        &self,
+    ) -> Result<(), NativeBackendPrivateMemoryError> {
+        for owner in self.backend_private_leases.values() {
+            let leases = owner.borrow().clone();
+            for lease in leases {
+                if lease.is_pending() {
+                    lease.finalize_pending()?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// GPU-class backends are expensive to initialize (device enumeration + driver
@@ -5614,6 +6261,11 @@ fn mark_backend_poisoned_sticky(raw: NonNull<c_void>) {
             .collect();
         for key in stale_keys {
             if let Some(guard) = cache.remove(&key) {
+                let mut leases = guard.private_memory_leases.borrow_mut();
+                for lease in leases.iter_mut() {
+                    lease.quarantine();
+                }
+                drop(leases);
                 std::mem::forget(guard);
             }
         }
@@ -5758,10 +6410,17 @@ impl GgmlBackendGuard {
         let raw = unsafe {
             ffi::ggml_backend_init_by_type(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null())
         };
-        let raw = NonNull::new(raw).ok_or(GgmlCpuGraphError::CpuBackendUnavailable)?;
+        let raw = NonNull::new(raw).ok_or_else(|| {
+            record_device_unavailable(
+                "cpu-backend/init",
+                "CPU backend initialization returned null",
+            );
+            GgmlCpuGraphError::CpuBackendUnavailable
+        })?;
         Ok(Self {
             raw,
             free_on_drop: true,
+            private_memory_leases: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -5810,39 +6469,59 @@ impl GgmlBackendGuard {
         key: CachedBackendKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
-        if let Some(raw) = Self::cached_backend_lookup(&key) {
+        if let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(&key) {
             return Ok(Self {
                 raw,
                 free_on_drop: false,
+                private_memory_leases,
             });
         }
         let raw = init()?;
-        Self::cached_backend_insert(key, raw);
+        let private_memory_leases = Self::cached_backend_insert(key, raw);
         Ok(Self {
             raw,
             free_on_drop: false,
+            private_memory_leases,
         })
     }
 
     /// Defensively re-checks `is_backend_poisoned` on every lookup (not just at
     /// the point of poisoning) so a poisoned handle can never be handed out,
     /// even if some future insert path forgets to consult the poison set.
-    fn cached_backend_lookup(key: &CachedBackendKey) -> Option<NonNull<c_void>> {
-        let raw =
-            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(key).map(|g| g.raw))?;
+    fn cached_backend_lookup(
+        key: &CachedBackendKey,
+    ) -> Option<(
+        NonNull<c_void>,
+        Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+    )> {
+        let (raw, private_memory_leases) = THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
+            cache
+                .borrow()
+                .get(key)
+                .map(|guard| (guard.raw, Rc::clone(&guard.private_memory_leases)))
+        })?;
         if is_backend_poisoned(raw) {
             mark_backend_poisoned_sticky(raw);
             return None;
         }
-        Some(raw)
+        Some((raw, private_memory_leases))
     }
 
-    fn cached_backend_insert(key: CachedBackendKey, raw: NonNull<c_void>) {
+    fn cached_backend_insert(
+        key: CachedBackendKey,
+        raw: NonNull<c_void>,
+    ) -> Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>> {
+        let private_memory_leases = Rc::new(RefCell::new(Vec::new()));
         THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
-            cache
-                .borrow_mut()
-                .insert(key, GgmlCachedBackendGuard { raw })
+            cache.borrow_mut().insert(
+                key,
+                GgmlCachedBackendGuard {
+                    raw,
+                    private_memory_leases: Rc::clone(&private_memory_leases),
+                },
+            )
         });
+        private_memory_leases
     }
 
     /// Preferred/Auto GPU init with Optimus-aware ranked fallthrough.
@@ -5858,6 +6537,7 @@ impl GgmlBackendGuard {
         let inventory = enumerate_compute_devices_from_ggml(&devices);
         let ranked = ranked_preferred_accelerated_devices(&inventory);
         if ranked.is_empty() {
+            record_device_unavailable("gpu-backend/route", "no accelerated device is available");
             return Err(GgmlCpuGraphError::ExecutionRoute(
                 ExecutionRouteError::AcceleratedUnavailable,
             ));
@@ -5867,18 +6547,20 @@ impl GgmlBackendGuard {
         for candidate in ranked {
             let route = candidate.to_resolved_route();
             let key = CachedBackendKey::Route(route.cache_key());
-            if let Some(raw) = Self::cached_backend_lookup(&key) {
+            if let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(&key) {
                 return Ok(Self {
                     raw,
                     free_on_drop: false,
+                    private_memory_leases,
                 });
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
-                    Self::cached_backend_insert(key, raw);
+                    let private_memory_leases = Self::cached_backend_insert(key, raw);
                     return Ok(Self {
                         raw,
                         free_on_drop: false,
+                        private_memory_leases,
                     });
                 }
                 Err(error) => {
@@ -5887,9 +6569,11 @@ impl GgmlBackendGuard {
             }
         }
 
-        Err(last_init_error.unwrap_or(GgmlCpuGraphError::ExecutionRoute(
+        let error = last_init_error.unwrap_or(GgmlCpuGraphError::ExecutionRoute(
             ExecutionRouteError::AcceleratedUnavailable,
-        )))
+        ));
+        record_device_unavailable("gpu-backend/init", error.to_string());
+        Err(error)
     }
 
     fn accelerators(
@@ -5908,6 +6592,7 @@ impl GgmlBackendGuard {
             let mut backend = Self {
                 raw,
                 free_on_drop: true,
+                private_memory_leases: Rc::new(RefCell::new(Vec::new())),
             };
             if let Some(n_threads) = n_threads {
                 let _ = backend.set_n_threads_if_supported(n_threads);
@@ -5924,6 +6609,10 @@ impl GgmlBackendGuard {
     fn init_metal_backend() -> Result<NonNull<c_void>, GgmlCpuGraphError> {
         let raw = unsafe { ffi::ggml_backend_init_best() };
         let Some(raw) = NonNull::new(raw) else {
+            record_device_unavailable(
+                "metal-backend/init",
+                "best backend initialization returned null",
+            );
             return Err(GgmlCpuGraphError::MetalBackendUnavailable {
                 actual_backend: "<none>".to_string(),
             });
@@ -5932,6 +6621,10 @@ impl GgmlBackendGuard {
         let name_lower = name.to_ascii_lowercase();
         if !(name_lower.contains("metal") || name_lower.starts_with("mtl")) {
             unsafe { ffi::ggml_backend_free(raw.as_ptr()) };
+            record_device_unavailable(
+                "metal-backend/init",
+                format!("best backend resolved to {name} instead of Metal"),
+            );
             return Err(GgmlCpuGraphError::MetalBackendUnavailable {
                 actual_backend: name,
             });
@@ -5945,7 +6638,9 @@ impl GgmlBackendGuard {
         route: &ResolvedExecutionRoute,
     ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
         let devices = ggml_available_devices();
-        Self::init_route_gpu_device(&devices, route)
+        Self::init_route_gpu_device(&devices, route).inspect_err(|error| {
+            record_device_unavailable("gpu-backend/exact-init", error.to_string());
+        })
     }
 
     fn init_route_gpu_device(
@@ -5953,24 +6648,26 @@ impl GgmlBackendGuard {
         route: &ResolvedExecutionRoute,
     ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
         let Some(device) = find_ggml_device_for_route(devices, route) else {
-            return Err(GgmlCpuGraphError::ExecutionRoute(
-                ExecutionRouteError::device_not_found(format!(
+            let error =
+                GgmlCpuGraphError::ExecutionRoute(ExecutionRouteError::device_not_found(format!(
                     "provider={} stable_id={} isolation_key={}",
                     route.provider.as_str(),
                     route.stable_id,
                     route.isolation_key()
-                )),
-            ));
+                )));
+            return Err(error);
         };
         match device.initialize() {
             Ok(backend) => Ok(backend.into_raw()),
-            Err(GgmlRuntimeError::BackendUnavailable(name)) => Err(
-                GgmlCpuGraphError::ExecutionRoute(ExecutionRouteError::init_failed(format!(
-                    "provider={} stable_id={} backend={name}",
-                    route.provider.as_str(),
-                    route.stable_id
-                ))),
-            ),
+            Err(GgmlRuntimeError::BackendUnavailable(name)) => {
+                let error =
+                    GgmlCpuGraphError::ExecutionRoute(ExecutionRouteError::init_failed(format!(
+                        "provider={} stable_id={} backend={name}",
+                        route.provider.as_str(),
+                        route.stable_id
+                    )));
+                Err(error)
+            }
         }
     }
 
@@ -6022,11 +6719,20 @@ fn map_compute_status(status: c_int) -> Result<(), GgmlCpuGraphError> {
     match status {
         ffi::GGML_STATUS_SUCCESS => Ok(()),
         ffi::GGML_STATUS_ABORTED => Err(GgmlCpuGraphError::Aborted),
-        ffi::GGML_STATUS_ALLOC_FAILED => Err(GgmlCpuGraphError::AllocationFailed),
+        ffi::GGML_STATUS_ALLOC_FAILED => {
+            record_capacity_failure("ggml-status", "GGML_STATUS_ALLOC_FAILED");
+            Err(GgmlCpuGraphError::AllocationFailed)
+        }
         ffi::GGML_STATUS_FAILED => Err(GgmlCpuGraphError::ComputeFailed { status }),
         ffi::GGML_STATUS_EXECUTION_FAILED => Err(GgmlCpuGraphError::ExecutionFailed),
-        ffi::GGML_STATUS_DEVICE_LOST => Err(GgmlCpuGraphError::DeviceLost),
-        ffi::GGML_STATUS_BACKEND_POISONED => Err(GgmlCpuGraphError::BackendPoisoned),
+        ffi::GGML_STATUS_DEVICE_LOST => {
+            record_device_lost("ggml-status", "GGML_STATUS_DEVICE_LOST");
+            Err(GgmlCpuGraphError::DeviceLost)
+        }
+        ffi::GGML_STATUS_BACKEND_POISONED => {
+            record_device_lost("ggml-status", "GGML_STATUS_BACKEND_POISONED");
+            Err(GgmlCpuGraphError::BackendPoisoned)
+        }
         status => Err(GgmlCpuGraphError::UnknownComputeStatus { status }),
     }
 }
@@ -6082,6 +6788,10 @@ fn ensure_backend_device_present(backend: NonNull<c_void>) -> Result<(), GgmlCpu
     if backend_device_present(backend) {
         Ok(())
     } else {
+        record_device_unavailable(
+            "backend-device",
+            "live backend handle no longer resolves to a device",
+        );
         Err(GgmlCpuGraphError::BackendDeviceUnavailable)
     }
 }
@@ -6107,9 +6817,7 @@ fn bind_ctx_tensors_grow_to_fit(
     ensure_backend_device_present(backend)?;
     let buft = unsafe { ffi::ggml_backend_get_default_buffer_type(backend.as_ptr()) };
     let Some(buft) = NonNull::new(buft) else {
-        return Err(GgmlCpuGraphError::BackendBufferAllocationFailed {
-            backend: backend_name(backend),
-        });
+        return Err(backend_buffer_allocation_failure(backend_name(backend)));
     };
     let required = unsafe {
         ffi::ggml_backend_alloc_ctx_tensors_from_buft_size(context.as_ptr(), buft.as_ptr())
@@ -6124,19 +6832,104 @@ fn bind_ctx_tensors_grow_to_fit(
         // across a session whose required size grows step over step, instead
         // of the O(steps) alloc+free churn this pool replaces.
         let new_capacity = required.max(pool.capacity_bytes.saturating_mul(2));
-        let buffer = GgmlBackendBufferGuard::allocate_sized(buft, new_capacity)?;
+        let buffer = GgmlBackendBufferGuard::allocate_sized(buft, backend, new_capacity)?;
         // ggml may round `new_capacity` up internally (allocator alignment);
         // track what it actually committed so a later step's capacity check
         // never reuses a buffer smaller than ggml believes it allocated.
         pool.capacity_bytes =
-            unsafe { ffi::ggml_backend_buffer_get_size(buffer.raw.as_ptr()) }.max(new_capacity);
+            unsafe { ffi::ggml_backend_buffer_get_size(buffer.raw().as_ptr()) }.max(new_capacity);
         pool.buffer = Some(buffer);
     }
     let buffer = pool
         .buffer
         .as_ref()
         .expect("capacity_bytes > 0 implies buffer is populated");
-    bind_unallocated_context_tensors(context, buffer.raw)
+    bind_unallocated_context_tensors(context, buffer.raw())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContextBufferChunk {
+    requested_bytes: usize,
+    max_tensor_bytes: usize,
+}
+
+/// Pure counterpart of ggml-alloc.c's
+/// `ggml_backend_alloc_ctx_tensors_from_buft_impl` packing loop. A bounded
+/// buffer type (notably Vulkan) allocates one native buffer per chunk, so
+/// quoting only the summed context bytes undercounts createBuffer alignment
+/// and allocation overhead. This returns the exact native chunk boundaries.
+fn pack_context_buffer_chunks(
+    alignment: usize,
+    max_size: usize,
+    tensor_alloc_sizes: impl IntoIterator<Item = usize>,
+) -> Result<Vec<ContextBufferChunk>, GgmlCpuGraphError> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(GgmlCpuGraphError::MemoryAdmission {
+            operation: "context-buffer/measure",
+            reason: format!("backend buffer alignment is invalid: {alignment}"),
+        });
+    }
+    let mut chunks = Vec::new();
+    let mut current_bytes = 0_usize;
+    let mut current_max_tensor = 0_usize;
+    for tensor_bytes in tensor_alloc_sizes {
+        let padded = tensor_bytes
+            .checked_add(alignment - 1)
+            .map(|bytes| bytes & !(alignment - 1))
+            .ok_or(GgmlCpuGraphError::MemoryAdmission {
+                operation: "context-buffer/measure",
+                reason: "aligned tensor allocation size overflowed usize".to_owned(),
+            })?;
+        let combined =
+            current_bytes
+                .checked_add(padded)
+                .ok_or(GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/measure",
+                    reason: "context buffer chunk size overflowed usize".to_owned(),
+                })?;
+        if current_bytes > 0 && combined > max_size {
+            chunks.push(ContextBufferChunk {
+                requested_bytes: current_bytes,
+                max_tensor_bytes: current_max_tensor,
+            });
+            current_bytes = padded;
+            current_max_tensor = tensor_bytes;
+        } else {
+            current_bytes = combined;
+            current_max_tensor = current_max_tensor.max(tensor_bytes);
+        }
+    }
+    if current_bytes > 0 {
+        chunks.push(ContextBufferChunk {
+            requested_bytes: current_bytes,
+            max_tensor_bytes: current_max_tensor,
+        });
+    }
+    Ok(chunks)
+}
+
+fn measure_context_buffer_chunks(
+    context: NonNull<c_void>,
+    buft: NonNull<c_void>,
+) -> Result<Vec<ContextBufferChunk>, GgmlCpuGraphError> {
+    let alignment = unsafe { ffi::ggml_backend_buft_get_alignment(buft.as_ptr()) };
+    let max_size = unsafe { openasr_ggml_backend_buft_get_max_size(buft.as_ptr()) };
+    let mut sizes = Vec::new();
+    let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.as_ptr()) };
+    while let Some(tensor) = NonNull::new(tensor_raw) {
+        let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        if layout.data.is_null() && layout.view_src.is_null() {
+            sizes.push(unsafe {
+                openasr_ggml_backend_buft_get_alloc_size(buft.as_ptr(), tensor.as_ptr())
+            });
+        } else {
+            // ggml keeps already-allocated tensors and views in the range walk
+            // but charges them zero bytes.
+            sizes.push(0);
+        }
+        tensor_raw = unsafe { ffi::ggml_get_next_tensor(context.as_ptr(), tensor.as_ptr()) };
+    }
+    pack_context_buffer_chunks(alignment, max_size, sizes)
 }
 
 /// Walks every tensor in `context` in declaration order and binds the ones
@@ -6171,9 +6964,7 @@ fn bind_unallocated_context_tensors(
             ffi::GGML_STATUS_SUCCESS
         };
         if status != ffi::GGML_STATUS_SUCCESS {
-            return Err(GgmlCpuGraphError::BackendBufferAllocationFailed {
-                backend: "cpu-step-buffer-pool".to_string(),
-            });
+            return Err(backend_buffer_allocation_failure("cpu-step-buffer-pool"));
         }
         tensor_raw = unsafe { ffi::ggml_get_next_tensor(context.as_ptr(), tensor.as_ptr()) };
     }
@@ -6183,6 +6974,214 @@ fn bind_unallocated_context_tensors(
 fn backend_name(backend: NonNull<c_void>) -> String {
     let raw_name = unsafe { ffi::ggml_backend_name(backend.as_ptr()) };
     cstr_lossy(raw_name)
+}
+
+fn filter_scheduler_request_batches(
+    batches: &[(ffi::GgmlBackendRaw, Vec<ffi::GgmlBackendMemoryRequestV1>)],
+    kind: u32,
+) -> Vec<(ffi::GgmlBackendRaw, Vec<ffi::GgmlBackendMemoryRequestV1>)> {
+    batches
+        .iter()
+        .filter_map(|(backend, requests)| {
+            let requests = requests
+                .iter()
+                .copied()
+                .filter(|request| request.kind == kind)
+                .collect::<Vec<_>>();
+            (!requests.is_empty()).then_some((*backend, requests))
+        })
+        .collect()
+}
+
+fn filter_scheduler_engine_request_batches(
+    batches: &[(ffi::GgmlBackendRaw, Vec<ffi::GgmlBackendMemoryRequestV1>)],
+) -> Vec<(ffi::GgmlBackendRaw, Vec<ffi::GgmlBackendMemoryRequestV1>)> {
+    batches
+        .iter()
+        .filter_map(|(backend, requests)| {
+            let requests = requests
+                .iter()
+                .copied()
+                .filter(|request| {
+                    matches!(
+                        request.kind,
+                        ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER
+                            | ffi::GGML_BACKEND_MEMORY_REQUEST_TRANSFER
+                    )
+                })
+                .collect::<Vec<_>>();
+            (!requests.is_empty()).then_some((*backend, requests))
+        })
+        .collect()
+}
+
+fn quote_scheduler_groups(
+    operation: &'static str,
+    batches: &[(ffi::GgmlBackendRaw, Vec<ffi::GgmlBackendMemoryRequestV1>)],
+) -> Result<Vec<NativeQuotedBackendGroup>, GgmlCpuGraphError> {
+    batches
+        .iter()
+        .enumerate()
+        .map(|(index, (backend, requests))| {
+            let backend = NonNull::new(*backend).ok_or_else(|| {
+                memory_admission_failure(operation, "scheduler plan returned a null backend")
+            })?;
+            let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }
+                .map_err(|source| memory_admission_error(operation, source.into()))?;
+            let request_semantics = requests
+                .iter()
+                .map(|request| {
+                    (
+                        request.request_id,
+                        NativeMemoryClaimSemantics {
+                            resource_id: format!(
+                                "{operation}-backend-{index}-request-{}",
+                                request.request_id
+                            ),
+                            lifetime: AllocationLifetime::RunnerRetainedHighWater,
+                            phases: PhaseSet::ALL,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let shared_semantics = NativeMemoryClaimSemantics {
+                resource_id: format!("{operation}-backend-{index}-shared"),
+                lifetime: AllocationLifetime::RunnerRetainedHighWater,
+                phases: PhaseSet::ALL,
+            };
+            NativeQuotedBackendGroup::quote(
+                format!("{operation}-{index}"),
+                backend_memory_identity(backend)?,
+                abi,
+                requests.clone(),
+                request_semantics,
+                shared_semantics,
+            )
+            .map_err(|source| memory_admission_error(operation, source))
+        })
+        .collect()
+}
+
+/// Stable backend identity retained in native quote evidence and diagnostics.
+/// Device-local admission itself never falls back to this provider-local key:
+/// its native domain must expose a canonical physical token or fail closed, so
+/// CUDA/HIP/Vulkan views of one GPU cannot enter separate broker accounts.
+fn backend_memory_identity(
+    backend: NonNull<c_void>,
+) -> Result<PhysicalDeviceKey, GgmlCpuGraphError> {
+    ensure_backend_device_present(backend)?;
+    let device = NonNull::new(unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) })
+        .expect("device presence was checked immediately above");
+    let mut props = ffi::GgmlBackendDevProps {
+        name: ptr::null(),
+        description: ptr::null(),
+        memory_free: 0,
+        memory_total: 0,
+        type_: 0,
+        device_id: ptr::null(),
+        caps: ffi::GgmlBackendDevCaps::default(),
+    };
+    unsafe { ffi::ggml_backend_dev_get_props(device.as_ptr(), &mut props) };
+    let name = cstr_lossy(props.name);
+    let provider = ExecutionProvider::from_backend_name(&name);
+    let stable_id = if props.device_id.is_null() {
+        name.as_str()
+    } else {
+        let value = unsafe { CStr::from_ptr(props.device_id) }.to_string_lossy();
+        if value.trim().is_empty() {
+            name.as_str()
+        } else {
+            return PhysicalDeviceKey::new(format!("{}:{}", provider.as_str(), value.trim()))
+                .map_err(|source| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "backend-identity",
+                    reason: source.to_string(),
+                });
+        }
+    };
+    PhysicalDeviceKey::new(format!("{}:{stable_id}", provider.as_str())).map_err(|source| {
+        GgmlCpuGraphError::MemoryAdmission {
+            operation: "backend-identity",
+            reason: source.to_string(),
+        }
+    })
+}
+
+fn memory_admission_error(
+    operation: &'static str,
+    source: NativeMemoryAdmissionError,
+) -> GgmlCpuGraphError {
+    memory_admission_error_maybe(operation, source, true)
+}
+
+fn memory_admission_error_maybe(
+    operation: &'static str,
+    source: NativeMemoryAdmissionError,
+    record_capacity: bool,
+) -> GgmlCpuGraphError {
+    let reason = source.to_string();
+    let device_lost = matches!(
+        &source,
+        NativeMemoryAdmissionError::Abi(BackendMemoryAbiError::Status { status, .. })
+            if *status == ffi::GGML_STATUS_DEVICE_LOST
+                || *status == ffi::GGML_STATUS_BACKEND_POISONED
+    ) || matches!(
+        &source,
+        NativeMemoryAdmissionError::UnhealthyBackend { health, .. }
+            if *health == ffi::GGML_BACKEND_MEMORY_QUARANTINED
+                || *health == ffi::GGML_BACKEND_MEMORY_DEVICE_LOST
+    ) || matches!(
+        &source,
+        NativeMemoryAdmissionError::Planning(MemoryPlanningError::DeviceQuarantined { .. })
+    );
+    if device_lost {
+        record_device_lost(operation, reason.clone());
+        GgmlCpuGraphError::MemoryAdmission { operation, reason }
+    } else {
+        memory_admission_failure_maybe(operation, reason, record_capacity)
+    }
+}
+
+fn memory_admission_failure(
+    operation: &'static str,
+    reason: impl Into<String>,
+) -> GgmlCpuGraphError {
+    memory_admission_failure_maybe(operation, reason, true)
+}
+
+fn memory_admission_failure_maybe(
+    operation: &'static str,
+    reason: impl Into<String>,
+    record_capacity: bool,
+) -> GgmlCpuGraphError {
+    let reason = reason.into();
+    if record_capacity {
+        record_capacity_failure(operation, reason.clone());
+    }
+    GgmlCpuGraphError::MemoryAdmission { operation, reason }
+}
+
+fn backend_buffer_allocation_failure(backend: impl Into<String>) -> GgmlCpuGraphError {
+    let backend = backend.into();
+    record_capacity_failure("backend-buffer/allocate", format!("backend={backend}"));
+    GgmlCpuGraphError::BackendBufferAllocationFailed { backend }
+}
+
+fn record_capacity_failure(operation: &'static str, detail: impl Into<String>) {
+    crate::models::native_execution_services::record_current_execution_candidate_failure(
+        ExecutionCandidateFailure::capacity(operation, detail),
+    );
+}
+
+fn record_device_unavailable(operation: &'static str, detail: impl Into<String>) {
+    crate::models::native_execution_services::record_current_execution_candidate_failure(
+        ExecutionCandidateFailure::device_unavailable(operation, detail),
+    );
+}
+
+fn record_device_lost(operation: &'static str, detail: impl Into<String>) {
+    crate::models::native_execution_services::record_current_execution_candidate_failure(
+        ExecutionCandidateFailure::device_lost(operation, detail),
+    );
 }
 
 fn cstr_lossy(raw_name: *const std::ffi::c_char) -> String {
@@ -6211,6 +7210,7 @@ impl Drop for GgmlCachedBackendGuard {
 impl GgmlBackendSchedulerGuard {
     fn new(
         backends: &mut [ffi::GgmlBackendRaw],
+        backend_private_leases: BTreeMap<usize, GgmlBackendPrivateLeaseOwner>,
         graph_size: usize,
     ) -> Result<Self, GgmlCpuGraphError> {
         let n_backends =
@@ -6228,8 +7228,18 @@ impl GgmlBackendSchedulerGuard {
             )
         };
         NonNull::new(raw)
-            .map(|raw| Self { raw })
-            .ok_or(GgmlCpuGraphError::BackendSchedulerInitFailed)
+            .map(|raw| Self {
+                raw,
+                memory_owner: GgmlSchedulerMemoryOwner {
+                    backend_private_leases,
+                    scheduler_leases: Arc::new(Mutex::new(Vec::new())),
+                    poisoned: Arc::new(AtomicBool::new(false)),
+                },
+            })
+            .ok_or_else(|| {
+                record_device_unavailable("scheduler-init", "ggml_backend_sched_new returned null");
+                GgmlCpuGraphError::BackendSchedulerInitFailed
+            })
     }
 }
 
@@ -6239,8 +7249,27 @@ impl Drop for GgmlBackendSchedulerGuard {
     }
 }
 
-struct GgmlBackendBufferGuard {
+struct GgmlRawBackendBufferGuard {
     raw: NonNull<c_void>,
+}
+
+impl Drop for GgmlRawBackendBufferGuard {
+    fn drop(&mut self) {
+        unsafe { ffi::ggml_backend_buffer_free(self.raw.as_ptr()) };
+    }
+}
+
+enum GgmlBackendBufferOwnership {
+    /// Low-level tests and internal helpers may run outside an explicitly
+    /// injected native service root. Production dispatch never takes this
+    /// lane because it always installs the process-wide broker first.
+    #[cfg(test)]
+    Direct(GgmlRawBackendBufferGuard),
+    Admitted(NativeMemoryAllocation<GgmlRawBackendBufferGuard>),
+}
+
+struct GgmlBackendBufferGuard {
+    ownership: GgmlBackendBufferOwnership,
 }
 
 impl GgmlBackendBufferGuard {
@@ -6248,14 +7277,32 @@ impl GgmlBackendBufferGuard {
         context: NonNull<c_void>,
         backend: NonNull<c_void>,
     ) -> Result<Self, GgmlCpuGraphError> {
-        ensure_backend_device_present(backend)?;
-        let raw =
-            unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
-        NonNull::new(raw).map(|raw| Self { raw }).ok_or_else(|| {
-            GgmlCpuGraphError::BackendBufferAllocationFailed {
-                backend: backend_name(backend),
-            }
-        })
+        Self::allocate_context_buffer(
+            context,
+            backend,
+            ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE,
+            NativeMemoryClaimSemantics {
+                resource_id: "direct-graph-buffer".to_owned(),
+                lifetime: AllocationLifetime::StepTransient,
+                phases: PhaseSet::ALL,
+            },
+        )
+    }
+
+    fn allocate_weights(
+        context: NonNull<c_void>,
+        backend: NonNull<c_void>,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::allocate_context_buffer(
+            context,
+            backend,
+            ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+            NativeMemoryClaimSemantics {
+                resource_id: "pack-weight-buffer".to_owned(),
+                lifetime: AllocationLifetime::PackShared,
+                phases: PhaseSet::ALL,
+            },
+        )
     }
 
     fn allocate_with_usage(
@@ -6263,21 +7310,16 @@ impl GgmlBackendBufferGuard {
         backend: NonNull<c_void>,
         usage: c_int,
     ) -> Result<Self, GgmlCpuGraphError> {
-        ensure_backend_device_present(backend)?;
-        let raw =
-            unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
-        let Some(raw) = NonNull::new(raw) else {
-            return Err(GgmlCpuGraphError::BackendBufferAllocationFailed {
-                backend: backend_name(backend),
-            });
-        };
-        unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
-        Ok(Self { raw })
-    }
-
-    fn from_raw(raw: NonNull<c_void>, usage: c_int) -> Self {
-        unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
-        Self { raw }
+        Self::allocate_context_buffer(
+            context,
+            backend,
+            usage,
+            NativeMemoryClaimSemantics {
+                resource_id: "static-tensor-arena".to_owned(),
+                lifetime: AllocationLifetime::SessionResident,
+                phases: PhaseSet::ALL,
+            },
+        )
     }
 
     /// Allocates an empty buffer of exactly `size` bytes from `buft`, with no
@@ -6285,14 +7327,210 @@ impl GgmlBackendBufferGuard {
     /// chosen capacity; tensors are bound into it afterwards via
     /// `ggml_tallocr`. Mirrors `alloc_tensor_range` (ggml-alloc.c), the same
     /// call `ggml_backend_alloc_ctx_tensors` itself makes internally.
-    fn allocate_sized(buft: NonNull<c_void>, size: usize) -> Result<Self, GgmlCpuGraphError> {
-        let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), size) };
-        NonNull::new(raw).map(|raw| Self { raw }).ok_or_else(|| {
-            GgmlCpuGraphError::BackendBufferAllocationFailed {
-                backend: "cpu-step-buffer-pool".to_string(),
-            }
-        })
+    fn allocate_sized(
+        buft: NonNull<c_void>,
+        backend: NonNull<c_void>,
+        size: usize,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        let native_allocate = || {
+            let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), size) };
+            NonNull::new(raw)
+                .map(|raw| GgmlRawBackendBufferGuard { raw })
+                .ok_or_else(|| backend_buffer_allocation_failure("cpu-step-buffer-pool"))
+        };
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+            request_id: 1,
+            backend: backend.as_ptr(),
+            buft: buft.as_ptr(),
+            requested_bytes: u64::try_from(size).map_err(|_| {
+                GgmlCpuGraphError::MemoryAdmission {
+                    operation: "cpu-step-buffer/describe",
+                    reason: "step buffer bytes exceed u64".to_owned(),
+                }
+            })?,
+            ..Default::default()
+        };
+        allocate_native_buffer_with_admission(
+            "cpu-step-buffer",
+            backend,
+            request,
+            NativeMemoryClaimSemantics {
+                resource_id: "cpu-step-buffer-pool".to_owned(),
+                lifetime: AllocationLifetime::SessionResident,
+                phases: PhaseSet::range(
+                    crate::device::execution_memory::ExecutionPhase::DecoderPrefill,
+                    crate::device::execution_memory::ExecutionPhase::DecoderStep,
+                ),
+            },
+            true,
+            native_allocate,
+        )
     }
+
+    fn raw(&self) -> NonNull<c_void> {
+        match &self.ownership {
+            #[cfg(test)]
+            GgmlBackendBufferOwnership::Direct(owner) => owner.raw,
+            GgmlBackendBufferOwnership::Admitted(allocation) => allocation.owner().raw,
+        }
+    }
+
+    fn allocate_context_buffer(
+        context: NonNull<c_void>,
+        backend: NonNull<c_void>,
+        usage: c_int,
+        semantics: NativeMemoryClaimSemantics,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        ensure_backend_device_present(backend)?;
+        let native_allocate = || {
+            let raw =
+                unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
+            let raw = NonNull::new(raw)
+                .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
+            unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
+            Ok(GgmlRawBackendBufferGuard { raw })
+        };
+
+        let buft =
+            NonNull::new(unsafe { ffi::ggml_backend_get_default_buffer_type(backend.as_ptr()) })
+                .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/describe",
+                    reason: "backend returned no default buffer type".to_owned(),
+                })?;
+        let usage = u32::try_from(usage).map_err(|_| GgmlCpuGraphError::MemoryAdmission {
+            operation: "context-buffer/describe",
+            reason: format!("negative or out-of-range buffer usage {usage}"),
+        })?;
+        let chunks = measure_context_buffer_chunks(context, buft)?;
+        let mut request_semantics = BTreeMap::new();
+        let mut requests = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let request_id =
+                u64::try_from(index + 1).map_err(|_| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/describe",
+                    reason: "context buffer chunk count exceeds u64".to_owned(),
+                })?;
+            requests.push(ffi::GgmlBackendMemoryRequestV1 {
+                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+                usage,
+                request_id,
+                backend: backend.as_ptr(),
+                buft: buft.as_ptr(),
+                requested_bytes: u64::try_from(chunk.requested_bytes).map_err(|_| {
+                    GgmlCpuGraphError::MemoryAdmission {
+                        operation: "context-buffer/describe",
+                        reason: "requested buffer chunk bytes exceed u64".to_owned(),
+                    }
+                })?,
+                max_tensor_bytes: u64::try_from(chunk.max_tensor_bytes).map_err(|_| {
+                    GgmlCpuGraphError::MemoryAdmission {
+                        operation: "context-buffer/describe",
+                        reason: "maximum tensor bytes exceed u64".to_owned(),
+                    }
+                })?,
+                ..Default::default()
+            });
+            request_semantics.insert(
+                request_id,
+                NativeMemoryClaimSemantics {
+                    resource_id: format!("{}-chunk-{index}", semantics.resource_id),
+                    ..semantics.clone()
+                },
+            );
+        }
+        allocate_native_buffers_with_admission(
+            "context-buffer",
+            backend,
+            requests,
+            request_semantics,
+            semantics,
+            true,
+            native_allocate,
+        )
+    }
+}
+
+fn allocate_native_buffer_with_admission(
+    operation: &'static str,
+    backend: NonNull<c_void>,
+    request: ffi::GgmlBackendMemoryRequestV1,
+    semantics: NativeMemoryClaimSemantics,
+    record_capacity: bool,
+    native_allocate: impl FnOnce() -> Result<GgmlRawBackendBufferGuard, GgmlCpuGraphError>,
+) -> Result<GgmlBackendBufferGuard, GgmlCpuGraphError> {
+    let request_id = request.request_id;
+    allocate_native_buffers_with_admission(
+        operation,
+        backend,
+        vec![request],
+        BTreeMap::from([(request_id, semantics.clone())]),
+        semantics,
+        record_capacity,
+        native_allocate,
+    )
+}
+
+fn allocate_native_buffers_with_admission(
+    operation: &'static str,
+    backend: NonNull<c_void>,
+    requests: Vec<ffi::GgmlBackendMemoryRequestV1>,
+    request_semantics: BTreeMap<u64, NativeMemoryClaimSemantics>,
+    shared_semantics: NativeMemoryClaimSemantics,
+    record_capacity: bool,
+    native_allocate: impl FnOnce() -> Result<GgmlRawBackendBufferGuard, GgmlCpuGraphError>,
+) -> Result<GgmlBackendBufferGuard, GgmlCpuGraphError> {
+    let Some(broker) =
+        crate::models::native_execution_services::current_native_execution_memory_broker()
+    else {
+        #[cfg(test)]
+        {
+            return native_allocate().map(|owner| GgmlBackendBufferGuard {
+                ownership: GgmlBackendBufferOwnership::Direct(owner),
+            });
+        }
+        #[cfg(not(test))]
+        {
+            return Err(memory_admission_failure_maybe(
+                operation,
+                "process-wide native execution memory broker is not installed",
+                record_capacity,
+            ));
+        }
+    };
+    let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }.map_err(|source| {
+        memory_admission_error_maybe(operation, source.into(), record_capacity)
+    })?;
+    let group = NativeQuotedBackendGroup::quote(
+        operation,
+        backend_memory_identity(backend)?,
+        abi,
+        requests,
+        request_semantics,
+        shared_semantics,
+    )
+    .map_err(|source| memory_admission_error_maybe(operation, source, record_capacity))?;
+    let transaction = NativeMemoryAdmissionPlan::from_groups(vec![group])
+        .and_then(|plan| {
+            plan.try_reserve(
+                &broker,
+                crate::models::native_execution_services::current_memory_reservation_cohort_id(),
+            )
+        })
+        .map_err(|source| memory_admission_error_maybe(operation, source, record_capacity))?;
+    let allocation = transaction
+        .commit_engine_owned_with(native_allocate)
+        .map_err(|error| match error {
+            NativeMemoryAllocationError::NativeCommit { source } => source,
+            NativeMemoryAllocationError::PostAllocationStats { source } => {
+                memory_admission_error_maybe(operation, source, record_capacity)
+            }
+            other => memory_admission_failure_maybe(operation, other.to_string(), record_capacity),
+        })?;
+    Ok(GgmlBackendBufferGuard {
+        ownership: GgmlBackendBufferOwnership::Admitted(allocation),
+    })
 }
 
 fn maybe_allocate_weight_buffer_from_host_ptr(
@@ -6317,21 +7555,60 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
         return Ok(None);
     }
     let mmap = reader.backing_mmap();
-    let buffer_raw = unsafe {
-        ffi::ggml_backend_dev_buffer_from_host_ptr(
-            device_raw.as_ptr(),
-            mmap.as_ptr().cast_mut().cast::<c_void>(),
-            mmap.len(),
-            0,
-        )
+    let host_ptr = mmap.as_ptr().cast::<c_void>();
+    let native_allocate = || {
+        let raw = unsafe {
+            ffi::ggml_backend_dev_buffer_from_host_ptr(
+                device_raw.as_ptr(),
+                host_ptr.cast_mut(),
+                mmap.len(),
+                0,
+            )
+        };
+        let raw = NonNull::new(raw).ok_or(())?;
+        unsafe {
+            ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+        };
+        Ok(GgmlRawBackendBufferGuard { raw })
     };
-    let Some(buffer_raw) = NonNull::new(buffer_raw) else {
-        return Ok(None);
+
+    let requested_bytes =
+        u64::try_from(mmap.len()).map_err(|_| GgmlCpuGraphError::MemoryAdmission {
+            operation: "weight-host-import/describe",
+            reason: "mapped weight bytes exceed u64".to_owned(),
+        })?;
+    let request = ffi::GgmlBackendMemoryRequestV1 {
+        kind: ffi::GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT,
+        usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+        request_id: 1,
+        backend: backend.as_ptr(),
+        host_ptr,
+        requested_bytes,
+        ..Default::default()
     };
-    Ok(Some((
-        GgmlBackendBufferGuard::from_raw(buffer_raw, ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
-        mmap,
-    )))
+    let semantics = NativeMemoryClaimSemantics {
+        resource_id: "pack-weight-host-import".to_owned(),
+        lifetime: AllocationLifetime::PackShared,
+        phases: PhaseSet::ALL,
+    };
+    let attempt = allocate_native_buffer_with_admission(
+        "weight-host-import",
+        backend,
+        request,
+        semantics,
+        false,
+        || {
+            native_allocate().map_err(|()| GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: backend_name(backend),
+            })
+        },
+    );
+
+    // Host import is a zero-copy optimization, not a semantic requirement.
+    // If its independently admitted footprint is infeasible or the backend
+    // declines the mapping, the caller immediately quotes the ordinary
+    // backend-owned weight buffer as a separate physical allocation choice.
+    Ok(attempt.ok().map(|buffer| (buffer, mmap)))
 }
 
 fn validate_direct_backend_matmul_weight_support(
@@ -6401,12 +7678,6 @@ fn ggml_type_name_lossy(type_: c_int) -> String {
     unsafe { cstr_lossy(ffi::ggml_type_name(type_)) }
 }
 
-impl Drop for GgmlBackendBufferGuard {
-    fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_buffer_free(self.raw.as_ptr()) };
-    }
-}
-
 unsafe fn write_tensor_data(
     tensor: NonNull<c_void>,
     data_ptr: *const c_void,
@@ -6463,6 +7734,32 @@ mod tests {
         let backend = super::GgmlBackendGuard::cpu().expect("cpu backend");
         assert!(super::backend_device_present(backend.raw));
         assert!(super::ensure_backend_device_present(backend.raw).is_ok());
+    }
+
+    #[test]
+    fn context_buffer_measurement_preserves_native_multibuffer_boundaries() {
+        let chunks = super::pack_context_buffer_chunks(256, 1024, [700, 700, 100])
+            .expect("valid buffer geometry");
+        assert_eq!(
+            chunks,
+            vec![
+                super::ContextBufferChunk {
+                    requested_bytes: 768,
+                    max_tensor_bytes: 700,
+                },
+                super::ContextBufferChunk {
+                    requested_bytes: 1024,
+                    max_tensor_bytes: 700,
+                },
+            ]
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.requested_bytes)
+                .sum::<usize>(),
+            1792
+        );
     }
 
     #[test]
@@ -6553,6 +7850,62 @@ mod tests {
                 .expect("no override installed -> real compute succeeds"),
             vec![4.0, 6.0]
         );
+    }
+
+    #[test]
+    fn compute_outputs_into_f32_uses_caller_storage_without_payload_vecs() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let lhs = graph.new_tensor_1d_f32(3, "lhs").expect("lhs");
+        let rhs = graph.new_tensor_1d_f32(3, "rhs").expect("rhs");
+        graph.set_input(lhs).expect("lhs input");
+        graph.set_input(rhs).expect("rhs input");
+        let sum = graph.add(lhs, rhs).expect("sum");
+        let product = graph.mul(lhs, rhs).expect("product");
+        graph
+            .set_f32_slice(lhs, &[1.0, 2.0, 3.0], "lhs")
+            .expect("lhs upload");
+        graph
+            .set_f32_slice(rhs, &[4.0, 5.0, 6.0], "rhs")
+            .expect("rhs upload");
+
+        let mut sum_target = [-1.0_f32; 3];
+        let mut product_target = [-1.0_f32; 3];
+        let mut outputs = [
+            (sum, sum_target.as_mut_slice()),
+            (product, product_target.as_mut_slice()),
+        ];
+        graph
+            .compute_outputs_into_f32(&mut outputs)
+            .expect("direct readback into caller storage");
+        assert_eq!(sum_target, [5.0, 7.0, 9.0]);
+        assert_eq!(product_target, [4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn compute_outputs_into_f32_terminal_compute_has_zero_readback_and_preserves_targets() {
+        super::reset_test_tensor_readback_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(2, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let output = graph.sqr(input).expect("square");
+        graph
+            .set_f32_slice(input, &[2.0, 3.0], "input")
+            .expect("input upload");
+
+        let mut target = [123.0_f32, 456.0];
+        let mut outputs = [(output, target.as_mut_slice())];
+        super::install_test_graph_compute_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+        let error = graph
+            .compute_outputs_into_f32(&mut outputs)
+            .expect_err("terminal compute must stop before direct readback");
+        assert!(matches!(error, GgmlCpuGraphError::ExecutionFailed));
+        assert_eq!(super::test_tensor_readback_count(), 0);
+        assert_eq!(target, [123.0, 456.0]);
+        assert!(graph.is_poisoned());
     }
 
     #[test]
@@ -7740,7 +9093,7 @@ mod tests {
                 .cpu_step_buffer_pool
                 .buffer
                 .as_ref()
-                .map(|buffer| buffer.raw)
+                .map(|buffer| buffer.raw())
         }
 
         #[test]
@@ -8017,10 +9370,10 @@ mod tests {
     #[test]
     fn persistent_graph_session_reuses_built_graph_on_scheduler_path() {
         // Same build-once/re-run proof, but with the backend scheduler enabled
-        // (the path Metal uses): prepare allocates via ggml_backend_sched_alloc_
-        // graph once, then each compute calls sched_graph_compute WITHOUT a
-        // sched_reset. This de-risks reusing a graph across decode steps on the
-        // scheduler/Metal path.
+        // (the path Metal uses): prepare allocates through one frozen memory
+        // plan, then each compute calls sched_graph_compute without creating a
+        // new plan/reset. This de-risks reusing a graph across decode steps on
+        // the scheduler/Metal path.
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.use_scheduler = true;
         let mut runner =
@@ -8066,6 +9419,52 @@ mod tests {
             .compute_add_f32(&[1.0, 2.5, -3.0], &[4.0, -0.5, 7.0])
             .expect("scheduler tiny add graph should compute");
         assert_eq!(output, vec![5.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn scheduler_graph_with_injected_broker_clears_candidate_pending_state() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let output = runner
+            .compute_add_f32(&[1.0, 2.5, -3.0], &[4.0, -0.5, 7.0])
+            .expect("atomically admitted scheduler graph should compute");
+        assert_eq!(output, vec![5.0, 2.0, 4.0]);
+
+        let usage = broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        assert_eq!(usage.pending_bytes, 0);
+        assert!(!usage.exclusive_pending);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_scheduler_exact_zero_private_quote_uses_domain_headroom() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        assert!(broker.minimum_headroom_bytes() > 0);
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Metal,
+            use_scheduler: true,
+            ..GgmlCpuGraphConfig::default()
+        })
+        .expect("Metal scheduler runner should initialize");
+        let output = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect("Metal exact-zero private quote should admit under headroom policy");
+        assert_eq!(output, vec![4.0, 6.0]);
+
+        let usage = broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        assert_eq!(usage.pending_bytes, 0);
+        assert!(!usage.exclusive_pending);
     }
 
     #[test]

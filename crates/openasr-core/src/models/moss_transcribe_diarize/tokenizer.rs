@@ -19,6 +19,8 @@ use crate::models::oasr_metadata::{
     required_metadata_string, required_metadata_string_array, required_metadata_u32,
 };
 use crate::models::phrase_bias_decode::{PhraseBiasTokenEncoder, encode_bpe_phrase_bias_variants};
+use crate::models::runtime_memory::{checked_sum, element_bytes};
+use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
 
 use super::runtime_contract::{
     LLM_AUDIO_END_TOKEN_ID_KEY, LLM_AUDIO_PAD_TOKEN_ID_KEY, LLM_AUDIO_START_TOKEN_ID_KEY,
@@ -50,6 +52,87 @@ pub(crate) struct MossTdTokenizer {
 }
 
 impl MossTdTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add_vec(
+            &self.id_to_token,
+            "moss-transcribe-diarize tokenizer id table",
+        )?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, "moss-transcribe-diarize tokenizer id token")?;
+        }
+        for (label, len, entry_size) in [
+            (
+                "moss-transcribe-diarize tokenizer token map",
+                self.token_to_id.len(),
+                std::mem::size_of::<(String, u32)>(),
+            ),
+            (
+                "moss-transcribe-diarize tokenizer merge map",
+                self.merge_rank.len(),
+                std::mem::size_of::<(String, usize)>(),
+            ),
+        ] {
+            bytes.add_usize(
+                len.checked_mul(entry_size)
+                    .ok_or_else(|| format!("{label} byte count overflowed"))?,
+                label,
+            )?;
+        }
+        for key in self.token_to_id.keys().chain(self.merge_rank.keys()) {
+            bytes.add_string(key, "moss-transcribe-diarize tokenizer map key")?;
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &GgufMetadata,
+    ) -> Result<u64, SystemMemoryOwnerError> {
+        let tokens = metadata
+            .get_string_array(TOKENIZER_GGML_TOKENS_KEY)
+            .ok_or_else(|| {
+                tokenizer_capacity_error(format!(
+                    "metadata is missing '{TOKENIZER_GGML_TOKENS_KEY}'"
+                ))
+            })?;
+        let merges = metadata
+            .get_string_array(TOKENIZER_GGML_MERGES_KEY)
+            .ok_or_else(|| {
+                tokenizer_capacity_error(format!(
+                    "metadata is missing '{TOKENIZER_GGML_MERGES_KEY}'"
+                ))
+            })?;
+        let token_text_bytes = tokenizer_text_bytes(tokens, "tokenizer token text")?;
+        let merge_text_bytes = tokenizer_text_bytes(merges, "tokenizer merge text")?;
+        let token_text_copies = token_text_bytes.checked_mul(2).ok_or_else(|| {
+            tokenizer_capacity_error("tokenizer token text copies byte count overflowed")
+        })?;
+
+        checked_sum(
+            [
+                element_bytes::<Option<String>>(
+                    tokens.len(),
+                    MOSS_TD_TOKENIZER_FAMILY,
+                    "tokenizer id table",
+                )?,
+                element_bytes::<(String, u32)>(
+                    tokens.len(),
+                    MOSS_TD_TOKENIZER_FAMILY,
+                    "tokenizer reverse map",
+                )?,
+                token_text_copies,
+                element_bytes::<(String, usize)>(
+                    merges.len(),
+                    MOSS_TD_TOKENIZER_FAMILY,
+                    "tokenizer merge map",
+                )?,
+                merge_text_bytes,
+            ],
+            MOSS_TD_TOKENIZER_FAMILY,
+            "tokenizer retained bytes",
+        )
+    }
+
     pub fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
         let tokenizer_model =
             required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, MOSS_TD_TOKENIZER_FAMILY)?;
@@ -216,6 +299,23 @@ impl MossTdTokenizer {
     }
 }
 
+fn tokenizer_text_bytes(values: &[String], label: &str) -> Result<u64, SystemMemoryOwnerError> {
+    values.iter().try_fold(0_u64, |total, value| {
+        let length = u64::try_from(value.len())
+            .map_err(|_| tokenizer_capacity_error(format!("{label} length does not fit u64")))?;
+        total
+            .checked_add(length)
+            .ok_or_else(|| tokenizer_capacity_error(format!("{label} byte count overflowed")))
+    })
+}
+
+fn tokenizer_capacity_error(reason: impl Into<String>) -> SystemMemoryOwnerError {
+    SystemMemoryOwnerError::capacity_failure(
+        "model_runtime_memory",
+        format!("{MOSS_TD_TOKENIZER_FAMILY}: {}", reason.into()),
+    )
+}
+
 impl BuiltinSeq2SeqDecodePolicyTokenSource for MossTdTokenizer {}
 
 impl PhraseBiasTokenEncoder for MossTdTokenizer {
@@ -343,5 +443,69 @@ mod tests {
             .expect_err("mismatch should fail")
             .to_string();
         assert!(error.contains("token count"), "{error}");
+    }
+
+    #[test]
+    fn retained_system_memory_is_within_metadata_quote() {
+        let metadata = base_metadata();
+        let tokenizer = MossTdTokenizer::from_gguf_metadata(&metadata).expect("load tokenizer");
+        let actual = tokenizer
+            .retained_system_memory_bytes()
+            .expect("count retained tokenizer memory");
+        let quote = MossTdTokenizer::quoted_retained_system_memory_bytes(&metadata)
+            .expect("quote retained tokenizer memory");
+        assert!(actual <= quote, "actual {actual} exceeds quote {quote}");
+    }
+
+    #[test]
+    fn duplicate_tokens_and_merges_still_fit_the_count_based_quote() {
+        let mut values = base_metadata().values().clone();
+        let mut tokens = match values.remove(TOKENIZER_GGML_TOKENS_KEY) {
+            Some(GgufMetadataValue::StringArray(tokens)) => tokens,
+            _ => panic!("base fixture must contain tokenizer tokens"),
+        };
+        tokens.push("user".to_string());
+        values.insert(
+            TOKENIZER_GGML_TOKENS_KEY.to_string(),
+            GgufMetadataValue::StringArray(tokens.clone()),
+        );
+        values.insert(
+            LLM_VOCAB_SIZE_KEY.to_string(),
+            GgufMetadataValue::U32(tokens.len() as u32),
+        );
+
+        let mut merges = match values.remove(TOKENIZER_GGML_MERGES_KEY) {
+            Some(GgufMetadataValue::StringArray(merges)) => merges,
+            _ => panic!("base fixture must contain tokenizer merges"),
+        };
+        merges.push(merges[0].clone());
+        values.insert(
+            TOKENIZER_GGML_MERGES_KEY.to_string(),
+            GgufMetadataValue::StringArray(merges.clone()),
+        );
+
+        let metadata = GgufMetadata::from_values_for_test(values);
+        let tokenizer = MossTdTokenizer::from_gguf_metadata(&metadata).expect("load tokenizer");
+        assert!(tokenizer.token_to_id.len() < tokens.len());
+        assert!(tokenizer.merge_rank.len() < merges.len());
+        let actual = tokenizer
+            .retained_system_memory_bytes()
+            .expect("count retained tokenizer memory");
+        let quote = MossTdTokenizer::quoted_retained_system_memory_bytes(&metadata)
+            .expect("quote retained tokenizer memory");
+        assert!(actual <= quote, "actual {actual} exceeds quote {quote}");
+    }
+
+    #[test]
+    fn tokenizer_quote_fails_closed_when_metadata_is_missing() {
+        let mut values = base_metadata().values().clone();
+        values.remove(TOKENIZER_GGML_TOKENS_KEY);
+        let missing_tokens = GgufMetadata::from_values_for_test(values);
+        assert!(MossTdTokenizer::quoted_retained_system_memory_bytes(&missing_tokens).is_err());
+
+        let mut values = base_metadata().values().clone();
+        values.remove(TOKENIZER_GGML_MERGES_KEY);
+        let missing_merges = GgufMetadata::from_values_for_test(values);
+        assert!(MossTdTokenizer::quoted_retained_system_memory_bytes(&missing_merges).is_err());
     }
 }

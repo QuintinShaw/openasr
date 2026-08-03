@@ -115,7 +115,11 @@ fn write_gguf_package(path: &std::path::Path) {
 }
 
 fn write_whisper_oasr_v1_fixture(path: &std::path::Path, model_id: &str) {
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(model_id);
+    // The CLI fixture is exercised with the 11-second JFK sample. Keep its
+    // semantic window production-shaped so capacity planning reaches the
+    // tokenizer boundary this fixture is intended to test instead of failing
+    // earlier on the tiny graph helper's 128-frame encoder ceiling.
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(model_id);
     write_tiny_gguf_runtime_source(path, &spec).expect("write whisper gguf runtime source");
 }
 

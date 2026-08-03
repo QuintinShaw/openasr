@@ -115,7 +115,12 @@ pub(crate) fn parse_live_output_format(
     }
 }
 
-pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
+pub(crate) async fn run_live(
+    native_execution_services: Arc<openasr_core::NativeExecutionServices>,
+    options: LiveCommandOptions<'_>,
+) -> Result<()> {
+    // Realtime Voice ID/diarization is intentionally not supported by the CLI
+    // live path. Reject it before capability resolution or runtime setup.
     ensure_live_voice_id_not_requested(options.diarize)?;
     validate_live_limits(options.max_seconds, options.max_utterances)?;
 
@@ -138,7 +143,12 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
     // CLI-only consent-pull: native without an explicit --model-pack ensures the
     // resolved model is installed first (see the transcribe handler).
     if backend == BackendKind::Native && options.model_pack.is_none() {
-        crate::pull_cli::ensure_asr_model_installed(options.model, &config, &options.consent)?;
+        crate::pull_cli::ensure_asr_model_installed(
+            &native_execution_services,
+            options.model,
+            &config,
+            &options.consent,
+        )?;
     }
     let model_pack_path = resolve_live_model_pack(
         backend,
@@ -162,6 +172,7 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
 
     if let Some(input_file) = options.input_file.as_deref() {
         return run_live_from_input_file(
+            Arc::clone(&native_execution_services),
             input_file,
             &options,
             backend,
@@ -175,6 +186,7 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
 
     if options.source == LiveSource::System {
         return run_live_from_system_audio(
+            Arc::clone(&native_execution_services),
             &options,
             backend,
             model_pack_path,
@@ -212,7 +224,8 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
         }
     });
 
-    let mut pipeline = LivePipeline::new(
+    let mut pipeline = LivePipeline::new_with_execution_services(
+        Arc::clone(&native_execution_services),
         live_config,
         options.output_format,
         options.max_utterances,
@@ -224,7 +237,8 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
         "OpenASR live microphone started on {device_label} ({sample_format}, {} Hz, {} channel(s)). Streaming partial/final updates are enabled.",
         stream_config.sample_rate, stream_config.channels
     );
-    let transcription_worker = LiveTranscriptionWorker::spawn(backend, model_pack_path);
+    let transcription_worker =
+        LiveTranscriptionWorker::spawn(native_execution_services, backend, model_pack_path);
     let mut capture = LiveCaptureRun {
         receiver,
         normalizer,
@@ -248,6 +262,7 @@ fn ensure_live_voice_id_not_requested(diarize: bool) -> Result<()> {
 }
 
 fn run_live_from_system_audio(
+    native_execution_services: Arc<openasr_core::NativeExecutionServices>,
     options: &LiveCommandOptions<'_>,
     backend: BackendKind,
     model_pack_path: Option<PathBuf>,
@@ -306,7 +321,8 @@ fn run_live_from_system_audio(
         let _ = capture_result_tx.send(result);
     });
 
-    let mut pipeline = LivePipeline::new(
+    let mut pipeline = LivePipeline::new_with_execution_services(
+        Arc::clone(&native_execution_services),
         live_config,
         options.output_format,
         options.max_utterances,
@@ -318,7 +334,8 @@ fn run_live_from_system_audio(
         "OpenASR live system audio started with {} on {}. Streaming partial/final updates are enabled.",
         support.label, support.platform
     );
-    let transcription_worker = LiveTranscriptionWorker::spawn(backend, model_pack_path);
+    let transcription_worker =
+        LiveTranscriptionWorker::spawn(native_execution_services, backend, model_pack_path);
     let mut capture = LiveCaptureRun {
         receiver,
         normalizer,
@@ -344,6 +361,7 @@ fn run_live_from_system_audio(
 
 #[allow(clippy::too_many_arguments)]
 fn run_live_from_input_file(
+    native_execution_services: Arc<openasr_core::NativeExecutionServices>,
     input_file: &Path,
     options: &LiveCommandOptions<'_>,
     backend: BackendKind,
@@ -353,7 +371,8 @@ fn run_live_from_input_file(
     obs_options: Option<LiveObsOptions>,
     markdown_note_options: Option<LiveMarkdownNoteOptions>,
 ) -> Result<()> {
-    let mut pipeline = LivePipeline::new(
+    let mut pipeline = LivePipeline::new_with_execution_services(
+        Arc::clone(&native_execution_services),
         live_config,
         options.output_format,
         options.max_utterances,
@@ -366,7 +385,8 @@ fn run_live_from_input_file(
         input_file.display(),
         options.frame_duration_ms
     );
-    let mut transcription_worker = LiveTranscriptionWorker::spawn(backend, model_pack_path);
+    let mut transcription_worker =
+        LiveTranscriptionWorker::spawn(native_execution_services, backend, model_pack_path);
     let samples = prepare_input_file_samples_pcm16_mono_16khz(input_file, options)?;
     let frame_sample_count = RealtimeAudioFormat::pcm16_mono_16khz()
         .sample_count_for_duration_ms(options.frame_duration_ms)?;
@@ -1122,13 +1142,18 @@ struct LiveTranscriptionWorker {
 }
 
 impl LiveTranscriptionWorker {
-    fn spawn(backend: BackendKind, model_pack_path: Option<PathBuf>) -> Self {
+    fn spawn(
+        native_execution_services: Arc<openasr_core::NativeExecutionServices>,
+        backend: BackendKind,
+        model_pack_path: Option<PathBuf>,
+    ) -> Self {
         let (job_sender, job_receiver) =
             mpsc::sync_channel::<LiveTranscriptionJob>(LIVE_TRANSCRIPTION_QUEUE_CAPACITY);
         let (result_sender, result_receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
             for job in job_receiver {
                 let result = transcribe_with_backend(
+                    &native_execution_services,
                     backend,
                     TranscriptionRequest::new(job.temp_wav.path(), job.model_id)
                         .with_source(openasr_core::RequestSource::CliLive)
@@ -1418,7 +1443,28 @@ struct LiveMarkdownNoteOptions {
 }
 
 impl LivePipeline {
+    #[cfg(test)]
     fn new(
+        config: LivePipelineConfig,
+        output_format: LiveOutputFormat,
+        max_utterances: Option<usize>,
+        save_options: Option<LiveSaveOptions>,
+    ) -> Result<Self> {
+        let execution_services = Arc::new(
+            openasr_core::NativeExecutionServices::for_local_process()
+                .context("Could not construct test execution services")?,
+        );
+        Self::new_with_execution_services(
+            execution_services,
+            config,
+            output_format,
+            max_utterances,
+            save_options,
+        )
+    }
+
+    fn new_with_execution_services(
+        _execution_services: Arc<openasr_core::NativeExecutionServices>,
         config: LivePipelineConfig,
         output_format: LiveOutputFormat,
         max_utterances: Option<usize>,
@@ -2454,6 +2500,13 @@ mod tests {
     };
     use sha2::Digest;
 
+    fn test_native_execution_services() -> Arc<openasr_core::NativeExecutionServices> {
+        Arc::new(
+            openasr_core::NativeExecutionServices::for_local_process()
+                .expect("test execution services must construct"),
+        )
+    }
+
     fn test_live_config() -> LivePipelineConfig {
         LivePipelineConfig {
             model_id: "whisper-large-v3-turbo".to_string(),
@@ -2480,7 +2533,7 @@ mod tests {
     }
 
     fn mock_transcription_worker() -> LiveTranscriptionWorker {
-        LiveTranscriptionWorker::spawn(BackendKind::Mock, None)
+        LiveTranscriptionWorker::spawn(test_native_execution_services(), BackendKind::Mock, None)
     }
 
     fn frame(seq: u64, start_ms: u64, sample: i16) -> RealtimeAudioFrame {
@@ -4201,7 +4254,11 @@ mod tests {
     fn backend_error_still_emits_terminal_events() {
         let mut pipeline =
             LivePipeline::new(test_live_config(), LiveOutputFormat::Jsonl, None, None).unwrap();
-        let mut worker = LiveTranscriptionWorker::spawn(BackendKind::Native, None);
+        let mut worker = LiveTranscriptionWorker::spawn(
+            test_native_execution_services(),
+            BackendKind::Native,
+            None,
+        );
         pipeline.start().unwrap();
         for (index, sample) in [0, 2000, 2000, 0, 0].into_iter().enumerate() {
             pipeline

@@ -55,6 +55,16 @@ pub(crate) struct ParakeetEncoderWeights {
     pub ctc_head_bias: NamedTensor,
 }
 
+impl ParakeetEncoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        crate::models::parakeet_runtime_memory::fastconformer_weights_retained_bytes(
+            &self.subsampling,
+            &self.layers,
+            &[&self.ctc_head_weight, &self.ctc_head_bias],
+        )
+    }
+}
+
 pub(crate) fn load_parakeet_ctc_encoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetCtcExecutionMetadata,

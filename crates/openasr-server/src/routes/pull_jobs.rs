@@ -754,9 +754,16 @@ pub(crate) fn run_pull_job(
     };
 
     let result = if let Some(source_path) = source_path {
-        install_model_pack_from_path(&resolved, source_path, &home, &mut progress)
+        install_model_pack_from_path_with_execution_services(
+            &resolved,
+            source_path,
+            &home,
+            Some(distribution.native_execution_services.as_ref()),
+            &mut progress,
+        )
     } else {
         PullModelPackRequest::new(&resolved, &home)
+            .execution_services(distribution.native_execution_services.as_ref())
             .cancel(|| cancel_flag.load(Ordering::SeqCst))
             .pause(|| pause_flag.load(Ordering::SeqCst))
             .execute(&mut progress)

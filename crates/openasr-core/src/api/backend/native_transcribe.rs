@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -15,8 +15,15 @@ use crate::arch::{
     DEFAULT_ENCODER_CHUNK_SECONDS, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
     SpeakerSegmentationSource, emits_punctuation_for_model_architecture,
 };
+use crate::device::{
+    execution_policy::{
+        ExecutionCandidate, ExecutionCandidateFailure, ExecutionIntent, ExecutionPlacement,
+        ExecutionPlan, ExecutionPolicyError,
+    },
+    execution_route::enumerate_compute_devices_from_ggml,
+};
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override, read_gguf_metadata,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference, read_gguf_metadata,
 };
 #[cfg(test)]
 use crate::longform::plan_longform_slices;
@@ -25,7 +32,6 @@ use crate::longform::{
     SegmentMergePolicy, SegmentTimeDomain, SliceTranscript, TranscriptAssembler,
     plan_longform_slices_with_materialization_gate,
 };
-use crate::models::builtin_execution_dispatch::build_builtin_ggml_execution_dispatch;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyLongformProfile, BuiltinDecodePolicyLongformPromptCarryMode,
     resolve_builtin_decode_policy_for_architecture,
@@ -34,11 +40,11 @@ use crate::models::graph_runtime_config::install_request_inference_threads_overr
 use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::{
-    ExecutionTarget, GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
+    GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
     GgmlAsrExecutionOptions, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlFamilyAdapterDescriptor,
-    GgmlFamilyRegistry, GgmlFamilyRegistrySelectionError, OasrV1MetadataError, PcmBuffer, PcmSlice,
-    parse_model_ref,
+    GgmlFamilyRegistry, GgmlFamilyRegistrySelectionError, NativeExecutionServices,
+    OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
 };
 
 use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
@@ -48,7 +54,10 @@ use crate::Segment;
 use crate::WordTimestamp;
 use crate::api::backend::{DecodeTruncation, TranscriptionLongFormMetadata, TruncatedDecode};
 use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
+use crate::models::firered_punc::policy_runtime::{FireRedPuncActor, load_actor, punctuate};
+#[cfg(test)]
 use crate::models::firered_punc::runtime::FireRedPuncRuntime;
+use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
 use crate::models::qwen::{
     ForcedAlignItem, forced_aligner_pack, refine_word_timestamps_with_forced_aligner,
 };
@@ -79,8 +88,6 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 /// both gets whichever is tighter.
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
-static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = OnceLock::new();
-
 // Phase-aware progress for the in-flight native file transcription, keyed by
 // transcription id in a bounded per-request registry. The server's native
 // path has no concurrency gate (each request's native transcription runs on
@@ -437,11 +444,14 @@ fn should_publish_token_step(step_index: usize) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn run_dispatch_once_with_progress(
     dispatch: &GgmlAsrExecutionDispatch,
+    execution_services: &Arc<NativeExecutionServices>,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     selected_family: &GgmlFamilyAdapterDescriptor,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
+    resolved_preference: Option<RequestBackendPreference>,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     execution_context: &Arc<crate::RequestExecutionContext>,
     decode_progress: &DecodeProgress,
     slice_samples: u64,
@@ -462,238 +472,115 @@ fn run_dispatch_once_with_progress(
         );
     let result = run_dispatch_once(
         dispatch,
+        execution_services,
         runtime_preflight,
         selected_family,
         chunk,
         request_options,
         backend_preference,
+        resolved_preference,
+        auto_gpu_policy,
         execution_context,
     )?;
     decode_progress.complete_slice(slice_samples);
     Ok(result)
 }
 
-/// Number of consecutive slices that must each hit a GPU-class compute-buffer
-/// allocation failure before the rest of the request stops even trying the
-/// GPU (issue #158): one slice's allocation failing under transient VRAM
-/// pressure is worth an immediate CPU retry, but if the *next* slice also
-/// fails the same way, the pressure is sustained rather than a one-off blip,
-/// so re-attempting the GPU on every remaining slice would just re-pay the
-/// same failed-allocation cost for no benefit.
-const GPU_ALLOCATION_FALLBACK_STREAK_LIMIT: usize = 2;
-
-/// Per-request state for the generic GPU-class allocation-failure fallback.
-/// Lives for the duration of one `run_native_transcription` call (one per
-/// longform slice loop, or one throwaway instance for the single-pass path).
-#[derive(Debug, Default)]
-struct GpuAllocationFallbackTracker {
-    consecutive_fallbacks: usize,
-    forced_cpu_for_rest: bool,
-}
-
-impl GpuAllocationFallbackTracker {
-    /// The backend preference to actually dispatch this attempt with. Forces
-    /// `CpuOnly` once the streak limit has tripped; otherwise passes
-    /// `requested` through unchanged so every slice still gets its own first
-    /// try at the requested backend (GPU pressure may be transient) until the
-    /// streak proves it is not.
-    fn effective_preference(
-        &self,
-        requested: GgmlAsrBackendPreference,
-    ) -> GgmlAsrBackendPreference {
-        if self.forced_cpu_for_rest && !matches!(requested, GgmlAsrBackendPreference::CpuOnly) {
-            GgmlAsrBackendPreference::CpuOnly
-        } else {
-            requested
-        }
-    }
-
-    /// Records the outcome of one attempt at `attempted` (the *effective*
-    /// preference actually dispatched, not necessarily the caller's original
-    /// request). An explicit `CpuOnly` attempt never participates in the
-    /// streak: there is no lower backend to fall back to, so a CPU failure is
-    /// a real capacity error, not a signal that GPU is under pressure.
-    fn record(&mut self, attempted: GgmlAsrBackendPreference, degraded: bool) {
-        if matches!(attempted, GgmlAsrBackendPreference::CpuOnly) {
-            return;
-        }
-        if degraded {
-            self.consecutive_fallbacks += 1;
-            if self.consecutive_fallbacks >= GPU_ALLOCATION_FALLBACK_STREAK_LIMIT {
-                self.forced_cpu_for_rest = true;
-            }
-        } else {
-            self.consecutive_fallbacks = 0;
-        }
-    }
-}
-
-/// Why a slice's result came from CPU instead of the requested GPU-class
-/// backend. Threaded into the longform provenance / degraded-result
-/// diagnostics rather than silently folded into a normal completion (mirrors
-/// the whisper max-tokens-cap "degraded" trace tag precedent).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SliceGpuFallback {
-    /// This slice's own allocation failed on `original_backend` and was
-    /// retried on CPU.
-    AllocationFailure { original_backend: String },
-    /// The GPU was skipped entirely for this slice because the previous
-    /// `GPU_ALLOCATION_FALLBACK_STREAK_LIMIT` slices already fell back.
-    SkippedAfterStreak,
+struct SliceExecutionFallback {
+    failures: Vec<(ExecutionCandidate, ExecutionCandidateFailure)>,
+    selected: ExecutionCandidate,
 }
 
-impl SliceGpuFallback {
-    fn log_reason(&self) -> &'static str {
-        match self {
-            Self::AllocationFailure { .. } => "allocation_failure",
-            Self::SkippedAfterStreak => "previous_slices_exhausted_gpu",
-        }
-    }
-}
-
-/// Recognizes `GgmlCpuGraphError::BackendBufferAllocationFailed`'s Display
-/// text after it has been flattened into a `BackendError::NativeFailClosed`
-/// reason string, and extracts the backend name it names.
-///
-/// This matches on message text rather than downcasting a preserved error
-/// source chain because most model families already flatten their internal
-/// decode-pipeline errors to a plain `String` well before the error reaches
-/// this generic dispatch boundary (e.g. `dolphin::executor`'s `execute` uses
-/// a `fail: impl Fn(String) -> GgmlAsrExecutionError` closure fed by
-/// `error.to_string()` at each internal call site) -- by the time a slice's
-/// dispatch fails here, there is no live source chain left to downcast.
-/// Threading a structured error through every family's internal pipeline
-/// just for this one classification would be exactly the kind of invasive,
-/// family-specific plumbing change `AGENTS.md` asks generic infrastructure
-/// changes to avoid. The marker text comes from this crate's own
-/// `#[error(...)]` message (`GgmlCpuGraphError::BackendBufferAllocationFailed`
-/// in `ggml_runtime::cpu_graph`), not an external dependency, so it is stable
-/// under our own control.
-fn gpu_buffer_allocation_failure_backend(error: &BackendError) -> Option<&str> {
-    let BackendError::NativeFailClosed { reason } = error else {
-        return None;
-    };
-    const MARKER: &str = "compute buffer allocation failed (backend: ";
-    let start = reason.find(MARKER)? + MARKER.len();
-    let end = start + reason[start..].find(')')?;
-    Some(&reason[start..end])
-}
-
-/// Runs one slice's decode, transparently retrying on CPU if the requested
-/// GPU-class backend's compute-buffer allocation fails for that slice.
-///
-/// Issue #158: an ~8GB Vulkan/Metal device's small per-slice compute buffer
-/// can OOM on one slice of a long-form request while every other slice
-/// succeeds (e.g. concurrent VRAM pressure from resident model weights and
-/// warmup buffers) -- failing the *whole* request over one slice's
-/// allocation is strictly worse than falling that one slice back to CPU.
-/// Later slices still try the requested backend first (the pressure may have
-/// been transient), unless the fallback streak limit has tripped (see
-/// [`GpuAllocationFallbackTracker`]).
-///
-/// An explicit `CpuOnly` request never retries: there is no lower backend
-/// to fall back to, so a CPU allocation failure is a real, unrecoverable
-/// capacity error and must fail closed as before. An explicit `Accelerated`
-/// request *does* retry -- the caller asked for speed, but handing back a
-/// slower, correct CPU result beats failing the whole transcription outright
-/// when the GPU genuinely cannot fit this slice; the degraded flag returned
-/// here keeps that substitution visible to the caller rather than silently
-/// invisible. Only `BackendBufferAllocationFailed` triggers this; every
-/// other error class fails closed exactly as before.
+/// Runs one slice through the immutable execution plan. Every attempt covers
+/// decoder-state planning plus the complete family dispatch. A later candidate
+/// is tried only when the failing attempt's allocator/device boundary recorded
+/// a typed candidate-local failure; ordinary decode/input/model errors fail
+/// closed without inspecting their text. `AcceleratedOnly` and `Exact` plans
+/// contain no CPU candidate, so this loop cannot weaken those user intents.
 #[allow(clippy::too_many_arguments)]
-fn run_dispatch_once_with_progress_and_gpu_fallback(
+fn run_dispatch_once_with_progress_and_policy(
     dispatch: &GgmlAsrExecutionDispatch,
+    execution_services: &Arc<NativeExecutionServices>,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     selected_family: &GgmlFamilyAdapterDescriptor,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
-    backend_preference: GgmlAsrBackendPreference,
+    execution_plan: &ExecutionPlan,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     execution_context: &Arc<crate::RequestExecutionContext>,
     decode_progress: &DecodeProgress,
     slice_samples: u64,
     slice_label: &str,
-    tracker: &mut GpuAllocationFallbackTracker,
-) -> Result<(GgmlAsrExecutionResult, Option<SliceGpuFallback>), BackendError> {
-    let effective_preference = tracker.effective_preference(backend_preference);
-    if effective_preference != backend_preference {
-        let fallback = SliceGpuFallback::SkippedAfterStreak;
-        crate::stage_timing::log_detail_event(
-            "native_transcribe",
-            format_args!(
-                "stage=gpu_alloc_fallback event=skip_gpu slice={slice_label} reason={}",
-                fallback.log_reason()
-            ),
-        );
-        let result = run_dispatch_once_with_progress(
-            dispatch,
-            runtime_preflight,
-            selected_family,
-            chunk,
-            request_options,
-            effective_preference,
-            execution_context,
-            decode_progress,
-            slice_samples,
-        )?;
-        tracker.record(effective_preference, true);
-        return Ok((result, Some(fallback)));
-    }
-
-    match run_dispatch_once_with_progress(
-        dispatch,
-        runtime_preflight,
-        selected_family,
-        chunk.clone(),
-        request_options.clone(),
-        effective_preference,
-        execution_context,
-        decode_progress,
-        slice_samples,
-    ) {
-        Ok(result) => {
-            tracker.record(effective_preference, false);
-            Ok((result, None))
-        }
-        Err(error) => {
-            // An already-CPU attempt has no lower backend to retry against: a
-            // `BackendBufferAllocationFailed` here is a real, unrecoverable
-            // capacity error, not a signal to fall further back. Must not
-            // recurse into another CPU attempt.
-            if matches!(effective_preference, GgmlAsrBackendPreference::CpuOnly) {
-                return Err(error);
+) -> Result<(GgmlAsrExecutionResult, Option<SliceExecutionFallback>), BackendError> {
+    let mut failures = Vec::new();
+    let candidates = execution_plan.candidates();
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let backend_preference = match candidate.placement {
+            ExecutionPlacement::CpuOnly => GgmlAsrBackendPreference::CpuOnly,
+            ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => {
+                GgmlAsrBackendPreference::Accelerated
             }
-            let Some(backend) = gpu_buffer_allocation_failure_backend(&error) else {
-                // Not a GPU allocation failure: fails closed exactly as before,
-                // no retry, no streak bookkeeping (this attempt was never a
-                // GPU-fallback-eligible outcome).
-                return Err(error);
-            };
-            let backend = backend.to_string();
-            let fallback = SliceGpuFallback::AllocationFailure {
-                original_backend: backend.clone(),
-            };
-            crate::stage_timing::log_detail_event(
-                "native_transcribe",
-                format_args!(
-                    "stage=gpu_alloc_fallback event=retry_on_cpu slice={slice_label} backend={backend} reason={}",
-                    fallback.log_reason()
-                ),
-            );
-            let result = run_dispatch_once_with_progress(
-                dispatch,
-                runtime_preflight,
-                selected_family,
-                chunk,
-                request_options,
-                GgmlAsrBackendPreference::CpuOnly,
-                execution_context,
-                decode_progress,
-                slice_samples,
-            )?;
-            tracker.record(effective_preference, true);
-            Ok((result, Some(fallback)))
+        };
+        let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
+            execution_services.as_ref(),
+            candidate,
+            || {
+                run_dispatch_once_with_progress(
+                    dispatch,
+                    execution_services,
+                    runtime_preflight,
+                    selected_family,
+                    chunk.clone(),
+                    request_options.clone(),
+                    backend_preference,
+                    request_backend_preference_for_candidate(candidate),
+                    auto_gpu_policy,
+                    execution_context,
+                    decode_progress,
+                    slice_samples,
+                )
+            },
+        );
+        match (attempt.result, attempt.candidate_failure) {
+            (Ok(result), None) => {
+                let fallback = (!failures.is_empty()).then(|| SliceExecutionFallback {
+                    failures,
+                    selected: candidate.clone(),
+                });
+                return Ok((result, fallback));
+            }
+            (Err(error), None) => return Err(error),
+            (result, Some(failure)) => {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => BackendError::NativeFailClosed {
+                        reason: format!(
+                            "execution candidate reported {:?} during '{}' despite returning success",
+                            failure.kind, failure.operation
+                        ),
+                    },
+                };
+                if candidate_index + 1 == candidates.len() {
+                    return Err(error);
+                }
+                crate::stage_timing::log_detail_event(
+                    "native_transcribe",
+                    format_args!(
+                        "stage=execution_candidate event=retry slice={slice_label} provider={} placement={:?} failure={:?} operation={}",
+                        candidate.device.route.provider,
+                        candidate.placement,
+                        failure.kind,
+                        failure.operation,
+                    ),
+                );
+                failures.push((candidate.clone(), failure));
+            }
         }
     }
+    Err(BackendError::NativeFailClosed {
+        reason: "execution policy produced no candidate attempts".to_string(),
+    })
 }
 
 /// Upper bound on concurrent long-audio slice workers. Kept small: the win is
@@ -839,7 +726,7 @@ struct DecodedSlice {
     text: String,
     segments: Vec<Segment>,
     truncation: Option<DecodeTruncation>,
-    fallback: Option<SliceGpuFallback>,
+    fallback: Option<SliceExecutionFallback>,
 }
 
 /// Borrowed context for one concurrent long-audio slice-pipeline run. Grouped
@@ -850,10 +737,12 @@ struct ConcurrentSlicePipeline<'a> {
     slices: Vec<crate::longform::AudioSlice>,
     plan_audio: &'a PcmBuffer,
     dispatch: &'a GgmlAsrExecutionDispatch,
+    execution_services: &'a Arc<NativeExecutionServices>,
     runtime_preflight: &'a GgmlAsrRuntimeSourcePreflight,
     selected_family: &'a GgmlFamilyAdapterDescriptor,
     request_options: &'a GgmlAsrExecutionOptions,
-    backend_preference: GgmlAsrBackendPreference,
+    execution_plan: &'a ExecutionPlan,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     execution_context: &'a Arc<crate::RequestExecutionContext>,
     longform_options: &'a crate::LongFormOptions,
     speaker_plan: SpeakerPlan,
@@ -861,7 +750,7 @@ struct ConcurrentSlicePipeline<'a> {
     assembler: &'a mut TranscriptAssembler,
     ran_any_slice: &'a mut bool,
     suppressed_slice_count: &'a mut usize,
-    degraded_slice_fallbacks: &'a mut Vec<(usize, SliceGpuFallback)>,
+    degraded_slice_fallbacks: &'a mut Vec<(usize, SliceExecutionFallback)>,
     truncated_slices: &'a mut Vec<String>,
     truncated_decodes: &'a mut Vec<TruncatedDecode>,
     speaker_scope_count: &'a mut usize,
@@ -900,10 +789,12 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         slices,
         plan_audio,
         dispatch,
+        execution_services,
         runtime_preflight,
         selected_family,
         request_options,
-        backend_preference,
+        execution_plan,
+        auto_gpu_policy,
         execution_context,
         longform_options,
         speaker_plan,
@@ -973,11 +864,6 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                     // between-step cancel is already covered by the shared
                     // greedy driver's per-token poll of the job-carried control.
                     let _abort_guard = execution_context.control.arm_for_native_decode();
-                    // Per-worker fallback tracker (property 4): the GPU-allocation
-                    // streak is meaningful only within one worker's own sequence
-                    // of slices, and sharing it across threads would be a data
-                    // race.
-                    let mut tracker = GpuAllocationFallbackTracker::default();
                     loop {
                         if stop_ref.load(Ordering::Relaxed) {
                             break;
@@ -1002,18 +888,19 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                         let slice_options = request_options.clone();
                         let chunk =
                             plan_audio.slice(item.slice.start_sample..item.slice.end_sample);
-                        let outcome = run_dispatch_once_with_progress_and_gpu_fallback(
+                        let outcome = run_dispatch_once_with_progress_and_policy(
                             dispatch,
+                            execution_services,
                             runtime_preflight,
                             selected_family,
                             chunk,
                             slice_options,
-                            backend_preference,
+                            execution_plan,
+                            auto_gpu_policy,
                             execution_context,
                             decode_progress,
                             item.slice_samples,
                             &format!("concurrent-pos={pos}"),
-                            &mut tracker,
                         )
                         .map(|(result, fallback)| DecodedSlice {
                             text: result.transcription.text,
@@ -1187,18 +1074,26 @@ struct NativeLongformPolicyResolution {
 /// covered by one log site instead of needing its own.
 pub(super) fn run_native_transcription(
     request: TranscriptionRequest,
+    execution_services: Arc<NativeExecutionServices>,
 ) -> Result<Transcription, BackendError> {
-    run_native_transcription_fallible(request).inspect_err(|error| {
-        log_failure_context(classify_backend_error_for_failure_log(error));
-    })
+    run_native_transcription_with_intent(request, execution_services, None)
 }
 
-/// Coarse [`FailureCategory`] bucket for a `BackendError`, reusing its
-/// existing variants (and, for the variants that flatten internal detail
-/// into a `NativeFailClosed` reason string, the same allocation-failure
-/// marker-text sniffing `gpu_buffer_allocation_failure_backend` already
-/// relies on above) rather than introducing a second, parallel error
-/// taxonomy just for logging.
+pub(super) fn run_native_transcription_with_intent(
+    request: TranscriptionRequest,
+    execution_services: Arc<NativeExecutionServices>,
+    execution_intent: Option<ExecutionIntent>,
+) -> Result<Transcription, BackendError> {
+    run_native_transcription_fallible(request, &execution_services, execution_intent).inspect_err(
+        |error| {
+            log_failure_context(classify_backend_error_for_failure_log(error));
+        },
+    )
+}
+
+/// Coarse [`FailureCategory`] bucket for a final `BackendError`. Candidate
+/// retry decisions use the typed attempt-local failure sink and never this
+/// diagnostic classification.
 fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCategory {
     match error {
         BackendError::NativeUnsupportedInputFormat { .. } => FailureCategory::AudioIo,
@@ -1226,11 +1121,6 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         // build instead of during it.
         BackendError::NativeInsufficientHostMemory { .. } => FailureCategory::Alloc,
         BackendError::NativeFailClosed { .. }
-            if gpu_buffer_allocation_failure_backend(error).is_some() =>
-        {
-            FailureCategory::Alloc
-        }
-        BackendError::NativeFailClosed { .. }
         | BackendError::ExternalDiarizationFailed { .. }
         | BackendError::WordTimestampAlignmentFailed { .. } => FailureCategory::Decode,
     }
@@ -1238,6 +1128,8 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
 
 fn run_native_transcription_fallible(
     request: TranscriptionRequest,
+    execution_services: &Arc<NativeExecutionServices>,
+    execution_intent: Option<ExecutionIntent>,
 ) -> Result<Transcription, BackendError> {
     if let Some(requested) = request.diarize_speakers {
         let max = crate::diarize::contract::MAX_DIARIZATION_SPEAKERS;
@@ -1279,21 +1171,13 @@ fn run_native_transcription_fallible(
     let language_hint = request.language.clone();
     let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
-    // Captured before the move below: the punctuation post-process is a
-    // separate pack from the main ASR family (never carries a
-    // `GgmlAsrExecutionViewRequest`/`resolved_runtime`), so it resolves its own
-    // backend explicitly here from this request's own execution target,
-    // rather than reaching for the implicit generic default.
-    let punctuation_backend = execution_target_backend_preference(request.execution_target)
-        .ok()
-        .map(|preference| {
-            crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-                preference.request_backend_override(),
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-            )
-            .backend()
-        })
-        .unwrap_or(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
+    // Every independent native model stage resolves from this same immutable
+    // product intent. Each stage still owns its own capability matrix and
+    // candidate transaction; no auxiliary model inherits a coarse backend or
+    // re-reads process defaults after the main ASR dispatch completes.
+    let request_execution_intent = execution_intent
+        .clone()
+        .unwrap_or_else(|| ExecutionIntent::from(request.execution_target.unwrap_or_default()));
     // Coarse per-request stage timing: "inference" spans model resolution +
     // audio prep (see the `audio_prep` stage logged inside `_impl` around the
     // WAV load) + decode/longform-assembly, i.e. the whole
@@ -1303,7 +1187,11 @@ fn run_native_transcription_fallible(
     // finer `audio_prep` sub-stage nests inside `inference`'s span rather than
     // being disjoint from it, which is called out in both log lines' names.
     let inference_started = Instant::now();
-    let (transcription, prepared_audio) = run_native_transcription_impl(request)?;
+    let (transcription, prepared_audio) = run_native_transcription_impl(
+        request,
+        execution_services,
+        Some(request_execution_intent.clone()),
+    )?;
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
@@ -1313,19 +1201,22 @@ fn run_native_transcription_fallible(
         inference_started.elapsed(),
     );
     let postprocess_started = Instant::now();
-    let transcription = apply_punctuation_stage_if_applicable(
+    let transcription = apply_punctuation_stage_with_policy(
         transcription,
         model_pack_path.as_deref(),
         punctuate,
-        punctuation_backend,
-    );
+        execution_services,
+        &request_execution_intent,
+    )?;
     let result = if refine {
         publish_align_progress(execution_context.request_id.as_deref());
-        refine_transcription_word_timestamps_with_forced_aligner(
+        refine_transcription_word_timestamps_with_forced_aligner_policy(
             transcription,
             forced_aligner_audio_view(&prepared_audio, refine)
                 .expect("enabled forced alignment retains the normalized PCM view"),
             language_hint.as_deref(),
+            execution_services,
+            &request_execution_intent,
         )
     } else {
         Ok(transcription)
@@ -1370,6 +1261,7 @@ fn model_emits_punctuation(model_pack_path: Option<&Path>) -> Option<bool> {
 /// corrupt pack, or a classifier failure all leave `transcription` exactly as
 /// the ASR family produced it rather than crashing the request or fabricating
 /// punctuation; the native backend never downloads this pack.
+#[cfg(test)]
 fn apply_punctuation_stage_if_applicable(
     transcription: Transcription,
     model_pack_path: Option<&Path>,
@@ -1388,6 +1280,90 @@ fn apply_punctuation_stage_if_applicable(
     punctuate_transcription_segments(transcription, &runtime)
 }
 
+fn apply_punctuation_stage_with_policy(
+    transcription: Transcription,
+    model_pack_path: Option<&Path>,
+    punctuate: bool,
+    execution_services: &NativeExecutionServices,
+    request_intent: &ExecutionIntent,
+) -> Result<Transcription, BackendError> {
+    if !should_run_punctuation_stage(punctuate, model_emits_punctuation(model_pack_path)) {
+        return Ok(transcription);
+    }
+    let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
+        return Ok(transcription);
+    };
+    let Ok(prepared_source) = crate::validate_ggml_runtime_source_path(&punc_pack_path) else {
+        return Ok(transcription);
+    };
+    let prepared_content_id = prepared_source.content_id().to_string();
+    drop(prepared_source);
+    let execution_plan = resolve_auxiliary_execution_plan(
+        execution_services,
+        crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
+        request_intent,
+    )?;
+    let result = run_auxiliary_stage_with_policy(
+        execution_services,
+        &execution_plan,
+        "firered-punctuation",
+        |candidate| {
+            // Punctuation is an optional accuracy stage: malformed/missing
+            // runtime errors keep the ASR output unchanged. Candidate-local
+            // allocator/device failures are still recorded by the graph
+            // boundary; the stage policy sees that typed side channel and
+            // retries instead of silently accepting the no-op.
+            let Ok(runtime) = load_actor(
+                execution_services,
+                &punc_pack_path,
+                &prepared_content_id,
+                candidate,
+            ) else {
+                return Ok(transcription.clone());
+            };
+            Ok(punctuate_transcription_segments_with_actor(
+                transcription.clone(),
+                &runtime,
+            ))
+        },
+    );
+    finish_optional_punctuation_stage(transcription, result)
+}
+
+/// Product-policy boundary for FireRedPunc. The planner has already exhausted
+/// only semantics-equivalent execution candidates when it returns
+/// `CandidatesExhausted`; because punctuation is an automatic enhancement,
+/// that expected resource failure (or an ordinary optional-model failure)
+/// preserves the ASR result. Internal planner invariants remain fatal.
+fn finish_optional_punctuation_stage(
+    original: Transcription,
+    result: Result<Transcription, PolicyResolvedAuxRuntimeError<BackendError>>,
+) -> Result<Transcription, BackendError> {
+    match result {
+        Ok(punctuated) => Ok(punctuated),
+        Err(error) if optional_punctuation_failure_disables_stage(&error) => {
+            crate::stage_timing::log_detail_event(
+                "native_transcribe",
+                format_args!(
+                    "stage=auxiliary_execution_candidate event=disabled auxiliary_stage=firered-punctuation reason={error}"
+                ),
+            );
+            Ok(original)
+        }
+        Err(error) => Err(required_auxiliary_stage_error(error)),
+    }
+}
+
+fn optional_punctuation_failure_disables_stage(
+    error: &PolicyResolvedAuxRuntimeError<BackendError>,
+) -> bool {
+    matches!(
+        error,
+        PolicyResolvedAuxRuntimeError::Operation(_)
+            | PolicyResolvedAuxRuntimeError::CandidatesExhausted { .. }
+    )
+}
+
 /// Restores punctuation on each finalized segment's text independently (the
 /// stage's documented "finalize-only, per segment" contract -- see
 /// `crate::punctuation`'s module docs) and rebuilds the top-level `text` field
@@ -1396,12 +1372,32 @@ fn apply_punctuation_stage_if_applicable(
 /// segments stay consistent. A segment whose classifier call fails keeps its
 /// original (unpunctuated) text -- fail-closed per segment rather than
 /// aborting the whole transcript.
+#[cfg(test)]
 fn punctuate_transcription_segments(
-    mut transcription: Transcription,
+    transcription: Transcription,
     runtime: &FireRedPuncRuntime,
 ) -> Transcription {
     for segment in &mut transcription.segments {
         if let Ok(punctuated) = runtime.punctuate(&segment.text) {
+            segment.text = punctuated;
+        }
+    }
+    transcription.text = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    transcription
+}
+
+fn punctuate_transcription_segments_with_actor(
+    mut transcription: Transcription,
+    runtime: &FireRedPuncActor,
+) -> Transcription {
+    for segment in &mut transcription.segments {
+        if let Ok(punctuated) = punctuate(runtime, &segment.text) {
             segment.text = punctuated;
         }
     }
@@ -1449,10 +1445,12 @@ fn resolve_prepared_audio_samples(
 /// per-word confidence -- the aligner does not produce one; never inventing a
 /// value is preferred to fabricating one). Segments/text/speaker attribution
 /// from the ordinary decode path are left untouched; only `words` changes.
-fn refine_transcription_word_timestamps_with_forced_aligner(
-    mut transcription: Transcription,
+fn refine_transcription_word_timestamps_with_forced_aligner_policy(
+    transcription: Transcription,
     prepared_audio: PcmSlice,
     language_hint: Option<&str>,
+    execution_services: &NativeExecutionServices,
+    request_intent: &ExecutionIntent,
 ) -> Result<Transcription, BackendError> {
     let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
         .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
@@ -1461,17 +1459,37 @@ fn refine_transcription_word_timestamps_with_forced_aligner(
         .clone()
         .or_else(|| language_hint.map(str::to_string))
         .unwrap_or_else(|| "en".to_string());
-    let items = refine_word_timestamps_with_forced_aligner(
-        &pack_path,
-        prepared_audio,
-        &transcription.text,
-        &language,
+    let execution_plan = resolve_auxiliary_execution_plan(
+        execution_services,
+        crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        request_intent,
+    )?;
+    run_auxiliary_stage_with_policy(
+        execution_services,
+        &execution_plan,
+        "qwen3-forced-aligner",
+        |candidate| {
+            let backend = resolved_runtime_for_candidate(
+                candidate,
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            )
+            .backend();
+            let items = refine_word_timestamps_with_forced_aligner(
+                &pack_path,
+                prepared_audio.clone(),
+                &transcription.text,
+                &language,
+                backend,
+            )
+            .map_err(|error| BackendError::WordTimestampAlignmentFailed {
+                reason: error.to_string(),
+            })?;
+            let mut refined = transcription.clone();
+            assign_aligned_words_to_segments(&mut refined.segments, &items);
+            Ok(refined)
+        },
     )
-    .map_err(|error| BackendError::WordTimestampAlignmentFailed {
-        reason: error.to_string(),
-    })?;
-    assign_aligned_words_to_segments(&mut transcription.segments, &items);
-    Ok(transcription)
+    .map_err(required_auxiliary_stage_error)
 }
 
 /// Distributes forced-aligner word spans onto the (time-ordered,
@@ -1512,11 +1530,11 @@ fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAli
 /// booleans that could both be live, letting an external pass overwrite labels
 /// a family had already produced.
 ///
-/// Identity is deliberately NOT part of this decision: matching
-/// recording-local turns to known people is one source-independent stage that
-/// runs afterwards (`diarize::voice_id`), so it composes with either source.
-/// An explicit Voice ID request preflights the shared embedder and fails closed
-/// when its acoustic-identity stage cannot run.
+/// Identity is deliberately NOT part of the segmentation-source decision:
+/// matching recording-local turns to known people is one source-independent
+/// stage that runs afterwards (`diarize::voice_id`) and composes with either
+/// source. Voice ID is default-off; once explicitly enabled, an installed but
+/// unusable required embedder fails closed before speaker results escape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpeakerPlan {
     /// Voice ID off. No speaker structure reaches the caller -- including for a
@@ -1552,6 +1570,8 @@ fn forced_aligner_audio_view(audio: &PcmBuffer, refine: bool) -> Option<PcmSlice
 
 fn run_native_transcription_impl(
     mut request: TranscriptionRequest,
+    execution_services: &Arc<NativeExecutionServices>,
+    execution_intent: Option<ExecutionIntent>,
 ) -> Result<(Transcription, PcmBuffer), BackendError> {
     // Captured up front and threaded explicitly through the dispatch calls
     // below (never a thread-local): every cooperative cancel checkpoint in
@@ -1583,6 +1603,16 @@ fn run_native_transcription_impl(
         runtime_preflight.runtime_source.path(),
         &selection_metadata,
     )?;
+    let request_execution_intent = execution_intent
+        .unwrap_or_else(|| ExecutionIntent::from(request.execution_target.unwrap_or_default()));
+    let execution_plan = resolve_native_execution_plan(
+        execution_services.as_ref(),
+        &selected_family,
+        request_execution_intent.clone(),
+    )?;
+    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
+        selected_family.model_architecture,
+    );
     // Fail closed up front on task/language a non-Whisper family cannot honor,
     // rather than silently transcribing or erroring deep in the decode loop.
     let language_mode = crate::models::language::resolve_language_mode(
@@ -1610,52 +1640,10 @@ fn run_native_transcription_impl(
         ),
         request.phrase_bias.as_ref(),
     )?;
-    // Resolve and install the request's hardware route before any auxiliary
-    // Voice ID model is preflighted. DiariZen constructs a resident ggml graph
-    // during preflight, so installing this only at decoder dispatch would let
-    // the first request permanently choose the auxiliary model's device.
-    let backend_preference = execution_target_backend_preference(request.execution_target)?;
-    let request_backend_preference = backend_preference.request_backend_override();
-    let _backend_guard = install_request_backend_override(request_backend_preference.clone());
-    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
-        selected_family.model_architecture,
-    );
-    let resolved_runtime_for_request = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        request_backend_preference.clone(),
-        auto_gpu_policy,
-    );
     // Resolve the one segmentation source for this request. Exactly one runs:
     // the family's own decode, or the external segment/embed/cluster pass --
     // never both, so nothing can overwrite the other's labels downstream.
     let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
-    // Freeze lightweight, already-open pack snapshots before audio decode, but
-    // do not parse/dequantize weights or construct an auxiliary graph yet. The
-    // held mappings are materialized only after audio preparation and memory
-    // admission, so a malformed input or known-impossible request never pays
-    // the auxiliary model working set and path replacement cannot change the
-    // bytes admitted for this request.
-    let voice_id_embedder_plan = if speaker_plan == SpeakerPlan::Off {
-        None
-    } else {
-        Some(
-            crate::diarize::embed::prepare_shared_embedder_snapshot().ok_or(
-                BackendError::VoiceIdIdentityFailed(
-                    crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
-                ),
-            )?,
-        )
-    };
-    let external_diarizer_plan = if speaker_plan == SpeakerPlan::External {
-        Some(
-            crate::diarize::external::PreparedExternalDiarizer::prepare(
-                request.voice_id_segmenter,
-                request_backend_preference.clone(),
-            )
-            .map_err(external_diarization_error_to_backend)?,
-        )
-    } else {
-        None
-    };
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
         // needs Voice ID on, and only the external clustering path clusters.
@@ -1699,86 +1687,48 @@ fn run_native_transcription_impl(
         speaker_plan
     };
 
-    // Reject before any decode graph gets built -- and before
-    // `compute_speaker_attribution` below, which loads the segmenter and
-    // speaker-embedder models and runs the whole-recording diarization module,
-    // itself a significant memory user -- if this request's decoder KV
-    // footprint plainly does not fit this host's memory budget (a pack whose
-    // KV cache plus weights exceed the host memory budget, surfacing
-    // otherwise as an opaque "ggml cpu graph backend buffer allocation
-    // failed" instead of an actionable error). `audio_duration_seconds` only
-    // needs the decoded sample count, so this can run as soon as
-    // `prepared_audio` exists, ahead of every other per-request pass. Shared
-    // by CLI and server -- both funnel through this function -- and runs
-    // before `resolve_native_longform_policy` / dispatch, i.e. before the
-    // real graph build, not in the server route layer (which the CLI never
-    // goes through). Wired per family via `native_capacity_admission_facts`;
-    // families without a wired deriver fall through to "allow". A request
-    // whose speaker plan enables Voice ID is additionally charged the shared
-    // Voice ID stack's co-resident footprint (`voice_id_admission_bytes`). The
-    // lightweight snapshots above are still unmaterialized at this gate.
-    let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
-    // Admission uses the exact same already-resolved decoder backend as
-    // provenance and dispatch. Auxiliary models report their own backend
-    // separately because Auto may legitimately place DiariZen on a GPU even
-    // when this ASR family gates its own Auto path to CPU.
-    let admission_backend = resolved_runtime_for_request.backend();
-    let request_working_set = native_request_working_set_admission(
-        speaker_plan,
-        prepared_audio.resident_bytes(),
-        voice_id_embedder_plan
-            .as_ref()
-            .map_or(0, |embedder| embedder.admission_bytes()),
-        external_diarizer_plan.as_ref().map(|diarizer| {
-            (
-                diarizer.segmenter_admission_bytes(),
-                diarizer.segmenter_admission_backend(),
-                diarizer.segmenter_discrete_vram_budget_bytes(),
-                diarizer
-                    .working_set_admission_bytes(prepared_audio.len(), request.diarize_speakers),
-            )
-        }),
-    );
-    let decoder_discrete_vram_budget_bytes = minimum_discrete_vram_budget_for_preference(
-        admission_backend,
-        request_backend_preference.as_ref(),
-    );
-    enforce_native_host_memory_admission(
-        selected_family.model_architecture,
-        &runtime_preflight.metadata,
-        runtime_source.byte_len(),
-        audio_duration_seconds,
-        admission_backend,
-        request_working_set,
-        decoder_discrete_vram_budget_bytes,
-    )?;
-
-    let voice_id_embedder = if speaker_plan == SpeakerPlan::Off {
-        None
-    } else {
-        let embedder = voice_id_embedder_plan
-            .expect("enabled Voice ID prepared an embedder snapshot")
-            .materialize()
-            .ok_or(BackendError::VoiceIdIdentityFailed(
-                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
-            ))?;
-        Some(embedder)
-    };
-    let external_diarizer = if speaker_plan == SpeakerPlan::External {
+    let external_diarizer_plan = if speaker_plan == SpeakerPlan::External {
         Some(
-            external_diarizer_plan
-                .expect("external Voice ID prepared a segmenter snapshot")
-                .materialize(Arc::clone(
-                    voice_id_embedder
-                        .as_ref()
-                        .expect("external Voice ID materialized its embedder"),
-                ))
+            crate::diarize::external::PreparedExternalDiarizer::prepare(request.voice_id_segmenter)
                 .map_err(external_diarization_error_to_backend)?,
         )
     } else {
         None
     };
 
+    let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
+    let speaker_runtime = if speaker_plan == SpeakerPlan::Off {
+        None
+    } else {
+        Some(
+            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
+                Arc::clone(execution_services),
+                request_execution_intent.clone(),
+            )
+            .map_err(|error| BackendError::NativeFailClosed {
+                reason: format!("could not construct the admitted speaker runtime: {error}"),
+            })?
+            .ok_or(BackendError::DiarizationNotSupported { backend: "native" })?,
+        )
+    };
+    let external_diarizer = if speaker_plan == SpeakerPlan::External {
+        let speaker_runtime = speaker_runtime
+            .as_ref()
+            .expect("external speaker plan materialized speaker runtime");
+        Some(
+            external_diarizer_plan
+                .expect("external speaker plan prepared a segmenter")
+                .materialize(
+                    Arc::clone(execution_services),
+                    request_execution_intent.clone(),
+                    speaker_runtime.shared_embedder(),
+                )
+                .map_err(external_diarization_error_to_backend)?,
+        )
+    } else {
+        None
+    };
+    let voice_id_embedder = speaker_runtime.as_ref().map(|runtime| runtime.embedder());
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
     let voice_id_audio = voice_id_audio_view(&prepared_audio, speaker_plan);
@@ -1792,14 +1742,14 @@ fn run_native_transcription_impl(
             voice_id_audio
                 .as_ref()
                 .expect("external speaker plan retains a Voice ID PCM view")
-                .as_slice(),
+                .clone(),
             hint,
             &execution_context,
         )?
     } else {
         SpeakerAttribution::default()
     };
-    let dispatch = shared_native_ggml_execution_dispatch();
+    let dispatch = execution_services.offline_dispatch();
     let longform_resolution = resolve_native_longform_policy(
         request.longform.as_ref(),
         audio_duration_seconds,
@@ -1857,6 +1807,12 @@ fn run_native_transcription_impl(
     // the two mutually exclusive, and this is where that decision reaches the
     // family executor.
     request_options.in_decoder_speakers = speaker_plan == SpeakerPlan::InDecoder;
+    let primary_candidate = execution_plan
+        .candidates()
+        .first()
+        .expect("execution policy plans are non-empty");
+    let resolved_runtime_for_request =
+        resolved_runtime_for_candidate(primary_candidate, auto_gpu_policy);
     // Per-request diagnostics line (source/model/quant/backend/audio shape) --
     // logged once here, after model resolution and audio prep have both
     // succeeded and the backend label is resolvable, and before decode
@@ -1881,31 +1837,52 @@ fn run_native_transcription_impl(
     // short recording used to come back silently cut with a success status.
     let mut truncated_decodes: Vec<TruncatedDecode> = Vec::new();
     if run_longform {
-        let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options)?;
-        let mut plan = plan_longform_slices_with_materialization_gate(
-            &prepared_audio,
-            16_000,
-            &longform_options,
-            Some(vad_provider.as_ref()),
-            |packed_samples| {
-                enforce_native_host_memory_admission(
-                    selected_family.model_architecture,
-                    &runtime_preflight.metadata,
-                    runtime_source.byte_len(),
-                    audio_duration_seconds,
-                    admission_backend,
-                    request_working_set
-                        .with_additional_unified_bytes(pcm_sample_capacity_bytes(packed_samples)),
-                    decoder_discrete_vram_budget_bytes,
+        let vad_execution_plan = resolve_fixed_cpu_execution_plan(execution_services.as_ref())?;
+        let (mut plan, vad_engine_label) = run_auxiliary_stage_with_policy(
+            execution_services.as_ref(),
+            &vad_execution_plan,
+            "longform-vad",
+            |_| {
+                let (vad_provider, vad_engine_label) =
+                    resolve_longform_vad_provider(&longform_options)?;
+                let plan = plan_longform_slices_with_materialization_gate(
+                    &prepared_audio,
+                    16_000,
+                    &longform_options,
+                    Some(vad_provider.as_ref()),
+                    |packed_samples| {
+                        // Packing a VAD timeline creates a second, recording-sized
+                        // PCM buffer. Reject a known-impossible allocation before
+                        // materializing it, while retaining broker headroom for
+                        // driver and backend allocations outside OpenASR owners.
+                        let packed_bytes = u64::try_from(packed_samples)
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(std::mem::size_of::<f32>() as u64);
+                        let headroom_bytes =
+                            execution_services.memory_broker().minimum_headroom_bytes();
+                        let required_bytes = packed_bytes.saturating_add(headroom_bytes);
+                        if let Some(available_bytes) = crate::host::host_available_memory_bytes()
+                            && available_bytes < required_bytes
+                        {
+                            return Err(BackendError::NativeInsufficientHostMemory {
+                                reason: format!(
+                                    "longform packed-audio materialization needs {packed_bytes} bytes in addition to broker headroom ({headroom_bytes} bytes), but only {available_bytes} bytes are currently available"
+                                ),
+                            });
+                        }
+                        Ok(())
+                    },
                 )
+                .map_err(|error| match error {
+                    LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
+                        reason: format!("could not build longform slice plan: {error}"),
+                    },
+                    LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
+                })?;
+                Ok((plan, vad_engine_label))
             },
         )
-        .map_err(|error| match error {
-            LongFormSlicePlanningError::Planning(error) => BackendError::NativeFailClosed {
-                reason: format!("could not build longform slice plan: {error}"),
-            },
-            LongFormSlicePlanningError::PackedAudioAdmission(error) => error,
-        })?;
+        .map_err(required_auxiliary_stage_error)?;
         let plan_stats = plan.stats.clone();
         let mut longform_provenance =
             combined_longform_provenance(&longform_resolution.provenance, &plan_stats.provenance);
@@ -1959,22 +1936,6 @@ fn run_native_transcription_impl(
                 prepared_audio,
             ));
         }
-        // The planner called the materialization gate before allocating this
-        // second PCM owner. Repeat with Vec's observed capacity as a defensive
-        // allocator check before any decode graph; identity and all-silent
-        // plans need neither packed charge.
-        if let Some(processed_audio) = plan.processed_audio.as_ref() {
-            enforce_native_host_memory_admission(
-                selected_family.model_architecture,
-                &runtime_preflight.metadata,
-                runtime_source.byte_len(),
-                audio_duration_seconds,
-                admission_backend,
-                request_working_set
-                    .with_additional_unified_bytes(pcm_vec_resident_bytes(processed_audio)),
-                decoder_discrete_vram_budget_bytes,
-            )?;
-        }
         if has_processed_audio || plan.slices.len() > 1 {
             let mut assembler =
                 TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default());
@@ -2021,11 +1982,7 @@ fn run_native_transcription_impl(
             // registered) never trips either check, leaving the decode
             // byte-identical to before.
             let mut slice_index = 0usize;
-            // Issue #158: per-slice GPU-class compute-buffer allocation
-            // fallback state, persisted across the whole slice loop (see
-            // `GpuAllocationFallbackTracker` / `run_dispatch_once_with_progress_and_gpu_fallback`).
-            let mut gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
-            let mut degraded_slice_fallbacks: Vec<(usize, SliceGpuFallback)> = Vec::new();
+            let mut degraded_slice_fallbacks: Vec<(usize, SliceExecutionFallback)> = Vec::new();
             // Slices whose decode stopped short of their own audio, rendered
             // for the provenance string channel (see
             // `format_truncated_slice_provenance`).
@@ -2067,10 +2024,12 @@ fn run_native_transcription_impl(
                     slices: plan.slices,
                     plan_audio: &plan_audio,
                     dispatch,
+                    execution_services,
                     runtime_preflight: &runtime_preflight,
                     selected_family: &selected_family,
                     request_options: &request_options,
-                    backend_preference,
+                    execution_plan: &execution_plan,
+                    auto_gpu_policy,
                     execution_context: &execution_context,
                     longform_options: &longform_options,
                     speaker_plan,
@@ -2134,21 +2093,22 @@ fn run_native_transcription_impl(
                     }
                     slice_index += 1;
                     let slice_decode_started = Instant::now();
-                    let (result, slice_gpu_fallback) =
-                        run_dispatch_once_with_progress_and_gpu_fallback(
+                    let (result, slice_execution_fallback) =
+                        run_dispatch_once_with_progress_and_policy(
                             dispatch,
+                            execution_services,
                             &runtime_preflight,
                             &selected_family,
                             chunk,
                             slice_options,
-                            backend_preference,
+                            &execution_plan,
+                            auto_gpu_policy,
                             &execution_context,
                             &decode_progress,
                             slice_samples,
                             &format!("index={slice_index}"),
-                            &mut gpu_fallback_tracker,
                         )?;
-                    if let Some(fallback) = slice_gpu_fallback {
+                    if let Some(fallback) = slice_execution_fallback {
                         degraded_slice_fallbacks.push((slice_index, fallback));
                     }
                     // OPENASR_TIMING=1 detail: per-longform-slice decode time.
@@ -2225,39 +2185,33 @@ fn run_native_transcription_impl(
             // Decode done; the merge/resegment tail below runs uncounted otherwise,
             // which is where the bar used to sit frozen at the last slice count.
             publish_assemble_progress(execution_context.request_id.as_deref(), with_align);
-            // Issue #158: surface any per-slice GPU-allocation-failure fallback in
-            // the run's existing provenance channel (mirrors the
-            // `cohere-metal-multichunk-prefer-cpu-decoder` tag above for a similar
-            // "backend behaved differently than the naive default" case) rather
-            // than silently returning a result whose degraded slices are invisible
-            // to the caller.
             if !degraded_slice_fallbacks.is_empty() {
-                let retried_indices: Vec<String> = degraded_slice_fallbacks
+                let fallback_facts: Vec<String> = degraded_slice_fallbacks
                     .iter()
-                    .filter(|(_, fallback)| {
-                        matches!(fallback, SliceGpuFallback::AllocationFailure { .. })
+                    .map(|(index, fallback)| {
+                        let failed = fallback
+                            .failures
+                            .iter()
+                            .map(|(candidate, failure)| {
+                                format!(
+                                    "{}:{:?}:{:?}",
+                                    candidate.device.route.provider,
+                                    candidate.placement,
+                                    failure.kind
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("+");
+                        format!(
+                            "{index}[{failed}->{}:{:?}]",
+                            fallback.selected.device.route.provider, fallback.selected.placement
+                        )
                     })
-                    .map(|(index, _)| index.to_string())
                     .collect();
-                let skipped_indices: Vec<String> = degraded_slice_fallbacks
-                    .iter()
-                    .filter(|(_, fallback)| {
-                        matches!(fallback, SliceGpuFallback::SkippedAfterStreak)
-                    })
-                    .map(|(index, _)| index.to_string())
-                    .collect();
-                if !retried_indices.is_empty() {
-                    longform_provenance.push(format!(
-                        "core.native.backend.gpu-alloc-fallback:retried-on-cpu,slices={}",
-                        retried_indices.join(";")
-                    ));
-                }
-                if !skipped_indices.is_empty() {
-                    longform_provenance.push(format!(
-                        "core.native.backend.gpu-alloc-fallback:skipped-gpu-after-streak,slices={}",
-                        skipped_indices.join(";")
-                    ));
-                }
+                longform_provenance.push(format!(
+                    "core.native.execution.candidate-fallback:slices={}",
+                    fallback_facts.join(";")
+                ));
             }
             if !truncated_slices.is_empty() {
                 longform_provenance.push(format!(
@@ -2283,14 +2237,19 @@ fn run_native_transcription_impl(
             );
             if !ran_any_slice && suppressed_slice_count > 0 {
                 let fallback_options = request_options.clone();
-                let fallback = run_dispatch_once(
+                let (fallback, _) = run_dispatch_once_with_progress_and_policy(
                     dispatch,
+                    execution_services,
                     &runtime_preflight,
                     &selected_family,
                     prepared_audio.full_slice(),
                     fallback_options,
-                    backend_preference,
+                    &execution_plan,
+                    auto_gpu_policy,
                     &execution_context,
+                    &decode_progress,
+                    0,
+                    "suppressed-whole-file",
                 )?;
                 // This whole-file fallback replaces the slice results entirely,
                 // so its own truncation is the only one that describes the
@@ -2309,7 +2268,7 @@ fn run_native_transcription_impl(
                     Some(run_metadata),
                     &speaker_turns,
                     voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
-                    voice_id_embedder.as_deref(),
+                    voice_id_embedder,
                     speaker_plan,
                     &[],
                     strip_forced_word_timestamps,
@@ -2324,7 +2283,7 @@ fn run_native_transcription_impl(
                 Some(run_metadata),
                 &speaker_turns,
                 voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
-                voice_id_embedder.as_deref(),
+                voice_id_embedder,
                 speaker_plan,
                 &speaker_scope_by_segment,
                 strip_forced_word_timestamps,
@@ -2359,30 +2318,25 @@ fn run_native_transcription_impl(
         single_pass_total_samples,
         request.word_timestamps_refine,
     );
-    // Issue #158: a fresh, one-shot tracker -- a single-pass request has
-    // exactly one dispatch attempt, so the streak-limit skip path can never
-    // trip here, but the same GPU-allocation-failure retry still applies
-    // (short audio, or a longform plan that collapsed to one slice, can still
-    // land on a GPU-class backend with no VRAM headroom for it).
-    let mut single_pass_gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
-    let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
+    let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_policy(
         dispatch,
+        execution_services,
         &runtime_preflight,
         &selected_family,
         prepared_audio.full_slice(),
         request_options,
-        backend_preference,
+        &execution_plan,
+        auto_gpu_policy,
         &execution_context,
         &single_pass_decode_progress,
         single_pass_total_samples,
         "single-pass",
-        &mut single_pass_gpu_fallback_tracker,
     )?;
     if single_pass_fallback.is_some() {
-        let tag = "core.native.backend.gpu-alloc-fallback:retried-on-cpu,slices=single-pass";
+        let tag = "core.native.execution.candidate-fallback:slices=single-pass";
         // No longform run at all (plain short-audio decode) leaves nowhere to
         // stamp this: the structured log line from
-        // `run_dispatch_once_with_progress_and_gpu_fallback` is this path's
+        // `run_dispatch_once_with_progress_and_policy` is this path's
         // only degraded-result diagnostic in that case.
         if let Some(metadata) = longform_metadata.as_mut() {
             metadata.provenance.push(tag.to_string());
@@ -2409,7 +2363,7 @@ fn run_native_transcription_impl(
         longform_metadata,
         &speaker_turns,
         voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
-        voice_id_embedder.as_deref(),
+        voice_id_embedder,
         speaker_plan,
         &[],
         strip_forced_word_timestamps,
@@ -2655,20 +2609,20 @@ struct SpeakerAttribution {
 /// centroids.
 fn compute_speaker_attribution(
     diarizer: &crate::diarize::external::ExternalDiarizer,
-    samples: &[f32],
+    samples: PcmSlice,
     hint: crate::diarize::contract::DiarizeHint,
     execution_context: &crate::RequestExecutionContext,
 ) -> Result<SpeakerAttribution, BackendError> {
     let diarize_debug = crate::diarize::debug::diarize_debug_enabled();
-    if diarize_debug {
-        eprintln!(
-            "openasr_diarize_debug stage=batch segmenter={:?}",
-            diarizer.selected_segmenter()
-        );
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
     }
     let diarization = diarizer
         .diarize(samples, 16_000, hint, &|| execution_context.is_canceled())
         .map_err(external_diarization_error_to_backend)?;
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     if diarize_debug {
         eprintln!(
             "openasr_diarize_debug stage=batch turns={} speakers={}",
@@ -2739,647 +2693,6 @@ fn apply_speaker_attribution(
         );
     }
     transcription
-}
-
-/// One family's decoder-KV admission facts, derived from the loaded pack by
-/// the per-family dispatch ([`native_capacity_admission_facts`]) and consumed
-/// by [`enforce_native_host_memory_admission`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeKvAdmissionFacts {
-    geometry: crate::capacity::KvGeometry,
-    spec: crate::nn::decoder::LlmKvCacheSpec,
-    /// Decoder positions charged through the shared positional KV model
-    /// (`crate::capacity::kv_bytes_at_positions`).
-    required_positions: usize,
-    /// Exact resident bytes of decode state the family allocates at fixed
-    /// per-pack ceilings outside the positional model (the AED families'
-    /// full-span f16 self-KV arenas; see `cohere::capacity` /
-    /// `firered_aed::capacity`). Zero for the Qwen-shaped LLM families, whose
-    /// entire decode KV state is positional.
-    fixed_decode_state_bytes: u64,
-}
-
-/// This request's decoder KV admission facts for `moss-transcribe-diarize`,
-/// assembled from the loaded pack's decoder + adaptor metadata. `None` leaves
-/// the request admission-unchecked (fail open). See
-/// [`native_capacity_admission_facts`] for how the per-family derivers are
-/// dispatched and which families are wired.
-fn moss_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<NativeKvAdmissionFacts> {
-    let decoder =
-        crate::models::moss_transcribe_diarize::runtime_contract::parse_decoder_metadata(metadata)
-            .ok()?;
-    let adaptor =
-        crate::models::moss_transcribe_diarize::runtime_contract::parse_adaptor_metadata(metadata)
-            .ok()?;
-    let derivation =
-        crate::models::moss_transcribe_diarize::capacity::moss_td_integral_window_derivation(
-            &decoder,
-            adaptor.merge_size,
-        );
-    if !derivation.chunk_seconds.is_finite() || derivation.chunk_seconds <= 0.0 {
-        return None;
-    }
-    // `ScopedSlices` guarantees no single decode ever spans more than the
-    // family's own machine-independent integral window, however long the
-    // recording is -- clamp the admission estimate there so a multi-hour
-    // recording is judged by what one decode actually needs, not by its
-    // full length. Falls back to one chunk's worth if the derivation itself
-    // cannot resolve an integral window (degenerate pack metadata; the
-    // family's own request-time gate fails closed on that separately).
-    let integral_seconds =
-        crate::capacity::derive_integral_seconds(&derivation).unwrap_or(derivation.chunk_seconds);
-    let admission_seconds = audio_duration_seconds
-        .max(0.0)
-        .min(integral_seconds.max(derivation.chunk_seconds));
-    let chunks = (admission_seconds / derivation.chunk_seconds)
-        .ceil()
-        .max(1.0);
-    if !chunks.is_finite() {
-        return None;
-    }
-    let required_positions = derivation.required_positions_for_chunks(chunks as usize);
-    let geometry = crate::models::moss_transcribe_diarize::capacity::moss_td_kv_geometry(&decoder);
-    // Every Qwen-shaped whole-decoder constructor -- including moss's, via
-    // `Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_adapter` -- calls
-    // `set_kv_cache_policy(resolve_qwen_family_production_kv_cache_policy(backend,
-    // head_dim))` unconditionally at construction time (see that function).
-    // Reading the same resolver here, from the same backend and head_dim the
-    // real executor will use, keeps admission's spec identical to the spec
-    // that actually gets allocated: on CPU/Metal with native GQA and this
-    // family's head_dim (128) that resolves to `Q8_0` (119 KiB/position), not
-    // `DEFAULT` (336 KiB/position). Hard-coding `DEFAULT` here previously
-    // overstated the real footprint by ~2.8x, which does not make admission
-    // safer -- it makes it wrong in the false-reject direction this module's
-    // own invariant forbids (refuse only when certain the request will not
-    // fit).
-    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
-        backend,
-        geometry.head_dim,
-    )
-    .to_spec();
-    Some(NativeKvAdmissionFacts {
-        geometry,
-        spec,
-        required_positions,
-        fixed_decode_state_bytes: 0,
-    })
-}
-
-/// This request's decoder KV admission facts for `qwen3-asr`, assembled from
-/// the loaded pack's LLM decoder metadata (`crate::models::qwen::capacity`).
-/// qwen3's audio-token rate IS derivable from pack metadata (the mel
-/// hop/sample-rate plus the fixed 3x stride-2 conv stem), so unlike the other
-/// still-`PackCarried` `Derived` families it is wired here. `None` (a pack
-/// whose qwen metadata does not parse) leaves the request admission-unchecked
-/// (fail open). The KV element-type policy is resolved from the SAME
-/// `resolve_qwen_family_production_kv_cache_policy(backend, head_dim)` the real
-/// decoder allocates against, so admission's spec matches the runtime's (q8_0
-/// on CPU/Metal with native GQA at head_dim 128, not the worst-case DEFAULT).
-fn qwen3_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<NativeKvAdmissionFacts> {
-    let execution_metadata =
-        crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(metadata).ok()?;
-    let geometry = crate::models::qwen::capacity::qwen3_kv_geometry(&execution_metadata);
-    let required_positions = crate::models::qwen::capacity::qwen3_admission_required_positions(
-        &execution_metadata,
-        audio_duration_seconds,
-    );
-    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
-        backend,
-        geometry.head_dim,
-    )
-    .to_spec();
-    Some(NativeKvAdmissionFacts {
-        geometry,
-        spec,
-        required_positions,
-        fixed_decode_state_bytes: 0,
-    })
-}
-
-/// This request's decoder KV admission facts for `firered-llm`, assembled
-/// from the loaded pack's Qwen2 decoder + adapter metadata
-/// (`crate::models::firered_llm::capacity`). `None` (a pack whose firered-llm
-/// metadata does not parse) leaves the request admission-unchecked (fail
-/// open). The KV element-type policy is resolved from the SAME
-/// `resolve_qwen_family_production_kv_cache_policy(backend, head_dim)` the
-/// real decoder allocates against
-/// (`Qwen3AsrLlmWholeDecoderGraphExecutor` construction).
-fn firered_llm_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<NativeKvAdmissionFacts> {
-    let decoder =
-        crate::models::firered_llm::runtime_contract::parse_firered_llm_decoder_metadata(metadata)
-            .ok()?;
-    let adapter =
-        crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(metadata)
-            .ok()?;
-    let geometry = crate::models::firered_llm::capacity::firered_llm_kv_geometry(&decoder);
-    let required_positions =
-        crate::models::firered_llm::capacity::firered_llm_admission_required_positions(
-            &adapter,
-            audio_duration_seconds,
-        );
-    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
-        backend,
-        geometry.head_dim,
-    )
-    .to_spec();
-    Some(NativeKvAdmissionFacts {
-        geometry,
-        spec,
-        required_positions,
-        fixed_decode_state_bytes: 0,
-    })
-}
-
-/// This request's decoder KV admission facts for `mimo-asr`, assembled from
-/// the loaded pack's Qwen2 backbone + mel/tokenizer/input-local metadata
-/// (`crate::models::mimo_asr::capacity`). `None` (a pack whose mimo metadata
-/// does not parse) leaves the request admission-unchecked (fail open). Spec
-/// resolution matches the real decoder's constructor, as for the other
-/// Qwen-shaped families.
-fn mimo_asr_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<NativeKvAdmissionFacts> {
-    let llm = crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(metadata).ok()?;
-    let mel = crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(metadata).ok()?;
-    let audiotok =
-        crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(metadata).ok()?;
-    let inlocal =
-        crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(metadata).ok()?;
-    let geometry = crate::models::mimo_asr::capacity::mimo_asr_kv_geometry(&llm);
-    let required_positions =
-        crate::models::mimo_asr::capacity::mimo_asr_admission_required_positions(
-            &mel,
-            &audiotok,
-            &inlocal,
-            audio_duration_seconds,
-        );
-    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
-        backend,
-        geometry.head_dim,
-    )
-    .to_spec();
-    Some(NativeKvAdmissionFacts {
-        geometry,
-        spec,
-        required_positions,
-        fixed_decode_state_bytes: 0,
-    })
-}
-
-/// This request's decoder KV admission facts for `cohere-transcribe`
-/// (`crate::models::cohere::capacity`): the fixed per-pack allocations the
-/// AED decoder runtime makes at construction -- chunk-cap cross-KV frames
-/// through the positional model, the full-context f16 self-KV arena as exact
-/// fixed bytes. Request-independent (see the capacity module's doc), and
-/// backend-independent (the arena element types do not vary by backend).
-/// `None` (unparseable cohere metadata) leaves the request
-/// admission-unchecked (fail open).
-fn cohere_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-) -> Option<NativeKvAdmissionFacts> {
-    let execution_metadata =
-        crate::models::cohere::runtime_contract::parse_cohere_transcribe_execution_metadata(
-            metadata,
-        )
-        .ok()?;
-    Some(NativeKvAdmissionFacts {
-        geometry: crate::models::cohere::capacity::cohere_kv_geometry(&execution_metadata),
-        spec: crate::models::cohere::capacity::COHERE_ADMISSION_KV_SPEC,
-        required_positions: crate::models::cohere::capacity::cohere_admission_required_positions(
-            &execution_metadata,
-        ),
-        fixed_decode_state_bytes:
-            crate::models::cohere::capacity::cohere_admission_fixed_self_kv_bytes(
-                &execution_metadata,
-            ),
-    })
-}
-
-/// This request's decoder KV admission facts for `firered-aed`
-/// (`crate::models::firered_aed::capacity`): same fixed-allocation shape as
-/// cohere-transcribe -- chunk-cap cross-KV frames through the positional
-/// model, the full `decoder_pe_len` f16 self-KV arena as exact fixed bytes.
-/// `None` (unparseable firered-aed metadata) leaves the request
-/// admission-unchecked (fail open).
-fn firered_aed_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-) -> Option<NativeKvAdmissionFacts> {
-    let execution_metadata =
-        crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
-            metadata,
-        )
-        .ok()?;
-    Some(NativeKvAdmissionFacts {
-        geometry: crate::models::firered_aed::capacity::firered_aed_kv_geometry(
-            &execution_metadata,
-        ),
-        spec: crate::models::firered_aed::capacity::FIRERED_AED_ADMISSION_KV_SPEC,
-        required_positions:
-            crate::models::firered_aed::capacity::firered_aed_admission_required_positions(
-                &execution_metadata,
-            ),
-        fixed_decode_state_bytes:
-            crate::models::firered_aed::capacity::firered_aed_admission_fixed_self_kv_bytes(
-                &execution_metadata,
-            ),
-    })
-}
-
-/// This request's decoder KV admission facts for `funasr-nano`, assembled from
-/// the loaded pack's Qwen3 decoder metadata
-/// (`crate::models::funasr_nano::capacity`). Audio-token count walks the same
-/// fbank + LFR + low-frame-rate truncation arithmetic the executor uses;
-/// generation backstop and single-decode window reuse the executor's own
-/// constants. The KV element-type policy is resolved from the SAME
-/// `resolve_qwen_family_production_kv_cache_policy(backend, head_dim)` the
-/// real decoder allocates against (`Qwen3AsrLlmWholeDecoderGraphExecutor`
-/// construction). `None` (unparseable funasr-nano metadata) leaves the
-/// request admission-unchecked (fail open).
-fn funasr_nano_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<NativeKvAdmissionFacts> {
-    let decoder =
-        crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(metadata)
-            .ok()?;
-    let geometry = crate::models::funasr_nano::capacity::funasr_nano_kv_geometry(&decoder);
-    let required_positions =
-        crate::models::funasr_nano::capacity::funasr_nano_admission_required_positions(
-            audio_duration_seconds,
-        );
-    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
-        backend,
-        geometry.head_dim,
-    )
-    .to_spec();
-    Some(NativeKvAdmissionFacts {
-        geometry,
-        spec,
-        required_positions,
-        fixed_decode_state_bytes: 0,
-    })
-}
-
-/// This request's decoder KV admission facts for `granite-speech`, assembled
-/// from the loaded pack's decoder metadata
-/// (`crate::models::granite_speech::capacity`). Audio-token rate and fixed
-/// prompt overhead reuse the family's capacity module (the same geometry the
-/// max-input-seconds derivation uses); generation headroom is the executor's
-/// `GRANITE_SPEECH_MAX_GENERATED_TOKENS`. Spec is
-/// `GRANITE_SPEECH_ADMISSION_KV_SPEC` (two f16 halves = the single f32 copy
-/// the runtime keeps -- see that constant's doc; NOT the qwen-family
-/// resolver, granite does not share the qwen decoder path). `None`
-/// (unparseable granite-speech metadata) leaves the request
-/// admission-unchecked (fail open).
-fn granite_speech_native_capacity_admission_facts(
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-) -> Option<NativeKvAdmissionFacts> {
-    let decoder =
-        crate::models::granite_speech::runtime_contract::parse_decoder_metadata(metadata).ok()?;
-    Some(NativeKvAdmissionFacts {
-        geometry: crate::models::granite_speech::capacity::granite_speech_kv_geometry(&decoder),
-        spec: crate::models::granite_speech::capacity::GRANITE_SPEECH_ADMISSION_KV_SPEC,
-        required_positions:
-            crate::models::granite_speech::capacity::granite_speech_admission_required_positions(
-                audio_duration_seconds,
-            ),
-        fixed_decode_state_bytes: 0,
-    })
-}
-
-/// The per-family KV admission facts deriver for `model_architecture`, or
-/// `None` when this architecture has no wired deriver (fail open -- left
-/// admission-unchecked, exactly as before this check existed). Each wired arm
-/// derives its [`NativeKvAdmissionFacts`] from the loaded pack; a new family
-/// opts in by adding an arm plus its own family-level `capacity` deriver,
-/// keeping the model-agnostic admission machinery (`crate::capacity`) free of
-/// family geometry.
-///
-/// Wired today: every `Derived`-capacity family (moss-transcribe-diarize,
-/// qwen3-asr, firered-llm, mimo-asr, cohere-transcribe, funasr-nano,
-/// granite-speech) plus firered-aed (whose fixed-ceiling decoder arenas are
-/// large enough to matter even though its audio bound lives elsewhere).
-/// Families that keep no per-request decoder KV state worth charging
-/// (CTC/transducer shapes, the small `BoundedElsewhere` decoders) stay
-/// unchecked.
-fn native_capacity_admission_facts(
-    model_architecture: &str,
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Option<NativeKvAdmissionFacts> {
-    if model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
-        moss_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
-    } else if model_architecture == crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID {
-        qwen3_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
-    } else if model_architecture == crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID {
-        firered_llm_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
-    } else if model_architecture == crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID {
-        mimo_asr_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
-    } else if model_architecture == crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID {
-        cohere_native_capacity_admission_facts(metadata)
-    } else if model_architecture == crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID {
-        firered_aed_native_capacity_admission_facts(metadata)
-    } else if model_architecture == crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID {
-        funasr_nano_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
-    } else if model_architecture == crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID {
-        granite_speech_native_capacity_admission_facts(metadata, audio_duration_seconds)
-    } else {
-        None
-    }
-}
-
-/// Request-owned resident bytes split by physical memory pool. Normalized PCM
-/// and pipeline scratch live in host/unified memory. ReDim and
-/// segmentation-3.0 are also CPU/unified-memory; DiariZen follows its
-/// independently resolved request backend and therefore occupies discrete
-/// VRAM only on the generic CUDA/HIP/Vulkan lane.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct NativeRequestWorkingSetAdmission {
-    unified_bytes: u64,
-    discrete_bytes: u64,
-    discrete_vram_budget_bytes: Option<u64>,
-}
-
-impl NativeRequestWorkingSetAdmission {
-    fn with_additional_unified_bytes(self, bytes: u64) -> Self {
-        Self {
-            unified_bytes: self.unified_bytes.saturating_add(bytes),
-            ..self
-        }
-    }
-}
-
-fn pcm_vec_resident_bytes(samples: &Vec<f32>) -> u64 {
-    pcm_sample_capacity_bytes(samples.capacity())
-}
-
-fn pcm_sample_capacity_bytes(samples: usize) -> u64 {
-    u64::try_from(samples)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(std::mem::size_of::<f32>() as u64)
-}
-
-fn native_request_working_set_admission(
-    speaker_plan: SpeakerPlan,
-    normalized_pcm_bytes: u64,
-    embedder_bytes: u64,
-    selected_segmenter: Option<(
-        u64,
-        crate::ggml_runtime::GgmlCpuGraphBackend,
-        Option<u64>,
-        u64,
-    )>,
-) -> NativeRequestWorkingSetAdmission {
-    let mut admission = NativeRequestWorkingSetAdmission {
-        unified_bytes: normalized_pcm_bytes,
-        discrete_bytes: 0,
-        discrete_vram_budget_bytes: None,
-    };
-    if speaker_plan == SpeakerPlan::Off {
-        return admission;
-    }
-    admission.unified_bytes = admission.unified_bytes.saturating_add(embedder_bytes);
-    if speaker_plan == SpeakerPlan::External
-        && let Some((bytes, backend, discrete_vram_budget_bytes, working_set_bytes)) =
-            selected_segmenter
-    {
-        // Activity/VAD/embedding/clustering/reconstruction buffers stay on
-        // the host even when the selected DiariZen graph itself uses VRAM.
-        admission.unified_bytes = admission.unified_bytes.saturating_add(working_set_bytes);
-        if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Gpu) {
-            admission.discrete_bytes = admission.discrete_bytes.saturating_add(bytes);
-            admission.discrete_vram_budget_bytes = discrete_vram_budget_bytes;
-        } else {
-            admission.unified_bytes = admission.unified_bytes.saturating_add(bytes);
-        }
-    }
-    admission
-}
-
-/// Reject this request before building its decode graph if its decoder KV
-/// footprint plainly does not fit this host's memory budget -- a pack whose
-/// KV cache plus weights exceed the host memory budget, the root cause class
-/// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
-/// of an actionable error (issue #159 on CPU). Wired per family through
-/// [`native_capacity_admission_facts`]; families without a wired deriver stay
-/// unchecked. `request_working_set` charges normalized PCM exactly once and,
-/// when selected, the shared Voice ID models plus external diarization
-/// working set ([`native_request_working_set_admission`]). Fails
-/// OPEN whenever the answer is uncertain rather than
-/// definite -- an unresolvable family, unprobeable host RAM, or an
-/// unreadable pack file all fall through to "allow" (`crate::capacity`'s
-/// invariant: refuse only when certain it will not fit; the worst case is
-/// then no worse than today's raw ggml error).
-fn enforce_native_host_memory_admission(
-    model_architecture: &str,
-    metadata: &crate::ggml_runtime::GgufMetadata,
-    pack_bytes: u64,
-    audio_duration_seconds: f32,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    request_working_set: NativeRequestWorkingSetAdmission,
-    decoder_discrete_vram_budget_bytes: Option<u64>,
-) -> Result<(), BackendError> {
-    let facts = native_capacity_admission_facts(
-        model_architecture,
-        metadata,
-        audio_duration_seconds,
-        backend,
-    );
-    let host_total_memory_bytes = crate::host::host_total_memory_bytes();
-    let unified_domain = crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
-        swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
-    };
-    let domain = match backend {
-        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
-        | crate::ggml_runtime::GgmlCpuGraphBackend::Metal => unified_domain,
-        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => {
-            let decoder_budget = facts
-                .is_some()
-                .then_some(decoder_discrete_vram_budget_bytes)
-                .flatten()
-                .filter(|budget| *budget > 0);
-            let auxiliary_budget = (request_working_set.discrete_bytes > 0)
-                .then_some(request_working_set.discrete_vram_budget_bytes)
-                .flatten()
-                .filter(|budget| *budget > 0);
-            let budget = match (facts.is_some(), request_working_set.discrete_bytes > 0) {
-                (true, true) => match (decoder_budget, auxiliary_budget) {
-                    (Some(decoder), Some(auxiliary)) => decoder.min(auxiliary),
-                    _ => {
-                        return Err(BackendError::NativeInsufficientHostMemory {
-                            reason: missing_discrete_vram_budget_message(
-                                "the selected ASR or Voice ID GPU route",
-                            ),
-                        });
-                    }
-                },
-                (true, false) => {
-                    decoder_budget.ok_or_else(|| BackendError::NativeInsufficientHostMemory {
-                        reason: missing_discrete_vram_budget_message("the selected ASR GPU route"),
-                    })?
-                }
-                (false, true) => {
-                    auxiliary_budget.ok_or_else(|| BackendError::NativeInsufficientHostMemory {
-                        reason: missing_discrete_vram_budget_message(
-                            "the selected Voice ID segmentation GPU route",
-                        ),
-                    })?
-                }
-                (false, false) => 0,
-            };
-            crate::capacity::MemoryAdmissionDomain::DiscreteVram {
-                budget_bytes: budget,
-            }
-        }
-    };
-    let (auxiliary_in_decode_domain, auxiliary_in_other_domain, other_domain) = match domain {
-        crate::capacity::MemoryAdmissionDomain::DiscreteVram { .. } => (
-            request_working_set.discrete_bytes,
-            request_working_set.unified_bytes,
-            unified_domain,
-        ),
-        crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. } => (
-            request_working_set.unified_bytes,
-            request_working_set.discrete_bytes,
-            crate::capacity::MemoryAdmissionDomain::DiscreteVram {
-                budget_bytes: if request_working_set.discrete_bytes > 0 {
-                    request_working_set
-                        .discrete_vram_budget_bytes
-                        .filter(|budget| *budget > 0)
-                        .ok_or_else(|| BackendError::NativeInsufficientHostMemory {
-                            reason: missing_discrete_vram_budget_message(
-                                "the selected Voice ID segmentation GPU route",
-                            ),
-                        })?
-                } else {
-                    0
-                },
-            },
-        ),
-    };
-    let evaluation = if matches!(
-        domain,
-        crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. }
-    ) && host_total_memory_bytes.is_none()
-    {
-        Ok(())
-    } else if let Some(facts) = facts {
-        crate::capacity::evaluate_host_memory_admission(
-            &facts.geometry,
-            facts.spec,
-            facts.required_positions,
-            pack_bytes,
-            facts
-                .fixed_decode_state_bytes
-                .saturating_add(auxiliary_in_decode_domain),
-            host_total_memory_bytes.unwrap_or(0),
-            domain,
-        )
-    } else if auxiliary_in_decode_domain > 0 {
-        crate::capacity::evaluate_static_host_memory_admission(
-            pack_bytes,
-            auxiliary_in_decode_domain,
-            host_total_memory_bytes.unwrap_or(0),
-            domain,
-        )
-    } else {
-        Ok(())
-    };
-    if let Err(rejection) = evaluation {
-        return Err(BackendError::NativeInsufficientHostMemory {
-            reason: rejection.user_message(),
-        });
-    }
-    if auxiliary_in_other_domain > 0
-        && !(matches!(
-            other_domain,
-            crate::capacity::MemoryAdmissionDomain::UnifiedMemory { .. }
-        ) && host_total_memory_bytes.is_none())
-        && let Err(rejection) = crate::capacity::evaluate_static_host_memory_admission(
-            0,
-            auxiliary_in_other_domain,
-            host_total_memory_bytes.unwrap_or(0),
-            other_domain,
-        )
-    {
-        return Err(BackendError::NativeInsufficientHostMemory {
-            reason: rejection.user_message(),
-        });
-    }
-    Ok(())
-}
-
-fn missing_discrete_vram_budget_message(route: &str) -> String {
-    format!(
-        "OpenASR could not read the current VRAM capacity for {route}, so it cannot safely admit this request before allocating GPU graphs. Retry on CPU, or update the GPU driver/runtime so ggml reports free and total device memory. The request was rejected before model materialization."
-    )
-}
-
-/// Minimum safe budget across every actual discrete route that an
-/// Auto/Accelerated graph may try. Keeping the whole fallback set here means
-/// a failed GPU initialization cannot move the request onto a smaller card
-/// after admission. Exact requests naturally contain one candidate.
-fn minimum_discrete_vram_budget_for_preference(
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    preference: Option<&crate::ggml_runtime::RequestBackendPreference>,
-) -> Option<u64> {
-    if backend != crate::ggml_runtime::GgmlCpuGraphBackend::Gpu {
-        return None;
-    }
-    let devices = crate::ggml_runtime::ggml_available_devices();
-    let inventory = crate::device::execution_route::enumerate_compute_devices_from_ggml(&devices);
-    let routes = match preference {
-        Some(crate::ggml_runtime::RequestBackendPreference::Exact(route)) => vec![route.clone()],
-        Some(crate::ggml_runtime::RequestBackendPreference::Accelerated) | None => {
-            crate::device::execution_route::ranked_preferred_accelerated_devices(&inventory)
-                .into_iter()
-                .map(|device| device.to_resolved_route())
-                .collect()
-        }
-        Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly) => Vec::new(),
-    };
-    routes
-        .iter()
-        .map(|route| {
-            crate::device::execution_route::discrete_vram_admission_budget_for_route(
-                route, &devices,
-            )
-        })
-        .collect::<Option<Vec<_>>>()
-        .and_then(|budgets| budgets.into_iter().min())
-}
-
-fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch {
-    NATIVE_GGML_EXECUTION_DISPATCH.get_or_init(|| {
-        build_builtin_ggml_execution_dispatch().expect("builtin native ggml dispatch must wire")
-    })
-}
-
-/// Idle-unload for the offline (file-transcription) dispatch. Deliberately
-/// uses `get()`, not `get_or_init` -- a daemon that never served a file
-/// transcription has nothing resident here, and this must not be the thing
-/// that first builds the dispatch.
-pub(crate) fn unload_idle_native_offline_runtime_caches() {
-    if let Some(dispatch) = NATIVE_GGML_EXECUTION_DISPATCH.get() {
-        dispatch.unload_all();
-    }
 }
 
 /// Resolve the long-form VAD provider for this request, returning the
@@ -3572,8 +2885,33 @@ fn apply_longform_safety_policy(
     options: &mut crate::LongFormOptions,
     provenance: &mut Vec<String>,
 ) {
+    apply_invocation_span_longform_policy(model_architecture, options, provenance);
     apply_conservative_seq2seq_longform_safety_policy(model_architecture, options, provenance);
     apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
+}
+
+/// Enforces the family runtime's semantic maximum for one executor call.
+/// This is not memory-pressure adaptation: a fixed-window frontend would
+/// otherwise discard audio, while explicit-limit families would fail only
+/// after slicing had already selected an invalid unit. The bound is stable
+/// across execution candidates, so CPU/GPU choice cannot change transcript
+/// segmentation.
+fn apply_invocation_span_longform_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    let Some(max_seconds) = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .and_then(|descriptor| descriptor.max_single_invocation_seconds())
+    else {
+        return;
+    };
+    if clamp_longform_chunks_to_ceiling(options, max_seconds) {
+        provenance.push(format!(
+            "core.native.longform.policy:invocation-span-cap={max_seconds}"
+        ));
+    }
 }
 
 /// Caps longform chunking for the decode-side `ConservativeSeq2SeqV1`
@@ -3684,17 +3022,24 @@ fn clamp_longform_chunks_to_encoder_memory_ceiling(
     options: &mut crate::LongFormOptions,
     max_safe_chunk_seconds: f32,
 ) -> bool {
+    clamp_longform_chunks_to_ceiling(options, max_safe_chunk_seconds)
+}
+
+fn clamp_longform_chunks_to_ceiling(
+    options: &mut crate::LongFormOptions,
+    max_chunk_seconds: f32,
+) -> bool {
     let mut changed = false;
-    if options.chunk_seconds > max_safe_chunk_seconds {
-        options.chunk_seconds = max_safe_chunk_seconds;
+    if options.chunk_seconds > max_chunk_seconds {
+        options.chunk_seconds = max_chunk_seconds;
         changed = true;
     }
-    if options.max_chunk_seconds > max_safe_chunk_seconds {
-        options.max_chunk_seconds = max_safe_chunk_seconds;
+    if options.max_chunk_seconds > max_chunk_seconds {
+        options.max_chunk_seconds = max_chunk_seconds;
         changed = true;
     }
-    if options.min_chunk_seconds > max_safe_chunk_seconds {
-        options.min_chunk_seconds = max_safe_chunk_seconds;
+    if options.min_chunk_seconds > max_chunk_seconds {
+        options.min_chunk_seconds = max_chunk_seconds;
         changed = true;
     }
     if options.max_chunk_seconds < options.chunk_seconds {
@@ -3941,30 +3286,28 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
         || reason.contains("aborted by cancel request")
 }
 
-/// Resolves its own [`crate::ggml_runtime::ResolvedFamilyRuntimeInput`] from
-/// `backend_preference`/`selected_family` rather than accepting one as a
-/// parameter: the GPU-allocation-failure fallback
-/// (`run_dispatch_once_with_progress_and_gpu_fallback`) retries a slice with
-/// a *different* `backend_preference` (forced `CpuOnly`), so a value
-/// precomputed once at the top of `transcribe_native` would be stale for
-/// that retry -- recomputing here from the parameter actually in effect for
-/// this attempt is what makes each attempt's resolved backend correct.
+/// Builds the request's resolved runtime from the exact candidate route passed
+/// by the policy loop. Recomputing it per attempt is required because a retry
+/// can change both provider and placement.
 fn run_dispatch_once(
     dispatch: &GgmlAsrExecutionDispatch,
+    execution_services: &Arc<NativeExecutionServices>,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     selected_family: &GgmlFamilyAdapterDescriptor,
     samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
+    resolved_preference: Option<RequestBackendPreference>,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        backend_preference.request_backend_override(),
-        crate::arch::family_auto_gpu_policy_for_model_architecture(
-            selected_family.model_architecture,
-        ),
+        resolved_preference,
+        auto_gpu_policy,
     );
     let execution_request = GgmlAsrExecutionViewRequest {
+        execution_services: Arc::clone(execution_services),
+        decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
         runtime_source_path: runtime_preflight.runtime_source.path().to_path_buf(),
         runtime_source_preflight: Some(runtime_preflight.clone()),
         selected_family: selected_family.clone(),
@@ -3973,6 +3316,21 @@ fn run_dispatch_once(
         backend_preference,
         resolved_runtime,
         execution_context: Arc::clone(execution_context),
+    };
+    let planning_input =
+        crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_offline_view_request(
+            runtime_preflight,
+            &execution_request.prepared_audio,
+            &execution_request.request_options,
+            execution_request.resolved_runtime.backend(),
+        )
+        .map_err(|error| dispatch_error_to_backend(error.into(), execution_context))?;
+    let decoder_state = dispatch
+        .plan_decoder_state(selected_family, &planning_input)
+        .map_err(|error| dispatch_error_to_backend(error, execution_context))?;
+    let execution_request = GgmlAsrExecutionViewRequest {
+        decoder_state,
+        ..execution_request
     };
     let _thread_override = install_request_inference_threads_override(
         execution_request.request_options.inference_threads,
@@ -3983,25 +3341,135 @@ fn run_dispatch_once(
     Ok(result)
 }
 
-fn execution_target_backend_preference(
-    target: Option<ExecutionTarget>,
-) -> Result<GgmlAsrBackendPreference, BackendError> {
-    match target.unwrap_or_default() {
-        ExecutionTarget::Auto => Ok(GgmlAsrBackendPreference::Auto),
-        ExecutionTarget::Cpu => Ok(GgmlAsrBackendPreference::CpuOnly),
-        ExecutionTarget::Accelerated => {
-            let has_accelerated_device = crate::ggml_available_devices()
-                .iter()
-                .any(|device| device.kind.is_gpu());
-            if has_accelerated_device {
-                Ok(GgmlAsrBackendPreference::Accelerated)
-            } else {
-                Err(BackendError::NativeFailClosed {
-                    reason: "execution_target=accelerated was requested, but no ggml GPU device is available."
-                        .to_string(),
-                })
+fn resolve_native_execution_plan(
+    execution_services: &NativeExecutionServices,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    intent: ExecutionIntent,
+) -> Result<ExecutionPlan, BackendError> {
+    let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+    execution_services
+        .policy_resolver()
+        .resolve(
+            intent,
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                selected_family.model_architecture,
+            ),
+            selected_family.execution_capabilities,
+            &inventory,
+        )
+        .map_err(execution_policy_error_to_backend)
+}
+
+fn resolve_auxiliary_execution_plan(
+    execution_services: &NativeExecutionServices,
+    architecture_id: &'static str,
+    request_intent: &ExecutionIntent,
+) -> Result<ExecutionPlan, BackendError> {
+    crate::models::policy_resolved_aux_runtime::resolve_auxiliary_execution_plan(
+        execution_services,
+        architecture_id,
+        request_intent,
+    )
+    .map_err(|error| BackendError::NativeFailClosed {
+        reason: error.to_string(),
+    })
+}
+
+fn resolve_fixed_cpu_execution_plan(
+    execution_services: &NativeExecutionServices,
+) -> Result<ExecutionPlan, BackendError> {
+    crate::models::policy_resolved_aux_runtime::resolve_fixed_cpu_execution_plan(execution_services)
+        .map_err(|error| BackendError::NativeFailClosed {
+            reason: error.to_string(),
+        })
+}
+
+/// Execute one independent auxiliary model stage transactionally. A stage may
+/// deliberately treat non-resource errors as a no-op (punctuation does); a
+/// typed allocator/device failure still invalidates that candidate even when
+/// the inner stage swallowed its ordinary error, so Auto can try its next
+/// semantics-equivalent placement instead of silently dropping the stage.
+fn run_auxiliary_stage_with_policy<T>(
+    execution_services: &NativeExecutionServices,
+    execution_plan: &ExecutionPlan,
+    stage: &'static str,
+    mut operation: impl FnMut(&ExecutionCandidate) -> Result<T, BackendError>,
+) -> Result<T, PolicyResolvedAuxRuntimeError<BackendError>> {
+    let candidates = execution_plan.candidates();
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
+            execution_services,
+            candidate,
+            || operation(candidate),
+        );
+        match (attempt.result, attempt.candidate_failure) {
+            (Ok(value), None) => return Ok(value),
+            (Err(error), None) => {
+                return Err(PolicyResolvedAuxRuntimeError::Operation(error));
+            }
+            (result, Some(failure)) => {
+                if candidate_index + 1 == candidates.len() {
+                    return Err(PolicyResolvedAuxRuntimeError::CandidatesExhausted {
+                        stage,
+                        failure,
+                        source: result.err(),
+                    });
+                }
+                crate::stage_timing::log_detail_event(
+                    "native_transcribe",
+                    format_args!(
+                        "stage=auxiliary_execution_candidate event=retry auxiliary_stage={stage} provider={} placement={:?} failure={:?} operation={}",
+                        candidate.device.route.provider,
+                        candidate.placement,
+                        failure.kind,
+                        failure.operation,
+                    ),
+                );
+                drop(result);
             }
         }
+    }
+    Err(PolicyResolvedAuxRuntimeError::EmptyPlan { stage })
+}
+
+fn required_auxiliary_stage_error(
+    error: PolicyResolvedAuxRuntimeError<BackendError>,
+) -> BackendError {
+    match error {
+        PolicyResolvedAuxRuntimeError::Operation(error) => error,
+        error => BackendError::NativeFailClosed {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn execution_policy_error_to_backend(error: ExecutionPolicyError) -> BackendError {
+    match error {
+        ExecutionPolicyError::Route(error) => BackendError::from_execution_route_error(error),
+        other => BackendError::NativeFailClosed {
+            reason: format!("could not resolve an execution candidate: {other}"),
+        },
+    }
+}
+
+fn resolved_runtime_for_candidate(
+    candidate: &ExecutionCandidate,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        request_backend_preference_for_candidate(candidate),
+        auto_gpu_policy,
+    )
+}
+
+fn request_backend_preference_for_candidate(
+    candidate: &ExecutionCandidate,
+) -> Option<RequestBackendPreference> {
+    match candidate.placement {
+        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
+        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
+            RequestBackendPreference::Exact(candidate.device.route.clone()),
+        ),
     }
 }
 
@@ -4358,6 +3826,10 @@ mod tests {
         Arc::new(crate::RequestExecutionContext::uncancellable(
             "test fixture",
         ))
+    }
+
+    fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
+        crate::models::native_execution_services::test_native_execution_services()
     }
 
     /// The full user-intent x family-capability matrix, pinned because every
@@ -6043,7 +5515,9 @@ mod tests {
             .with_model_pack_path(Some(pack))
             .with_execution_context(execution_context);
 
-        let decode_thread = std::thread::spawn(move || run_native_transcription(request));
+        let execution_services = native_execution_services_for_test();
+        let decode_thread =
+            std::thread::spawn(move || run_native_transcription(request, execution_services));
 
         let mut saw_intermediate_signal = false;
         let mut previous_fraction = 0.0_f32;
@@ -6249,9 +5723,11 @@ mod tests {
         assert!(!matches!(resolution.options.mode, LongFormMode::Off));
     }
 
-    /// A `ScopedSlices` family gets its declared decoder-context window in
-    /// place of the shared 30s default -- widened, not clamped -- plus the
-    /// three options that shape implies (a contiguous full-coverage planner
+    /// A `ScopedSlices` family gets its declared decoder-context window rather
+    /// than inheriting the shared default by accident. The current product
+    /// target deliberately equals the shared 30s target, while the 60s ceiling
+    /// remains family-owned and independently asserted below. The shape also
+    /// carries the three options it implies (a contiguous full-coverage planner
     /// that cannot elide audio, no padding bias on in-decoder timestamps, and
     /// no free-text prompt carry across a fixed fine-tuned instruction).
     #[test]
@@ -6266,7 +5742,8 @@ mod tests {
         else {
             panic!("moss-transcribe-diarize must declare ScopedSlices");
         };
-        assert!(target_seconds > crate::LongFormOptions::default().chunk_seconds);
+        assert_eq!(target_seconds, 30.0);
+        assert_eq!(max_seconds, 60.0);
 
         let resolution = resolve_native_longform_policy_for_backend(
             None,
@@ -6438,6 +5915,42 @@ mod tests {
         assert_eq!(resolution.options.chunk_seconds, defaults.chunk_seconds);
         assert_eq!(resolution.options.padding_seconds, defaults.padding_seconds);
         assert!(resolution.options.carry_prompt_across_slices);
+    }
+
+    #[test]
+    fn whisper_semantic_window_caps_padded_executor_inputs_at_thirty_seconds() {
+        let requested = crate::LongFormOptions {
+            mode: LongFormMode::Fixed,
+            chunk_seconds: 30.0,
+            max_chunk_seconds: 60.0,
+            padding_seconds: 0.25,
+            ..crate::LongFormOptions::default()
+        };
+        let resolution = resolve_native_longform_policy_for_backend(
+            Some(&requested),
+            61.0,
+            crate::WHISPER_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.chunk_seconds, 30.0);
+        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("invocation-span-cap=30"))
+        );
+
+        let samples = vec![0.05_f32; 61 * 16_000];
+        let plan = plan_longform_slices(&samples, 16_000, &resolution.options, None)
+            .expect("fixed Whisper slices");
+        assert!(plan.slices.len() >= 3);
+        assert!(
+            plan.slices
+                .iter()
+                .all(|slice| slice.duration_samples() <= 30 * 16_000),
+            "padding must shrink inside the semantic invocation cap"
+        );
     }
 
     /// granite-speech is `SharedWindow` + `LocalChunked` + decode-policy
@@ -6652,7 +6165,7 @@ mod tests {
         // qwen has no `ConservativeSeq2SeqV1` decode-side profile, so
         // `chunk_seconds` (already 30.0 by default) is untouched. But qwen's
         // audio encoder IS `GlobalQuadratic` (issue #68), so the much larger
-        // `max_chunk_seconds` default (120.0) -- the true ceiling the VAD/
+        // `max_chunk_seconds` default (60.0) -- the true ceiling the VAD/
         // energy/auto slicer can grow a chunk to on long, pause-free audio --
         // must still be capped down to the 30s safe ceiling.
         let resolution = resolve_native_longform_policy_for_backend(
@@ -6709,15 +6222,23 @@ mod tests {
         assert!(correct.options.max_chunk_seconds < 120.0);
 
         // The bug class this guards against: keying off adapter_id finds no
-        // matching architecture, so every safety cap silently no-ops and the
-        // unsafe 120s default max_chunk_seconds survives untouched.
+        // matching architecture, so family safety policy silently no-ops. The
+        // product-wide default is now 60s (not the old 120s), but it must still
+        // be distinguishable from FireRed-AED's stricter family ceiling.
         let wrong = resolve_native_longform_policy_for_backend(
             None,
             120.0,
             selected_family.adapter_id,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(wrong.options.max_chunk_seconds, 120.0);
+        assert_eq!(
+            wrong.options.max_chunk_seconds,
+            crate::LongFormOptions::default().max_chunk_seconds
+        );
+        assert!(
+            wrong.options.max_chunk_seconds > correct.options.max_chunk_seconds,
+            "the wrong identity must demonstrably miss the stricter family cap"
+        );
         assert!(wrong.provenance.is_empty());
     }
 
@@ -6738,14 +6259,14 @@ mod tests {
         const OLD_SHARED_VALUE: f32 = 30.0;
         let defaults = crate::LongFormOptions::default();
 
-        // A host that can afford more than the default chunk length keeps the
-        // band the slicer needs in order to cut on a real pause.
+        // A ceiling above the target but below the product-wide maximum keeps
+        // a non-collapsed band for cutting on a real pause.
         let mut roomy = defaults.clone();
         assert!(clamp_longform_chunks_to_encoder_memory_ceiling(
-            &mut roomy, 90.0
+            &mut roomy, 45.0
         ));
         assert_eq!(roomy.chunk_seconds, defaults.chunk_seconds);
-        assert_eq!(roomy.max_chunk_seconds, 90.0);
+        assert_eq!(roomy.max_chunk_seconds, 45.0);
         assert_eq!(roomy.min_chunk_seconds, defaults.min_chunk_seconds);
 
         // Counterfactual: with the ceiling pinned to the default chunk length,
@@ -6773,9 +6294,8 @@ mod tests {
     /// Data-driven production-path coverage over every builtin architecture
     /// (issue #68): a `GlobalQuadratic` encoder must never be handed a
     /// longform chunk longer than its declared safe ceiling, while
-    /// `FixedWindow` (whisper) and `LocalChunked` (zipformer) architectures
-    /// need no additional cap and keep whatever window their own slice shape
-    /// asked for (the shared 120s default unless the family declares one). All nine
+    /// encoder-memory cap. An independent semantic invocation span may still
+    /// narrow the window (notably Whisper's 30s frontend). All nine
     /// `GlobalQuadratic` builtins (including firered-aed/cohere-transcribe/
     /// moonshine, which also carry the decode-side `ConservativeSeq2SeqV1`
     /// cap) declare `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`, so this asserts
@@ -6817,20 +6337,26 @@ mod tests {
                     );
                 }
                 None => {
-                    // No encoder cap applies, so the window is whatever the
-                    // family's own slice shape asked for: its declared
-                    // decoder-context window, or the shared default when it
-                    // declares none.
-                    let expected = match descriptor.longform_slice_shape {
+                    // No encoder-memory cap applies. The product slice shape
+                    // supplies the base window and a semantic invocation span
+                    // may independently narrow it.
+                    let product_window = match descriptor.longform_slice_shape {
                         crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
                             max_seconds,
                             ..
                         } => max_seconds,
-                        crate::arch::OpenAsrLongformSliceShape::SharedWindow => 120.0,
+                        crate::arch::OpenAsrLongformSliceShape::SharedWindow => {
+                            crate::arch::DEFAULT_ENCODER_MAX_CHUNK_SECONDS
+                        }
                     };
+                    let expected = descriptor
+                        .max_single_invocation_seconds()
+                        .map_or(product_window, |semantic_max| {
+                            product_window.min(semantic_max)
+                        });
                     assert_eq!(
                         resolution.options.max_chunk_seconds, expected,
-                        "'{}' (FixedWindow/LocalChunked) must keep its declared window",
+                        "'{}' must keep the min(product window, semantic invocation span)",
                         descriptor.model_architecture
                     );
                 }
@@ -6890,9 +6416,10 @@ mod tests {
     }
 
     #[test]
-    fn native_dispatch_is_process_shared() {
-        let first = shared_native_ggml_execution_dispatch() as *const _;
-        let second = shared_native_ggml_execution_dispatch() as *const _;
+    fn native_dispatch_is_reused_within_one_service_root() {
+        let services = native_execution_services_for_test();
+        let first = services.offline_dispatch() as *const _;
+        let second = services.offline_dispatch() as *const _;
         assert_eq!(first, second);
     }
 
@@ -7042,8 +6569,8 @@ mod tests {
         )
         .with_model_pack_path(Some(pack))
         .with_voice_id(true);
-        let transcription =
-            run_native_transcription(request).expect("diarized transcription must succeed");
+        let transcription = run_native_transcription(request, native_execution_services_for_test())
+            .expect("diarized transcription must succeed");
 
         let rendered = crate::format::render_transcription(
             &transcription,
@@ -7402,202 +6929,6 @@ mod tests {
         assert_eq!(unchanged, transcription);
     }
 
-    // -- issue #158: per-slice GPU-class compute-buffer allocation fallback --
-
-    #[test]
-    fn gpu_buffer_allocation_failure_backend_extracts_name_from_nested_reason() {
-        // The marker text is nested inside outer wrapping (executor id, adapter
-        // id, family-specific "graph construction failed at ..." context) the
-        // way it really arrives after `dispatch_error_to_backend`, not a bare
-        // top-level message -- this must still find it.
-        let error = BackendError::NativeFailClosed {
-            reason: "ggml executor 'firered-aed-ggml-executor-v1' failed for adapter \
-                     'ggml-family-firered-aed-runtime-v1': firered-aed encoder graph \
-                     construction failed at 'encoder_forward': compute buffer allocation \
-                     failed (backend: Vulkan0)"
-                .to_string(),
-        };
-        assert_eq!(
-            gpu_buffer_allocation_failure_backend(&error),
-            Some("Vulkan0")
-        );
-    }
-
-    #[test]
-    fn gpu_buffer_allocation_failure_backend_ignores_unrelated_errors() {
-        let unrelated = BackendError::NativeFailClosed {
-            reason: "ggml executor 'whisper-ggml-executor-v1' failed for adapter 'x': \
-                     tensor 'encoder.blocks.0.attn.weight' is missing from context"
-                .to_string(),
-        };
-        assert_eq!(gpu_buffer_allocation_failure_backend(&unrelated), None);
-
-        let other_variant = BackendError::ServeBatchUnavailable {
-            reason: "compute buffer allocation failed (backend: Metal)".to_string(),
-            retryable: true,
-        };
-        assert_eq!(
-            gpu_buffer_allocation_failure_backend(&other_variant),
-            None,
-            "only NativeFailClosed carries a classifiable ggml-graph reason"
-        );
-    }
-
-    #[test]
-    fn gpu_allocation_fallback_tracker_trips_after_streak_limit_and_resets_on_success() {
-        let mut tracker = GpuAllocationFallbackTracker::default();
-        assert_eq!(
-            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
-            GgmlAsrBackendPreference::Auto
-        );
-
-        // First fallback: still under the limit, GPU still tried next time.
-        tracker.record(GgmlAsrBackendPreference::Auto, true);
-        assert_eq!(
-            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
-            GgmlAsrBackendPreference::Auto
-        );
-
-        // Second consecutive fallback trips the streak: forced CPU from here on.
-        tracker.record(GgmlAsrBackendPreference::Auto, true);
-        assert_eq!(
-            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
-            GgmlAsrBackendPreference::CpuOnly
-        );
-        assert_eq!(
-            tracker.effective_preference(GgmlAsrBackendPreference::Accelerated),
-            GgmlAsrBackendPreference::CpuOnly
-        );
-
-        // A fresh tracker resets on a successful GPU attempt in between two
-        // fallbacks -- the streak counts *consecutive* fallbacks only.
-        let mut tracker = GpuAllocationFallbackTracker::default();
-        tracker.record(GgmlAsrBackendPreference::Auto, true);
-        tracker.record(GgmlAsrBackendPreference::Auto, false);
-        tracker.record(GgmlAsrBackendPreference::Auto, true);
-        assert_eq!(
-            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
-            GgmlAsrBackendPreference::Auto,
-            "a successful attempt in between resets the streak"
-        );
-    }
-
-    #[test]
-    fn gpu_allocation_fallback_tracker_never_forces_cpu_from_an_explicit_cpu_only_attempt() {
-        // An explicit CpuOnly attempt has no lower backend to fall back to, so
-        // its own failure is a real capacity error, not GPU-pressure signal --
-        // it must never participate in (or be forced further by) the streak.
-        let mut tracker = GpuAllocationFallbackTracker::default();
-        tracker.record(GgmlAsrBackendPreference::CpuOnly, true);
-        tracker.record(GgmlAsrBackendPreference::CpuOnly, true);
-        tracker.record(GgmlAsrBackendPreference::CpuOnly, true);
-        assert_eq!(
-            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
-            GgmlAsrBackendPreference::Auto
-        );
-    }
-
-    /// A stub `GgmlAsrViewExecutor` for the GPU-fallback wrapper tests: records
-    /// every `backend_preference` it was invoked with, and fails with a
-    /// configurable error whenever the request does *not* ask for `CpuOnly`
-    /// (mimicking a GPU-class compute-buffer allocation that fails no matter
-    /// how many times it is retried on the same backend, but always succeeds
-    /// once actually run on CPU -- the real-world shape of issue #158).
-    struct GpuAllocFallbackStubExecutor {
-        calls: Mutex<Vec<GgmlAsrBackendPreference>>,
-        backing_identities: Mutex<Vec<usize>>,
-        gpu_failure_reason: String,
-    }
-
-    impl GpuAllocFallbackStubExecutor {
-        fn new(gpu_failure_reason: impl Into<String>) -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                backing_identities: Mutex::new(Vec::new()),
-                gpu_failure_reason: gpu_failure_reason.into(),
-            }
-        }
-
-        fn calls_snapshot(&self) -> Vec<GgmlAsrBackendPreference> {
-            self.calls.lock().unwrap().clone()
-        }
-
-        fn backing_identities_snapshot(&self) -> Vec<usize> {
-            self.backing_identities.lock().unwrap().clone()
-        }
-    }
-
-    impl GgmlAsrViewExecutor for GpuAllocFallbackStubExecutor {
-        fn executor_id(&self) -> &'static str {
-            "gpu-alloc-fallback-stub"
-        }
-
-        fn supports_phrase_bias(&self) -> bool {
-            true
-        }
-
-        fn execute_view(
-            &self,
-            request: &GgmlAsrExecutionViewRequest,
-        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
-            self.calls.lock().unwrap().push(request.backend_preference);
-            self.backing_identities
-                .lock()
-                .unwrap()
-                .push(request.prepared_audio.samples_f32.backing_identity());
-            if matches!(
-                request.backend_preference,
-                GgmlAsrBackendPreference::CpuOnly
-            ) {
-                return Ok(GgmlAsrExecutionResult {
-                    transcription: Transcription {
-                        truncated_decodes: Vec::new(),
-                        unnamed_speakers: Vec::new(),
-                        text: "ok-on-cpu".to_string(),
-                        segments: Vec::new(),
-                        longform: None,
-                        language: None,
-                    },
-                    carry_context: None,
-                    decode_truncation: None,
-                });
-            }
-            Err(GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: "gpu-alloc-fallback-stub",
-                adapter_id: request.selected_family.adapter_id,
-                reason: self.gpu_failure_reason.clone(),
-            })
-        }
-    }
-
-    /// A stub whose executor always fails, regardless of backend preference,
-    /// with a non-allocation error -- for the "other errors never retry" test.
-    struct AlwaysFailsUnrelatedStubExecutor {
-        calls: Mutex<usize>,
-    }
-
-    impl GgmlAsrViewExecutor for AlwaysFailsUnrelatedStubExecutor {
-        fn executor_id(&self) -> &'static str {
-            "always-fails-unrelated-stub"
-        }
-
-        fn supports_phrase_bias(&self) -> bool {
-            true
-        }
-
-        fn execute_view(
-            &self,
-            request: &GgmlAsrExecutionViewRequest,
-        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
-            *self.calls.lock().unwrap() += 1;
-            Err(GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: "always-fails-unrelated-stub",
-                adapter_id: request.selected_family.adapter_id,
-                reason: "tensor 'x' is missing from context".to_string(),
-            })
-        }
-    }
-
     fn tiny_whisper_preflight(dir: &Path) -> GgmlAsrRuntimeSourcePreflight {
         let pack_path = dir.join("whisper.oasr");
         let mut metadata = std::collections::BTreeMap::new();
@@ -7616,7 +6947,7 @@ mod tests {
             .expect("load tiny fixture preflight")
     }
 
-    fn gpu_fallback_test_fixture(
+    fn execution_policy_test_fixture(
         dir: &Path,
         executor: std::sync::Arc<dyn GgmlAsrViewExecutor>,
     ) -> (
@@ -7630,197 +6961,270 @@ mod tests {
         (dispatch, preflight, crate::whisper_runtime_descriptor_v1())
     }
 
-    #[test]
-    fn slice_dispatch_retries_gpu_allocation_failure_on_cpu_and_reports_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = std::sync::Arc::new(GpuAllocFallbackStubExecutor::new(
-            "compute buffer allocation failed (backend: Vulkan0)",
-        ));
-        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let decode_progress = DecodeProgress::begin(None, 1_000, false);
-        let mut tracker = GpuAllocationFallbackTracker::default();
-        let audio = PcmBuffer::from_vec(vec![0.0; 1_000]);
-        let backing_identity = audio.backing_identity();
+    struct TypedCandidateFailureStubExecutor {
+        calls: Mutex<Vec<GgmlAsrBackendPreference>>,
+        record_typed_failure: bool,
+    }
 
-        let (result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
-            &dispatch,
-            &preflight,
-            &family,
-            audio.full_slice(),
-            GgmlAsrExecutionOptions::default(),
-            GgmlAsrBackendPreference::Auto,
-            &uncancellable_execution_context_for_test(),
-            &decode_progress,
-            1_000,
-            "index=1",
-            &mut tracker,
-        )
-        .expect("should recover via CPU retry rather than failing the slice");
+    impl TypedCandidateFailureStubExecutor {
+        fn new(record_typed_failure: bool) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                record_typed_failure,
+            }
+        }
 
-        assert_eq!(result.transcription.text, "ok-on-cpu");
-        assert_eq!(
-            fallback,
-            Some(SliceGpuFallback::AllocationFailure {
-                original_backend: "Vulkan0".to_string()
+        fn calls(&self) -> Vec<GgmlAsrBackendPreference> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl GgmlAsrExecutor for TypedCandidateFailureStubExecutor {
+        fn executor_id(&self) -> &'static str {
+            "typed-candidate-failure-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn decoder_state_contract(
+            &self,
+            _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        ) -> Result<
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract,
+            GgmlAsrExecutionError,
+        > {
+            Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            self.calls.lock().unwrap().push(request.backend_preference);
+            if request.backend_preference == GgmlAsrBackendPreference::CpuOnly {
+                return Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
+                        text: "cpu-success".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                    decode_truncation: None,
+                });
+            }
+            if self.record_typed_failure {
+                crate::models::native_execution_services::record_current_execution_candidate_failure(
+                    ExecutionCandidateFailure::capacity(
+                        "stub-allocation",
+                        "typed capacity fact independent of the returned error text",
+                    ),
+                );
+            }
+            Err(GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: self.executor_id(),
+                adapter_id: request.selected_family.adapter_id,
+                reason: "opaque failure text with no allocation marker".to_string(),
             })
-        );
-        assert_eq!(
-            executor.calls_snapshot(),
+        }
+    }
+
+    fn policy_test_candidate(
+        provider: crate::ExecutionProvider,
+        stable_id: &str,
+        placement: ExecutionPlacement,
+    ) -> ExecutionCandidate {
+        let kind = if placement == ExecutionPlacement::CpuOnly {
+            crate::RouteDeviceKind::Cpu
+        } else {
+            crate::RouteDeviceKind::Accelerated
+        };
+        ExecutionCandidate {
+            device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                route: crate::ResolvedExecutionRoute {
+                    provider,
+                    stable_id: stable_id.to_string(),
+                    registry_ordinal: 0,
+                    kind,
+                    addressability: crate::DeviceAddressability::NotExactlyAddressable {
+                        reason: "test candidate",
+                    },
+                },
+                ggml_kind: if placement == ExecutionPlacement::CpuOnly {
+                    crate::GgmlBackendKind::Cpu
+                } else {
+                    crate::GgmlBackendKind::Gpu
+                },
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement,
+        }
+    }
+
+    fn typed_fallback_test_plan() -> ExecutionPlan {
+        ExecutionPlan::for_test(
+            ExecutionIntent::Auto,
             vec![
-                GgmlAsrBackendPreference::Auto,
-                GgmlAsrBackendPreference::CpuOnly
+                policy_test_candidate(
+                    crate::ExecutionProvider::Vulkan,
+                    "VulkanTest0",
+                    ExecutionPlacement::Hybrid,
+                ),
+                policy_test_candidate(
+                    crate::ExecutionProvider::Cpu,
+                    "CPU",
+                    ExecutionPlacement::CpuOnly,
+                ),
             ],
-            "exactly one GPU attempt, then exactly one CPU retry"
-        );
-        assert_eq!(
-            executor.backing_identities_snapshot(),
-            vec![backing_identity, backing_identity],
-            "GPU failure and CPU retry must reuse the exact same PCM backing"
-        );
-    }
-
-    #[test]
-    fn slice_dispatch_does_not_retry_a_non_allocation_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = std::sync::Arc::new(AlwaysFailsUnrelatedStubExecutor {
-            calls: Mutex::new(0),
-        });
-        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let decode_progress = DecodeProgress::begin(None, 1_000, false);
-        let mut tracker = GpuAllocationFallbackTracker::default();
-
-        let error = run_dispatch_once_with_progress_and_gpu_fallback(
-            &dispatch,
-            &preflight,
-            &family,
-            vec![0.0; 1_000].into(),
-            GgmlAsrExecutionOptions::default(),
-            GgmlAsrBackendPreference::Auto,
-            &uncancellable_execution_context_for_test(),
-            &decode_progress,
-            1_000,
-            "index=1",
-            &mut tracker,
         )
-        .expect_err("a non-allocation failure must fail closed, not retry");
+    }
 
-        assert!(
-            error.to_string().contains("tensor 'x' is missing"),
-            "original error must propagate unchanged: {error}"
-        );
-        assert_eq!(
-            *executor.calls.lock().unwrap(),
-            1,
-            "no retry attempt for an error class other than the GPU allocation failure"
-        );
+    fn optional_punctuation_test_transcription() -> Transcription {
+        Transcription {
+            truncated_decodes: Vec::new(),
+            unnamed_speakers: Vec::new(),
+            text: "raw transcript".to_string(),
+            segments: Vec::new(),
+            longform: None,
+            language: None,
+        }
     }
 
     #[test]
-    fn slice_dispatch_does_not_recurse_when_an_explicit_cpu_only_request_fails() {
-        // No lower-level backend exists below CPU: a CpuOnly request that
-        // itself hits `BackendBufferAllocationFailed` must fail closed exactly
-        // like any other CPU error, not loop back into itself.
-        let dir = tempfile::tempdir().unwrap();
-        // `GpuAllocFallbackStubExecutor` only fails when *not* CpuOnly, so a
-        // dedicated stub is needed here to simulate a CPU-side allocation
-        // failure specifically.
-        struct AlwaysFailsCpuAllocExecutor {
-            calls: Mutex<usize>,
-        }
-        impl GgmlAsrViewExecutor for AlwaysFailsCpuAllocExecutor {
-            fn executor_id(&self) -> &'static str {
-                "always-fails-cpu-alloc-stub"
-            }
-            fn supports_phrase_bias(&self) -> bool {
-                true
-            }
-            fn execute_view(
-                &self,
-                request: &GgmlAsrExecutionViewRequest,
-            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
-                *self.calls.lock().unwrap() += 1;
-                Err(GgmlAsrExecutionError::ExecutorFailed {
-                    executor_id: "always-fails-cpu-alloc-stub",
-                    adapter_id: request.selected_family.adapter_id,
-                    reason: "compute buffer allocation failed (backend: CPU)".to_string(),
-                })
-            }
-        }
-        let cpu_executor = std::sync::Arc::new(AlwaysFailsCpuAllocExecutor {
-            calls: Mutex::new(0),
-        });
-        let (dispatch, preflight, family) =
-            gpu_fallback_test_fixture(dir.path(), cpu_executor.clone());
-        let decode_progress = DecodeProgress::begin(None, 1_000, false);
-        let mut tracker = GpuAllocationFallbackTracker::default();
+    fn optional_punctuation_preserves_asr_after_typed_candidates_are_exhausted() {
+        let original = optional_punctuation_test_transcription();
+        let error = PolicyResolvedAuxRuntimeError::CandidatesExhausted {
+            stage: "firered-punctuation",
+            failure: ExecutionCandidateFailure::capacity("test-punctuation", "full"),
+            source: None,
+        };
 
-        let error = run_dispatch_once_with_progress_and_gpu_fallback(
-            &dispatch,
-            &preflight,
-            &family,
-            vec![0.0; 1_000].into(),
-            GgmlAsrExecutionOptions::default(),
-            GgmlAsrBackendPreference::CpuOnly,
-            &uncancellable_execution_context_for_test(),
-            &decode_progress,
-            1_000,
-            "index=1",
-            &mut tracker,
-        )
-        .expect_err("an explicit CpuOnly allocation failure must fail closed");
+        let resolved = finish_optional_punctuation_stage(original.clone(), Err(error))
+            .expect("optional punctuation exhaustion must preserve ASR");
 
-        assert!(
-            error
-                .to_string()
-                .contains("compute buffer allocation failed")
-        );
-        assert_eq!(
-            *cpu_executor.calls.lock().unwrap(),
-            1,
-            "a CpuOnly request must never be retried -- there is no lower backend"
-        );
+        assert_eq!(resolved, original);
     }
 
     #[test]
-    fn slice_dispatch_switches_to_cpu_only_after_two_consecutive_fallbacks() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = std::sync::Arc::new(GpuAllocFallbackStubExecutor::new(
-            "compute buffer allocation failed (backend: Vulkan0)",
-        ));
-        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let decode_progress = DecodeProgress::begin(None, 3_000, false);
-        let mut tracker = GpuAllocationFallbackTracker::default();
+    fn optional_punctuation_does_not_hide_empty_plan_invariant() {
+        let error = PolicyResolvedAuxRuntimeError::EmptyPlan {
+            stage: "firered-punctuation",
+        };
 
-        for slice_index in 1..=3 {
-            let (_result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
-                &dispatch,
-                &preflight,
-                &family,
-                vec![0.0; 1_000].into(),
-                GgmlAsrExecutionOptions::default(),
-                GgmlAsrBackendPreference::Auto,
-                &uncancellable_execution_context_for_test(),
-                &decode_progress,
-                1_000,
-                &format!("index={slice_index}"),
-                &mut tracker,
+        let result = finish_optional_punctuation_stage(
+            optional_punctuation_test_transcription(),
+            Err(error),
+        );
+
+        assert!(matches!(result, Err(BackendError::NativeFailClosed { .. })));
+    }
+
+    #[test]
+    fn every_required_auxiliary_stage_fails_closed_after_typed_exhaustion() {
+        for stage in [
+            "qwen3-forced-aligner",
+            "speaker-attribution",
+            "longform-vad",
+            "speaker-identity",
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let error = run_auxiliary_stage_with_policy(
+                native_execution_services_for_test().as_ref(),
+                &typed_fallback_test_plan(),
+                stage,
+                |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    crate::models::native_execution_services::record_current_execution_candidate_failure(
+                        ExecutionCandidateFailure::capacity("test-required-aux", "full"),
+                    );
+                    Ok::<(), BackendError>(())
+                },
             )
-            .expect("every slice recovers via CPU");
-            assert!(fallback.is_some(), "slice {slice_index} should be degraded");
-        }
+            .expect_err("required auxiliary stage must retain typed exhaustion");
+            assert!(matches!(
+                error,
+                PolicyResolvedAuxRuntimeError::CandidatesExhausted { .. }
+            ));
 
-        // Slices 1 and 2 each got their own GPU attempt (and failed) before the
-        // CPU retry; slice 3's streak already tripped, so it must go straight
-        // to CPU with no third GPU attempt at all.
+            let error = required_auxiliary_stage_error(error);
+            let BackendError::NativeFailClosed { reason } = error else {
+                panic!("{stage} typed exhaustion must fail closed");
+            };
+            assert!(reason.contains(stage), "{stage}: {reason}");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "{stage} must exhaust both approved candidates before failing"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_candidate_failure_retries_without_parsing_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(TypedCandidateFailureStubExecutor::new(true));
+        let (dispatch, preflight, family) =
+            execution_policy_test_fixture(dir.path(), executor.clone());
+        let services = native_execution_services_for_test();
+        let progress = DecodeProgress::begin(None, 160, false);
+        let (result, fallback) = run_dispatch_once_with_progress_and_policy(
+            &dispatch,
+            &services,
+            &preflight,
+            &family,
+            vec![0.0; 160],
+            GgmlAsrExecutionOptions::default(),
+            &typed_fallback_test_plan(),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            &uncancellable_execution_context_for_test(),
+            &progress,
+            160,
+            "typed-fallback-test",
+        )
+        .expect("typed capacity failure should advance to CPU under Auto");
+        assert_eq!(result.transcription.text, "cpu-success");
+        assert!(fallback.is_some());
         assert_eq!(
-            executor.calls_snapshot(),
+            executor.calls(),
             vec![
-                GgmlAsrBackendPreference::Auto,
-                GgmlAsrBackendPreference::CpuOnly,
-                GgmlAsrBackendPreference::Auto,
-                GgmlAsrBackendPreference::CpuOnly,
+                GgmlAsrBackendPreference::Accelerated,
                 GgmlAsrBackendPreference::CpuOnly,
             ]
+        );
+    }
+
+    #[test]
+    fn identical_error_without_typed_failure_never_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(TypedCandidateFailureStubExecutor::new(false));
+        let (dispatch, preflight, family) =
+            execution_policy_test_fixture(dir.path(), executor.clone());
+        let services = native_execution_services_for_test();
+        let progress = DecodeProgress::begin(None, 160, false);
+        let error = run_dispatch_once_with_progress_and_policy(
+            &dispatch,
+            &services,
+            &preflight,
+            &family,
+            vec![0.0; 160],
+            GgmlAsrExecutionOptions::default(),
+            &typed_fallback_test_plan(),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            &uncancellable_execution_context_for_test(),
+            &progress,
+            160,
+            "untyped-failure-test",
+        )
+        .expect_err("ordinary executor failure must fail closed on its candidate");
+        assert!(error.to_string().contains("opaque failure text"));
+        assert_eq!(
+            executor.calls(),
+            vec![GgmlAsrBackendPreference::Accelerated]
         );
     }
 
@@ -8006,6 +7410,16 @@ mod tests {
             true
         }
 
+        fn decoder_state_contract(
+            &self,
+            _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        ) -> Result<
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract,
+            GgmlAsrExecutionError,
+        > {
+            Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
+        }
+
         fn execute_view(
             &self,
             request: &GgmlAsrExecutionViewRequest,
@@ -8082,7 +7496,7 @@ mod tests {
     ) -> Result<ConcurrentPipelineOutcome, BackendError> {
         let audio = PcmBuffer::from_vec(audio.to_vec());
         let dir = tempfile::tempdir().unwrap();
-        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor);
+        let (dispatch, preflight, family) = execution_policy_test_fixture(dir.path(), executor);
         let timeline = crate::longform::TimelineMap::identity();
         let mut assembler =
             TranscriptAssembler::new(timeline.clone(), SegmentMergePolicy::default());
@@ -8095,15 +7509,25 @@ mod tests {
         let mut truncated_slices = Vec::new();
         let mut truncated_decodes = Vec::new();
         let mut speaker_scope_count = 0usize;
+        let execution_services = native_execution_services_for_test();
+        let execution_plan = resolve_native_execution_plan(
+            execution_services.as_ref(),
+            &family,
+            ExecutionIntent::CpuOnly,
+        )?;
+        let auto_gpu_policy =
+            crate::arch::family_auto_gpu_policy_for_model_architecture(family.model_architecture);
         run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
             width,
             slices,
             plan_audio: &audio,
             dispatch: &dispatch,
+            execution_services: &execution_services,
             runtime_preflight: &preflight,
             selected_family: &family,
             request_options: &request_options,
-            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_plan: &execution_plan,
+            auto_gpu_policy,
             execution_context,
             longform_options,
             speaker_plan: SpeakerPlan::Off,
@@ -8254,6 +7678,16 @@ mod tests {
 
         fn supports_phrase_bias(&self) -> bool {
             true
+        }
+
+        fn decoder_state_contract(
+            &self,
+            _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        ) -> Result<
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract,
+            GgmlAsrExecutionError,
+        > {
+            Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
         }
 
         fn execute_view(
@@ -8436,6 +7870,16 @@ mod tests {
             true
         }
 
+        fn decoder_state_contract(
+            &self,
+            _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        ) -> Result<
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract,
+            GgmlAsrExecutionError,
+        > {
+            Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
+        }
+
         fn execute_view(
             &self,
             request: &GgmlAsrExecutionViewRequest,
@@ -8476,6 +7920,16 @@ mod tests {
 
         fn supports_phrase_bias(&self) -> bool {
             true
+        }
+
+        fn decoder_state_contract(
+            &self,
+            _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        ) -> Result<
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract,
+            GgmlAsrExecutionError,
+        > {
+            Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
         }
 
         fn execute_view(

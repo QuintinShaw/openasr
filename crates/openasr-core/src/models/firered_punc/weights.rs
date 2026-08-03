@@ -69,6 +69,141 @@ pub(crate) struct FireRedPuncWeights {
     pub punc_head_bias: NamedTensor,
 }
 
+impl NamedTensor {
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_string(&self.name, "firered-punc staged tensor name")?;
+        bytes.add_vec(&self.dims, "firered-punc staged tensor dims")?;
+        bytes.add_vec(&self.values, "firered-punc staged tensor values")?;
+        Ok(bytes.finish())
+    }
+}
+
+impl FireRedPuncLayerWeights {
+    fn tensors(&self) -> [&NamedTensor; 16] {
+        [
+            &self.attn_q_weight,
+            &self.attn_q_bias,
+            &self.attn_k_weight,
+            &self.attn_k_bias,
+            &self.attn_v_weight,
+            &self.attn_v_bias,
+            &self.attn_output_weight,
+            &self.attn_output_bias,
+            &self.attn_norm_weight,
+            &self.attn_norm_bias,
+            &self.ffn_up_weight,
+            &self.ffn_up_bias,
+            &self.ffn_down_weight,
+            &self.ffn_down_bias,
+            &self.ffn_norm_weight,
+            &self.ffn_norm_bias,
+        ]
+    }
+}
+
+impl FireRedPuncWeights {
+    pub(crate) fn quoted_staging_system_memory_bytes(
+        tensor_index: &crate::GgufTensorIndex,
+        metadata: &FireRedPuncExecutionMetadata,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            metadata
+                .layers
+                .checked_mul(std::mem::size_of::<FireRedPuncLayerWeights>())
+                .ok_or_else(|| "firered-punc staged-layer quote overflowed".to_string())?,
+            "firered-punc staged layers",
+        )?;
+        let mut add_tensor = |name: &str| -> Result<(), String> {
+            let tensor = tensor_index
+                .get(name)
+                .ok_or_else(|| format!("firered-punc quote tensor '{name}' is missing"))?;
+            bytes.add_usize(name.len(), "firered-punc staged tensor name")?;
+            bytes.add_usize(
+                tensor
+                    .dims
+                    .len()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or_else(|| format!("firered-punc quote tensor '{name}' dims overflowed"))?,
+                "firered-punc staged tensor dims",
+            )?;
+            let elements = tensor.num_elements().ok_or_else(|| {
+                format!("firered-punc quote tensor '{name}' element count overflowed")
+            })?;
+            bytes.add(
+                elements.checked_mul(4).ok_or_else(|| {
+                    format!("firered-punc quote tensor '{name}' f32 bytes overflowed")
+                })?,
+                "firered-punc staged tensor values",
+            )
+        };
+        for name in [
+            TOKEN_EMBD_WEIGHT,
+            TOKEN_TYPE_EMBD_WEIGHT,
+            POSITION_EMBD_WEIGHT,
+            EMBD_NORM_WEIGHT,
+            EMBD_NORM_BIAS,
+            PUNC_HEAD_WEIGHT,
+            PUNC_HEAD_BIAS,
+        ] {
+            add_tensor(name)?;
+        }
+        for layer in 0..metadata.layers {
+            let names = firered_punc_layer_tensor_names(layer);
+            for name in [
+                names.attn_q_weight,
+                names.attn_q_bias,
+                names.attn_k_weight,
+                names.attn_k_bias,
+                names.attn_v_weight,
+                names.attn_v_bias,
+                names.attn_output_weight,
+                names.attn_output_bias,
+                names.attn_norm_weight,
+                names.attn_norm_bias,
+                names.ffn_up_weight,
+                names.ffn_up_bias,
+                names.ffn_down_weight,
+                names.ffn_down_bias,
+                names.ffn_norm_weight,
+                names.ffn_norm_bias,
+            ] {
+                add_tensor(&name)?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "firered-punc staged layers")?;
+        for tensor in [
+            &self.token_embd,
+            &self.token_type_embd,
+            &self.position_embd,
+            &self.embd_norm_weight,
+            &self.embd_norm_bias,
+            &self.punc_head_weight,
+            &self.punc_head_bias,
+        ] {
+            bytes.add(
+                tensor.retained_system_memory_bytes()?,
+                "firered-punc staged fixed tensor",
+            )?;
+        }
+        for layer in &self.layers {
+            for tensor in layer.tensors() {
+                bytes.add(
+                    tensor.retained_system_memory_bytes()?,
+                    "firered-punc staged layer tensor",
+                )?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+}
+
 fn load_named(
     reader: &GgufTensorDataReader,
     name: &str,

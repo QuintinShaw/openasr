@@ -41,6 +41,43 @@ pub struct Hymt2Tokenizer {
 }
 
 impl Hymt2Tokenizer {
+    #[allow(dead_code)] // Reconciled by the aggregate Hy-MT2 candidate owner.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "hymt2 tokenizer id table")?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, "hymt2 tokenizer id token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "hymt2 tokenizer token map byte count overflowed".to_string())?,
+            "hymt2 tokenizer token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "hymt2 tokenizer token map key")?;
+        }
+        bytes.add_usize(
+            self.merge_rank
+                .len()
+                .checked_mul(std::mem::size_of::<(String, usize)>())
+                .ok_or_else(|| "hymt2 tokenizer merge map byte count overflowed".to_string())?,
+            "hymt2 tokenizer merge map entries",
+        )?;
+        for merge in self.merge_rank.keys() {
+            bytes.add_string(merge, "hymt2 tokenizer merge key")?;
+        }
+        bytes.add_usize(
+            self.special_token_ids
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| "hymt2 tokenizer special-token byte count overflowed".to_string())?,
+            "hymt2 tokenizer special-token entries",
+        )?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
         let tokenizer_model =
             required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, HYMT2_TOKENIZER_FAMILY)?;
@@ -120,7 +157,9 @@ impl Hymt2Tokenizer {
     }
 
     pub(crate) fn encode_content_text(&self, text: &str) -> Result<Vec<u32>, NativeAsrError> {
-        self.encode_plain_text_chunk(text)
+        let token_ids = self.encode_plain_text_chunk(text)?;
+        validate_byte_level_token_bound(text, token_ids.len())?;
+        Ok(token_ids)
     }
 
     pub fn encode_text(&self, text: &str) -> Result<Vec<u32>, NativeAsrError> {
@@ -220,6 +259,23 @@ impl Hymt2Tokenizer {
         }
         Ok(token_ids)
     }
+}
+
+/// Enforce the byte-level BPE invariant used by the construction-time KV
+/// envelope. Initial symbols correspond one-for-one with UTF-8 bytes and BPE
+/// merges can only reduce their count. A malformed vocabulary normally fails
+/// earlier while encoding; this check makes any future tokenizer drift fail
+/// closed instead of invalidating the memory proof.
+fn validate_byte_level_token_bound(text: &str, token_count: usize) -> Result<(), NativeAsrError> {
+    if token_count <= text.len() {
+        return Ok(());
+    }
+    Err(NativeAsrError::UnsupportedModelPack {
+        reason: format!(
+            "Hy-MT2 byte-level tokenizer emitted {token_count} tokens for {} UTF-8 bytes",
+            text.len()
+        ),
+    })
 }
 
 fn hunyuan_dense_pretokenize(text: &str) -> Vec<&str> {
@@ -558,6 +614,24 @@ mod tests {
         .collect::<BTreeSet<_>>();
         assert!(stop.contains(&HYMT2_EOS_TOKEN_ID));
         assert!(stop.contains(&HYMT2_ASSISTANT_TOKEN_ID));
+    }
+
+    #[test]
+    fn byte_level_bound_covers_ascii_four_byte_scalars_and_mixed_unicode() {
+        let cases = [
+            "OpenASR",
+            "\u{10ffff}",
+            "会议🙂OpenASR ２０２６",
+            "a\u{301}éカナ中文",
+        ];
+        for text in cases {
+            validate_byte_level_token_bound(text, text.len()).expect("one token per byte bound");
+            if !text.is_empty() {
+                validate_byte_level_token_bound(text, text.len() + 1)
+                    .expect_err("more tokens than bytes must fail closed");
+            }
+            assert!(text.len() <= text.chars().count().saturating_mul(4));
+        }
     }
 
     #[test]

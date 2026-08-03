@@ -71,17 +71,16 @@ pub use api::backend::{
     BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
     FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeRuntimeShutdownGuard,
-    RequestExecutionContext, RequestSource, Segment, SliceBoundaryControl, Transcription,
-    TranscriptionBackend, TranscriptionControl, TranscriptionRequest, TranscriptionTask,
-    TruncatedDecode, WordTimestamp, add_segment_word_timestamps,
-    describe_native_runtime_model_mismatch, format_failure_context_line,
-    format_request_context_line, native_adapter_supports_source_language_hint,
-    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
-    native_runtime_realtime_capabilities_for_path,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestExecutionContext,
+    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
+    TranscriptionControl, TranscriptionRequest, TranscriptionTask, TruncatedDecode, WordTimestamp,
+    add_segment_word_timestamps, describe_native_runtime_model_mismatch,
+    format_failure_context_line, format_request_context_line,
+    native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
+    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path,
-    resolve_local_native_runtime_model_identity, unload_idle_native_model_runtime_caches,
-    validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
+    resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
+    validate_native_runtime_model_pack_contract,
 };
 pub use api::native::{
     NativeAsrBackpressurePolicy, NativeAsrBenchmarkStatus, NativeAsrCapabilities,
@@ -198,6 +197,9 @@ pub use model_store_gc::{
 pub(crate) use models::ggml_asr_executor::{
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
+pub use models::native_execution_services::{
+    NativeExecutionScopeId, NativeExecutionServices, NativeExecutionServicesError,
+};
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
     cohere::{
@@ -262,7 +264,8 @@ pub use models::{
         HYMT2_PINNED_SOURCE_GGUF_SHA256, Hymt2ConfigError, Hymt2DecodeResult, Hymt2DecodeTimings,
         Hymt2ExecutionMetadata, Hymt2ImportError, Hymt2ImportRequest, Hymt2ImportResult,
         Hymt2PrefixCacheConfig, Hymt2PrefixReuseReport, Hymt2Runtime, Hymt2RuntimeError,
-        Hymt2TranslationSessionCache, import_hymt2_gguf_to_runtime_pack,
+        Hymt2TranslationSessionCache, PolicyResolvedHymt2Error,
+        PolicyResolvedHymt2TranslationRuntime, import_hymt2_gguf_to_runtime_pack,
     },
     moonshine::{
         MOONSHINE_MODEL_FAMILY, MoonshineLocalSourceError, MoonshineLocalSourceImportRequest,
@@ -316,11 +319,14 @@ pub use pull::{
     BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, LegacyMigrationFailure,
     LegacyMigrationReport, PullError, PullModelPackRequest, PullProgress,
     available_disk_space_bytes, default_pack_pointer_path, install_backend_pack,
-    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
+    install_catalog_model_pack_from_path,
+    install_catalog_model_pack_from_path_with_execution_services, install_model_pack_from_path,
+    install_model_pack_from_path_with_execution_services, list_installed_packs,
     migrate_legacy_model_store, migrate_model_store_at_startup, open_installed_content_lease,
     persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
-    resolve_catalog_model_pack_from_path, resolve_installed_pack_path,
-    resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
+    remove_model_pack_with_execution_services, resolve_catalog_model_pack_from_path,
+    resolve_installed_pack_path, resolve_installed_pack_reference,
+    resolve_installed_pack_reference_with_catalog,
 };
 pub use realtime::{
     BufferedUtterance, CaptureBackpressureQueue, CaptureEngine, CaptureEngineError,
@@ -380,5 +386,5 @@ pub use translation::{
     LatestOnlyTranslationQueue, StabilityGate, StabilityGateConfig, StabilityGateDecision,
     StabilityGateInput, StabilityGateReason, TargetLang, TranslationOutput, TranslationQueueError,
     TranslationQueueSubmit, TranslationRequest, TranslationSession, TranslationSessionError,
-    TranslationTimings, TranslationWorkerOutput,
+    TranslationTimings, TranslationWorkerOutput, TranslationWorkerReadiness,
 };

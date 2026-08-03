@@ -81,6 +81,9 @@ fn build_request(pack: &Path, descriptor_id: &str) -> GgmlAsrStreamingSessionReq
         other => panic!("unknown descriptor {other}"),
     };
     GgmlAsrStreamingSessionRequest {
+        execution_services:
+            crate::models::native_execution_services::test_native_execution_services(),
+        decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
         runtime_source_path: pack.to_path_buf(),
         runtime_source_preflight: None,
         selected_family,
@@ -91,6 +94,7 @@ fn build_request(pack: &Path, descriptor_id: &str) -> GgmlAsrStreamingSessionReq
             (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         ),
+        final_text_processor: None,
         session_context: NativeAsrSessionContext::new("rt_finalize_bench"),
         session_config: NativeAsrStreamingSessionConfig::new()
             .with_partial_results(true)
@@ -108,13 +112,11 @@ fn start_session(
         .with_partial_results(partial_results)
         .into();
     let session = match descriptor_id {
-        "sensevoice" => {
-            super::sensevoice::executor::SenseVoiceGgmlExecutor.start_streaming_session(&request)
-        }
+        "sensevoice" => super::sensevoice::executor::SenseVoiceGgmlExecutor::default()
+            .start_streaming_session(&request),
         "qwen" => super::qwen::Qwen3AsrGgmlExecutor::default().start_streaming_session(&request),
-        "dolphin" => {
-            super::dolphin::executor::DolphinGgmlExecutor.start_streaming_session(&request)
-        }
+        "dolphin" => super::dolphin::executor::DolphinGgmlExecutor::default()
+            .start_streaming_session(&request),
         other => panic!("unknown descriptor {other}"),
     };
     session.expect("streaming session should start")

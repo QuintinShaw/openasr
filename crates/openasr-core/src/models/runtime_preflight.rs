@@ -69,11 +69,14 @@ pub(crate) fn build_runtime_tensor_reader_from_preflight(
     // mapping, the same open the preflight's `metadata` and `tensor_index`
     // were derived from. Re-opening the path here would let a pack replaced in
     // between pair an index with bytes from a different file generation.
-    GgufTensorDataReader::from_runtime_source(&preflight.runtime_source).map_err(|source| {
-        RuntimeSourceTensorReaderError::Build {
-            runtime_source_path: preflight.runtime_source.path().to_path_buf(),
-            source: Box::new(source),
-        }
+    GgufTensorDataReader::from_preflight_parts(
+        &preflight.runtime_source,
+        &preflight.metadata,
+        Arc::clone(&preflight.tensor_index),
+    )
+    .map_err(|source| RuntimeSourceTensorReaderError::Build {
+        runtime_source_path: preflight.runtime_source.path().to_path_buf(),
+        source: Box::new(source),
     })
 }
 

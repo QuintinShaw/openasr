@@ -56,6 +56,66 @@ pub(crate) struct CohereTranscribeDecoderWeights {
     pub layers: Vec<CohereDecoderLayerWeights>,
 }
 
+impl CohereTranscribeDecoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for weight in [
+            &self.token_embedding,
+            &self.positional_embedding,
+            &self.output_head_weight,
+        ] {
+            weight.add_retained_system_memory(&mut bytes, "cohere decoder matrix weight")?;
+        }
+        for weight in [
+            &self.emb_ln_weight,
+            &self.emb_ln_bias,
+            &self.out_ln_weight,
+            &self.out_ln_bias,
+            &self.output_head_bias,
+        ] {
+            weight.add_retained_system_memory(&mut bytes, "cohere decoder vector weight")?;
+        }
+        bytes.add_vec(&self.layers, "cohere decoder layers")?;
+        for layer in &self.layers {
+            for weight in [
+                &layer.attn_q_weight,
+                &layer.attn_k_weight,
+                &layer.attn_v_weight,
+                &layer.attn_o_weight,
+                &layer.cross_q_weight,
+                &layer.cross_k_weight,
+                &layer.cross_v_weight,
+                &layer.cross_o_weight,
+                &layer.ffn_up_weight,
+                &layer.ffn_down_weight,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "cohere decoder layer matrix")?;
+            }
+            for weight in [
+                &layer.attn_ln_weight,
+                &layer.attn_ln_bias,
+                &layer.attn_q_bias,
+                &layer.attn_k_bias,
+                &layer.attn_v_bias,
+                &layer.attn_o_bias,
+                &layer.cross_ln_weight,
+                &layer.cross_ln_bias,
+                &layer.cross_q_bias,
+                &layer.cross_k_bias,
+                &layer.cross_v_bias,
+                &layer.cross_o_bias,
+                &layer.ffn_ln_weight,
+                &layer.ffn_ln_bias,
+                &layer.ffn_up_bias,
+                &layer.ffn_down_bias,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "cohere decoder layer vector")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) type CohereDecoderWeightsError = CohereWeightLoadError;
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -7,7 +7,9 @@ use super::frontend::{
     clean_frame_count_for_samples, earliest_sample_needed_for_frame,
     samples_needed_for_clean_frame_count, total_frame_count_for_samples,
 };
-use super::runtime::{PooledRuntime, XasrChunkedDecodeState};
+use super::runtime::{
+    HopDecodeOutcome, XasrChunkedDecodeState, XasrRuntimeActor, XasrZipformerPreparedRuntime,
+};
 use super::tokenizer::XasrStreamingDetokenizer;
 
 const XASR_STREAMING_BASELINE_LEFT_CONTEXT_TOKENS: usize = 16;
@@ -16,8 +18,8 @@ pub(crate) struct XasrIncrementalDecoder {
     executor_id: &'static str,
     adapter_id: &'static str,
     request: GgmlAsrStreamingSessionRequest,
-    runtime: PooledRuntime,
-    decode_state: XasrChunkedDecodeState,
+    runtime: XasrRuntimeActor,
+    decode_state: Option<XasrChunkedDecodeState>,
     audio: Vec<f32>,
     /// Samples drained from the front of `audio`; all sample/frame indices
     /// below stay absolute against the full stream.
@@ -42,15 +44,19 @@ impl XasrIncrementalDecoder {
         request: &GgmlAsrStreamingSessionRequest,
         executor_id: &'static str,
         adapter_id: &'static str,
-        runtime: PooledRuntime,
-    ) -> Self {
-        let decode_state = runtime.new_decode_state();
-        Self {
+        runtime: XasrRuntimeActor,
+    ) -> Result<Self, GgmlAsrExecutionError> {
+        let decode_state = runtime
+            .call_mut(|runtime| runtime.new_decode_state())
+            .map_err(|error| {
+                GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error.to_string())
+            })?;
+        Ok(Self {
             executor_id,
             adapter_id,
             request: request.clone(),
             runtime,
-            decode_state,
+            decode_state: Some(decode_state),
             audio: Vec::new(),
             dropped_samples: 0,
             frontend: XasrFbankFrontend::new(),
@@ -62,11 +68,85 @@ impl XasrIncrementalDecoder {
             dropped_frames: 0,
             detokenizer: XasrStreamingDetokenizer::default(),
             decoded_tokens: 0,
-        }
+        })
     }
 
     fn failed(&self, reason: impl Into<String>) -> GgmlAsrExecutionError {
         GgmlAsrExecutionError::executor_failed(self.executor_id, self.adapter_id, reason)
+    }
+
+    fn decode_state(&self) -> Result<&XasrChunkedDecodeState, GgmlAsrExecutionError> {
+        self.decode_state
+            .as_ref()
+            .ok_or_else(|| self.failed("xasr runtime actor terminated"))
+    }
+
+    fn decode_state_mut(&mut self) -> Result<&mut XasrChunkedDecodeState, GgmlAsrExecutionError> {
+        let executor_id = self.executor_id;
+        let adapter_id = self.adapter_id;
+        self.decode_state.as_mut().ok_or_else(|| {
+            GgmlAsrExecutionError::executor_failed(
+                executor_id,
+                adapter_id,
+                "xasr runtime actor terminated",
+            )
+        })
+    }
+
+    /// Moves the session-local decode state and feature window through the
+    /// command channel while the thread-affine runtime stays on its owner
+    /// actor. Both values are restored before an ordinary model error is
+    /// returned. A transport/panic failure is terminal for this actor, so the
+    /// session intentionally remains without a decode state and fails closed.
+    fn call_decode<O, F>(&mut self, operation: F) -> Result<O, GgmlAsrExecutionError>
+    where
+        O: Send + 'static,
+        F: FnOnce(
+                &mut XasrZipformerPreparedRuntime,
+                &mut XasrChunkedDecodeState,
+                &XasrFbankFeatures,
+            ) -> Result<O, String>
+            + Send
+            + 'static,
+    {
+        let mut state = self
+            .decode_state
+            .take()
+            .ok_or_else(|| self.failed("xasr runtime actor terminated"))?;
+        let features = std::mem::replace(
+            &mut self.features,
+            XasrFbankFeatures {
+                data: Vec::new(),
+                n_frames: 0,
+                n_mels: XASR_N_MELS,
+            },
+        );
+        let response = self.runtime.call_mut(move |runtime| {
+            let result = operation(runtime, &mut state, &features);
+            (state, features, result)
+        });
+        let (state, features, result) = response.map_err(|error| self.failed(error.to_string()))?;
+        self.decode_state = Some(state);
+        self.features = features;
+        result.map_err(|error| self.failed(error))
+    }
+
+    fn decode_available_chunks_on_actor(
+        &mut self,
+        final_flush: bool,
+    ) -> Result<usize, GgmlAsrExecutionError> {
+        self.call_decode(move |runtime, state, features| {
+            runtime.decode_available_chunks(state, features, final_flush)
+        })
+    }
+
+    fn decode_next_chunk_on_actor(
+        &mut self,
+        final_flush: bool,
+    ) -> Result<HopDecodeOutcome, GgmlAsrExecutionError> {
+        self.call_decode(move |runtime, state, features| {
+            runtime.decode_next_chunk(state, features, final_flush)
+        })
     }
 
     /// Extends the feature cache up to `target_total_frames` (an absolute
@@ -99,11 +179,16 @@ impl XasrIncrementalDecoder {
     fn drain_consumed_prefix(&mut self) {
         const DRAIN_SLACK_FRAMES: usize = 96;
         const DRAIN_SLACK_SAMPLES: usize = 16 * 1024;
-        let consumed = self.decode_state.consumed_feature_frames();
+        let consumed = self
+            .decode_state
+            .as_ref()
+            .map_or(0, XasrChunkedDecodeState::consumed_feature_frames);
         if consumed >= DRAIN_SLACK_FRAMES {
             self.features.data.drain(..consumed * self.features.n_mels);
             self.features.n_frames -= consumed;
-            self.decode_state.rebase_feature_frames(consumed);
+            if let Some(state) = &mut self.decode_state {
+                state.rebase_feature_frames(consumed);
+            }
             self.dropped_frames += consumed;
         }
         let next_frame = self.dropped_frames + self.features.n_frames;
@@ -134,14 +219,7 @@ impl XasrIncrementalDecoder {
             return Ok(String::new());
         }
         self.extend_feature_rows(target_total_frames)?;
-        let executor_id = self.executor_id;
-        let adapter_id = self.adapter_id;
-        let new_tokens = self
-            .runtime
-            .decode_available_chunks(&mut self.decode_state, &self.features, final_flush)
-            .map_err(|error| {
-                GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error)
-            })?;
+        let new_tokens = self.decode_available_chunks_on_actor(final_flush)?;
         self.drain_consumed_prefix();
         if new_tokens == 0 {
             return Ok(String::new());
@@ -150,29 +228,41 @@ impl XasrIncrementalDecoder {
     }
 
     fn text_delta(&mut self) -> Result<String, GgmlAsrExecutionError> {
-        let executor_id = self.executor_id;
-        let adapter_id = self.adapter_id;
-        let emitted = self.decode_state.emitted_token_ids();
+        let emitted = self.decode_state()?.emitted_token_ids();
+        let emitted_len = emitted.len();
+        let token_ids = emitted[self.decoded_tokens..].to_vec();
         let stable_len = self.detokenizer.text().len();
-        for &id in &emitted[self.decoded_tokens..] {
-            self.detokenizer
-                .push_token(self.runtime.tokenizer(), id)
-                .map_err(|error| {
-                    GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error)
-                })?;
-        }
-        self.decoded_tokens = emitted.len();
+        let mut detokenizer = std::mem::take(&mut self.detokenizer);
+        let response = self.runtime.call_mut(move |runtime| {
+            let result = token_ids
+                .iter()
+                .try_for_each(|&id| detokenizer.push_token(runtime.tokenizer(), id));
+            (detokenizer, result)
+        });
+        let (detokenizer, result) = response.map_err(|error| self.failed(error.to_string()))?;
+        self.detokenizer = detokenizer;
+        result.map_err(|error| self.failed(error))?;
+        self.decoded_tokens = emitted_len;
         Ok(self.detokenizer.text()[stable_len..].to_string())
     }
 
     fn rebase_decode_baseline(&mut self) {
-        let dropped = self.decode_state.rebase_decoded_emitted_history(
-            self.decoded_tokens,
-            XASR_STREAMING_BASELINE_LEFT_CONTEXT_TOKENS,
-        );
+        let decoded_tokens = self.decoded_tokens;
+        let dropped = self
+            .decode_state_mut()
+            .expect("live decoder must retain decode state")
+            .rebase_decoded_emitted_history(
+                decoded_tokens,
+                XASR_STREAMING_BASELINE_LEFT_CONTEXT_TOKENS,
+            );
         self.decoded_tokens -= dropped;
         self.detokenizer.rebase_preserving_boundary_context();
-        debug_assert_eq!(self.decoded_tokens, self.decode_state.emitted_history_len());
+        debug_assert_eq!(
+            self.decoded_tokens,
+            self.decode_state
+                .as_ref()
+                .map_or(0, XasrChunkedDecodeState::emitted_history_len)
+        );
     }
 
     /// Adaptive early-exit predicate for the final-flush pad loop in
@@ -222,6 +312,10 @@ thread_local! {
 
 impl IncrementalAudioDecoder for XasrIncrementalDecoder {
     fn accept_samples(&mut self, samples: &[f32]) -> Result<String, GgmlAsrExecutionError> {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                self.request.execution_services.as_ref(),
+            );
         if samples.iter().any(|value| !value.is_finite()) {
             return Err(self.failed("xasr streaming requires finite audio samples"));
         }
@@ -233,6 +327,10 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
     }
 
     fn finish(&mut self) -> Result<String, GgmlAsrExecutionError> {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                self.request.execution_services.as_ref(),
+            );
         let _thread_override = install_request_inference_threads_override(
             self.request.request_options.inference_threads,
         );
@@ -241,7 +339,7 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         }
         // Final flush: append the tail padding so the model sees the trailing
         // silence it needs to emit the last sentence's terminal punctuation
-        // (mirrors the batch path in `PooledRuntime::transcribe`). Appending the
+        // (mirrors the batch path in the prepared runtime). Appending the
         // whole 0.8 s up front -- rather than growing it hop by hop -- keeps
         // every fbank row byte-identical to a full-pad flush, so the adaptive
         // early exit below can only ever skip trailing hops, never change the
@@ -267,16 +365,9 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         // never fires (e.g. a clause that ends without terminal punctuation)
         // every hop runs, exactly like the pad-all-then-flush path, so this can
         // only skip work, never change a retained hop's output.
-        let executor_id = self.executor_id;
-        let adapter_id = self.adapter_id;
         let mut delta = String::new();
         loop {
-            let outcome = self
-                .runtime
-                .decode_next_chunk(&mut self.decode_state, &self.features, true)
-                .map_err(|error| {
-                    GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error)
-                })?;
+            let outcome = self.decode_next_chunk_on_actor(true)?;
             if !outcome.processed {
                 break;
             }
@@ -297,7 +388,10 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         self.dropped_frames = 0;
         self.detokenizer.reset();
         self.decoded_tokens = 0;
-        self.decode_state.reset_for_runtime(&self.runtime);
+        self.decode_state = self
+            .runtime
+            .call_mut(|runtime| runtime.new_decode_state())
+            .ok();
     }
 
     fn rebase_after_soft_split(&mut self) -> Result<(), GgmlAsrExecutionError> {
@@ -328,7 +422,8 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
     fn warm_up(&mut self) -> Result<(), GgmlAsrExecutionError> {
         let target_frames = self
             .runtime
-            .first_chunk_input_frames()
+            .call_mut(|runtime| runtime.first_chunk_input_frames())
+            .map_err(|error| self.failed(error.to_string()))?
             .map_err(|error| self.failed(error))?;
         let silence = vec![0.0f32; samples_needed_for_clean_frame_count(target_frames)];
         self.accept_samples(&silence)?;
@@ -493,6 +588,9 @@ mod tests {
         .expect("batch xasr")
         .text;
         let request = GgmlAsrStreamingSessionRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack,
             runtime_source_preflight: None,
             selected_family: crate::xasr_zipformer_runtime_descriptor_v1(),
@@ -500,21 +598,25 @@ mod tests {
             configured_diarize: false,
             backend_preference: crate::GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime,
+            final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_match"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(true)
                 .into(),
         };
+        let runtime_pool = super::super::runtime::new_runtime_actor_pool();
         let mut decoder = XasrIncrementalDecoder::new(
             &request,
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             super::super::runtime::checkout_prepared_runtime(
+                &runtime_pool,
                 &runtime_source,
                 resolved_runtime.backend(),
             )
             .expect("streaming runtime"),
-        );
+        )
+        .expect("streaming decoder");
         let mut streaming = String::new();
         for chunk in samples.chunks(320) {
             streaming.push_str(&decoder.accept_samples(chunk).expect("stream chunk"));
@@ -573,6 +675,7 @@ mod tests {
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack.clone();
         request.resolved_runtime = resolved_runtime;
+        let runtime_pool = super::super::runtime::new_runtime_actor_pool();
 
         // Streams `wav` in small chunks then flushes, returning the final-flush
         // delta. With `force_full` the endpoint heuristic is disabled, so
@@ -590,6 +693,7 @@ mod tests {
             )
             .expect("sample wav should load");
             let runtime = super::super::runtime::checkout_prepared_runtime(
+                &runtime_pool,
                 &runtime_source,
                 resolved_runtime.backend(),
             )
@@ -599,7 +703,8 @@ mod tests {
                 crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
                 crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
                 runtime,
-            );
+            )
+            .expect("streaming decoder");
             for chunk in samples.chunks(320) {
                 decoder.accept_samples(chunk).expect("stream chunk");
             }
@@ -625,6 +730,9 @@ mod tests {
 
     fn xasr_streaming_request() -> GgmlAsrStreamingSessionRequest {
         GgmlAsrStreamingSessionRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: std::path::PathBuf::new(),
             runtime_source_preflight: None,
             selected_family: crate::xasr_zipformer_runtime_descriptor_v1(),
@@ -635,6 +743,7 @@ mod tests {
                 (crate::GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
+            final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_warmup"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(true)
@@ -655,7 +764,9 @@ mod tests {
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
+        let runtime_pool = super::super::runtime::new_runtime_actor_pool();
         let runtime = super::super::runtime::checkout_prepared_runtime(
+            &runtime_pool,
             &runtime_source,
             request.resolved_runtime.backend(),
         )
@@ -665,10 +776,14 @@ mod tests {
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             runtime,
-        );
+        )
+        .expect("streaming decoder");
 
         assert!(
-            !decoder.runtime.encoder_runner_is_initialized(),
+            !decoder
+                .runtime
+                .call_mut(|runtime| runtime.encoder_runner_is_initialized())
+                .expect("inspect cold runner"),
             "runner must be cold before warm_up"
         );
         let started = std::time::Instant::now();
@@ -682,7 +797,10 @@ mod tests {
         // happened -- the first real accept_samples call therefore cannot
         // pay it again.
         assert!(
-            decoder.runtime.encoder_runner_is_initialized(),
+            decoder
+                .runtime
+                .call_mut(|runtime| runtime.encoder_runner_is_initialized())
+                .expect("inspect warm runner"),
             "warm_up must force the encoder_graph_runner_init lazy init"
         );
         // Warm-up's silence must not leak: every field `reset` clears must be
@@ -737,9 +855,11 @@ mod tests {
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
+        let runtime_pool = super::super::runtime::new_runtime_actor_pool();
 
         let transcribe = |warm_up: bool| -> String {
             let runtime = super::super::runtime::checkout_prepared_runtime(
+                &runtime_pool,
                 &runtime_source,
                 request.resolved_runtime.backend(),
             )
@@ -749,7 +869,8 @@ mod tests {
                 crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
                 crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
                 runtime,
-            );
+            )
+            .expect("streaming decoder");
             if warm_up {
                 decoder.warm_up().expect("warm up before real audio");
             }

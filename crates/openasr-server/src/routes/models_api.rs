@@ -54,7 +54,12 @@ pub(crate) async fn delete_model(
     let home = distribution.openasr_home()?;
     let default_pull =
         resolve_default_pack(&home, distribution.catalog_source())?.map(|pack| pack.pull);
-    let removed = remove_model_pack(&home, &id).map_err(ApiError::Pull)?;
+    let removed = remove_model_pack_with_execution_services(
+        &home,
+        &id,
+        Some(distribution.native_execution_services.as_ref()),
+    )
+    .map_err(ApiError::Pull)?;
     if removed
         .as_ref()
         .is_some_and(|pack| default_pull.as_deref() == Some(pack.pull.as_str()))
@@ -78,8 +83,14 @@ pub(crate) async fn import_local_model(
     let resolved = resolve_catalog_model_pack_from_path(&catalog, &path).map_err(ApiError::Pull)?;
     ensure_explicit_model_license_acceptance(&resolved, request.accept_license == Some(true))?;
     let mut progress = |_| {};
-    let installed = install_model_pack_from_path(&resolved, path, &home, &mut progress)
-        .map_err(ApiError::Pull)?;
+    let installed = install_catalog_model_pack_from_path_with_execution_services(
+        &catalog,
+        path,
+        &home,
+        Some(distribution.native_execution_services.as_ref()),
+        &mut progress,
+    )
+    .map_err(ApiError::Pull)?;
     Ok(Json(ImportLocalModelResponse {
         object: "model.local_import",
         installed,

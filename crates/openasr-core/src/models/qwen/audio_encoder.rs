@@ -109,6 +109,18 @@ struct F32Tensor {
     values: Vec<f32>,
 }
 
+impl F32Tensor {
+    fn add_retained_system_memory(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_string(&self.name, label)?;
+        bytes.add_vec(&self.dims, label)?;
+        bytes.add_vec(&self.values, label)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AudioLayerWeights {
     attn_norm_weight: F32Tensor,
@@ -151,6 +163,54 @@ pub(crate) struct Qwen3AsrAudioEncoderWeights {
 }
 
 impl Qwen3AsrAudioEncoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for tensor in [
+            &self.conv1_weight,
+            &self.conv1_bias,
+            &self.conv2_weight,
+            &self.conv2_bias,
+            &self.conv3_weight,
+            &self.conv3_bias,
+            &self.conv_out_weight,
+            &self.ln_post_weight,
+            &self.ln_post_bias,
+            &self.proj1_weight,
+            &self.proj1_bias,
+            &self.proj2_weight,
+            &self.proj2_bias,
+        ] {
+            tensor.add_retained_system_memory(&mut bytes, "qwen audio encoder tensor")?;
+        }
+        if let Some(tensor) = &self.conv_out_bias {
+            tensor.add_retained_system_memory(&mut bytes, "qwen audio encoder conv-out bias")?;
+        }
+        bytes.add_vec(&self.layers, "qwen audio encoder layers")?;
+        for layer in &self.layers {
+            for tensor in [
+                &layer.attn_norm_weight,
+                &layer.attn_norm_bias,
+                &layer.attn_q_weight,
+                &layer.attn_q_bias,
+                &layer.attn_k_weight,
+                &layer.attn_k_bias,
+                &layer.attn_v_weight,
+                &layer.attn_v_bias,
+                &layer.attn_out_weight,
+                &layer.attn_out_bias,
+                &layer.ffn_norm_weight,
+                &layer.ffn_norm_bias,
+                &layer.ffn_up_weight,
+                &layer.ffn_up_bias,
+                &layer.ffn_down_weight,
+                &layer.ffn_down_bias,
+            ] {
+                tensor.add_retained_system_memory(&mut bytes, "qwen audio encoder layer tensor")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+
     /// The number of transformer-encoder layers materialized from the GGUF — the
     /// count the composer walks. Cross-checked against the block-stack
     /// descriptor's `qwen3-asr.audio.n_layers` at executor construction (P4 S5d).

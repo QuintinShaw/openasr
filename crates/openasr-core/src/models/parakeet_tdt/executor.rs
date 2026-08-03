@@ -1,11 +1,15 @@
 //! parakeet-tdt transcription core: frontend -> encoder graph (with in-graph
 //! joint encoder projection) -> host TDT greedy decode -> detokenize.
 
-use std::cell::RefCell;
+use std::fmt;
+use std::sync::Arc;
 
-use crate::GgmlRuntimeSource;
 use crate::api::backend::WordTimestamp;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata};
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout,
+};
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
     GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
@@ -13,17 +17,24 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::parakeet_ctc::frontend::ParakeetFrontend;
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
+use crate::models::parakeet_runtime_memory::{
+    FastConformerMemoryTopology, FastConformerSystemMemoryPlan, checked_sum, element_bytes,
+    named_tensor_quote_bytes, plan_fastconformer_system_memory, tokenizer_quote_bytes,
+};
+use crate::models::runtime_cache_coordinator::PackContentKey;
+use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner, SystemMemoryOwnerError,
 };
 use crate::{NativeAsrSession, PARAKEET_TDT_GGML_ADAPTER_ID};
 
 use super::encoder_graph::{ParakeetTdtEncoderGraph, ParakeetTdtMelFeatures};
 use super::encoder_weights::{
-    load_parakeet_tdt_encoder_weights, load_parakeet_tdt_joint_weights,
-    load_parakeet_tdt_predictor_weights,
+    ParakeetTdtLstmLayerWeights, load_parakeet_tdt_encoder_weights,
+    load_parakeet_tdt_joint_weights, load_parakeet_tdt_predictor_weights,
 };
 use super::greedy::{ParakeetTdtJoint, tdt_greedy_decode};
 use super::predictor::ParakeetTdtPredictor;
@@ -32,12 +43,14 @@ use super::runtime_contract::{
 };
 use super::tokenizer::ParakeetTdtTokenizer;
 
-type ParakeetTdtRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+type ParakeetTdtRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type ParakeetTdtRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>;
+type ParakeetTdtRuntimeActor =
+    PinnedRuntimeActorCheckout<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>;
 
-thread_local! {
-    static PARAKEET_TDT_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
+const PARAKEET_TDT_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
+const PARAKEET_TDT_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 4;
 
 const PARAKEET_TDT_STREAMING_EXECUTOR_ID: &str = "parakeet-tdt-ggml-redecode-streaming-executor-v1";
 
@@ -55,39 +68,198 @@ pub(crate) struct ParakeetTdtTranscription {
     pub words: Vec<WordTimestamp>,
 }
 
-fn build_parakeet_tdt_prepared_runtime(
-    runtime_source: &GgmlRuntimeSource,
-    backend: GgmlCpuGraphBackend,
-) -> Result<ParakeetTdtPreparedRuntime, String> {
-    // `from_runtime_source` reads tensor data from `runtime_source`'s
-    // already-open mapping -- this used to reopen `pack_path` a second time
-    // via `from_path`, racing the earlier preflight open that produced
-    // `runtime_source`.
-    let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
-        .map_err(|e| e.to_string())?;
-    let gguf_metadata = crate::ggml_runtime::read_gguf_metadata_from_runtime_source(runtime_source)
-        .map_err(|e| e.to_string())?;
-    let metadata =
-        parse_parakeet_tdt_execution_metadata(&gguf_metadata).map_err(|e| e.to_string())?;
-    let tokenizer = ParakeetTdtTokenizer::from_metadata(&gguf_metadata)?;
-    let weights =
-        load_parakeet_tdt_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    let graph = ParakeetTdtEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
-        .map_err(|e| e.to_string())?;
-    let predictor_weights =
-        load_parakeet_tdt_predictor_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    let predictor =
-        ParakeetTdtPredictor::new(predictor_weights, metadata.pred_hidden, metadata.vocab_size);
-    let joint_weights =
-        load_parakeet_tdt_joint_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    let joint = ParakeetTdtJoint::new(joint_weights, metadata.joint_hidden);
-    Ok(ParakeetTdtPreparedRuntime {
-        metadata,
-        tokenizer,
-        graph,
-        predictor,
-        joint,
-    })
+fn new_parakeet_tdt_runtime_pool() -> Arc<ParakeetTdtRuntimePool> {
+    Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+        "openasr-parakeet-tdt-runtime-owner",
+        AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            PARAKEET_TDT_RUNTIME_MAX_IDLE_ENTRIES,
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+            PARAKEET_TDT_RUNTIME_MAX_INSTANCES_PER_KEY,
+        ),
+    ))
+}
+
+fn checkout_parakeet_tdt_prepared_runtime(
+    pool: &ParakeetTdtRuntimePool,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    resolved_backend: GgmlCpuGraphBackend,
+) -> Result<ParakeetTdtRuntimeActor, String> {
+    let backend = crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config(
+        resolved_backend,
+    )
+    .backend;
+    let key = (
+        PackContentKey::for_runtime_source(&preflight.runtime_source),
+        current_execution_lane_key(backend),
+    );
+    let preflight = preflight.clone();
+    let pack_content_id = preflight.runtime_source.content_id().to_string();
+    pool.checkout_or_try_build_with(
+        key,
+        move || {
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+                .map_err(|error| error.to_string())?;
+            let metadata = parse_parakeet_tdt_execution_metadata(&preflight.metadata)
+                .map_err(|error| error.to_string())?;
+            let (quote, plan) = parakeet_tdt_runtime_system_memory_quote(
+                &preflight.metadata,
+                &preflight.tensor_index,
+                metadata,
+                &pack_content_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((
+                quote.retained_bytes,
+                (preflight, reader, metadata, quote, plan, backend),
+            ))
+        },
+        |(preflight, reader, metadata, quote, plan, backend)| {
+            match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let tokenizer = ParakeetTdtTokenizer::from_metadata(&preflight.metadata)?;
+                let tokenizer_bytes = tokenizer.retained_system_memory_bytes()?;
+
+                let encoder_weights = load_parakeet_tdt_encoder_weights(&reader, &metadata)
+                    .map_err(|error| error.to_string())?;
+                let encoder_weights_bytes = encoder_weights.retained_system_memory_bytes()?;
+                let graph = ParakeetTdtEncoderGraph::new(
+                    &encoder_weights,
+                    metadata,
+                    Some(&preflight.runtime_source),
+                    backend,
+                )
+                .map_err(|error| error.to_string())?;
+                let graph_bytes = graph.retained_system_memory_bytes()?;
+                drop(encoder_weights);
+
+                let predictor_weights = load_parakeet_tdt_predictor_weights(&reader, &metadata)
+                    .map_err(|error| error.to_string())?;
+                let predictor_bytes = predictor_weights.retained_system_memory_bytes()?;
+                let predictor = ParakeetTdtPredictor::new(
+                    predictor_weights,
+                    metadata.pred_hidden,
+                    metadata.vocab_size,
+                );
+                let joint_weights = load_parakeet_tdt_joint_weights(&reader, &metadata)
+                    .map_err(|error| error.to_string())?;
+                let joint_bytes = joint_weights.retained_system_memory_bytes()?;
+                let joint = ParakeetTdtJoint::new(joint_weights, metadata.joint_hidden);
+
+                let retained = checked_sum(
+                    [tokenizer_bytes, graph_bytes, predictor_bytes, joint_bytes],
+                    "parakeet-tdt measured runtime retained bytes",
+                )
+                .map_err(|error| error.to_string())?;
+                let measured_encoder_peak = checked_sum(
+                    [tokenizer_bytes, encoder_weights_bytes, graph_bytes],
+                    "parakeet-tdt measured encoder build peak",
+                )
+                .map_err(|error| error.to_string())?;
+                let planned_encoder_peak = tokenizer_bytes
+                    .checked_add(plan.build_peak_bytes)
+                    .ok_or_else(|| "parakeet-tdt measured build peak overflowed".to_string())?;
+                let runtime = ParakeetTdtPreparedRuntime {
+                    metadata,
+                    tokenizer,
+                    graph,
+                    predictor,
+                    joint,
+                };
+                Ok(SystemMemoryAllocationOutcome::new(
+                    runtime,
+                    retained
+                        .max(measured_encoder_peak)
+                        .max(planned_encoder_peak),
+                    retained,
+                ))
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(reason)) => Err(reason),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(error.to_string())
+                }
+            }
+        },
+        |error| error.to_string(),
+    )
+}
+
+fn parakeet_tdt_runtime_system_memory_quote(
+    gguf_metadata: &GgufMetadata,
+    tensor_index: &crate::GgufTensorIndex,
+    metadata: ParakeetTdtExecutionMetadata,
+    pack_content_id: &str,
+) -> Result<(SystemMemoryAllocationQuote, FastConformerSystemMemoryPlan), SystemMemoryOwnerError> {
+    let tokenizer_bytes = tokenizer_quote_bytes(gguf_metadata, "parakeet-tdt")?;
+    let plan = plan_fastconformer_system_memory(
+        tensor_index,
+        FastConformerMemoryTopology {
+            n_layers: metadata.n_layers,
+            hidden_size: metadata.hidden_size,
+            ffn_dim: metadata.ffn_dim,
+            checkpoint_has_projection_biases: false,
+            bound_tail_weight: "enc.proj.weight",
+            retained_tail_bias: "enc.proj.bias",
+        },
+    )?;
+    let predictor_bytes = parakeet_tdt_predictor_quote_bytes(tensor_index, metadata.pred_layers)?;
+    let joint_bytes = checked_sum(
+        [
+            named_tensor_quote_bytes(tensor_index, "joint.pred.weight", true)?,
+            named_tensor_quote_bytes(tensor_index, "joint.pred.bias", true)?,
+            named_tensor_quote_bytes(tensor_index, "joint.out.weight", true)?,
+            named_tensor_quote_bytes(tensor_index, "joint.out.bias", true)?,
+        ],
+        "parakeet-tdt quoted joint bytes",
+    )?;
+    let retained_bytes = checked_sum(
+        [
+            tokenizer_bytes,
+            plan.graph_retained_bytes,
+            predictor_bytes,
+            joint_bytes,
+        ],
+        "parakeet-tdt quoted runtime retained bytes",
+    )?;
+    let peak_bytes = tokenizer_bytes
+        .checked_add(plan.build_peak_bytes)
+        .ok_or_else(|| {
+            SystemMemoryOwnerError::capacity_failure(
+                "parakeet_tdt_runtime_quote",
+                "parakeet-tdt quoted encoder build peak overflowed",
+            )
+        })?
+        .max(retained_bytes);
+    let quote = SystemMemoryAllocationQuote::new(
+        format!("parakeet-tdt-prepared-runtime:{pack_content_id}"),
+        peak_bytes,
+        retained_bytes,
+    )?;
+    Ok((quote, plan))
+}
+
+fn parakeet_tdt_predictor_quote_bytes(
+    tensor_index: &crate::GgufTensorIndex,
+    pred_layers: usize,
+) -> Result<u64, SystemMemoryOwnerError> {
+    let mut values = vec![named_tensor_quote_bytes(
+        tensor_index,
+        "dec.embed.weight",
+        true,
+    )?];
+    values.push(element_bytes::<ParakeetTdtLstmLayerWeights>(
+        pred_layers,
+        "parakeet-tdt predictor layer descriptors",
+    )?);
+    for layer in 0..pred_layers {
+        for suffix in ["w_ih", "w_hh", "b_ih", "b_hh"] {
+            values.push(named_tensor_quote_bytes(
+                tensor_index,
+                &format!("dec.lstm.{layer}.{suffix}"),
+                true,
+            )?);
+        }
+    }
+    checked_sum(values, "parakeet-tdt quoted predictor bytes")
 }
 
 impl ParakeetTdtPreparedRuntime {
@@ -141,25 +313,41 @@ impl ParakeetTdtPreparedRuntime {
 /// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
 /// replacement at the same path from reusing a runtime built from the old
 /// bytes.
-pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
+fn transcribe_parakeet_tdt_pcm_cached(
+    runtime_pool: &ParakeetTdtRuntimePool,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetTdtTranscription, String> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &PARAKEET_TDT_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_tdt_prepared_runtime(runtime_source, backend),
-        |runtime| runtime.transcribe(samples, word_timestamps),
-    )
+    let actor = checkout_parakeet_tdt_prepared_runtime(runtime_pool, preflight, backend)?;
+    let samples = samples.to_vec();
+    actor
+        .call_mut(move |runtime| runtime.transcribe(&samples, word_timestamps))
+        .map_err(|error| error.to_string())?
 }
 
 /// Dedicated GgmlAsrViewExecutor for parakeet-tdt (DedicatedRuntimeExecutorV1).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ParakeetTdtGgmlExecutor;
+#[derive(Clone)]
+pub(crate) struct ParakeetTdtGgmlExecutor {
+    runtime_pool: Arc<ParakeetTdtRuntimePool>,
+}
+
+impl fmt::Debug for ParakeetTdtGgmlExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParakeetTdtGgmlExecutor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ParakeetTdtGgmlExecutor {
+    fn default() -> Self {
+        Self {
+            runtime_pool: new_parakeet_tdt_runtime_pool(),
+        }
+    }
+}
 
 impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
     fn executor_id(&self) -> &'static str {
@@ -170,6 +358,14 @@ impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
         // The TDT greedy loop does not apply vocab-logit boosts yet (the
         // xasr transducer precedent); keep the capability honest.
         false
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
     }
 
     fn execute_view(
@@ -194,8 +390,9 @@ impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_parakeet_tdt_pcm_cached(
+            &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight.runtime_source,
+            &preflight,
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
         )
@@ -255,11 +452,16 @@ impl GgmlAsrStreamingExecutor for ParakeetTdtGgmlExecutor {
             <ParakeetTdtGgmlExecutor as GgmlAsrViewExecutor>::execute_view,
         )
     }
+
+    fn unload_idle_state(&self) {
+        self.runtime_pool.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source;
     use std::path::Path;
 
     fn read_wav_mono_16k(path: &Path) -> Option<Vec<f32>> {
@@ -300,9 +502,12 @@ mod tests {
         let samples = read_wav_mono_16k(&clip).expect("wav");
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("validate runtime source");
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .expect("preflight");
         let output = transcribe_parakeet_tdt_pcm_cached(
+            &new_parakeet_tdt_runtime_pool(),
             &samples,
-            &runtime_source,
+            &preflight,
             true,
             GgmlCpuGraphBackend::Cpu,
         )

@@ -41,6 +41,32 @@ pub(crate) struct XasrZipformerExecutionMetadata {
 }
 
 impl XasrZipformerExecutionMetadata {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for (label, values) in [
+            (
+                "xasr metadata encoder layer counts",
+                &self.num_encoder_layers,
+            ),
+            ("xasr metadata encoder dims", &self.encoder_dims),
+            ("xasr metadata query head dims", &self.query_head_dims),
+            ("xasr metadata value head dims", &self.value_head_dims),
+            ("xasr metadata head counts", &self.num_heads),
+            (
+                "xasr metadata convolution kernels",
+                &self.cnn_module_kernels,
+            ),
+            ("xasr metadata left context", &self.left_context_len),
+            (
+                "xasr metadata downsampling factors",
+                &self.downsampling_factors,
+            ),
+        ] {
+            bytes.add_vec(values, label)?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn total_encoder_layers(&self) -> usize {
         self.num_encoder_layers.iter().sum()
     }

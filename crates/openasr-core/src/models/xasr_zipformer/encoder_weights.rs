@@ -105,6 +105,169 @@ pub(crate) struct XasrConv2dWeights {
     pub bias: Vec<f32>,
 }
 
+impl XasrEncoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        add_embed_bytes(&self.embed, &mut bytes)?;
+        bytes.add_vec(&self.stacks, "xasr encoder stack descriptors")?;
+        for stack in &self.stacks {
+            bytes.add_vec(&stack.layers, "xasr encoder layer descriptors")?;
+            if let Some(values) = &stack.downsample_bias {
+                bytes.add_vec(values, "xasr encoder stack downsample bias")?;
+            }
+            if let Some(values) = &stack.out_combiner_bypass_scale {
+                bytes.add_vec(values, "xasr encoder stack combiner scale")?;
+            }
+            for layer in &stack.layers {
+                add_layer_bytes(layer, &mut bytes)?;
+            }
+        }
+        bytes.add_vec(
+            &self.downsample_output_bias,
+            "xasr encoder output downsample bias",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
+fn add_embed_bytes(
+    embed: &XasrEncoderEmbedWeights,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+) -> Result<(), String> {
+    for (label, conv) in [
+        ("xasr encoder embed conv0", &embed.conv0),
+        ("xasr encoder embed conv4", &embed.conv4),
+        ("xasr encoder embed conv7", &embed.conv7),
+        (
+            "xasr encoder embed convnext depthwise",
+            &embed.convnext_depthwise,
+        ),
+        (
+            "xasr encoder embed convnext pointwise1",
+            &embed.convnext_pointwise1,
+        ),
+        (
+            "xasr encoder embed convnext pointwise2",
+            &embed.convnext_pointwise2,
+        ),
+    ] {
+        add_conv2d_bytes(conv, bytes, label)?;
+    }
+    add_linear_with_bias_bytes(&embed.out, bytes, "xasr encoder embed output")?;
+    bytes.add_vec(&embed.out_norm_bias, "xasr encoder embed norm bias")?;
+    bytes.add_vec(
+        &embed.out_norm_log_scale,
+        "xasr encoder embed norm log scale",
+    )
+}
+
+fn add_layer_bytes(
+    layer: &XasrEncoderLayerWeights,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+) -> Result<(), String> {
+    for (label, pair) in [
+        ("xasr encoder feed forward1", &layer.feed_forward1),
+        ("xasr encoder feed forward2", &layer.feed_forward2),
+        ("xasr encoder feed forward3", &layer.feed_forward3),
+        ("xasr encoder self attention1", &layer.self_attn1),
+        ("xasr encoder self attention2", &layer.self_attn2),
+    ] {
+        add_linear_pair_bytes(pair, bytes, label)?;
+    }
+    add_linear_with_bias_bytes(
+        &layer.self_attn_weights.in_proj,
+        bytes,
+        "xasr encoder attention qkv projection",
+    )?;
+    layer
+        .self_attn_weights
+        .linear_pos
+        .add_retained_system_memory_bytes(bytes, "xasr encoder attention position projection")?;
+    add_linear_with_bias_bytes(
+        &layer.nonlin_attention.in_proj,
+        bytes,
+        "xasr encoder nonlinear attention input",
+    )?;
+    add_linear_with_bias_bytes(
+        &layer.nonlin_attention.out_proj,
+        bytes,
+        "xasr encoder nonlinear attention output",
+    )?;
+    add_convolution_module_bytes(&layer.conv_module1, bytes, "xasr encoder conv module1")?;
+    add_convolution_module_bytes(&layer.conv_module2, bytes, "xasr encoder conv module2")?;
+    for (label, values) in [
+        ("xasr encoder norm bias", &layer.norm_bias),
+        ("xasr encoder norm log scale", &layer.norm_log_scale),
+        ("xasr encoder bypass scale", &layer.bypass_scale),
+        ("xasr encoder mid bypass scale", &layer.bypass_mid_scale),
+    ] {
+        bytes.add_vec(values, label)?;
+    }
+    Ok(())
+}
+
+fn add_linear_pair_bytes(
+    pair: &XasrLinearPairWeights,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    add_linear_with_bias_bytes(&pair.in_proj, bytes, &format!("{label} input"))?;
+    add_linear_with_bias_bytes(&pair.out_proj, bytes, &format!("{label} output"))
+}
+
+fn add_linear_with_bias_bytes(
+    linear: &XasrLinearWithBias,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    linear
+        .weight
+        .add_retained_system_memory_bytes(bytes, &format!("{label} weight"))?;
+    bytes.add_vec(&linear.bias, &format!("{label} bias"))
+}
+
+fn add_convolution_module_bytes(
+    module: &XasrConvolutionModuleWeights,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    add_linear_with_bias_bytes(&module.in_proj, bytes, &format!("{label} input"))?;
+    add_conv1d_bytes(
+        &module.depthwise_causal_conv,
+        bytes,
+        &format!("{label} causal"),
+    )?;
+    add_conv1d_bytes(
+        &module.depthwise_chunkwise_conv,
+        bytes,
+        &format!("{label} chunkwise"),
+    )?;
+    module
+        .chunkwise_conv_scale
+        .add_retained_system_memory_bytes(bytes, &format!("{label} chunkwise scale"))?;
+    add_linear_with_bias_bytes(&module.out_proj, bytes, &format!("{label} output"))
+}
+
+fn add_conv1d_bytes(
+    conv: &XasrConv1dWeights,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    conv.weight
+        .add_retained_system_memory_bytes(bytes, &format!("{label} weight"))?;
+    bytes.add_vec(&conv.bias, &format!("{label} bias"))
+}
+
+fn add_conv2d_bytes(
+    conv: &XasrConv2dWeights,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    conv.weight
+        .add_retained_system_memory_bytes(bytes, &format!("{label} weight"))?;
+    bytes.add_vec(&conv.bias, &format!("{label} bias"))
+}
+
 pub(crate) fn load_xasr_encoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &XasrZipformerExecutionMetadata,

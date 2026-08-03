@@ -13,17 +13,23 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgufMetadata, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
-    GgufTensorDataReader, GgufWeightTensorElementType,
+    GGML_TYPE_F32, GgmlCpuGraphBackend, GgufMetadata, GgufOwnedWeightTensorPayload,
+    GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
+};
+use crate::models::admitted_host_object_cache::{
+    AdmittedHostObjectCache, AdmittedHostObjectCacheLimits,
+};
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -32,8 +38,9 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, with_thread_local_cached_mut_by_key,
+use crate::models::system_memory_owner::{
+    AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 
 use super::decoder_graph::{DolphinDecoderConfig, DolphinDecoderRescoreRuntime};
@@ -229,6 +236,93 @@ pub(crate) struct DolphinRuntimeWeights {
     native_weights: HashMap<String, GgufOwnedWeightTensorPayload>,
 }
 
+impl DolphinRuntimeWeights {
+    fn quoted_system_memory_bytes(reader: &GgufTensorDataReader) -> Result<(u64, u64), String> {
+        let mut retained = 0u64;
+        let mut peak = 0u64;
+        for tensor in reader.tensor_index().tensors() {
+            let key_bytes = u64::try_from(tensor.name.len())
+                .map_err(|_| "dolphin tensor name length exceeds u64".to_string())?;
+            let native_candidate = is_native_matmul_weight(&tensor.name, &tensor.dims);
+            if native_candidate && tensor.ggml_type != GGML_TYPE_F32 {
+                let payload =
+                    GgufOwnedWeightTensorPayload::quoted_retained_system_memory_bytes(tensor)?;
+                let entry =
+                    u64::try_from(std::mem::size_of::<(String, GgufOwnedWeightTensorPayload)>())
+                        .map_err(|_| "dolphin native map entry size exceeds u64".to_string())?;
+                let component = key_bytes
+                    .checked_add(payload)
+                    .and_then(|bytes| bytes.checked_add(entry))
+                    .ok_or_else(|| "dolphin native weight quote overflowed".to_string())?;
+                retained = retained
+                    .checked_add(component)
+                    .ok_or_else(|| "dolphin retained weight quote overflowed".to_string())?;
+                peak = peak.max(retained);
+                continue;
+            }
+
+            let elements = tensor.num_elements().ok_or_else(|| {
+                format!("dolphin tensor '{}' element count overflowed", tensor.name)
+            })?;
+            let values = elements
+                .checked_mul(std::mem::size_of::<f32>() as u64)
+                .ok_or_else(|| format!("dolphin tensor '{}' f32 quote overflowed", tensor.name))?;
+            let entry = u64::try_from(std::mem::size_of::<(String, Vec<f32>)>())
+                .map_err(|_| "dolphin f32 map entry size exceeds u64".to_string())?;
+            let component = key_bytes
+                .checked_add(values)
+                .and_then(|bytes| bytes.checked_add(entry))
+                .ok_or_else(|| "dolphin f32 weight quote overflowed".to_string())?;
+            let temporary_payload = if native_candidate {
+                GgufOwnedWeightTensorPayload::quoted_retained_system_memory_bytes(tensor)?
+            } else {
+                0
+            };
+            let payload_phase = retained
+                .checked_add(temporary_payload)
+                .ok_or_else(|| "dolphin temporary weight quote overflowed".to_string())?;
+            let materialized_phase = retained
+                .checked_add(component)
+                .ok_or_else(|| "dolphin weight construction peak overflowed".to_string())?;
+            peak = peak.max(payload_phase).max(materialized_phase);
+            retained = retained
+                .checked_add(component)
+                .ok_or_else(|| "dolphin retained weight quote overflowed".to_string())?;
+        }
+        Ok((peak.max(retained), retained))
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            self.f32_tensors
+                .len()
+                .checked_mul(std::mem::size_of::<(String, Vec<f32>)>())
+                .ok_or_else(|| "dolphin f32 map entry bytes overflowed".to_string())?,
+            "dolphin f32 weight map entries",
+        )?;
+        for (name, values) in &self.f32_tensors {
+            bytes.add_string(name, "dolphin f32 tensor name")?;
+            bytes.add_vec(values, "dolphin f32 tensor values")?;
+        }
+        bytes.add_usize(
+            self.native_weights
+                .len()
+                .checked_mul(std::mem::size_of::<(String, GgufOwnedWeightTensorPayload)>())
+                .ok_or_else(|| "dolphin native map entry bytes overflowed".to_string())?,
+            "dolphin native weight map entries",
+        )?;
+        for (name, payload) in &self.native_weights {
+            bytes.add_string(name, "dolphin native tensor name")?;
+            bytes.add(
+                payload.retained_system_memory_bytes()?,
+                "dolphin native tensor payload metadata",
+            )?;
+        }
+        Ok(bytes.finish())
+    }
+}
+
 impl DolphinWeightProvider for DolphinRuntimeWeights {
     fn tensor(&self, name: &str) -> Option<&[f32]> {
         self.f32_tensors.get(name).map(Vec::as_slice)
@@ -255,93 +349,6 @@ impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeigh
     }
 }
 
-/// Process-level pool of runtime weights keyed by pack content id alone.
-/// Building the pool (dequantizing the f32 vectors + mmapping the native
-/// weight blocks) costs ~0.4 s (18% of the single-utterance wall on M1); caching
-/// it lets warm calls skip the reload and reuse the same immutable table,
-/// mirroring the xasr process runtime pool.
-///
-/// Content-addressed (never bare path): same-path byte replacement resolves a
-/// different content id and misses on its own -- no generation/epoch is
-/// mixed into this key (removed; see `runtime_cache_coordinator`'s module doc
-/// comment for why that was an audited bug). Idle unload drops the whole pool
-/// via [`clear_dolphin_weights_pool`]; a pull install/replace evicts just the
-/// old content id via [`evict_dolphin_pool_entry_for_content_id`]. Native
-/// payloads carry the shared pack mmap and the f32 vectors are
-/// backend-independent, so CPU and Metal runs share one entry.
-static DOLPHIN_WEIGHTS_POOL: OnceLock<
-    Mutex<
-        HashMap<
-            crate::models::runtime_cache_coordinator::PackContentKey,
-            Arc<DolphinRuntimeWeights>,
-        >,
-    >,
-> = OnceLock::new();
-
-/// Drop every pooled Dolphin weight table. Called from
-/// [`DolphinGgmlExecutor::unload_idle_state`] so idle unload actually frees the
-/// process-level resident state (the trait default is a no-op).
-pub(crate) fn clear_dolphin_weights_pool() {
-    if let Some(pool) = DOLPHIN_WEIGHTS_POOL.get()
-        && let Ok(mut guard) = pool.lock()
-    {
-        guard.clear();
-    }
-}
-
-/// Evicts exactly the pooled weight table for `pack_content_id`, leaving
-/// every other resident content identity untouched. Called by `pull`'s
-/// post-install handling with the *old* content id after a pack
-/// install/replace -- the new bytes already resolve to a different content
-/// id and miss on their own, so this only reclaims the now-orphaned old
-/// entry's memory.
-pub(crate) fn evict_dolphin_pool_entry_for_content_id(pack_content_id: &str) {
-    if let Some(pool) = DOLPHIN_WEIGHTS_POOL.get()
-        && let Ok(mut guard) = pool.lock()
-    {
-        guard.retain(|key, _| key.pack_content_id != pack_content_id);
-    }
-}
-
-/// Fetch the pack's runtime weights from the pool, building them (via the
-/// already-resolved `reader`) and caching on a miss. The build runs outside the
-/// pool lock so concurrent first callers for distinct packs don't serialize.
-///
-/// `runtime_source` must be the same already-open source `reader` was built
-/// from (`GgufTensorDataReader::from_runtime_source`) -- its `content_id()`
-/// is the cache key, derived from the same handle the weights are read from,
-/// never a fresh re-derivation from a path.
-///
-/// When the pack cannot be content-hashed, the build still runs once but is
-/// **not** inserted -- path-only keys are a hard NO-GO.
-pub(crate) fn cached_dolphin_runtime_weights(
-    runtime_source: &crate::GgmlRuntimeSource,
-    reader: &GgufTensorDataReader,
-) -> Result<Arc<DolphinRuntimeWeights>, String> {
-    use crate::models::runtime_cache_coordinator::PackContentKey;
-
-    let cache_key = PackContentKey::try_for_runtime_source(runtime_source);
-    if let Some(ref key) = cache_key {
-        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(weights) = pool.lock().expect("dolphin weights pool lock").get(key) {
-            return Ok(weights.clone());
-        }
-    }
-
-    let weights = Arc::new(
-        load_dolphin_runtime_weights_from_pack(reader)
-            .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?,
-    );
-
-    if let Some(key) = cache_key {
-        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-        pool.lock()
-            .expect("dolphin weights pool lock")
-            .insert(key, weights.clone());
-    }
-    Ok(weights)
-}
-
 /// Prepared per-`(pack, backend)` graph runtimes: the encoder, CTC head, and
 /// rescore decoder each keep their weights resident in a persistent
 /// WEIGHTS-usage arena (see the respective runtime types). Cached thread-local
@@ -357,16 +364,68 @@ pub(crate) struct DolphinPreparedRuntime {
     rescore: DolphinDecoderRescoreRuntime,
 }
 
+impl DolphinPreparedRuntime {
+    fn quoted_system_memory_bytes(
+        weights: &DolphinRuntimeWeights,
+        metadata: &GgufMetadata,
+    ) -> Result<(u64, u64), String> {
+        let language_scheme = parse_dolphin_language_scheme(metadata)?;
+        let execution_metadata = parse_dolphin_execution_metadata(metadata, weights)
+            .map_err(|error| format!("dolphin runtime metadata contract failed: {error}"))?;
+        let encoder_config =
+            DolphinEncoderConfig::from_execution_metadata(&execution_metadata, language_scheme);
+        let decoder_config = DolphinDecoderConfig::from_execution_metadata(&execution_metadata);
+        let (encoder_peak, encoder_retained) = DolphinEncoderRuntime::quoted_system_memory_bytes(
+            &encoder_config,
+            encoder_config.max_positions,
+        )?;
+        let (decoder_peak, decoder_retained) =
+            DolphinDecoderRescoreRuntime::quoted_system_memory_bytes(&decoder_config)?;
+        let retained = encoder_retained
+            .checked_add(decoder_retained)
+            .ok_or_else(|| "dolphin prepared retained quote overflowed".to_string())?;
+        let decoder_phase = encoder_retained
+            .checked_add(decoder_peak)
+            .ok_or_else(|| "dolphin decoder construction peak overflowed".to_string())?;
+        Ok((encoder_peak.max(decoder_phase).max(retained), retained))
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        self.encoder
+            .retained_system_memory_bytes()?
+            .checked_add(self.rescore.retained_system_memory_bytes()?)
+            .ok_or_else(|| "dolphin prepared retained measurement overflowed".to_string())
+    }
+}
+
 type DolphinPreparedRuntimeCacheKey = (
     crate::models::runtime_cache_coordinator::PackContentKey,
-    GgmlCpuGraphBackend,
+    crate::models::native_execution_services::ExecutionLaneKey,
 );
 
-thread_local! {
-    static DOLPHIN_PREPARED_RUNTIME_BY_KEY: RefCell<
-        BoundedRuntimeCache<DolphinPreparedRuntimeCacheKey, DolphinPreparedRuntime>,
-    > = RefCell::new(BoundedRuntimeCache::new());
+struct DolphinPreparedRuntimeActorState {
+    runtime: DolphinPreparedRuntime,
+    _weights: AdmittedHostObject<DolphinRuntimeWeights>,
 }
+
+impl std::fmt::Debug for DolphinPreparedRuntimeActorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DolphinPreparedRuntimeActorState")
+            .finish_non_exhaustive()
+    }
+}
+
+type DolphinRuntimeWeightsCache = AdmittedHostObjectCache<
+    crate::models::runtime_cache_coordinator::PackContentKey,
+    DolphinRuntimeWeights,
+>;
+type DolphinPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    DolphinPreparedRuntimeCacheKey,
+    DolphinPreparedRuntimeActorState,
+>;
+type DolphinPreparedRuntimeActor =
+    PinnedRuntimeActorCheckout<DolphinPreparedRuntimeCacheKey, DolphinPreparedRuntimeActorState>;
 
 /// Build the three prepared graph runtimes for one pack + backend. The
 /// encoder's resident position-table capacity is sized to the pack's own
@@ -411,9 +470,9 @@ pub(crate) fn build_dolphin_prepared_runtime(
 /// The complete Dolphin transcribe pipeline over 16 kHz mono PCM (`samples` in
 /// `[-1, 1]`): fbank + CMVN -> encoder -> CTC/attention joint decode -> detokenize.
 /// Loads the pack's weights from `reader` and builds fresh prepared runtimes
-/// each call (the uncached path the parity harness drives); the executor uses
-/// [`cached_dolphin_runtime_weights`] + the thread-local
-/// [`DolphinPreparedRuntime`] cache to reuse both across requests.
+/// each call (the uncached path the parity harness drives); the executor keeps
+/// admitted weights and owner-thread [`DolphinPreparedRuntime`] actors to reuse
+/// both across requests.
 pub(crate) fn transcribe_dolphin_pcm(
     reader: &GgufTensorDataReader,
     metadata: &GgufMetadata,
@@ -641,9 +700,156 @@ pub(crate) fn run_dolphin_pipeline(
     })
 }
 
+const DOLPHIN_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
+const DOLPHIN_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
+
 /// Dedicated `GgmlAsrViewExecutor` for the Dolphin family (DedicatedRuntimeExecutorV1).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DolphinGgmlExecutor;
+/// All resident host weights and backend-bound graph runtimes are owned by this
+/// service-scoped executor; no process-global pool or worker TLS can outlive its
+/// memory admission lease.
+#[derive(Clone)]
+pub(crate) struct DolphinGgmlExecutor {
+    weights: Arc<DolphinRuntimeWeightsCache>,
+    prepared_runtimes: Arc<DolphinPreparedRuntimePool>,
+}
+
+impl std::fmt::Debug for DolphinGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DolphinGgmlExecutor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DolphinGgmlExecutor {
+    fn default() -> Self {
+        let host_budget = crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        Self {
+            weights: Arc::new(AdmittedHostObjectCache::new(
+                AdmittedHostObjectCacheLimits::new(DOLPHIN_RUNTIME_MAX_IDLE_ENTRIES, host_budget),
+            )),
+            prepared_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-dolphin-runtime-owner",
+                AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                    DOLPHIN_RUNTIME_MAX_IDLE_ENTRIES,
+                    host_budget,
+                    DOLPHIN_RUNTIME_MAX_INSTANCES_PER_KEY,
+                ),
+            )),
+        }
+    }
+}
+
+impl DolphinGgmlExecutor {
+    fn cached_runtime_weights(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        reader: &GgufTensorDataReader,
+    ) -> Result<AdmittedHostObject<DolphinRuntimeWeights>, String> {
+        let key = crate::models::runtime_cache_coordinator::PackContentKey::for_runtime_source(
+            runtime_source,
+        );
+        let content_id = runtime_source.content_id().to_string();
+        self.weights.get_or_try_insert_with(
+            key,
+            || {
+                let (peak_bytes, retained_bytes) =
+                    DolphinRuntimeWeights::quoted_system_memory_bytes(reader)?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!("dolphin-runtime-weights:{content_id}"),
+                    peak_bytes,
+                    retained_bytes,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((retained_bytes, quote))
+            },
+            |quote| match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let weights = load_dolphin_runtime_weights_from_pack(reader)
+                    .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
+                let retained = weights.retained_system_memory_bytes()?;
+                Ok(SystemMemoryAllocationOutcome::new(
+                    weights, retained, retained,
+                ))
+            }) {
+                Ok(owner) => Ok(Arc::new(owner)),
+                Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(error.to_string())
+                }
+            },
+            || "dolphin runtime weight cache lock is poisoned".to_string(),
+        )
+    }
+
+    fn checkout_prepared_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        metadata: Arc<GgufMetadata>,
+        weights: AdmittedHostObject<DolphinRuntimeWeights>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<DolphinPreparedRuntimeActor, String> {
+        let key = (
+            crate::models::runtime_cache_coordinator::PackContentKey::for_runtime_source(
+                runtime_source,
+            ),
+            crate::models::native_execution_services::current_execution_lane_key(backend),
+        );
+        let quote_weights = Arc::clone(&weights);
+        let quote_metadata = Arc::clone(&metadata);
+        let content_id = runtime_source.content_id().to_string();
+        self.prepared_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let (peak_bytes, retained_bytes) =
+                    DolphinPreparedRuntime::quoted_system_memory_bytes(
+                        &quote_weights,
+                        &quote_metadata,
+                    )?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!("dolphin-prepared-runtime:{content_id}"),
+                    peak_bytes,
+                    retained_bytes,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((retained_bytes, (quote, weights, metadata)))
+            },
+            move |(quote, weights, metadata)| match SystemMemoryOwner::try_allocate_transaction(
+                quote,
+                || {
+                    let runtime = build_dolphin_prepared_runtime(&weights, &metadata, backend)?;
+                    let retained = runtime.retained_system_memory_bytes()?;
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        DolphinPreparedRuntimeActorState {
+                            runtime,
+                            _weights: weights,
+                        },
+                        retained,
+                        retained,
+                    ))
+                },
+            ) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(error.to_string())
+                }
+            },
+            |error: PinnedRuntimeActorError| error.to_string(),
+        )
+    }
+
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.prepared_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.weights
+            .evict_where(|key| key.pack_content_id == pack_content_id);
+    }
+
+    fn clear_runtime_state(&self) {
+        self.prepared_runtimes.clear();
+        self.weights.clear();
+    }
+}
 
 impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
     fn executor_id(&self) -> &'static str {
@@ -656,6 +862,14 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         // context extractor + biasing attention fusion. Per-phrase `boost` has no
         // upstream semantics here (see that module's docs) and is ignored.
         true
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
     }
 
     fn execute_view(
@@ -698,42 +912,40 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         let backend = request.resolved_runtime.backend();
         let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
-        // Reuse dequantized weights across requests (pool keyed by pack path); the
-        // ~0.4 s reload+dequant is paid once, later requests are compute-only.
-        let weights =
-            cached_dolphin_runtime_weights(&preflight.runtime_source, &reader).map_err(fail)?;
-        // Reuse the prepared graph runtimes (backend-resident encoder / CTC
-        // head / rescore decoder weights) across requests too, keyed by
-        // `(pack content id, backend)` in the shared thread-local runtime
-        // cache -- the sensevoice/moonshine pattern. A cold key builds them
-        // from the pooled weights; warm requests (and every streaming tick)
-        // skip the whole per-call weight re-upload.
-        let cache_key = (
-            crate::models::runtime_cache_coordinator::PackContentKey::for_runtime_source(
+        // The immutable dequantized/native-mapped table is admitted once per
+        // content id. Backend-bound mutable runtimes are then checked out from
+        // owner-thread actors keyed by the exact content and execution lane.
+        let weights = self
+            .cached_runtime_weights(&preflight.runtime_source, &reader)
+            .map_err(fail)?;
+        let actor = self
+            .checkout_prepared_runtime(
                 &preflight.runtime_source,
-            ),
-            backend,
-        );
+                Arc::clone(&preflight.metadata),
+                weights,
+                backend,
+            )
+            .map_err(fail)?;
+        let metadata = Arc::clone(&preflight.metadata);
+        let samples = request.prepared_audio.samples_f32.to_owned_pcm_slice();
+        let language = request.request_options.language.clone();
+        let phrase_bias = request.request_options.phrase_bias.clone();
         // Thread the request language into the decode prefix builder; an
         // unsupported code / missing region token fails closed here (typed).
-        let output = with_thread_local_cached_mut_by_key(
-            &DOLPHIN_PREPARED_RUNTIME_BY_KEY,
-            cache_key,
-            DEFAULT_RUNTIME_CACHE_CAPACITY,
-            || build_dolphin_prepared_runtime(&weights, &preflight.metadata, backend),
-            |prepared| {
+        let output = actor
+            .call_mut(move |state| {
                 run_dolphin_pipeline(
-                    prepared,
-                    &weights,
-                    &preflight.metadata,
-                    &request.prepared_audio.samples_f32,
+                    &mut state.runtime,
+                    &state._weights,
+                    &metadata,
+                    &samples,
                     DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
-                    request.request_options.language.as_deref(),
-                    request.request_options.phrase_bias.as_ref(),
+                    language.as_deref(),
+                    phrase_bias.as_ref(),
                 )
-            },
-        )
-        .map_err(fail)?;
+            })
+            .map_err(|error| fail(error.to_string()))?
+            .map_err(fail)?;
 
         let duration = request.prepared_audio.samples_f32.len() as f32
             / request.prepared_audio.sample_rate_hz.max(1) as f32;
@@ -768,13 +980,8 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         })
     }
 
-    /// The process-level `DOLPHIN_WEIGHTS_POOL` is this family's only resident
-    /// state outside a live request. Without an explicit unload hook the trait
-    /// default no-op would leave every pooled weight table resident for the rest
-    /// of the process lifetime (and same-path content replacement would keep
-    /// serving the pre-replace table until something else happened to clear it).
     fn unload_idle_state(&self) {
-        clear_dolphin_weights_pool();
+        self.clear_runtime_state();
     }
 }
 
@@ -786,7 +993,7 @@ impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
-        clear_dolphin_weights_pool();
+        self.clear_runtime_state();
     }
 
     fn start_streaming_session(
@@ -841,22 +1048,29 @@ mod tests {
         convert_local_dolphin_wenet_source_to_runtime_pack,
     };
     use crate::models::runtime_cache_coordinator::PackContentKey;
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
-    fn dolphin_pool_len() -> usize {
-        DOLPHIN_WEIGHTS_POOL
-            .get()
-            .and_then(|pool| pool.lock().ok().map(|guard| guard.len()))
-            .unwrap_or(0)
-    }
-
-    fn dolphin_pool_contains(key: &PackContentKey) -> bool {
-        DOLPHIN_WEIGHTS_POOL
-            .get()
-            .and_then(|pool| pool.lock().ok().map(|guard| guard.contains_key(key)))
-            .unwrap_or(false)
+    fn cached_placeholder(
+        executor: &DolphinGgmlExecutor,
+        key: PackContentKey,
+    ) -> AdmittedHostObject<DolphinRuntimeWeights> {
+        executor
+            .weights
+            .get_or_try_insert_with(
+                key,
+                || Ok::<_, String>((0, ())),
+                |()| {
+                    Ok(Arc::new(
+                        SystemMemoryOwner::with_committed_requested_bytes_for_test(
+                            DolphinRuntimeWeights::default(),
+                            0,
+                        ),
+                    ))
+                },
+                || "poisoned".to_string(),
+            )
+            .expect("cache placeholder")
     }
 
     /// Writes a minimal valid GGUF-magic fixture: `PackContentKey` now only
@@ -870,7 +1084,7 @@ mod tests {
 
     fn key_for(path: &Path) -> PackContentKey {
         let source = crate::validate_ggml_runtime_source_path(path).expect("validate source");
-        PackContentKey::try_for_runtime_source(&source).expect("cacheable")
+        PackContentKey::for_runtime_source(&source)
     }
 
     /// Same-path A/B content swap must not hit the previous weight table. Uses a
@@ -879,7 +1093,7 @@ mod tests {
     /// lookup/miss behavior, so we seed the pool map directly with Arc placeholders).
     #[test]
     fn dolphin_weights_pool_keys_by_content_id_not_path() {
-        clear_dolphin_weights_pool();
+        let executor = DolphinGgmlExecutor::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.oasr");
         write_gguf_fixture(&path, b"dolphin-content-a");
@@ -889,18 +1103,15 @@ mod tests {
         assert_ne!(key_a.pack_content_id, key_b.pack_content_id);
         assert_ne!(key_a, key_b);
 
-        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let mut guard = pool.lock().expect("lock");
-            guard.insert(key_a.clone(), Arc::new(DolphinRuntimeWeights::default()));
-        }
-        assert!(dolphin_pool_contains(&key_a));
-        assert!(!dolphin_pool_contains(&key_b));
+        let cached_a = cached_placeholder(&executor, key_a.clone());
+        let cached_a_again = cached_placeholder(&executor, key_a.clone());
+        let cached_b = cached_placeholder(&executor, key_b);
+        assert!(Arc::ptr_eq(&cached_a, &cached_a_again));
+        assert!(!Arc::ptr_eq(&cached_a, &cached_b));
 
         // Idle unload must drop the pool entirely.
-        clear_dolphin_weights_pool();
-        assert_eq!(dolphin_pool_len(), 0);
-        assert!(!dolphin_pool_contains(&key_a));
+        executor.clear_runtime_state();
+        assert_eq!(executor.weights.usage_for_test(), (0, 0));
     }
 
     /// No global invalidation: evicting one pack's content id (the pull
@@ -910,7 +1121,7 @@ mod tests {
     /// resident content identity in the process at once.
     #[test]
     fn evicting_one_content_id_leaves_a_different_pack_resident() {
-        clear_dolphin_weights_pool();
+        let executor = DolphinGgmlExecutor::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let path_one = dir.path().join("pack-one.oasr");
         let path_two = dir.path().join("pack-two.oasr");
@@ -921,45 +1132,31 @@ mod tests {
         let key_two = key_for(&path_two);
         assert_ne!(key_one, key_two);
 
-        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let mut guard = pool.lock().expect("lock");
-            guard.insert(key_one.clone(), Arc::new(DolphinRuntimeWeights::default()));
-            guard.insert(key_two.clone(), Arc::new(DolphinRuntimeWeights::default()));
-        }
-        assert!(dolphin_pool_contains(&key_one));
-        assert!(dolphin_pool_contains(&key_two));
+        let cached_one = cached_placeholder(&executor, key_one.clone());
+        let cached_two = cached_placeholder(&executor, key_two.clone());
 
         // The invalidation action: evict pack one's content id only (what
         // `pull` does with the old content id after an install/replace).
-        evict_dolphin_pool_entry_for_content_id(&key_one.pack_content_id);
+        executor.evict_prepared_runtime_content_id(&key_one.pack_content_id);
 
-        assert!(
-            !dolphin_pool_contains(&key_one),
-            "the evicted content id must be gone"
-        );
-        assert!(
-            dolphin_pool_contains(&key_two),
-            "a healthy, unrelated content id must remain resident"
-        );
+        let rebuilt_one = cached_placeholder(&executor, key_one);
+        let cached_two_again = cached_placeholder(&executor, key_two);
+        assert!(!Arc::ptr_eq(&cached_one, &rebuilt_one));
+        assert!(Arc::ptr_eq(&cached_two, &cached_two_again));
     }
 
     #[test]
     fn dolphin_unload_idle_state_clears_weights_pool() {
-        clear_dolphin_weights_pool();
+        let executor = DolphinGgmlExecutor::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pool.oasr");
         write_gguf_fixture(&path, b"dolphin-pool-seed");
         let key = key_for(&path);
-        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-        pool.lock()
-            .expect("lock")
-            .insert(key.clone(), Arc::new(DolphinRuntimeWeights::default()));
-        assert_eq!(dolphin_pool_len(), 1);
+        let _cached = cached_placeholder(&executor, key);
+        assert_eq!(executor.weights.usage_for_test(), (1, 0));
 
-        <DolphinGgmlExecutor as GgmlAsrViewExecutor>::unload_idle_state(&DolphinGgmlExecutor);
-        assert_eq!(dolphin_pool_len(), 0);
-        assert!(!dolphin_pool_contains(&key));
+        <DolphinGgmlExecutor as GgmlAsrViewExecutor>::unload_idle_state(&executor);
+        assert_eq!(executor.weights.usage_for_test(), (0, 0));
     }
 
     fn root() -> Option<PathBuf> {

@@ -13,17 +13,37 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::native_execution_services::{
+    NativeExecutionContext, current_native_execution_context, install_native_execution_context,
+};
 use crate::models::serve_batch_env::{
     OwnerAliveGuard, SERVE_BATCH_COLLECT_WINDOW, ServeBatchPolicy, serve_batch_bucket_width,
     serve_batch_compact_active_slots, serve_batch_drain_compatible_batch, serve_batch_owner_alive,
     serve_batch_submit_with_timeout, serve_batch_trace_enabled, serve_batch_vram_capped_max_batch,
 };
 use crate::nn::decoder::reusable_decode_graph_supported;
+
+fn rebucket_dummy_position(
+    physical_self_kv_positions: usize,
+    prompt_len: usize,
+    replay_steps: usize,
+) -> Result<Option<usize>, &'static str> {
+    if replay_steps == 0 {
+        return Ok(None);
+    }
+    let position = physical_self_kv_positions
+        .checked_sub(1)
+        .ok_or("seq2seq serve batch rebucket requires non-empty context")?;
+    if position < prompt_len {
+        return Err("seq2seq serve batch rebucket has no dummy KV row");
+    }
+    Ok(Some(position))
+}
 
 /// Per-family decoder-runtime contract. Bound to `WhisperServeDecoderRuntime` /
 /// `CohereDecoderGraphRuntime` / `MoonshineDecoderGraphRuntime`. The generic
@@ -33,6 +53,11 @@ pub(crate) trait Seq2SeqServeRuntime: Sized {
     type Error;
     fn build_serial(job: &Self::Job) -> Result<Self, Self::Error>; // n_seq == 1
     fn build_batched(job: &Self::Job, n_seq: usize) -> Result<Self, Self::Error>;
+    /// Select the current invocation's logical views inside a stable resident
+    /// capacity. Implementations must not allocate or resize here.
+    fn configure_for_job(&mut self, _job: &Self::Job) -> Result<(), Self::Error> {
+        Ok(())
+    }
     // Part of the per-family runtime contract (the serial path drives slot 0 of
     // the resident runtime), but the generic owner never calls it: `decode_serial`
     // is a family hook that owns the serial flow. Kept on the trait so each
@@ -161,6 +186,7 @@ pub(crate) const SERVE_BATCH_CANCEL_REASON: &str =
 pub(crate) struct Envelope<F: Seq2SeqServeBatchFamily> {
     pub job: F::Job,
     pub context: Arc<crate::RequestExecutionContext>,
+    pub native_execution_context: Option<NativeExecutionContext>,
     pub reply: mpsc::Sender<Result<F::Output, F::Error>>,
 }
 
@@ -169,6 +195,7 @@ pub(crate) struct Envelope<F: Seq2SeqServeBatchFamily> {
 struct ActiveBatchSlot<F: Seq2SeqServeBatchFamily> {
     slot: F::Slot,
     context: Arc<crate::RequestExecutionContext>,
+    native_execution_context: Option<NativeExecutionContext>,
     reply: mpsc::Sender<Result<F::Output, F::Error>>,
 }
 
@@ -178,6 +205,7 @@ struct PendingRefillSlot<F: Seq2SeqServeBatchFamily> {
     slot_index: usize,
     slot: F::Slot,
     context: Arc<crate::RequestExecutionContext>,
+    native_execution_context: Option<NativeExecutionContext>,
     reply: mpsc::Sender<Result<F::Output, F::Error>>,
 }
 
@@ -205,7 +233,14 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
     ) -> VecDeque<Envelope<F>> {
         if batch.len() <= 1 {
             for envelope in batch {
-                let Envelope { job, reply, .. } = envelope;
+                let Envelope {
+                    job,
+                    native_execution_context,
+                    reply,
+                    ..
+                } = envelope;
+                let _native_execution =
+                    native_execution_context.map(install_native_execution_context);
                 let result = self.decode_serial_job(job);
                 let _ = reply.send(result);
             }
@@ -233,13 +268,14 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             let Envelope {
                 job,
                 context,
+                native_execution_context,
                 reply,
             } = envelope;
-            contexts_and_replies.push((context, reply));
+            contexts_and_replies.push((context, native_execution_context, reply));
             match F::slot_new(job) {
                 Ok(slot) => slots.push(slot),
                 Err(error) => {
-                    let (_, reply) = contexts_and_replies
+                    let (_, _, reply) = contexts_and_replies
                         .pop()
                         .expect("context/reply pushed before slot build");
                     let _ = reply.send(Err(error));
@@ -249,10 +285,11 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         let mut slots = slots
             .into_iter()
             .zip(contexts_and_replies)
-            .map(|(slot, (context, reply))| {
+            .map(|(slot, (context, native_execution_context, reply))| {
                 Some(ActiveBatchSlot::<F> {
                     slot,
                     context,
+                    native_execution_context,
                     reply,
                 })
             })
@@ -270,7 +307,14 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         let active_count = slots.iter().filter(|slot| slot.is_some()).count();
         if active_count <= 1 {
             for active in slots.into_iter().flatten() {
-                let ActiveBatchSlot { slot, reply, .. } = active;
+                let ActiveBatchSlot {
+                    slot,
+                    native_execution_context,
+                    reply,
+                    ..
+                } = active;
+                let _native_execution =
+                    native_execution_context.map(install_native_execution_context);
                 let result = self.decode_serial_job(F::slot_job(&slot).clone());
                 let _ = reply.send(result);
             }
@@ -281,10 +325,10 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             slots.resize_with(bucket_width, || None);
         }
 
-        let Some(first_job) = Self::first_active_job(&slots) else {
+        let Some(first_job) = Self::first_active_job(&slots).cloned() else {
             return deferred;
         };
-        let prompt_len = F::initial_prompt_tokens(first_job).len();
+        let prompt_len = F::initial_prompt_tokens(&first_job).len();
         if prompt_len == 0 {
             Self::fail_all_active_slots(
                 &mut slots,
@@ -292,9 +336,21 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             );
             return deferred;
         }
-        let prompt_tokens = F::initial_prompt_tokens(first_job).to_vec();
+        let prompt_tokens = F::initial_prompt_tokens(&first_job).to_vec();
         {
-            let runtime = match self.batched_runtime_for(first_job, slots.len()) {
+            let native_execution_context = match Self::active_native_execution_context(&slots) {
+                Ok(context) => context,
+                Err(error) => {
+                    Self::fail_all_active_slots(&mut slots, error);
+                    return deferred;
+                }
+            };
+            let runtime_result = {
+                let _native_execution =
+                    native_execution_context.map(install_native_execution_context);
+                self.batched_runtime_for(&first_job, slots.len())
+            };
+            let runtime = match runtime_result {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     Self::fail_all_active_slots(&mut slots, error);
@@ -305,9 +361,20 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 let Some(active) = slots[slot_index].as_ref() else {
                     continue;
                 };
-                if let Err(error) = runtime
-                    .populate_cross_attention_cache_slot(slot_index, F::slot_job(&active.slot))
-                {
+                let job = F::slot_job(&active.slot).clone();
+                let native_execution_context = match Self::active_native_execution_context(&slots) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        Self::fail_all_active_slots(&mut slots, error);
+                        return deferred;
+                    }
+                };
+                let populate_result = {
+                    let _native_execution =
+                        native_execution_context.map(install_native_execution_context);
+                    runtime.populate_cross_attention_cache_slot(slot_index, &job)
+                };
+                if let Err(error) = populate_result {
                     Self::fail_active_slot(
                         &mut slots,
                         slot_index,
@@ -319,7 +386,19 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 return deferred;
             }
 
-            match Self::seed_initial_batch_prompt(&mut slots, runtime, &prompt_tokens) {
+            let native_execution_context = match Self::active_native_execution_context(&slots) {
+                Ok(context) => context,
+                Err(error) => {
+                    Self::fail_all_active_slots(&mut slots, error);
+                    return deferred;
+                }
+            };
+            let seed_result = {
+                let _native_execution =
+                    native_execution_context.map(install_native_execution_context);
+                Self::seed_initial_batch_prompt(&mut slots, runtime, &prompt_tokens)
+            };
+            match seed_result {
                 Ok(()) => Self::finish_done_active_slots(&mut slots),
                 Err(error) => {
                     Self::fail_all_active_slots(&mut slots, error);
@@ -339,8 +418,20 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             // runtime and every healthy sibling slot continue unaffected.
             Self::finish_canceled_active_slots(&mut slots);
             Self::finish_maxed_active_slots(&mut slots);
-            if let Some(first_job) = Self::first_active_job(&slots) {
-                let runtime = match self.batched_runtime_for(first_job, slots.len()) {
+            if let Some(first_job) = Self::first_active_job(&slots).cloned() {
+                let native_execution_context = match Self::active_native_execution_context(&slots) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        Self::fail_all_active_slots(&mut slots, error);
+                        break;
+                    }
+                };
+                let runtime_result = {
+                    let _native_execution =
+                        native_execution_context.map(install_native_execution_context);
+                    self.batched_runtime_for(&first_job, slots.len())
+                };
+                let runtime = match runtime_result {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         Self::fail_all_active_slots(&mut slots, error);
@@ -394,17 +485,26 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                     break;
                 }
             };
-            let Some(first_job) = Self::first_active_job(&slots) else {
+            let Some(first_job) = Self::first_active_job(&slots).cloned() else {
                 break;
             };
-            let runtime = match self.batched_runtime_for(first_job, slots.len()) {
-                Ok(runtime) => runtime,
+            let native_execution_context = match Self::active_native_execution_context(&slots) {
+                Ok(context) => context,
                 Err(error) => {
                     Self::fail_all_active_slots(&mut slots, error);
                     break;
                 }
             };
-            let logits =
+            let logits = {
+                let _native_execution =
+                    native_execution_context.map(install_native_execution_context);
+                let runtime = match self.batched_runtime_for(&first_job, slots.len()) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        Self::fail_all_active_slots(&mut slots, error);
+                        break;
+                    }
+                };
                 match runtime.compute_reused_batched_step_logits(&token_ids, &positions, &totals) {
                     Ok(logits) => logits,
                     Err(error) => {
@@ -414,7 +514,8 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                         );
                         break;
                     }
-                };
+                }
+            };
             match Self::scatter_and_select_active_slots(&mut slots, &logits) {
                 Ok(()) => Self::finish_done_active_slots(&mut slots),
                 Err(error) => {
@@ -459,6 +560,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             let Envelope {
                 job,
                 context,
+                native_execution_context,
                 reply,
             } = envelope;
             // Already-canceled before it ever occupied a lane: reply canceled
@@ -468,8 +570,23 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 let _ = reply.send(Err(F::decode_failed(SERVE_BATCH_CANCEL_REASON.to_string())));
                 continue;
             }
+            if let Err(error) = Self::native_execution_context_for_options(
+                slots
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(|active| &active.native_execution_context)
+                    .chain(
+                        pending
+                            .iter()
+                            .map(|(_, _, native_execution_context, _)| native_execution_context),
+                    )
+                    .chain(std::iter::once(&native_execution_context)),
+            ) {
+                let _ = reply.send(Err(error));
+                continue;
+            }
             match F::slot_new(job) {
-                Ok(slot) => pending.push((slot, context, reply)),
+                Ok(slot) => pending.push((slot, context, native_execution_context, reply)),
                 Err(error) => {
                     let _ = reply.send(Err(error));
                 }
@@ -484,10 +601,11 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         })?;
         let bucket_width = serve_batch_bucket_width(target_active, max_batch);
         if bucket_width <= slots.len() {
-            for (slot, context, reply) in pending.into_iter().rev() {
+            for (slot, context, native_execution_context, reply) in pending.into_iter().rev() {
                 deferred.push_front(Envelope {
                     job: F::slot_job(&slot).clone(),
                     context,
+                    native_execution_context,
                     reply,
                 });
             }
@@ -495,10 +613,11 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         }
 
         let previous_width = slots.len();
-        for (slot, context, reply) in pending {
+        for (slot, context, native_execution_context, reply) in pending {
             slots.push(Some(ActiveBatchSlot::<F> {
                 slot,
                 context,
+                native_execution_context,
                 reply,
             }));
         }
@@ -548,29 +667,18 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         slots: &mut [Option<ActiveBatchSlot<F>>],
         prompt_len: usize,
     ) -> Result<(), F::Error> {
-        let first_job = Self::first_active_job(slots).ok_or_else(|| {
+        let native_execution_context = Self::active_native_execution_context(slots)?;
+        let _native_execution = native_execution_context.map(install_native_execution_context);
+        let first_job = Self::first_active_job(slots).cloned().ok_or_else(|| {
             F::owner_failed("seq2seq serve batch rebucket has no active slots".to_string())
         })?;
-        let prompt_tokens = F::initial_prompt_tokens(first_job).to_vec();
+        let prompt_tokens = F::initial_prompt_tokens(&first_job).to_vec();
         if prompt_tokens.len() != prompt_len {
             return Err(F::decode_failed(
                 "seq2seq serve batch rebucket prompt length changed".to_string(),
             ));
         }
-        let dummy_position = F::decoder_max_context(first_job)
-            .checked_sub(1)
-            .ok_or_else(|| {
-                F::decode_failed(
-                    "seq2seq serve batch rebucket requires non-empty context".to_string(),
-                )
-            })?;
-        if dummy_position < prompt_len {
-            return Err(F::decode_failed(
-                "seq2seq serve batch rebucket has no dummy KV row".to_string(),
-            ));
-        }
-
-        let runtime = self.batched_runtime_for(first_job, slots.len())?;
+        let runtime = self.batched_runtime_for(&first_job, slots.len())?;
         runtime.reset_self_kv_state();
         #[allow(clippy::needless_range_loop)]
         for slot_index in 0..slots.len() {
@@ -610,6 +718,14 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             })
             .max()
             .unwrap_or(0);
+        // A one-token generation performs no incremental replay at all, so it
+        // needs no dummy row beyond the prompt. Only materialize and validate
+        // the inactive-lane row when a rebucket actually replays steps. For
+        // G >= 2, the exact greedy arena K = P + G - 1 guarantees K - 1 >= P.
+        let dummy_position =
+            rebucket_dummy_position(F::decoder_max_context(&first_job), prompt_len, replay_steps)
+                .map_err(|reason| F::decode_failed(reason.to_string()))?
+                .unwrap_or(0);
         for generated_index in 0..replay_steps {
             let mut token_ids = Vec::with_capacity(slots.len());
             let mut positions = Vec::with_capacity(slots.len());
@@ -682,6 +798,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 let Envelope {
                     job,
                     context,
+                    native_execution_context,
                     reply,
                 } = envelope;
                 // Already-canceled before it ever occupied a lane: reply
@@ -699,9 +816,33 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                         continue;
                     }
                 };
-                if let Err(error) =
+                let prospective_native_execution_context =
+                    match Self::native_execution_context_for_options(
+                        slots
+                            .iter()
+                            .filter_map(Option::as_ref)
+                            .map(|active| &active.native_execution_context)
+                            .chain(
+                                pending_refills
+                                    .iter()
+                                    .map(|pending: &PendingRefillSlot<F>| {
+                                        &pending.native_execution_context
+                                    }),
+                            )
+                            .chain(std::iter::once(&native_execution_context)),
+                    ) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            continue;
+                        }
+                    };
+                let populate_result = {
+                    let _native_execution =
+                        prospective_native_execution_context.map(install_native_execution_context);
                     runtime.populate_cross_attention_cache_slot(slot_index, F::slot_job(&slot))
-                {
+                };
+                if let Err(error) = populate_result {
                     let _ = reply.send(Err(F::decode_failed(format_error::<F>(error))));
                     continue;
                 }
@@ -709,6 +850,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                     slot_index,
                     slot,
                     context,
+                    native_execution_context,
                     reply,
                 });
                 break;
@@ -732,6 +874,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 slot_index,
                 slot,
                 context,
+                native_execution_context,
                 reply,
             } = pending;
             if F::slot_done(&slot) {
@@ -741,6 +884,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             slots[slot_index] = Some(ActiveBatchSlot::<F> {
                 slot,
                 context,
+                native_execution_context,
                 reply,
             });
             if trace_batches {
@@ -786,6 +930,18 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         if pending_refills.is_empty() {
             return Ok(());
         }
+        let native_execution_context = Self::native_execution_context_for_options(
+            slots
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|active| &active.native_execution_context)
+                .chain(
+                    pending_refills
+                        .iter()
+                        .map(|pending| &pending.native_execution_context),
+                ),
+        )?;
+        let _native_execution = native_execution_context.map(install_native_execution_context);
         let n_seq = slots.len();
         let prompt_tokens =
             F::initial_prompt_tokens(F::slot_job(&pending_refills[0].slot)).to_vec();
@@ -964,6 +1120,38 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             .find_map(|active| active.as_ref().map(|active| F::slot_job(&active.slot)))
     }
 
+    fn active_native_execution_context(
+        slots: &[Option<ActiveBatchSlot<F>>],
+    ) -> Result<Option<NativeExecutionContext>, F::Error> {
+        Self::native_execution_context_for_options(
+            slots
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|active| &active.native_execution_context),
+        )
+    }
+
+    fn native_execution_context_for_options<'a>(
+        contexts: impl IntoIterator<Item = &'a Option<NativeExecutionContext>>,
+    ) -> Result<Option<NativeExecutionContext>, F::Error> {
+        let contexts = contexts.into_iter().collect::<Vec<_>>();
+        let present = contexts
+            .iter()
+            .filter_map(|context| context.as_ref().cloned())
+            .collect::<Vec<_>>();
+        if present.is_empty() {
+            return Ok(None);
+        }
+        if present.len() != contexts.len() {
+            return Err(F::owner_failed(
+                "seq2seq serve batch cannot mix requests with and without a native execution context"
+                    .to_string(),
+            ));
+        }
+        NativeExecutionContext::shared_lane(&present)
+            .map_err(|error| F::owner_failed(error.to_string()))
+    }
+
     fn decode_serial_job(&mut self, job: F::Job) -> Result<F::Output, F::Error> {
         F::decode_serial(&mut self.serial_runtime, job)
     }
@@ -977,9 +1165,11 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             let runtime = F::Runtime::build_batched(job, n_seq)?;
             e.insert(runtime);
         }
-        self.batched_runtimes.get_mut(&n_seq).ok_or_else(|| {
+        let runtime = self.batched_runtimes.get_mut(&n_seq).ok_or_else(|| {
             F::owner_failed("seq2seq serve batch runtime cache is unexpectedly empty".to_string())
-        })
+        })?;
+        runtime.configure_for_job(job)?;
+        Ok(runtime)
     }
 }
 
@@ -1131,12 +1321,14 @@ impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
 
     pub(crate) fn submit(&self, job: F::Job) -> Result<F::Output, F::Error> {
         let context = Arc::clone(F::job_execution_context(&job));
+        let native_execution_context = current_native_execution_context();
         let (reply, reply_rx) = mpsc::channel();
         serve_batch_submit_with_timeout(
             &self.sender,
             Envelope {
                 job,
                 context,
+                native_execution_context,
                 reply,
             },
             reply_rx,
@@ -1176,53 +1368,114 @@ fn owner_thread_loop<F: Seq2SeqServeBatchFamily>(
     }
 }
 
-/// Registry lookup with dead-owner respawn: if a cached engine's owner thread
-/// has exited (normal or panic), drop the stale engine and spawn a fresh one
-/// with clean ggml state. The `registry` is passed in because Rust has no
-/// generic-over-`F` static; each family owns its own `static`.
-pub(crate) fn serve_batch_engine_for_key<F: Seq2SeqServeBatchFamily>(
-    registry: &OnceLock<Mutex<HashMap<F::EngineKey, Arc<ServeBatchEngine<F>>>>>,
-    key: F::EngineKey,
-    config: ServeBatchConfig,
-) -> Result<Arc<ServeBatchEngine<F>>, F::Error>
+/// Executor-owned registry for one serve-batch family.
+///
+/// The registry used to be a process-global `OnceLock` and smuggled a service
+/// scope id into every key. That made ownership indirect: dropping one
+/// `NativeExecutionServices` root did not drop its owner threads, and scoped
+/// shutdown depended on ambient TLS. The registry is now an ordinary cloneable
+/// value owned by the family executor. Executor clones share the same inner
+/// map, while independently constructed service roots cannot observe one
+/// another's engines and therefore need no scope component in their keys.
+pub(crate) struct ServeBatchEngineRegistry<F: Seq2SeqServeBatchFamily> {
+    engines: Arc<Mutex<HashMap<F::EngineKey, Arc<ServeBatchEngine<F>>>>>,
+}
+
+impl<F: Seq2SeqServeBatchFamily> Clone for ServeBatchEngineRegistry<F> {
+    fn clone(&self) -> Self {
+        Self {
+            engines: Arc::clone(&self.engines),
+        }
+    }
+}
+
+impl<F: Seq2SeqServeBatchFamily> std::fmt::Debug for ServeBatchEngineRegistry<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServeBatchEngineRegistry")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Seq2SeqServeBatchFamily> Default for ServeBatchEngineRegistry<F> {
+    fn default() -> Self {
+        Self {
+            engines: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<F: Seq2SeqServeBatchFamily> ServeBatchEngineRegistry<F>
 where
     F::Job: Send,
     F::Output: Send,
     F::Error: Send,
 {
-    let registry = registry.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut engines = registry.lock().map_err(|_| F::registry_poisoned())?;
-    if let Some(engine) = engines.get(&key) {
-        if serve_batch_owner_alive(&engine.is_alive) {
-            return Ok(Arc::clone(engine));
+    /// Registry lookup with dead-owner respawn. Publication is delayed until
+    /// the enclosing execution candidate succeeds; the staged closure owns a
+    /// clone of this explicit registry rather than reaching a process static.
+    pub(crate) fn engine_for_key(
+        &self,
+        key: F::EngineKey,
+        config: ServeBatchConfig,
+    ) -> Result<Arc<ServeBatchEngine<F>>, F::Error> {
+        let mut engines = self.engines.lock().map_err(|_| F::registry_poisoned())?;
+        if let Some(engine) = engines.get(&key) {
+            if serve_batch_owner_alive(&engine.is_alive) {
+                return Ok(Arc::clone(engine));
+            }
+            engines.remove(&key);
         }
-        // The cached owner thread exited (normal or panic); drop the stale
-        // engine and respawn a fresh one with clean ggml state.
-        engines.remove(&key);
-    }
-    let engine = Arc::new(ServeBatchEngine::<F>::spawn(key.clone(), config)?);
-    engines.insert(key, Arc::clone(&engine));
-    Ok(engine)
-}
+        let engine = Arc::new(ServeBatchEngine::<F>::spawn(key.clone(), config)?);
+        drop(engines);
 
-/// Drops registry references to every cached serve-batch engine for this family.
-///
-/// This does **not** join owner threads synchronously. Clearing the registry
-/// drops the last non-submitter `Arc`s; once in-flight submitters finish and
-/// drop their `Arc`s, the sync channel sender disconnects. The owner then
-/// finishes its current batch, drains deferred replies through the ordinary
-/// loop, and exits. Idle unload calls this only after native activity reaches
-/// zero, so it never abandons an admitted request or releases its server permit
-/// early. Callers also bump the process-wide runtime-build generation so the
-/// next request cannot reuse a drained owner's identity generation.
-pub(crate) fn shutdown_and_remove_serve_batch_engines<F: Seq2SeqServeBatchFamily>(
-    registry: &OnceLock<Mutex<HashMap<F::EngineKey, Arc<ServeBatchEngine<F>>>>>,
-) {
-    let Some(registry) = registry.get() else {
-        return;
-    };
-    if let Ok(mut engines) = registry.lock() {
-        engines.clear();
+        let registry = self.clone();
+        let staged_engine = Arc::clone(&engine);
+        crate::models::native_execution_services::stage_execution_cache_commit(move || {
+            let Ok(mut engines) = registry.engines.lock() else {
+                return;
+            };
+            if engines
+                .get(&key)
+                .is_some_and(|existing| serve_batch_owner_alive(&existing.is_alive))
+            {
+                return;
+            }
+            engines.insert(key, staged_engine);
+        });
+        Ok(engine)
+    }
+
+    /// Removes the exact owner that participated in a typed candidate failure.
+    /// Pointer identity prevents an older failed submitter from evicting a
+    /// newer replacement published under the same key.
+    pub(crate) fn evict_after_candidate_failure(
+        &self,
+        key: &F::EngineKey,
+        engine: &Arc<ServeBatchEngine<F>>,
+    ) {
+        if crate::models::native_execution_services::current_execution_candidate_failure().is_none()
+        {
+            return;
+        }
+        let Ok(mut engines) = self.engines.lock() else {
+            return;
+        };
+        if engines
+            .get(key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, engine))
+        {
+            engines.remove(key);
+        }
+    }
+
+    /// Drops this executor's registry references. In-flight submitters retain
+    /// their engine until their reply completes; after the final sender drops,
+    /// the owner drains and exits through the ordinary channel lifecycle.
+    pub(crate) fn shutdown(&self) {
+        if let Ok(mut engines) = self.engines.lock() {
+            engines.clear();
+        }
     }
 }
 
@@ -1550,11 +1803,13 @@ mod slot_isolation_tests {
             Envelope {
                 job: job_a,
                 context: context_a,
+                native_execution_context: None,
                 reply: reply_a,
             },
             Envelope {
                 job: job_b,
                 context: context_b,
+                native_execution_context: None,
                 reply: reply_b,
             },
         ];
@@ -1585,6 +1840,124 @@ mod slot_isolation_tests {
             FAKE_RUNTIME_BUILD_COUNT.load(AtomicOrdering::SeqCst),
             1,
             "canceling A must not rebuild or abort the shared batched runtime B still uses"
+        );
+    }
+
+    #[test]
+    fn requests_from_different_native_execution_lanes_fail_before_runtime_build() {
+        let first_services =
+            crate::models::native_execution_services::test_native_execution_services();
+        let second_services =
+            crate::models::native_execution_services::test_native_execution_services();
+        let capture =
+            |services: &crate::models::native_execution_services::NativeExecutionServices| {
+                let _guard =
+                    crate::models::native_execution_services::install_native_execution_services(
+                        services,
+                    );
+                current_native_execution_context().expect("installed native execution context")
+            };
+        let first_native = capture(first_services.as_ref());
+        let second_native = capture(second_services.as_ref());
+        let first_request = Arc::new(RequestExecutionContext::new(
+            Some("first-lane".to_string()),
+            Arc::new(crate::TranscriptionControl::new()),
+        ));
+        let second_request = Arc::new(RequestExecutionContext::new(
+            Some("second-lane".to_string()),
+            Arc::new(crate::TranscriptionControl::new()),
+        ));
+        let (first_reply, first_rx) = mpsc::channel();
+        let (second_reply, second_rx) = mpsc::channel();
+        let batch = vec![
+            Envelope {
+                job: FakeJob {
+                    id: 1,
+                    max_tokens: 2,
+                    execution_context: Arc::clone(&first_request),
+                    self_cancel_after_step: None,
+                },
+                context: first_request,
+                native_execution_context: Some(first_native),
+                reply: first_reply,
+            },
+            Envelope {
+                job: FakeJob {
+                    id: 2,
+                    max_tokens: 2,
+                    execution_context: Arc::clone(&second_request),
+                    self_cancel_after_step: None,
+                },
+                context: second_request,
+                native_execution_context: Some(second_native),
+                reply: second_reply,
+            },
+        ];
+
+        let (_receiver_keepalive, receiver) = mpsc::channel();
+        let mut state = OwnerThreadState::<FakeFamily>::new();
+        assert!(state.run_batch(batch, &receiver, 2, false).is_empty());
+        for result in [first_rx.recv().unwrap(), second_rx.recv().unwrap()] {
+            assert!(
+                matches!(result, Err(FakeError::DecodeFailed(ref reason)) if reason.contains("does not share the batch execution scope")),
+                "incompatible execution lanes must fail closed, got {result:?}"
+            );
+        }
+        assert!(
+            state.batched_runtimes.is_empty(),
+            "an incompatible lane must be rejected before resident runtime allocation"
+        );
+    }
+
+    #[test]
+    fn executor_owned_registry_is_shared_by_clones_but_isolated_between_roots() {
+        let config = ServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            collect_window: Duration::ZERO,
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(1),
+            trace_batches: false,
+        };
+        let first = ServeBatchEngineRegistry::<FakeFamily>::default();
+        let first_clone = first.clone();
+        let second = ServeBatchEngineRegistry::<FakeFamily>::default();
+
+        let first_engine = first
+            .engine_for_key(7, config)
+            .expect("first registry engine");
+        let cloned_lookup = first_clone
+            .engine_for_key(7, config)
+            .expect("clone registry engine");
+        let second_engine = second
+            .engine_for_key(7, config)
+            .expect("independent registry engine");
+
+        assert!(Arc::ptr_eq(&first_engine, &cloned_lookup));
+        assert!(!Arc::ptr_eq(&first_engine, &second_engine));
+        assert_eq!(first.engines.lock().unwrap().len(), 1);
+        assert_eq!(second.engines.lock().unwrap().len(), 1);
+
+        first_clone.shutdown();
+        assert!(first.engines.lock().unwrap().is_empty());
+        assert_eq!(second.engines.lock().unwrap().len(), 1);
+        second.shutdown();
+    }
+
+    #[test]
+    fn rebucket_needs_no_dummy_row_when_one_token_budget_has_no_replay() {
+        assert_eq!(rebucket_dummy_position(1, 1, 0), Ok(None));
+        assert_eq!(rebucket_dummy_position(4, 4, 0), Ok(None));
+    }
+
+    #[test]
+    fn rebucket_uses_the_last_physical_row_only_when_incremental_replay_exists() {
+        // P=4, G=2 => exact physical K=P+G-1=5. The one replay step may use
+        // row K-1=4 for an inactive lane without requiring a sixth row.
+        assert_eq!(rebucket_dummy_position(5, 4, 1), Ok(Some(4)));
+        assert_eq!(
+            rebucket_dummy_position(4, 4, 1),
+            Err("seq2seq serve batch rebucket has no dummy KV row")
         );
     }
 

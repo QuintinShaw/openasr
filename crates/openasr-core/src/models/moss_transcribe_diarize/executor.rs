@@ -19,13 +19,15 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::NativeAsrError;
 use crate::api::backend::Transcription;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     run_builtin_seq2seq_decode_policy,
@@ -37,29 +39,40 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
-use crate::models::qwen::{Qwen3AsrLayerKvCacheState, Qwen3AsrPromptEmbeddings};
-use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::prepared_runtime_cache::{
+    PreparedRuntimeCache, PreparedRuntimeHandle, PreparedRuntimeQuoteContext,
+};
+use crate::models::qwen::{
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
+    Qwen3AsrPromptEmbeddings,
+};
+use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
     Seq2SeqGreedyDecodeStopReason,
 };
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
-use super::adaptor_graph::{load_moss_adaptor_weights_from_reader, run_moss_adaptor};
+use super::adaptor_graph::run_moss_adaptor;
+use super::decode_budget::moss_td_generated_token_budget as moss_td_budget_for_shape;
+#[cfg(test)]
+use super::decode_budget::{MOSS_TD_MAX_GENERATED_TOKENS, MOSS_TD_MIN_GENERATED_TOKENS};
 use super::decode_prompt::build_moss_td_decode_prompt;
 use super::encoder_graph::{MossEncoderConfig, MossEncoderRuntime};
 use super::graph_config::{moss_td_encoder_graph_config, moss_td_runtime_graph_config};
 use super::llm_decoder::MossTdDecoderRuntime;
+use super::prepared_runtime::{
+    MossTdPreparedRuntime, MossTdPreparedRuntimeError, build_moss_td_prepared_runtime,
+};
 use super::prompt_embedding::build_moss_td_prompt_embeddings_with_audio_splice;
 use super::runtime_contract::{
-    MOSS_TD_ADAPTOR_NORM_EPSILON, MossTdDecoderMetadata, moss_td_kv_cache_positions,
-    moss_td_request_kv_cache_positions, parse_adaptor_metadata, parse_decoder_metadata,
-    parse_encoder_metadata,
+    MossTdDecoderMetadata, moss_td_kv_cache_positions, moss_td_request_kv_cache_positions,
 };
 use super::speaker_segments::MossTdDecodeExtent;
 use super::tokenizer::MossTdTokenizer;
@@ -77,42 +90,14 @@ pub(crate) const SAMPLE_RATE_HZ: usize = 16_000;
 /// `_compute_audio_token_length`'s `stride` (`processing_moss_transcribe_diarize.py`).
 pub(crate) const WHISPER_ENCODER_CONV_STRIDE: usize = 2;
 pub(crate) const HOP_LENGTH: usize = 160;
-/// Absolute fail-closed backstop for a non-terminating decode. The checkpoint's
-/// reference configuration uses this ceiling, but each request receives a much
-/// smaller audio-proportional budget below so its persistent Metal KV graph does
-/// not reserve the runaway allowance for ordinary speech. `pub(crate)` because
-/// the capacity derivation takes it as a first-class input (the integral
-/// window's required generation is clamped to this backstop -- see
-/// `super::capacity`).
-pub(crate) const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
-/// Output allowance for timestamped MOSS transcripts, per second of audio.
-///
-/// Deliberately far above average demand, because under-budgeting does not
-/// degrade gracefully: the decode never emits a stop token, so the request
-/// fails and the caller gets nothing at all for that audio. Observed demand
-/// spans a wide range -- the three-minute AISHELL-4 golden emits 920 tokens
-/// (~5.1 tokens/s), while dense overlapping Mandarin meeting audio (AliMeeting
-/// `R8001_M8004`, `R8007_M8010`) exhausted a 12 tokens/s allowance on a 180s
-/// slice, so it needs upwards of 12.7. A rate cannot be fitted to that spread
-/// by observation alone; 23 is instead the rate at which a slice-length
-/// request reaches the runaway backstop (`MOSS_TD_MAX_GENERATED_TOKENS`), the
-/// most this family will ever let one decode generate. Past that point the
-/// per-second allowance is no longer what binds, and the answer to denser
-/// audio is a shorter slice, not a larger number here.
-///
-/// Being this generous costs nothing on short clips, where the budget is still
-/// proportional, so a ten-second request does not size its persistent Metal
-/// reuse graph for a transcript that cannot exist.
-const MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND: usize = 23;
-const MOSS_TD_MIN_GENERATED_TOKENS: usize = 128;
-const MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN: usize = 128;
 /// Audio tokens per second the adaptor emits (`audio_tokens_per_second` in
 /// `processing_moss_transcribe_diarize.py`, same value `decode_prompt`'s marker
 /// cadence uses). Only used to render the `AudioExceedsContext` limit as an
 /// approximate minutes figure; not part of any decode math. `pub(crate)` so
 /// `super::capacity`'s drift guard can pin it equal to the capacity frontend
 /// registry's derived rate (three copies of one fact, one pinned number).
-pub(crate) const AUDIO_TOKENS_PER_SECOND_FOR_LIMIT: f32 = 12.5;
+pub(crate) const AUDIO_TOKENS_PER_SECOND_FOR_LIMIT: f32 =
+    super::decode_prompt::AUDIO_TOKENS_PER_SECOND;
 
 #[derive(Debug, Error)]
 enum MossTdExecutorError {
@@ -129,6 +114,10 @@ enum MossTdExecutorError {
     TokenizerBuildFailed { reason: String },
     #[error("moss-transcribe-diarize requires non-empty audio")]
     EmptyAudio,
+    #[error(
+        "moss-transcribe-diarize one invocation contains {samples} samples, exceeding the product envelope {max_samples} samples"
+    )]
+    InvocationTooLong { samples: usize, max_samples: usize },
     #[error("moss-transcribe-diarize decode budget is unavailable: {reason}")]
     DecodeBudgetUnavailable { reason: String },
     #[error(
@@ -154,14 +143,81 @@ enum MossTdExecutorError {
     DecodePromptFailed { reason: String },
     #[error("moss-transcribe-diarize decoder failed: {reason}")]
     DecoderFailed { reason: String },
+    #[error("moss-transcribe-diarize {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
+    #[error("moss-transcribe-diarize prepared runtime failed: {reason}")]
+    PreparedRuntimeFailed { reason: String },
     #[error("moss-transcribe-diarize prompt embedding splice failed: {reason}")]
     PromptEmbeddingFailed { reason: String },
+    #[error("moss-transcribe-diarize decoder-state capacity contract failed: {source}")]
+    DecoderStateCapacity {
+        #[source]
+        source: Qwen3AsrKvCacheCapacityError,
+    },
     #[error("moss-transcribe-diarize greedy decode failed: {reason}")]
     GreedyDecodeFailed { reason: String },
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct MossTdGgmlExecutor;
+const MOSS_TD_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
+const MOSS_TD_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
+
+type MossTdEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type MossTdDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+
+struct MossTdEncoderActorState {
+    runtime: MossEncoderRuntime,
+    _prepared_owner: PreparedRuntimeHandle<MossTdPreparedRuntime>,
+}
+
+struct MossTdDecoderActorState {
+    runtime: MossTdDecoderRuntime,
+    _prepared_owner: PreparedRuntimeHandle<MossTdPreparedRuntime>,
+}
+
+type MossTdEncoderRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<MossTdEncoderRuntimeCacheKey, MossTdEncoderActorState>;
+type MossTdDecoderRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<MossTdDecoderRuntimeCacheKey, MossTdDecoderActorState>;
+type MossTdEncoderRuntimeActor =
+    PinnedRuntimeActorCheckout<MossTdEncoderRuntimeCacheKey, MossTdEncoderActorState>;
+type MossTdDecoderRuntimeActor =
+    PinnedRuntimeActorCheckout<MossTdDecoderRuntimeCacheKey, MossTdDecoderActorState>;
+
+#[derive(Clone)]
+pub(crate) struct MossTdGgmlExecutor {
+    prepared_runtimes: Arc<PreparedRuntimeCache<MossTdPreparedRuntime>>,
+    encoder_runtimes: Arc<MossTdEncoderRuntimePool>,
+    decoder_runtimes: Arc<MossTdDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for MossTdGgmlExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MossTdGgmlExecutor").finish_non_exhaustive()
+    }
+}
+
+impl Default for MossTdGgmlExecutor {
+    fn default() -> Self {
+        let max_committed_requested_bytes =
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        let limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            MOSS_TD_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            MOSS_TD_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        );
+        Self {
+            prepared_runtimes: Arc::new(PreparedRuntimeCache::default()),
+            encoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-moss-td-encoder-owner",
+                limits,
+            )),
+            decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-moss-td-decoder-owner",
+                limits,
+            )),
+        }
+    }
+}
 
 const MOSS_TD_EXECUTOR_ID: &str = "moss-transcribe-diarize-ggml-executor-v1";
 const MOSS_TD_STREAMING_EXECUTOR_ID: &str =
@@ -169,7 +225,8 @@ const MOSS_TD_STREAMING_EXECUTOR_ID: &str =
 
 struct MossTdGreedyStepExecutor<'a> {
     decoder: &'a mut MossTdDecoderRuntime,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
     prompt_embeddings: Option<Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
     /// Explicit cancel/pause/resume control for this decode -- never a
@@ -186,7 +243,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let prefill = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
+                .prefill(
+                    &prompt_embeddings,
+                    &mut self.layer_kv_caches,
+                    self.kv_capacity,
+                    &self.control,
+                )
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -210,7 +272,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
             })?;
         if let Some(token_id) = self
             .decoder
-            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .decode_step_reused_top1(
+                last_token,
+                cache_position,
+                &self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?
@@ -222,7 +289,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
         }
         let logits = self
             .decoder
-            .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
+            .decode_step(
+                last_token,
+                cache_position,
+                &mut self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?;
@@ -231,57 +303,6 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
             greedy_token_hint: None,
         })
     }
-}
-
-/// Thread-local resident cache for the family's two heavy per-pack runtimes
-/// (the Whisper-Medium-style [`MossEncoderRuntime`] and the Qwen3
-/// [`MossTdDecoderRuntime`]), keyed by `(canonical pack path, resolved
-/// backend)`. Mirrors `firered_aed::executor`'s
-/// `FIRERED_AED_ENCODER_RUNTIME_BY_KEY`/`FIRERED_AED_DECODER_RUNTIME_BY_KEY`
-/// exactly -- same shared `BoundedRuntimeCache` + `with_thread_local_cached_mut_by_key`
-/// machinery, same key shape, same lazy idle-unload-generation eviction. Before
-/// this, every `execute()` rebuilt both runtimes from scratch: re-mmapped the
-/// pack, re-read every encoder tensor off disk, and re-uploaded every decoder
-/// layer's weights, on every single call (including every chunk of the same
-/// longform request).
-/// Keyed by (pack content id, backend); the content id
-/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
-/// replacement at the same path from reusing a runtime whose mmapped weights
-/// came from the old bytes.
-type MossTdEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
-type MossTdDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
-
-thread_local! {
-    static MOSS_TD_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdEncoderRuntimeCacheKey, MossEncoderRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-    static MOSS_TD_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdDecoderRuntimeCacheKey, MossTdDecoderRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
-
-// Test-only build counters, incremented from inside the two caches' `build`
-// closures below -- lets a same-thread test pin "a second call reuses the
-// cached runtime" as a structural fact (build count stays 1 across two
-// calls) rather than inferring cache-hit behavior from wall-clock timing.
-#[cfg(test)]
-thread_local! {
-    static MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static MOSS_TD_DECODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn reset_moss_td_runtime_build_counts_for_test() {
-    MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(0));
-    MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(0));
-}
-
-/// `(encoder builds, decoder builds)` recorded on the calling thread since
-/// the last [`reset_moss_td_runtime_build_counts_for_test`].
-#[cfg(test)]
-fn moss_td_runtime_build_counts_for_test() -> (usize, usize) {
-    (
-        MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
-        MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
-    )
 }
 
 /// Upstream `_compute_audio_token_length`'s per-chunk audio-token count: how
@@ -304,7 +325,7 @@ pub(crate) fn moss_td_chunk_token_length(chunk_samples: usize, token_stride: usi
 /// tokens each span `merge_size` pre-merge encoder frames, capped at the
 /// encoder's `max_source_positions` (a full un-trimmed 30s chunk can never
 /// legitimately need more than that many frames kept).
-fn moss_td_chunk_keep_frames(
+pub(crate) fn moss_td_chunk_keep_frames(
     token_length: usize,
     merge_size: usize,
     max_source_positions: usize,
@@ -319,7 +340,7 @@ fn moss_td_chunk_keep_frames(
 /// `max_source_positions` cap, which is itself merge-size-aligned for every
 /// real checkpoint), so summing them keeps the running total aligned too --
 /// this is a no-op guard against that invariant, not a silent frame drop.
-fn moss_td_aligned_frame_count(total_frames: usize, merge_size: usize) -> usize {
+pub(crate) fn moss_td_aligned_frame_count(total_frames: usize, merge_size: usize) -> usize {
     let merge_size = merge_size.max(1);
     (total_frames / merge_size) * merge_size
 }
@@ -340,24 +361,11 @@ fn moss_td_generated_token_budget(
     prompt_tokens: usize,
     kv_capacity: usize,
 ) -> Result<usize, MossTdExecutorError> {
-    let audio_tokens = sample_count
-        .checked_mul(MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND)
-        .and_then(|value| value.checked_add(SAMPLE_RATE_HZ - 1))
-        .and_then(|value| value.checked_div(SAMPLE_RATE_HZ))
-        .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
-            reason: "audio-duration token budget overflowed".to_string(),
-        })?;
-    let proportional = audio_tokens
-        .checked_add(MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN)
-        .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
-            reason: "audio-duration token budget margin overflowed".to_string(),
-        })?
-        .max(MOSS_TD_MIN_GENERATED_TOKENS);
-    let remaining_context = kv_capacity.saturating_sub(prompt_tokens);
-    Ok(proportional
-        .min(MOSS_TD_MAX_GENERATED_TOKENS)
-        .min(remaining_context)
-        .max(MOSS_TD_MIN_GENERATED_TOKENS))
+    moss_td_budget_for_shape(sample_count, SAMPLE_RATE_HZ, prompt_tokens, kv_capacity).map_err(
+        |error| MossTdExecutorError::DecodeBudgetUnavailable {
+            reason: error.to_string(),
+        },
+    )
 }
 
 /// Weight-free, always-on coverage for the executor's chunk/slice-planning
@@ -378,42 +386,13 @@ mod moss_td_chunk_frame_math_tests {
     const MAX_SOURCE_POSITIONS: usize = 1500;
     const TOKEN_STRIDE: usize = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * MERGE_SIZE;
 
-    /// Prompt tokens a request of `window_seconds` audio costs, computed by
-    /// the SAME shared capacity arithmetic the family's integral-window
-    /// derivation uses (`super::capacity::moss_td_integral_window_derivation`,
-    /// fed the real checkpoint's geometry): the honest fixed wrapper (86
-    /// tokens, measured token-for-token against the real golden prompt) +
-    /// 375 audio tokens per full 30s encoder chunk + the time-marker digit
-    /// tokens derived from the duration. The flat 512-token overhead that
-    /// used to live here was only conservatively correct by accident; the
-    /// single-sourced model is exact for the fixed term and grows the marker
-    /// term the flat number never modeled.
-    fn prompt_tokens_for(window_seconds: f32) -> usize {
-        derivation().prompt_tokens_for_chunks(chunks_for(window_seconds))
-    }
-
-    /// Whole encoder chunks a `window_seconds` request occupies (a partial
-    /// chunk still costs a full one's audio tokens).
-    fn chunks_for(window_seconds: f32) -> usize {
-        let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
-        samples.div_ceil(CHUNK_SAMPLES)
-    }
-
-    /// The shared derivation inputs for the real shipped pack geometry --
-    /// the regression anchors in `super::capacity` pin its derived integral
-    /// window equal to the descriptor's declared `integral_seconds`.
-    fn derivation() -> crate::capacity::IntegralWindowDerivation {
-        crate::models::moss_transcribe_diarize::capacity::moss_td_integral_window_derivation(
-            &crate::models::moss_transcribe_diarize::capacity::shipped_pack_decoder_fixture(),
-            MERGE_SIZE,
-        )
-    }
-
     fn budget_for(window_seconds: f32) -> usize {
         let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
+        // These tests exercise the audio-proportional rule itself. Exact
+        // prompt+budget coverage is tested by the family topology module.
         moss_td_generated_token_budget(
             samples,
-            prompt_tokens_for(window_seconds),
+            0,
             crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS,
         )
         .expect("budget")
@@ -427,7 +406,7 @@ mod moss_td_chunk_frame_math_tests {
     /// descriptor to the budget rule -- the two are a pair, and widening the
     /// window alone silently eats the headroom.
     #[test]
-    fn the_declared_slice_window_fits_the_decoder_context_with_its_decode_budget() {
+    fn product_envelope_is_30s_target_and_60s_maximum() {
         let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
             integral_seconds,
             target_seconds,
@@ -438,94 +417,17 @@ mod moss_td_chunk_frame_math_tests {
         else {
             panic!("moss-transcribe-diarize must declare ScopedSlices");
         };
-        let kv_capacity =
-            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
-
-        for window_seconds in [target_seconds, max_seconds, integral_seconds] {
-            let required = prompt_tokens_for(window_seconds) + budget_for(window_seconds);
-            assert!(
-                required <= kv_capacity,
-                "{window_seconds}s slice needs {required} positions, capacity is {kv_capacity}"
-            );
-        }
-    }
-
-    /// `integral_seconds` is derived, not chosen: it must be the LARGEST
-    /// 30s-chunk-aligned window whose prompt plus a budget covering the densest
-    /// measured demand still fits the decoder context. Checking only that the
-    /// declared value fits would pass for any smaller number too, and a value
-    /// set too low silently sends recordings the decoder can serve whole down
-    /// the lossy slicing path -- so this also asserts the next window up does
-    /// NOT fit, pinning the number from both sides. The required-position
-    /// arithmetic is the shared capacity derivation's (Phase 0: the declared
-    /// constant and the derived value are pinned to the SAME arithmetic --
-    /// `super::capacity::tests::derived_integral_window_equals_the_declared_constant`
-    /// asserts the derivation lands on exactly this declared value).
-    #[test]
-    fn the_integral_window_is_the_largest_one_the_context_can_serve() {
-        use crate::models::moss_transcribe_diarize::capacity::MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND;
-
-        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
-            integral_seconds, ..
-        } = crate::arch::longform_slice_shape_for_model_architecture(
-            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
-        )
-        else {
-            panic!("moss-transcribe-diarize must declare ScopedSlices");
-        };
-        let derivation = derivation();
-        let kv_capacity = derivation.kv_position_ceiling;
-        // One encoder chunk. A window is only meaningful in whole chunks: a
-        // partial chunk still costs a full one's audio tokens.
-        const CHUNK_SECONDS: f32 = 30.0;
-
-        let required_positions = |window_seconds: f32| {
-            derivation.required_positions_for_chunks(chunks_for(window_seconds))
-        };
-
-        assert!(
-            required_positions(integral_seconds) <= kv_capacity,
-            "{integral_seconds}s needs {} positions, capacity is {kv_capacity}",
-            required_positions(integral_seconds)
+        assert_eq!(
+            target_seconds,
+            crate::arch::MOSS_TD_TARGET_INVOCATION_SECONDS as f32
         );
-        let next_window = integral_seconds + CHUNK_SECONDS;
-        assert!(
-            required_positions(next_window) > kv_capacity,
-            "{next_window}s also fits ({} positions <= {kv_capacity}), so integral_seconds is \
-             set below what this context can serve",
-            required_positions(next_window)
+        assert_eq!(
+            max_seconds,
+            crate::arch::MOSS_TD_MAX_INVOCATION_SECONDS as f32
         );
-        // The budget actually granted at that window must cover the same
-        // demand: the context clamp inside `moss_td_generated_token_budget` is
-        // what a real request is held to, not the requirement above.
-        assert!(
-            budget_for(integral_seconds) as f32
-                >= integral_seconds * MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND,
-            "granted budget {} at {integral_seconds}s does not cover the densest measured demand",
-            budget_for(integral_seconds)
-        );
-    }
-
-    /// A slice-length request reaches the runaway backstop, so the per-second
-    /// allowance stops being what limits it and denser audio has to be answered
-    /// with a shorter slice rather than a bigger constant. Dense meeting audio
-    /// exhausted a 12 tokens/s allowance on a 180s slice, so the rate has to
-    /// clear well past that.
-    #[test]
-    fn a_slice_length_request_reaches_the_runaway_backstop() {
-        use crate::models::moss_transcribe_diarize::capacity::MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND;
-
-        for window_seconds in [180.0_f32, 240.0] {
-            let budget = budget_for(window_seconds);
-            assert!(
-                budget as f32 >= window_seconds * MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND,
-                "{window_seconds}s budget {budget} does not clear the densest measured demand"
-            );
-            assert_eq!(
-                budget, MOSS_TD_MAX_GENERATED_TOKENS,
-                "{window_seconds}s slice must reach the backstop"
-            );
-        }
+        assert_eq!(integral_seconds, max_seconds);
+        assert_eq!(budget_for(30.0), 818);
+        assert_eq!(budget_for(60.0), 1_508);
     }
 
     /// A short clip keeps a small, audio-proportional budget: reserving the
@@ -547,12 +449,12 @@ mod moss_td_chunk_frame_math_tests {
     #[test]
     fn the_budget_never_exceeds_the_context_the_prompt_left() {
         let kv_capacity = 4_096;
-        let prompt_tokens = 4_000;
+        let prompt_tokens = 3_900;
         let budget =
             moss_td_generated_token_budget(600 * SAMPLE_RATE_HZ, prompt_tokens, kv_capacity)
                 .expect("budget");
         assert!(
-            prompt_tokens + budget <= kv_capacity.max(prompt_tokens + MOSS_TD_MIN_GENERATED_TOKENS),
+            prompt_tokens + budget <= kv_capacity,
             "budget {budget} on top of prompt {prompt_tokens} overruns capacity {kv_capacity}"
         );
     }
@@ -629,8 +531,9 @@ mod moss_td_chunk_frame_math_tests {
         // the mixed clip (13s), and 920 for the three-minute AISHELL-4 clip.
         // The two short clips stay on the proportional floor (no fixed
         // 4096-token Metal reuse-graph reservation for a few seconds of
-        // speech); the three-minute one is slice-length and claims the
-        // backstop.
+        // speech); the historical three-minute direct-call fixture still
+        // demonstrates the independent runaway backstop. Product slicing now
+        // keeps legal invocations at or below 60s.
         assert_eq!(budget_for(11.0), 381);
         assert_eq!(budget_for(13.0), 427);
         assert_eq!(budget_for(180.0), MOSS_TD_MAX_GENERATED_TOKENS);
@@ -642,41 +545,25 @@ mod moss_td_chunk_frame_math_tests {
     }
 }
 
-/// Encodes every 30s chunk of `samples` against the cached, resident encoder
+/// Encodes every 30s chunk of `samples` against the checked-out resident encoder
 /// runtime for this pack+backend, returning the concatenated (already
 /// merge-size-aligned) encoder rows and the number of kept frames -- the same
 /// computation the executor's per-chunk loop always did, just routed through
-/// the shared resident-runtime cache instead of building a fresh
+/// the executor-owned actor pool instead of building a fresh
 /// [`MossEncoderRuntime`] (and re-reading every encoder tensor from disk) on
 /// every call.
 fn encode_moss_td_chunks_with_cached_runtime(
-    runtime_source: &crate::GgmlRuntimeSource,
+    actor: &MossTdEncoderRuntimeActor,
     encoder_config: MossEncoderConfig,
     merge_size: usize,
     samples: &[f32],
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
-    let key = (
-        PackContentKey::for_runtime_source(runtime_source),
-        moss_td_encoder_graph_config(backend).backend,
-    );
     // Upstream `_compute_audio_token_length`'s stride: hop_length * the
     // Whisper conv stem's 2x stride * audio_merge_size.
     let token_stride = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * merge_size;
-    with_thread_local_cached_mut_by_key(
-        &MOSS_TD_ENCODER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || {
-            #[cfg(test)]
-            MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossEncoderRuntime::new(runtime_source, encoder_config, backend).map_err(|error| {
-                MossTdExecutorError::EncoderFailed {
-                    reason: format!("could not initialize encoder runtime: {error}"),
-                }
-            })
-        },
-        |runtime| {
+    let samples = samples.to_vec();
+    actor
+        .call_mut(move |state| {
             let mut concatenated_rows: Vec<f32> = Vec::new();
             let mut total_frames = 0usize;
             for chunk in samples.chunks(CHUNK_SAMPLES) {
@@ -688,7 +575,8 @@ fn encode_moss_td_chunks_with_cached_runtime(
                 .map_err(|error| MossTdExecutorError::FrontendFailed {
                     reason: error.to_string(),
                 })?;
-                let encoder_out = runtime
+                let encoder_out = state
+                    .runtime
                     .encode(encoder_config, mel.data(), MEL_TARGET_FRAMES)
                     .map_err(|error| MossTdExecutorError::EncoderFailed {
                         reason: error.to_string(),
@@ -704,8 +592,11 @@ fn encode_moss_td_chunks_with_cached_runtime(
                 total_frames += keep_frames;
             }
             Ok((concatenated_rows, total_frames))
-        },
-    )
+        })
+        .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
+            stage: "encoder",
+            reason: error.to_string(),
+        })?
 }
 
 /// One decode's text plus how the shared driver ended it. The stop reason is
@@ -722,42 +613,29 @@ struct MossTdDecodeOutput {
 /// decode driver through to `<|im_end|>` (or the fail-closed token budget),
 /// returning the trimmed decode text. Mirrors `firered_aed::executor`'s
 /// `decode_with_cached_runtime`: the runtime (loaded weights + the Qwen
-/// decode graph's reuse machinery) stays resident across calls, while every
-/// per-utterance KV cache is still allocated fresh right here
-/// (`MossTdDecoderRuntime::new_kv_caches`) -- unlike firered-aed's decoder,
-/// this family's `MossTdDecoderRuntime` carries no cross-request KV state of
-/// its own between calls, so no cache-reset step is needed before reuse.
+/// decode graph's reuse machinery) stays resident across calls. Every
+/// per-utterance host KV cache is allocated fresh at the exact logical span;
+/// the device arena/graph remains at the stable session-envelope reserve and
+/// is logically reset by the next prefill. `release_session_scoped_buffers`
+/// below drops poisoned resident state and CPU-only scratch before reuse.
 #[allow(clippy::too_many_arguments)]
 fn run_moss_td_decoder_with_cached_runtime(
-    runtime_source: &crate::GgmlRuntimeSource,
+    actor: &MossTdDecoderRuntimeActor,
     decoder_metadata: MossTdDecoderMetadata,
-    request_kv_cache_positions: usize,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
     max_generated_tokens: usize,
     decode_prompt_token_ids: &[u32],
     audio_pad_positions: &[usize],
     audio_rows: &[f32],
-    tokenizer: &MossTdTokenizer,
-    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    tokenizer: MossTdTokenizer,
+    control: Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
-    let key = (
-        PackContentKey::for_runtime_source(runtime_source),
-        moss_td_runtime_graph_config(backend).backend,
-    );
-    with_thread_local_cached_mut_by_key(
-        &MOSS_TD_DECODER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || {
-            #[cfg(test)]
-            MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossTdDecoderRuntime::new(runtime_source, decoder_metadata, backend).map_err(|error| {
-                MossTdExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                }
-            })
-        },
-        |decoder| {
+    let decode_prompt_token_ids = decode_prompt_token_ids.to_vec();
+    let audio_pad_positions = audio_pad_positions.to_vec();
+    let audio_rows = audio_rows.to_vec();
+    actor
+        .call_mut(move |state| {
+            let decoder = &mut state.runtime;
             if std::env::var_os("OPENASR_MOSS_TD_PROFILE").is_some() {
                 eprintln!(
                     "OPENASR_MOSS_TD_PROFILE decoder_backend={}",
@@ -767,7 +645,7 @@ fn run_moss_td_decoder_with_cached_runtime(
 
             let token_rows_len = decode_prompt_token_ids.len() * decoder_metadata.d_model;
             let mut token_rows = Vec::with_capacity(token_rows_len);
-            for &token_id in decode_prompt_token_ids {
+            for &token_id in &decode_prompt_token_ids {
                 let row = decoder.gather_token_embedding(token_id).map_err(|error| {
                     MossTdExecutorError::DecoderFailed {
                         reason: error.to_string(),
@@ -777,10 +655,10 @@ fn run_moss_td_decoder_with_cached_runtime(
             }
             let spliced = build_moss_td_prompt_embeddings_with_audio_splice(
                 decode_prompt_token_ids.len(),
-                audio_pad_positions,
+                &audio_pad_positions,
                 decoder_metadata.d_model,
                 &token_rows,
-                audio_rows,
+                &audio_rows,
             )
             .map_err(|error| MossTdExecutorError::PromptEmbeddingFailed {
                 reason: error.to_string(),
@@ -791,17 +669,16 @@ fn run_moss_td_decoder_with_cached_runtime(
                 token_major_values: spliced.token_major_values,
             };
 
-            // Use the validated request capacity, not the checkpoint's
-            // 131072-token RoPE context, so the fixed Metal reuse-graph span
-            // remains proportional to this utterance and can serve the entire
-            // configured decode budget without a mid-decode bounds failure.
-            let layer_kv_caches = decoder.new_kv_caches(request_kv_cache_positions);
+            let layer_kv_caches = decoder
+                .new_kv_caches(kv_capacity)
+                .map_err(|reason| MossTdExecutorError::DecoderFailed { reason })?;
             let mut step_executor = MossTdGreedyStepExecutor {
                 decoder,
                 layer_kv_caches,
+                kv_capacity,
                 prompt_embeddings: Some(prompt_embeddings),
                 cache_prompt_tokens: 0,
-                control: std::sync::Arc::clone(control),
+                control: Arc::clone(&control),
             };
             let config = BuiltinSeq2SeqDecodePolicyConfigInput {
                 initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
@@ -812,7 +689,7 @@ fn run_moss_td_decoder_with_cached_runtime(
             let result = run_builtin_seq2seq_decode_policy(
                 crate::arch::MOSS_TD_DECODE_POLICY_ID,
                 &config,
-                tokenizer,
+                &tokenizer,
                 None,
                 &mut step_executor,
                 &|token_ids: &[u32]| {
@@ -825,7 +702,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 |error: Seq2SeqGreedyDecodeError| error,
                 |error: Seq2SeqGreedyDecodeError| error,
                 map_registry_error,
-                control,
+                &control,
             );
             // Release this request's per-token grow-to-fit host buffer before
             // the runtime goes back into the cache (mirrors qwen3-asr's
@@ -874,11 +751,182 @@ fn run_moss_td_decoder_with_cached_runtime(
                 text: result.text.trim().to_string(),
                 stop_reason: result.stop_reason,
             })
-        },
-    )
+        })
+        .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
+            stage: "decoder",
+            reason: error.to_string(),
+        })?
 }
 
 impl MossTdGgmlExecutor {
+    fn map_actor_error(stage: &'static str, error: PinnedRuntimeActorError) -> MossTdExecutorError {
+        MossTdExecutorError::RuntimeOwnershipFailed {
+            stage,
+            reason: error.to_string(),
+        }
+    }
+
+    fn prepared_runtime_for_preflight(
+        &self,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<PreparedRuntimeHandle<MossTdPreparedRuntime>, MossTdExecutorError> {
+        self.prepared_runtimes.get_or_try_insert_with(
+            &preflight.runtime_source,
+            PreparedRuntimeQuoteContext {
+                model_architecture: crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+                metadata: &preflight.metadata,
+                tensor_index: &preflight.tensor_index,
+                backend,
+            },
+            || {
+                build_moss_td_prepared_runtime(preflight, backend).map_err(
+                    |error: MossTdPreparedRuntimeError| {
+                        MossTdExecutorError::PreparedRuntimeFailed {
+                            reason: error.to_string(),
+                        }
+                    },
+                )
+            },
+            || MossTdExecutorError::PreparedRuntimeFailed {
+                reason: "prepared-runtime cache lock poisoned".to_string(),
+            },
+            |error| MossTdExecutorError::RuntimeOwnershipFailed {
+                stage: "prepared",
+                reason: error.to_string(),
+            },
+        )
+    }
+
+    fn checkout_encoder_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<MossTdEncoderRuntimeActor, MossTdExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(moss_td_encoder_graph_config(backend).backend),
+        );
+        let source = runtime_source.clone();
+        self.encoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || Ok((0, (source, prepared))),
+            move |(source, prepared)| {
+                let runtime = MossEncoderRuntime::new_with_prepared_weights(
+                    &source,
+                    Arc::clone(&prepared.encoder_weights),
+                    backend,
+                )
+                .map_err(|error| MossTdExecutorError::EncoderFailed {
+                    reason: format!("could not initialize encoder runtime: {error}"),
+                })?;
+                Ok(SystemMemoryOwner::without_allocation(
+                    MossTdEncoderActorState {
+                        runtime,
+                        _prepared_owner: prepared,
+                    },
+                ))
+            },
+            |error| Self::map_actor_error("encoder", error),
+        )
+    }
+
+    fn checkout_decoder_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
+        kv_capacity: Qwen3AsrKvCacheCapacity,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<MossTdDecoderRuntimeActor, MossTdExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(moss_td_runtime_graph_config(backend).backend),
+            kv_capacity.resident_positions(),
+        );
+        let source = runtime_source.clone();
+        let content_id = runtime_source.content_id().to_string();
+        self.decoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let retained = MossTdDecoderRuntime::quoted_resident_system_memory_bytes(
+                    prepared.decoder_metadata.n_layers,
+                )
+                .map_err(|reason| MossTdExecutorError::RuntimeOwnershipFailed {
+                    stage: "decoder",
+                    reason,
+                })?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!(
+                        "moss-td-decoder-runtime:{content_id}:positions={}",
+                        kv_capacity.resident_positions()
+                    ),
+                    retained,
+                    retained,
+                )
+                .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
+                    stage: "decoder",
+                    reason: error.to_string(),
+                })?;
+                Ok((retained, (source, prepared, quote)))
+            },
+            move |(source, prepared, quote)| match SystemMemoryOwner::try_allocate_transaction(
+                quote,
+                || {
+                    let runtime = MossTdDecoderRuntime::new_with_prepared_state(
+                        &source,
+                        prepared.decoder_metadata,
+                        Arc::clone(&prepared.decoder_plan),
+                        Arc::clone(&prepared.logits_head),
+                        Arc::clone(&prepared.token_embedding),
+                        backend,
+                    )
+                    .map_err(|error| MossTdExecutorError::DecoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                    let retained = runtime.resident_system_memory_bytes().map_err(|reason| {
+                        MossTdExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason,
+                        }
+                    })?;
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        MossTdDecoderActorState {
+                            runtime,
+                            _prepared_owner: prepared,
+                        },
+                        retained,
+                        retained,
+                    ))
+                },
+            ) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(MossTdExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: error.to_string(),
+                    })
+                }
+            },
+            |error| Self::map_actor_error("decoder", error),
+        )
+    }
+
+    fn clear_runtime_owners(&self) {
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
+        self.prepared_runtimes.clear();
+    }
+
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.encoder_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.decoder_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.prepared_runtimes.evict_content_id(pack_content_id);
+    }
+
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -896,30 +944,27 @@ impl MossTdGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        let encoder_metadata = parse_encoder_metadata(&*preflight.metadata).map_err(|error| {
-            MossTdExecutorError::RuntimeContractViolation {
-                reason: error.to_string(),
-            }
-        })?;
-        let adaptor_metadata = parse_adaptor_metadata(&*preflight.metadata).map_err(|error| {
-            MossTdExecutorError::RuntimeContractViolation {
-                reason: error.to_string(),
-            }
-        })?;
-        let decoder_metadata = parse_decoder_metadata(&*preflight.metadata).map_err(|error| {
-            MossTdExecutorError::RuntimeContractViolation {
-                reason: error.to_string(),
-            }
-        })?;
-        let tokenizer = MossTdTokenizer::from_gguf_metadata(&preflight.metadata).map_err(
-            |error: NativeAsrError| MossTdExecutorError::TokenizerBuildFailed {
-                reason: error.to_string(),
-            },
-        )?;
+        let backend = request.resolved_runtime.backend();
+        let prepared = self.prepared_runtime_for_preflight(&preflight, backend)?;
+        let encoder_metadata = prepared.encoder_metadata;
+        let adaptor_metadata = prepared.adaptor_metadata;
+        let decoder_metadata = prepared.decoder_metadata;
+        let tokenizer = prepared.tokenizer.clone();
 
         let samples = &request.prepared_audio.samples_f32;
         if samples.is_empty() {
             return Err(MossTdExecutorError::EmptyAudio);
+        }
+        let max_samples = SAMPLE_RATE_HZ
+            .checked_mul(crate::arch::MOSS_TD_MAX_INVOCATION_SECONDS as usize)
+            .ok_or_else(|| MossTdExecutorError::RuntimeContractViolation {
+                reason: "MOSS-TD product invocation sample ceiling overflowed".to_string(),
+            })?;
+        if samples.len() > max_samples {
+            return Err(MossTdExecutorError::InvocationTooLong {
+                samples: samples.len(),
+                max_samples,
+            });
         }
         // Derived from THIS call's buffer, never from a request-level "whole
         // recording" duration. Under longform slicing that buffer is one slice,
@@ -928,11 +973,6 @@ impl MossTdGgmlExecutor {
         // ever blanket the rest of its own slice, not the rest of the recording.
         let audio_duration_seconds = samples.len() as f32 / SAMPLE_RATE_HZ as f32;
 
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
-            MossTdExecutorError::RuntimeContractViolation {
-                reason: error.to_string(),
-            }
-        })?;
         let encoder_config = MossEncoderConfig {
             n_layers: encoder_metadata.n_layers,
             d_model: encoder_metadata.d_model,
@@ -940,34 +980,22 @@ impl MossTdGgmlExecutor {
             n_mels: encoder_metadata.n_mels,
             max_source_positions: encoder_metadata.max_source_positions,
         };
-        let adaptor_weights = load_moss_adaptor_weights_from_reader(
-            &reader,
-            encoder_metadata.d_model,
-            adaptor_metadata.merge_size,
-            decoder_metadata.d_model,
-            MOSS_TD_ADAPTOR_NORM_EPSILON,
-        )
-        .map_err(|error| MossTdExecutorError::AdaptorFailed {
-            reason: error.to_string(),
-        })?;
-
-        // Routed through the resident, thread-local encoder-runtime cache
-        // (mirrors `firered_aed::executor`'s cached encoder): the loaded
-        // weights + mmap'd zero-copy context stay resident across calls to
-        // this pack+backend instead of being rebuilt from scratch on every
-        // `execute()`.
-        let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
+        let encoder_actor = self.checkout_encoder_runtime(
             &preflight.runtime_source,
+            Arc::clone(&prepared),
+            backend,
+        )?;
+        let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
+            &encoder_actor,
             encoder_config,
             adaptor_metadata.merge_size,
             samples,
-            request.resolved_runtime.backend(),
         )?;
         let aligned_frames = moss_td_aligned_frame_count(total_frames, adaptor_metadata.merge_size);
         concatenated_rows.truncate(aligned_frames * encoder_metadata.d_model);
 
         let (audio_rows, audio_token_count) = run_moss_adaptor(
-            &adaptor_weights,
+            &prepared.adaptor_weights,
             &concatenated_rows,
             aligned_frames,
             encoder_metadata.d_model,
@@ -1011,31 +1039,46 @@ impl MossTdGgmlExecutor {
             required_positions: decode_prompt
                 .token_ids
                 .len()
-                .saturating_add(max_generated_tokens),
+                .saturating_add(max_generated_tokens.saturating_sub(1)),
             kv_capacity,
             max_minutes: (kv_capacity.saturating_sub(max_generated_tokens) as f32
                 / AUDIO_TOKENS_PER_SECOND_FOR_LIMIT
                 / 60.0)
                 .max(0.0),
         })?;
+        let kv_capacity_plan = Qwen3AsrKvCacheCapacity::from_decoder_state(
+            &request.decoder_state,
+            super::capacity::MOSS_TD_SELF_KV_STATE_ID,
+        )
+        .and_then(|capacity| {
+            capacity.validate_measured_logical_positions(request_kv_cache_positions)
+        })
+        .map_err(|source| MossTdExecutorError::DecoderStateCapacity { source })?;
+        if kv_capacity_plan.resident_positions() > kv_capacity {
+            return Err(MossTdExecutorError::RuntimeContractViolation {
+                reason: format!(
+                    "planned resident KV span {} exceeds the validated MOSS cap {kv_capacity}",
+                    kv_capacity_plan.resident_positions()
+                ),
+            });
+        }
 
-        // Routed through the resident, thread-local decoder-runtime cache
-        // (mirrors `firered_aed::executor`'s cached decoder): the loaded
-        // decoder weights + reuse-graph machinery stay resident across calls
-        // to this pack+backend, while the KV cache for this one utterance is
-        // still allocated fresh inside the helper.
-        let runtime_source = &preflight.runtime_source;
+        let decoder_actor = self.checkout_decoder_runtime(
+            &preflight.runtime_source,
+            prepared,
+            kv_capacity_plan,
+            backend,
+        )?;
         let decoded = run_moss_td_decoder_with_cached_runtime(
-            runtime_source,
+            &decoder_actor,
             decoder_metadata,
-            request_kv_cache_positions,
+            kv_capacity_plan,
             max_generated_tokens,
             &decode_prompt.token_ids,
             &decode_prompt.audio_pad_positions,
             &audio_rows,
-            &tokenizer,
-            &request.execution_context.control,
-            request.resolved_runtime.backend(),
+            tokenizer,
+            Arc::clone(&request.execution_context.control),
         )?;
         // Normalize the model's own inline `[start][end][SNN]` markup into the
         // engine's shared segment representation. The decode prompt is fixed,
@@ -1091,6 +1134,18 @@ impl GgmlAsrViewExecutor for MossTdGgmlExecutor {
         false
     }
 
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_moss_td_decoder_state,
+            ),
+        )
+    }
+
     fn execute_view(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -1101,6 +1156,10 @@ impl GgmlAsrViewExecutor for MossTdGgmlExecutor {
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_owners();
     }
 }
 
@@ -1132,6 +1191,10 @@ impl GgmlAsrStreamingExecutor for MossTdGgmlExecutor {
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
             MossTdGgmlExecutor::execute_view,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_owners();
     }
 }
 
@@ -1245,6 +1308,19 @@ mod tests {
         wav_path: PathBuf,
         backend_preference: GgmlAsrBackendPreference,
     ) -> Option<(String, Vec<Segment>, std::time::Duration, f32)> {
+        let executor = MossTdGgmlExecutor::default();
+        transcribe_with_dev_pack_backend_using_executor(&executor, wav_path, backend_preference)
+    }
+
+    /// Execute one dev-pack request through the caller-provided executor.
+    /// Keeping the executor outside this helper lets tests prove that the
+    /// owner-actor pools retain and reuse runtimes across requests, while the
+    /// ordinary fixture helpers below still get an isolated default executor.
+    fn transcribe_with_dev_pack_backend_using_executor(
+        executor: &MossTdGgmlExecutor,
+        wav_path: PathBuf,
+        backend_preference: GgmlAsrBackendPreference,
+    ) -> Option<(String, Vec<Segment>, std::time::Duration, f32)> {
         let pack_path = dev_pack_path()?;
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
@@ -1278,6 +1354,9 @@ mod tests {
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
 
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
@@ -1296,7 +1375,6 @@ mod tests {
             )),
         };
 
-        let executor = MossTdGgmlExecutor;
         let started_at = Instant::now();
         let result = executor.execute_view(&request).expect("moss-td transcribe");
         let elapsed = started_at.elapsed();
@@ -1339,6 +1417,9 @@ mod tests {
         )
         .expect("load wav fixture");
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
@@ -1353,7 +1434,7 @@ mod tests {
                 "test fixture",
             )),
         };
-        let executor = MossTdGgmlExecutor;
+        let executor = MossTdGgmlExecutor::default();
         let result = executor.execute_view(&request).expect("moss-td transcribe");
         Some(result.transcription.segments)
     }
@@ -1451,47 +1532,55 @@ mod tests {
         assert_eq!(text, normalized_golden_text(GOLDEN_JFK_TEXT, 10.59));
     }
 
-    /// Pins the resident-runtime cache's two contracts introduced by this
-    /// PR: (1) a second `execute()` on the same thread against the same pack
-    /// reuses both the cached encoder and decoder runtimes rather than
-    /// rebuilding them (asserted structurally via the build counters, not by
-    /// timing -- see `moss_td_runtime_build_counts_for_test`'s doc comment),
-    /// and (2) reuse changes nothing observable: the second call's transcript
-    /// is byte-for-byte identical to the first (and to `GOLDEN_JFK_TEXT`).
+    /// Pins the resident owner pool's two contracts: (1) a second
+    /// `execute()` through the same executor reuses both owner-actor runtimes
+    /// rather than creating another cache entry, and (2) reuse changes nothing
+    /// observable: the second call's transcript is byte-for-byte identical to
+    /// the first (and to `GOLDEN_JFK_TEXT`).
     #[test]
     #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
                 and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
     fn resident_runtime_cache_hits_on_a_second_transcribe_call_for_the_same_pack() {
-        reset_moss_td_runtime_build_counts_for_test();
-        let Some((first_text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
+        let executor = MossTdGgmlExecutor::default();
+        let Some((first_text, _, _, _)) = transcribe_with_dev_pack_backend_using_executor(
+            &executor,
+            dev_sample_path("jfk.wav"),
+            GgmlAsrBackendPreference::CpuOnly,
+        ) else {
             return;
         };
         assert_eq!(first_text, normalized_golden_text(GOLDEN_JFK_TEXT, 10.59));
-        let (encoder_builds, decoder_builds) = moss_td_runtime_build_counts_for_test();
         assert_eq!(
-            encoder_builds, 1,
-            "first call must build the encoder runtime exactly once"
+            executor.encoder_runtimes.usage_for_test().0,
+            1,
+            "first call must retain one idle encoder owner"
         );
         assert_eq!(
-            decoder_builds, 1,
-            "first call must build the decoder runtime exactly once"
+            executor.decoder_runtimes.usage_for_test().0,
+            1,
+            "first call must retain one idle decoder owner"
         );
 
-        let Some((second_text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
+        let Some((second_text, _, _, _)) = transcribe_with_dev_pack_backend_using_executor(
+            &executor,
+            dev_sample_path("jfk.wav"),
+            GgmlAsrBackendPreference::CpuOnly,
+        ) else {
             return;
         };
         assert_eq!(
             second_text, first_text,
-            "reusing the cached runtimes must not change the decode"
-        );
-        let (encoder_builds, decoder_builds) = moss_td_runtime_build_counts_for_test();
-        assert_eq!(
-            encoder_builds, 1,
-            "second call must hit the cached encoder runtime, not rebuild it"
+            "reusing the owner-actor runtimes must not change the decode"
         );
         assert_eq!(
-            decoder_builds, 1,
-            "second call must hit the cached decoder runtime, not rebuild it"
+            executor.encoder_runtimes.usage_for_test().0,
+            1,
+            "second call must reuse the same idle encoder owner"
+        );
+        assert_eq!(
+            executor.decoder_runtimes.usage_for_test().0,
+            1,
+            "second call must reuse the same idle decoder owner"
         );
     }
 

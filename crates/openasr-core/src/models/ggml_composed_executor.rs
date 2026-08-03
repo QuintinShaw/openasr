@@ -1,5 +1,9 @@
+use crate::models::ggml_asr_executor::{
+    GgmlAsrDecoderState, GgmlAsrDecoderStateContract, GgmlAsrDecoderStatePlanningInput,
+};
 use crate::{
-    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest, GgmlAsrViewExecutor,
+    GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
+    GgmlAsrViewExecutor, GgmlFamilyAdapterDescriptor,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -45,6 +49,37 @@ impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
                 .executors_by_model_architecture
                 .values()
                 .all(|executor| executor.supports_phrase_bias())
+    }
+
+    fn decoder_state_contract(
+        &self,
+        selected_family: &GgmlFamilyAdapterDescriptor,
+    ) -> Result<GgmlAsrDecoderStateContract, GgmlAsrExecutionError> {
+        let executor = self
+            .executors_by_model_architecture
+            .get(selected_family.model_architecture)
+            .ok_or(GgmlAsrExecutionError::ExecutorUnavailable {
+                adapter_id: selected_family.adapter_id,
+                model_family: selected_family.model_family,
+                capability: "model-architecture-executor",
+            })?;
+        executor.decoder_state_contract(selected_family)
+    }
+
+    fn replan_streaming_decoder_state(
+        &self,
+        selected_family: &GgmlFamilyAdapterDescriptor,
+        input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    ) -> Result<GgmlAsrDecoderState, GgmlAsrExecutionError> {
+        let executor = self
+            .executors_by_model_architecture
+            .get(selected_family.model_architecture)
+            .ok_or(GgmlAsrExecutionError::ExecutorUnavailable {
+                adapter_id: selected_family.adapter_id,
+                model_family: selected_family.model_family,
+                capability: "model-architecture-executor",
+            })?;
+        executor.replan_streaming_decoder_state(selected_family, input)
     }
 
     fn execute_view(
@@ -101,6 +136,13 @@ mod tests {
             true
         }
 
+        fn decoder_state_contract(
+            &self,
+            _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        ) -> Result<GgmlAsrDecoderStateContract, GgmlAsrExecutionError> {
+            Ok(GgmlAsrDecoderStateContract::NoPersistentState)
+        }
+
         fn execute_view(
             &self,
             _request: &GgmlAsrExecutionViewRequest<'_>,
@@ -122,6 +164,9 @@ mod tests {
 
     fn qwen_request() -> GgmlAsrExecutionViewRequest<'static> {
         GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
@@ -189,6 +234,12 @@ mod tests {
             }
             fn supports_phrase_bias(&self) -> bool {
                 true
+            }
+            fn decoder_state_contract(
+                &self,
+                _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+            ) -> Result<GgmlAsrDecoderStateContract, GgmlAsrExecutionError> {
+                Ok(GgmlAsrDecoderStateContract::NoPersistentState)
             }
             fn execute_view(
                 &self,

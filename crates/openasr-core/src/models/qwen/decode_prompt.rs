@@ -24,6 +24,73 @@ pub(crate) enum Qwen3AsrDecodePromptError {
     },
 }
 
+fn tail_chars(value: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    value
+        .char_indices()
+        .rev()
+        .nth(max_chars.saturating_sub(1))
+        .map_or(value, |(index, _)| &value[index..])
+}
+
+fn encode_qwen3_suffix(
+    tokenizer: &Qwen3AsrTokenizer,
+    normalized_prompt: &str,
+    request_options: &GgmlAsrExecutionOptions,
+) -> Result<Vec<u32>, Qwen3AsrDecodePromptError> {
+    const AUDIO_END: &str = "<|audio_end|>";
+    const ASSISTANT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+    let tokenize = |prompt: &str| {
+        let mut suffix = String::from(AUDIO_END);
+        if !prompt.is_empty() {
+            suffix.push('\n');
+            suffix.push_str(prompt);
+        }
+        suffix.push_str(ASSISTANT_SUFFIX);
+        tokenizer.encode_prompt_text(&suffix).map_err(|_| {
+            Qwen3AsrDecodePromptError::UnsupportedRequestOption {
+                option: "prompt",
+                reason: "ChatML prompt tokenization failed",
+            }
+        })
+    };
+
+    let Some(longform) = request_options.longform.as_ref() else {
+        return tokenize(normalized_prompt);
+    };
+
+    // The character tail is a product-quality bound. The token tail is the
+    // decoder-state/memory bound. Both are applied with the exact tokenizer
+    // used by execution; no chars-to-tokens estimate enters capacity math.
+    let prompt = tail_chars(normalized_prompt, longform.max_context_chars);
+    let empty_suffix_len = tokenize("")?.len();
+    let suffix_token_cap = empty_suffix_len
+        .checked_add(longform.max_context_tokens)
+        .ok_or(Qwen3AsrDecodePromptError::UnsupportedRequestOption {
+            option: "prompt",
+            reason: "long-form prompt token budget overflowed",
+        })?;
+    let full = tokenize(prompt)?;
+    if full.len() <= suffix_token_cap {
+        return Ok(full);
+    }
+
+    // Search source-character boundaries from longest to shortest tail. Each
+    // candidate is tokenized as the complete real suffix, preserving BPE
+    // behavior at ChatML boundaries. At most max_context_chars candidates are
+    // considered (512 by default), and the first fit is the longest exact
+    // prompt satisfying the declared token envelope.
+    for (start, _) in prompt.char_indices().skip(1) {
+        let candidate = tokenize(&prompt[start..])?;
+        if candidate.len() <= suffix_token_cap {
+            return Ok(candidate);
+        }
+    }
+    tokenize("")
+}
+
 pub(crate) fn build_qwen3_decode_prompt(
     metadata: Qwen3AsrExecutionMetadata,
     tokenizer: Option<&Qwen3AsrTokenizer>,
@@ -63,24 +130,13 @@ pub(crate) fn build_qwen3_decode_prompt(
         .unwrap_or("");
     if let Some(tokenizer) = tokenizer {
         let prefix = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>";
-        let mut suffix = String::from("<|audio_end|>");
-        if !normalized_prompt.is_empty() {
-            suffix.push('\n');
-            suffix.push_str(normalized_prompt);
-        }
-        suffix.push_str("<|im_end|>\n<|im_start|>assistant\n");
         let prefix_ids = tokenizer.encode_prompt_text(prefix).map_err(|_| {
             Qwen3AsrDecodePromptError::UnsupportedRequestOption {
                 option: "prompt",
                 reason: "ChatML prompt tokenization failed",
             }
         })?;
-        let suffix_ids = tokenizer.encode_prompt_text(&suffix).map_err(|_| {
-            Qwen3AsrDecodePromptError::UnsupportedRequestOption {
-                option: "prompt",
-                reason: "ChatML prompt tokenization failed",
-            }
-        })?;
+        let suffix_ids = encode_qwen3_suffix(tokenizer, normalized_prompt, request_options)?;
         let mut token_ids = Vec::with_capacity(
             prefix_ids
                 .len()
@@ -301,5 +357,42 @@ mod tests {
             .to_string();
         assert!(error.contains("language"), "{error}");
         assert!(error.contains("Whisper"), "{error}");
+    }
+
+    #[test]
+    fn longform_prompt_is_bounded_by_exact_token_count() {
+        let tokenizer = tokenizer_fixture();
+        let base = build_qwen3_decode_prompt(
+            metadata(),
+            Some(&tokenizer),
+            2,
+            &GgmlAsrExecutionOptions {
+                longform: Some(crate::LongFormOptions {
+                    max_context_tokens: 1,
+                    max_context_chars: 100,
+                    ..crate::LongFormOptions::default()
+                }),
+                ..GgmlAsrExecutionOptions::default()
+            },
+        )
+        .expect("base prompt");
+        let bounded = build_qwen3_decode_prompt(
+            metadata(),
+            Some(&tokenizer),
+            2,
+            &GgmlAsrExecutionOptions {
+                prompt: Some("systemsystemsystemsystem".to_string()),
+                longform: Some(crate::LongFormOptions {
+                    max_context_tokens: 1,
+                    max_context_chars: 100,
+                    ..crate::LongFormOptions::default()
+                }),
+                ..GgmlAsrExecutionOptions::default()
+            },
+        )
+        .expect("bounded prompt");
+        assert!(bounded.token_ids.len() <= base.token_ids.len() + 1);
+        assert_eq!(bounded.audio_pad_start_index, base.audio_pad_start_index);
+        assert_eq!(bounded.audio_pad_count, base.audio_pad_count);
     }
 }

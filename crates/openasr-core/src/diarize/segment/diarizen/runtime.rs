@@ -66,7 +66,7 @@ struct TraceTensor {
 /// Field order is a lifetime invariant: the persistent session owns graph
 /// nodes pointing into both arenas and into the runner backend, so it must be
 /// dropped before those owners.
-pub(super) struct DiariZenRuntime {
+pub(crate) struct DiariZenRuntime {
     graph: Option<DiariZenPersistentGraph>,
     static_handles: StaticHandles,
     layer_sum: Vec<f32>,
@@ -74,6 +74,7 @@ pub(super) struct DiariZenRuntime {
     trace: bool,
     samples: usize,
     frames: usize,
+    construction_requested_peak_bytes: u64,
     _static_arena: GgmlStaticTensorArena,
     _loaded_weights: GgmlLoadedWeightContext,
     _runner: GgmlCpuGraphRunner,
@@ -88,6 +89,59 @@ struct DiariZenPersistentGraph {
 }
 
 impl DiariZenRuntime {
+    pub(crate) fn quote_candidate_system_memory(
+        source: &GgmlRuntimeSource,
+    ) -> Result<
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote,
+        DiariZenSegmenterError,
+    > {
+        let (_, retained_bytes, peak_bytes) = system_memory_shape(super::config::WINDOW_SAMPLES)?;
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+            format!(
+                "aux.{}.{}.host-state",
+                super::DIARIZEN_GGML_ARCHITECTURE_ID,
+                source.content_id()
+            ),
+            peak_bytes,
+            retained_bytes,
+        )
+        .map_err(|error| DiariZenSegmenterError::Capacity(error.to_string()))
+    }
+
+    pub(crate) fn try_allocate_inside_parent_candidate(
+        quote: crate::models::system_memory_owner::SystemMemoryAllocationQuote,
+        source: &GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<crate::models::system_memory_owner::SystemMemoryOwner<Self>, DiariZenSegmenterError>
+    {
+        match crate::models::system_memory_owner::SystemMemoryOwner::try_allocate_transaction(
+            quote,
+            || {
+                let runtime = Self::from_runtime_source(
+                    source,
+                    super::config::WINDOW_SAMPLES,
+                    false,
+                    Some(backend),
+                )?;
+                let retained = runtime.retained_system_memory_bytes()?;
+                let requested_peak = retained.max(runtime.construction_requested_peak_bytes);
+                Ok::<_, DiariZenSegmenterError>(
+                    crate::models::system_memory_owner::SystemMemoryAllocationOutcome::new(
+                        runtime,
+                        requested_peak,
+                        retained,
+                    ),
+                )
+            },
+        ) {
+            Ok(owner) => Ok(owner),
+            Err(crate::models::system_memory_owner::SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+            Err(crate::models::system_memory_owner::SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                Err(DiariZenSegmenterError::Capacity(error.to_string()))
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn new(
         path: &Path,
@@ -188,6 +242,7 @@ impl DiariZenRuntime {
             frames,
             trace,
         )?;
+        let (_, _, construction_requested_peak_bytes) = system_memory_shape(samples)?;
 
         Ok(Self {
             graph: Some(graph),
@@ -197,10 +252,23 @@ impl DiariZenRuntime {
             trace,
             samples,
             frames,
+            construction_requested_peak_bytes,
             _static_arena: static_arena,
             _loaded_weights: loaded_weights,
             _runner: runner,
         })
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, DiariZenSegmenterError> {
+        self.layer_sum
+            .capacity()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                DiariZenSegmenterError::Capacity(
+                    "DiariZen retained layer-mixture byte count overflowed".to_string(),
+                )
+            })
     }
 
     fn ensure_healthy_graph(&mut self) -> Result<(), DiariZenSegmenterError> {
@@ -225,7 +293,7 @@ impl DiariZenRuntime {
         Ok(())
     }
 
-    pub(super) fn infer(
+    pub(crate) fn infer(
         &mut self,
         samples: &[f32],
     ) -> Result<DiariZenWindowOutput, DiariZenSegmenterError> {
@@ -297,6 +365,60 @@ impl DiariZenRuntime {
         ));
         Ok(named)
     }
+}
+
+/// Exact Rust-owned construction geometry. Native tensor arenas, weights, and
+/// scheduler buffers are excluded because the backend-memory ABI quotes and
+/// owns those physical allocations directly.
+fn system_memory_shape(samples: usize) -> Result<(usize, u64, u64), DiariZenSegmenterError> {
+    let frames = output_frames(samples);
+    let checked_bytes = |elements: usize, label: &str| {
+        elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                DiariZenSegmenterError::Capacity(format!("DiariZen {label} byte count overflowed"))
+            })
+    };
+    let relative_bias = frames
+        .checked_mul(frames)
+        .and_then(|value| value.checked_mul(TOTAL_HEADS))
+        .ok_or_else(|| {
+            DiariZenSegmenterError::Capacity(
+                "DiariZen relative-position element count overflowed".to_string(),
+            )
+        })?;
+    let bias_bytes = checked_bytes(relative_bias, "relative-position staging")?;
+    let relative_table_bytes = checked_bytes(
+        TOTAL_HEADS
+            .checked_mul(RELATIVE_POSITION_BUCKETS)
+            .ok_or_else(|| {
+                DiariZenSegmenterError::Capacity(
+                    "DiariZen relative-table element count overflowed".to_string(),
+                )
+            })?,
+        "relative-table staging",
+    )?;
+    // gamma, beta, running mean, running variance, scale and shift coexist for
+    // one conformer layer; layers are uploaded serially.
+    let batch_norm_bytes = checked_bytes(
+        CONFORMER_DIM.checked_mul(6).ok_or_else(|| {
+            DiariZenSegmenterError::Capacity(
+                "DiariZen batch-norm staging element count overflowed".to_string(),
+            )
+        })?,
+        "batch-norm staging",
+    )?;
+    let construction_peak = bias_bytes
+        .checked_add(relative_table_bytes)
+        .and_then(|value| value.checked_add(batch_norm_bytes))
+        .ok_or_else(|| {
+            DiariZenSegmenterError::Capacity(
+                "DiariZen construction peak byte count overflowed".to_string(),
+            )
+        })?;
+    let retained = checked_bytes(LAYER_REPRESENTATIONS, "layer-mixture")?;
+    Ok((frames, retained, construction_peak.max(retained)))
 }
 
 fn build_persistent_graph(

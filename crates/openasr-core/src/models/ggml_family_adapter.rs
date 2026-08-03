@@ -69,6 +69,7 @@ pub struct GgmlFamilyAdapterDescriptor {
     pub tokenizer_id: &'static str,
     pub decode_policy_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
+    pub execution_capabilities: crate::device::execution_policy::ExecutionCapabilities,
     pub language_family_hint: LanguageFamilyHint,
     /// Where this family's speaker turns come from. Mirrored verbatim from
     /// `arch::OpenAsrArchitectureDescriptor::speaker_segmentation`, which is

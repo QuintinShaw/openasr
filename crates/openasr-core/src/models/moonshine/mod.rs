@@ -1,4 +1,5 @@
 mod batched_decode;
+pub(crate) mod capacity;
 mod decoder_graph;
 mod encoder_graph;
 mod frontend;

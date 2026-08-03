@@ -54,14 +54,16 @@ use openasr_core::realtime::history::{DaemonHistoryEntry, DaemonHistoryStoreErro
 use openasr_core::{
     AudioPreparationError, BackendKind, CatalogError, CatalogMirror, CatalogPullRequest,
     InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, ModelInstallLicenseDecision,
-    NativeRuntimeShutdownGuard, OpenAsrHomeError, PullError, PullModelPackRequest, PullProgress,
+    NativeExecutionServices, OpenAsrHomeError, PullError, PullModelPackRequest, PullProgress,
     QuantPreference, RealtimeBackendCapabilities, ResolvedCatalogPull,
     certificate_fingerprint_sha256, host_quant_recommendation_profile,
-    install_model_pack_from_path, list_installed_packs, load_local_catalog_file_with_identity,
-    load_model_catalog, model_install_license_decision,
+    install_catalog_model_pack_from_path_with_execution_services,
+    install_model_pack_from_path_with_execution_services, list_installed_packs,
+    load_local_catalog_file_with_identity, load_model_catalog, model_install_license_decision,
     native_runtime_realtime_capabilities_for_path,
-    native_runtime_transcription_capabilities_for_path, openasr_home, remove_model_pack,
-    resolve_catalog_model_pack_from_path, resolve_catalog_pull, resolve_installed_pack_reference,
+    native_runtime_transcription_capabilities_for_path, openasr_home,
+    remove_model_pack_with_execution_services, resolve_catalog_model_pack_from_path,
+    resolve_catalog_pull, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog, resolve_launch_pack, resolve_runtime_catalog,
     runtime_registry,
 };
@@ -129,7 +131,10 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     distribution_runtime: DistributionRuntime,
     launch_options: ServerLaunchOptions,
 ) -> Router {
-    let distribution = DistributionContext::new(distribution_runtime);
+    let distribution = DistributionContext::with_execution_services(
+        distribution_runtime,
+        Arc::clone(runtime.native_execution.execution_services()),
+    );
     distribution.ensure_restart_resumes_started();
     let auth = launch_options.auth.clone();
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
@@ -252,7 +257,6 @@ pub async fn serve_with_launch_options(
     runtime: ServerRuntime,
     launch_options: ServerLaunchOptions,
 ) -> anyhow::Result<()> {
-    let _native_runtime_owner = NativeRuntimeShutdownGuard::new();
     // Boot stage timing: each phase logged as its own timestamped line so a
     // slow daemon start (validate/bind/router-build/model-bind) can be
     // attributed to a specific phase from `daemon.log` alone, instead of
@@ -321,7 +325,10 @@ pub async fn serve_with_launch_options(
     // `never` (`idle_unload_after` is `None` for `never` and for every
     // existing caller/test that does not set it, so this is a no-op there).
     if let Some(idle_unload_after) = launch_options.idle_unload_after {
-        spawn_idle_unload_reaper(idle_unload_after);
+        spawn_idle_unload_reaper(
+            idle_unload_after,
+            Arc::clone(runtime.native_execution.execution_services()),
+        );
     }
     match &launch_options.tls.clone() {
         ServerTlsConfig::Disabled => {
@@ -1397,6 +1404,7 @@ impl Default for DistributionRuntime {
 #[derive(Clone)]
 pub(crate) struct DistributionContext {
     runtime: DistributionRuntime,
+    native_execution_services: Arc<NativeExecutionServices>,
     jobs: Arc<DistributionJobs>,
     // In-flight file transcriptions that opted into control, keyed by the
     // client-supplied transcription id. The pause/resume/cancel HTTP handlers
@@ -1407,12 +1415,22 @@ pub(crate) struct DistributionContext {
 }
 
 impl DistributionContext {
-    fn new(runtime: DistributionRuntime) -> Self {
+    fn with_execution_services(
+        runtime: DistributionRuntime,
+        native_execution_services: Arc<NativeExecutionServices>,
+    ) -> Self {
         Self {
             jobs: Arc::new(DistributionJobs::new(load_persisted_pull_jobs(&runtime))),
             transcriptions: Arc::new(Mutex::new(HashMap::new())),
+            native_execution_services,
             runtime,
         }
+    }
+
+    #[cfg(test)]
+    fn new(runtime: DistributionRuntime) -> Self {
+        let supervisor = NativeExecutionSupervisor::default();
+        Self::with_execution_services(runtime, Arc::clone(supervisor.execution_services()))
     }
 
     fn register_transcription(

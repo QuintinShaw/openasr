@@ -14,7 +14,7 @@ pub use gating::{
 };
 pub use queue::{
     LatestOnlyTranslationQueue, TranslationQueueError, TranslationQueueSubmit,
-    TranslationWorkerOutput,
+    TranslationWorkerOutput, TranslationWorkerReadiness,
 };
 pub use session::{
     FinalizedTranslationContext, TargetLang, TranslationOutput, TranslationRequest,

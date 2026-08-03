@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use openasr_core::NativeExecutionServices;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Bounds concurrent native executions for one resolved runtime model identity.
@@ -49,6 +50,7 @@ pub(crate) struct ModelSessionPermit {
 #[derive(Clone, Debug)]
 pub struct NativeExecutionSupervisor {
     admission: ModelSessionAdmission,
+    execution_services: Arc<NativeExecutionServices>,
 }
 
 impl PartialEq for NativeExecutionSupervisor {
@@ -67,9 +69,28 @@ impl Default for NativeExecutionSupervisor {
 
 impl NativeExecutionSupervisor {
     pub fn new(max_concurrent_sessions_per_model: NonZeroUsize) -> Self {
+        let execution_services = Arc::new(
+            NativeExecutionServices::for_local_process()
+                .expect("builtin native execution services must construct"),
+        );
+        Self::with_execution_services(max_concurrent_sessions_per_model, execution_services)
+    }
+
+    /// Constructs a supervisor around the process-owned native execution
+    /// service root. Process hosts should use this constructor so offline,
+    /// streaming, warm-up, eviction, and idle-unload paths share one scope.
+    pub fn with_execution_services(
+        max_concurrent_sessions_per_model: NonZeroUsize,
+        execution_services: Arc<NativeExecutionServices>,
+    ) -> Self {
         Self {
             admission: ModelSessionAdmission::new(max_concurrent_sessions_per_model),
+            execution_services,
         }
+    }
+
+    pub fn execution_services(&self) -> &Arc<NativeExecutionServices> {
+        &self.execution_services
     }
 
     pub(crate) fn try_acquire(

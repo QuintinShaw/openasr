@@ -11,12 +11,13 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::GgufTensorDataReadError;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReadError, GgufTensorDataReader};
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
-    QwenFamilyLlmLayerTensorNames, load_llm_logits_head_from_reader_with_tensor_names,
-    load_qwen_family_llm_layer_attention_projection_generic,
+    QwenFamilyLlmLayerTensorNames, QwenWholeDecoderPlan,
+    load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 
@@ -27,6 +28,81 @@ use super::tensor_names::{
     LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT,
     funasr_nano_llm_layer_tensor_names,
 };
+
+/// Exact Rust/system-memory quote for one resident FunASR-Nano decoder actor.
+/// Native ggml arenas account their own backend-domain allocations; this quote
+/// covers only graph-handle containers and any materialized host logits or
+/// token-embedding matrices. Construction-phase liveness follows `new`: the
+/// temporary decoder plan survives until the whole-decoder graph is built.
+pub(crate) fn quoted_funasr_nano_decoder_system_memory_bytes(
+    reader: &GgufTensorDataReader,
+    metadata: &FunasrNanoDecoderMetadata,
+    backend: GgmlCpuGraphBackend,
+) -> Result<(u64, u64), String> {
+    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
+        metadata.n_layers,
+    )?;
+    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
+        metadata.n_layers,
+        |layer_index| {
+            let names = funasr_nano_llm_layer_tensor_names(layer_index);
+            QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_output_weight,
+                q_norm_name: Some(names.attn_q_norm_weight),
+                k_norm_name: Some(names.attn_k_norm_weight),
+                q_bias_name: None,
+                k_bias_name: None,
+                v_bias_name: None,
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            }
+        },
+    )?;
+    let (logits_peak, logits_retained) =
+        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
+            reader,
+            LLM_OUTPUT_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+            backend,
+        )?;
+    let (embedding_peak, embedding_retained) =
+        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
+            reader,
+            LLM_TOKEN_EMBD_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+        )?;
+
+    let retained_bytes = graph_retained
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .ok_or_else(|| "funasr-nano decoder retained quote overflowed".to_string())?;
+    let logits_phase_peak = plan_transient
+        .checked_add(logits_peak)
+        .ok_or_else(|| "funasr-nano logits construction peak quote overflowed".to_string())?;
+    let embedding_phase_peak = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_peak))
+        .ok_or_else(|| "funasr-nano embedding construction peak quote overflowed".to_string())?;
+    let graph_phase_peak = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .and_then(|bytes| bytes.checked_add(graph_retained))
+        .ok_or_else(|| "funasr-nano graph construction peak quote overflowed".to_string())?;
+    Ok((
+        logits_phase_peak
+            .max(embedding_phase_peak)
+            .max(graph_phase_peak),
+        retained_bytes,
+    ))
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum FunasrNanoDecoderError {
@@ -44,15 +120,19 @@ pub(crate) enum FunasrNanoDecoderError {
     EmptyPrefillOutput,
 }
 
-fn load_layer_projections(
+fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FunasrNanoDecoderMetadata,
-) -> Result<Vec<Qwen3AsrLlmLayerAttentionProjection>, FunasrNanoDecoderError> {
-    let mut projections = Vec::with_capacity(metadata.n_layers);
-    for layer_index in 0..metadata.n_layers {
-        let names = funasr_nano_llm_layer_tensor_names(layer_index);
-        let generic = load_qwen_family_llm_layer_attention_projection_generic(
-            reader,
+) -> Result<QwenWholeDecoderPlan, FunasrNanoDecoderError> {
+    QwenWholeDecoderPlan::for_qwen_family(
+        reader,
+        metadata.n_layers,
+        metadata.d_model,
+        metadata.n_heads,
+        metadata.n_kv_heads,
+        metadata.head_dim,
+        |layer_index| {
+            let names = funasr_nano_llm_layer_tensor_names(layer_index);
             QwenFamilyLlmLayerTensorNames {
                 attn_norm_name: names.attn_norm_weight,
                 attn_q_name: names.attn_q_weight,
@@ -70,24 +150,18 @@ fn load_layer_projections(
                 ffn_gate_name: names.ffn_gate_weight,
                 ffn_up_name: names.ffn_up_weight,
                 ffn_down_name: names.ffn_down_weight,
-            },
-            metadata.d_model,
-            metadata.n_heads,
-            metadata.n_kv_heads,
-            metadata.head_dim,
-            false,
-        )
-        .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        })?;
-        projections.push(Qwen3AsrLlmLayerAttentionProjection::Generic(generic));
-    }
-    Ok(projections)
+            }
+        },
+    )
+    .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
+        reason: error.to_string(),
+    })
 }
 
 pub(crate) struct FunasrNanoDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
+    logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
     token_embedding: Qwen3AsrTokenEmbeddingTable,
     metadata: FunasrNanoDecoderMetadata,
 }
@@ -105,7 +179,7 @@ impl FunasrNanoDecoderRuntime {
     ) -> Result<Self, FunasrNanoDecoderError> {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(map_tensor_read_error)?;
-        let projections = load_layer_projections(&reader, &metadata)?;
+        let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
             runtime_source,
@@ -131,9 +205,9 @@ impl FunasrNanoDecoderRuntime {
             reason: error.to_string(),
         })?;
         let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_source),
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+                &decoder_plan,
+                runtime_source,
                 FUNASR_NANO_RMS_NORM_EPSILON,
                 logits_head.fused_top1_spec(),
                 backend,
@@ -141,38 +215,63 @@ impl FunasrNanoDecoderRuntime {
             .map_err(|error| FunasrNanoDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
+        let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
+            FunasrNanoDecoderError::LogitsHeadFailed {
+                reason: error.to_string(),
+            }
+        })?;
         Ok(Self {
             whole_decoder,
             logits_head,
+            logits_runtime,
             token_embedding,
             metadata,
         })
+    }
+
+    /// Exact post-build Rust container capacity retained by this actor.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.whole_decoder.retained_system_memory_bytes()?,
+            "funasr-nano decoder graph handles",
+        )?;
+        bytes.add(
+            self.logits_head.retained_system_memory_bytes()?,
+            "funasr-nano logits head",
+        )?;
+        bytes.add(
+            self.token_embedding.retained_system_memory_bytes()?,
+            "funasr-nano token embedding",
+        )?;
+        Ok(bytes.finish())
     }
 
     pub(crate) fn release_session_scoped_buffers(&mut self) {
         self.whole_decoder.release_session_scoped_buffers();
     }
 
-    /// `capacity` is the request-sized bound (prompt tokens + generation
-    /// budget), NOT the checkpoint's native `max_positions` -- it becomes the
-    /// persistent Metal/GPU reuse graph's fixed KV/mask/RoPE span, a per-token
-    /// compute and device-resident-allocation cost. Mirrors
-    /// `moss_transcribe_diarize`/`firered_llm`/`mimo_asr`'s request-sized sizing.
-    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+    /// Allocate only the exact logical host history. The stable resident span
+    /// is carried separately to the reusable GPU graph.
+    pub(crate) fn new_kv_caches(
+        &self,
+        capacity: Qwen3AsrKvCacheCapacity,
+    ) -> Result<Qwen3AsrHostKvCacheOwner, String> {
         let host = self.whole_decoder.kv_cache_spec().host;
-        (0..self.metadata.n_layers)
-            .map(|_| {
-                Qwen3AsrLayerKvCacheState::new_with_element_type(
-                    capacity,
-                    self.metadata.n_kv_heads,
-                    self.metadata.head_dim,
-                    host,
-                )
-                .unwrap_or_else(|reason| {
-                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                })
-            })
-            .collect()
+        let mode = if self.whole_decoder.supports_graph_reuse() {
+            Qwen3AsrHostKvMode::ResidentOnly
+        } else {
+            Qwen3AsrHostKvMode::Materialized
+        };
+        Qwen3AsrHostKvCacheOwner::try_new(
+            "funasr-nano.decoder.self-kv.host",
+            self.metadata.n_layers,
+            capacity,
+            self.metadata.n_kv_heads,
+            self.metadata.head_dim,
+            host,
+            mode,
+        )
     }
 
     pub(crate) fn gather_token_embedding(
@@ -190,6 +289,7 @@ impl FunasrNanoDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<FunasrNanoPrefillOutput, FunasrNanoDecoderError> {
         let token_count = prompt_embeddings.token_count;
@@ -199,6 +299,7 @@ impl FunasrNanoDecoderRuntime {
                 &prompt_embeddings.token_major_values,
                 token_count,
                 layer_kv_caches,
+                capacity,
                 FUNASR_NANO_ROPE_THETA,
                 control,
             )
@@ -219,8 +320,8 @@ impl FunasrNanoDecoderRuntime {
                 });
             }
             let logits = self
-                .logits_head
-                .compute_logits_for_last_hidden(&final_hidden)
+                .logits_runtime
+                .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
                 .map_err(|error| FunasrNanoDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
                 })?;
@@ -241,8 +342,8 @@ impl FunasrNanoDecoderRuntime {
             })?;
         let final_hidden = self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?;
         let logits = self
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden)
+            .logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
             .map_err(|error| FunasrNanoDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })?;
@@ -257,6 +358,7 @@ impl FunasrNanoDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Vec<f32>, FunasrNanoDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
         let step = self
@@ -265,6 +367,7 @@ impl FunasrNanoDecoderRuntime {
                 &hidden,
                 cache_position,
                 layer_kv_caches,
+                capacity,
                 FUNASR_NANO_ROPE_THETA,
             )
             .map_err(|error| FunasrNanoDecoderError::GraphFailed {
@@ -277,8 +380,8 @@ impl FunasrNanoDecoderRuntime {
             self.metadata.n_kv_heads * self.metadata.head_dim,
             layer_kv_caches,
         )?;
-        self.logits_head
-            .compute_logits_for_last_hidden(&step.hidden)
+        self.logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &step.hidden)
             .map_err(|error| FunasrNanoDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
@@ -294,16 +397,16 @@ impl FunasrNanoDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Option<u32>, FunasrNanoDecoderError> {
         if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
             return Ok(None);
         }
-        let max_positions = layer_kv_caches
-            .first()
-            .map(Qwen3AsrLayerKvCacheState::max_positions)
-            .ok_or_else(|| FunasrNanoDecoderError::KvCacheFailed {
+        if layer_kv_caches.is_empty() {
+            return Err(FunasrNanoDecoderError::KvCacheFailed {
                 reason: "funasr-nano decoder has no layer KV caches".to_string(),
-            })?;
+            });
+        }
         let hidden = self.gather_token_embedding(token_id)?;
         let step = self
             .whole_decoder
@@ -311,7 +414,7 @@ impl FunasrNanoDecoderRuntime {
                 &hidden,
                 &[cache_position],
                 FUNASR_NANO_ROPE_THETA,
-                max_positions,
+                capacity.resident_positions(),
             )
             .map_err(|error| FunasrNanoDecoderError::GraphFailed {
                 reason: error.to_string(),

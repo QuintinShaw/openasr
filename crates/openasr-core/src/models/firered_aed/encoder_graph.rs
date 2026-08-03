@@ -95,8 +95,8 @@ fn conv_out_dim(input: usize, kernel: usize, stride: usize) -> Result<usize, Fir
 }
 
 /// Owns the encoder's mmap'd weight context plus the ggml graph runner across
-/// calls, so a caller (see the thread-local cache in `executor.rs`) can reuse
-/// the same runtime for every transcription on this pack instead of
+/// calls, so the executor-owned runtime actor pool can reuse the same runtime
+/// across transcriptions on this pack instead of
 /// re-loading the GGUF weight context from scratch each time -- the encoder
 /// forward itself stays a fresh single-shot graph per call (no incremental
 /// reuse across time steps, matching cohere's/parakeet's shape).
@@ -108,6 +108,28 @@ pub(crate) struct FireRedEncoderGraphRuntime {
 }
 
 impl FireRedEncoderGraphRuntime {
+    /// Exact engine-requested Rust capacity retained by one prepared encoder
+    /// runtime. Native ggml contexts, weight buffers, and graph workspaces are
+    /// admitted by the backend allocation layer and are deliberately not
+    /// charged a second time here.
+    pub(crate) fn system_memory_quote(
+        metadata: FireRedAedExecutionMetadata,
+        pack_content_id: &str,
+    ) -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, String> {
+        let retained =
+            FireRedEncoderWeights::quoted_retained_system_memory_bytes(metadata.encoder_n_layers)?;
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+            format!("firered-aed-encoder-runtime:{pack_content_id}"),
+            retained,
+            retained,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        self.weights.retained_system_memory_bytes()
+    }
+
     pub(crate) fn new(
         runtime_source: &GgmlRuntimeSource,
         metadata: FireRedAedExecutionMetadata,

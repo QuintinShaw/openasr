@@ -182,6 +182,9 @@ where
     // Clone the shared request fields once; each driver closure rebuilds the
     // per-decode request from them plus the (windowed) prepared audio.
     let runtime_source_path = request.runtime_source_path.clone();
+    let execution_services = std::sync::Arc::clone(&request.execution_services);
+    let decode_execution_services = std::sync::Arc::clone(&request.execution_services);
+    let resident_decoder_state = request.decoder_state.clone();
     let runtime_source_preflight = request.runtime_source_preflight.clone();
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
@@ -192,7 +195,11 @@ where
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
     let make_request = move |audio: &GgmlAsrPreparedAudioView<'static>,
-                             partial_prompt: Option<&str>| {
+                             partial_prompt: Option<&str>|
+          -> Result<
+        GgmlAsrExecutionViewRequest<'static>,
+        GgmlAsrExecutionError,
+    > {
         let mut request_options = request_options.clone();
         if let Some(prompt) =
             merge_partial_prompt(request_options.prompt.as_deref(), partial_prompt)
@@ -200,7 +207,42 @@ where
             request_options.prompt = Some(prompt);
             request_options.prompt_token_ids = None;
         }
-        GgmlAsrExecutionViewRequest {
+        let decoder_state = match resident_decoder_state.invocation_envelope() {
+            None => resident_decoder_state.clone(),
+            Some(envelope) => {
+                let preflight = runtime_source_preflight.as_ref().ok_or_else(|| {
+                    GgmlAsrExecutionError::executor_failed(
+                        executor_id,
+                        adapter_id,
+                        "planned streaming decoder state is missing its runtime preflight",
+                    )
+                })?;
+                let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_decode_view(
+                    preflight,
+                    audio,
+                    envelope,
+                    &request_options,
+                    resolved_runtime.backend(),
+                )
+                .map_err(|error| {
+                    GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error.to_string())
+                })?;
+                execution_services
+                    .streaming_dispatch()
+                    .replan_streaming_decoder_state(&selected_family, &planning_input)?
+                    .with_resident_demands_from(&resident_decoder_state)
+                    .map_err(|error| {
+                        GgmlAsrExecutionError::executor_failed(
+                            executor_id,
+                            adapter_id,
+                            error.to_string(),
+                        )
+                    })?
+            }
+        };
+        Ok(GgmlAsrExecutionViewRequest {
+            execution_services: std::sync::Arc::clone(&execution_services),
+            decoder_state,
             runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
@@ -217,11 +259,15 @@ where
                  execution-context field of its own yet, and a live session ends by \
                  the caller dropping it rather than canceling a transcription id",
             )),
-        }
+        })
     };
 
     let transcribe = Box::new(
         move |audio: &GgmlAsrPreparedAudioView<'static>, partial_prompt: Option<&str>| {
+            let _execution_scope =
+                crate::models::native_execution_services::install_native_execution_services(
+                    decode_execution_services.as_ref(),
+                );
             let _thread_override = install_request_inference_threads_override(inference_threads);
             // Mirror GgmlAsrExecutionDispatch::execute's override install (the
             // offline/batch entry point): the streaming path calls the
@@ -233,7 +279,7 @@ where
             // carried on `make_request`'s `resolved_runtime` field above).
             let _backend_override =
                 install_request_backend_override(backend_preference.request_backend_override());
-            decode(&executor, &make_request(audio, partial_prompt))
+            decode(&executor, &make_request(audio, partial_prompt)?)
                 .map(|result| result.transcription)
         },
     );
@@ -1651,6 +1697,10 @@ mod tests {
                 ),
             );
             GgmlAsrStreamingSessionRequest {
+                execution_services:
+                    crate::models::native_execution_services::test_native_execution_services(),
+                decoder_state:
+                    crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
                 runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
                 runtime_source_preflight: None,
                 selected_family: crate::qwen3_asr_runtime_descriptor_v1(),
@@ -1658,6 +1708,7 @@ mod tests {
                 configured_diarize: false,
                 backend_preference,
                 resolved_runtime,
+                final_text_processor: None,
                 session_context: crate::NativeAsrSessionContext::new("rt_backend_override_test"),
                 session_config: crate::NativeAsrStreamingSessionConfig::new()
                     .with_partial_results(true)

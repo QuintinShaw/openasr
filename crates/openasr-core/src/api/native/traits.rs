@@ -2,6 +2,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::{
     Transcription,
+    models::native_execution_services::NativeExecutionServices,
     realtime::{RealtimeAudioFrame, RealtimeEventEnvelope},
 };
 
@@ -21,6 +22,7 @@ pub trait NativeAsrModelAdapter {
     fn supports_model_pack(&self, model_pack: &NativeAsrModelPackRef) -> bool;
     fn start_streaming_session(
         &self,
+        execution_services: Arc<NativeExecutionServices>,
         model_pack: &NativeAsrModelPackRef,
         target: NativeAsrHardwareTarget,
         context: NativeAsrSessionContext,
@@ -28,7 +30,7 @@ pub trait NativeAsrModelAdapter {
         session_config: NativeAsrStreamingSessionConfig,
     ) -> Result<Box<dyn NativeAsrSession>, NativeAsrError> {
         session_config.validate()?;
-        let _ = (model_pack, target, context, options);
+        let _ = (execution_services, model_pack, target, context, options);
         Err(NativeAsrError::BackendDoesNotSupportTrueStreaming {
             backend: self.adapter_id().to_string(),
         })

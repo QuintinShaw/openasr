@@ -1,6 +1,7 @@
 //! moss-transcribe-diarize execution metadata parsed from the `.oasr` GGUF
 //! header. Key names match exactly what `package_import` writes.
 
+use crate::capacity::decode_schedule::greedy_self_kv_positions;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_u64_scalar, u64_to_u32, u64_to_usize,
     validate_positive_usize,
@@ -38,7 +39,7 @@ pub(crate) const MOSS_TD_RMS_NORM_EPSILON: f32 = 1e-6;
 /// RMSNorm epsilon, verified against the real checkpoint's `config.json`.
 pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 
-/// KV-cache preallocation cap for this family's Qwen3 decoder.
+/// Final position safety ceiling for this family's Qwen3 decoder.
 ///
 /// The checkpoint's `text_config.max_position_embeddings` is 131072 -- the
 /// decoder's *RoPE context limit*, NOT a sane KV-cache capacity. But a decode
@@ -64,25 +65,14 @@ pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 /// reasoning must take the worst-case DEFAULT figure -- `crate::capacity`
 /// pins both policies' numbers.
 ///
-/// This is a ceiling on top of the request-sized capacity
-/// `llm_decoder::new_kv_caches` computes (prompt + generation-budget tokens
-/// for the utterance actually being decoded, mirroring
-/// `firered_llm`/`mimo_asr`'s identical sizing) -- NOT the value that capacity
-/// is unconditionally forced to. Sizing every request to this cap
-/// unconditionally previously made the fixed Metal/GPU reuse-graph KV/mask/
-/// RoPE span 8192-wide regardless of real utterance length and made a
-/// several-minute clip's 28-layer x 8192-wide single-shot device allocation
-/// exhaust Metal's working set outright (OOM) even though the utterance's real
-/// demand was far below the cap. The executor validates the complete
-/// prompt-plus-generation request against this ceiling before constructing a
-/// decoder cache, so an over-limit request fails closed instead of allocating a
-/// cache that cannot serve its configured decode budget. At the cap, the
-/// worst-case DEFAULT total is 8192 x 336 KiB = 2.625 GiB, which fits this
-/// repo's 8 GiB min-spec memory budget under every policy -- the fit is a
-/// pinned regression anchor in `crate::models::moss_transcribe_diarize::capacity`,
-/// and the cap itself stays a DECLARED constant on purpose: deriving it at
-/// runtime from a min-spec rationale would take worst-case bytes/position and
-/// could silently tighten the shipped number.
+/// This limit is only a final validation guard above the unified topology
+/// planner's request and session-envelope spans. It is never substituted as a
+/// resident allocation size and it is not a VRAM-admission guarantee. Even a
+/// legal KV span can be infeasible beside a particular weight layout,
+/// allocator block geometry, encoder workspace, driver reserve, or external
+/// process; those physical facts are quoted by the selected backend and
+/// admitted transactionally by the device-memory broker. A rejected candidate
+/// is handed back to execution policy without changing the semantic window.
 ///
 /// Lesson, recorded so it does not recur: `max_position_embeddings` is an
 /// attention/positional-encoding ceiling, not a working-set size; the two must
@@ -90,10 +80,9 @@ pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 /// always computed for BOTH copies (host + resident), never one.
 pub(crate) const MOSS_TD_MAX_KV_CACHE_POSITIONS: usize = 8192;
 
-/// Clamp a KV-cache capacity (request-sized, or the raw RoPE context limit for
-/// the pack importer's own bookkeeping) to the family-wide preallocation cap.
-/// Both the runtime decoder and the pack importer route their respective bounds
-/// through this, so neither ever allocates past the cap.
+/// Intersect the pack's mathematical position ceiling with the family's final
+/// safety ceiling. The result validates a topology demand; it does not request
+/// an allocation of that size.
 pub(crate) fn moss_td_kv_cache_positions(max_positions: usize) -> usize {
     max_positions.min(MOSS_TD_MAX_KV_CACHE_POSITIONS)
 }
@@ -108,9 +97,15 @@ pub(crate) fn moss_td_request_kv_cache_positions(
     prompt_tokens: usize,
     max_generated_tokens: usize,
 ) -> Option<usize> {
-    let request_positions = prompt_tokens.checked_add(max_generated_tokens)?;
-    (request_positions <= moss_td_kv_cache_positions(pack_max_positions))
-        .then_some(request_positions)
+    // Context legality is a semantic token bound: every returned token counts
+    // even though the final sampled token is never fed back into the decoder.
+    // Keep that proof separate from the physical greedy-cache write count.
+    let semantic_positions = prompt_tokens.checked_add(max_generated_tokens)?;
+    if semantic_positions > moss_td_kv_cache_positions(pack_max_positions) {
+        return None;
+    }
+    let request_positions = greedy_self_kv_positions(prompt_tokens, max_generated_tokens).ok()?;
+    Some(request_positions)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,9 +339,9 @@ mod tests {
     #[test]
     fn kv_cache_positions_caps_the_rope_context_limit() {
         // A pack with the raw RoPE ceiling (131072) baked in clamps down to the
-        // pragmatic cap: worst case (the DEFAULT policy's two copies) the KV
-        // cache preallocates 8192 x 336 KiB = 2.625 GiB, not the raw ceiling's
-        // ~42 GiB (28 GiB host + 14 GiB resident).
+        // final safety ceiling. The topology planner still requests only its
+        // proven invocation/session span; neither 8192 nor 131072 is an arena
+        // allocation request.
         assert_eq!(
             moss_td_kv_cache_positions(131_072),
             MOSS_TD_MAX_KV_CACHE_POSITIONS
@@ -362,12 +357,12 @@ mod tests {
         // allocates the prompt plus its configured generation budget.
         assert_eq!(
             moss_td_request_kv_cache_positions(131_072, 300, 4_096),
-            Some(4_396)
+            Some(4_395)
         );
         // A freshly imported pack advertises the same 8192-position ceiling.
         assert_eq!(
             moss_td_request_kv_cache_positions(8_192, 4_096, 4_096),
-            Some(8_192)
+            Some(8_191)
         );
         // Never let an imported lower ceiling be silently expanded.
         assert_eq!(moss_td_request_kv_cache_positions(4_096, 1, 4_096), None);

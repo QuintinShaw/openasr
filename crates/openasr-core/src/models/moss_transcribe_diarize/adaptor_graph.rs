@@ -47,6 +47,40 @@ pub(crate) struct MossAdaptorWeights {
     norm_epsilon: f32,
 }
 
+impl MossAdaptorWeights {
+    pub(crate) fn add_system_memory_quote(
+        quote: &mut crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder,
+        tensor_index: &crate::GgufTensorIndex,
+    ) -> Result<(), crate::models::system_memory_owner::SystemMemoryOwnerError> {
+        for name in [
+            ADAPTOR_LINEAR1_WEIGHT,
+            ADAPTOR_LINEAR1_BIAS,
+            ADAPTOR_LINEAR2_WEIGHT,
+            ADAPTOR_LINEAR2_BIAS,
+            ADAPTOR_NORM_WEIGHT,
+            ADAPTOR_NORM_BIAS,
+        ] {
+            quote.add_tensor_f32(tensor_index, name)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for (values, label) in [
+            (&self.linear1_weight, "moss adaptor linear1 weight"),
+            (&self.linear1_bias, "moss adaptor linear1 bias"),
+            (&self.linear2_weight, "moss adaptor linear2 weight"),
+            (&self.linear2_bias, "moss adaptor linear2 bias"),
+            (&self.norm_weight, "moss adaptor norm weight"),
+            (&self.norm_bias, "moss adaptor norm bias"),
+        ] {
+            bytes.add_vec(values, label)?;
+        }
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) fn load_moss_adaptor_weights_from_reader(
     reader: &GgufTensorDataReader,
     encoder_d_model: usize,

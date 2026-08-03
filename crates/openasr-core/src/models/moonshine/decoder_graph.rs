@@ -1,4 +1,4 @@
-use std::{cell::RefCell, sync::Arc};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -16,16 +16,13 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
+use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
     Seq2SeqGreedyDecodeStopReason, Seq2SeqGreedyTokenDecoder,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
-};
 use crate::nn::decoder::{
     LlmResidentKvArena, Seq2SeqReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
     build_fixed_kv_attention_mask_bits, build_fixed_kv_attention_mask_bits_for_sequences,
@@ -36,9 +33,7 @@ use crate::{Segment, Transcription};
 
 use super::encoder_graph::MoonshineEncoderOutput;
 use super::graph_config::moonshine_decoder_graph_config;
-use super::lora::{
-    LoraSlot, MoonshineLoraAdapter, moonshine_adapter_cache_fingerprint, new_lora_slot_tensors,
-};
+use super::lora::{LoraSlot, MoonshineLoraAdapter, new_lora_slot_tensors};
 use super::runtime_contract::MoonshineExecutionMetadata;
 use super::tokenizer::MoonshineTokenizer;
 use super::weights::{MoonshineDecoderLayerWeights, MoonshineDecoderWeights, MoonshineWeight};
@@ -52,19 +47,6 @@ const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// independent of this context's size). Mirrors the encoder's proven
 /// `16_384` headroom (`moonshine_encoder_graph_config`).
 const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
-
-/// (pack content id, backend, cross frame count, adapter fingerprint). The
-/// content id ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
-/// replacement at the same path from reusing a runtime built from the old
-/// bytes. The adapter fingerprint MUST stay in this key: the runtime owns
-/// prepared cgraphs with the adapter tensors baked in, so reuse keyed only on
-/// the base pack would serve stale adapter graphs (correctness bug).
-type MoonshineDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend, usize, String);
-
-thread_local! {
-    static MOONSHINE_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderGraphRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MoonshineDecodeOutput {
@@ -92,100 +74,7 @@ pub(crate) enum MoonshineDecoderGraphError {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_moonshine_decoder_short_form(
-    decoder_weights: &MoonshineDecoderWeights,
-    tokenizer: &MoonshineTokenizer,
-    metadata: MoonshineExecutionMetadata,
-    encoder_output: &MoonshineEncoderOutput,
-    phrase_bias: Option<&PhraseBiasConfig>,
-    backend: GgmlCpuGraphBackend,
-    prefer_cpu_backend: bool,
-    runtime_source: Option<&GgmlRuntimeSource>,
-    word_timestamps: bool,
-    audio_duration_seconds: f32,
-    adapter: Option<&MoonshineLoraAdapter>,
-    control: &Arc<crate::api::backend::TranscriptionControl>,
-) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
-    if let Some(runtime_source) = runtime_source {
-        let key = moonshine_decoder_runtime_cache_key(
-            runtime_source,
-            encoder_output.frame_count,
-            backend,
-            prefer_cpu_backend,
-            adapter,
-        );
-        return with_thread_local_cached_mut_by_key(
-            &MOONSHINE_DECODER_RUNTIME_BY_KEY,
-            key,
-            DEFAULT_RUNTIME_CACHE_CAPACITY,
-            || {
-                MoonshineDecoderGraphRuntime::new(
-                    MoonshineDecoderRuntimeInput {
-                        decoder_weights,
-                        metadata,
-                        cross_frame_count: encoder_output.frame_count,
-                        backend,
-                    },
-                    prefer_cpu_backend,
-                    Some(runtime_source),
-                    adapter,
-                )
-            },
-            |runtime| {
-                run_moonshine_decoder_short_form_with_runtime(
-                    runtime,
-                    tokenizer,
-                    metadata,
-                    encoder_output,
-                    phrase_bias,
-                    word_timestamps,
-                    audio_duration_seconds,
-                    control,
-                )
-            },
-        );
-    }
-
-    let mut runtime = MoonshineDecoderGraphRuntime::new(
-        MoonshineDecoderRuntimeInput {
-            decoder_weights,
-            metadata,
-            cross_frame_count: encoder_output.frame_count,
-            backend,
-        },
-        prefer_cpu_backend,
-        runtime_source,
-        adapter,
-    )?;
-    run_moonshine_decoder_short_form_with_runtime(
-        &mut runtime,
-        tokenizer,
-        metadata,
-        encoder_output,
-        phrase_bias,
-        word_timestamps,
-        audio_duration_seconds,
-        control,
-    )
-}
-
-fn moonshine_decoder_runtime_cache_key(
-    runtime_source: &GgmlRuntimeSource,
-    cross_frame_count: usize,
-    backend: GgmlCpuGraphBackend,
-    prefer_cpu_backend: bool,
-    adapter: Option<&MoonshineLoraAdapter>,
-) -> MoonshineDecoderRuntimeCacheKey {
-    (
-        PackContentKey::for_runtime_source(runtime_source),
-        moonshine_decoder_graph_config(backend, prefer_cpu_backend).backend,
-        cross_frame_count,
-        moonshine_adapter_cache_fingerprint(adapter),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_moonshine_decoder_short_form_with_runtime(
+pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
     runtime: &mut MoonshineDecoderGraphRuntime,
     tokenizer: &MoonshineTokenizer,
     metadata: MoonshineExecutionMetadata,
@@ -204,6 +93,35 @@ fn run_moonshine_decoder_short_form_with_runtime(
         .decoder_max_context
         .saturating_sub(prompt_tokens.len())
         .max(1);
+    let required_self_positions =
+        crate::capacity::topology::causal_prefix_positions_with_context_cap(
+            super::capacity::SELF_KV_STATE_ID,
+            prompt_tokens.len(),
+            max_generated_tokens,
+            metadata.decoder_max_context,
+        )
+        .map_err(|error| MoonshineDecoderGraphError::InvalidInput {
+            reason: format!("moonshine decode schedule is invalid: {error}"),
+        })?;
+    if required_self_positions
+        != step_executor
+            .runtime
+            .decoder_state
+            .self_attention
+            .logical_positions
+    {
+        return Err(MoonshineDecoderGraphError::InvalidInput {
+            reason: format!(
+                "moonshine planned self-KV span {} does not match greedy schedule requirement {}",
+                step_executor
+                    .runtime
+                    .decoder_state
+                    .self_attention
+                    .logical_positions,
+                required_self_positions
+            ),
+        });
+    }
     // moonshine routes through the shared decode-policy registry (same path as
     // whisper/cohere/qwen) instead of hand-building a config: the descriptor
     // declares no suppression, no extra stop tokens and Identity postprocess, so
@@ -422,6 +340,7 @@ fn new_lora_slot<'adapter>(
 struct MoonshineCrossLayerRuntime {
     key: GgmlStaticTensor,
     value: GgmlStaticTensor,
+    capacity_frames: usize,
 }
 
 pub(crate) struct MoonshineDecoderGraphRuntime {
@@ -446,19 +365,20 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     out_norm: GgmlStaticTensor,
     layers: Vec<MoonshineDecoderLayerRuntime>,
     cross_layers: Vec<MoonshineCrossLayerRuntime>,
+    decoder_state: Seq2SeqDecoderState,
     cross_frame_count: usize,
     n_seq: usize,
 }
 
 /// The resolved-input identity a decoder runtime is built from: the weights
-/// and metadata it decodes, the encoder frame count its cross-KV cache is
-/// sized against, and the backend this request resolved to. Grouped because
+/// and metadata it decodes, the planned logical/resident decoder state, and
+/// the backend this request resolved to. Grouped because
 /// they always travel together into [`MoonshineDecoderGraphRuntime::new`]
 /// from a single call site.
 pub(crate) struct MoonshineDecoderRuntimeInput<'a> {
     pub(crate) decoder_weights: &'a MoonshineDecoderWeights,
     pub(crate) metadata: MoonshineExecutionMetadata,
-    pub(crate) cross_frame_count: usize,
+    pub(crate) decoder_state: Seq2SeqDecoderState,
     pub(crate) backend: GgmlCpuGraphBackend,
 }
 
@@ -516,7 +436,7 @@ impl MoonshineDecoderGraphRuntime {
                 self.persistent_graph_context_bytes,
                 self.layers.len(),
                 self.metadata.head_dim,
-                self.metadata.decoder_max_context,
+                self.decoder_state.self_attention.resident_positions,
                 self.metadata.n_heads,
                 self.n_seq,
                 "moonshine_decoder_resident_kv",
@@ -536,7 +456,7 @@ impl MoonshineDecoderGraphRuntime {
         Self::new_with_n_seq(
             input.decoder_weights,
             input.metadata,
-            input.cross_frame_count,
+            input.decoder_state,
             input.backend,
             prefer_cpu_backend,
             runtime_source,
@@ -549,13 +469,18 @@ impl MoonshineDecoderGraphRuntime {
     pub(crate) fn new_with_n_seq(
         decoder_weights: &MoonshineDecoderWeights,
         metadata: MoonshineExecutionMetadata,
-        cross_frame_count: usize,
+        decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         runtime_source: Option<&GgmlRuntimeSource>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
+        decoder_state
+            .validate()
+            .map_err(|error| MoonshineDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         if decoder_weights.layers.len() != metadata.decoder_layers {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: format!(
@@ -565,11 +490,15 @@ impl MoonshineDecoderGraphRuntime {
                 ),
             });
         }
-        if cross_frame_count == 0 {
-            return Err(MoonshineDecoderGraphError::InvalidInput {
-                reason: "encoder frame_count must be > 0".to_string(),
-            });
-        }
+        decoder_state
+            .self_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+                metadata.decoder_max_context,
+            )
+            .map_err(|error| MoonshineDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         if n_seq == 0 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "moonshine decoder n_seq must be positive".to_string(),
@@ -689,17 +618,18 @@ impl MoonshineDecoderGraphRuntime {
                 key: new_cross_cache(
                     &arena,
                     d_model,
-                    cross_frame_count,
+                    decoder_state.cross_attention.resident_positions,
                     n_seq,
                     "dec_cross_k_cache",
                 )?,
                 value: new_cross_cache(
                     &arena,
                     d_model,
-                    cross_frame_count,
+                    decoder_state.cross_attention.resident_positions,
                     n_seq,
                     "dec_cross_v_cache",
                 )?,
+                capacity_frames: decoder_state.cross_attention.resident_positions,
             });
         }
 
@@ -734,9 +664,55 @@ impl MoonshineDecoderGraphRuntime {
             out_norm,
             layers,
             cross_layers,
-            cross_frame_count,
+            decoder_state,
+            cross_frame_count: decoder_state.cross_attention.logical_positions,
             n_seq,
         })
+    }
+
+    pub(crate) fn activate_decoder_state(
+        &mut self,
+        decoder_state: Seq2SeqDecoderState,
+    ) -> Result<(), MoonshineDecoderGraphError> {
+        decoder_state
+            .validate()
+            .map_err(|error| MoonshineDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if decoder_state.self_attention.resident_positions
+            != self.decoder_state.self_attention.resident_positions
+            || decoder_state.cross_attention.resident_positions
+                != self.decoder_state.cross_attention.resident_positions
+        {
+            return Err(MoonshineDecoderGraphError::InvalidInput {
+                reason: format!(
+                    "moonshine cached decoder resident capacity mismatch: cached self/cross={}/{}, requested={}/{}",
+                    self.decoder_state.self_attention.resident_positions,
+                    self.decoder_state.cross_attention.resident_positions,
+                    decoder_state.self_attention.resident_positions,
+                    decoder_state.cross_attention.resident_positions,
+                ),
+            });
+        }
+        decoder_state
+            .self_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+                self.metadata.decoder_max_context,
+            )
+            .map_err(|error| MoonshineDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if decoder_state.self_attention.logical_positions
+            != self.decoder_state.self_attention.logical_positions
+            || decoder_state.cross_attention.logical_positions
+                != self.decoder_state.cross_attention.logical_positions
+        {
+            self.reuse = None;
+        }
+        self.decoder_state = decoder_state;
+        self.cross_frame_count = decoder_state.cross_attention.logical_positions;
+        Ok(())
     }
 
     /// Precompute per-layer cross-attention K/V from the encoder output (once per utterance).
@@ -760,6 +736,15 @@ impl MoonshineDecoderGraphRuntime {
                 ),
             });
         }
+        self.decoder_state
+            .cross_attention
+            .validate_exact_shape(
+                crate::capacity::topology::StateKind::CrossAttentionKv,
+                encoder_output.frame_count,
+            )
+            .map_err(|error| MoonshineDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         let d_model = self.metadata.d_model;
         let expected = encoder_output
             .frame_count
@@ -835,6 +820,7 @@ impl MoonshineDecoderGraphRuntime {
                 self.arena.graph_tensor(cross.key),
                 d_model,
                 frame_count,
+                cross.capacity_frames,
                 self.n_seq,
                 slot_index,
                 "moonshine_cross_k_slot",
@@ -844,6 +830,7 @@ impl MoonshineDecoderGraphRuntime {
                 self.arena.graph_tensor(cross.value),
                 d_model,
                 frame_count,
+                cross.capacity_frames,
                 self.n_seq,
                 slot_index,
                 "moonshine_cross_v_slot",
@@ -895,11 +882,12 @@ impl MoonshineDecoderGraphRuntime {
                 reason: "single moonshine decode step requires n_seq=1".to_string(),
             });
         }
-        if position >= self.metadata.decoder_max_context {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if position >= logical_max_positions {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: format!(
                     "decoder position {position} exceeds max context {}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
@@ -920,7 +908,7 @@ impl MoonshineDecoderGraphRuntime {
             .as_ref()
             .map(|reuse| {
                 reuse.is_poisoned()
-                    || reuse.max_positions != self.metadata.decoder_max_context
+                    || reuse.max_positions != logical_max_positions
                     || reuse.n_seq != 1
             })
             .unwrap_or(true);
@@ -986,24 +974,26 @@ impl MoonshineDecoderGraphRuntime {
                 ),
             });
         }
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
         if positions
             .iter()
-            .any(|&position| position >= self.metadata.decoder_max_context)
+            .any(|&position| position >= logical_max_positions)
         {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: format!(
                     "batched moonshine decoder position exceeds max context {}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
-        if total_tokens_by_sequence.iter().any(|&total_tokens| {
-            total_tokens == 0 || total_tokens > self.metadata.decoder_max_context
-        }) {
+        if total_tokens_by_sequence
+            .iter()
+            .any(|&total_tokens| total_tokens == 0 || total_tokens > logical_max_positions)
+        {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: format!(
                     "batched moonshine total token count must be in 1..={}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
@@ -1030,7 +1020,7 @@ impl MoonshineDecoderGraphRuntime {
             .as_ref()
             .map(|reuse| {
                 reuse.is_poisoned()
-                    || reuse.max_positions != self.metadata.decoder_max_context
+                    || reuse.max_positions != logical_max_positions
                     || reuse.n_seq != self.n_seq
             })
             .unwrap_or(true);
@@ -1098,11 +1088,12 @@ impl MoonshineDecoderGraphRuntime {
                 reason: "batched moonshine prefill token_count must be > 0".to_string(),
             });
         }
-        if token_count > self.metadata.decoder_max_context {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if token_count > logical_max_positions {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: format!(
                     "batched moonshine prefill token_count {token_count} exceeds max context {}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
@@ -1198,6 +1189,7 @@ impl MoonshineDecoderGraphRuntime {
                 self.metadata.decoder_ffn_dim,
                 self.metadata.rotary_dim,
                 self.metadata.decoder_max_context,
+                self.decoder_state.self_attention.resident_positions,
                 self.metadata.rope_theta,
                 self.n_seq,
             )?;
@@ -1249,7 +1241,8 @@ impl MoonshineDecoderGraphRuntime {
         let heads = self.metadata.n_heads;
         let head_dim = self.metadata.head_dim;
         let frame_count = self.cross_frame_count;
-        let max_context = self.metadata.decoder_max_context;
+        let max_context = self.decoder_state.self_attention.logical_positions;
+        let resident_max_context = self.decoder_state.self_attention.resident_positions;
         let n_seq = self.n_seq;
 
         self.ensure_resident_self_kv_arena()?;
@@ -1324,7 +1317,9 @@ impl MoonshineDecoderGraphRuntime {
                 head_dim,
                 self.metadata.decoder_ffn_dim,
                 self.metadata.rotary_dim,
+                max_context,
                 self.metadata.decoder_max_context,
+                resident_max_context,
                 self.metadata.rope_theta,
                 n_seq,
             )?;
@@ -1369,11 +1364,12 @@ impl MoonshineDecoderGraphRuntime {
                 reason: "decoder token_count must be > 0".to_string(),
             });
         }
-        if token_count > self.metadata.decoder_max_context {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if token_count > logical_max_positions {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: format!(
                     "decoder token_count {token_count} exceeds max context {}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
@@ -1512,7 +1508,9 @@ fn run_incremental_decoder_layer<'a>(
     head_dim: usize,
     ffn_dim: usize,
     rotary_dim: usize,
+    logical_max_context: usize,
     rope_max_context: usize,
+    resident_max_context: usize,
     rope_theta: f32,
     n_seq: usize,
 ) -> Result<GgmlCpuTensor<'a>, MoonshineDecoderGraphError> {
@@ -1582,6 +1580,26 @@ fn run_incremental_decoder_layer<'a>(
     let v = graph
         .set_rows(self_v_cache, v, row_index)
         .map_err(build_err("ggml_set_rows(dec_self_v_cache)"))?;
+    let k = view_self_kv_prefix(
+        graph,
+        k,
+        head_dim,
+        logical_max_context,
+        heads,
+        resident_max_context,
+        n_seq,
+        "dec_self_k_view",
+    )?;
+    let v = view_self_kv_prefix(
+        graph,
+        v,
+        head_dim,
+        logical_max_context,
+        heads,
+        resident_max_context,
+        n_seq,
+        "dec_self_v_view",
+    )?;
 
     let context = scaled_dot_product_attention(
         graph,
@@ -1644,7 +1662,8 @@ fn run_prefill_decoder_layer<'a>(
     head_dim: usize,
     ffn_dim: usize,
     rotary_dim: usize,
-    max_context: usize,
+    rope_max_context: usize,
+    resident_max_context: usize,
     rope_theta: f32,
     n_seq: usize,
 ) -> Result<GgmlCpuTensor<'a>, MoonshineDecoderGraphError> {
@@ -1691,7 +1710,7 @@ fn run_prefill_decoder_layer<'a>(
         token_count,
         positions,
         rotary_dim,
-        max_context,
+        rope_max_context,
         rope_theta,
         n_seq,
         "prefill_dec_q_rope",
@@ -1704,7 +1723,7 @@ fn run_prefill_decoder_layer<'a>(
         token_count,
         positions,
         rotary_dim,
-        max_context,
+        rope_max_context,
         rope_theta,
         n_seq,
         "prefill_dec_k_rope",
@@ -1730,7 +1749,7 @@ fn run_prefill_decoder_layer<'a>(
         head_dim,
         token_count,
         heads,
-        max_context,
+        resident_max_context,
         n_seq,
         "prefill_dec_self_k_view",
     )?;
@@ -1740,7 +1759,7 @@ fn run_prefill_decoder_layer<'a>(
         head_dim,
         token_count,
         heads,
-        max_context,
+        resident_max_context,
         n_seq,
         "prefill_dec_self_v_view",
     )?;
@@ -1803,7 +1822,7 @@ fn run_decoder_layer<'a>(
     head_dim: usize,
     ffn_dim: usize,
     rotary_dim: usize,
-    max_context: usize,
+    rope_max_context: usize,
     rope_theta: f32,
 ) -> Result<GgmlCpuTensor<'a>, MoonshineDecoderGraphError> {
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -1849,7 +1868,7 @@ fn run_decoder_layer<'a>(
         token_count,
         positions,
         rotary_dim,
-        max_context,
+        rope_max_context,
         rope_theta,
         "dec_q_rope",
     )?;
@@ -1861,7 +1880,7 @@ fn run_decoder_layer<'a>(
         token_count,
         positions,
         rotary_dim,
-        max_context,
+        rope_max_context,
         rope_theta,
         "dec_k_rope",
     )?;
@@ -1964,6 +1983,7 @@ fn run_cross_attention_and_ffn<'a>(
         d_model,
         head_dim,
         frame_count,
+        cross.capacity_frames,
         heads,
         n_seq,
         "dec_cross_k_view",
@@ -1974,6 +1994,7 @@ fn run_cross_attention_and_ffn<'a>(
         d_model,
         head_dim,
         frame_count,
+        cross.capacity_frames,
         heads,
         n_seq,
         "dec_cross_v_view",
@@ -2340,10 +2361,18 @@ fn view_cross_kv<'a>(
     d_model: usize,
     head_dim: usize,
     frame_count: usize,
+    capacity_frames: usize,
     heads: usize,
     n_seq: usize,
     step: &'static str,
 ) -> Result<GgmlCpuTensor<'a>, MoonshineDecoderGraphError> {
+    if frame_count == 0 || frame_count > capacity_frames {
+        return Err(MoonshineDecoderGraphError::InvalidInput {
+            reason: format!(
+                "moonshine cross-KV logical frames must be in 1..={capacity_frames}, got {frame_count}"
+            ),
+        });
+    }
     let element_size = std::mem::size_of::<f32>();
     let nb1 = d_model
         .checked_mul(element_size)
@@ -2353,7 +2382,7 @@ fn view_cross_kv<'a>(
         .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
     if n_seq > 1 {
         let nb3 = d_model
-            .checked_mul(frame_count)
+            .checked_mul(capacity_frames)
             .and_then(|value| value.checked_mul(element_size))
             .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
         return graph
@@ -2384,7 +2413,7 @@ fn view_self_kv_prefix<'a>(
     head_dim: usize,
     token_count: usize,
     heads: usize,
-    max_context: usize,
+    storage_max_context: usize,
     n_seq: usize,
     step: &'static str,
 ) -> Result<GgmlCpuTensor<'a>, MoonshineDecoderGraphError> {
@@ -2393,10 +2422,10 @@ fn view_self_kv_prefix<'a>(
             reason: "moonshine self-KV prefix view n_seq must be positive".to_string(),
         });
     }
-    if token_count > max_context {
+    if token_count > storage_max_context {
         return Err(MoonshineDecoderGraphError::InvalidInput {
             reason: format!(
-                "moonshine self-KV prefix token_count {token_count} exceeds max context {max_context}"
+                "moonshine self-KV prefix token_count {token_count} exceeds resident context {storage_max_context}"
             ),
         });
     }
@@ -2407,12 +2436,12 @@ fn view_self_kv_prefix<'a>(
         .checked_mul(element_size)
         .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
     let nb2 = head_dim
-        .checked_mul(max_context)
+        .checked_mul(storage_max_context)
         .and_then(|value| value.checked_mul(element_size))
         .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
     if n_seq > 1 {
         let nb3 = head_dim
-            .checked_mul(max_context)
+            .checked_mul(storage_max_context)
             .and_then(|value| value.checked_mul(heads))
             .and_then(|value| value.checked_mul(element_size))
             .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
@@ -2440,24 +2469,37 @@ fn cross_cache_slot_target<'a>(
     cache: GgmlCpuTensor<'a>,
     d_model: usize,
     frame_count: usize,
+    capacity_frames: usize,
     n_seq: usize,
     slot_index: usize,
     step: &'static str,
 ) -> Result<GgmlCpuTensor<'a>, MoonshineDecoderGraphError> {
+    if frame_count == 0 || frame_count > capacity_frames {
+        return Err(MoonshineDecoderGraphError::InvalidInput {
+            reason: format!(
+                "moonshine cross-cache logical frames must be in 1..={capacity_frames}, got {frame_count}"
+            ),
+        });
+    }
     if slot_index >= n_seq {
         return Err(MoonshineDecoderGraphError::InvalidInput {
             reason: format!("moonshine cross-cache slot {slot_index} exceeds n_seq {n_seq}"),
         });
     }
     if n_seq == 1 {
-        return Ok(cache);
+        let row_stride = d_model
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
+        return graph
+            .view_2d(cache, d_model, frame_count, row_stride, 0)
+            .map_err(|source| MoonshineDecoderGraphError::GraphBuildFailed { step, source });
     }
     let element_size = std::mem::size_of::<f32>();
     let row_stride = d_model
         .checked_mul(element_size)
         .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
     let slot_stride = d_model
-        .checked_mul(frame_count)
+        .checked_mul(capacity_frames)
         .and_then(|value| value.checked_mul(element_size))
         .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
     let offset = slot_stride
@@ -2745,6 +2787,27 @@ mod tests {
         }
     }
 
+    fn decoder_state(
+        metadata: MoonshineExecutionMetadata,
+        logical_cross_positions: usize,
+    ) -> Seq2SeqDecoderState {
+        use crate::models::seq2seq_decoder_state::Seq2SeqStateAxis;
+
+        let self_positions = metadata.decoder_max_context - 1;
+        Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: self_positions,
+                resident_positions: self_positions,
+                hard_position_cap: self_positions,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: logical_cross_positions,
+                resident_positions: logical_cross_positions + 16,
+                hard_position_cap: logical_cross_positions + 16,
+            },
+        }
+    }
+
     fn assert_argmax_matches(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
         let argmax = |values: &[f32]| {
@@ -2801,7 +2864,7 @@ mod tests {
             MoonshineDecoderRuntimeInput {
                 decoder_weights: &prepared.decoder_weights,
                 metadata,
-                cross_frame_count: encoder_output_0.frame_count,
+                decoder_state: decoder_state(metadata, encoder_output_0.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
@@ -2820,7 +2883,7 @@ mod tests {
             MoonshineDecoderRuntimeInput {
                 decoder_weights: &prepared.decoder_weights,
                 metadata,
-                cross_frame_count: encoder_output_1.frame_count,
+                decoder_state: decoder_state(metadata, encoder_output_1.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
@@ -2838,7 +2901,7 @@ mod tests {
         let mut batched_runtime = MoonshineDecoderGraphRuntime::new_with_n_seq(
             &prepared.decoder_weights,
             metadata,
-            encoder_output_0.frame_count,
+            decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(&preflight.runtime_source),
@@ -2886,7 +2949,7 @@ mod tests {
             MoonshineDecoderRuntimeInput {
                 decoder_weights: &prepared.decoder_weights,
                 metadata,
-                cross_frame_count: encoder_output_0.frame_count,
+                decoder_state: decoder_state(metadata, encoder_output_0.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
@@ -2910,7 +2973,7 @@ mod tests {
             MoonshineDecoderRuntimeInput {
                 decoder_weights: &prepared.decoder_weights,
                 metadata,
-                cross_frame_count: encoder_output_1.frame_count,
+                decoder_state: decoder_state(metadata, encoder_output_1.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
@@ -2933,7 +2996,7 @@ mod tests {
         let mut batched_runtime = MoonshineDecoderGraphRuntime::new_with_n_seq(
             &prepared.decoder_weights,
             metadata,
-            encoder_output_0.frame_count,
+            decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(&preflight.runtime_source),

@@ -37,7 +37,7 @@ use crate::ggml_runtime::{
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
 };
-use crate::models::decode_token_history::context_window_budget;
+use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
@@ -46,14 +46,12 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::nn::decoder::{
     CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights,
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
-    reusable_decode_graph_supported_for_runner, seq2seq_layer,
+    reusable_decode_graph_supported, reusable_decode_graph_supported_for_runner, seq2seq_layer,
 };
 use crate::nn::ffn::FeedForwardActivation;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::decoder_weights::{FireRedDecoderWeights, FireRedDecoderWeightsError};
-use super::encoder_graph::predicted_encoder_time_frames;
-use super::frontend::{FRAME_LENGTH_SAMPLES, FRAME_SHIFT_SAMPLES, SAMPLE_RATE_HZ};
 use super::graph_config::firered_decoder_graph_config;
 use super::runtime_contract::FireRedAedExecutionMetadata;
 
@@ -100,58 +98,6 @@ fn firered_decoder_arena_context_bytes(decoder_n_layers: usize) -> usize {
     GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
 
-/// Extra headroom (beyond the architecture's declared safe chunk length)
-/// folded into the cross-KV capacity below, purely to reduce how often a
-/// chunk-boundary rounding in an upstream caller (VAD snapping, sample-count
-/// truncation) triggers [`FireRedDecoderGraphRuntime::grow_cross_capacity`] --
-/// never load-bearing for correctness: a chunk past this capacity still
-/// grows the cache to fit rather than silently truncating, overrunning the
-/// arena, or being rejected.
-const FIRERED_DECODER_CROSS_CAPACITY_MARGIN_SECONDS: f32 = 2.0;
-
-/// Predict the mel (pre-subsampling) fbank frame count for `duration_seconds`
-/// of 16 kHz audio under this family's `snip_edges=true` framing
-/// (`1 + (samples - FRAME_LENGTH_SAMPLES) / FRAME_SHIFT_SAMPLES`; see
-/// [`super::frontend`]).
-fn firered_mel_frames_for_seconds(duration_seconds: f32) -> usize {
-    let samples = (duration_seconds.max(0.0) * SAMPLE_RATE_HZ as f32) as usize;
-    let Some(usable) = samples.checked_sub(FRAME_LENGTH_SAMPLES) else {
-        return 1;
-    };
-    1 + usable / FRAME_SHIFT_SAMPLES
-}
-
-/// Cross-attention KV cache capacity, in post-subsampling encoder frames: the
-/// decoder's cross-KV cache is now allocated ONCE per pack at this size
-/// (issue #68's `GlobalQuadratic` chunk ceiling +
-/// [`FIRERED_DECODER_CROSS_CAPACITY_MARGIN_SECONDS`] margin) instead of
-/// exactly matching each utterance's actual encoder frame count. Every VAD /
-/// longform chunk for this architecture -- which the shared longform safety
-/// policy (`apply_encoder_attention_span_longform_safety_policy`) already caps
-/// at `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` -- then reuses the SAME decoder
-/// runtime (thread-local cache keyed only by pack path + backend, no more
-/// per-frame-count fan-out) instead of rebuilding the whole GGUF weight
-/// context and cross-KV arena per differing chunk length. Clamped to the
-/// pack's own PE-table ceiling (`encoder_max_frames`) so this never allocates
-/// past what any single call could legally present (the executor's
-/// `AudioWindowTooLong` preflight already rejects anything larger before it
-/// reaches the decoder). Reserve-once sizing follows the same convention as
-/// `references/transcribe.cpp@b6a6aca`'s `causal_lm.cpp` KV-cache init
-/// (`kv_init`: reserve at a known max, never reallocate per step) -- see
-/// `GgmlCpuStepBufferPool`'s doc in `ggml_runtime/cpu_graph.rs` for the
-/// sibling citation and `ACKNOWLEDGMENTS.md`.
-pub(crate) fn firered_decoder_cross_capacity_frames(
-    metadata: &FireRedAedExecutionMetadata,
-) -> usize {
-    let chunk_seconds = crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS
-        + FIRERED_DECODER_CROSS_CAPACITY_MARGIN_SECONDS;
-    let mel_frames = firered_mel_frames_for_seconds(chunk_seconds);
-    let predicted = predicted_encoder_time_frames(mel_frames)
-        .map(|frames| frames.max(1))
-        .unwrap_or(1);
-    predicted.min(metadata.encoder_max_frames().max(1))
-}
-
 #[derive(Clone, Copy)]
 struct FireRedDecoderCrossCacheLayer {
     key: GgmlStaticTensor,
@@ -164,20 +110,9 @@ struct FireRedDecoderSelfKvLayer {
     value: GgmlStaticTensor,
 }
 
-/// Owns the decoder's mmap'd weight context plus the persistent runtime state
-/// (cross-KV cache, incremental self-KV cache). The cross-KV cache arena
-/// starts, at construction, sized to this pack's
-/// [`firered_decoder_cross_capacity_frames`] capacity -- NOT to any one
-/// utterance's actual encoder frame count -- so the same runtime is reusable
-/// across every chunk a VAD/longform run presents (each capped at the shared
-/// longform safety ceiling by the caller), not just chunks that happen to
-/// share an exact frame count. A chunk past that capacity (a caller that
-/// legitimately bypasses longform, e.g. `segment_mode=off`) grows it in place
-/// ([`Self::grow_cross_capacity`]) rather than rejecting a request the pack's
-/// PE-table ceiling would otherwise support.
-/// [`Self::populate_cross_attention_cache`] views only the first
-/// `cross_frame_count` (actual, current-utterance) columns of the current
-/// capacity on every call.
+/// Owns the decoder's mmap'd weight context plus its persistent cross/self KV
+/// arena. Construction uses the planner's stable resident spans; each call
+/// activates a logical shape inside those spans and never reallocates them.
 pub(crate) struct FireRedDecoderGraphRuntime {
     // `reuse` holds raw pointers into `runner`, `arena`, and the weight
     // context, so it must be declared first and dropped first (same drop-order
@@ -198,9 +133,8 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     zero_bias: GgmlStaticTensor,
     cross_layers: Vec<FireRedDecoderCrossCacheLayer>,
     self_kv_layers: Vec<FireRedDecoderSelfKvLayer>,
-    /// Allocated column count of every `cross_layers[i].{key,value}` tensor
-    /// (see [`firered_decoder_cross_capacity_frames`]). Grows (never shrinks)
-    /// via [`Self::grow_cross_capacity`] when a chunk exceeds it.
+    decoder_state: Seq2SeqDecoderState,
+    /// Stable planner-reserved column count of every cross-KV tensor.
     cross_capacity_frames: usize,
     /// The CURRENT utterance's actual encoder frame count -- always
     /// `<= cross_capacity_frames` -- set by
@@ -221,11 +155,9 @@ pub(crate) struct FireRedDecoderGraphRuntime {
 
 /// The static-tensor arena plus everything allocated directly in it
 /// (cross-KV/self-KV caches, shared zero-bias) -- everything about a
-/// [`FireRedDecoderGraphRuntime`] that depends on `cross_capacity_frames` and
-/// must be rebuilt wholesale when that capacity grows
-/// ([`FireRedDecoderGraphRuntime::grow_cross_capacity`]). Kept separate from
-/// `runner`/`_loaded`/`weights` (independent of cross-KV capacity: `weights`
-/// borrows the mmap'd GGUF context directly and never needs rebuilding).
+/// [`FireRedDecoderGraphRuntime`] that depends on the stable resident spans.
+/// Kept separate from `runner`/`_loaded`/`weights`, which borrow the mmap'd
+/// GGUF context independently of decoder-state capacity.
 struct FireRedDecoderArenaState {
     arena: GgmlStaticTensorArena,
     zero_bias: GgmlStaticTensor,
@@ -236,6 +168,7 @@ struct FireRedDecoderArenaState {
 fn build_firered_decoder_arena_state(
     runner: &GgmlCpuGraphRunner,
     metadata: &FireRedAedExecutionMetadata,
+    self_kv_capacity_positions: usize,
     cross_capacity_frames: usize,
 ) -> Result<FireRedDecoderArenaState, FireRedDecoderError> {
     let arena = runner
@@ -269,7 +202,7 @@ fn build_firered_decoder_arena_state(
             key: arena
                 .new_tensor_3d_f16(
                     metadata.head_dim,
-                    metadata.decoder_pe_len,
+                    self_kv_capacity_positions,
                     metadata.n_heads,
                     "firered_dec_self_k",
                 )
@@ -277,7 +210,7 @@ fn build_firered_decoder_arena_state(
             value: arena
                 .new_tensor_3d_f16(
                     metadata.head_dim,
-                    metadata.decoder_pe_len,
+                    self_kv_capacity_positions,
                     metadata.n_heads,
                     "firered_dec_self_v",
                 )
@@ -307,14 +240,14 @@ fn build_firered_decoder_arena_state(
     // the rebuild-per-step path views only written rows, so on CPU /
     // scheduler-on runners no unwritten row is ever read and the fill is pure
     // waste -- worse than waste, actually, because touching every byte of the
-    // full `decoder_pe_len`-span cache commits all of its pages up front
-    // (hundreds of MB of peak RSS) where the untouched malloc'd CPU arena
+    // full planner-reserved cache commits all of its pages up front where the
+    // untouched malloc'd CPU arena
     // pages would otherwise stay uncommitted until the decode actually wrote
     // them.
     if reusable_decode_graph_supported_for_runner(runner) {
         let self_kv_tensor_bytes = metadata
             .head_dim
-            .checked_mul(metadata.decoder_pe_len)
+            .checked_mul(self_kv_capacity_positions)
             .and_then(|value| value.checked_mul(metadata.n_heads))
             .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
             .ok_or(FireRedDecoderError::ShapeOverflow)?;
@@ -338,12 +271,118 @@ fn build_firered_decoder_arena_state(
 }
 
 impl FireRedDecoderGraphRuntime {
+    /// Provisional SystemMemory quote for the family-owned Rust containers in
+    /// one resident decoder. Self-attention and cross-attention capacities are
+    /// kept as independent multiplicands; adding their position axes would
+    /// describe no allocation the runtime actually owns.
+    pub(crate) fn system_memory_quote(
+        metadata: FireRedAedExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        pack_content_id: &str,
+    ) -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, String> {
+        decoder_state
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let retained = Self::quoted_retained_system_memory_bytes(metadata)?;
+        let config = firered_decoder_graph_config(backend);
+        let transient = firered_decoder_construction_transient_system_memory_bytes(
+            metadata,
+            decoder_state,
+            reusable_decode_graph_supported(config.backend, config.use_scheduler),
+        )?;
+        let peak = retained.checked_add(transient).ok_or_else(|| {
+            "firered-aed decoder SystemMemory construction peak overflowed".to_string()
+        })?;
+        let capacity = decoder_state.resident_capacity();
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+            format!(
+                "firered-aed-decoder-runtime:{pack_content_id}:self={}:cross={}",
+                capacity.self_attention_positions, capacity.cross_attention_positions
+            ),
+            peak,
+            retained,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn quoted_retained_system_memory_bytes(
+        metadata: FireRedAedExecutionMetadata,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            FireRedDecoderWeights::quoted_retained_system_memory_bytes(metadata.decoder_n_layers)?,
+            "firered-aed decoder weight handles",
+        )?;
+        bytes.add(
+            quoted_vec_capacity_bytes::<FireRedDecoderCrossCacheLayer>(
+                metadata.decoder_n_layers,
+                "firered-aed cross-KV handles",
+            )?,
+            "firered-aed cross-KV handles",
+        )?;
+        bytes.add(
+            quoted_vec_capacity_bytes::<FireRedDecoderSelfKvLayer>(
+                metadata.decoder_n_layers,
+                "firered-aed self-KV handles",
+            )?,
+            "firered-aed self-KV handles",
+        )?;
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.weights.retained_system_memory_bytes()?,
+            "firered-aed decoder weight handles",
+        )?;
+        bytes.add_vec(&self.cross_layers, "firered-aed cross-KV handles")?;
+        bytes.add_vec(&self.self_kv_layers, "firered-aed self-KV handles")?;
+        Ok(bytes.finish())
+    }
+
+    /// Construction staging has already been released when the actor owner is
+    /// published. Recompute its exact requested capacity from the runtime's
+    /// resolved backend and resident self-KV shape for post-build validation.
+    pub(crate) fn construction_transient_system_memory_bytes(&self) -> Result<u64, String> {
+        firered_decoder_construction_transient_system_memory_bytes(
+            self.metadata,
+            self.decoder_state,
+            reusable_decode_graph_supported_for_runner(&self.runner),
+        )
+    }
+
     pub(crate) fn new(
         runtime_source: &GgmlRuntimeSource,
         metadata: FireRedAedExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedDecoderError> {
-        let cross_capacity_frames = firered_decoder_cross_capacity_frames(&metadata);
+        decoder_state
+            .validate()
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        decoder_state
+            .self_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+                metadata.decoder_pe_len,
+            )
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        decoder_state
+            .cross_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::CrossAttentionKv,
+                metadata.encoder_max_frames(),
+            )
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        let cross_capacity_frames = decoder_state.cross_attention.resident_positions;
         let config = firered_decoder_graph_config(backend);
         let persistent_graph_context_bytes = config.context_bytes;
         let runner =
@@ -352,8 +391,12 @@ impl FireRedDecoderGraphRuntime {
             .load_gguf_weight_context(runtime_source)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedDecoderWeights::load(&loaded, metadata.decoder_n_layers)?;
-        let arena_state =
-            build_firered_decoder_arena_state(&runner, &metadata, cross_capacity_frames)?;
+        let arena_state = build_firered_decoder_arena_state(
+            &runner,
+            &metadata,
+            decoder_state.self_attention.resident_positions,
+            cross_capacity_frames,
+        )?;
 
         Ok(Self {
             reuse: None,
@@ -366,79 +409,95 @@ impl FireRedDecoderGraphRuntime {
             zero_bias: arena_state.zero_bias,
             cross_layers: arena_state.cross_layers,
             self_kv_layers: arena_state.self_kv_layers,
+            decoder_state,
             cross_capacity_frames,
-            cross_frame_count: 0,
+            cross_frame_count: decoder_state.cross_attention.logical_positions,
             reuse_cross_frame_count: 0,
             cached_positions: 0,
         })
     }
 
-    /// Grow-to-fit: rebuilds the cross-KV (and, incidentally, self-KV -- its
-    /// content is about to be invalidated by the caller's `cached_positions =
-    /// 0` reset anyway) arena at `max(needed_frames, 2x current capacity)`,
-    /// clamped to this pack's PE-table ceiling. Only reachable when a caller
-    /// presents a chunk past `cross_capacity_frames` -- normal VAD/longform
-    /// chunks never do, since the shared longform safety policy already caps
-    /// every chunk at (or under) the capacity this runtime was built with;
-    /// this exists for callers that legitimately bypass longform with a
-    /// larger single window (e.g. `segment_mode=off`), which the executor's
-    /// own `AudioWindowTooLong` preflight allows up to the PE-table ceiling.
-    /// Cheap relative to the original miss-every-chunk bug this module fixes:
-    /// `weights`/`_loaded` (the mmap'd GGUF context) are untouched, only the
-    /// arena's own metadata pool + backend buffer are rebuilt.
-    fn grow_cross_capacity(&mut self, needed_frames: usize) -> Result<(), FireRedDecoderError> {
-        let max_frames = self.metadata.encoder_max_frames().max(1);
-        if needed_frames > max_frames {
+    pub(crate) fn activate_decoder_state(
+        &mut self,
+        decoder_state: Seq2SeqDecoderState,
+    ) -> Result<(), FireRedDecoderError> {
+        decoder_state
+            .validate()
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if decoder_state.self_attention.resident_positions
+            != self.decoder_state.self_attention.resident_positions
+            || decoder_state.cross_attention.resident_positions
+                != self.decoder_state.cross_attention.resident_positions
+        {
             return Err(FireRedDecoderError::InvalidInput {
                 reason: format!(
-                    "encoder frame count {needed_frames} exceeds this pack's positional-encoding \
-                     capacity of {max_frames} frames; this should already have been rejected by \
-                     the executor's AudioWindowTooLong preflight before reaching the decoder"
+                    "firered-aed cached decoder resident capacity mismatch: cached self/cross={}/{}, requested={}/{}",
+                    self.decoder_state.self_attention.resident_positions,
+                    self.decoder_state.cross_attention.resident_positions,
+                    decoder_state.self_attention.resident_positions,
+                    decoder_state.cross_attention.resident_positions,
                 ),
             });
         }
-        let new_capacity = needed_frames
-            .max(self.cross_capacity_frames.saturating_mul(2))
-            .min(max_frames);
-        let arena_state =
-            build_firered_decoder_arena_state(&self.runner, &self.metadata, new_capacity)?;
-        // The persistent reuse graph holds raw pointers into the OLD arena's
-        // cross-KV/self-KV tensors, which this call is about to free -- the
-        // `reuse_cross_frame_count` mismatch-triggered rebuild alone is not
-        // enough (that logic assumes the arena itself is stable), so drop it
-        // unconditionally and let the next reusable step rebuild against the
-        // new arena instead of dereferencing freed memory.
-        self.reuse = None;
-        self.reuse_cross_frame_count = 0;
-        self.arena = arena_state.arena;
-        self.zero_bias = arena_state.zero_bias;
-        self.cross_layers = arena_state.cross_layers;
-        self.self_kv_layers = arena_state.self_kv_layers;
-        self.cross_capacity_frames = new_capacity;
+        decoder_state
+            .self_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+                self.metadata.decoder_pe_len,
+            )
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        decoder_state
+            .cross_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::CrossAttentionKv,
+                self.metadata.encoder_max_frames(),
+            )
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if decoder_state.self_attention.logical_positions
+            != self.decoder_state.self_attention.logical_positions
+            || decoder_state.cross_attention.logical_positions
+                != self.decoder_state.cross_attention.logical_positions
+        {
+            self.reuse = None;
+            self.reuse_cross_frame_count = 0;
+        }
+        self.decoder_state = decoder_state;
+        self.cross_frame_count = decoder_state.cross_attention.logical_positions;
         Ok(())
     }
 
     /// Precompute cross-attention K/V for every layer from the encoder output
     /// and write them into the persistent cross-KV cache. Must be called once
-    /// before the first [`Self::compute_step_logits`]. `frame_count` is this
-    /// utterance's ACTUAL encoder frame count -- normally `<=`
-    /// [`Self::cross_capacity_frames`], but when it isn't (a caller past the
-    /// architecture's chunk-cap, e.g. `segment_mode=off`), this grows the
-    /// cross-KV cache to fit first ([`Self::grow_cross_capacity`]) rather
-    /// than rejecting a request the pack's own PE-table ceiling would
-    /// otherwise support.
+    /// before the first [`Self::compute_step_logits`]. `frame_count` must
+    /// equal the planner's logical cross shape and fit the stable resident
+    /// span; mismatches fail closed before any write.
     pub(crate) fn populate_cross_attention_cache(
         &mut self,
         encoder_rows: &[f32],
         frame_count: usize,
     ) -> Result<(), FireRedDecoderError> {
-        if frame_count == 0 {
-            return Err(FireRedDecoderError::InvalidInput {
-                reason: "cross_frame_count must be > 0".to_string(),
-            });
-        }
+        self.decoder_state
+            .cross_attention
+            .validate_exact_shape(
+                crate::capacity::topology::StateKind::CrossAttentionKv,
+                frame_count,
+            )
+            .map_err(|error| FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         if frame_count > self.cross_capacity_frames {
-            self.grow_cross_capacity(frame_count)?;
+            return Err(FireRedDecoderError::InvalidInput {
+                reason: format!(
+                    "firered-aed logical cross shape {frame_count} exceeds resident capacity {}",
+                    self.cross_capacity_frames
+                ),
+            });
         }
         let d_model = self.metadata.d_model;
         let expected = frame_count
@@ -585,11 +644,12 @@ impl FireRedDecoderGraphRuntime {
                 reason: "decoder token_count must be > 0".to_string(),
             });
         }
-        if total_prefix_tokens > self.metadata.decoder_pe_len {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if total_prefix_tokens > logical_max_positions {
             return Err(FireRedDecoderError::InvalidInput {
                 reason: format!(
                     "decoder token_count {total_prefix_tokens} exceeds max context {}",
-                    self.metadata.decoder_pe_len
+                    logical_max_positions
                 ),
             });
         }
@@ -697,8 +757,9 @@ impl FireRedDecoderGraphRuntime {
                 position_offset,
                 layer_norm_epsilon: FIRERED_DECODER_LAYER_NORM_EPSILON,
                 ffn_activation: FeedForwardActivation::Gelu,
-                self_kv_max_positions: self.metadata.decoder_pe_len,
+                self_kv_max_positions: self.decoder_state.self_attention.resident_positions,
                 cross_frame_count: self.cross_frame_count,
+                cross_kv_max_positions: self.decoder_state.cross_attention.resident_positions,
                 cross_hidden_size: d_model,
             };
             let weights = Seq2SeqLayerWeights {
@@ -822,7 +883,7 @@ impl FireRedDecoderGraphRuntime {
     /// attention mask, then recompute -- no graph construction, no
     /// reallocation (the cohere/moonshine reuse pattern). Must produce
     /// byte-identical logits to the rebuild path for the same step; the
-    /// masked (`-inf`) tail of the fixed `decoder_pe_len`-span self-KV view
+    /// masked (`-inf`) tail of the fixed logical self-KV view
     /// contributes exactly zero attention weight, and the underlying
     /// arithmetic per valid position is unchanged.
     fn compute_reused_incremental_step_logits(
@@ -830,7 +891,7 @@ impl FireRedDecoderGraphRuntime {
         token_id: u32,
         position: usize,
     ) -> Result<Vec<f32>, FireRedDecoderError> {
-        let max_positions = self.metadata.decoder_pe_len;
+        let max_positions = self.decoder_state.self_attention.logical_positions;
         if position >= max_positions {
             return Err(FireRedDecoderError::InvalidInput {
                 reason: format!("decoder position {position} exceeds max context {max_positions}"),
@@ -905,7 +966,7 @@ impl FireRedDecoderGraphRuntime {
     /// one `token_count == 1` step of the rebuild path, except the self-KV
     /// write goes through `set_rows` on a runtime row-index input (so the
     /// write slot can move per step without rebuilding) and self-attention
-    /// reads the full fixed `decoder_pe_len` span under an externally-uploaded
+    /// reads the full fixed logical self-KV span under an externally-uploaded
     /// `-inf` tail mask (so the graph shape is constant across steps). The
     /// current `cross_frame_count` is baked into the cross-attention views;
     /// `compute_reused_incremental_step_logits` rebuilds on mismatch.
@@ -913,7 +974,9 @@ impl FireRedDecoderGraphRuntime {
         let d_model = self.metadata.d_model;
         let heads = self.metadata.n_heads;
         let head_dim = self.metadata.head_dim;
-        let max_positions = self.metadata.decoder_pe_len;
+        let max_positions = self.decoder_state.self_attention.logical_positions;
+        let resident_self_positions = self.decoder_state.self_attention.resident_positions;
+        let resident_cross_positions = self.decoder_state.cross_attention.resident_positions;
         let cross_frame_count = self.cross_frame_count;
 
         let mut session = self
@@ -979,8 +1042,9 @@ impl FireRedDecoderGraphRuntime {
                 position_offset: 0,
                 layer_norm_epsilon: FIRERED_DECODER_LAYER_NORM_EPSILON,
                 ffn_activation: FeedForwardActivation::Gelu,
-                self_kv_max_positions: max_positions,
+                self_kv_max_positions: resident_self_positions,
                 cross_frame_count,
+                cross_kv_max_positions: resident_cross_positions,
                 cross_hidden_size: d_model,
             };
             let weights = Seq2SeqLayerWeights {
@@ -1070,6 +1134,36 @@ impl FireRedDecoderGraphRuntime {
         self.reuse_cross_frame_count = cross_frame_count;
         Ok(())
     }
+}
+
+fn quoted_vec_capacity_bytes<T>(elements: usize, label: &str) -> Result<u64, String> {
+    let bytes = elements
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| format!("{label} quote overflowed"))?;
+    u64::try_from(bytes).map_err(|_| format!("{label} quote does not fit u64"))
+}
+
+fn firered_decoder_construction_transient_system_memory_bytes(
+    metadata: FireRedAedExecutionMetadata,
+    decoder_state: Seq2SeqDecoderState,
+    reusable_graph_supported: bool,
+) -> Result<u64, String> {
+    let zero_bias_bytes = metadata
+        .d_model
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| "firered-aed zero-bias staging byte count overflowed".to_string())?;
+    if !reusable_graph_supported {
+        return Ok(zero_bias_bytes);
+    }
+    let self_kv_zero_bytes = metadata
+        .head_dim
+        .checked_mul(decoder_state.self_attention.resident_positions)
+        .and_then(|value| value.checked_mul(metadata.n_heads))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| "firered-aed self-KV zero-fill staging byte count overflowed".to_string())?;
+    Ok(zero_bias_bytes.max(self_kv_zero_bytes))
 }
 
 /// firered-aed decodes through the shared seq2seq greedy driver: every step
@@ -1197,7 +1291,24 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
 ) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     runtime.populate_cross_attention_cache(encoder_rows, encoder_frame_count)?;
 
-    let max_generated_tokens = context_window_budget(metadata.decoder_pe_len, 1).unwrap_or(0);
+    let decode_budget = super::decode_budget::firered_aed_decode_budget(
+        encoder_frame_count,
+        metadata.decoder_pe_len,
+    )
+    .map_err(|error| FireRedDecoderError::InvalidInput {
+        reason: error.to_string(),
+    })?;
+    runtime
+        .decoder_state
+        .self_attention
+        .validate_exact_shape(
+            crate::capacity::topology::StateKind::SelfAttentionKv,
+            decode_budget.self_kv_positions,
+        )
+        .map_err(|error| FireRedDecoderError::InvalidInput {
+            reason: error.to_string(),
+        })?;
+    let max_generated_tokens = decode_budget.max_generated_tokens;
     let config = BuiltinSeq2SeqDecodePolicyConfigInput {
         initial_prompt_tokens: vec![metadata.sos_token_id],
         eot_token_id: metadata.eos_token_id,

@@ -21,8 +21,6 @@
 // the established per-family convention without a matching crate-wide pass.
 #![allow(dead_code)]
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -31,9 +29,10 @@ use crate::NativeAsrError;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, RequestBackendOverrideGuard, RequestBackendPreference,
-    install_request_backend_override,
+use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -49,17 +48,21 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
+    build_qwen3_prompt_embeddings_with_audio_splice,
 };
+use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
-use crate::models::thread_local_runtime_cache::{
-    PackContentKey, current_unload_generation, take_generation_tagged,
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 
 use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
@@ -71,65 +74,43 @@ use super::runtime_contract::{
 };
 use super::tokenizer::FireRedLlmTokenizer;
 
-/// Resident decoder cache (mirrors qwen's `QWEN_WHOLE_DECODER_BY_KEY` design
-/// S4, `models::qwen::ggml_executor`): `FireRedLlmDecoderRuntime` owns the
+/// Resident decoder actor pool. `FireRedLlmDecoderRuntime` owns the
 /// Qwen2 whole-decoder graph runner, its device-uploaded layer weights, the
 /// logits head, and the token-embedding table -- all identical across every
 /// `execute()` call against the same pack on the same backend. Without this,
 /// every request paid a full decoder-runtime rebuild (~1.8-2.0s measured,
 /// `docs/model-audits/firered2-llm.md` SS3) purely to re-derive state that
-/// does not change between requests. Keyed by (pack content id, backend):
-/// unlike qwen this family has no LoRA/adapter input, so the key omits qwen's
-/// third (adapter fingerprint) component. The pack half is a
+/// does not change between requests. Keyed by pack content, concrete execution
+/// lane, and stable resident KV span. Unlike qwen this family has no
+/// LoRA/adapter input. The pack half is a
 /// [`PackContentKey`] built from the same already-open source the request
 /// preflight resolved: an in-place `.oasr` replacement at the same path
 /// resolves to a different id, so the next lookup misses and rebuilds instead
 /// of reusing a decoder whose device-uploaded weights came from the old
 /// bytes.
 ///
-/// This reuses the same session/model split transcribe.cpp uses for its own
-/// Qwen-family LLM decoder (`references/transcribe.cpp@b6a6acad`,
-/// `src/arch/qwen3_asr/model.cpp`: weights load once into `transcribe_model`,
-/// a session's KV cache grows-to-fit and is reused across `run()` calls
-/// instead of being rebuilt) -- transcribe.cpp keeps the resident state in a
-/// caller-owned session object rather than a thread-local cache; this crate's
-/// dispatch is a stateless `&self` executor called per request, so the
-/// thread-local + generation-tag mechanism below is what plays that role
-/// here.
-///
-/// A plain `HashMap` (not the shared bounded LRU): the key does not explode
-/// per audio chunk (one entry is built and reused across a whole longform
-/// run for a given pack), so there is no unbounded-growth hazard to bound.
-/// Entries are tagged with the idle-unload generation they were built under
-/// (`thread_local_runtime_cache`): the `idle_unload` reaper cannot reach this
-/// TLS from its own thread, so `take_cached_decoder_runtime` discards any
-/// decoder built before the last unload instead of handing it back out --
-/// this is how the resident 8B decoder becomes evictable under memory
-/// pressure without a bespoke eviction policy.
-type FireRedLlmDecoderCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// Each finite checkout owns a dedicated thread because ggml runtime objects
+/// are thread-affine. The accompanying [`SystemMemoryOwner`] accounts for the
+/// host logits/embedding representation, while native graph construction
+/// accounts backend buffers in their physical memory domain.
+type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey, usize);
 
-thread_local! {
-    static FIRERED_LLM_DECODER_BY_KEY: RefCell<HashMap<FireRedLlmDecoderCacheKey, (u64, FireRedLlmDecoderRuntime)>> =
-        RefCell::new(HashMap::new());
+struct FireRedLlmDecoderActorState {
+    runtime: FireRedLlmDecoderRuntime,
 }
 
-fn take_cached_decoder_runtime(
-    key: &FireRedLlmDecoderCacheKey,
-    unload_generation: u64,
-) -> Option<FireRedLlmDecoderRuntime> {
-    FIRERED_LLM_DECODER_BY_KEY
-        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
+impl std::fmt::Debug for FireRedLlmDecoderActorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FireRedLlmDecoderActorState")
+            .finish_non_exhaustive()
+    }
 }
 
-fn store_cached_decoder_runtime(
-    key: FireRedLlmDecoderCacheKey,
-    unload_generation: u64,
-    decoder: FireRedLlmDecoderRuntime,
-) {
-    FIRERED_LLM_DECODER_BY_KEY.with(|cache| {
-        cache.borrow_mut().insert(key, (unload_generation, decoder));
-    });
-}
+type FireRedLlmDecoderRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
+type FireRedLlmDecoderRuntimeActor =
+    PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
 
 const FIRERED_LLM_EXECUTOR_ID: &str = "firered-llm-ggml-executor-v1";
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
@@ -173,14 +154,44 @@ enum FireRedLlmExecutorError {
     DecodePromptFailed { reason: String },
     #[error("firered-llm prompt embedding splice failed: {reason}")]
     PromptEmbeddingFailed { reason: String },
+    #[error("firered-llm decoder-state capacity contract failed: {source}")]
+    DecoderStateCapacity {
+        #[source]
+        source: Qwen3AsrKvCacheCapacityError,
+    },
     #[error("firered-llm decoder failed: {reason}")]
     DecoderFailed { reason: String },
+    #[error("firered-llm {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
     #[error("firered-llm greedy decode failed: {reason}")]
     GreedyDecodeFailed { reason: String },
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct FireRedLlmGgmlExecutor;
+const FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
+const FIRERED_LLM_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
+
+#[derive(Debug, Clone)]
+pub(crate) struct FireRedLlmGgmlExecutor {
+    decoder_runtimes: Arc<FireRedLlmDecoderRuntimePool>,
+}
+
+impl Default for FireRedLlmGgmlExecutor {
+    fn default() -> Self {
+        let max_committed_requested_bytes =
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        let limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            FIRERED_LLM_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        );
+        Self {
+            decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-firered-llm-decoder-owner",
+                limits,
+            )),
+        }
+    }
+}
 
 /// A no-op phrase-bias/token-source shim: firered-llm's decode policy never
 /// consults these (no phrase bias, `seq2seq_stop_token_kind: None` -- eot is
@@ -203,7 +214,8 @@ impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 /// `qwen::ggml_executor::Qwen3AsrPrefillOnlyGreedyStepExecutor`'s shape.
 struct FireRedLlmGreedyStepExecutor<'a> {
     decoder: &'a mut FireRedLlmDecoderRuntime,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
     prompt_embeddings: Option<crate::models::qwen::Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
     /// Explicit cancel/pause/resume control for this decode -- never a
@@ -220,7 +232,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let prefill = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
+                .prefill(
+                    &prompt_embeddings,
+                    &mut self.layer_kv_caches,
+                    self.kv_capacity,
+                    &self.control,
+                )
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -243,7 +260,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
             })?;
         if let Some(token_id) = self
             .decoder
-            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .decode_step_reused_top1(
+                last_token,
+                cache_position,
+                &self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?
@@ -255,7 +277,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
         }
         let logits = self
             .decoder
-            .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
+            .decode_step(
+                last_token,
+                cache_position,
+                &mut self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?;
@@ -267,6 +294,106 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
 }
 
 impl FireRedLlmGgmlExecutor {
+    fn map_actor_error(
+        stage: &'static str,
+        error: PinnedRuntimeActorError,
+    ) -> FireRedLlmExecutorError {
+        FireRedLlmExecutorError::DecoderFailed {
+            reason: format!("{stage} runtime ownership failed: {error}"),
+        }
+    }
+
+    fn checkout_decoder_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        metadata: super::runtime_contract::FireRedLlmDecoderMetadata,
+        kv_capacity: Qwen3AsrKvCacheCapacity,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<FireRedLlmDecoderRuntimeActor, FireRedLlmExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(backend),
+            kv_capacity.resident_positions(),
+        );
+        let quote_source = runtime_source.clone();
+        let build_source = runtime_source.clone();
+        let content_id = runtime_source.content_id().to_string();
+        self.decoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let reader =
+                    crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(&quote_source)
+                        .map_err(|error| FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: format!("decoder quote tensor reader failed: {error}"),
+                    })?;
+                let (peak_bytes, retained_bytes) =
+                    super::llm_transformer::quoted_firered_llm_decoder_system_memory_bytes(
+                        &reader, &metadata, backend,
+                    )
+                    .map_err(|reason| {
+                        FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason,
+                        }
+                    })?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!(
+                        "firered-llm-decoder-runtime:{content_id}:positions={}",
+                        kv_capacity.resident_positions()
+                    ),
+                    peak_bytes,
+                    retained_bytes,
+                )
+                .map_err(|error| {
+                    FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok((retained_bytes, (build_source, metadata, backend, quote)))
+            },
+            move |(source, metadata, backend, quote)| {
+                match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                    let runtime = FireRedLlmDecoderRuntime::new(&source, metadata, backend)
+                        .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
+                            reason: error.to_string(),
+                        })?;
+                    let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
+                        FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason,
+                        }
+                    })?;
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        FireRedLlmDecoderActorState { runtime },
+                        retained,
+                        retained,
+                    ))
+                }) {
+                    Ok(owner) => Ok(owner),
+                    Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                    Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                        Err(FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason: error.to_string(),
+                        })
+                    }
+                }
+            },
+            |error| Self::map_actor_error("decoder", error),
+        )
+    }
+
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.decoder_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+    }
+
+    fn clear_runtime_actors(&self) {
+        self.decoder_runtimes.clear();
+    }
+
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -349,7 +476,6 @@ impl FireRedLlmGgmlExecutor {
         )?;
 
         let runtime_source = &preflight.runtime_source;
-        let runtime_path = runtime_source.path();
         let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
             runtime_source,
             encoder_metadata,
@@ -399,143 +525,115 @@ impl FireRedLlmGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        // Pin the memory-dominant 7B decoder to a backend that fits this host
-        // (see `resolve_decoder_backend`), starting from this request's own
-        // already-resolved backend rather than any thread-local read. The
-        // returned guard (if any) is held for the whole decode so the graph
-        // runner built here -- and reused every step -- stays on the chosen
-        // backend for the few remaining thread-local readers unrelated to
-        // this family's own resolution; the encoder/adapter above already
-        // ran and are unaffected.
-        let (decoder_backend, _decoder_backend_override) = resolve_decoder_backend(
-            runtime_path,
-            request.backend_preference,
-            request.resolved_runtime,
-        );
-        let decoder_cache_key: FireRedLlmDecoderCacheKey = (
-            PackContentKey::for_runtime_source(runtime_source),
-            decoder_backend,
-        );
-        // Sampled before the cache take and reused for the store-back below:
-        // if the idle-unload reaper bumps the generation while this decode is
-        // in flight, the decoder goes back tagged with the pre-unload
-        // generation and the *next* take discards it, so an unload can never
-        // be lost to an overlapping decode (mirrors qwen's
-        // `ggml_executor::execute_inner`).
-        let unload_generation = current_unload_generation();
-        let firered_llm_profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
-        let mut decoder = match take_cached_decoder_runtime(&decoder_cache_key, unload_generation) {
-            // Resident hit: layer weights already uploaded to the device and
-            // the reuse graph already built -- skip the ~1.8-2.0s rebuild.
-            Some(decoder) => {
-                if firered_llm_profile_enabled {
-                    eprintln!("OPENASR_FIRERED_LLM_PROFILE stage=decoder_cache_hit");
-                }
-                decoder
-            }
-            None => {
-                let decoder = FireRedLlmDecoderRuntime::new(
-                    runtime_source,
-                    decoder_metadata,
-                    decoder_backend,
-                )
-                .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                })?;
-                if firered_llm_profile_enabled {
-                    eprintln!("OPENASR_FIRERED_LLM_PROFILE stage=decoder_cache_miss_init");
-                }
-                decoder
-            }
-        };
-        // Opt-in perf diagnostic (mirrors the qwen `OPENASR_HYMT2_PROFILE`
-        // backend log line): confirms which backend the 7B Qwen2 decoder graph
-        // actually resolved to (Metal vs CPU) without asserting a host-dependent
-        // timing number in shipping code.
-        if firered_llm_profile_enabled {
-            eprintln!(
-                "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
-                decoder.backend_label()
-            );
-        }
-        let token_rows_len = decode_prompt.token_ids.len() * decoder_metadata.d_model;
-        let mut token_rows = Vec::with_capacity(token_rows_len);
-        for &token_id in &decode_prompt.token_ids {
-            let row = decoder.gather_token_embedding(token_id).map_err(|error| {
-                FireRedLlmExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                }
+        // The process-root policy resolver has already selected and admitted
+        // this candidate. Family executors must not invent a second heuristic
+        // fallback: doing so would make allocation ownership and the reported
+        // execution route disagree.
+        let decoder_backend = request.resolved_runtime.backend();
+        let measured_positions =
+            crate::capacity::topology::causal_prefix_positions_with_context_cap(
+                super::capacity::FIRERED_LLM_SELF_KV_STATE_ID,
+                decode_prompt.token_ids.len(),
+                FIRERED_LLM_MAX_GENERATED_TOKENS,
+                decoder_metadata.max_positions,
+            )
+            .map_err(|error| FireRedLlmExecutorError::RuntimeContractViolation {
+                reason: error.to_string(),
             })?;
-            token_rows.extend_from_slice(&row);
-        }
-        let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
-            &decode_prompt,
-            decoder_metadata.d_model,
-            token_rows,
-            &speech_rows,
+        let kv_capacity = Qwen3AsrKvCacheCapacity::from_decoder_state(
+            &request.decoder_state,
+            super::capacity::FIRERED_LLM_SELF_KV_STATE_ID,
         )
-        .map_err(|error| FireRedLlmExecutorError::PromptEmbeddingFailed {
-            reason: error.to_string(),
-        })?;
-
-        // Request-sized, not the decoder's native 32768-token context: see
-        // `FireRedLlmDecoderRuntime::new_kv_caches`'s doc comment for why the
-        // fixed reuse-graph span this sizes must stay tight to what this
-        // utterance actually needs.
-        let layer_kv_caches = decoder.new_kv_caches(
-            decode_prompt
-                .token_ids
-                .len()
-                .saturating_add(FIRERED_LLM_MAX_GENERATED_TOKENS),
-        );
-        let mut step_executor = FireRedLlmGreedyStepExecutor {
-            decoder: &mut decoder,
-            layer_kv_caches,
-            prompt_embeddings: Some(prompt_embeddings),
-            cache_prompt_tokens: 0,
-            control: Arc::clone(&request.execution_context.control),
-        };
+        .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
+        .map_err(|source| FireRedLlmExecutorError::DecoderStateCapacity { source })?;
+        let decoder_actor = self.checkout_decoder_runtime(
+            runtime_source,
+            decoder_metadata,
+            kv_capacity,
+            decoder_backend,
+        )?;
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
             eot_token_id: tokenizer.chatml_im_end_token_id,
             vocab_size: decoder_metadata.vocab_size,
             max_generated_tokens: FIRERED_LLM_MAX_GENERATED_TOKENS,
         };
-        let decode_result = run_builtin_seq2seq_decode_policy(
-            FIRERED_LLM_DECODE_POLICY_ID,
-            &config,
-            &NoPhraseBiasTokenSource,
-            None,
-            &mut step_executor,
-            &|token_ids: &[u32]| {
-                tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
-                    Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+        let decoder_tokenizer = tokenizer.clone();
+        let decoder_control = Arc::clone(&request.execution_context.control);
+        let profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
+        let result = decoder_actor
+            .call_mut(move |state| {
+                let decoder = &mut state.runtime;
+                if profile_enabled {
+                    eprintln!(
+                        "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
+                        decoder.backend_label()
+                    );
+                }
+                let token_rows_len = decode_prompt
+                    .token_ids
+                    .len()
+                    .checked_mul(decoder_metadata.d_model)
+                    .ok_or_else(|| FireRedLlmExecutorError::PromptEmbeddingFailed {
+                        reason: "token embedding row allocation overflowed".to_string(),
+                    })?;
+                let mut token_rows = Vec::with_capacity(token_rows_len);
+                for &token_id in &decode_prompt.token_ids {
+                    let row = decoder.gather_token_embedding(token_id).map_err(|error| {
+                        FireRedLlmExecutorError::DecoderFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    token_rows.extend_from_slice(&row);
+                }
+                let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
+                    &decode_prompt,
+                    decoder_metadata.d_model,
+                    token_rows,
+                    &speech_rows,
+                )
+                .map_err(|error| {
+                    FireRedLlmExecutorError::PromptEmbeddingFailed {
                         reason: error.to_string(),
                     }
+                })?;
+                let layer_kv_caches = decoder
+                    .new_kv_caches(kv_capacity)
+                    .map_err(|reason| FireRedLlmExecutorError::DecoderFailed { reason })?;
+                let mut step_executor = FireRedLlmGreedyStepExecutor {
+                    decoder,
+                    layer_kv_caches,
+                    kv_capacity,
+                    prompt_embeddings: Some(prompt_embeddings),
+                    cache_prompt_tokens: 0,
+                    control: Arc::clone(&decoder_control),
+                };
+                let decode_result = run_builtin_seq2seq_decode_policy(
+                    FIRERED_LLM_DECODE_POLICY_ID,
+                    &config,
+                    &NoPhraseBiasTokenSource,
+                    None,
+                    &mut step_executor,
+                    &|token_ids: &[u32]| {
+                        decoder_tokenizer
+                            .decode_text_token_ids(token_ids)
+                            .map_err(|error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                                reason: error.to_string(),
+                            })
+                    },
+                    |error: Seq2SeqGreedyDecodeError| error,
+                    |error: Seq2SeqGreedyDecodeError| error,
+                    map_registry_error,
+                    &decoder_control,
+                );
+                // CPU step buffers are invocation-scoped. Native weights and
+                // the stable resident arena remain with this actor.
+                state.runtime.release_session_scoped_buffers();
+                decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
+                    reason: error.to_string(),
                 })
-            },
-            |error: Seq2SeqGreedyDecodeError| error,
-            |error: Seq2SeqGreedyDecodeError| error,
-            map_registry_error,
-            &request.execution_context.control,
-        );
-        // Session/slice is done: release the CPU per-token grow-to-fit step
-        // buffer before the decoder goes back into the cross-chunk cache, so
-        // it stays scoped to this decode and never rides along as a
-        // process-resident allocation on the cached decoder.
-        decoder.release_session_scoped_buffers();
-        // Return the resident decoder to the cache for the next chunk /
-        // execute() regardless of decode outcome. The release call above has
-        // already discarded graph/KV state poisoned by an incomplete compute;
-        // uploaded weights and the backend handle remain valid. `step_executor`
-        // is not used again after this point, so
-        // its `&mut decoder` borrow ends here under NLL and `decoder` (owned
-        // locally) is free to move into the cache.
-        store_cached_decoder_runtime(decoder_cache_key, unload_generation, decoder);
-        let result =
-            decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
-                reason: error.to_string(),
-            })?;
+            })
+            .map_err(|error| Self::map_actor_error("decoder", error))??;
 
         let text = result.text.trim().to_string();
         let transcription = Transcription {
@@ -574,84 +672,6 @@ fn map_registry_error(
     }
 }
 
-/// Decide which backend the 7B Qwen2 decoder stage should build on, starting
-/// from this request's own already-resolved `resolved_runtime` (never a
-/// thread-local read) and narrowing it further for a host RAM-fit check.
-/// Also returns an override guard (kept alive across the decoder's
-/// construction + decode) when a value narrower than `resolved_runtime`
-/// needs to also reach the few remaining thread-local readers unrelated to
-/// this family's own resolution.
-///
-/// The decoder is the memory-dominant stage: at fp16/q8_0 its weights plus the
-/// f16 embedding, the growing KV cache and the ggml compute buffers overrun a
-/// small unified-memory GPU working set, so a Metal command buffer fails with
-/// `kIOGPUCommandBufferCallbackErrorOutOfMemory` partway through decode (M1/16GB
-/// measured: q8_0 OOMs, q4_k -- ~4.9GB peak RSS -- fits comfortably). Rather
-/// than let Auto crash mid-decode or silently fall back to a 30x-slower path, we
-/// pick the backend up front:
-///
-/// - An explicit `Accelerated`/`CpuOnly` request always wins (the product rule
-///   that a user's explicit hardware choice is never second-guessed) -- we just
-///   honor it, which also makes the request preference authoritative on the
-///   direct-`execute` path that does not go through the dispatch wrapper.
-/// - Under `Auto`, follow `resolved_runtime`, but if the pack cannot fit this
-///   host (a conservative `pack_bytes * 2 <= total_RAM` unified-memory
-///   budget: weights resident on the GPU plus comparable headroom for the host
-///   embedding, KV, compute buffers and the OS) and the resolved backend is a
-///   GPU-class backend, fall the decoder back to CPU and print a one-line
-///   not-real-time notice instead of OOM-ing.
-fn resolve_decoder_backend(
-    runtime_path: &std::path::Path,
-    backend_preference: GgmlAsrBackendPreference,
-    resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
-) -> (GgmlCpuGraphBackend, Option<RequestBackendOverrideGuard>) {
-    match backend_preference {
-        GgmlAsrBackendPreference::CpuOnly => (
-            resolved_runtime.backend(),
-            Some(install_request_backend_override(Some(
-                RequestBackendPreference::CpuOnly,
-            ))),
-        ),
-        GgmlAsrBackendPreference::Accelerated => (
-            resolved_runtime.backend(),
-            Some(install_request_backend_override(Some(
-                RequestBackendPreference::Accelerated,
-            ))),
-        ),
-        GgmlAsrBackendPreference::Auto => {
-            let backend = resolved_runtime.backend();
-            if !backend.is_gpu_class() {
-                return (backend, None);
-            }
-            // Unknown RAM -> trust the resolved default rather than force CPU.
-            let Some(total_ram) = crate::host::host_total_memory_bytes() else {
-                return (backend, None);
-            };
-            let Ok(pack_metadata) = std::fs::metadata(runtime_path) else {
-                return (backend, None);
-            };
-            let pack_bytes = pack_metadata.len();
-            if pack_bytes.saturating_mul(2) <= total_ram {
-                return (backend, None);
-            }
-            eprintln!(
-                "openasr: the FireRedASR2-LLM 7B decoder pack ({:.1} GB) does not fit this host's \
-                 GPU memory budget ({:.1} GB RAM); running the decoder on CPU (transcription will \
-                 be slower than real time). Install a lower-quant pack (q4_k) for GPU-accelerated \
-                 decode.",
-                pack_bytes as f64 / 1.0e9,
-                total_ram as f64 / 1.0e9,
-            );
-            (
-                GgmlCpuGraphBackend::Cpu,
-                Some(install_request_backend_override(Some(
-                    RequestBackendPreference::CpuOnly,
-                ))),
-            )
-        }
-    }
-}
-
 impl GgmlAsrViewExecutor for FireRedLlmGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         FIRERED_LLM_EXECUTOR_ID
@@ -659,6 +679,18 @@ impl GgmlAsrViewExecutor for FireRedLlmGgmlExecutor {
 
     fn supports_phrase_bias(&self) -> bool {
         false
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_firered_llm_decoder_state,
+            ),
+        )
     }
 
     fn execute_view(
@@ -671,6 +703,10 @@ impl GgmlAsrViewExecutor for FireRedLlmGgmlExecutor {
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -693,6 +729,10 @@ impl GgmlAsrStreamingExecutor for FireRedLlmGgmlExecutor {
             FireRedLlmGgmlExecutor::execute_view,
         )
     }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
+    }
 }
 
 #[cfg(test)]
@@ -700,6 +740,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use crate::models::ggml_asr_executor::GgmlAsrBackendPreference;
     use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
     use crate::models::ggml_family_registry::firered_llm_runtime_descriptor_v1;
 
@@ -732,8 +773,8 @@ mod tests {
     // on Metal (verified against the q4_k pack on an M1: Metal:MTL0 vs Cpu:CPU
     // produce the same transcript). The q4_k pack fits Metal comfortably (~4.9GB
     // peak RSS on a 16GB Mac); only the larger fp16/q8_0 packs overrun a small
-    // unified-memory GPU, which `resolve_decoder_backend` now handles by
-    // falling the decoder back to CPU under Auto. JFK is word-for-word correct;
+    // unified-memory GPU; the unified execution policy resolves those packs to
+    // another admitted candidate before this family executor runs. JFK is word-for-word correct;
     // the Mandarin sentence is the same non-copyrighted `say -v Tingting`
     // synthesis firered-aed's own golden uses (see that family's `zh_sample.wav`
     // doc comment).
@@ -789,6 +830,9 @@ mod tests {
             ),
         );
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_llm_runtime_descriptor_v1(),
@@ -808,7 +852,7 @@ mod tests {
             request.backend_preference.request_backend_override(),
         );
 
-        let executor = FireRedLlmGgmlExecutor;
+        let executor = FireRedLlmGgmlExecutor::default();
         let started_at = Instant::now();
         let result = executor
             .execute_view(&request)

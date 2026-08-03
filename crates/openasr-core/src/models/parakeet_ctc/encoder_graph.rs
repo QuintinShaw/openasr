@@ -73,6 +73,10 @@ pub(crate) struct ParakeetCtcEncoderGraph {
 }
 
 impl ParakeetCtcEncoderGraph {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        crate::models::parakeet_runtime_memory::graph_retained_bytes(&self.core)
+    }
+
     pub(crate) fn new(
         weights: &ParakeetEncoderWeights,
         metadata: ParakeetCtcExecutionMetadata,

@@ -18,27 +18,37 @@
 //!   greedy step loop and fails closed on decoder/tokenizer boundary errors.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
 use thiserror::Error;
 
+use crate::capacity::topology::StateKind;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
     GgmlStaticTensorArena,
 };
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError, call_checked_out_actor_mut_async,
+};
 use crate::models::ggml_asr_executor::GgmlAsrCarryContext;
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_WHISPER_SEQ2SEQ, build_seq2seq_streaming_session,
 };
-use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
-use crate::models::runtime_contract::MetadataContractError;
-use crate::models::thread_local_runtime_cache::{
-    PackContentKey, UnloadGenerationGated, canonical_runtime_cache_path,
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::prepared_runtime_cache::{
+    HostNeutralPreparedRuntime, PreparedRuntimeCache, PreparedRuntimeHandle,
+    PreparedRuntimeQuoteBuilder, PreparedRuntimeQuoteContext, SystemMemoryMaterialization,
 };
+use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
+use crate::models::runtime_contract::MetadataContractError;
+#[cfg(test)]
+use crate::models::seq2seq_decoder_state::Seq2SeqStateAxis;
+use crate::models::seq2seq_decoder_state::{Seq2SeqDecoderState, Seq2SeqResidentCapacity};
+use crate::models::system_memory_owner::SystemMemoryOwner;
 use crate::models::tokenizer_component_registry::materialize_builtin_tokenizer_for_architecture;
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -62,8 +72,8 @@ use crate::{
 use crate::{GgufTensorIndexReadError, read_gguf_tensor_index_from_runtime_source};
 
 use super::batched_decode::{
-    WhisperServeBatchConfig, WhisperServeBatchConfigFromPolicy, WhisperServeBatchJob,
-    shutdown_whisper_serve_batch_engines, submit_whisper_serve_batch_job,
+    WhisperServeBatchConfig, WhisperServeBatchConfigFromPolicy, WhisperServeBatchEngineRegistry,
+    WhisperServeBatchJob, shutdown_whisper_serve_batch_engines, submit_whisper_serve_batch_job,
     whisper_serve_batch_decode_config,
 };
 use super::execution_policy::{
@@ -81,7 +91,7 @@ use super::ggml_decoder_graph::{
     WhisperDecoderLayerTensorBinding, WhisperDecoderPersistentWeightCache,
     WhisperDecoderSelfKvCacheState, WhisperDecoderTensorBindingSeam,
     WhisperDecoderTensorMaterializationSeam, WhisperDecoderTensorSource,
-    build_whisper_decoder_graph_plan,
+    build_whisper_decoder_graph_plan, persistent_cross_attention_layer_stride_frames,
     run_whisper_decoder_greedy_step_with_cache_and_runner_ggml_v0,
     run_whisper_decoder_reused_incremental_step_ggml_v0,
 };
@@ -151,6 +161,10 @@ const WHISPER_STREAMING_EXECUTOR_ID: &str = "whisper-ggml-snapshot-streaming-exe
 /// (vocab == this value) keep the bare `<|sot|> <|notimestamps|>` prompt.
 pub(crate) const WHISPER_ENGLISH_ONLY_MAX_VOCAB_SIZE: usize = 51_864;
 const WHISPER_DECODER_PERSISTENT_SESSION_POOL_CAPACITY: usize = 8;
+const WHISPER_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 8;
+const WHISPER_ENCODER_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
+const WHISPER_DECODER_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize =
+    WHISPER_DECODER_PERSISTENT_SESSION_POOL_CAPACITY;
 const WHISPER_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 
 fn whisper_can_use_serve_batch(
@@ -222,6 +236,8 @@ pub enum WhisperGgmlExecutorError {
     DecoderNoEotBeforeMaxTokens { max_generated_tokens: usize },
     #[error("whisper ggml executor decoder token->text decode failed: {reason}")]
     DecoderInvalidTokenDecode { reason: String },
+    #[error("whisper ggml executor {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
     /// Carries a transient serve-batch failure (queue full / owner gone / reply
     /// timeout) through to the `execute` trait boundary so it can become a
     /// retryable HTTP status instead of a generic 500.
@@ -292,6 +308,48 @@ struct WhisperPreparedRuntime {
     tokenizer: WhisperTokenizer,
 }
 
+impl SystemMemoryMaterialization for WhisperPreparedRuntime {
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.encoder_weights.retained_system_memory_bytes()?,
+            "whisper prepared encoder weights",
+        )?;
+        bytes.add(
+            self.decoder_weights
+                .tensor_source
+                .retained_system_memory_bytes()?,
+            "whisper prepared decoder weights",
+        )?;
+        bytes.add(
+            self.tokenizer.retained_system_memory_bytes()?,
+            "whisper prepared tokenizer",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
+impl HostNeutralPreparedRuntime for WhisperPreparedRuntime {
+    fn system_memory_quote(
+        context: PreparedRuntimeQuoteContext<'_>,
+        pack_content_id: &str,
+    ) -> Result<
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote,
+        crate::models::system_memory_owner::SystemMemoryOwnerError,
+    > {
+        let mut quote = PreparedRuntimeQuoteBuilder::new::<Self>(pack_content_id);
+        quote.add_tokenizer_metadata(context.metadata, true)?;
+        for tensor in context.tensor_index.tensors() {
+            match tensor.ggml_type {
+                0 => quote.add_tensor_f32(context.tensor_index, &tensor.name)?,
+                1 => quote.add_tensor_f16(context.tensor_index, &tensor.name)?,
+                _ => quote.add_tensor_raw(context.tensor_index, &tensor.name)?,
+            }
+        }
+        quote.finish()
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct WhisperExecutionOutput {
     pub(super) text: String,
@@ -320,27 +378,203 @@ struct WhisperDecoderPersistentStaticSession {
     reuse: Option<Seq2SeqReusableDecodeGraph>,
     graph_config: GgmlCpuGraphConfig,
     plan: WhisperDecoderGraphPlan,
+    decoder_state: Seq2SeqDecoderState,
 }
 
 /// (pack content id, backend). The content id
 /// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
 /// replacement at the same path from reusing a persistent session whose
 /// resident weights came from the old bytes.
-type WhisperEncoderPersistentSessionKey = (PackContentKey, GgmlCpuGraphBackend);
-type WhisperDecoderPersistentSessionKey = (PackContentKey, GgmlCpuGraphBackend);
+type WhisperEncoderPersistentSessionKey = (PackContentKey, ExecutionLaneKey);
+type WhisperDecoderPersistentSessionKey =
+    (PackContentKey, ExecutionLaneKey, Seq2SeqResidentCapacity);
 
-thread_local! {
-    // Gated on the idle-unload generation: these sessions pin the resident
-    // encoder/decoder weight caches in the TLS of a reused spawn_blocking
-    // thread, where the idle-unload reaper cannot drop them, so every access
-    // goes through `synced()` and discards pre-unload sessions on the owning
-    // thread instead of reusing them.
-    static WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY:
-        RefCell<UnloadGenerationGated<HashMap<WhisperEncoderPersistentSessionKey, WhisperEncoderPersistentStaticSession>>> =
-            RefCell::new(UnloadGenerationGated::new());
-    static WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY:
-        RefCell<UnloadGenerationGated<HashMap<WhisperDecoderPersistentSessionKey, Vec<WhisperDecoderPersistentStaticSession>>>> =
-            RefCell::new(UnloadGenerationGated::new());
+type WhisperEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    WhisperEncoderPersistentSessionKey,
+    WhisperEncoderRuntimeActorState,
+>;
+type WhisperDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    WhisperDecoderPersistentSessionKey,
+    WhisperDecoderRuntimeActorState,
+>;
+type WhisperEncoderRuntimeActor =
+    PinnedRuntimeActorCheckout<WhisperEncoderPersistentSessionKey, WhisperEncoderRuntimeActorState>;
+type WhisperDecoderRuntimeActor =
+    PinnedRuntimeActorCheckout<WhisperDecoderPersistentSessionKey, WhisperDecoderRuntimeActorState>;
+
+struct WhisperEncoderRuntimeActorState {
+    session: Option<WhisperEncoderPersistentStaticSession>,
+    runner: Arc<dyn WhisperEncoderGraphRunner>,
+    _prepared_owner: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+}
+
+struct WhisperDecoderRuntimeActorState {
+    session: Option<WhisperDecoderPersistentStaticSession>,
+    runner: Arc<dyn WhisperDecoderLoopRunner>,
+    _prepared_owner: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+}
+
+enum WhisperEncoderResultDelivery {
+    Ready(Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError>),
+    Pending(
+        std::sync::mpsc::Receiver<Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError>>,
+    ),
+}
+
+impl WhisperEncoderResultDelivery {
+    fn receive(self) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
+        match self {
+            Self::Ready(result) => result,
+            Self::Pending(receiver) => {
+                receiver
+                    .recv()
+                    .map_err(|_| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: "encoder result channel closed before delivery".to_string(),
+                    })?
+            }
+        }
+    }
+}
+
+struct WhisperDecoderActorJob {
+    runtime_source: GgmlRuntimeSource,
+    prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    prelude_plan: WhisperEncoderPreludePlan,
+    initial_prompt_tokens: Vec<u32>,
+    request_options: GgmlAsrExecutionOptions,
+    trace: WhisperGgmlTrace,
+    prelude_result: WhisperEncoderPreludeSeamResult,
+    decoder_state: Seq2SeqDecoderState,
+    audio_duration: f32,
+    allow_persistent_session_reuse: bool,
+    backend: GgmlCpuGraphBackend,
+    control: Arc<crate::api::backend::TranscriptionControl>,
+}
+
+impl WhisperDecoderActorJob {
+    fn run(
+        self,
+        state: &mut WhisperDecoderRuntimeActorState,
+        encoder_delivery: WhisperEncoderResultDelivery,
+    ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
+        let result = (|| {
+            let graph_config = whisper_decoder_graph_config(self.backend);
+            let needs_build = !self.allow_persistent_session_reuse
+                || state.session.as_ref().is_none_or(|session| {
+                    !decoder_persistent_session_matches_runtime(
+                        session,
+                        &self.prepared.execution,
+                        &self.prelude_plan,
+                        self.initial_prompt_tokens.len(),
+                        self.decoder_state,
+                        graph_config,
+                    )
+                });
+            if needs_build {
+                state.session = Some(build_whisper_decoder_persistent_static_session(
+                    &self.runtime_source,
+                    &self.prepared,
+                    &self.prelude_plan,
+                    self.initial_prompt_tokens.len(),
+                    self.decoder_state,
+                    &self.trace,
+                    self.backend,
+                )?);
+            }
+            let session = state.session.as_mut().ok_or_else(|| {
+                WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "decoder",
+                    reason: "actor session was not initialized".to_string(),
+                }
+            })?;
+
+            // Build the cross-cache graph while the encoder actor computes its
+            // hidden state. The prepared stage borrows this actor's runner and
+            // therefore never crosses an owner-thread boundary.
+            let prepared_stage = if session
+                .cache
+                .supports_cross_attention_for_plan(&session.plan)
+            {
+                Some(
+                    self.trace
+                        .run_stage("decoder_persistent_cache_prepare", || {
+                            session
+                                .cache
+                                .prepare_cross_attention_stage(&mut session.runner, &session.plan)
+                        })
+                        .map_err(
+                            |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
+                                reason: error.to_string(),
+                            },
+                        )?,
+                )
+            } else {
+                None
+            };
+
+            let encoder_result = encoder_delivery.receive()?;
+            let actual_encoder_frames = match &encoder_result {
+                WhisperEncoderGraphSeamResult::GraphExecuted { output_frames, .. } => {
+                    *output_frames
+                }
+            };
+            validate_whisper_decoder_state(
+                &self.prepared.execution,
+                self.decoder_state,
+                actual_encoder_frames,
+            )?;
+
+            let mut decoder_persistent_cache_populated = false;
+            if let Some(prepared_stage) = prepared_stage {
+                let encoder_hidden_f32 = match &encoder_result {
+                    WhisperEncoderGraphSeamResult::GraphExecuted {
+                        output_hidden_f32, ..
+                    } => output_hidden_f32.as_slice(),
+                };
+                self.trace
+                    .run_stage("decoder_persistent_cache", || {
+                        session.cache.populate_cross_attention_stage_with_prepared(
+                            prepared_stage,
+                            &session.plan,
+                            encoder_hidden_f32,
+                            WhisperDecoderHiddenStateLayout::SequenceHidden,
+                        )
+                    })
+                    .map_err(
+                        |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
+                            reason: error.to_string(),
+                        },
+                    )?;
+                decoder_persistent_cache_populated = true;
+            }
+
+            run_whisper_decode_loop(
+                &self.runtime_source,
+                &self.prepared.execution,
+                session,
+                &self.prepared.decoder_weights,
+                (
+                    &self.prepared.tokenizer,
+                    self.initial_prompt_tokens.as_slice(),
+                ),
+                &self.request_options,
+                &self.prelude_result,
+                &encoder_result,
+                self.audio_duration,
+                decoder_persistent_cache_populated,
+                state.runner.as_ref(),
+                &self.trace,
+                &self.control,
+            )
+        })();
+        if !self.allow_persistent_session_reuse {
+            // Request-scoped graph/KV state must be destroyed on the owner
+            // thread on success and on every early error path.
+            state.session = None;
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +590,41 @@ pub(super) struct WhisperDecoderMaterializedTensorSource {
     tensors_f32_by_name: HashMap<String, Arc<[f32]>>,
     tensors_f16_bits_by_name: HashMap<String, Arc<[u16]>>,
     tensors_quantized_by_name: HashMap<String, (i32, Arc<[u8]>)>,
+}
+
+impl WhisperDecoderMaterializedTensorSource {
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for (name, values) in &self.tensors_f32_by_name {
+            bytes.add_string(name, "whisper decoder f32 tensor name")?;
+            bytes.add_usize(
+                values
+                    .len()
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| {
+                        "whisper decoder f32 tensor payload byte count overflowed".to_string()
+                    })?,
+                "whisper decoder f32 tensor payload",
+            )?;
+        }
+        for (name, values) in &self.tensors_f16_bits_by_name {
+            bytes.add_string(name, "whisper decoder f16 tensor name")?;
+            bytes.add_usize(
+                values
+                    .len()
+                    .checked_mul(std::mem::size_of::<u16>())
+                    .ok_or_else(|| {
+                        "whisper decoder f16 tensor payload byte count overflowed".to_string()
+                    })?,
+                "whisper decoder f16 tensor payload",
+            )?;
+        }
+        for (name, (_, values)) in &self.tensors_quantized_by_name {
+            bytes.add_string(name, "whisper decoder quantized tensor name")?;
+            bytes.add_usize(values.len(), "whisper decoder quantized tensor payload")?;
+        }
+        Ok(bytes.finish())
+    }
 }
 
 impl WhisperDecoderTensorSource for WhisperDecoderMaterializedTensorSource {
@@ -459,10 +728,8 @@ trait WhisperEncoderPreludeRunner: Send + Sync {
 /// planned graph shape, the prelude's hidden-state output, and the backend
 /// this request resolved to. Grouped because they always travel together
 /// from `execute_whisper_with_prepared_runtime` through the seam and into
-/// the runner, and shared verbatim between [`WhisperEncoderGraphRunner::run_encoder_graph`]
-/// and [`run_encoder_graph_seam`], which have identical shapes.
+/// the owner-thread runner.
 struct WhisperEncoderGraphInput<'a> {
-    runtime_source: &'a GgmlRuntimeSource,
     execution: &'a WhisperGgmlExecutionMetadata,
     encoder_weights: &'a WhisperEncoderWeightBundle,
     plan: &'a WhisperEncoderGraphPlan,
@@ -475,6 +742,7 @@ trait WhisperEncoderGraphRunner: Send + Sync {
     fn run_encoder_graph(
         &self,
         input: WhisperEncoderGraphInput<'_>,
+        session: &mut WhisperEncoderPersistentStaticSession,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError>;
 }
 
@@ -866,16 +1134,10 @@ impl WhisperEncoderGraphRunner for WhisperCpuEncoderGraphComputeRunnerV0 {
     fn run_encoder_graph(
         &self,
         input: WhisperEncoderGraphInput<'_>,
+        session: &mut WhisperEncoderPersistentStaticSession,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
         let graph_config = whisper_encoder_graph_config(input.backend);
-        let mut session = take_or_build_whisper_encoder_persistent_static_session(
-            input.runtime_source,
-            input.execution,
-            input.encoder_weights,
-            input.plan,
-            graph_config,
-        )?;
-        let result = run_encoder_graph_with_runner(
+        run_encoder_graph_with_runner(
             self.runner_id(),
             graph_config,
             input.execution,
@@ -884,9 +1146,7 @@ impl WhisperEncoderGraphRunner for WhisperCpuEncoderGraphComputeRunnerV0 {
             input.encoder_hidden_input_f32,
             &mut session.runner,
             session.resident_weights.as_ref(),
-        );
-        store_whisper_encoder_persistent_static_session(input.runtime_source, session);
-        result
+        )
     }
 }
 
@@ -3018,10 +3278,32 @@ pub(crate) struct WhisperGgmlExecutor {
     decoder_runner: Arc<dyn WhisperDecoderLoopRunner>,
     tokenizer_provider: Arc<dyn WhisperTokenizerProvider>,
     runtime_cache_by_path: PreparedRuntimeCache<WhisperPreparedRuntime>,
+    serve_batch_engines: WhisperServeBatchEngineRegistry,
+    encoder_runtimes: Arc<WhisperEncoderRuntimePool>,
+    decoder_runtimes: Arc<WhisperDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for WhisperGgmlExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WhisperGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for WhisperGgmlExecutor {
     fn default() -> Self {
+        let max_committed_requested_bytes =
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        let encoder_limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            WHISPER_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            WHISPER_ENCODER_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        );
+        let decoder_limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            WHISPER_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            WHISPER_DECODER_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        );
         Self {
             mel_feature_input_provider: Arc::new(WhisperMelFeatureInputProviderFrontendV0),
             encoder_prelude_runner: Arc::new(WhisperCpuEncoderPreludeComputeRunnerV0),
@@ -3029,17 +3311,164 @@ impl Default for WhisperGgmlExecutor {
             decoder_runner: Arc::new(WhisperDecoderGraphRunnerGgmlV0),
             tokenizer_provider: Arc::new(WhisperTokenizerProviderGgufV0),
             runtime_cache_by_path: PreparedRuntimeCache::default(),
+            serve_batch_engines: WhisperServeBatchEngineRegistry::default(),
+            encoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-whisper-encoder-owner",
+                encoder_limits,
+            )),
+            decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-whisper-decoder-owner",
+                decoder_limits,
+            )),
         }
     }
+}
+
+fn map_whisper_actor_error(
+    stage: &'static str,
+    error: PinnedRuntimeActorError,
+) -> WhisperGgmlExecutorError {
+    WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+        stage,
+        reason: error.to_string(),
+    }
+}
+
+fn checkout_whisper_encoder_runtime(
+    pool: &WhisperEncoderRuntimePool,
+    runtime_source: &GgmlRuntimeSource,
+    prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    runner: Arc<dyn WhisperEncoderGraphRunner>,
+    backend: GgmlCpuGraphBackend,
+) -> Result<WhisperEncoderRuntimeActor, WhisperGgmlExecutorError> {
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        current_execution_lane_key(whisper_encoder_graph_config(backend).backend),
+    );
+    pool.checkout_or_try_build_with(
+        key,
+        move || Ok((0, (prepared, runner))),
+        move |(prepared, runner)| {
+            Ok(SystemMemoryOwner::without_allocation(
+                WhisperEncoderRuntimeActorState {
+                    session: None,
+                    runner,
+                    _prepared_owner: prepared,
+                },
+            ))
+        },
+        |error| map_whisper_actor_error("encoder", error),
+    )
+}
+
+fn checkout_whisper_decoder_runtime(
+    pool: &WhisperDecoderRuntimePool,
+    runtime_source: &GgmlRuntimeSource,
+    prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    runner: Arc<dyn WhisperDecoderLoopRunner>,
+    decoder_state: Seq2SeqDecoderState,
+    backend: GgmlCpuGraphBackend,
+) -> Result<WhisperDecoderRuntimeActor, WhisperGgmlExecutorError> {
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        current_execution_lane_key(whisper_decoder_graph_config(backend).backend),
+        decoder_state.resident_capacity(),
+    );
+    pool.checkout_or_try_build_with(
+        key,
+        move || Ok((0, (prepared, runner))),
+        move |(prepared, runner)| {
+            Ok(SystemMemoryOwner::without_allocation(
+                WhisperDecoderRuntimeActorState {
+                    session: None,
+                    runner,
+                    _prepared_owner: prepared,
+                },
+            ))
+        },
+        |error| map_whisper_actor_error("decoder", error),
+    )
+}
+
+fn run_whisper_encoder_actor(
+    actor: WhisperEncoderRuntimeActor,
+    runtime_source: GgmlRuntimeSource,
+    prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    execution: WhisperGgmlExecutionMetadata,
+    plan: WhisperEncoderGraphPlan,
+    encoder_hidden_input: Vec<f32>,
+    allow_persistent_session_reuse: bool,
+    backend: GgmlCpuGraphBackend,
+    trace: WhisperGgmlTrace,
+) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
+    actor
+        .call_mut(move |state| {
+            let graph_config = whisper_encoder_graph_config(backend);
+            let can_reuse = allow_persistent_session_reuse
+                && state.session.as_ref().is_some_and(|session| {
+                    encoder_persistent_session_matches_runtime(
+                        session,
+                        &execution,
+                        &plan,
+                        graph_config,
+                    )
+                });
+            if !can_reuse {
+                state.session = Some(build_whisper_encoder_persistent_static_session(
+                    &runtime_source,
+                    &execution,
+                    &prepared.encoder_weights,
+                    &plan,
+                    graph_config,
+                )?);
+            } else {
+                emit_encoder_resident_weight_cache_reuse_trace();
+            }
+            let session = state.session.as_mut().ok_or_else(|| {
+                WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "encoder",
+                    reason: "actor session was not initialized".to_string(),
+                }
+            })?;
+            let result = trace.run_stage("encoder_run", || {
+                run_encoder_graph_seam(
+                    WhisperEncoderGraphInput {
+                        execution: &execution,
+                        encoder_weights: &prepared.encoder_weights,
+                        plan: &plan,
+                        encoder_hidden_input_f32: &encoder_hidden_input,
+                        backend,
+                    },
+                    session,
+                    state.runner.as_ref(),
+                )
+            });
+            if !allow_persistent_session_reuse {
+                // Short-form requests do not promise cross-request graph
+                // reuse. Drop the session while still on its owner thread;
+                // the actor itself remains cacheable for future ownership
+                // and prepared-runtime reuse.
+                state.session = None;
+            }
+            result
+        })
+        .map_err(|error| map_whisper_actor_error("encoder", error))?
 }
 
 impl WhisperGgmlExecutor {
     fn prepared_runtime_for_preflight(
         &self,
         preflight: &crate::GgmlAsrRuntimeSourcePreflight,
-    ) -> Result<Arc<WhisperPreparedRuntime>, WhisperGgmlExecutorError> {
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<PreparedRuntimeHandle<WhisperPreparedRuntime>, WhisperGgmlExecutorError> {
         self.runtime_cache_by_path.get_or_try_insert_with(
             &preflight.runtime_source,
+            PreparedRuntimeQuoteContext {
+                model_architecture: crate::WHISPER_GGML_ARCHITECTURE_ID,
+                metadata: &preflight.metadata,
+                tensor_index: &preflight.tensor_index,
+                backend,
+            },
             || {
                 build_whisper_prepared_runtime(
                     &preflight.runtime_source,
@@ -3049,14 +3478,19 @@ impl WhisperGgmlExecutor {
                 )
             },
             whisper_runtime_cache_slot_unavailable,
+            |error| WhisperGgmlExecutorError::TensorMaterializationFailed {
+                reason: error.to_string(),
+            },
         )
     }
 
     /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
     /// resident state left over from a since-replaced pack without touching
-    /// any other content identity. Called by `pull`'s post-install handling
-    /// via [`crate::models::executor_component_registry::shared_whisper_executor`].
+    /// any other content identity. Reached through
+    /// [`crate::NativeExecutionServices::evict_prepared_runtime_content_id`].
     pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
     }
 }
@@ -3083,6 +3517,18 @@ impl GgmlAsrViewExecutor for WhisperGgmlExecutor {
         true
     }
 
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_whisper_decoder_state,
+            ),
+        )
+    }
+
     fn execute_view(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -3092,7 +3538,9 @@ impl GgmlAsrViewExecutor for WhisperGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
-        shutdown_whisper_serve_batch_engines();
+        shutdown_whisper_serve_batch_engines(&self.serve_batch_engines);
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -3112,6 +3560,15 @@ impl WhisperGgmlExecutor {
         request: &GgmlAsrExecutionViewRequest,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        let decoder_state = Seq2SeqDecoderState::from_request_state(
+            &request.decoder_state,
+            super::capacity::WHISPER_DECODER_STATE_IDS,
+        )
+        .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
+            executor_id: GgmlAsrViewExecutor::executor_id(self),
+            adapter_id: request.selected_family.adapter_id,
+            reason: error.to_string(),
+        })?;
         let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
@@ -3120,54 +3577,32 @@ impl WhisperGgmlExecutor {
                 reason: error.to_string(),
             })?;
         let reuse_runtime_state = request.request_options.longform.is_some();
-        let output = if reuse_runtime_state {
-            let prepared_runtime = self
-                .prepared_runtime_for_preflight(preflight.as_ref())
-                .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                    executor_id: GgmlAsrViewExecutor::executor_id(self),
-                    adapter_id: request.selected_family.adapter_id,
-                    reason: error.to_string(),
-                })?;
-            execute_whisper_with_prepared_runtime(
-                &request.selected_family,
-                &preflight.runtime_source,
-                &request.prepared_audio,
-                prepared_runtime.as_ref(),
-                &request.request_options,
-                self.mel_feature_input_provider.as_ref(),
-                self.encoder_prelude_runner.as_ref(),
-                self.encoder_graph_runner.as_ref(),
-                self.decoder_runner.as_ref(),
-                true,
-                skip_serve_batch,
-                &request.execution_context,
-                request.resolved_runtime.backend(),
-            )
-        } else {
-            let runtime = build_whisper_prepared_runtime(
-                &preflight.runtime_source,
-                &preflight.metadata,
-                &preflight.tensor_index,
-                self.tokenizer_provider.as_ref(),
-            );
-            runtime.and_then(|runtime| {
-                execute_whisper_with_prepared_runtime(
-                    &request.selected_family,
-                    &preflight.runtime_source,
-                    &request.prepared_audio,
-                    &runtime,
-                    &request.request_options,
-                    self.mel_feature_input_provider.as_ref(),
-                    self.encoder_prelude_runner.as_ref(),
-                    self.encoder_graph_runner.as_ref(),
-                    self.decoder_runner.as_ref(),
-                    false,
-                    skip_serve_batch,
-                    &request.execution_context,
-                    request.resolved_runtime.backend(),
-                )
-            })
-        }
+        let prepared_runtime = self
+            .prepared_runtime_for_preflight(preflight.as_ref(), request.resolved_runtime.backend())
+            .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: GgmlAsrViewExecutor::executor_id(self),
+                adapter_id: request.selected_family.adapter_id,
+                reason: error.to_string(),
+            })?;
+        let output = execute_whisper_with_prepared_runtime(
+            &request.selected_family,
+            &preflight.runtime_source,
+            &request.prepared_audio,
+            prepared_runtime,
+            decoder_state,
+            &request.request_options,
+            &self.serve_batch_engines,
+            &self.encoder_runtimes,
+            &self.decoder_runtimes,
+            self.mel_feature_input_provider.as_ref(),
+            self.encoder_prelude_runner.as_ref(),
+            Arc::clone(&self.encoder_graph_runner),
+            Arc::clone(&self.decoder_runner),
+            reuse_runtime_state,
+            skip_serve_batch,
+            &request.execution_context,
+            request.resolved_runtime.backend(),
+        )
         .map_err(|error| match error {
             WhisperGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
                 GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
@@ -3224,7 +3659,9 @@ impl GgmlAsrStreamingExecutor for WhisperGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
-        shutdown_whisper_serve_batch_engines();
+        shutdown_whisper_serve_batch_engines(&self.serve_batch_engines);
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -3408,31 +3845,6 @@ fn build_whisper_carry_prompt_seed_token_ids(
     }
 }
 
-fn take_whisper_encoder_persistent_static_session(
-    runtime_source: &GgmlRuntimeSource,
-    backend: GgmlCpuGraphBackend,
-) -> Option<WhisperEncoderPersistentStaticSession> {
-    WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
-        sessions
-            .borrow_mut()
-            .synced()
-            .remove(&(PackContentKey::for_runtime_source(runtime_source), backend))
-    })
-}
-
-fn store_whisper_encoder_persistent_static_session(
-    runtime_source: &GgmlRuntimeSource,
-    session: WhisperEncoderPersistentStaticSession,
-) {
-    WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
-        let key = (
-            PackContentKey::for_runtime_source(runtime_source),
-            session.graph_config.backend,
-        );
-        sessions.borrow_mut().synced().insert(key, session);
-    });
-}
-
 fn encoder_persistent_session_matches_runtime(
     session: &WhisperEncoderPersistentStaticSession,
     execution: &WhisperGgmlExecutionMetadata,
@@ -3487,62 +3899,79 @@ fn build_whisper_encoder_persistent_static_session(
     })
 }
 
-fn take_or_build_whisper_encoder_persistent_static_session(
-    runtime_source: &GgmlRuntimeSource,
-    execution: &WhisperGgmlExecutionMetadata,
-    encoder_weights: &WhisperEncoderWeightBundle,
-    plan: &WhisperEncoderGraphPlan,
-    graph_config: GgmlCpuGraphConfig,
-) -> Result<WhisperEncoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    if let Some(session) =
-        take_whisper_encoder_persistent_static_session(runtime_source, graph_config.backend)
-        && encoder_persistent_session_matches_runtime(&session, execution, plan, graph_config)
-    {
-        emit_encoder_resident_weight_cache_reuse_trace();
-        return Ok(session);
-    }
-    build_whisper_encoder_persistent_static_session(
-        runtime_source,
-        execution,
-        encoder_weights,
-        plan,
-        graph_config,
-    )
-}
-
 fn decoder_persistent_session_matches_runtime(
     session: &WhisperDecoderPersistentStaticSession,
     execution: &WhisperGgmlExecutionMetadata,
     prelude_plan: &WhisperEncoderPreludePlan,
     initial_prompt_token_count: usize,
+    decoder_state: Seq2SeqDecoderState,
     graph_config: GgmlCpuGraphConfig,
 ) -> bool {
+    let current_schedule_fits =
+        decode_generated_token_step_cap(execution.max_target_positions, initial_prompt_token_count)
+            .ok()
+            .and_then(|generated| {
+                crate::capacity::decode_schedule::greedy_self_kv_positions(
+                    initial_prompt_token_count,
+                    generated,
+                )
+                .ok()
+            })
+            .is_some_and(|required| required <= decoder_state.self_attention.logical_positions);
     session.graph_config == graph_config
-        && session.plan.input_shape.token_count == initial_prompt_token_count
+        && session.decoder_state == decoder_state
         && session.plan.input_shape.encoder_frames == prelude_plan.output_frames
         && session.plan.input_shape.hidden_size == execution.encoder_hidden_size
         && session.plan.layers.len() == execution.decoder_layers
         && session.plan.decoder_attention_heads == execution.decoder_attention_heads
         && session.plan.output_projection.vocab_size == execution.vocab_size
-        && session.plan.input_shape.token_count <= execution.max_target_positions
+        && session.plan.position_embedding.vocab_size == execution.max_target_positions
+        && current_schedule_fits
 }
 
-fn build_whisper_decoder_persistent_static_session(
-    runtime_source: &GgmlRuntimeSource,
+fn validate_whisper_decoder_state(
+    execution: &WhisperGgmlExecutionMetadata,
+    decoder_state: Seq2SeqDecoderState,
+    encoder_frames: usize,
+) -> Result<(), WhisperGgmlExecutorError> {
+    decoder_state
+        .validate()
+        .and_then(|()| {
+            decoder_state.self_attention.validate_runtime_ceiling(
+                StateKind::SelfAttentionKv,
+                execution.max_target_positions,
+            )
+        })
+        .and_then(|()| {
+            decoder_state
+                .cross_attention
+                .validate_exact_shape(StateKind::CrossAttentionKv, encoder_frames)
+        })
+        .and_then(|()| {
+            decoder_state.cross_attention.validate_resident_shape(
+                StateKind::CrossAttentionKv,
+                persistent_cross_attention_layer_stride_frames(encoder_frames),
+            )
+        })
+        .map_err(
+            |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
+                reason: error.to_string(),
+            },
+        )
+}
+
+fn build_whisper_decoder_session_plan(
     runtime: &WhisperPreparedRuntime,
     prelude_plan: &WhisperEncoderPreludePlan,
     initial_prompt_token_count: usize,
-    trace: &WhisperGgmlTrace,
-    backend: GgmlCpuGraphBackend,
-) -> Result<WhisperDecoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let graph_config = whisper_decoder_graph_config(backend);
-    let plan = build_whisper_decoder_graph_plan(
+) -> Result<WhisperDecoderGraphPlan, WhisperGgmlExecutorError> {
+    build_whisper_decoder_graph_plan(
         WhisperDecoderGraphMetadata {
             decoder_layers: runtime.execution.decoder_layers,
             decoder_hidden_size: runtime.execution.decoder_hidden_size,
             decoder_attention_heads: runtime.execution.decoder_attention_heads,
             vocab_size: runtime.execution.vocab_size,
-            max_target_positions: runtime.execution.max_target_positions,
+            semantic_context_positions: runtime.execution.max_target_positions,
         },
         &runtime.decoder_weights.graph_binding,
         &runtime.decoder_weights.graph_materialization,
@@ -3557,7 +3986,26 @@ fn build_whisper_decoder_persistent_static_session(
         |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
             reason: error.to_string(),
         },
+    )
+}
+
+fn build_whisper_decoder_persistent_static_session(
+    runtime_source: &GgmlRuntimeSource,
+    runtime: &WhisperPreparedRuntime,
+    prelude_plan: &WhisperEncoderPreludePlan,
+    initial_prompt_token_count: usize,
+    decoder_state: Seq2SeqDecoderState,
+    trace: &WhisperGgmlTrace,
+    backend: GgmlCpuGraphBackend,
+) -> Result<WhisperDecoderPersistentStaticSession, WhisperGgmlExecutorError> {
+    let graph_config = whisper_decoder_graph_config(backend);
+    validate_whisper_decoder_state(
+        &runtime.execution,
+        decoder_state,
+        prelude_plan.output_frames,
     )?;
+    let plan =
+        build_whisper_decoder_session_plan(runtime, prelude_plan, initial_prompt_token_count)?;
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(|error| {
         WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
             reason: format!("could not initialize static decoder cache runner: {error}"),
@@ -3571,7 +4019,7 @@ fn build_whisper_decoder_persistent_static_session(
                 &plan,
                 &runtime.decoder_weights.tensor_source,
                 &mut persistent_weight_tensor_cache,
-                runtime.execution.max_target_positions,
+                decoder_state.self_attention.resident_positions,
                 Some(runtime_source),
             )
         })
@@ -3586,80 +4034,8 @@ fn build_whisper_decoder_persistent_static_session(
         reuse: None,
         graph_config,
         plan,
+        decoder_state,
     })
-}
-
-fn take_or_build_whisper_decoder_persistent_static_session(
-    runtime_source: &GgmlRuntimeSource,
-    runtime: &WhisperPreparedRuntime,
-    prelude_plan: &WhisperEncoderPreludePlan,
-    initial_prompt_token_count: usize,
-    trace: &WhisperGgmlTrace,
-    backend: GgmlCpuGraphBackend,
-) -> Result<WhisperDecoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let graph_config = whisper_decoder_graph_config(backend);
-    let key = (
-        PackContentKey::for_runtime_source(runtime_source),
-        graph_config.backend,
-    );
-    WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
-        let mut sessions = sessions.borrow_mut();
-        let sessions = sessions.synced();
-        if let Some(pool) = sessions.get_mut(&key)
-            && let Some(index) = pool.iter().position(|session| {
-                decoder_persistent_session_matches_runtime(
-                    session,
-                    &runtime.execution,
-                    prelude_plan,
-                    initial_prompt_token_count,
-                    graph_config,
-                )
-            })
-        {
-            let session = pool.swap_remove(index);
-            if pool.is_empty() {
-                sessions.remove(&key);
-            }
-            return Ok(session);
-        }
-        build_whisper_decoder_persistent_static_session(
-            runtime_source,
-            runtime,
-            prelude_plan,
-            initial_prompt_token_count,
-            trace,
-            backend,
-        )
-    })
-}
-
-fn store_whisper_decoder_persistent_static_session(
-    runtime_source: &GgmlRuntimeSource,
-    session: WhisperDecoderPersistentStaticSession,
-) {
-    WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
-        let mut sessions = sessions.borrow_mut();
-        let sessions = sessions.synced();
-        let key = (
-            PackContentKey::for_runtime_source(runtime_source),
-            session.graph_config.backend,
-        );
-        let pool = sessions.entry(key).or_default();
-        if let Some(index) = pool.iter().position(|existing| {
-            existing.graph_config == session.graph_config
-                && existing.plan.input_shape == session.plan.input_shape
-                && existing.plan.layers.len() == session.plan.layers.len()
-                && existing.plan.decoder_attention_heads == session.plan.decoder_attention_heads
-                && existing.plan.output_projection.vocab_size
-                    == session.plan.output_projection.vocab_size
-        }) {
-            pool.swap_remove(index);
-        }
-        pool.push(session);
-        if pool.len() > WHISPER_DECODER_PERSISTENT_SESSION_POOL_CAPACITY {
-            pool.remove(0);
-        }
-    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3667,17 +4043,22 @@ fn execute_whisper_with_prepared_runtime(
     adapter: &GgmlFamilyAdapterDescriptor,
     runtime_source: &GgmlRuntimeSource,
     prepared_audio: &GgmlAsrPreparedAudioView,
-    runtime: &WhisperPreparedRuntime,
+    prepared_owner: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    decoder_state: Seq2SeqDecoderState,
     request_options: &GgmlAsrExecutionOptions,
+    serve_batch_engines: &WhisperServeBatchEngineRegistry,
+    encoder_runtimes: &WhisperEncoderRuntimePool,
+    decoder_runtimes: &WhisperDecoderRuntimePool,
     mel_feature_input_provider: &dyn WhisperMelFeatureInputProvider,
     prelude_runner: &dyn WhisperEncoderPreludeRunner,
-    encoder_graph_runner: &dyn WhisperEncoderGraphRunner,
-    decoder_runner: &dyn WhisperDecoderLoopRunner,
+    encoder_graph_runner: Arc<dyn WhisperEncoderGraphRunner>,
+    decoder_runner: Arc<dyn WhisperDecoderLoopRunner>,
     allow_persistent_session_reuse: bool,
     skip_serve_batch: bool,
     execution_context: &std::sync::Arc<crate::RequestExecutionContext>,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
+    let runtime = prepared_owner.as_ref();
     let trace = WhisperGgmlTrace::from_env();
     if adapter.adapter_id != WHISPER_GGML_ADAPTER_ID {
         return Err(WhisperGgmlExecutorError::AdapterMismatch {
@@ -3720,6 +4101,11 @@ fn execute_whisper_with_prepared_runtime(
         )
         .map_err(map_prelude_plan_error)
     })?;
+    validate_whisper_decoder_state(
+        &runtime.execution,
+        decoder_state,
+        prelude_plan.output_frames,
+    )?;
     let prelude_result = trace.run_stage("prelude_run", || {
         run_encoder_prelude_seam(
             runtime_source,
@@ -3763,8 +4149,9 @@ fn execute_whisper_with_prepared_runtime(
     let prelude_hidden_output = match &prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
             output_hidden_f32, ..
-        } => output_hidden_f32.as_slice(),
+        } => output_hidden_f32.clone(),
     };
+    let audio_duration = audio_duration_seconds(prepared_audio);
     let serve_batch_config =
         WhisperServeBatchConfig::from_server_policy(request_options.serve_batch);
     let decoder_graph_config = whisper_decoder_graph_config(resolved_backend);
@@ -3775,25 +4162,31 @@ fn execute_whisper_with_prepared_runtime(
             allow_persistent_session_reuse,
         );
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
-        let encoder_result = trace.run_stage("encoder_run", || {
-            run_encoder_graph_seam(
-                WhisperEncoderGraphInput {
-                    runtime_source,
-                    execution: &runtime.execution,
-                    encoder_weights: &runtime.encoder_weights,
-                    plan: &encoder_plan,
-                    encoder_hidden_input_f32: prelude_hidden_output,
-                    backend: resolved_backend,
-                },
-                encoder_graph_runner,
-            )
-        })?;
+        let encoder_actor = checkout_whisper_encoder_runtime(
+            encoder_runtimes,
+            runtime_source,
+            Arc::clone(&prepared_owner),
+            Arc::clone(&encoder_graph_runner),
+            resolved_backend,
+        )?;
+        let encoder_result = run_whisper_encoder_actor(
+            encoder_actor,
+            runtime_source.clone(),
+            Arc::clone(&prepared_owner),
+            runtime.execution.clone(),
+            encoder_plan.clone(),
+            prelude_hidden_output.clone(),
+            allow_persistent_session_reuse,
+            resolved_backend,
+            trace.clone(),
+        )?;
         let WhisperEncoderGraphSeamResult::GraphExecuted {
             output_frames,
             output_hidden_size,
             output_hidden_f32,
             ..
         } = encoder_result;
+        validate_whisper_decoder_state(&runtime.execution, decoder_state, output_frames)?;
         emit_encoder_hidden_probe_trace(&output_hidden_f32, output_frames, output_hidden_size);
         let eot_token_id = runtime
             .tokenizer
@@ -3802,6 +4195,11 @@ fn execute_whisper_with_prepared_runtime(
         let max_generated_tokens = decode_generated_token_step_cap(
             runtime.execution.max_target_positions,
             initial_prompt_tokens.len(),
+        )?;
+        validate_whisper_self_kv_schedule(
+            decoder_state,
+            initial_prompt_tokens.len(),
+            max_generated_tokens,
         )?;
         let decode_config = whisper_serve_batch_decode_config(
             initial_prompt_tokens,
@@ -3817,6 +4215,7 @@ fn execute_whisper_with_prepared_runtime(
             },
         )?;
         return submit_whisper_serve_batch_job(
+            serve_batch_engines,
             serve_batch_config,
             WhisperServeBatchJob {
                 runtime_cache_path: canonical_runtime_cache_path(runtime_source.path()),
@@ -3833,6 +4232,7 @@ fn execute_whisper_with_prepared_runtime(
                 execution: runtime.execution.clone(),
                 decoder_weights: runtime.decoder_weights.clone(),
                 tokenizer: runtime.tokenizer.clone(),
+                decoder_state,
                 encoder_frames: output_frames,
                 encoder_hidden_size: output_hidden_size,
                 encoder_hidden_f32: output_hidden_f32,
@@ -3856,191 +4256,98 @@ fn execute_whisper_with_prepared_runtime(
             },
         });
     }
-    let mut decoder_persistent_static = if allow_persistent_session_reuse {
-        take_or_build_whisper_decoder_persistent_static_session(
-            runtime_source,
-            runtime,
-            &prelude_plan,
-            initial_prompt_tokens.len(),
-            &trace,
-            resolved_backend,
-        )?
-    } else {
-        build_whisper_decoder_persistent_static_session(
-            runtime_source,
-            runtime,
-            &prelude_plan,
-            initial_prompt_tokens.len(),
-            &trace,
-            resolved_backend,
-        )?
-    };
-    let longform_backend = resolved_backend;
-    let (encoder_result, decoder_persistent_cache_populated) =
-        if whisper_parallel_encoder_and_decoder_static_enabled(
-            longform_backend,
-            allow_persistent_session_reuse,
-        ) {
-            std::thread::scope(|parallel_scope| {
-                let execution_ref = &runtime.execution;
-                let runtime_source_ref = runtime_source;
-                let encoder_weights_ref = &runtime.encoder_weights;
-                let encoder_plan_ref = &encoder_plan;
-                let encoder_trace = trace.clone();
-                let encoder_handle = parallel_scope.spawn(move || {
-                    encoder_trace.run_stage("encoder_run", || {
-                        run_encoder_graph_seam(
-                            WhisperEncoderGraphInput {
-                                runtime_source: runtime_source_ref,
-                                execution: execution_ref,
-                                encoder_weights: encoder_weights_ref,
-                                plan: encoder_plan_ref,
-                                encoder_hidden_input_f32: prelude_hidden_output,
-                                backend: resolved_backend,
-                            },
-                            encoder_graph_runner,
-                        )
-                    })
-                });
-                let mut prepared_cross_attention_stage = if decoder_persistent_static
-                    .cache
-                    .supports_cross_attention_for_plan(&decoder_persistent_static.plan)
-                {
-                    let prepared_stage = trace
-                        .run_stage("decoder_persistent_cache_prepare", || {
-                            decoder_persistent_static
-                                .cache
-                                .prepare_cross_attention_stage(
-                                    &mut decoder_persistent_static.runner,
-                                    &decoder_persistent_static.plan,
-                                )
-                        })
-                        .map_err(
-                            |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
-                                reason: error.to_string(),
-                            },
-                        )?;
-                    Some(prepared_stage)
-                } else {
-                    None
-                };
-                let encoder_result = encoder_handle
-                    .join()
-                    .map_err(|_| WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
-                        reason: "encoder runner worker panicked".to_string(),
-                    })?
-                    .map_err(
-                        |error| WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
-                            reason: error.to_string(),
-                        },
-                    )?;
-                let mut decoder_persistent_cache_populated = false;
-                if let Some(prepared_stage) = prepared_cross_attention_stage.take() {
-                    let encoder_hidden_f32 = match &encoder_result {
-                        WhisperEncoderGraphSeamResult::GraphExecuted {
-                            output_hidden_f32, ..
-                        } => output_hidden_f32.as_slice(),
-                    };
-                    trace
-                        .run_stage("decoder_persistent_cache", || {
-                            decoder_persistent_static
-                                .cache
-                                .populate_cross_attention_stage_with_prepared(
-                                    prepared_stage,
-                                    &decoder_persistent_static.plan,
-                                    encoder_hidden_f32,
-                                    WhisperDecoderHiddenStateLayout::SequenceHidden,
-                                )
-                        })
-                        .map_err(
-                            |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
-                                reason: error.to_string(),
-                            },
-                        )?;
-                    decoder_persistent_cache_populated = true;
-                }
-                Ok::<_, WhisperGgmlExecutorError>((
-                    encoder_result,
-                    decoder_persistent_cache_populated,
-                ))
-            })?
-        } else {
-            let encoder_result = trace.run_stage("encoder_run", || {
-                run_encoder_graph_seam(
-                    WhisperEncoderGraphInput {
-                        runtime_source,
-                        execution: &runtime.execution,
-                        encoder_weights: &runtime.encoder_weights,
-                        plan: &encoder_plan,
-                        encoder_hidden_input_f32: prelude_hidden_output,
-                        backend: resolved_backend,
-                    },
-                    encoder_graph_runner,
-                )
-            })?;
-            let mut decoder_persistent_cache_populated = false;
-            if decoder_persistent_static
-                .cache
-                .supports_cross_attention_for_plan(&decoder_persistent_static.plan)
-            {
-                let prepared_stage = trace
-                    .run_stage("decoder_persistent_cache_prepare", || {
-                        decoder_persistent_static
-                            .cache
-                            .prepare_cross_attention_stage(
-                                &mut decoder_persistent_static.runner,
-                                &decoder_persistent_static.plan,
-                            )
-                    })
-                    .map_err(
-                        |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
-                            reason: error.to_string(),
-                        },
-                    )?;
-                let encoder_hidden_f32 = match &encoder_result {
-                    WhisperEncoderGraphSeamResult::GraphExecuted {
-                        output_hidden_f32, ..
-                    } => output_hidden_f32.as_slice(),
-                };
-                trace
-                    .run_stage("decoder_persistent_cache", || {
-                        decoder_persistent_static
-                            .cache
-                            .populate_cross_attention_stage_with_prepared(
-                                prepared_stage,
-                                &decoder_persistent_static.plan,
-                                encoder_hidden_f32,
-                                WhisperDecoderHiddenStateLayout::SequenceHidden,
-                            )
-                    })
-                    .map_err(
-                        |error| WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
-                            reason: error.to_string(),
-                        },
-                    )?;
-                decoder_persistent_cache_populated = true;
-            }
-            (encoder_result, decoder_persistent_cache_populated)
-        };
-    let decode_result = run_whisper_decode_loop(
+    let encoder_actor = checkout_whisper_encoder_runtime(
+        encoder_runtimes,
         runtime_source,
-        &runtime.execution,
-        &mut decoder_persistent_static,
-        &runtime.decoder_weights,
-        (&runtime.tokenizer, initial_prompt_tokens.as_slice()),
-        request_options,
-        &prelude_result,
-        &encoder_result,
-        audio_duration_seconds(prepared_audio),
-        decoder_persistent_cache_populated,
-        decoder_runner,
-        &trace,
-        &execution_context.control,
-    );
-    if allow_persistent_session_reuse {
-        store_whisper_decoder_persistent_static_session(runtime_source, decoder_persistent_static);
+        Arc::clone(&prepared_owner),
+        Arc::clone(&encoder_graph_runner),
+        resolved_backend,
+    )?;
+    let decoder_actor = checkout_whisper_decoder_runtime(
+        decoder_runtimes,
+        runtime_source,
+        Arc::clone(&prepared_owner),
+        Arc::clone(&decoder_runner),
+        decoder_state,
+        resolved_backend,
+    )?;
+
+    let decoder_job = WhisperDecoderActorJob {
+        runtime_source: runtime_source.clone(),
+        prepared: Arc::clone(&prepared_owner),
+        prelude_plan: prelude_plan.clone(),
+        initial_prompt_tokens,
+        request_options: request_options.clone(),
+        trace: trace.clone(),
+        prelude_result,
+        decoder_state,
+        audio_duration,
+        allow_persistent_session_reuse,
+        backend: resolved_backend,
+        control: Arc::clone(&execution_context.control),
+    };
+    let run_encoder = || {
+        run_whisper_encoder_actor(
+            encoder_actor,
+            runtime_source.clone(),
+            Arc::clone(&prepared_owner),
+            runtime.execution.clone(),
+            encoder_plan,
+            prelude_hidden_output,
+            allow_persistent_session_reuse,
+            resolved_backend,
+            trace,
+        )
+    };
+
+    if whisper_parallel_encoder_and_decoder_static_enabled(
+        resolved_backend,
+        allow_persistent_session_reuse,
+    ) {
+        let (encoder_tx, encoder_rx) = std::sync::mpsc::sync_channel(1);
+        let pending_decoder = call_checked_out_actor_mut_async(decoder_actor, move |state| {
+            decoder_job.run(state, WhisperEncoderResultDelivery::Pending(encoder_rx))
+        })
+        .map_err(|error| map_whisper_actor_error("decoder", error))?;
+        // The decoder actor is now constructing its static session/cross-cache
+        // graph while this thread drives the independent encoder actor.
+        let encoder_outcome = run_encoder();
+        let _ = encoder_tx.send(encoder_outcome);
+        pending_decoder
+            .join()
+            .map_err(|error| map_whisper_actor_error("decoder", error))?
+    } else {
+        let encoder_result = run_encoder()?;
+        decoder_actor
+            .call_mut(move |state| {
+                decoder_job.run(
+                    state,
+                    WhisperEncoderResultDelivery::Ready(Ok(encoder_result)),
+                )
+            })
+            .map_err(|error| map_whisper_actor_error("decoder", error))?
     }
-    decode_result
+}
+
+#[cfg(test)]
+fn whisper_decoder_state_for_execution(
+    execution: &WhisperGgmlExecutionMetadata,
+) -> Seq2SeqDecoderState {
+    let cross_resident =
+        persistent_cross_attention_layer_stride_frames(execution.encoder_context_length);
+    let self_positions = execution.max_target_positions - 1;
+    Seq2SeqDecoderState {
+        self_attention: Seq2SeqStateAxis {
+            logical_positions: self_positions,
+            resident_positions: self_positions,
+            hard_position_cap: self_positions,
+        },
+        cross_attention: Seq2SeqStateAxis {
+            logical_positions: execution.encoder_context_length,
+            resident_positions: cross_resident,
+            hard_position_cap: cross_resident,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -4052,18 +4359,26 @@ fn execute_whisper_ggml_non_streaming_cpu(
     prepared_audio: &GgmlAsrPreparedAudioView,
     mel_feature_input_provider: &dyn WhisperMelFeatureInputProvider,
     prelude_runner: &dyn WhisperEncoderPreludeRunner,
-    encoder_graph_runner: &dyn WhisperEncoderGraphRunner,
-    decoder_runner: &dyn WhisperDecoderLoopRunner,
+    encoder_graph_runner: Arc<dyn WhisperEncoderGraphRunner>,
+    decoder_runner: Arc<dyn WhisperDecoderLoopRunner>,
     tokenizer_provider: &dyn WhisperTokenizerProvider,
 ) -> Result<String, WhisperGgmlExecutorError> {
     let runtime =
         build_whisper_prepared_runtime(runtime_source, metadata, tensor_index, tokenizer_provider)?;
+    let decoder_state = whisper_decoder_state_for_execution(&runtime.execution);
+    let prepared_owner = Arc::new(SystemMemoryOwner::without_allocation(runtime));
+    let executor = WhisperGgmlExecutor::default();
+    let serve_batch_engines = WhisperServeBatchEngineRegistry::default();
     execute_whisper_with_prepared_runtime(
         adapter,
         runtime_source,
         prepared_audio,
-        &runtime,
+        prepared_owner,
+        decoder_state,
         &GgmlAsrExecutionOptions::default(),
+        &serve_batch_engines,
+        &executor.encoder_runtimes,
+        &executor.decoder_runtimes,
         mel_feature_input_provider,
         prelude_runner,
         encoder_graph_runner,
@@ -4195,9 +4510,10 @@ fn run_encoder_prelude_seam(
 
 fn run_encoder_graph_seam(
     input: WhisperEncoderGraphInput<'_>,
+    session: &mut WhisperEncoderPersistentStaticSession,
     encoder_graph_runner: &dyn WhisperEncoderGraphRunner,
 ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
-    encoder_graph_runner.run_encoder_graph(input)
+    encoder_graph_runner.run_encoder_graph(input, session)
 }
 
 fn build_encoder_graph_binding_seam(
@@ -4694,6 +5010,29 @@ fn decode_generated_token_step_cap(
         .map(|budget| budget.min(WHISPER_DEFAULT_DECODE_MAX_GENERATED_TOKENS_CAP))
 }
 
+fn validate_whisper_self_kv_schedule(
+    decoder_state: Seq2SeqDecoderState,
+    initial_prompt_len: usize,
+    max_generated_tokens: usize,
+) -> Result<(), WhisperGgmlExecutorError> {
+    let required = crate::capacity::decode_schedule::greedy_self_kv_positions(
+        initial_prompt_len,
+        max_generated_tokens,
+    )
+    .map_err(|error| WhisperGgmlExecutorError::DecoderGraphUnsupported {
+        reason: format!("whisper decode schedule is invalid: {error}"),
+    })?;
+    if required > decoder_state.self_attention.logical_positions {
+        return Err(WhisperGgmlExecutorError::DecoderGraphUnsupported {
+            reason: format!(
+                "whisper greedy schedule requires {required} self-KV rows, planner supplied {}",
+                decoder_state.self_attention.logical_positions
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
@@ -5145,6 +5484,12 @@ fn run_whisper_decode_loop(
         initial_prompt_tokens.len(),
     )
     .map_err(|error| decorate_decoder_boundary_error(error, &prelude_summary, &encoder_summary))?;
+    validate_whisper_self_kv_schedule(
+        decoder_persistent_static.decoder_state,
+        initial_prompt_tokens.len(),
+        max_generated_tokens,
+    )
+    .map_err(|error| decorate_decoder_boundary_error(error, &prelude_summary, &encoder_summary))?;
     let decode_loop_span = trace.start_stage("decode_loop");
     let decode_loop_start = Instant::now();
     let plan_cache_base = WhisperDecoderStepPlanCacheBase {
@@ -5153,7 +5498,7 @@ fn run_whisper_decode_loop(
             decoder_hidden_size: execution.decoder_hidden_size,
             decoder_attention_heads: execution.decoder_attention_heads,
             vocab_size: execution.vocab_size,
-            max_target_positions: execution.max_target_positions,
+            semantic_context_positions: execution.max_target_positions,
         },
         encoder_frames,
         encoder_hidden_size,

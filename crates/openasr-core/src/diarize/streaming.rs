@@ -8,15 +8,14 @@
 //! identities, while high-confidence enrollment matches anchor profile-owned
 //! speakers before anonymous assignment.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use super::calibration::StreamingCalibrationProfile;
 use super::contract::{SpeakerEmbedding, SpeakerId};
 use super::debug::diarize_debug_enabled as debug_enabled;
-use super::embed::{SpeakerEmbedder, shared_embedder};
+use super::embed::SpeakerEmbedder;
 use super::enrollment::SpeakerDisplayAssignment;
-use super::voice_id::{PersonMatcher, VoiceIdAssignment, load_person_matcher_for_embedder};
+use super::voice_id::{PersonMatcher, VoiceIdAssignment};
 
 /// Default cosine-similarity floor to reuse an existing speaker. Mirrors the
 /// legacy reuse floor. The active ReDimNet2-B6 calibration can override this in
@@ -458,7 +457,21 @@ impl SpeakerRegistry {
     }
 }
 
-/// Per-session streaming diarizer over the shared ReDimNet2-B6 embedder.
+enum SpeakerEmbedderHandle {
+    Static(&'static dyn SpeakerEmbedder),
+    Shared(Arc<dyn SpeakerEmbedder>),
+}
+
+impl SpeakerEmbedderHandle {
+    fn as_ref(&self) -> &dyn SpeakerEmbedder {
+        match self {
+            Self::Static(embedder) => *embedder,
+            Self::Shared(embedder) => embedder.as_ref(),
+        }
+    }
+}
+
+/// Per-session streaming diarizer over one explicitly owned embedding runtime.
 pub struct StreamingDiarizer {
     embedder: SpeakerEmbedderHandle,
     registry: SpeakerRegistry,
@@ -497,43 +510,25 @@ pub struct StreamingSpeakerChangeDetector {
     anchor_quality: Option<UtteranceQuality>,
 }
 
-enum SpeakerEmbedderHandle {
-    Shared(Arc<dyn SpeakerEmbedder>),
-    Static(&'static dyn SpeakerEmbedder),
-}
-
-impl std::ops::Deref for SpeakerEmbedderHandle {
-    type Target = dyn SpeakerEmbedder;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Shared(embedder) => embedder.as_ref(),
-            Self::Static(embedder) => *embedder,
-        }
-    }
-}
-
 impl StreamingSpeakerChangeDetector {
-    pub fn shared(sample_rate_hz: u32) -> Option<Self> {
-        shared_change_detector_embedder()
-            .map(|embedder| Self::with_shared_embedder(embedder, sample_rate_hz))
-    }
-
     pub fn with_embedder(embedder: &'static dyn SpeakerEmbedder, sample_rate_hz: u32) -> Self {
-        Self::with_handle(SpeakerEmbedderHandle::Static(embedder), sample_rate_hz)
+        Self::with_embedder_handle(SpeakerEmbedderHandle::Static(embedder), sample_rate_hz)
     }
 
-    fn with_shared_embedder(embedder: Arc<dyn SpeakerEmbedder>, sample_rate_hz: u32) -> Self {
-        Self::with_handle(SpeakerEmbedderHandle::Shared(embedder), sample_rate_hz)
+    pub(crate) fn with_shared_embedder(
+        embedder: Arc<dyn SpeakerEmbedder>,
+        sample_rate_hz: u32,
+    ) -> Self {
+        Self::with_embedder_handle(SpeakerEmbedderHandle::Shared(embedder), sample_rate_hz)
     }
 
-    fn with_handle(embedder: SpeakerEmbedderHandle, sample_rate_hz: u32) -> Self {
+    fn with_embedder_handle(embedder: SpeakerEmbedderHandle, sample_rate_hz: u32) -> Self {
         let reference_window_samples =
             (SPEAKER_CHANGE_REFERENCE_WINDOW_S * sample_rate_hz as f32) as usize;
         let recent_window_samples =
             (SPEAKER_CHANGE_RECENT_WINDOW_S * sample_rate_hz as f32) as usize;
         let hop_samples = (SPEAKER_CHANGE_HOP_S * sample_rate_hz as f32) as usize;
-        let profile = embedder.calibration_profile().streaming;
+        let profile = embedder.as_ref().calibration_profile().streaming;
         Self {
             embedder,
             sample_rate_hz,
@@ -591,7 +586,7 @@ impl StreamingSpeakerChangeDetector {
         let reference_embedding = match self.anchor_embedding.clone() {
             Some(embedding) => embedding,
             None => {
-                let embedding = match self.embedder.embed(reference, self.sample_rate_hz) {
+                let embedding = match self.embedder.as_ref().embed(reference, self.sample_rate_hz) {
                     Ok(embedding) => embedding,
                     Err(_) => {
                         log_change_debug(
@@ -613,7 +608,7 @@ impl StreamingSpeakerChangeDetector {
             }
         };
         let reference_quality = self.anchor_quality.unwrap_or(reference_quality);
-        let recent_embedding = match self.embedder.embed(recent, self.sample_rate_hz) {
+        let recent_embedding = match self.embedder.as_ref().embed(recent, self.sample_rate_hz) {
             Ok(embedding) => embedding,
             Err(_) => {
                 log_change_debug(
@@ -656,27 +651,7 @@ impl StreamingSpeakerChangeDetector {
     }
 }
 
-fn shared_change_detector_embedder() -> Option<Arc<dyn SpeakerEmbedder>> {
-    shared_embedder()
-}
-
 impl StreamingDiarizer {
-    /// Build over the shared embedder, or `Ok(None)` if the pack is unavailable.
-    /// An unreadable Voice ID library is a typed error, never an empty matcher.
-    pub fn shared(
-        sample_rate_hz: u32,
-    ) -> Result<Option<Self>, super::voice_id::VoiceIdLibraryError> {
-        let Some(embedder) = shared_embedder() else {
-            return Ok(None);
-        };
-        let persons = load_person_matcher_for_embedder(embedder.as_ref())?;
-        Ok(Some(Self::with_shared_embedder_and_persons(
-            embedder,
-            sample_rate_hz,
-            persons,
-        )))
-    }
-
     /// Build over a caller-supplied embedder (tests, alternative backends).
     pub fn with_embedder(embedder: &'static dyn SpeakerEmbedder, sample_rate_hz: u32) -> Self {
         Self::with_embedder_and_persons(
@@ -696,31 +671,31 @@ impl StreamingDiarizer {
         sample_rate_hz: u32,
         persons: PersonMatcher,
     ) -> Self {
-        Self::with_handle_and_persons(
+        Self::with_embedder_handle_and_persons(
             SpeakerEmbedderHandle::Static(embedder),
             sample_rate_hz,
             persons,
         )
     }
 
-    fn with_shared_embedder_and_persons(
+    pub(crate) fn with_shared_embedder_and_persons(
         embedder: Arc<dyn SpeakerEmbedder>,
         sample_rate_hz: u32,
         persons: PersonMatcher,
     ) -> Self {
-        Self::with_handle_and_persons(
+        Self::with_embedder_handle_and_persons(
             SpeakerEmbedderHandle::Shared(embedder),
             sample_rate_hz,
             persons,
         )
     }
 
-    fn with_handle_and_persons(
+    fn with_embedder_handle_and_persons(
         embedder: SpeakerEmbedderHandle,
         sample_rate_hz: u32,
         persons: PersonMatcher,
     ) -> Self {
-        let profile = embedder.calibration_profile().streaming;
+        let profile = embedder.as_ref().calibration_profile().streaming;
         Self {
             embedder,
             registry: SpeakerRegistry::default(),
@@ -761,7 +736,7 @@ impl StreamingDiarizer {
             return None;
         }
 
-        let embedding = match self.embedder.embed(samples, sample_rate_hz) {
+        let embedding = match self.embedder.as_ref().embed(samples, sample_rate_hz) {
             Ok(embedding) => embedding,
             Err(_) => {
                 log_debug(

@@ -60,6 +60,16 @@ pub(crate) struct GgufTensorIndexSnapshot {
 }
 
 impl GgufTensorIndex {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(path: PathBuf) -> Self {
+        Self {
+            path,
+            data_section_offset_bytes: 0,
+            tensors: Vec::new(),
+            tensor_index_by_name: BTreeMap::new(),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

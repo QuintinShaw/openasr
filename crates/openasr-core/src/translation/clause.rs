@@ -62,8 +62,40 @@ impl Default for ClauseSegmentationConfig {
         Self {
             min_clause_chars: 4,
             soft_char_threshold: 24,
-            hard_char_threshold: 32,
+            // This is an absolute product bound, not merely a target.  The
+            // previous implementation searched up to 8 characters beyond 32
+            // for a safe split, so 40 preserves that intended quality window
+            // while making the public "hard" name truthful.
+            hard_char_threshold: 40,
         }
+    }
+}
+
+impl ClauseSegmentationConfig {
+    /// Maximum Unicode-scalar length of any active or finalized clause
+    /// emitted by a segmenter using this configuration.
+    ///
+    /// This value is also the construction-time text envelope used by local
+    /// translation runtimes. Keeping the segmentation and decoder contracts
+    /// on the same value prevents a late clause from discovering that its KV
+    /// arena was sized for a smaller, unrelated heuristic.
+    pub const fn max_emitted_clause_chars(&self) -> usize {
+        self.hard_char_threshold
+    }
+
+    fn assert_valid(&self) {
+        assert!(
+            self.min_clause_chars > 0,
+            "clause min_clause_chars must be positive"
+        );
+        assert!(
+            self.soft_char_threshold >= self.min_clause_chars,
+            "clause soft_char_threshold must cover min_clause_chars"
+        );
+        assert!(
+            self.hard_char_threshold >= self.soft_char_threshold,
+            "clause hard_char_threshold must cover soft_char_threshold"
+        );
     }
 }
 
@@ -96,6 +128,7 @@ impl Default for ClauseSegmenter {
 
 impl ClauseSegmenter {
     pub fn new(config: ClauseSegmentationConfig) -> Self {
+        config.assert_valid();
         Self {
             config,
             next_clause_id: 2,
@@ -303,12 +336,23 @@ struct Boundary {
 }
 
 fn find_clause_boundary(text: &str, config: &ClauseSegmentationConfig) -> Option<Boundary> {
-    let strong = first_punctuation_boundary(text, true, 1).map(|byte_end| Boundary {
-        byte_end,
-        reason: ClauseBoundaryReason::StrongPunctuation,
-    });
-    let secondary =
-        first_punctuation_boundary(text, false, config.min_clause_chars).map(|byte_end| Boundary {
+    let hard_byte_end = char_end_at(
+        &text.char_indices().collect::<Vec<_>>(),
+        config.hard_char_threshold,
+    );
+    // Punctuation remains preferable to an arbitrary length cut, but only
+    // when it lies inside the declared hard envelope. Searching the entire
+    // partial first used to let a punctuation mark hundreds of characters
+    // away silently defeat both latency and memory-capacity bounds.
+    let strong = first_punctuation_boundary(text, true, 1)
+        .filter(|byte_end| hard_byte_end.is_none_or(|hard| *byte_end <= hard))
+        .map(|byte_end| Boundary {
+            byte_end,
+            reason: ClauseBoundaryReason::StrongPunctuation,
+        });
+    let secondary = first_punctuation_boundary(text, false, config.min_clause_chars)
+        .filter(|byte_end| hard_byte_end.is_none_or(|hard| *byte_end <= hard))
+        .map(|byte_end| Boundary {
             byte_end,
             reason: ClauseBoundaryReason::CommaPunctuation,
         });
@@ -375,14 +419,14 @@ fn safe_length_boundary(text: &str, config: &ClauseSegmentationConfig) -> Option
             return Some(byte_end);
         }
     }
-    let extended_hard = hard.saturating_add(8).min(chars.len());
-    for index in hard.saturating_add(1)..=extended_hard {
-        let byte_end = char_end_at(&chars, index)?;
-        if is_safe_boundary(text, byte_end) {
-            return Some(byte_end);
-        }
-    }
-    None
+    // At the declared maximum, bounded latency and a provable downstream
+    // token envelope take precedence over lexical nicety. The earlier loops
+    // still choose every safe/preferred option first; this fallback is what
+    // makes `hard_char_threshold` a mathematical upper bound even for an
+    // unbroken URL, identifier, or number/unit run.
+    (chars.len() >= config.hard_char_threshold)
+        .then(|| char_end_at(&chars, config.hard_char_threshold))
+        .flatten()
 }
 
 fn longest_common_prefix_byte_len(left: &str, right: &str) -> usize {
@@ -640,9 +684,9 @@ mod tests {
         let mut segmenter = ClauseSegmenter::new(ClauseSegmentationConfig {
             min_clause_chars: 4,
             soft_char_threshold: 8,
-            hard_char_threshold: 12,
+            hard_char_threshold: 20,
         });
-        let update = segmenter.push_partial("我们测试OpenASR2026版本在30ms内显示");
+        let update = segmenter.push_partial("我们测试 OpenASR2026 版本在 30ms 内显示更多内容");
 
         assert!(update.segments.len() >= 2);
         for pair in update.segments.windows(2) {
@@ -658,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_length_boundary_defers_unbroken_ascii_runs() {
+    fn hard_length_boundary_caps_unbroken_ascii_runs() {
         let mut segmenter = ClauseSegmenter::new(ClauseSegmentationConfig {
             min_clause_chars: 4,
             soft_char_threshold: 8,
@@ -666,11 +710,39 @@ mod tests {
         });
         let update = segmenter.push_partial("Supercalifragilistic2026BuildPipeline");
 
-        assert_eq!(update.segments.len(), 1);
-        assert_eq!(update.segments[0].status, ClauseStatus::Active);
+        assert!(update.segments.len() >= 3);
+        assert!(
+            update
+                .segments
+                .iter()
+                .all(|segment| segment.text.chars().count() <= 12)
+        );
         assert_eq!(
-            update.segments[0].text,
+            update
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
             "Supercalifragilistic2026BuildPipeline"
+        );
+    }
+
+    #[test]
+    fn punctuation_beyond_hard_limit_cannot_defeat_the_envelope() {
+        let config = ClauseSegmentationConfig {
+            min_clause_chars: 4,
+            soft_char_threshold: 8,
+            hard_char_threshold: 12,
+        };
+        let mut segmenter = ClauseSegmenter::new(config.clone());
+        let update = segmenter.push_partial(&format!("{}。", "长".repeat(64)));
+
+        assert_eq!(config.max_emitted_clause_chars(), 12);
+        assert!(update.segments.len() >= 5);
+        assert!(
+            update.segments.iter().all(|segment| {
+                segment.text.chars().count() <= config.max_emitted_clause_chars()
+            })
         );
     }
 

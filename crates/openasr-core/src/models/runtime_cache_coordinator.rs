@@ -1,4 +1,4 @@
-//! Pack content identity + the TLS lazy-eviction generation.
+//! Pack content identity for service-owned runtime caches.
 //!
 //! This module used to also coordinate a single process-wide "build
 //! generation" shared by serve-batch engine keys, prepared-runtime caches,
@@ -11,40 +11,19 @@
 //! used to bump it now either rely on their own explicit registry/cache
 //! `clear()` (idle unload, serve-batch owner shutdown) or on the new content
 //! id naturally missing (pack install/replace). See `pull.rs`'s post-install
-//! handling and each family's `unload_idle_state`.
-//!
-//! The one counter that remains here is [`current_unload_generation`] /
-//! [`bump_unload_generation`], which is a different thing: a lazy-eviction
-//! signal for thread-local runtime caches (see `thread_local_runtime_cache`).
-//! TLS caches live on worker threads the idle-unload reaper cannot reach
-//! directly, so each cache instead records the generation it last synced at
-//! and drops its resident entries the next time its owning thread touches it
-//! after the generation has moved on. This generation must never be mixed
-//! into a content-identity cache key.
+//! handling and each family's `unload_idle_state`. Mutable ggml runtimes are
+//! now service-owned actors, so unload reaches their owners directly and no
+//! process-wide lazy-eviction clock remains.
 
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 use crate::ggml_runtime::{StrongFileIdentity, resolve_content_id, unreadable_content_id};
 
-/// TLS lazy-eviction generation. See the module doc comment: this is
-/// intentionally the *only* process-wide counter left in this module, and it
-/// must never be read by content-identity resolution.
-static TLS_LAZY_EVICTION_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Current TLS lazy-eviction generation. `Relaxed` matches the historical
-/// counter this replaces: a coarse "an idle unload happened since this
-/// thread-local entry was filled" signal for the owning thread to observe on
-/// its own next access, not a cross-thread synchronization fence.
-pub(crate) fn current_unload_generation() -> u64 {
-    TLS_LAZY_EVICTION_GENERATION.load(Ordering::Relaxed)
-}
-
-/// Marks one idle-unload sweep by advancing the TLS lazy-eviction generation.
-pub(crate) fn bump_unload_generation() {
-    TLS_LAZY_EVICTION_GENERATION.fetch_add(1, Ordering::Relaxed);
+/// Canonicalizes a runtime source path for APIs that still require a load
+/// location. Cache identity never comes from this path; it comes from the
+/// already-open source's content id via [`PackContentKey`].
+pub(crate) fn canonical_runtime_cache_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Formats a content id from a lowercase hex sha256 digest.
@@ -133,36 +112,22 @@ pub(crate) fn pack_content_id_for_path_before_replace(path: &Path, models_root: 
 /// tables); callers that need those to participate mix them in separately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PackContentKey {
+    pub execution_scope_id:
+        Option<crate::models::native_execution_services::NativeExecutionScopeId>,
     pub pack_content_id: String,
 }
 
 impl PackContentKey {
     pub(crate) fn new(pack_content_id: impl Into<String>) -> Self {
         Self {
+            execution_scope_id:
+                crate::models::native_execution_services::current_native_execution_scope_id(),
             pack_content_id: pack_content_id.into(),
         }
     }
 
-    /// Resolve a cacheable key from an already-open source's content id.
-    ///
-    /// Returns `None` when the pack cannot be content-hashed -- callers must
-    /// skip the reusable cache (one-shot uncached execute) rather than key by
-    /// path alone.
-    pub(crate) fn try_for_runtime_source(source: &crate::GgmlRuntimeSource) -> Option<Self> {
-        let pack_content_id = source.content_id();
-        if !is_cacheable_pack_content_id(pack_content_id) {
-            return None;
-        }
-        Some(Self::new(pack_content_id.to_string()))
-    }
-
     /// Resolve a key directly from an already-open, already-validated
-    /// source's content id -- the identity family thread-local runtime
-    /// caches (`models::thread_local_runtime_cache`) key on instead of the
-    /// removed path-plus-fingerprint identity type this superseded.
-    ///
-    /// Unlike [`Self::try_for_runtime_source`] this is infallible: a
-    /// `GgmlRuntimeSource` only exists once
+    /// source's content id. This is infallible: a `GgmlRuntimeSource` only exists once
     /// [`crate::validate_ggml_runtime_source_path`] has already opened and
     /// mapped the file successfully, and [`crate::GgmlRuntimeSource::content_id`]
     /// hashes that already-held mapping (never a fresh `stat`/`open`), so it
@@ -241,7 +206,7 @@ mod tests {
         std::fs::write(&path, b"GGUFpack-content-key-fixture").expect("write");
         let source = crate::validate_ggml_runtime_source_path(&path).expect("validate source");
 
-        let key = PackContentKey::try_for_runtime_source(&source).expect("cacheable");
+        let key = PackContentKey::for_runtime_source(&source);
         assert_eq!(key.pack_content_id, source.content_id());
         assert!(is_cacheable_pack_content_id(&key.pack_content_id));
     }
@@ -264,7 +229,7 @@ mod tests {
         );
     }
 
-    /// Family thread-local runtime caches now key on
+    /// Family service-owned runtime caches key on
     /// [`PackContentKey::for_runtime_source`] instead of the removed
     /// path-plus-fingerprint identity type this superseded. This is the
     /// infallible constructor's own narrow contract -- same bytes at
@@ -274,7 +239,7 @@ mod tests {
     /// re-opens and re-hashes the replaced file rather than reusing a stale
     /// key built from an old open. The family-level regression tests (one
     /// hit/miss test per family in each family's own module) exercise this
-    /// same guarantee through an actual family TLS cache.
+    /// same guarantee through actual family caches.
     #[test]
     fn pack_content_key_for_runtime_source_is_stable_while_the_pack_is_unchanged() {
         let dir = tempfile::tempdir().expect("tempdir");

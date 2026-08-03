@@ -100,6 +100,9 @@ mod tests {
 
     fn request() -> GgmlAsrStreamingSessionRequest {
         GgmlAsrStreamingSessionRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
@@ -110,6 +113,7 @@ mod tests {
                 (GgmlAsrBackendPreference::Auto).request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
+            final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_executor_wrapper"),
             session_config: NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(true)

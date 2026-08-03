@@ -9,6 +9,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -34,7 +35,10 @@ const ENTRY_IPC_MARKER: &str = "__OASR_BENCH_ENTRY__";
 /// child binary can never silently corrupt gating data with defaulted fields.
 const BENCH_ENTRY_IPC_SCHEMA_VERSION: u32 = 1;
 
-pub(crate) fn bench_suite(options: BenchSuiteCommandOptions<'_>) -> Result<()> {
+pub(crate) fn bench_suite(
+    native_execution_services: &Arc<openasr_core::NativeExecutionServices>,
+    options: BenchSuiteCommandOptions<'_>,
+) -> Result<()> {
     let config = load_suite_config(options.config)?;
     if config.schema_version != 1 {
         bail!(
@@ -58,6 +62,7 @@ pub(crate) fn bench_suite(options: BenchSuiteCommandOptions<'_>) -> Result<()> {
     // in-process loop made every entry inherit the largest earlier entry's peak).
     if let Some(entry_id) = options.run_single_entry {
         return run_single_entry_child(
+            native_execution_services,
             &config,
             entry_id,
             ffmpeg_bin,
@@ -180,6 +185,7 @@ fn suite_entry_transcription_request(
 }
 
 fn run_entry(
+    native_execution_services: &Arc<openasr_core::NativeExecutionServices>,
     entry: &SuiteEntry,
     ffmpeg_bin: Option<PathBuf>,
     ffmpeg_bin_explicit: bool,
@@ -225,7 +231,8 @@ fn run_entry(
         let request = suite_entry_transcription_request(entry, &validated_pack, &prepared);
         configure_native_cpu_inference_threads();
         let started = Instant::now();
-        let transcription = transcribe_with_backend(BackendKind::Native, request)?;
+        let transcription =
+            transcribe_with_backend(native_execution_services, BackendKind::Native, request)?;
         let elapsed = started.elapsed();
         if best_elapsed.is_none_or(|best| elapsed < best) {
             best_elapsed = Some(elapsed);
@@ -319,6 +326,7 @@ fn run_entry(
 /// pack emits `metrics: null` (the parent treats it as skipped); a hard failure
 /// returns an error so the child exits non-zero and the parent surfaces it.
 fn run_single_entry_child(
+    native_execution_services: &Arc<openasr_core::NativeExecutionServices>,
     config: &SuiteConfig,
     entry_id: &str,
     ffmpeg_bin: Option<PathBuf>,
@@ -330,8 +338,14 @@ fn run_single_entry_child(
         .iter()
         .find(|entry| entry.id == entry_id)
         .ok_or_else(|| anyhow::anyhow!("unknown suite entry id '{entry_id}'"))?;
-    let measured = run_entry(entry, ffmpeg_bin, ffmpeg_bin_explicit, runs)
-        .with_context(|| format!("Suite entry '{}' failed", entry.id))?;
+    let measured = run_entry(
+        native_execution_services,
+        entry,
+        ffmpeg_bin,
+        ffmpeg_bin_explicit,
+        runs,
+    )
+    .with_context(|| format!("Suite entry '{}' failed", entry.id))?;
     let envelope = serde_json::json!({
         "schema_version": BENCH_ENTRY_IPC_SCHEMA_VERSION,
         "metrics": measured,

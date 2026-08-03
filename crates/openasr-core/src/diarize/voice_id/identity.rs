@@ -221,15 +221,14 @@ pub struct SpeakerScope<'a> {
 /// speaker in this transcript has a name", and is the only shape a
 /// single-speaker recording of an enrolled person produces.
 pub fn name_speakers_across_scopes(
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     scopes: &mut [SpeakerScope<'_>],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
-    let embedder = crate::diarize::embed::shared_embedder();
-    name_speakers_across_scopes_with(embedder.as_deref(), scopes)
+    name_speakers_across_scopes_with(embedder, scopes)
 }
 
 /// Request-scoped variant used after transcription preflight has frozen an
-/// exact embedding-space snapshot. Pack replacement or removal during a long
-/// job cannot change the evidence model halfway through finalization.
+/// exact embedding-space snapshot.
 pub(crate) fn name_speakers_across_scopes_with_embedder(
     embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     scopes: &mut [SpeakerScope<'_>],
@@ -239,10 +238,11 @@ pub(crate) fn name_speakers_across_scopes_with_embedder(
 
 /// [`name_speakers_across_scopes`] with the embedder passed explicitly.
 ///
-/// The public entry point resolves the process-wide shared embedder; this
-/// seam exists so tests exercise both sides of the missing-embedder contract
-/// deterministically instead of inheriting whatever packs the host machine
-/// happens to have installed.
+/// The public boundary passes its policy-resolved, admitted embedder here.
+/// This seam resolves the persistent library state once and then hands every
+/// external availability input to the pure core below, so tests can exercise
+/// both sides of the missing-embedder contract without inheriting a user's
+/// installed packs or Voice ID database.
 fn name_speakers_across_scopes_with(
     embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     scopes: &mut [SpeakerScope<'_>],
@@ -254,6 +254,10 @@ fn name_speakers_across_scopes_with(
     )
 }
 
+/// Pure identity-resolution core with every external availability input made
+/// explicit. Production resolves the library state once at the boundary;
+/// tests inject it so their result cannot depend on a user's real Voice ID
+/// database.
 fn name_speakers_across_scopes_with_library_state(
     embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     person_library_non_empty: bool,
@@ -388,7 +392,10 @@ fn name_speakers_across_scopes_with_library_state(
         }
     }
 
-    let matcher = super::load_person_matcher_for_embedder(embedder)?;
+    let identity = embedder
+        .identity()
+        .ok_or(super::VoiceIdLibraryError::EmbedderIdentityUnavailable)?;
+    let matcher = super::load_person_matcher_for_embedder(&identity, embedder)?;
     let mut matches: BTreeMap<String, super::PersonMatch> = BTreeMap::new();
     for (label, evidence) in evidence {
         let Some(centroid) = evidence.centroid_for_naming() else {
@@ -562,10 +569,11 @@ const MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING: f64 = {
 /// (every offline transcription today). Same semantics as
 /// [`name_speakers_across_scopes`] with one scope.
 pub fn name_speakers_from_labeled_segments(
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     segments: &mut [Segment],
     samples: &[f32],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
-    name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }])
+    name_speakers_across_scopes(embedder, &mut [SpeakerScope { segments, samples }])
 }
 
 pub(crate) fn name_speakers_from_labeled_segments_with_embedder(
@@ -869,6 +877,17 @@ mod tests {
         }
     }
 
+    fn name_without_embedder_or_enrollment(
+        segments: &mut [Segment],
+        samples: &[f32],
+    ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+        name_speakers_across_scopes_with_library_state(
+            None,
+            false,
+            &mut [SpeakerScope { segments, samples }],
+        )
+    }
+
     /// Without an embedder the stage must still leave usable scope-local labels
     /// behind (the "can separate, cannot name" degrade), and must never invent
     /// a person id out of a label.
@@ -878,7 +897,7 @@ mod tests {
             labeled(0.0, 1.0, Some("SPEAKER_01")),
             labeled(1.0, 2.0, None),
         ];
-        name_speakers_from_labeled_segments(&mut segments, &[]).unwrap();
+        name_without_embedder_or_enrollment(&mut segments, &[]).unwrap();
 
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[0].speaker_label.as_deref(), Some("SPEAKER_01"));
@@ -891,7 +910,7 @@ mod tests {
     fn a_label_only_segment_gets_its_display_speaker_filled_in() {
         let mut segments = vec![labeled(0.0, 1.0, None)];
         segments[0].speaker_label = Some("SPEAKER_03".to_string());
-        name_speakers_from_labeled_segments(&mut segments, &[]).unwrap();
+        name_without_embedder_or_enrollment(&mut segments, &[]).unwrap();
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_03"));
     }
 
@@ -904,7 +923,7 @@ mod tests {
             labeled(0.0, 1.0, Some("SPEAKER_01")),
             labeled(1.0, 2.0, Some("SPEAKER_05")),
         ];
-        name_speakers_from_labeled_segments(&mut segments, &[]).unwrap();
+        name_without_embedder_or_enrollment(&mut segments, &[]).unwrap();
         assert_eq!(segments[0].speaker_label.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[1].speaker_label.as_deref(), Some("SPEAKER_05"));
     }
@@ -927,8 +946,9 @@ mod tests {
             labeled(0.0, 1.0, Some("SPEAKER_01")),
             labeled(1.0, 2.0, Some("SPEAKER_01")),
         ];
-        let result = name_speakers_across_scopes_with(
+        let result = name_speakers_across_scopes_with_library_state(
             None,
+            false,
             &mut [
                 SpeakerScope {
                     segments: &mut first,

@@ -1,4 +1,4 @@
-//! Model-agnostic integration gates for two runtime-cost invariants that used
+//! Model-agnostic integration gates for runtime-cost invariants that used
 //! to be enforced only by prose in `docs/MODEL_ONBOARDING.md` plus a human's
 //! eyes on the published model card -- which is exactly how families slipped
 //! through rebuilding their whole runtime per request (mimo-asr) or (in earlier
@@ -38,6 +38,18 @@
 //!   (e.g. mimo-asr's / firered-llm's
 //!   `resident_*_cache_reuse_across_consecutive_calls_stays_byte_identical`),
 //!   which this static gate backstops.
+//!
+//! - **K3 (physical-lane identity):**
+//!   [`k3_resident_families_reference_physical_execution_lane_identity`]
+//!   requires every resident family to derive native-owner keys through
+//!   `ExecutionLaneKey`, not the historical coarse CPU-vs-GPU enum. The lane
+//!   identity includes provider, physical device, placement and graph backend,
+//!   so a runtime built on one card/candidate cannot be handed to another.
+//!
+//! - **K4 (owner-bound lifetime):** process-resident state must use an admitted
+//!   host owner, prepared-runtime owner, or dedicated pinned actor. Family-local
+//!   `unsafe impl Send` wrappers and retired thread-affine checkout shapes are
+//!   forbidden.
 
 #![cfg(test)]
 
@@ -58,23 +70,17 @@ const HOST_F32_LOADER_CALLS: &[&str] = &[
     "host_tensor_f32_copy_by_id",
 ];
 
-/// Source-token signatures of a resident runtime-cache primitive. A family that
-/// reuses a prepared runtime across requests references at least one of these
-/// (a thread-local generation-tagged cache, the shared prepared-runtime cache,
-/// or a content-id-keyed process weights pool such as dolphin's). This is the
-/// K2 "there is somewhere the per-request runtime is kept resident" signal.
+/// Source-token signatures of an owner-bound resident-runtime primitive. This
+/// is the K2 "there is an admitted owner for reused state" signal; a raw map,
+/// TLS slot, family-global weight pool, or take/store helper is intentionally
+/// not sufficient.
 const RESIDENT_CACHE_PRIMITIVES: &[&str] = &[
-    "thread_local!",
-    "take_generation_tagged",
-    "with_thread_local_cached_mut_by_key",
+    "AdmittedPinnedRuntimeActorCheckoutPool",
+    "AdmittedPinnedRuntimeActorPool",
+    "AdmittedExclusiveObjectPool",
+    "AdmittedHostObjectCache",
     "PreparedRuntimeCache",
-    "take_cached_",
-    "store_cached_",
-    "DolphinRuntimeWeights",
-    "weights_pool",
     "runtime_prepared_registry",
-    "UnloadGenerationGated",
-    "BoundedRuntimeCache",
 ];
 
 /// Classification of one dedicated ggml-executor family for the K2 gate.
@@ -298,5 +304,98 @@ fn k2_resident_families_reference_a_resident_cache() {
                 );
             }
         }
+    }
+}
+
+/// K3: a resident native owner is valid only on the exact execution lane that
+/// built it. The source token check complements the Rust key type itself:
+/// adding a family to the completeness table also requires its family module
+/// to derive cache keys through the central lane resolver.
+#[test]
+fn k3_resident_families_reference_physical_execution_lane_identity() {
+    let models_dir = models_dir();
+    for (family, classification) in GGML_EXECUTOR_FAMILY_GATES {
+        if !matches!(classification, ResidentClassification::Resident) {
+            continue;
+        }
+        let family_dir = models_dir.join(family);
+        let mut rs_files = Vec::new();
+        collect_rs_files(&family_dir, &mut rs_files);
+        let sources = rs_files
+            .iter()
+            .map(|file| std::fs::read_to_string(file).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sources.contains("ExecutionLaneKey") && sources.contains("current_execution_lane_key"),
+            "K3 execution-lane gate: resident family '{family}' does not derive its \
+             backend-owner cache identity through ExecutionLaneKey/current_execution_lane_key. \
+             A coarse GgmlCpuGraphBackend key aliases providers and physical cards."
+        );
+    }
+}
+
+#[test]
+fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
+    let models_dir = models_dir();
+    let mut rs_files = Vec::new();
+    collect_rs_files(&models_dir, &mut rs_files);
+    let forbidden = [
+        "checkout_thread_affine_admitted_object",
+        "ThreadAffineAdmittedObjectCache",
+        "take_generation_tagged",
+        "with_thread_local_cached_mut_by_key",
+        "UnloadGenerationGated",
+        "BoundedRuntimeCache",
+        "DOLPHIN_WEIGHTS_POOL",
+        "unsafe impl Send for",
+        "unsafe impl Sync for",
+    ];
+    let mut violations = Vec::new();
+    for file in rs_files {
+        let relative = models_relative(&models_dir, &file);
+        if matches!(
+            relative.as_str(),
+            "resident_runtime_audit.rs" | "admitted_thread_affine_object_cache.rs"
+        ) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).unwrap_or_default();
+        for token in forbidden {
+            if source.contains(token) {
+                violations.push(format!("{relative}: {token}"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "K4 owner-bound lifetime gate: family code bypasses admitted owner/pinned actor primitives: {violations:?}"
+    );
+}
+
+#[test]
+fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    for (relative, required) in [
+        (
+            "diarize/embed/policy_runtime.rs",
+            "AuxiliaryRuntimeCacheKey",
+        ),
+        (
+            "diarize/segment/policy_runtime.rs",
+            "AuxiliaryRuntimeCacheKey",
+        ),
+        ("models/hymt2/policy_runtime.rs", "PinnedRuntimeActor"),
+        (
+            "models/firered_punc/policy_runtime.rs",
+            "PinnedRuntimeActor",
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            source.contains(required),
+            "K4 auxiliary ownership gate: {relative} does not reference declared owner primitive {required}"
+        );
     }
 }

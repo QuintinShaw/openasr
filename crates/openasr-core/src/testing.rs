@@ -220,6 +220,39 @@ impl TinyGgufFixtureSpec {
         Self::whisper_oasr_v1_encoder_graph_one_layer(model_id)
     }
 
+    /// Production-window metadata and positional tensors, but still no
+    /// tokenizer. This is the end-to-end fixture for callers that must pass
+    /// semantic capacity planning and tensor binding before failing at the
+    /// tokenizer boundary.
+    pub fn whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self::whisper_oasr_v1_encoder_graph_one_layer(model_id)
+            .with_metadata("whisper.encoder.context_length", "1500")
+            .with_metadata("whisper.decoder.context_length", "448")
+            .with_tensor_shape(
+                "model.encoder.embed_positions.weight",
+                [1_500_u64, WHISPER_DEFAULT_HIDDEN_SIZE as u64],
+            )
+            .with_tensor_shape(
+                "model.decoder.embed_positions.weight",
+                [448_u64, WHISPER_DEFAULT_HIDDEN_SIZE as u64],
+            )
+    }
+
+    /// A production-window-shaped Whisper metadata fixture with intentionally
+    /// incomplete tensors. Streaming session planning therefore accepts the
+    /// real 30-second frontend contract before execution fails at the selected
+    /// Whisper tensor boundary.
+    pub fn whisper_oasr_v1_metadata_ready_for_streaming_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self::whisper_oasr_v1_non_streaming_cpu(model_id)
+            .with_whisper_graph_metadata(1, 1, 8, 80)
+            .with_metadata("whisper.encoder.context_length", "1500")
+            .with_metadata("whisper.decoder.context_length", "448")
+    }
+
     pub fn whisper_oasr_v1_encoder_graph_one_layer(model_id: impl Into<String>) -> Self {
         Self::whisper_oasr_v1_encoder_graph_layers(model_id, 1, 1)
     }
@@ -358,6 +391,122 @@ impl TinyGgufFixtureSpec {
         Self::cohere_oasr_v1_non_streaming_cpu(model_id)
             .with_cohere_graph_metadata(2, 2, 16, 2, 8, 32, 5, 32, 32)
             .with_cohere_runtime_tensors_with_layers(2, 2)
+    }
+
+    /// Metadata-complete Moonshine fixture used to prove product routing up
+    /// to the family's tensor-binding boundary. The placeholder tensor is
+    /// intentionally not a runnable model: decode must fail through the
+    /// Moonshine executor, not earlier in the unified state planner.
+    pub fn moonshine_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::MOONSHINE_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::MOONSHINE_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::MOONSHINE_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::MOONSHINE_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::MOONSHINE_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "moonshine-encoder-decoder"),
+            ("moonshine.vocab_size", "4"),
+            ("moonshine.d_model", "16"),
+            ("moonshine.encoder.n_layers", "1"),
+            ("moonshine.decoder.n_layers", "1"),
+            ("moonshine.n_heads", "2"),
+            ("moonshine.head_dim", "8"),
+            ("moonshine.rotary_dim", "4"),
+            ("moonshine.encoder.ffn_dim", "64"),
+            ("moonshine.decoder.ffn_dim", "64"),
+            ("moonshine.decoder.max_ctx", "128"),
+            ("moonshine.decoder.bos_token_id", "1"),
+            ("moonshine.decoder.eos_token_id", "2"),
+            ("moonshine.audio.sample_rate", "16000"),
+            ("moonshine.rope_theta", "10000"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Metadata-complete Qwen3-ASR routing fixture. As with the Moonshine
+    /// counterpart, its placeholder tensor deliberately proves that failure
+    /// happens inside the selected family executor rather than in topology
+    /// discovery.
+    pub fn qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::models::qwen::QWEN3_ASR_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::QWEN3_ASR_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::QWEN3_ASR_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::QWEN3_ASR_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "qwen3-asr"),
+            ("qwen3-asr.sample_rate", "16000"),
+            ("qwen3-asr.n_mels", "8"),
+            ("qwen3-asr.n_fft", "400"),
+            ("qwen3-asr.win_length", "400"),
+            ("qwen3-asr.hop_length", "160"),
+            ("qwen3-asr.audio.n_layers", "2"),
+            ("qwen3-asr.audio.d_model", "16"),
+            ("qwen3-asr.audio.n_heads", "2"),
+            ("qwen3-asr.llm.n_layers", "2"),
+            ("qwen3-asr.llm.d_model", "16"),
+            ("qwen3-asr.llm.n_heads", "2"),
+            ("qwen3-asr.llm.n_kv_heads", "2"),
+            ("qwen3-asr.llm.head_dim", "8"),
+            ("qwen3-asr.llm.vocab_size", "32"),
+            ("qwen3-asr.llm.max_pos", "2048"),
+            ("qwen3-asr.audio_start_token_id", "2"),
+            ("qwen3-asr.audio_end_token_id", "3"),
+            ("qwen3-asr.audio_pad_token_id", "4"),
+            ("qwen3-asr.eos_token_id", "0"),
+            ("qwen3-asr.pad_token_id", "6"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
     }
 
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {

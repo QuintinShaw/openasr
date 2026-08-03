@@ -14,9 +14,10 @@
 //! subsequent step computes Q/K/V for **only the new token**, appends its K/V
 //! to the cache, and attends the single new query against the full cached
 //! history. Per-step compute drops from `O(prefix)` to `O(1)` projection/MLP
-//! plus an `O(prefix)` attention dot-product -- total decode `O(n)` (plus a
-//! small `O(n^2)` host-side K/V copy that is orders of magnitude cheaper than
-//! the projections/MLP it replaces).
+//! plus an `O(prefix)` attention dot-product -- total decode `O(n)` projection/
+//! MLP work plus the attention's inherent `O(n^2)` score work. Host K/V is
+//! retained token-major at fixed capacity, so an incremental step appends one
+//! row and never flattens or recopies the existing history.
 //!
 //! Bit-exactness (the hard requirement): every op here is byte-for-byte the one
 //! the one-shot recompute runs. Prefill and decode share
@@ -76,11 +77,134 @@ use crate::ggml_runtime::{
     GgmlKvElementType, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
     GgmlRuntimeSource,
 };
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote, SystemMemoryOwner,
+};
 use crate::nn::decoder::{
     LlmKvCacheSpec, LlmResidentKvArena, allocate_zeroed_llm_resident_kv_arena,
     build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits, last_token_hidden_view,
     reusable_decode_graph_supported_for_runner,
 };
+
+/// Exact per-invocation KV bound plus the stable session-envelope reservation
+/// used by Granite's reusable device graph.
+///
+/// The host path consumes only `logical_positions`. The GPU reuse path owns an
+/// arena and graph whose fixed span is `resident_positions`; varying legal
+/// chunk lengths therefore never change their physical shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraniteSpeechKvCacheCapacity {
+    logical_positions: usize,
+    resident_positions: usize,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub(crate) enum GraniteSpeechKvCacheCapacityError {
+    #[error("granite-speech request carries no planned persistent decoder state")]
+    DecoderStateNotPlanned,
+    #[error("granite-speech decoder state axis is invalid: {source}")]
+    InvalidStateAxis {
+        #[source]
+        source: crate::capacity::topology::TopologyError,
+    },
+    #[error("granite-speech logical KV span must be positive")]
+    ZeroLogicalPositions,
+    #[error(
+        "granite-speech resident KV span {resident_positions} does not cover logical span {logical_positions}"
+    )]
+    ResidentDoesNotCoverLogical {
+        logical_positions: usize,
+        resident_positions: usize,
+    },
+    #[error(
+        "granite-speech runtime measured {measured_positions} KV positions, but the planner proved {planned_positions}"
+    )]
+    LogicalPositionMismatch {
+        planned_positions: usize,
+        measured_positions: usize,
+    },
+    #[error("granite-speech prompt-plus-generation position arithmetic overflowed")]
+    LogicalPositionOverflow,
+    #[error(
+        "granite-speech resident KV span {resident_positions} exceeds decoder hard cap {hard_cap}"
+    )]
+    HardCapExceeded {
+        resident_positions: usize,
+        hard_cap: usize,
+    },
+}
+
+impl GraniteSpeechKvCacheCapacity {
+    pub(crate) fn from_decoder_state(
+        state: &crate::models::ggml_asr_executor::GgmlAsrDecoderState,
+    ) -> Result<Self, GraniteSpeechKvCacheCapacityError> {
+        let crate::models::ggml_asr_executor::GgmlAsrDecoderState::Planned(plan) = state else {
+            return Err(GraniteSpeechKvCacheCapacityError::DecoderStateNotPlanned);
+        };
+        let axis = plan
+            .position_axis(
+                super::capacity::GRANITE_SPEECH_SELF_KV_STATE_ID,
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+            )
+            .map_err(|source| GraniteSpeechKvCacheCapacityError::InvalidStateAxis { source })?;
+        Self::new(axis.logical_positions, axis.resident_positions)
+    }
+
+    pub(crate) fn new(
+        logical_positions: usize,
+        resident_positions: usize,
+    ) -> Result<Self, GraniteSpeechKvCacheCapacityError> {
+        if logical_positions == 0 {
+            return Err(GraniteSpeechKvCacheCapacityError::ZeroLogicalPositions);
+        }
+        if resident_positions < logical_positions {
+            return Err(
+                GraniteSpeechKvCacheCapacityError::ResidentDoesNotCoverLogical {
+                    logical_positions,
+                    resident_positions,
+                },
+            );
+        }
+        Ok(Self {
+            logical_positions,
+            resident_positions,
+        })
+    }
+
+    pub(crate) const fn logical_positions(self) -> usize {
+        self.logical_positions
+    }
+
+    pub(crate) const fn resident_positions(self) -> usize {
+        self.resident_positions
+    }
+
+    pub(crate) fn validate_measured_logical_positions(
+        self,
+        measured_positions: usize,
+    ) -> Result<Self, GraniteSpeechKvCacheCapacityError> {
+        if measured_positions != self.logical_positions {
+            return Err(GraniteSpeechKvCacheCapacityError::LogicalPositionMismatch {
+                planned_positions: self.logical_positions,
+                measured_positions,
+            });
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn validate_hard_cap(
+        self,
+        hard_cap: usize,
+    ) -> Result<Self, GraniteSpeechKvCacheCapacityError> {
+        if self.resident_positions > hard_cap {
+            return Err(GraniteSpeechKvCacheCapacityError::HardCapExceeded {
+                resident_positions: self.resident_positions,
+                hard_cap,
+            });
+        }
+        Ok(self)
+    }
+}
 
 use super::decoder_graph::{
     GraniteDecoderLoadedWeights, GraniteDecoderWeightArena, GraniteDecoderWeights,
@@ -88,14 +212,6 @@ use super::decoder_graph::{
     embed_token_row, granite_post_attention, granite_pre_attention, linear, rms_norm,
     weight_in_major,
 };
-
-/// Headroom (in tokens) reserved above the prompt length when sizing the
-/// resident KV arena's fixed span, so the whole greedy decode
-/// (`GRANITE_SPEECH_MAX_GENERATED_TOKENS` new tokens after the prompt) fits
-/// without ever overrunning the arena. Kept in sync with the executor's
-/// `max_generated_tokens`; a larger value only reserves more (masked-until-used)
-/// span, never changes results.
-const GRANITE_RESIDENT_DECODE_HEADROOM: usize = 256;
 
 /// f32 resident KV element type for the Metal reuse path. f32 (not f16) keeps
 /// the cached K/V rounding-free, so the only numerical difference from the CPU
@@ -153,10 +269,138 @@ fn map_ggml(stage: &'static str) -> impl Fn(GgmlCpuGraphError) -> GraniteSpeechD
     move |source| GraniteSpeechDecoderError::Ggml { stage, source }
 }
 
-/// A forward pass' outputs: the (last-position for prefill / only-position for a
-/// step) logits row, plus each layer's tapped `(K, V)` in `[head_dim, tokens,
-/// kv_heads]` (kv-head-major) layout for the KV cache.
-type ForwardGraphOutput = (Vec<f32>, Vec<(Vec<f32>, Vec<f32>)>);
+const GRANITE_HOST_KV_RESOURCE_ID: &str = "granite-speech.decoder.host-self-kv";
+
+/// One allocation transaction for the complete CPU-path KV owner.
+///
+/// Each layer is a fixed-length token-major `[position, kv_head, head_dim]`
+/// array. The prefill graph emits that layout directly and every incremental
+/// graph writes exactly one row, so no history-sized staging allocation is
+/// ever needed after this owner commits.
+#[derive(Debug)]
+struct GraniteHostKvState {
+    k_history: Vec<Vec<f32>>,
+    v_history: Vec<Vec<f32>>,
+}
+
+impl GraniteHostKvState {
+    fn try_allocate(
+        num_layers: usize,
+        max_positions: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<SystemMemoryOwner<Self>, GraniteSpeechDecoderError> {
+        let quoted_bytes =
+            granite_host_kv_quoted_bytes(num_layers, max_positions, kv_heads, head_dim)?;
+        let quote = SystemMemoryAllocationQuote::new(
+            GRANITE_HOST_KV_RESOURCE_ID,
+            quoted_bytes,
+            quoted_bytes,
+        )
+        .map_err(|error| GraniteSpeechDecoderError::Shape {
+            reason: error.to_string(),
+        })?;
+        SystemMemoryOwner::try_allocate(quote, || {
+            let state =
+                Self::try_allocate_unadmitted(num_layers, max_positions, kv_heads, head_dim)?;
+            let actual_bytes = state.actual_capacity_bytes()?;
+            Ok(SystemMemoryAllocationOutcome::new(
+                state,
+                actual_bytes,
+                actual_bytes,
+            ))
+        })
+        .map_err(|error| GraniteSpeechDecoderError::Shape {
+            reason: error.to_string(),
+        })
+    }
+
+    fn try_allocate_unadmitted(
+        num_layers: usize,
+        max_positions: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, String> {
+        let row_width = kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "granite host KV row width overflowed".to_string())?;
+        let layer_len = max_positions
+            .checked_mul(row_width)
+            .ok_or_else(|| "granite host KV layer length overflowed".to_string())?;
+        let allocate_layers = || -> Result<Vec<Vec<f32>>, String> {
+            let mut layers = Vec::new();
+            layers.try_reserve_exact(num_layers).map_err(|error| {
+                format!("granite host KV layer table allocation failed: {error}")
+            })?;
+            for _ in 0..num_layers {
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(layer_len)
+                    .map_err(|error| format!("granite host KV layer allocation failed: {error}"))?;
+                values.resize(layer_len, 0.0);
+                layers.push(values);
+            }
+            Ok(layers)
+        };
+        Ok(Self {
+            k_history: allocate_layers()?,
+            v_history: allocate_layers()?,
+        })
+    }
+
+    fn actual_capacity_bytes(&self) -> Result<u64, String> {
+        fn nested_capacity_bytes(values: &Vec<Vec<f32>>) -> Result<u64, String> {
+            let table = values
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<f32>>())
+                .ok_or_else(|| "granite host KV table capacity overflowed".to_string())?;
+            let payload = values.iter().try_fold(0usize, |total, values| {
+                let bytes = values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| "granite host KV payload capacity overflowed".to_string())?;
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| "granite host KV payload sum overflowed".to_string())
+            })?;
+            u64::try_from(
+                table
+                    .checked_add(payload)
+                    .ok_or_else(|| "granite host KV capacity sum overflowed".to_string())?,
+            )
+            .map_err(|_| "granite host KV capacity exceeds u64".to_string())
+        }
+        nested_capacity_bytes(&self.k_history)?
+            .checked_add(nested_capacity_bytes(&self.v_history)?)
+            .ok_or_else(|| "granite host K/V capacity sum overflowed".to_string())
+    }
+}
+
+fn granite_host_kv_quoted_bytes(
+    num_layers: usize,
+    max_positions: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<u64, GraniteSpeechDecoderError> {
+    let bytes = num_layers
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(max_positions))
+        .and_then(|value| value.checked_mul(kv_heads))
+        .and_then(|value| value.checked_mul(head_dim))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|payload| {
+            num_layers
+                .checked_mul(2)
+                .and_then(|tables| tables.checked_mul(std::mem::size_of::<Vec<f32>>()))
+                .and_then(|tables| payload.checked_add(tables))
+        })
+        .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+            reason: "granite host KV quoted bytes overflowed".to_string(),
+        })?;
+    u64::try_from(bytes).map_err(|_| GraniteSpeechDecoderError::Shape {
+        reason: "granite host KV quoted bytes exceed u64".to_string(),
+    })
+}
 
 /// A prefilled, persistent Granite decoder ready to emit one incremental
 /// single-token step at a time. Construct with [`new`](Self::new), seed with
@@ -186,12 +430,10 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// mmap'd loaded context plus its zero-copy bound weights -- can live in
     /// the cross-request resident cache (`executor::GraniteSpeechPreparedRuntime`).
     _loaded: Option<GgmlLoadedWeightContext>,
-    /// `k_history[layer][kv_head]` is that head's `[seq, head_dim]` (row-major)
-    /// key rows, appended token by token; concatenating the `kv_heads` inner
-    /// buffers yields the `[head_dim, seq, kv_heads]` (kv-head-major) layout the
-    /// attention `mul_mat` consumes.
-    k_history: Vec<Vec<Vec<f32>>>,
-    v_history: Vec<Vec<Vec<f32>>>,
+    /// Transactionally admitted token-major CPU-path K/V. `None` for the
+    /// resident-only GPU path. The owner drops its Vec payloads before its
+    /// SystemMemory lease, including when a candidate prefill fails.
+    host_kv: Option<SystemMemoryOwner<GraniteHostKvState>>,
     seq_len: usize,
     prefilled: bool,
     /// Device-resident, per-layer fixed-span `[head_dim, resident_capacity,
@@ -204,9 +446,13 @@ pub(crate) struct GraniteSpeechDecodeSession {
     resident_kv: Option<LlmResidentKvArena>,
     /// Allocated column count (`max_positions`) of every `resident_kv` tensor.
     /// The fixed span the reuse graph attends over and bakes into its topology;
-    /// grown (never shrunk) when a later request's `prompt + headroom` exceeds
-    /// it. `0` before the first resident allocation.
+    /// exactly equal to the planner's stable session-envelope reserve. `0`
+    /// before the first resident allocation.
     resident_capacity: usize,
+    /// Exact prompt-plus-generation bound for the active invocation. This is
+    /// request-scoped even when the resident arena/graph survives in the
+    /// cross-request cache.
+    logical_capacity: usize,
 }
 
 /// Build-once/re-run persistent single-token Granite decode graph plus its
@@ -232,6 +478,16 @@ struct GraniteReusableDecodeGraph {
 }
 
 impl GraniteSpeechDecodeSession {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        config: &GraniteSpeechDecoderConfig,
+    ) -> Result<u64, String> {
+        GraniteDecoderLoadedWeights::quoted_retained_system_memory_bytes(config.num_layers)
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        self.weights.retained_system_memory_bytes()
+    }
+
     /// Build the runner and upload every decoder weight once. No prefill yet.
     /// `provider` is consulted transiently here (to fill the f32 arena) and is
     /// not retained; `decode_step` takes it again per call for the token embed.
@@ -285,19 +541,18 @@ impl GraniteSpeechDecodeSession {
         weights: GraniteDecoderWeights,
         loaded: Option<GgmlLoadedWeightContext>,
     ) -> Self {
-        let num_layers = config.num_layers;
         Self {
             reuse: None,
             config,
             runner,
             weights,
             _loaded: loaded,
-            k_history: vec![Vec::new(); num_layers],
-            v_history: vec![Vec::new(); num_layers],
+            host_kv: None,
             seq_len: 0,
             prefilled: false,
             resident_kv: None,
             resident_capacity: 0,
+            logical_capacity: 0,
         }
     }
 
@@ -317,11 +572,10 @@ impl GraniteSpeechDecodeSession {
     /// stale rows invisible. In both cases clearing `seq_len` and `prefilled`
     /// makes a new prefill mandatory before another step can execute.
     pub(crate) fn release_session_scoped_buffers(&mut self) {
-        let num_layers = self.config.num_layers;
-        self.k_history = vec![Vec::new(); num_layers];
-        self.v_history = vec![Vec::new(); num_layers];
+        self.host_kv = None;
         self.seq_len = 0;
         self.prefilled = false;
+        self.logical_capacity = 0;
     }
 
     pub(crate) fn is_prefilled(&self) -> bool {
@@ -342,6 +596,7 @@ impl GraniteSpeechDecodeSession {
         &mut self,
         embeddings: &[f32],
         n_tokens: usize,
+        capacity: GraniteSpeechKvCacheCapacity,
     ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
         if self.prefilled {
             return Err(GraniteSpeechDecoderError::Shape {
@@ -362,16 +617,19 @@ impl GraniteSpeechDecodeSession {
                 ),
             });
         }
+        if n_tokens > capacity.logical_positions() {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: format!(
+                    "granite prefill requires {n_tokens} KV positions, exceeding logical span {}",
+                    capacity.logical_positions()
+                ),
+            });
+        }
 
         if self.reuse_supported() {
             // Metal reuse path: seed the resident KV arena directly from the
             // prefill graph (rows `0..n_tokens` via `set_rows`), no host copy.
-            let required = n_tokens
-                .checked_add(GRANITE_RESIDENT_DECODE_HEADROOM)
-                .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                    reason: "granite resident KV span overflow".to_string(),
-                })?;
-            self.ensure_resident_arena(required)?;
+            self.ensure_resident_arena(capacity.resident_positions())?;
             let last_logits = run_prefill_graph_seeding_resident(
                 &mut self.runner,
                 &self.weights,
@@ -384,35 +642,32 @@ impl GraniteSpeechDecodeSession {
             )?;
             self.seq_len = n_tokens;
             self.prefilled = true;
+            self.logical_capacity = capacity.logical_positions();
             return Ok(last_logits);
         }
 
-        let (last_logits, per_layer_kv) = run_prefill_graph(
+        // Allocate and commit the entire CPU-path owner before graph
+        // admission. The graph then writes token-major taps directly into
+        // this storage; no provisional SystemMemory gate is held while ggml
+        // performs its own native-memory transaction.
+        let mut host_kv = GraniteHostKvState::try_allocate(
+            self.config.num_layers,
+            capacity.logical_positions(),
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        )?;
+        let last_logits = run_prefill_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
             embeddings,
             n_tokens,
+            &mut host_kv,
         )?;
-
-        let head_dim = self.config.head_dim;
-        let kv_heads = self.config.num_kv_heads;
-        for (layer, (k_tap, v_tap)) in per_layer_kv.into_iter().enumerate() {
-            // k_tap / v_tap are `[head_dim, n_tokens, kv_heads]` (kv-head-major):
-            // split each kv_head's contiguous `[n_tokens, head_dim]` block into
-            // its own history buffer.
-            let mut k_heads = Vec::with_capacity(kv_heads);
-            let mut v_heads = Vec::with_capacity(kv_heads);
-            let block = n_tokens * head_dim;
-            for h in 0..kv_heads {
-                k_heads.push(k_tap[h * block..(h + 1) * block].to_vec());
-                v_heads.push(v_tap[h * block..(h + 1) * block].to_vec());
-            }
-            self.k_history[layer] = k_heads;
-            self.v_history[layer] = v_heads;
-        }
+        self.host_kv = Some(host_kv);
         self.seq_len = n_tokens;
         self.prefilled = true;
+        self.logical_capacity = capacity.logical_positions();
         Ok(last_logits)
     }
 
@@ -429,6 +684,14 @@ impl GraniteSpeechDecodeSession {
                 reason: "granite decode session must be prefilled before decode_step".to_string(),
             });
         }
+        if self.seq_len >= self.logical_capacity {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: format!(
+                    "granite decode position {} exceeds logical KV span {}",
+                    self.seq_len, self.logical_capacity
+                ),
+            });
+        }
 
         if self.reuse_supported() {
             // Metal reuse path: one persistent single-token step against the
@@ -439,54 +702,31 @@ impl GraniteSpeechDecodeSession {
 
         let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
 
-        let head_dim = self.config.head_dim;
-        let kv_heads = self.config.num_kv_heads;
         let seq_len = self.seq_len;
-        // Flatten each layer's per-kv-head history into one contiguous
-        // `[head_dim, seq_len, kv_heads]` (kv-head-major) buffer for upload.
-        let k_hist_bufs: Vec<Vec<f32>> = self
-            .k_history
-            .iter()
-            .map(|layer| flatten_history(layer, seq_len, head_dim, kv_heads))
-            .collect();
-        let v_hist_bufs: Vec<Vec<f32>> = self
-            .v_history
-            .iter()
-            .map(|layer| flatten_history(layer, seq_len, head_dim, kv_heads))
-            .collect();
-
-        let (logits, per_layer_kv) = run_decode_step_graph(
+        let host_kv = self
+            .host_kv
+            .as_mut()
+            .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+                reason: "granite CPU decode path has no admitted host KV owner".to_string(),
+            })?;
+        let logits = run_decode_step_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
             &embed_row,
             seq_len,
-            &k_hist_bufs,
-            &v_hist_bufs,
+            host_kv,
         )?;
-
-        // Append this token's K/V (`[head_dim, 1, kv_heads]` = kv-head-major)
-        // to each head's history buffer.
-        for (layer, (k_new, v_new)) in per_layer_kv.into_iter().enumerate() {
-            for h in 0..kv_heads {
-                self.k_history[layer][h]
-                    .extend_from_slice(&k_new[h * head_dim..(h + 1) * head_dim]);
-                self.v_history[layer][h]
-                    .extend_from_slice(&v_new[h * head_dim..(h + 1) * head_dim]);
-            }
-        }
         self.seq_len += 1;
         Ok(logits)
     }
 
-    /// Ensure the resident KV arena has at least `required` columns of fixed
-    /// span, (re)allocating (and zero-filling) it when absent or too small.
-    /// Growing invalidates the reuse graph (whose baked-in tensors point into
-    /// the old arena buffer), so drop it; the next reused step rebuilds against
-    /// the new arena. Never shrinks -- a smaller later request reuses the wider
-    /// span (its tail simply stays masked).
+    /// Ensure the resident KV arena has exactly the planner's stable envelope
+    /// span. A different envelope invalidates the graph and arena together;
+    /// changing only the current invocation's logical span never reaches this
+    /// branch and therefore never rebuilds either object.
     fn ensure_resident_arena(&mut self, required: usize) -> Result<(), GraniteSpeechDecoderError> {
-        if self.resident_kv.is_some() && self.resident_capacity >= required {
+        if self.resident_kv.is_some() && self.resident_capacity == required {
             return Ok(());
         }
         // Drop the reuse graph before freeing the old arena it points into.
@@ -774,31 +1014,17 @@ impl GraniteSpeechDecodeSession {
     }
 }
 
-/// Concatenate a layer's `kv_heads` history buffers (each `[seq_len, head_dim]`,
-/// row-major) into one `[head_dim, seq_len, kv_heads]` kv-head-major buffer.
-fn flatten_history(
-    layer: &[Vec<f32>],
-    seq_len: usize,
-    head_dim: usize,
-    kv_heads: usize,
-) -> Vec<f32> {
-    let mut out = Vec::with_capacity(seq_len * head_dim * kv_heads);
-    for head in layer.iter().take(kv_heads) {
-        out.extend_from_slice(head);
-    }
-    out
-}
-
 /// One-shot causal prefill that ALSO taps every layer's post-RoPE K/V. Returns
-/// the last-position logits row plus, per layer, the `[head_dim, n_tokens,
-/// kv_heads]` K and V tensors.
+/// the last-position logits row and writes each tap directly into the
+/// transactionally admitted token-major host owner.
 fn run_prefill_graph(
     runner: &mut GgmlCpuGraphRunner,
     weights: &GraniteDecoderWeights,
     config: &GraniteSpeechDecoderConfig,
     embeddings: &[f32],
     n_tokens: usize,
-) -> Result<ForwardGraphOutput, GraniteSpeechDecoderError> {
+    host_kv: &mut GraniteHostKvState,
+) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -835,7 +1061,25 @@ fn run_prefill_graph(
             n_tokens,
             rope,
         )?;
-        kv_taps.push((pre.k_perm, pre.v_perm));
+        // Convert the graph tap itself to contiguous token-major
+        // `[head_dim, kv_heads, position]`. The admitted host owner can then
+        // be the readback target directly; no Rust staging Vec or transpose
+        // survives outside ggml's already-admitted graph workspace.
+        let k_token_major = graph
+            .cont(
+                graph
+                    .permute(pre.k_perm, 0, 2, 1, 3)
+                    .map_err(map_ggml("session_prefill_k_token_permute"))?,
+            )
+            .map_err(map_ggml("session_prefill_k_token_contiguous"))?;
+        let v_token_major = graph
+            .cont(
+                graph
+                    .permute(pre.v_perm, 0, 2, 1, 3)
+                    .map_err(map_ggml("session_prefill_v_token_permute"))?,
+            )
+            .map_err(map_ggml("session_prefill_v_token_contiguous"))?;
+        kv_taps.push((k_token_major, v_token_major));
 
         let scores = graph
             .mul_mat(pre.k_perm, pre.q_perm)
@@ -931,26 +1175,53 @@ fn run_prefill_graph(
         .set_f32_slice(mask, &mask_values, "granite_session_prefill_mask")
         .map_err(map_ggml("session_prefill_upload_mask"))?;
 
-    let mut request: Vec<_> = Vec::with_capacity(1 + kv_taps.len() * 2);
-    request.push((logits, vocab_size));
-    for (k_tap, v_tap) in &kv_taps {
-        request.push((*k_tap, n_tokens * kv_width));
-        request.push((*v_tap, n_tokens * kv_width));
+    if host_kv.k_history.len() != config.num_layers || host_kv.v_history.len() != config.num_layers
+    {
+        return Err(GraniteSpeechDecoderError::Shape {
+            reason: "granite admitted host KV layer count does not match decoder".to_string(),
+        });
     }
-    let results = graph
-        .compute_outputs_f32(&request)
+    let written_len =
+        n_tokens
+            .checked_mul(kv_width)
+            .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+                reason: "granite prefill host KV written length overflowed".to_string(),
+            })?;
+    let mut last_logits = Vec::new();
+    last_logits.try_reserve_exact(vocab_size).map_err(|error| {
+        crate::models::native_execution_services::record_current_execution_candidate_failure(
+            crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                "granite_prefill_logits_allocate",
+                error.to_string(),
+            ),
+        );
+        GraniteSpeechDecoderError::Shape {
+            reason: format!("granite prefill logits allocation failed: {error}"),
+        }
+    })?;
+    last_logits.resize(vocab_size, 0.0);
+
+    let mut destinations: Vec<(GgmlCpuTensor<'_>, &mut [f32])> =
+        Vec::with_capacity(1 + kv_taps.len() * 2);
+    destinations.push((logits, last_logits.as_mut_slice()));
+    for ((k_tap, v_tap), (k_history, v_history)) in kv_taps.iter().zip(
+        host_kv
+            .k_history
+            .iter_mut()
+            .zip(host_kv.v_history.iter_mut()),
+    ) {
+        if k_history.len() < written_len || v_history.len() < written_len {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: "granite admitted host KV storage is smaller than prefill".to_string(),
+            });
+        }
+        destinations.push((*k_tap, &mut k_history[..written_len]));
+        destinations.push((*v_tap, &mut v_history[..written_len]));
+    }
+    graph
+        .compute_outputs_into_f32(destinations.as_mut_slice())
         .map_err(map_ggml("session_prefill_compute"))?;
-
-    let mut iter = results.into_iter();
-    let last_logits = iter.next().expect("prefill logits tap");
-
-    let mut per_layer_kv = Vec::with_capacity(config.num_layers);
-    for _ in 0..config.num_layers {
-        let k = iter.next().expect("prefill k tap");
-        let v = iter.next().expect("prefill v tap");
-        per_layer_kv.push((k, v));
-    }
-    Ok((last_logits, per_layer_kv))
+    Ok(last_logits)
 }
 
 /// One-shot causal prefill that ALSO seeds the device-resident KV arena
@@ -1140,10 +1411,12 @@ fn run_prefill_graph_seeding_resident(
     Ok(logits_output)
 }
 
-/// One incremental single-token step. `k_hist_bufs[layer]` / `v_hist_bufs[layer]`
-/// are the `[head_dim, seq_len, kv_heads]` cached history for that layer. Returns
-/// the next-token logits row plus, per layer, this token's `[head_dim, 1,
-/// kv_heads]` K and V (to append to the cache).
+/// One incremental single-token step. Each admitted history layer is a
+/// contiguous token-major
+/// `[seq_len, kv_heads, head_dim]` prefixes. The graph uploads them as
+/// `[head_dim, kv_heads, seq_len]` and permutes/contiguates it inside the graph
+/// workspace to the attention layout `[head_dim, seq_len, kv_heads]`. The new
+/// token's K/V is read directly into row `seq_len` of the admitted owner.
 #[allow(clippy::too_many_arguments)]
 fn run_decode_step_graph(
     runner: &mut GgmlCpuGraphRunner,
@@ -1151,15 +1424,42 @@ fn run_decode_step_graph(
     config: &GraniteSpeechDecoderConfig,
     embed_row: &[f32],
     seq_len: usize,
-    k_hist_bufs: &[Vec<f32>],
-    v_hist_bufs: &[Vec<f32>],
-) -> Result<ForwardGraphOutput, GraniteSpeechDecoderError> {
+    host_kv: &mut GraniteHostKvState,
+) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
     let vocab_size = config.vocab_size;
     let kv_width = kv_heads * head_dim;
     let new_position = seq_len; // 0-based position of the new token.
+    if host_kv.k_history.len() != config.num_layers || host_kv.v_history.len() != config.num_layers
+    {
+        return Err(GraniteSpeechDecoderError::Shape {
+            reason: "granite admitted host KV layer count does not match decoder".to_string(),
+        });
+    }
+    let history_len =
+        seq_len
+            .checked_mul(kv_width)
+            .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+                reason: "granite step host KV history length overflowed".to_string(),
+            })?;
+    let row_end =
+        history_len
+            .checked_add(kv_width)
+            .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+                reason: "granite step host KV row end overflowed".to_string(),
+            })?;
+    if host_kv
+        .k_history
+        .iter()
+        .chain(host_kv.v_history.iter())
+        .any(|history| history.len() < row_end)
+    {
+        return Err(GraniteSpeechDecoderError::Shape {
+            reason: "granite admitted host KV storage is smaller than decode step".to_string(),
+        });
+    }
 
     let mut graph = runner.start_graph();
 
@@ -1170,18 +1470,20 @@ fn run_decode_step_graph(
         .new_tensor_1d_i32(1, "granite_session_step_position")
         .map_err(map_ggml("session_step_position_alloc"))?;
 
-    // Per-layer K/V history input tensors (`[head_dim, seq_len, kv_heads]`).
+    // Per-layer token-major K/V history input tensors
+    // (`[head_dim, kv_heads, seq_len]`). This matches append order in the host
+    // arena, so no full-history host flatten/copy is needed per token.
     let mut k_hist_tensors = Vec::with_capacity(config.num_layers);
     let mut v_hist_tensors = Vec::with_capacity(config.num_layers);
     for _ in 0..config.num_layers {
         k_hist_tensors.push(
             graph
-                .new_tensor_3d_f32(head_dim, seq_len, kv_heads, "granite_session_step_k_hist")
+                .new_tensor_3d_f32(head_dim, kv_heads, seq_len, "granite_session_step_k_hist")
                 .map_err(map_ggml("session_step_k_hist_alloc"))?,
         );
         v_hist_tensors.push(
             graph
-                .new_tensor_3d_f32(head_dim, seq_len, kv_heads, "granite_session_step_v_hist")
+                .new_tensor_3d_f32(head_dim, kv_heads, seq_len, "granite_session_step_v_hist")
                 .map_err(map_ggml("session_step_v_hist_alloc"))?,
         );
     }
@@ -1206,12 +1508,30 @@ fn run_decode_step_graph(
         )?;
         kv_taps.push((pre.k_perm, pre.v_perm));
 
+        // Restore the attention layout `[head_dim, seq_len, kv_heads]` and
+        // make it contiguous for concat. The copy now lives in ggml's quoted
+        // graph workspace instead of an untracked Rust Vec allocation.
+        let k_history = graph
+            .cont(
+                graph
+                    .permute(k_hist_tensors[index], 0, 2, 1, 3)
+                    .map_err(map_ggml("session_step_k_history_permute"))?,
+            )
+            .map_err(map_ggml("session_step_k_history_contiguous"))?;
+        let v_history = graph
+            .cont(
+                graph
+                    .permute(v_hist_tensors[index], 0, 2, 1, 3)
+                    .map_err(map_ggml("session_step_v_history_permute"))?,
+            )
+            .map_err(map_ggml("session_step_v_history_contiguous"))?;
+
         // Attend the single new query against `history ++ new`.
         let k_full = graph
-            .concat(k_hist_tensors[index], pre.k_perm, 1)
+            .concat(k_history, pre.k_perm, 1)
             .map_err(map_ggml("session_step_k_concat"))?;
         let v_full = graph
-            .concat(v_hist_tensors[index], pre.v_perm, 1)
+            .concat(v_history, pre.v_perm, 1)
             .map_err(map_ggml("session_step_v_concat"))?;
         let scores = graph
             .mul_mat(k_full, pre.q_perm)
@@ -1300,10 +1620,14 @@ fn run_decode_step_graph(
     graph
         .set_f32_slice(embed_tensor, embed_row, "granite_session_step_embed")
         .map_err(map_ggml("session_step_upload_embed"))?;
+    let new_position_i32 =
+        i32::try_from(new_position).map_err(|_| GraniteSpeechDecoderError::Shape {
+            reason: format!("granite decode position {new_position} does not fit i32"),
+        })?;
     graph
         .set_i32_slice(
             positions,
-            &[new_position as i32],
+            &[new_position_i32],
             "granite_session_step_position",
         )
         .map_err(map_ggml("session_step_upload_position"))?;
@@ -1311,38 +1635,48 @@ fn run_decode_step_graph(
         graph
             .set_f32_slice(
                 k_hist_tensors[index],
-                &k_hist_bufs[index],
+                &host_kv.k_history[index][..history_len],
                 "granite_session_step_k_hist",
             )
             .map_err(map_ggml("session_step_upload_k_hist"))?;
         graph
             .set_f32_slice(
                 v_hist_tensors[index],
-                &v_hist_bufs[index],
+                &host_kv.v_history[index][..history_len],
                 "granite_session_step_v_hist",
             )
             .map_err(map_ggml("session_step_upload_v_hist"))?;
     }
 
-    let mut request: Vec<_> = Vec::with_capacity(1 + kv_taps.len() * 2);
-    request.push((logits, vocab_size));
-    for (k_tap, v_tap) in &kv_taps {
-        request.push((*k_tap, kv_width));
-        request.push((*v_tap, kv_width));
+    let mut logits_row = Vec::new();
+    logits_row.try_reserve_exact(vocab_size).map_err(|error| {
+        crate::models::native_execution_services::record_current_execution_candidate_failure(
+            crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                "granite_step_logits_allocate",
+                error.to_string(),
+            ),
+        );
+        GraniteSpeechDecoderError::Shape {
+            reason: format!("granite step logits allocation failed: {error}"),
+        }
+    })?;
+    logits_row.resize(vocab_size, 0.0);
+    let mut destinations: Vec<(GgmlCpuTensor<'_>, &mut [f32])> =
+        Vec::with_capacity(1 + kv_taps.len() * 2);
+    destinations.push((logits, logits_row.as_mut_slice()));
+    for ((k_tap, v_tap), (k_history, v_history)) in kv_taps.iter().zip(
+        host_kv
+            .k_history
+            .iter_mut()
+            .zip(host_kv.v_history.iter_mut()),
+    ) {
+        destinations.push((*k_tap, &mut k_history[history_len..row_end]));
+        destinations.push((*v_tap, &mut v_history[history_len..row_end]));
     }
-    let results = graph
-        .compute_outputs_f32(&request)
+    graph
+        .compute_outputs_into_f32(destinations.as_mut_slice())
         .map_err(map_ggml("session_step_compute"))?;
-
-    let mut iter = results.into_iter();
-    let logits_row = iter.next().expect("step logits tap");
-    let mut per_layer_kv = Vec::with_capacity(config.num_layers);
-    for _ in 0..config.num_layers {
-        let k = iter.next().expect("step k tap");
-        let v = iter.next().expect("step v tap");
-        per_layer_kv.push((k, v));
-    }
-    Ok((logits_row, per_layer_kv))
+    Ok(logits_row)
 }
 
 #[cfg(test)]
@@ -1493,6 +1827,42 @@ mod tests {
         assert_eq!(fixed_span_tail_mask(4, 3), vec![0.0; 4]);
     }
 
+    #[test]
+    fn granite_capacity_keeps_runtime_bound_and_stable_reserve_distinct() {
+        let capacity = GraniteSpeechKvCacheCapacity::new(640, 960).expect("capacity");
+        assert_eq!(capacity.logical_positions(), 640);
+        assert_eq!(capacity.resident_positions(), 960);
+        assert_eq!(
+            capacity
+                .validate_measured_logical_positions(639)
+                .expect_err("runtime/planner drift must fail closed"),
+            GraniteSpeechKvCacheCapacityError::LogicalPositionMismatch {
+                planned_positions: 640,
+                measured_positions: 639,
+            }
+        );
+        assert_eq!(
+            capacity
+                .validate_hard_cap(959)
+                .expect_err("reserve above hard cap must fail"),
+            GraniteSpeechKvCacheCapacityError::HardCapExceeded {
+                resident_positions: 960,
+                hard_cap: 959,
+            }
+        );
+    }
+
+    #[test]
+    fn granite_capacity_requires_planned_decoder_state() {
+        assert_eq!(
+            GraniteSpeechKvCacheCapacity::from_decoder_state(
+                &crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
+            )
+            .expect_err("runtime must not invent a capacity fallback"),
+            GraniteSpeechKvCacheCapacityError::DecoderStateNotPlanned,
+        );
+    }
+
     /// The load-bearing correctness gate: the incremental KV-cache session must
     /// reproduce the one-shot full recompute's logits BIT-FOR-BIT at every step
     /// (which also forces identical greedy token choices). Runs entirely on
@@ -1513,11 +1883,30 @@ mod tests {
         let mut session =
             GraniteSpeechDecodeSession::new(config, &weights, GgmlCpuGraphBackend::Cpu)
                 .expect("session");
+        let logical_positions = prompt.len() + 8;
+        let capacity = GraniteSpeechKvCacheCapacity::new(logical_positions, logical_positions + 4)
+            .expect("test capacity");
 
         // Step 0: prefill logits vs full recompute over the prompt alone.
         let inc0 = session
-            .prefill(&prompt_embeddings, prompt.len())
+            .prefill(&prompt_embeddings, prompt.len(), capacity)
             .expect("prefill");
+        assert!(
+            session.resident_kv.is_none(),
+            "CPU must not allocate resident KV"
+        );
+        let host_kv = session.host_kv.as_ref().expect("CPU host KV owner");
+        let k_allocations: Vec<(*const f32, usize)> = host_kv
+            .k_history
+            .iter()
+            .map(|history| (history.as_ptr(), history.capacity()))
+            .collect();
+        let v_allocations: Vec<(*const f32, usize)> = host_kv
+            .v_history
+            .iter()
+            .map(|history| (history.as_ptr(), history.capacity()))
+            .collect();
+        assert_eq!(session.logical_capacity, logical_positions);
         let ref0 = recompute_last_logits(&config, &weights, &prompt);
         assert_bit_identical(0, &inc0, &ref0);
         assert_eq!(session.cached_positions(), prompt.len());
@@ -1540,6 +1929,25 @@ mod tests {
 
             assert_bit_identical(step, &inc, &reference);
             assert_eq!(session.cached_positions(), prompt.len() + generated.len());
+            let host_kv = session.host_kv.as_ref().expect("CPU host KV owner");
+            assert_eq!(
+                host_kv
+                    .k_history
+                    .iter()
+                    .map(|history| (history.as_ptr(), history.capacity()))
+                    .collect::<Vec<_>>(),
+                k_allocations,
+                "K history must never realloc"
+            );
+            assert_eq!(
+                host_kv
+                    .v_history
+                    .iter()
+                    .map(|history| (history.as_ptr(), history.capacity()))
+                    .collect::<Vec<_>>(),
+                v_allocations,
+                "V history must never realloc"
+            );
             next_logits = inc;
         }
     }
@@ -1583,8 +1991,11 @@ mod tests {
         let mut session =
             GraniteSpeechDecodeSession::new(config, &weights, GgmlCpuGraphBackend::Cpu)
                 .expect("session");
+        let logical_positions = prompt.len() + 96;
+        let capacity = GraniteSpeechKvCacheCapacity::new(logical_positions, logical_positions + 16)
+            .expect("test capacity");
         let mut logits = session
-            .prefill(&prompt_embeddings, prompt.len())
+            .prefill(&prompt_embeddings, prompt.len(), capacity)
             .expect("prefill");
         let mut incremental_first = None;
         let mut incremental_last = None;

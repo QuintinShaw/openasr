@@ -68,6 +68,12 @@ pub(crate) enum PadMode {
 pub(crate) enum StftError {
     #[error("stft framer produced no frames from {samples} samples")]
     TooShort { samples: usize },
+    #[error("stft framer geometry is invalid: n_fft={n_fft}, hop={hop}")]
+    InvalidGeometry { n_fft: usize, hop: usize },
+    #[error("stft centered-padding length overflowed for {samples} samples")]
+    LengthOverflow { samples: usize },
+    #[error("stft pad mode {pad_mode:?} has no whole-buffer frame count")]
+    WholeBufferUnsupported { pad_mode: PadMode },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +152,49 @@ impl StftFramer {
         self.n_fft / 2 + 1
     }
 
+    /// Count whole-buffer STFT rows without allocating a padded signal, FFT
+    /// plan, or output tensor. Capacity planners call this associated oracle
+    /// from pack-carried geometry; [`Self::power_spectrogram`] calls the same
+    /// implementation before materializing samples, so frontend and planner
+    /// cannot drift on centered-frame arithmetic.
+    pub(crate) fn output_frame_count_for(
+        n_fft: usize,
+        hop: usize,
+        pad_mode: PadMode,
+        samples: usize,
+    ) -> Result<usize, StftError> {
+        if n_fft == 0 || hop == 0 {
+            return Err(StftError::InvalidGeometry { n_fft, hop });
+        }
+        if samples == 0 {
+            return Err(StftError::TooShort { samples });
+        }
+        match pad_mode {
+            PadMode::ReflectCenter | PadMode::ZeroCenter => {
+                let pad = n_fft / 2;
+                let padded_len = pad
+                    .checked_mul(2)
+                    .and_then(|padding| samples.checked_add(padding))
+                    .ok_or(StftError::LengthOverflow { samples })?;
+                let tail = padded_len
+                    .checked_sub(n_fft)
+                    .ok_or(StftError::TooShort { samples })?;
+                tail.checked_div(hop)
+                    .and_then(|frames| frames.checked_add(1))
+                    .ok_or(StftError::LengthOverflow { samples })
+            }
+            PadMode::KaldiSnipEdgesFalse => {
+                // This mode is range-driven and has no whole-buffer entry
+                // point, matching `power_spectrogram`'s contract.
+                Err(StftError::WholeBufferUnsupported { pad_mode })
+            }
+        }
+    }
+
+    pub(crate) fn output_frame_count(&self, samples: usize) -> Result<usize, StftError> {
+        Self::output_frame_count_for(self.n_fft, self.hop, self.pad_mode, samples)
+    }
+
     /// Compute the power spectrogram for mono `samples` (float, any scale --
     /// scaling to the engine's native domain, e.g. int16 magnitude, is the
     /// caller's job before calling this).
@@ -221,18 +270,20 @@ impl StftFramer {
         &self,
         samples: &[f32],
     ) -> Result<PowerSpectrogram, StftError> {
+        let n_frames = self.output_frame_count(samples.len())?;
         let pad = self.n_fft / 2;
         let padded = reflect_pad(samples, pad);
-        self.power_spectrogram_from_centered_pad(padded, samples.len())
+        self.power_spectrogram_from_centered_pad(padded, n_frames)
     }
 
     fn power_spectrogram_zero_center(
         &self,
         samples: &[f32],
     ) -> Result<PowerSpectrogram, StftError> {
+        let n_frames = self.output_frame_count(samples.len())?;
         let pad = self.n_fft / 2;
         let padded = zero_pad(samples, pad);
-        self.power_spectrogram_from_centered_pad(padded, samples.len())
+        self.power_spectrogram_from_centered_pad(padded, n_frames)
     }
 
     /// Shared frame + window + FFT loop for the two centered pad modes
@@ -242,14 +293,9 @@ impl StftFramer {
     fn power_spectrogram_from_centered_pad(
         &self,
         padded: Vec<f32>,
-        original_len: usize,
+        n_frames: usize,
     ) -> Result<PowerSpectrogram, StftError> {
-        if padded.len() < self.n_fft {
-            return Err(StftError::TooShort {
-                samples: original_len,
-            });
-        }
-        let n_frames = (padded.len() - self.n_fft) / self.hop + 1;
+        debug_assert_eq!(n_frames, (padded.len() - self.n_fft) / self.hop + 1);
         let fft_bins = self.n_fft_bins();
 
         let r2c = &self.fft;
@@ -452,6 +498,15 @@ mod tests {
         let spectrogram = framer.power_spectrogram(&samples).expect("spectrogram");
         let expected_frames = (16_000 + 512 - 512) / 160 + 1;
         assert_eq!(spectrogram.n_frames, expected_frames);
+        assert_eq!(
+            framer.output_frame_count(samples.len()).unwrap(),
+            expected_frames
+        );
+        assert_eq!(
+            StftFramer::output_frame_count_for(512, 160, PadMode::ReflectCenter, samples.len())
+                .unwrap(),
+            expected_frames
+        );
         assert_eq!(spectrogram.n_fft_bins, 257);
         assert_eq!(
             spectrogram.data.len(),
@@ -489,8 +544,36 @@ mod tests {
         let spectrogram = framer.power_spectrogram(&samples).expect("spectrogram");
         let expected_frames = (16_000 + 400 - 400) / 160 + 1;
         assert_eq!(spectrogram.n_frames, expected_frames);
+        assert_eq!(
+            framer.output_frame_count(samples.len()).unwrap(),
+            expected_frames
+        );
         assert_eq!(spectrogram.n_fft_bins, 201);
         assert!(spectrogram.data.iter().all(|v| v.is_finite() && *v >= 0.0));
+    }
+
+    #[test]
+    fn count_only_oracle_rejects_empty_invalid_and_overflowing_shapes() {
+        assert!(matches!(
+            StftFramer::output_frame_count_for(400, 160, PadMode::ZeroCenter, 0),
+            Err(StftError::TooShort { samples: 0 })
+        ));
+        assert!(matches!(
+            StftFramer::output_frame_count_for(400, 0, PadMode::ZeroCenter, 1),
+            Err(StftError::InvalidGeometry { n_fft: 400, hop: 0 })
+        ));
+        assert!(matches!(
+            StftFramer::output_frame_count_for(400, 160, PadMode::KaldiSnipEdgesFalse, 1),
+            Err(StftError::WholeBufferUnsupported {
+                pad_mode: PadMode::KaldiSnipEdgesFalse
+            })
+        ));
+        assert!(matches!(
+            StftFramer::output_frame_count_for(400, 160, PadMode::ZeroCenter, usize::MAX),
+            Err(StftError::LengthOverflow {
+                samples: usize::MAX
+            })
+        ));
     }
 
     /// Reimplementation of the pre-refactor `qwen`/`cohere`

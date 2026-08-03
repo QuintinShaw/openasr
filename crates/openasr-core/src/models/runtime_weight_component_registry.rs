@@ -19,10 +19,9 @@ use super::cohere::{
     load_cohere_transcribe_encoder_weights_from_reader,
 };
 use super::qwen::{
-    Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmLogitsHead,
-    Qwen3AsrTokenEmbeddingTable, load_qwen3_audio_encoder_weights_from_reader,
-    load_qwen3_llm_attention_projections_from_reader, load_qwen3_llm_logits_head_from_reader,
-    load_qwen3_token_embedding_table_from_reader,
+    Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable,
+    QwenWholeDecoderPlan, load_qwen3_audio_encoder_weights_from_reader,
+    load_qwen3_llm_logits_head_from_reader, load_qwen3_token_embedding_table_from_reader,
 };
 use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 
@@ -41,7 +40,7 @@ pub(crate) enum BuiltinRuntimeWeightComponents {
         audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
         token_embedding_table: Qwen3AsrTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
-        layer_attention_projections: Vec<Qwen3AsrLlmLayerAttentionProjection>,
+        decoder_plan: QwenWholeDecoderPlan,
     },
 }
 
@@ -67,19 +66,19 @@ impl BuiltinRuntimeWeightComponents {
         Qwen3AsrAudioEncoderWeights,
         Qwen3AsrTokenEmbeddingTable,
         Qwen3AsrLlmLogitsHead,
-        Vec<Qwen3AsrLlmLayerAttentionProjection>,
+        QwenWholeDecoderPlan,
     )> {
         match self {
             Self::Qwen3Asr {
                 audio_encoder_weights,
                 token_embedding_table,
                 logits_head,
-                layer_attention_projections,
+                decoder_plan,
             } => Some((
                 audio_encoder_weights,
                 token_embedding_table,
                 logits_head,
-                layer_attention_projections,
+                decoder_plan,
             )),
             _ => None,
         }
@@ -166,18 +165,18 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                         reason: error.to_string(),
                     }
                 })?;
-            let layer_attention_projections =
-                load_qwen3_llm_attention_projections_from_reader(reader, metadata).map_err(
-                    |error| BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
+            let decoder_plan =
+                QwenWholeDecoderPlan::for_qwen3_asr(reader, metadata).map_err(|error| {
+                    BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
                         component: "qwen3-asr.layer-attention-projections",
                         reason: error.to_string(),
-                    },
-                )?;
+                    }
+                })?;
             Ok(BuiltinRuntimeWeightComponents::Qwen3Asr {
                 audio_encoder_weights,
                 token_embedding_table,
                 logits_head,
-                layer_attention_projections,
+                decoder_plan,
             })
         }
         (crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, metadata) => Err(

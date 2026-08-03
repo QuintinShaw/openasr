@@ -32,6 +32,18 @@ pub(crate) struct NamedTensor {
     pub values: Vec<f32>,
 }
 
+impl NamedTensor {
+    pub(crate) fn add_retained_system_memory_bytes(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_string(&self.name, &format!("{label} name"))?;
+        bytes.add_vec(&self.dims, &format!("{label} dims"))?;
+        bytes.add_vec(&self.values, &format!("{label} values"))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StoredLinear {
     pub name: String,
@@ -52,6 +64,22 @@ pub(crate) struct StoredLinear {
 }
 
 impl StoredLinear {
+    pub(crate) fn add_retained_system_memory_bytes(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_string(&self.name, &format!("{label} name"))?;
+        bytes.add_vec(&self.values, &format!("{label} values"))?;
+        if let Some(native) = &self.native {
+            bytes.add(
+                native.retained_system_memory_bytes()?,
+                &format!("{label} native payload"),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply(&self, input: &[f32], bias: Option<&[f32]>) -> Result<Vec<f32>, String> {
         let mut output = vec![0.0_f32; self.output_dim];
         self.apply_into(input, bias, &mut output)?;
@@ -145,6 +173,42 @@ pub(crate) struct XasrJoinerWeights {
     pub decoder_proj_bias: Vec<f32>,
     pub output_linear_weight: StoredLinear,
     pub output_linear_bias: Vec<f32>,
+}
+
+impl XasrDecoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        self.embedding
+            .add_retained_system_memory_bytes(&mut bytes, "xasr decoder embedding")?;
+        self.conv_weight
+            .add_retained_system_memory_bytes(&mut bytes, "xasr decoder conv")?;
+        Ok(bytes.finish())
+    }
+}
+
+impl XasrJoinerWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        self.encoder_proj_weight
+            .add_retained_system_memory_bytes(&mut bytes, "xasr joiner encoder projection")?;
+        bytes.add_vec(
+            &self.encoder_proj_bias,
+            "xasr joiner encoder projection bias",
+        )?;
+        self.decoder_proj_weight
+            .add_retained_system_memory_bytes(&mut bytes, "xasr joiner decoder projection")?;
+        bytes.add_vec(
+            &self.decoder_proj_bias,
+            "xasr joiner decoder projection bias",
+        )?;
+        self.output_linear_weight
+            .add_retained_system_memory_bytes(&mut bytes, "xasr joiner output projection")?;
+        bytes.add_vec(
+            &self.output_linear_bias,
+            "xasr joiner output projection bias",
+        )?;
+        Ok(bytes.finish())
+    }
 }
 
 pub(crate) fn load_xasr_decoder_weights(

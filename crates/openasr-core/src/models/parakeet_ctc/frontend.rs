@@ -44,12 +44,23 @@ pub(crate) enum ParakeetFrontendError {
     UnsupportedAudio { channels: usize, sample_rate: u32 },
     #[error("parakeet-ctc frontend: audio too short ({samples} samples) for one STFT frame")]
     TooShort { samples: usize },
+    #[error("parakeet-ctc frontend: invalid STFT geometry n_fft={n_fft}, hop={hop}")]
+    InvalidStftGeometry { n_fft: usize, hop: usize },
+    #[error("parakeet-ctc frontend: STFT length overflow for {samples} samples")]
+    StftLengthOverflow { samples: usize },
+    #[error("parakeet-ctc frontend: STFT pad mode {pad_mode:?} has no whole-buffer shape")]
+    UnsupportedStftPadMode { pad_mode: PadMode },
 }
 
 impl From<StftError> for ParakeetFrontendError {
     fn from(error: StftError) -> Self {
         match error {
             StftError::TooShort { samples } => Self::TooShort { samples },
+            StftError::InvalidGeometry { n_fft, hop } => Self::InvalidStftGeometry { n_fft, hop },
+            StftError::LengthOverflow { samples } => Self::StftLengthOverflow { samples },
+            StftError::WholeBufferUnsupported { pad_mode } => {
+                Self::UnsupportedStftPadMode { pad_mode }
+            }
         }
     }
 }

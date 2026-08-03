@@ -12,8 +12,7 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -22,6 +21,10 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::MIMO_ASR_DECODE_POLICY_ID;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
@@ -33,17 +36,21 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
+    build_qwen3_prompt_embeddings_with_audio_splice,
 };
+use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
 };
-use crate::models::thread_local_runtime_cache::{
-    PackContentKey, current_unload_generation, take_generation_tagged,
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 
 use super::audio_tokenizer_graph::MimoAudiotokEncoderRuntime;
@@ -101,14 +108,18 @@ enum MimoAsrExecutorError {
     DecodePromptFailed { reason: String },
     #[error("mimo-asr prompt embedding splice failed: {reason}")]
     PromptEmbeddingFailed { reason: String },
+    #[error("mimo-asr decoder-state capacity contract failed: {source}")]
+    DecoderStateCapacity {
+        #[source]
+        source: Qwen3AsrKvCacheCapacityError,
+    },
     #[error("mimo-asr backbone decoder failed: {reason}")]
     DecoderFailed { reason: String },
     #[error("mimo-asr greedy decode failed: {reason}")]
     GreedyDecodeFailed { reason: String },
+    #[error("mimo-asr {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
 }
-
-#[derive(Debug, Default, Clone)]
-pub(crate) struct MimoAsrGgmlExecutor;
 
 /// Everything mimo-asr materializes from a pack that does NOT depend on the
 /// per-request audio: all three graph runtimes (audio-tokenizer encoder,
@@ -135,47 +146,56 @@ struct MimoAsrPreparedRuntime {
     inlocal_metadata: MimoInlocalMetadata,
 }
 
-/// Resident prepared-runtime cache keyed by (pack content id, backend), the
-/// same design + idle-unload-generation tagging `firered_llm` uses for its
-/// resident decoder (see that module's `FIRERED_LLM_DECODER_BY_KEY` doc). The
+/// Resident prepared-runtime actor pool keyed by content id, execution lane,
+/// and resident KV capacity. The
 /// pack half is a [`PackContentKey`] from the request's already-open source,
 /// so an in-place `.oasr` replacement at the same path resolves a different id
 /// and the next lookup rebuilds instead of reusing runtimes built from the old
 /// bytes. Entries are tagged with the idle-unload generation they were built
-/// under: `take_generation_tagged` discards any prepared runtime built before
-/// the last idle unload (the reaper cannot reach this worker thread's TLS from
-/// its own thread), so the resident ~8B pipeline stays evictable under memory
-/// pressure through the shared central unload clock -- no bespoke policy.
-///
-/// A plain `HashMap` (not the bounded LRU): the key does not explode per audio
-/// chunk (one entry is built and reused across a whole longform run for a given
-/// pack/backend), so there is no unbounded-growth hazard to bound.
-type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// service root can clear or target-evict every actor directly; each runtime is
+/// destroyed on the same owner thread that constructed its native contexts.
+type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
 
-thread_local! {
-    static MIMO_ASR_PREPARED_BY_KEY: RefCell<
-        HashMap<MimoAsrPreparedRuntimeCacheKey, (u64, MimoAsrPreparedRuntime)>,
-    > = RefCell::new(HashMap::new());
+struct MimoAsrPreparedRuntimeActorState {
+    runtime: MimoAsrPreparedRuntime,
 }
 
-fn take_cached_prepared_runtime(
-    key: &MimoAsrPreparedRuntimeCacheKey,
-    unload_generation: u64,
-) -> Option<MimoAsrPreparedRuntime> {
-    MIMO_ASR_PREPARED_BY_KEY
-        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
+impl std::fmt::Debug for MimoAsrPreparedRuntimeActorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MimoAsrPreparedRuntimeActorState")
+            .finish_non_exhaustive()
+    }
 }
 
-fn store_cached_prepared_runtime(
-    key: MimoAsrPreparedRuntimeCacheKey,
-    unload_generation: u64,
-    prepared: MimoAsrPreparedRuntime,
-) {
-    MIMO_ASR_PREPARED_BY_KEY.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(key, (unload_generation, prepared));
-    });
+type MimoAsrPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    MimoAsrPreparedRuntimeCacheKey,
+    MimoAsrPreparedRuntimeActorState,
+>;
+type MimoAsrPreparedRuntimeActor =
+    PinnedRuntimeActorCheckout<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntimeActorState>;
+
+const MIMO_ASR_RUNTIME_MAX_IDLE_ENTRIES: usize = 2;
+const MIMO_ASR_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
+
+#[derive(Debug, Clone)]
+pub(crate) struct MimoAsrGgmlExecutor {
+    prepared_runtimes: Arc<MimoAsrPreparedRuntimePool>,
+}
+
+impl Default for MimoAsrGgmlExecutor {
+    fn default() -> Self {
+        Self {
+            prepared_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-mimo-asr-runtime-owner",
+                AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                    MIMO_ASR_RUNTIME_MAX_IDLE_ENTRIES,
+                    crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+                    MIMO_ASR_RUNTIME_MAX_INSTANCES_PER_KEY,
+                ),
+            )),
+        }
+    }
 }
 
 /// No-op phrase-bias shim: mimo-asr's decode policy never consults these (no
@@ -195,7 +215,8 @@ impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 /// incrementally. Mirrors `firered_llm::executor::FireRedLlmGreedyStepExecutor`.
 struct MimoAsrGreedyStepExecutor<'a> {
     decoder: &'a mut MimoLlmDecoderRuntime,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
     prompt_embeddings: Option<crate::models::qwen::Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
     /// Explicit cancel/pause/resume control for this decode -- never a
@@ -212,7 +233,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let prefill = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
+                .prefill(
+                    &prompt_embeddings,
+                    &mut self.layer_kv_caches,
+                    self.kv_capacity,
+                    &self.control,
+                )
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -235,7 +261,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
             })?;
         if let Some(token_id) = self
             .decoder
-            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .decode_step_reused_top1(
+                last_token,
+                cache_position,
+                &self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?
@@ -247,7 +278,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
         }
         let logits = self
             .decoder
-            .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
+            .decode_step(
+                last_token,
+                cache_position,
+                &mut self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?;
@@ -259,6 +295,97 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
 }
 
 impl MimoAsrPreparedRuntime {
+    fn quoted_system_memory_bytes(
+        preflight: &crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<(u64, u64), MimoAsrExecutorError> {
+        let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata)
+            .map_err(|error| contract_error(error.to_string()))?;
+        let inlocal_metadata = parse_mimo_inlocal_metadata(&preflight.metadata)
+            .map_err(|error| contract_error(error.to_string()))?;
+        let audiotok_metadata = parse_mimo_audiotok_metadata(&preflight.metadata)
+            .map_err(|error| contract_error(error.to_string()))?;
+        let mel_metadata = parse_mimo_mel_metadata(&preflight.metadata)
+            .map_err(|error| contract_error(error.to_string()))?;
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+            MimoAsrExecutorError::RuntimeOwnershipFailed {
+                stage: "prepared-runtime-quote",
+                reason: error.to_string(),
+            }
+        })?;
+        let speech_vocab_sizes = audiotok_metadata
+            .codebook_sizes
+            .iter()
+            .map(|size| {
+                size.checked_add(1)
+                    .ok_or_else(|| capacity_error("mimo speech vocabulary size overflowed"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let tokenizer = MimoAsrTokenizer::quoted_retained_system_memory_bytes(&preflight.metadata)
+            .map_err(capacity_error)?;
+        let mel = MimoMelFrontendPlan::quoted_retained_system_memory_bytes(&mel_metadata)
+            .map_err(capacity_error)?;
+        let encoder =
+            MimoAudiotokEncoderRuntime::quoted_retained_system_memory_bytes(&audiotok_metadata)
+                .map_err(capacity_error)?;
+        let codebooks = MimoRvqCodebooks::quoted_retained_system_memory_bytes(&audiotok_metadata)
+            .map_err(capacity_error)?;
+        let speech_embeddings = MimoSpeechEmbeddingTables::quoted_retained_system_memory_bytes(
+            inlocal_metadata.d_model,
+            &speech_vocab_sizes,
+        )
+        .map_err(capacity_error)?;
+        let inlocal = MimoInputLocalRuntime::quoted_retained_system_memory_bytes(&inlocal_metadata)
+            .map_err(capacity_error)?;
+        let (decoder_peak, decoder_retained) =
+            super::llm_transformer::quoted_mimo_llm_decoder_system_memory_bytes(
+                &reader,
+                &llm_metadata,
+                backend,
+            )
+            .map_err(capacity_error)?;
+
+        phase_aware_quote([
+            (tokenizer, tokenizer),
+            (mel, mel),
+            (encoder, encoder),
+            (codebooks, codebooks),
+            (speech_embeddings, speech_embeddings),
+            (inlocal, inlocal),
+            (decoder_peak, decoder_retained),
+        ])
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, MimoAsrExecutorError> {
+        checked_sum_u64(
+            [
+                self.encoder_runtime
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.inlocal_runtime
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.decoder
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.tokenizer
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.codebooks
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.speech_embedding_tables
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.mel_plan
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+            ],
+            "mimo prepared measured retained bytes",
+        )
+    }
+
     /// Materializes every per-request-invariant piece of the mimo-asr pipeline
     /// from an already-resolved preflight: the three graph runtimes and their
     /// resident weights, plus the RVQ codebooks, speech-embedding tables, mel
@@ -340,8 +467,13 @@ impl MimoAsrPreparedRuntime {
         let speech_vocab_sizes: Vec<u32> = audiotok_metadata
             .codebook_sizes
             .iter()
-            .map(|size| size + 1)
-            .collect();
+            .map(|size| {
+                size.checked_add(1)
+                    .ok_or_else(|| MimoAsrExecutorError::RuntimeContractViolation {
+                        reason: "speech vocabulary size overflowed".to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
         let zeroemb_idx: Vec<u32> = audiotok_metadata.codebook_sizes.clone();
         let speech_embedding_tables = load_speech_embedding_tables_from_reader(
             &reader,
@@ -379,7 +511,117 @@ impl MimoAsrPreparedRuntime {
     }
 }
 
+fn contract_error(reason: String) -> MimoAsrExecutorError {
+    MimoAsrExecutorError::RuntimeContractViolation { reason }
+}
+
+fn capacity_error(reason: impl Into<String>) -> MimoAsrExecutorError {
+    MimoAsrExecutorError::RuntimeOwnershipFailed {
+        stage: "prepared-runtime",
+        reason: reason.into(),
+    }
+}
+
+fn checked_sum_u64<const N: usize>(
+    values: [u64; N],
+    label: &'static str,
+) -> Result<u64, MimoAsrExecutorError> {
+    values.into_iter().try_fold(0u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| capacity_error(format!("{label} overflowed")))
+    })
+}
+
+fn phase_aware_quote<const N: usize>(
+    components: [(u64, u64); N],
+) -> Result<(u64, u64), MimoAsrExecutorError> {
+    let mut retained = 0u64;
+    let mut peak = 0u64;
+    for (component_peak, component_retained) in components {
+        if component_retained > component_peak {
+            return Err(capacity_error(format!(
+                "mimo component retained bytes {component_retained} exceed peak {component_peak}"
+            )));
+        }
+        peak = peak.max(
+            retained
+                .checked_add(component_peak)
+                .ok_or_else(|| capacity_error("mimo construction peak quote overflowed"))?,
+        );
+        retained = retained
+            .checked_add(component_retained)
+            .ok_or_else(|| capacity_error("mimo retained quote overflowed"))?;
+    }
+    Ok((peak, retained))
+}
+
 impl MimoAsrGgmlExecutor {
+    fn map_actor_error(error: PinnedRuntimeActorError) -> MimoAsrExecutorError {
+        MimoAsrExecutorError::RuntimeOwnershipFailed {
+            stage: "prepared-runtime",
+            reason: error.to_string(),
+        }
+    }
+
+    fn checkout_prepared_runtime(
+        &self,
+        preflight: &crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+        kv_capacity: Qwen3AsrKvCacheCapacity,
+    ) -> Result<MimoAsrPreparedRuntimeActor, MimoAsrExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
+            current_execution_lane_key(backend),
+            kv_capacity.resident_positions(),
+        );
+        let quote_preflight = preflight.clone();
+        let build_preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
+        self.prepared_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let (peak_bytes, retained_bytes) =
+                    MimoAsrPreparedRuntime::quoted_system_memory_bytes(&quote_preflight, backend)?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!(
+                        "mimo-asr-runtime:{content_id}:positions={}",
+                        kv_capacity.resident_positions()
+                    ),
+                    peak_bytes,
+                    retained_bytes,
+                )
+                .map_err(|error| capacity_error(error.to_string()))?;
+                Ok((retained_bytes, quote))
+            },
+            move |quote| match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend)?;
+                let retained = runtime.retained_system_memory_bytes()?;
+                Ok(SystemMemoryAllocationOutcome::new(
+                    MimoAsrPreparedRuntimeActorState { runtime },
+                    retained,
+                    retained,
+                ))
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(capacity_error(error.to_string()))
+                }
+            },
+            Self::map_actor_error,
+        )
+    }
+
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.prepared_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+    }
+
+    fn clear_runtime_actors(&self) {
+        self.prepared_runtimes.clear();
+    }
+
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -407,33 +649,29 @@ impl MimoAsrGgmlExecutor {
             });
         }
 
-        // Take the resident prepared runtime out of this thread's cache (or
-        // build it once on a cold miss). Sampled before the take and reused for
-        // the store-back below: if the idle-unload reaper bumps the generation
-        // while this decode is in flight, the runtime goes back tagged with the
-        // pre-unload generation and the *next* take discards it, so an unload is
-        // never lost to an overlapping decode (mirrors `firered_llm`).
         let backend = request.resolved_runtime.backend();
-        let cache_key: MimoAsrPreparedRuntimeCacheKey = (
-            PackContentKey::for_runtime_source(&preflight.runtime_source),
-            backend,
-        );
-        let unload_generation = current_unload_generation();
-        let mut prepared = match take_cached_prepared_runtime(&cache_key, unload_generation) {
-            Some(prepared) => prepared,
-            None => MimoAsrPreparedRuntime::build(&preflight, backend)?,
-        };
-
-        let result = self.transcribe_with_prepared(&mut prepared, request, samples);
-
-        // Return the resident runtime to the cache for the next chunk /
-        // execute() regardless of decode outcome (the session-scoped buffer
-        // release below already discarded any state a partial compute poisoned;
-        // uploaded weights and the arena/graph handles remain valid).
-        prepared.decoder.release_session_scoped_buffers();
-        store_cached_prepared_runtime(cache_key, unload_generation, prepared);
-
-        let result = result?;
+        let kv_capacity = Qwen3AsrKvCacheCapacity::from_decoder_state(
+            &request.decoder_state,
+            super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
+        )
+        .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
+        let actor = self.checkout_prepared_runtime(&preflight, backend, kv_capacity)?;
+        let samples = samples.to_vec();
+        let input_rate = request.prepared_audio.sample_rate_hz;
+        let control = Arc::clone(&request.execution_context.control);
+        let result = actor
+            .call_mut(move |state| {
+                let result = Self::transcribe_with_prepared(
+                    &mut state.runtime,
+                    samples,
+                    input_rate,
+                    kv_capacity,
+                    control,
+                );
+                state.runtime.decoder.release_session_scoped_buffers();
+                result
+            })
+            .map_err(Self::map_actor_error)??;
         let text = strip_mimo_language_tags(&result.text);
         let transcription = Transcription {
             truncated_decodes: Vec::new(),
@@ -470,18 +708,18 @@ impl MimoAsrGgmlExecutor {
     /// disjointly (`&mut` encoder, then `&mut` input-local, then `&mut` decoder
     /// alongside `&` tokenizer) so the resident runtime is reused in place.
     fn transcribe_with_prepared(
-        &self,
         prepared: &mut MimoAsrPreparedRuntime,
-        request: &GgmlAsrExecutionViewRequest,
-        samples: &[f32],
+        samples: Vec<f32>,
+        input_rate: u32,
+        kv_capacity: Qwen3AsrKvCacheCapacity,
+        control: Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Seq2SeqGreedyDecodeResult, MimoAsrExecutorError> {
         // The OpenASR pipeline delivers 16kHz mono to every executor, but
         // MiMo's audio tokenizer (and its baked mel filterbank/window) is
         // trained at 24kHz -- resample up before the mel front-end, matching
         // the reference `preprocess_input`'s own resample-to-tokenizer-rate.
-        let input_rate = request.prepared_audio.sample_rate_hz;
         let target_rate = prepared.mel_plan.sample_rate_hz as u32;
-        let resampled = resample_mono(samples, input_rate, target_rate).ok_or(
+        let resampled = resample_mono(&samples, input_rate, target_rate).ok_or(
             MimoAsrExecutorError::MelFrontendFailed {
                 reason: format!("failed to resample {input_rate}Hz -> {target_rate}Hz"),
             },
@@ -549,8 +787,14 @@ impl MimoAsrGgmlExecutor {
                 }
             })?;
 
-        let mut token_rows =
-            Vec::with_capacity(decode_prompt.token_ids.len() * llm_metadata.d_model);
+        let token_value_count = decode_prompt
+            .token_ids
+            .len()
+            .checked_mul(llm_metadata.d_model)
+            .ok_or_else(|| MimoAsrExecutorError::PromptEmbeddingFailed {
+                reason: "token embedding row allocation overflowed".to_string(),
+            })?;
+        let mut token_rows = Vec::with_capacity(token_value_count);
         for &token_id in &decode_prompt.token_ids {
             let row = decoder.gather_token_embedding(token_id).map_err(|error| {
                 MimoAsrExecutorError::DecoderFailed {
@@ -569,20 +813,29 @@ impl MimoAsrGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        // Request-sized, not the decoder's native context window: see
-        // `MimoLlmDecoderRuntime::new_kv_caches`'s doc comment.
-        let layer_kv_caches = decoder.new_kv_caches(
-            decode_prompt
-                .token_ids
-                .len()
-                .saturating_add(MIMO_ASR_MAX_GENERATED_TOKENS),
-        );
+        let measured_positions =
+            crate::capacity::topology::causal_prefix_positions_with_context_cap(
+                super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
+                decode_prompt.token_ids.len(),
+                MIMO_ASR_MAX_GENERATED_TOKENS,
+                llm_metadata.max_positions,
+            )
+            .map_err(|error| MimoAsrExecutorError::RuntimeContractViolation {
+                reason: error.to_string(),
+            })?;
+        let kv_capacity = kv_capacity
+            .validate_measured_logical_positions(measured_positions)
+            .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
+        let layer_kv_caches = decoder
+            .new_kv_caches(kv_capacity)
+            .map_err(|reason| MimoAsrExecutorError::DecoderFailed { reason })?;
         let mut step_executor = MimoAsrGreedyStepExecutor {
             decoder,
             layer_kv_caches,
+            kv_capacity,
             prompt_embeddings: Some(prompt_embeddings),
             cache_prompt_tokens: 0,
-            control: std::sync::Arc::clone(&request.execution_context.control),
+            control: Arc::clone(&control),
         };
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
@@ -606,7 +859,7 @@ impl MimoAsrGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
-            &request.execution_context.control,
+            &control,
         )
         .map_err(|error| MimoAsrExecutorError::GreedyDecodeFailed {
             reason: error.to_string(),
@@ -652,6 +905,18 @@ impl GgmlAsrViewExecutor for MimoAsrGgmlExecutor {
         false
     }
 
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_mimo_asr_decoder_state,
+            ),
+        )
+    }
+
     fn execute_view(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -662,6 +927,10 @@ impl GgmlAsrViewExecutor for MimoAsrGgmlExecutor {
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -683,6 +952,10 @@ impl GgmlAsrStreamingExecutor for MimoAsrGgmlExecutor {
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
             MimoAsrGgmlExecutor::execute_view,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -799,6 +1072,9 @@ mod tests {
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
 
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: mimo_asr_runtime_descriptor_v1(),
@@ -814,7 +1090,7 @@ mod tests {
             )),
         };
 
-        let executor = MimoAsrGgmlExecutor;
+        let executor = MimoAsrGgmlExecutor::default();
         let started_at = Instant::now();
         let result = executor
             .execute_view(&request)

@@ -68,6 +68,10 @@ typedef enum OpenAsrStatus {
    * Any partial download is cleaned up; nothing is installed.
    */
   OPEN_ASR_STATUS_PULL_CANCELED = 8,
+  /**
+   * The process-owned native execution services could not be constructed.
+   */
+  OPEN_ASR_STATUS_INITIALIZATION_FAILED = 9,
 } OpenAsrStatus;
 
 /**
@@ -177,6 +181,8 @@ typedef struct OpenAsrCatalog OpenAsrCatalog;
  * once up front and fail closed before any transcription is attempted with a
  * bad path.
  */
+typedef struct OpenAsrEngine OpenAsrEngine;
+
 typedef struct OpenAsrModel OpenAsrModel;
 
 /**
@@ -278,6 +284,35 @@ extern "C" {
 const char *openasr_version(void);
 
 /**
+ * Creates the explicit process-owned execution root shared by batch,
+ * streaming, model-market eviction, and idle unload. Free it with
+ * [`openasr_engine_free`] after every dependent handle has been released.
+ *
+ * # Safety
+ * `out_engine` must point to writable storage for one `*mut OpenAsrEngine`.
+ */
+enum OpenAsrStatus openasr_engine_create(struct OpenAsrEngine **out_engine);
+
+/**
+ * Frees an engine handle. Null is accepted and is a no-op. Dependent model,
+ * catalog, and streaming handles retain their own `Arc`, so destruction order
+ * is safe, though callers should normally release dependents first.
+ *
+ * # Safety
+ * `engine`, if non-null, must be a live handle from [`openasr_engine_create`].
+ */
+void openasr_engine_free(struct OpenAsrEngine *engine);
+
+/**
+ * Releases idle native runtime caches owned by `engine` while preserving the
+ * engine and its memory broker for later requests.
+ *
+ * # Safety
+ * `engine` must be a live handle from [`openasr_engine_create`].
+ */
+enum OpenAsrStatus openasr_engine_unload_idle_runtime_caches(const struct OpenAsrEngine *engine);
+
+/**
  * Loads (validates) a local `.oasr` model pack and returns an opaque handle
  * through `out_model`. Fails closed -- with [`OpenAsrStatus::ModelLoadFailed`]
  * and no handle written -- if the path is missing, not UTF-8, a directory, or
@@ -288,6 +323,18 @@ const char *openasr_version(void);
  * a valid, non-null pointer to a `*mut OpenAsrModel` the caller owns.
  */
 enum OpenAsrStatus openasr_model_open(const char *path, struct OpenAsrModel **out_model);
+
+/**
+ * Engine-aware form of [`openasr_model_open`]. Every model opened from the
+ * same engine participates in the same execution policy and memory broker.
+ *
+ * # Safety
+ * `engine` must be a live handle from [`openasr_engine_create`]; the remaining
+ * arguments follow [`openasr_model_open`]'s contract.
+ */
+enum OpenAsrStatus openasr_model_open_with_engine(const struct OpenAsrEngine *engine,
+                                                  const char *path,
+                                                  struct OpenAsrModel **out_model);
 
 /**
  * Frees a handle returned by [`openasr_model_open`]. Null is accepted and is
@@ -407,6 +454,20 @@ const char *openasr_result_segment_text(const struct OpenAsrResult *result, uint
 enum OpenAsrStatus openasr_streaming_session_open(const char *path,
                                                   const struct OpenAsrStreamingConfig *config,
                                                   struct OpenAsrStreamingSession **out_session);
+
+/**
+ * Engine-aware form of [`openasr_streaming_session_open`]. Offline and
+ * streaming handles opened from one engine share runtime caches and device
+ * memory accounting.
+ *
+ * # Safety
+ * `engine` must be a live handle from [`openasr_engine_create`]; the remaining
+ * arguments follow [`openasr_streaming_session_open`]'s contract.
+ */
+enum OpenAsrStatus openasr_streaming_session_open_with_engine(const struct OpenAsrEngine *engine,
+                                                              const char *path,
+                                                              const struct OpenAsrStreamingConfig *config,
+                                                              struct OpenAsrStreamingSession **out_session);
 
 /**
  * Feeds a chunk of 16 kHz mono `f32` PCM (any length, including zero) into an
@@ -588,6 +649,20 @@ enum OpenAsrStatus openasr_catalog_fetch(const char *catalog_url,
                                          struct OpenAsrCatalog **out_catalog);
 
 /**
+ * Engine-aware form of [`openasr_catalog_fetch`]. Pull, install, and removal
+ * operations using this catalog reclaim caches owned by the same engine that
+ * serves batch and streaming requests.
+ *
+ * # Safety
+ * `engine` must be a live handle from [`crate::openasr_engine_create`]; the
+ * remaining arguments follow [`openasr_catalog_fetch`]'s contract.
+ */
+enum OpenAsrStatus openasr_catalog_fetch_with_engine(const struct OpenAsrEngine *engine,
+                                                     const char *catalog_url,
+                                                     const char *home_dir,
+                                                     struct OpenAsrCatalog **out_catalog);
+
+/**
  * Returns the verified catalog as a UTF-8, NUL-terminated JSON string (the
  * serialized [`ModelCatalog`]: models with their quants, sizes, sha256s,
  * languages, licenses, perf, etc.). Valid until `catalog` is freed; null only
@@ -737,6 +812,19 @@ enum OpenAsrStatus openasr_list_installed_json(const char *home_dir, char **out_
 enum OpenAsrStatus openasr_remove_model(const char *home_dir,
                                         const char *reference,
                                         bool *out_removed);
+
+/**
+ * Engine-aware form of [`openasr_remove_model`] that immediately reclaims
+ * the removed pack's resident runtime caches from the supplied engine.
+ *
+ * # Safety
+ * `engine` must be a live handle from [`crate::openasr_engine_create`]; the
+ * remaining arguments follow [`openasr_remove_model`]'s contract.
+ */
+enum OpenAsrStatus openasr_remove_model_with_engine(const struct OpenAsrEngine *engine,
+                                                    const char *home_dir,
+                                                    const char *reference,
+                                                    bool *out_removed);
 
 /**
  * Frees a string returned through an `out_*_json` out-parameter by

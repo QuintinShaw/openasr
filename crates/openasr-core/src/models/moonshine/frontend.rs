@@ -1,16 +1,17 @@
-use std::borrow::Cow;
-
 use thiserror::Error;
 
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
+use crate::{
+    PcmSlice,
+    models::ggml_asr_executor::{GgmlAsrPreparedAudioView, GgmlAsrSamplesView},
+};
 
 /// Raw 16 kHz mono PCM samples fed directly to the conv stem.
 ///
 /// Moonshine sets `do_normalize=false`, so unlike wav2vec2-960h there is NO zero-mean /
 /// unit-variance normalization: the raw f32 waveform is the feature input.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MoonshineWaveformFeatures<'a> {
-    pub samples: Cow<'a, [f32]>,
+pub(crate) struct MoonshineWaveformFeatures {
+    pub samples: PcmSlice,
 }
 
 #[derive(Debug, Error)]
@@ -23,10 +24,10 @@ pub(crate) enum MoonshineFrontendError {
     NonFiniteSamples,
 }
 
-pub(crate) fn moonshine_waveform_from_prepared_audio<'a>(
-    audio: &'a GgmlAsrPreparedAudioView<'_>,
+pub(crate) fn moonshine_waveform_from_prepared_audio(
+    audio: &GgmlAsrPreparedAudioView<'_>,
     expected_sample_rate_hz: u32,
-) -> Result<MoonshineWaveformFeatures<'a>, MoonshineFrontendError> {
+) -> Result<MoonshineWaveformFeatures, MoonshineFrontendError> {
     if audio.sample_rate_hz != expected_sample_rate_hz {
         return Err(MoonshineFrontendError::UnexpectedSampleRate {
             got: audio.sample_rate_hz,
@@ -43,17 +44,16 @@ pub(crate) fn moonshine_waveform_from_prepared_audio<'a>(
     Ok(MoonshineWaveformFeatures { samples })
 }
 
-fn downmix_to_mono(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
+fn downmix_to_mono(samples: &GgmlAsrSamplesView<'_>, channels: u16) -> PcmSlice {
     if channels <= 1 {
-        return Cow::Borrowed(samples);
+        return samples.to_owned_pcm_slice();
     }
     let channels = channels as usize;
-    Cow::Owned(
-        samples
-            .chunks(channels)
-            .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
-            .collect(),
-    )
+    samples
+        .chunks(channels)
+        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+        .collect::<Vec<_>>()
+        .into()
 }
 
 #[cfg(test)]
@@ -64,9 +64,11 @@ mod tests {
     fn passes_raw_mono_samples_without_normalization() {
         let audio = GgmlAsrPreparedAudioView::mono_16khz(vec![0.5, -0.25, 1.0]);
         let features = moonshine_waveform_from_prepared_audio(&audio, 16_000).expect("features");
-        assert!(matches!(&features.samples, Cow::Borrowed(_)));
         assert_eq!(features.samples.as_ref(), &[0.5, -0.25, 1.0]);
-        assert_eq!(features.samples.as_ptr(), audio.samples_f32.as_ptr());
+        assert_eq!(
+            features.samples.as_slice().as_ptr(),
+            audio.samples_f32.as_ptr()
+        );
     }
 
     #[test]
@@ -88,7 +90,6 @@ mod tests {
             samples_f32: vec![1.0, 3.0, 0.0, 4.0].into(),
         };
         let features = moonshine_waveform_from_prepared_audio(&audio, 16_000).expect("features");
-        assert!(matches!(&features.samples, Cow::Owned(_)));
         assert_eq!(features.samples.as_ref(), &[2.0, 2.0]);
     }
 }

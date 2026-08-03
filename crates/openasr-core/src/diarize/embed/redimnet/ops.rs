@@ -704,13 +704,17 @@ pub(super) fn weigth1d_softmax_host(raw_w: &[f32], n: usize, cf: usize) -> Vec<V
     // raw_w is the pack's `*.w` tensor, logical torch shape (1,N,CF,1) ->
     // flat row-major (n-major, cf-minor): raw_w[i*cf + c].
     let mut out = vec![vec![0.0f32; cf]; n];
+    // One reusable channel scratch, rather than one heap allocation per
+    // channel. A B6 forward evaluates seven such softmax tables over 4,608
+    // channels; allocating `exps` inside this loop caused tens of thousands
+    // of avoidable allocator round trips per speaker embedding.
+    let mut exps = vec![0.0f32; n];
     for c in 0..cf {
         let mut max = f32::NEG_INFINITY;
         for i in 0..n {
             max = max.max(raw_w[i * cf + c]);
         }
         let mut sum = 0.0f64;
-        let mut exps = vec![0.0f32; n];
         for i in 0..n {
             let e = (raw_w[i * cf + c] - max).exp();
             exps[i] = e;

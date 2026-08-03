@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,9 +7,10 @@ use thiserror::Error;
 use std::path::{Path, PathBuf};
 
 use super::batched_decode::{
-    CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchJob,
-    cohere_serve_batch_decode_config, cohere_serve_batch_text_postprocess_kind,
-    shutdown_cohere_serve_batch_engines, submit_cohere_serve_batch_job,
+    CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchEngineRegistry,
+    CohereServeBatchJob, cohere_serve_batch_decode_config,
+    cohere_serve_batch_text_postprocess_kind, shutdown_cohere_serve_batch_engines,
+    submit_cohere_serve_batch_job,
 };
 use super::decoder_graph::{
     CohereDecoderGraphError, CohereDecoderGraphRuntime,
@@ -35,9 +35,11 @@ use crate::arch::shape_orchestrator::{
 };
 use crate::arch::{COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, OpenAsrArchitectureRegistry};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
-use crate::models::decode_token_history::{
-    build_longform_token_history_carry, trim_prompt_token_tail,
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
 };
+use crate::models::decode_token_history::build_longform_token_history_carry;
 use crate::models::ggml_asr_executor::{
     GgmlAsrCarryContext, GgmlAsrExecutionError, GgmlAsrExecutionResult,
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor,
@@ -46,40 +48,76 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
+use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
 use crate::models::runtime_prepared_registry::{
-    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError, PreparedRuntimeLookup,
+    BuiltinPreparedRuntime, BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError,
+    PreparedRuntimeLookup,
 };
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
-};
+use crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity;
+use crate::models::system_memory_owner::SystemMemoryOwner;
 
 const COHERE_EXECUTOR_ID: &str = "cohere-transcribe-ggml-executor-v1";
 const COHERE_STREAMING_EXECUTOR_ID: &str = "cohere-transcribe-ggml-snapshot-streaming-executor-v1";
-const COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT: usize = 64;
+const COHERE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
+const COHERE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
+use super::prompt::{
+    COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT, build_cohere_initial_prompt_token_ids,
+};
 const COHERE_DEBUG_TIMINGS_ENV: &str = "OPENASR_COHERE_DEBUG_TIMINGS";
 const COHERE_DEBUG_ENCODER_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER";
 
-thread_local! {
-    static COHERE_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<CohereEncoderRuntimeCacheKey, CohereTranscribeEncoderGraphRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-    static COHERE_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<CohereDecoderRuntimeCacheKey, CohereDecoderGraphRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
-
-type CohereEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
-/// (pack content id, backend). The content id
+type CohereEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+/// (pack content id, backend, resident self/cross spans). The content id
 /// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
 /// replacement at the same path from reusing a runtime built from the old
-/// bytes. Used to be `(path, backend, frame_count,
-/// hidden_size)`: the decoder's cross-KV cache is now allocated ONCE per pack
-/// at this architecture's chunk-cap capacity (see
-/// `CohereDecoderGraphRuntime::new` / `cohere_decoder_cross_capacity_frames`),
-/// not at any one utterance's exact encoder frame count, so a cached runtime
-/// is reusable across every VAD/longform chunk regardless of its actual frame
-/// count. `hidden_size` was always redundant too -- it is a pack-constant
-/// (`metadata.decoder_d_model`), never a per-utterance value.
-type CohereDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// bytes. Logical per-chunk shapes do not belong in this key: the runtime
+/// activates them inside the planner-reserved spans without reallocating.
+type CohereDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, Seq2SeqResidentCapacity);
+
+/// The graph runtimes are backend-owned (`GgmlCpuGraphRunner` is not `Send`)
+/// and therefore must stay on one owner thread for their whole lifetime. The
+/// prepared-runtime handle is deliberately part of the actor state rather
+/// than merely a build-closure capture: it keeps the host lease that backs the
+/// mmap/dequantized weights alive for as long as the native arena can refer to
+/// them, including while the actor is idle in the checkout pool.
+struct CohereEncoderRuntimeActorState {
+    runtime: CohereTranscribeEncoderGraphRuntime,
+    _prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+}
+
+impl std::fmt::Debug for CohereEncoderRuntimeActorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CohereEncoderRuntimeActorState")
+            .finish_non_exhaustive()
+    }
+}
+
+struct CohereDecoderRuntimeActorState {
+    runtime: CohereDecoderGraphRuntime,
+    _prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+}
+
+impl std::fmt::Debug for CohereDecoderRuntimeActorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CohereDecoderRuntimeActorState")
+            .finish_non_exhaustive()
+    }
+}
+
+type CohereEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    CohereEncoderRuntimeCacheKey,
+    CohereEncoderRuntimeActorState,
+>;
+type CohereDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    CohereDecoderRuntimeCacheKey,
+    CohereDecoderRuntimeActorState,
+>;
+type CohereEncoderRuntimeActor =
+    PinnedRuntimeActorCheckout<CohereEncoderRuntimeCacheKey, CohereEncoderRuntimeActorState>;
+type CohereDecoderRuntimeActor =
+    PinnedRuntimeActorCheckout<CohereDecoderRuntimeCacheKey, CohereDecoderRuntimeActorState>;
 
 // Test-only build counters, incremented from inside the two caches' `build`
 // closures below -- lets a same-thread test pin "a second call against the
@@ -118,6 +156,8 @@ enum CohereTranscribeGgmlExecutorError {
     EncoderFailed { reason: String },
     #[error("cohere-transcribe ggml executor decoder failed: {reason}")]
     DecoderFailed { reason: String },
+    #[error("cohere-transcribe {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
     /// Carries a transient serve-batch failure (queue full / owner gone / reply
     /// timeout) through to the `execute` trait boundary so it can become a
     /// retryable HTTP status instead of a generic 500.
@@ -144,9 +184,36 @@ impl LayerCountResolver for CohereLayerCountResolver {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct CohereTranscribeGgmlExecutor {
     runtime_cache_by_path: BuiltinPreparedRuntimeCache,
+    encoder_runtimes: Arc<CohereEncoderRuntimePool>,
+    decoder_runtimes: Arc<CohereDecoderRuntimePool>,
+    serve_batch_engines: CohereServeBatchEngineRegistry,
+}
+
+impl Default for CohereTranscribeGgmlExecutor {
+    fn default() -> Self {
+        let max_committed_requested_bytes =
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        let limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            COHERE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            COHERE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        );
+        Self {
+            runtime_cache_by_path: BuiltinPreparedRuntimeCache::default(),
+            encoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-cohere-encoder-owner",
+                limits,
+            )),
+            decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-cohere-decoder-owner",
+                limits,
+            )),
+            serve_batch_engines: CohereServeBatchEngineRegistry::default(),
+        }
+    }
 }
 
 impl CohereTranscribeGgmlExecutor {
@@ -161,6 +228,14 @@ impl CohereTranscribeGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
+        let decoder_state =
+            crate::models::seq2seq_decoder_state::Seq2SeqDecoderState::from_request_state(
+                &request.decoder_state,
+                super::capacity::COHERE_DECODER_STATE_IDS,
+            )
+            .map_err(|error| CohereTranscribeGgmlExecutorError::DecoderFailed {
+                reason: error.to_string(),
+            })?;
 
         let preflight_start = debug_timing_start();
         let preflight = request
@@ -172,51 +247,49 @@ impl CohereTranscribeGgmlExecutor {
             )?;
         emit_cohere_debug_timing_if_enabled("runtime_preflight", preflight_start, None);
         let prepared_runtime_start = debug_timing_start();
-        self.runtime_cache_by_path
-            .with_cohere_transcribe_runtime_for_preflight(
-                PreparedRuntimeLookup {
-                    model_architecture: request.selected_family.model_architecture,
-                    preflight: preflight.as_ref(),
-                    backend: request.resolved_runtime.backend(),
-                },
-                map_prepared_runtime_registry_error,
-                cohere_runtime_cache_slot_unavailable,
-                || CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
-                    reason: format!(
-                        "prepared runtime registry returned non-cohere runtime for architecture '{}'",
-                        request.selected_family.model_architecture
-                    ),
-                },
-                |prepared_runtime| {
-                    emit_cohere_debug_timing_if_enabled(
-                        "prepared_runtime",
-                        prepared_runtime_start,
-                        None,
-                    );
-                    let frontend_start = debug_timing_start();
-                    let features = cohere_transcribe_features_from_prepared_audio(
-                        &request.prepared_audio,
-                        &prepared_runtime.frontend_plan,
-                    )
-                    .map_err(map_frontend_error)?;
-                    emit_cohere_debug_timing_if_enabled(
-                        "frontend",
-                        frontend_start,
-                        Some(format!(
-                            "frames={} mels={}",
-                            features.n_frames, features.n_mels
-                        )),
-                    );
-                    emit_cohere_debug_feature_preview_if_enabled(&features);
-                    self.decode_with_prepared_runtime(
-                        &preflight.runtime_source,
-                        request,
-                        prepared_runtime,
-                        &features,
-                        skip_serve_batch,
-                    )
-                },
-            )
+        let prepared_runtime_owner = self.runtime_cache_by_path.prepared_runtime_for_preflight(
+            PreparedRuntimeLookup {
+                model_architecture: request.selected_family.model_architecture,
+                preflight: preflight.as_ref(),
+                backend: request.resolved_runtime.backend(),
+            },
+            map_prepared_runtime_registry_error,
+            cohere_runtime_cache_slot_unavailable,
+        )?;
+        let prepared_runtime = prepared_runtime_owner
+            .as_ref()
+            .as_cohere_transcribe()
+            .ok_or_else(|| CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
+                reason: format!(
+                    "prepared runtime registry returned non-cohere runtime for architecture '{}'",
+                    request.selected_family.model_architecture
+                ),
+            })?;
+        emit_cohere_debug_timing_if_enabled("prepared_runtime", prepared_runtime_start, None);
+        let frontend_start = debug_timing_start();
+        let features = cohere_transcribe_features_from_prepared_audio(
+            &request.prepared_audio,
+            &prepared_runtime.frontend_plan,
+        )
+        .map_err(map_frontend_error)?;
+        emit_cohere_debug_timing_if_enabled(
+            "frontend",
+            frontend_start,
+            Some(format!(
+                "frames={} mels={}",
+                features.n_frames, features.n_mels
+            )),
+        );
+        emit_cohere_debug_feature_preview_if_enabled(&features);
+        self.decode_with_prepared_runtime(
+            &preflight.runtime_source,
+            request,
+            prepared_runtime,
+            Arc::clone(&prepared_runtime_owner),
+            features,
+            decoder_state,
+            skip_serve_batch,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -225,7 +298,9 @@ impl CohereTranscribeGgmlExecutor {
         runtime_source: &GgmlRuntimeSource,
         request: &GgmlAsrExecutionViewRequest,
         prepared_runtime: &CoherePreparedRuntime,
-        features: &CohereTranscribeMelFeatures,
+        prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+        features: CohereTranscribeMelFeatures,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, CohereTranscribeGgmlExecutorError> {
         let runtime_path = runtime_source.path();
@@ -290,20 +365,24 @@ impl CohereTranscribeGgmlExecutor {
             prompt.token_ids,
             &request.request_options,
             prepared_runtime.metadata,
-        )?;
+        )
+        .map_err(|error| CohereTranscribeGgmlExecutorError::DecoderFailed {
+            reason: error.to_string(),
+        })?;
         let eos_token_id = prompt.eos_token_id.ok_or_else(|| {
             CohereTranscribeGgmlExecutorError::DecoderFailed {
                 reason: "cohere decode prompt is missing EOS token id".to_string(),
             }
         })?;
         let encoder_start = debug_timing_start();
-        let encoder_output = encode_with_cached_cohere_encoder_runtime(
-            runtime_source,
-            prepared_runtime,
-            features,
-            request.resolved_runtime.backend(),
-        )
-        .map_err(map_encoder_error)?;
+        let encoder_output = self
+            .encode_with_owned_cohere_encoder_runtime(
+                runtime_source,
+                features,
+                request.resolved_runtime.backend(),
+                Arc::clone(&prepared_runtime_owner),
+            )
+            .map_err(map_encoder_error)?;
         emit_cohere_debug_timing_if_enabled(
             "encoder",
             encoder_start,
@@ -332,6 +411,7 @@ impl CohereTranscribeGgmlExecutor {
                 &initial_prompt_tokens,
                 prepared_runtime.metadata,
                 encoder_output.frame_count,
+                decoder_state,
                 eos_token_id,
                 &prepared_runtime.tokenizer,
                 request.request_options.phrase_bias.as_ref(),
@@ -340,6 +420,7 @@ impl CohereTranscribeGgmlExecutor {
                 reason: error.to_string(),
             })?;
             submit_cohere_serve_batch_job(
+                &self.serve_batch_engines,
                 serve_batch_config,
                 CohereServeBatchJob {
                     runtime_cache_path: canonical_runtime_cache_path(runtime_path),
@@ -353,6 +434,7 @@ impl CohereTranscribeGgmlExecutor {
                     backend: decoder_config.backend,
                     uses_scheduler: decoder_config.use_scheduler,
                     decoder_weights: prepared_runtime.decoder_weights.clone(),
+                    decoder_state,
                     tokenizer: prepared_runtime.tokenizer.clone(),
                     metadata: prepared_runtime.metadata,
                     // Moved (not cloned): this branch is the last use of
@@ -381,20 +463,21 @@ impl CohereTranscribeGgmlExecutor {
                 },
             })?
         } else {
-            decode_with_cached_cohere_decoder_runtime(
+            self.decode_with_owned_cohere_decoder_runtime(
                 runtime_source,
-                &prepared_runtime.decoder_weights,
                 &prepared_runtime.tokenizer,
                 prepared_runtime.metadata,
                 &initial_prompt_tokens,
                 eos_token_id,
-                &encoder_output,
+                encoder_output,
+                decoder_state,
                 request.request_options.phrase_bias.as_ref(),
                 request.resolved_runtime.backend(),
                 prefer_cpu_decoder,
                 request.request_options.word_timestamps,
                 audio_duration,
                 &request.execution_context.control,
+                Arc::clone(&prepared_runtime_owner),
             )
             .map_err(map_decoder_error)?
         };
@@ -432,9 +515,14 @@ impl CohereTranscribeGgmlExecutor {
 
     /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
     /// resident state left over from a since-replaced pack without touching
-    /// any other content identity. Called by `pull`'s post-install handling
-    /// via [`crate::models::executor_component_registry::shared_cohere_transcribe_executor`].
+    /// any other content identity. Reached through
+    /// [`crate::NativeExecutionServices::evict_prepared_runtime_content_id`].
     pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.encoder_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.decoder_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        shutdown_cohere_serve_batch_engines(&self.serve_batch_engines);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
     }
 }
@@ -456,87 +544,202 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
 
-fn encode_with_cached_cohere_encoder_runtime(
-    runtime_source: &GgmlRuntimeSource,
-    prepared_runtime: &CoherePreparedRuntime,
-    features: &CohereTranscribeMelFeatures,
-    backend: GgmlCpuGraphBackend,
-) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
-    let encoder_backend = cohere_encoder_graph_config(backend).backend;
-    let key = (
-        PackContentKey::for_runtime_source(runtime_source),
-        encoder_backend,
-    );
-    with_thread_local_cached_mut_by_key(
-        &COHERE_ENCODER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || {
-            #[cfg(test)]
-            COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            CohereTranscribeEncoderGraphRuntime::new(
-                &prepared_runtime.encoder_weights,
-                prepared_runtime.metadata,
-                Some(runtime_source),
-                backend,
-            )
-        },
-        |runtime| runtime.encode(features),
-    )
-}
+impl CohereTranscribeGgmlExecutor {
+    fn map_actor_error(
+        stage: &'static str,
+        error: PinnedRuntimeActorError,
+    ) -> CohereTranscribeGgmlExecutorError {
+        CohereTranscribeGgmlExecutorError::RuntimeOwnershipFailed {
+            stage,
+            reason: error.to_string(),
+        }
+    }
 
-#[allow(clippy::too_many_arguments)]
-fn decode_with_cached_cohere_decoder_runtime(
-    runtime_source: &GgmlRuntimeSource,
-    decoder_weights: &super::decoder_weights::CohereTranscribeDecoderWeights,
-    tokenizer: &super::tokenizer::CohereTranscribeTokenizer,
-    metadata: super::runtime_contract::CohereTranscribeExecutionMetadata,
-    initial_prompt_tokens: &[u32],
-    eos_token_id: u32,
-    encoder_output: &super::encoder_graph::CohereTranscribeEncoderOutput,
-    phrase_bias: Option<&crate::PhraseBiasConfig>,
-    backend: GgmlCpuGraphBackend,
-    prefer_cpu_backend: bool,
-    word_timestamps: bool,
-    audio_duration_seconds: f32,
-    control: &Arc<crate::TranscriptionControl>,
-) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
-    let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
-    let key = (
-        PackContentKey::for_runtime_source(runtime_source),
-        decoder_backend,
-    );
-    with_thread_local_cached_mut_by_key(
-        &COHERE_DECODER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || {
-            #[cfg(test)]
-            COHERE_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            CohereDecoderGraphRuntime::new(
-                decoder_weights,
-                metadata,
-                encoder_output.frame_count,
+    fn checkout_encoder_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<CohereEncoderRuntimeActor, CohereTranscribeGgmlExecutorError> {
+        let encoder_backend = cohere_encoder_graph_config(backend).backend;
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(encoder_backend),
+        );
+        let source = runtime_source.clone();
+        self.encoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                #[cfg(test)]
+                COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+                Ok((0, (source, prepared_owner)))
+            },
+            move |(source, prepared_owner)| {
+                let prepared_runtime =
+                    prepared_owner
+                        .as_ref()
+                        .as_cohere_transcribe()
+                        .ok_or_else(|| {
+                            CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
+                                reason: "encoder actor received a non-cohere prepared runtime"
+                                    .to_string(),
+                            }
+                        })?;
+                let runtime = CohereTranscribeEncoderGraphRuntime::new(
+                    &prepared_runtime.encoder_weights,
+                    prepared_runtime.metadata,
+                    Some(&source),
+                    backend,
+                )
+                .map_err(|error| {
+                    CohereTranscribeGgmlExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(SystemMemoryOwner::without_allocation(
+                    CohereEncoderRuntimeActorState {
+                        runtime,
+                        _prepared_owner: prepared_owner,
+                    },
+                ))
+            },
+            |error| Self::map_actor_error("encoder", error),
+        )
+    }
+
+    fn encode_with_owned_cohere_encoder_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        features: CohereTranscribeMelFeatures,
+        backend: GgmlCpuGraphBackend,
+        prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+    ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError>
+    {
+        let actor = self
+            .checkout_encoder_runtime(runtime_source, prepared_owner, backend)
+            .map_err(|error| CohereTranscribeEncoderError::GraphExecutionFailed {
+                reason: error.to_string(),
+            })?;
+        actor
+            .call_mut(move |state| state.runtime.encode(&features))
+            .map_err(|error| CohereTranscribeEncoderError::GraphExecutionFailed {
+                reason: error.to_string(),
+            })?
+    }
+
+    fn checkout_decoder_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+    ) -> Result<CohereDecoderRuntimeActor, CohereTranscribeGgmlExecutorError> {
+        let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(decoder_backend),
+            decoder_state.resident_capacity(),
+        );
+        let source = runtime_source.clone();
+        self.decoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                #[cfg(test)]
+                COHERE_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+                Ok((0, (source, prepared_owner)))
+            },
+            move |(_source, prepared_owner)| {
+                let prepared_runtime =
+                    prepared_owner
+                        .as_ref()
+                        .as_cohere_transcribe()
+                        .ok_or_else(|| {
+                            CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
+                                reason: "decoder actor received a non-cohere prepared runtime"
+                                    .to_string(),
+                            }
+                        })?;
+                let runtime = CohereDecoderGraphRuntime::new(
+                    &prepared_runtime.decoder_weights,
+                    prepared_runtime.metadata,
+                    decoder_state,
+                    cross_hidden_size,
+                    backend,
+                    prefer_cpu_backend,
+                )
+                .map_err(|error| {
+                    CohereTranscribeGgmlExecutorError::DecoderFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(SystemMemoryOwner::without_allocation(
+                    CohereDecoderRuntimeActorState {
+                        runtime,
+                        _prepared_owner: prepared_owner,
+                    },
+                ))
+            },
+            |error| Self::map_actor_error("decoder", error),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_with_owned_cohere_decoder_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        tokenizer: &super::tokenizer::CohereTranscribeTokenizer,
+        metadata: super::runtime_contract::CohereTranscribeExecutionMetadata,
+        initial_prompt_tokens: &[u32],
+        eos_token_id: u32,
+        encoder_output: super::encoder_graph::CohereTranscribeEncoderOutput,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        phrase_bias: Option<&crate::PhraseBiasConfig>,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        word_timestamps: bool,
+        audio_duration_seconds: f32,
+        control: &Arc<crate::TranscriptionControl>,
+        prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+    ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
+        let actor = self
+            .checkout_decoder_runtime(
+                runtime_source,
+                prepared_owner,
+                decoder_state,
                 encoder_output.hidden_size,
                 backend,
                 prefer_cpu_backend,
             )
-        },
-        |runtime| {
-            run_cohere_decoder_graph_short_form_with_runtime(
-                runtime,
-                tokenizer,
-                metadata,
-                initial_prompt_tokens,
-                eos_token_id,
-                encoder_output,
-                phrase_bias,
-                word_timestamps,
-                audio_duration_seconds,
-                control,
-            )
-        },
-    )
+            .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
+                reason: format!("decoder runtime actor checkout failed: {error}"),
+            })?;
+        let tokenizer = tokenizer.clone();
+        let initial_prompt_tokens = initial_prompt_tokens.to_vec();
+        let encoder_output = Arc::new(encoder_output);
+        let phrase_bias = phrase_bias.cloned();
+        let control = Arc::clone(control);
+        actor
+            .call_mut(move |state| {
+                state.runtime.activate_decoder_state(decoder_state)?;
+                run_cohere_decoder_graph_short_form_with_runtime(
+                    &mut state.runtime,
+                    &tokenizer,
+                    metadata,
+                    &initial_prompt_tokens,
+                    eos_token_id,
+                    &encoder_output,
+                    phrase_bias.as_ref(),
+                    word_timestamps,
+                    audio_duration_seconds,
+                    &control,
+                )
+            })
+            .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
+                reason: format!("decoder runtime actor call failed: {error}"),
+            })?
+    }
 }
 
 impl GgmlAsrViewExecutor for CohereTranscribeGgmlExecutor {
@@ -546,6 +749,42 @@ impl GgmlAsrViewExecutor for CohereTranscribeGgmlExecutor {
 
     fn supports_phrase_bias(&self) -> bool {
         true
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_cohere_decoder_state,
+            ),
+        )
+    }
+
+    fn replan_streaming_decoder_state(
+        &self,
+        selected_family: &crate::GgmlFamilyAdapterDescriptor,
+        input: &crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput<'_>,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderState, GgmlAsrExecutionError> {
+        if let Some(owner) = self
+            .runtime_cache_by_path
+            .ready_for_preflight(input.preflight)
+            && let Some(prepared) = owner.as_ref().as_cohere_transcribe()
+        {
+            let plan =
+                super::capacity::plan_cohere_decoder_state_with_prepared_runtime(input, prepared)?;
+            return Ok(
+                crate::models::ggml_asr_executor::GgmlAsrDecoderState::planned(
+                    plan,
+                    input.envelope,
+                ),
+            );
+        }
+        self.decoder_state_contract(selected_family)?
+            .plan(input)
+            .map_err(Into::into)
     }
 
     fn execute_view(
@@ -558,7 +797,9 @@ impl GgmlAsrViewExecutor for CohereTranscribeGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
-        shutdown_cohere_serve_batch_engines();
+        shutdown_cohere_serve_batch_engines(&self.serve_batch_engines);
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -613,7 +854,9 @@ impl GgmlAsrStreamingExecutor for CohereTranscribeGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
-        shutdown_cohere_serve_batch_engines();
+        shutdown_cohere_serve_batch_engines(&self.serve_batch_engines);
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -777,48 +1020,6 @@ fn emit_cohere_debug_timing_if_enabled(
     }
 }
 
-fn build_cohere_initial_prompt_token_ids(
-    base_prompt_tokens: Vec<u32>,
-    request_options: &crate::GgmlAsrExecutionOptions,
-    metadata: super::runtime_contract::CohereTranscribeExecutionMetadata,
-) -> Result<Vec<u32>, CohereTranscribeGgmlExecutorError> {
-    if base_prompt_tokens.is_empty() {
-        return Err(CohereTranscribeGgmlExecutorError::DecoderFailed {
-            reason: "cohere decode prompt must contain at least one token".to_string(),
-        });
-    }
-
-    let mut initial_prompt_tokens = base_prompt_tokens;
-    let Some(mut prompt_token_ids) = request_options.prompt_token_ids.clone() else {
-        return Ok(initial_prompt_tokens);
-    };
-    if prompt_token_ids.is_empty() {
-        return Ok(initial_prompt_tokens);
-    }
-
-    let max_prompt_tokens = metadata
-        .decoder_max_context
-        .saturating_sub(initial_prompt_tokens.len())
-        .saturating_sub(1);
-    if max_prompt_tokens == 0 {
-        return Err(CohereTranscribeGgmlExecutorError::DecoderFailed {
-            reason: format!(
-                "cohere base prompt len {} leaves no generation budget in decoder_max_context {}",
-                initial_prompt_tokens.len(),
-                metadata.decoder_max_context
-            ),
-        });
-    }
-    prompt_token_ids = trim_prompt_token_tail(
-        prompt_token_ids,
-        max_prompt_tokens,
-        request_options.longform.is_some(),
-        COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
-    );
-    initial_prompt_tokens.extend(prompt_token_ids);
-    Ok(initial_prompt_tokens)
-}
-
 fn build_cohere_carry_prompt_token_ids(
     request_options: &crate::GgmlAsrExecutionOptions,
     generated_tokens: &[u32],
@@ -853,8 +1054,49 @@ mod tests {
             .expect("sample wav fixture path must exist")
     }
 
+    fn plan_request_decoder_state(
+        request: &mut GgmlAsrExecutionViewRequest<'_>,
+        envelope_samples: Option<usize>,
+    ) {
+        use std::num::NonZeroU32;
+
+        let preflight = request
+            .resolve_runtime_source_preflight()
+            .expect("resolve cohere runtime preflight")
+            .into_owned();
+        let sample_rate = NonZeroU32::new(request.prepared_audio.sample_rate_hz)
+            .expect("test sample rate is non-zero");
+        let invocation = crate::capacity::topology::InvocationShapeInput::new(
+            sample_rate,
+            request.prepared_audio.samples_f32.len(),
+        )
+        .expect("valid cohere test invocation");
+        let envelope = crate::capacity::topology::InvocationEnvelope::new(
+            sample_rate,
+            envelope_samples
+                .unwrap_or(invocation.samples())
+                .max(invocation.samples()),
+        )
+        .expect("valid cohere test envelope");
+        let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput {
+            preflight: &preflight,
+            invocation,
+            envelope,
+            request_options: &request.request_options,
+            backend: request.resolved_runtime.backend(),
+        };
+        let plan = super::super::capacity::plan_cohere_decoder_state(&planning_input)
+            .expect("plan cohere decoder state");
+        request.decoder_state =
+            crate::models::ggml_asr_executor::GgmlAsrDecoderState::planned_for_test(plan, envelope);
+        request.runtime_source_preflight = Some(preflight);
+    }
+
     fn runtime_ready_request(runtime_path: PathBuf) -> GgmlAsrExecutionViewRequest<'static> {
-        GgmlAsrExecutionViewRequest {
+        let mut request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: runtime_path,
             runtime_source_preflight: None,
             selected_family: cohere_transcribe_runtime_descriptor_v1(),
@@ -875,7 +1117,9 @@ mod tests {
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),
-        }
+        };
+        plan_request_decoder_state(&mut request, None);
+        request
     }
 
     #[test]
@@ -892,6 +1136,24 @@ mod tests {
                 .expect("executor should produce a best-effort transcription");
             assert!(result.transcription.text.is_ascii() || !result.transcription.text.is_empty());
             assert!(result.transcription.segments.is_empty());
+        });
+    }
+
+    #[test]
+    fn cohere_fixture_decode_is_invariant_to_larger_stable_resident_envelope() {
+        with_forced_cpu_backend_for_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let runtime_path = temp.path().join("cohere-runtime.gguf");
+            let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+            write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+            let mut request = runtime_ready_request(runtime_path);
+            plan_request_decoder_state(&mut request, Some(60 * 16_000));
+            let result = executor
+                .execute(&request)
+                .expect("resident headroom must not change the active logical decode");
+            assert!(result.transcription.text.is_ascii() || !result.transcription.text.is_empty());
         });
     }
 
@@ -1079,7 +1341,7 @@ mod tests {
     fn cohere_lru_eviction_targets_the_least_recently_used_pack_and_spares_siblings() {
         with_forced_cpu_backend_for_test(|| {
             assert_eq!(
-                DEFAULT_RUNTIME_CACHE_CAPACITY, 4,
+                COHERE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES, 4,
                 "this test drives exactly capacity + 1 distinct packs; update the pack count \
                  alongside this constant if it ever changes"
             );
@@ -1309,13 +1571,10 @@ mod tests {
         assert!(Arc::ptr_eq(&runtime_a, &runtime_b));
     }
 
-    /// Core-layer regression coverage for the shared-executor change (PR
-    /// #96): `shared_cohere_transcribe_executor()` is the literal process-wide
-    /// singleton that BOTH `build_builtin_ggml_execution_dispatch` (offline)
-    /// and `build_builtin_ggml_streaming_execution_dispatch` (streaming)
-    /// register into their respective dispatch tables (see
-    /// `executor_component_registry.rs`) -- this test drives that same
-    /// singleton through its two real entry points (`execute`, the offline
+    /// Core-layer regression coverage for the shared-executor change: one
+    /// service-owned executor scope is registered into both its offline and
+    /// streaming dispatch tables. This test drives one scoped executor through
+    /// its two real entry points (`execute`, the offline
     /// path, and `execute_streaming`, exactly what
     /// `GgmlAsrStreamingExecutor::start_streaming_session` calls per chunk)
     /// and asserts they resolve to the *same* `Arc<CoherePreparedRuntime>`,
@@ -1332,8 +1591,9 @@ mod tests {
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
 
-            let shared =
-                crate::models::executor_component_registry::shared_cohere_transcribe_executor();
+            let scope =
+                crate::models::executor_component_registry::BuiltinStatefulExecutorScope::new();
+            let shared = scope.cohere_transcribe();
             let request = runtime_ready_request(runtime_path);
             let preflight = request
                 .resolve_runtime_source_preflight()
@@ -1393,22 +1653,12 @@ mod tests {
 
     #[test]
     fn decoder_cpu_preference_is_off_by_default_and_on_when_set() {
-        let request = runtime_ready_request(PathBuf::from("fixtures/cohere-runtime.gguf"));
-        assert!(
-            !request
-                .request_options
-                .prefer_cpu_decoder_for_multichunk_metal
-        );
+        let options = GgmlAsrExecutionOptions::default();
+        assert!(!options.prefer_cpu_decoder_for_multichunk_metal);
 
-        let mut request_with_preference = request;
-        request_with_preference
-            .request_options
-            .prefer_cpu_decoder_for_multichunk_metal = true;
-        assert!(
-            request_with_preference
-                .request_options
-                .prefer_cpu_decoder_for_multichunk_metal
-        );
+        let mut options_with_preference = options;
+        options_with_preference.prefer_cpu_decoder_for_multichunk_metal = true;
+        assert!(options_with_preference.prefer_cpu_decoder_for_multichunk_metal);
     }
 
     #[test]
@@ -1436,7 +1686,9 @@ mod tests {
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
 
-            let backend = NativeBackend;
+            let backend = NativeBackend::new(
+                crate::models::native_execution_services::test_native_execution_services(),
+            );
             let request =
                 TranscriptionRequest::new(sample_wav_fixture_path(), "cohere-runtime-fixture")
                     .with_model_pack_path(Some(runtime_path));
@@ -1470,10 +1722,9 @@ mod tests {
     /// Structural regression test for the VAD/longform 0%-cache-hit bug this
     /// module fixes (mirrors firered-aed's committed
     /// `differently_sized_chunks_reuse_the_same_decoder_runtime_cache_slot`):
-    /// two CPU-decoder chunks with different encoder frame counts on the same
-    /// thread must land in the SAME decoder cache slot, because the cross-KV
-    /// cache is now allocated once at this pack's chunk-cap capacity rather
-    /// than exactly at each chunk's frame count.
+    /// two CPU-decoder chunks with different logical encoder frame counts but
+    /// the same 60-second session envelope must land in the same resident
+    /// decoder cache slot.
     #[test]
     #[ignore = "requires the private dev-only cohere-transcribe-03-2026-q4_k.oasr pack; see module docs"]
     fn differently_sized_chunks_reuse_the_same_decoder_runtime_cache_slot() {
@@ -1484,12 +1735,12 @@ mod tests {
         }
         with_forced_cpu_backend_for_test(|| {
             let executor = CohereTranscribeGgmlExecutor::default();
-            let decoder_cache_len =
-                || COHERE_DECODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+            let decoder_cache_len = || executor.decoder_runtimes.usage_for_test().0;
             assert_eq!(decoder_cache_len(), 0, "cache must start empty");
 
             let mut req_jfk = runtime_ready_request(pack_path.clone());
             req_jfk.backend_preference = GgmlAsrBackendPreference::CpuOnly;
+            plan_request_decoder_state(&mut req_jfk, Some(60 * 16_000));
             let jfk = executor.execute_view(&req_jfk).expect("jfk transcribe");
             assert_eq!(jfk.transcription.text, COHERE_GOLDEN_JFK_TEXT);
             eprintln!("cohere cache slots after chunk 1: {}", decoder_cache_len());
@@ -1501,7 +1752,11 @@ mod tests {
                 "cohere cache-reuse test",
             )
             .expect("load zh_sample.wav");
-            let req_zh = GgmlAsrExecutionViewRequest {
+            let mut req_zh = GgmlAsrExecutionViewRequest {
+                execution_services:
+                    crate::models::native_execution_services::test_native_execution_services(),
+                decoder_state:
+                    crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
                 runtime_source_path: pack_path,
                 runtime_source_preflight: None,
                 selected_family: cohere_transcribe_runtime_descriptor_v1(),
@@ -1516,6 +1771,7 @@ mod tests {
                     crate::RequestExecutionContext::uncancellable("test fixture"),
                 ),
             };
+            plan_request_decoder_state(&mut req_zh, Some(60 * 16_000));
             // Content/language mismatch (zh_sample.wav vs cohere's English-first
             // prompt) is irrelevant here -- only decode-succeeds + cache-slot
             // count matter for this structural check.
@@ -1532,19 +1788,12 @@ mod tests {
         });
     }
 
-    /// Regression for a REJECTed earlier version of this fix that made this
-    /// case fail closed: `segment_mode=off` (a real, user-reachable CLI/server
-    /// path) sends the WHOLE audio window straight to the executor with no
-    /// longform chunking at all, so a >32s clip legitimately presents an
-    /// encoder frame count past this pack's chunk-cap cross-KV capacity.
-    /// Before this fix (still exact-per-call allocation) this simply worked;
-    /// the cross-KV capacity refactor must not turn that into a hard failure
-    /// -- growing the cache to fit must produce the EXACT same transcript as
-    /// `origin/main` (verified by hand for this specific pack/clip; see the
-    /// PR description for the recorded baseline).
+    /// A 45-second single invocation remains legal when its declared session
+    /// envelope is 60 seconds; it must fit the preplanned resident span with
+    /// no allocation growth and preserve the recorded transcript.
     #[test]
     #[ignore = "requires the private dev-only cohere-transcribe-03-2026-q4_k.oasr pack; see module docs"]
-    fn mode_off_single_window_past_chunk_cap_grows_and_matches_baseline() {
+    fn mode_off_single_window_fits_declared_envelope_and_matches_baseline() {
         let pack_path = cohere_dev_pack_path();
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
@@ -1566,12 +1815,13 @@ mod tests {
             request.prepared_audio = GgmlAsrPreparedAudioView::mono_16khz(
                 crate::api::audio_io::load_wav_16khz_mono_f32_v0(
                     wav_path,
-                    "cohere mode=off grow test",
-                    "cohere mode=off grow test",
+                    "cohere mode=off envelope test",
+                    "cohere mode=off envelope test",
                 )
                 .expect("load wav fixture"),
             );
             request.backend_preference = GgmlAsrBackendPreference::CpuOnly;
+            plan_request_decoder_state(&mut request, Some(60 * 16_000));
             let result = executor
                 .execute_view(&request)
                 .expect("mode=off single-window transcribe must succeed, not fail closed");

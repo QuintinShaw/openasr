@@ -16,6 +16,16 @@ impl MoonshineWeight {
     pub(crate) fn len(&self) -> usize {
         self.values.len()
     }
+
+    fn add_retained_system_memory(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_string(&self.name, label)?;
+        bytes.add_vec(&self.dims, label)?;
+        bytes.add_vec(&self.values, label)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +79,74 @@ pub(crate) struct MoonshineDecoderWeights {
     pub embedding: MoonshineWeight,
     pub out_norm: MoonshineWeight,
     pub layers: Vec<MoonshineDecoderLayerWeights>,
+}
+
+impl MoonshineEncoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for weight in [
+            &self.conv1_weight,
+            &self.conv2_weight,
+            &self.conv2_bias,
+            &self.conv3_weight,
+            &self.conv3_bias,
+            &self.groupnorm_weight,
+            &self.groupnorm_bias,
+            &self.out_norm,
+        ] {
+            weight.add_retained_system_memory(&mut bytes, "moonshine encoder weight")?;
+        }
+        bytes.add_vec(&self.layers, "moonshine encoder layers")?;
+        for layer in &self.layers {
+            for weight in [
+                &layer.attn_norm,
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                &layer.attn_o,
+                &layer.ffn_norm,
+                &layer.ffn_up,
+                &layer.ffn_up_bias,
+                &layer.ffn_down,
+                &layer.ffn_down_bias,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "moonshine encoder layer weight")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+}
+
+impl MoonshineDecoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for weight in [&self.embedding, &self.out_norm] {
+            weight.add_retained_system_memory(&mut bytes, "moonshine decoder weight")?;
+        }
+        bytes.add_vec(&self.layers, "moonshine decoder layers")?;
+        for layer in &self.layers {
+            for weight in [
+                &layer.attn_norm,
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                &layer.attn_o,
+                &layer.cross_norm,
+                &layer.cross_q,
+                &layer.cross_k,
+                &layer.cross_v,
+                &layer.cross_o,
+                &layer.ffn_norm,
+                &layer.ffn_up,
+                &layer.ffn_up_bias,
+                &layer.ffn_down,
+                &layer.ffn_down_bias,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "moonshine decoder layer weight")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
 }
 
 #[derive(Debug, Error)]

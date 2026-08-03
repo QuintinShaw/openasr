@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
     time::Instant,
 };
 
@@ -13,7 +14,7 @@ use openasr_core::{
     AudioInputInfo, AudioInputIssue, AudioPreparationOptions, BackendKind, BatchFailure,
     BatchOutput, BatchSummary, BenchmarkFormat, BenchmarkResult, CATALOG_SIGNATURE_KEY_ID,
     CohereLocalSourceImportRequest, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_ID, ModelCard,
-    MossTdImportRequest, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeRuntimeShutdownGuard,
+    MossTdImportRequest, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeExecutionServices,
     OpenAsrConfig, PreparedAudioInput, Qwen3AsrLocalSourceImportRequest,
     Qwen3ForcedAlignerLocalSourceImportRequest, ResponseFormat, TranscriptionBackend,
     TranscriptionRequest, WhisperLocalSourceImportRequest, atomic_write_text, config_path,
@@ -196,8 +197,11 @@ fn migrate_model_store_once() {
 }
 
 async fn run() -> Result<()> {
-    let _native_runtime_owner = NativeRuntimeShutdownGuard::new();
     let command = Cli::parse().command;
+    let native_execution_services = Arc::new(
+        NativeExecutionServices::for_local_process()
+            .context("Could not initialize native execution services")?,
+    );
     // Installed here, before anything else `openasr serve` does, so no
     // startup panic (config/catalog loading, backend resolution, model-pack
     // binding, a background task spawned during boot) escapes without a
@@ -223,19 +227,22 @@ async fn run() -> Result<()> {
             accept_license,
             from,
         } => tokio::task::spawn_blocking(move || {
-            pull_cli::pull(PullCommandOptions {
-                reference: &reference,
-                quant: quant.as_deref(),
-                size: size.as_deref(),
-                catalog_url: catalog_url.as_deref(),
-                source: source.as_deref(),
-                accept_license,
-                from: from.as_deref(),
-            })
+            pull_cli::pull(
+                &native_execution_services,
+                PullCommandOptions {
+                    reference: &reference,
+                    quant: quant.as_deref(),
+                    size: size.as_deref(),
+                    catalog_url: catalog_url.as_deref(),
+                    source: source.as_deref(),
+                    accept_license,
+                    from: from.as_deref(),
+                },
+            )
         })
         .await
         .context("openasr pull worker task failed")?,
-        Command::Rm { id } => pull_cli::remove_installed(&id),
+        Command::Rm { id } => pull_cli::remove_installed(&native_execution_services, &id),
         Command::Config { command } => config_command(command),
         Command::Doctor => doctor(),
         Command::Verify { path } => model_pack_cli::validate_model_pack_path_command(&path),
@@ -300,27 +307,30 @@ async fn run() -> Result<()> {
             longform,
             phrase_bias,
             language_task,
-        } => transcribe(TranscribeCommandOptions {
-            inputs: &inputs,
-            formats: &formats,
-            model: model.as_deref(),
-            backend_kind: backend,
-            runtime_paths: RuntimePathOverrides { ffmpeg_bin },
-            diarize,
-            speakers,
-            punctuate: !no_punctuate,
-            word_timestamps_mode: word_timestamps,
-            model_pack: model_pack.as_deref(),
-            adapter: adapter.as_deref(),
-            output: output.as_deref(),
-            continue_on_error,
-            benchmark,
-            longform,
-            phrase_bias,
-            language: normalize_language_hint(language_task.language),
-            task: language_task.task,
-            consent: consent::PullConsent::resolve(yes, offline),
-        }),
+        } => transcribe(
+            &native_execution_services,
+            TranscribeCommandOptions {
+                inputs: &inputs,
+                formats: &formats,
+                model: model.as_deref(),
+                backend_kind: backend,
+                runtime_paths: RuntimePathOverrides { ffmpeg_bin },
+                diarize,
+                speakers,
+                punctuate: !no_punctuate,
+                word_timestamps_mode: word_timestamps,
+                model_pack: model_pack.as_deref(),
+                adapter: adapter.as_deref(),
+                output: output.as_deref(),
+                continue_on_error,
+                benchmark,
+                longform,
+                phrase_bias,
+                language: normalize_language_hint(language_task.language),
+                task: language_task.task,
+                consent: consent::PullConsent::resolve(yes, offline),
+            },
+        ),
         Command::Apikey { command } => apikey_command(command),
         Command::BenchSuite {
             config,
@@ -331,16 +341,19 @@ async fn run() -> Result<()> {
             runs,
             ffmpeg_bin,
             run_single_entry,
-        } => bench_suite_cli::bench_suite(BenchSuiteCommandOptions {
-            config: &config,
-            baseline: baseline.as_deref(),
-            write_baseline: write_baseline.as_deref(),
-            format,
-            family: family.as_deref(),
-            runs,
-            run_single_entry: run_single_entry.as_deref(),
-            runtime_paths: RuntimePathOverrides { ffmpeg_bin },
-        }),
+        } => bench_suite_cli::bench_suite(
+            &native_execution_services,
+            BenchSuiteCommandOptions {
+                config: &config,
+                baseline: baseline.as_deref(),
+                write_baseline: write_baseline.as_deref(),
+                format,
+                family: family.as_deref(),
+                runs,
+                run_single_entry: run_single_entry.as_deref(),
+                runtime_paths: RuntimePathOverrides { ffmpeg_bin },
+            },
+        ),
         Command::Live {
             source,
             list_devices,
@@ -377,41 +390,44 @@ async fn run() -> Result<()> {
             yes,
             offline,
         } => {
-            live::run_live(live::LiveCommandOptions {
-                source,
-                list_devices,
-                device,
-                input_file,
-                model: model.as_deref(),
-                backend,
-                model_pack: model_pack.as_deref(),
-                output_format: format,
-                max_seconds,
-                max_utterances,
-                frame_duration_ms,
-                speech_start_ms,
-                speech_stop_ms,
-                pre_roll_ms,
-                max_utterance_ms,
-                no_speech_timeout_ms,
-                energy_threshold,
-                partial_interval_ms,
-                partial_window_ms,
-                diarize,
-                save_path: save,
-                save_join_segments,
-                save_suggest_title,
-                obs_text_file,
-                obs_max_lines,
-                obs_clear_on_start,
-                obs_clear_on_stop,
-                markdown_note_path: markdown_note,
-                markdown_append,
-                markdown_title,
-                markdown_suggest_title,
-                runtime_paths: RuntimePathOverrides { ffmpeg_bin },
-                consent: consent::PullConsent::resolve(yes, offline),
-            })
+            live::run_live(
+                Arc::clone(&native_execution_services),
+                live::LiveCommandOptions {
+                    source,
+                    list_devices,
+                    device,
+                    input_file,
+                    model: model.as_deref(),
+                    backend,
+                    model_pack: model_pack.as_deref(),
+                    output_format: format,
+                    max_seconds,
+                    max_utterances,
+                    frame_duration_ms,
+                    speech_start_ms,
+                    speech_stop_ms,
+                    pre_roll_ms,
+                    max_utterance_ms,
+                    no_speech_timeout_ms,
+                    energy_threshold,
+                    partial_interval_ms,
+                    partial_window_ms,
+                    diarize,
+                    save_path: save,
+                    save_join_segments,
+                    save_suggest_title,
+                    obs_text_file,
+                    obs_max_lines,
+                    obs_clear_on_start,
+                    obs_clear_on_stop,
+                    markdown_note_path: markdown_note,
+                    markdown_append,
+                    markdown_title,
+                    markdown_suggest_title,
+                    runtime_paths: RuntimePathOverrides { ffmpeg_bin },
+                    consent: consent::PullConsent::resolve(yes, offline),
+                },
+            )
             .await
         }
         Command::Serve {
@@ -430,6 +446,7 @@ async fn run() -> Result<()> {
                 parent_watchdog::spawn(parent_pid);
             }
             serve(
+                native_execution_services,
                 addr,
                 model.as_deref(),
                 backend,
@@ -1084,7 +1101,10 @@ fn maybe_read_stdin_to_temp(inputs: &[PathBuf]) -> Result<Option<tempfile::Named
     Ok(Some(temp))
 }
 
-fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
+fn transcribe(
+    native_execution_services: &Arc<NativeExecutionServices>,
+    options: TranscribeCommandOptions<'_>,
+) -> Result<()> {
     let home = openasr_home()?;
     let config = load_config(&home)?;
     // `--benchmark` measures plain transcription timing; run_benchmark does not
@@ -1125,7 +1145,12 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
     // visible confirmation when it is missing. The server never does this.
     let backend = resolve_backend(options.backend_kind, &config)?;
     if backend == BackendKind::Native && options.model_pack.is_none() {
-        pull_cli::ensure_asr_model_installed(options.model, &config, &options.consent)?;
+        pull_cli::ensure_asr_model_installed(
+            native_execution_services,
+            options.model,
+            &config,
+            &options.consent,
+        )?;
     }
     let prepared_run = prepare_backend_run(
         if options.benchmark {
@@ -1140,6 +1165,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         &config,
     )?;
     ensure_cli_diarization_packs_installed(
+        native_execution_services,
         prepared_run.backend_kind,
         prepared_run.model_source.model_pack_path.as_deref(),
         options.diarize,
@@ -1153,6 +1179,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
     // Qwen3-ForcedAligner-0.6B capability pack, mirroring --diarize's ReDimNet2-B6
     // auto-install above; approximate (or omitted) never touches the network.
     ensure_cli_word_timestamps_pack_installed(
+        native_execution_services,
         prepared_run.backend_kind,
         options.word_timestamps_mode,
     )?;
@@ -1189,6 +1216,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
             .into());
         }
         return run_benchmark(
+            native_execution_services,
             &prepared_run,
             &files[0],
             options
@@ -1226,7 +1254,14 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
                 "Multiple inputs (or a directory) require --output <dir>.".to_string(),
             )
         })?;
-        return transcribe_many(&prepared_run, &files, output_dir, skipped, &options);
+        return transcribe_many(
+            native_execution_services,
+            &prepared_run,
+            &files,
+            output_dir,
+            skipped,
+            &options,
+        );
     }
 
     // Single input: print to stdout or write one --output file.
@@ -1278,10 +1313,12 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
             Some(WordTimestampsMode::Aligned)
         ))
         .with_prepared_samples(prepared.shared_samples());
-    let transcription =
-        transcribe_with_backend(prepared_run.backend_kind, request).map_err(|error| {
-            consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string())
-        })?;
+    let transcription = transcribe_with_backend(
+        native_execution_services,
+        prepared_run.backend_kind,
+        request,
+    )
+    .map_err(|error| consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string()))?;
     write_rendered_formats(&transcription, options.formats, file, options.output, false)?;
     Ok(())
 }

@@ -17,6 +17,8 @@ use crate::ggml_runtime::{
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
 };
+use crate::models::runtime_memory::{checked_sum, element_bytes};
+use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
 use crate::nn::encoder::{SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer};
 use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -150,6 +152,30 @@ struct LayerArena {
     input_dim: usize,
 }
 
+/// Count only the two handle vectors retained by a built SenseVoice graph.
+/// Native ggml buffers are admitted in their backend memory domain instead.
+pub(crate) fn quoted_graph_retained_bytes(
+    enc_layer_capacity: usize,
+    tp_layer_capacity: usize,
+) -> Result<u64, SystemMemoryOwnerError> {
+    checked_sum(
+        [
+            element_bytes::<LayerArena>(
+                enc_layer_capacity,
+                "sensevoice",
+                "graph encoder layer handles",
+            )?,
+            element_bytes::<LayerArena>(
+                tp_layer_capacity,
+                "sensevoice",
+                "graph transcription layer handles",
+            )?,
+        ],
+        "sensevoice",
+        "graph retained bytes",
+    )
+}
+
 pub(crate) struct SenseVoiceEncoderGraph {
     metadata: SenseVoiceExecutionMetadata,
     runner: GgmlCpuGraphRunner,
@@ -168,6 +194,16 @@ pub(crate) struct SenseVoiceEncoderGraph {
 }
 
 impl SenseVoiceEncoderGraph {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add_vec(&self.enc_layers, "sensevoice graph encoder layer handles")?;
+        bytes.add_vec(
+            &self.tp_layers,
+            "sensevoice graph transcription layer handles",
+        )?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn new(
         weights: &SenseVoiceEncoderWeights,
         metadata: SenseVoiceExecutionMetadata,

@@ -17,6 +17,7 @@
 //!   ([`decoder_graph`]), and the dedicated [`executor`] complete the stage.
 
 pub(crate) mod capacity;
+mod decode_budget;
 pub(crate) mod decoder_graph;
 pub(crate) mod decoder_weights;
 pub(crate) mod encoder_graph;

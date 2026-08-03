@@ -13,7 +13,7 @@
 //! the configured threshold.
 
 use std::sync::{
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -342,13 +342,16 @@ impl SharedNativeActivityGuard {
 /// 5s floor) or over-polling for the common 10m/1h thresholds. Callers only
 /// spawn this when the resolved policy is not `never` (see
 /// `IdleUnloadPolicy::idle_threshold`).
-pub(crate) fn spawn_idle_unload_reaper(idle_for: Duration) {
+pub(crate) fn spawn_idle_unload_reaper(
+    idle_for: Duration,
+    execution_services: Arc<openasr_core::NativeExecutionServices>,
+) {
     let poll_interval = (idle_for / 4).max(Duration::from_secs(1));
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(poll_interval).await;
             if native_activity_is_idle_for(Instant::now(), idle_for) {
-                openasr_core::unload_idle_native_model_runtime_caches();
+                execution_services.unload_idle_native_model_runtime_caches();
                 bump_native_unload_generation();
             }
         }

@@ -1,15 +1,13 @@
-use std::{cell::RefCell, fmt};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
-};
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
+    GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
+    GgufTensorDataReader, env_toggle_with_raw,
 };
 
 use super::graph_config::{qwen_decoder_graph_config, qwen_runtime_graph_config};
@@ -21,17 +19,19 @@ use super::tensor_names::{
 const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
+static NEXT_LOGITS_HEAD_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
-/// (pack content id, backend): identifies the resident fused logits-head
-/// graph executor for a loaded pack, mirroring the `(PackContentKey,
-/// GgmlCpuGraphBackend)` key convention used by the qwen audio-encoder and
-/// firered-aed encoder/decoder runtime caches. The content id keeps an
-/// in-place pack replacement at the same path from reusing an executor built
-/// from the old bytes.
-type QwenLogitsHeadExecutorCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+fn next_logits_head_runtime_identity() -> u64 {
+    NEXT_LOGITS_HEAD_RUNTIME_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("qwen logits-head runtime identity space exhausted")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLlmLogitsHead {
+    runtime_identity: u64,
     d_model: usize,
     vocab_size: usize,
     rms_norm_epsilon: f32,
@@ -40,7 +40,25 @@ pub(crate) struct Qwen3AsrLlmLogitsHead {
     output_weight_values: Option<Vec<f32>>,
     output_weight_layout: OutputWeightLayout,
     ggml_output_weight: Option<OwnedGgmlLogitsWeight>,
-    ggml_executor_cache_key: Option<QwenLogitsHeadExecutorCacheKey>,
+}
+
+/// Mutable native logits graph owned by the decoder runtime that consumes it.
+/// Prepared weights remain host-neutral and shareable, while this graph runner
+/// and its static arena are pinned to one concrete execution lane and follow
+/// that decoder owner's eviction lifetime.
+pub(crate) struct Qwen3AsrLlmLogitsHeadRuntime {
+    head_runtime_identity: u64,
+    executor: Option<Qwen3AsrLlmLogitsHeadGraphExecutor>,
+}
+
+impl fmt::Debug for Qwen3AsrLlmLogitsHeadRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Qwen3AsrLlmLogitsHeadRuntime")
+            .field("head_runtime_identity", &self.head_runtime_identity)
+            .field("native_executor", &self.executor.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +85,8 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
     NonFiniteInputs,
     #[error("qwen3-asr llm logits head fallback values are unavailable")]
     OutputWeightValuesUnavailable,
+    #[error("qwen3-asr llm logits runtime was paired with a different prepared head")]
+    RuntimeHeadMismatch,
     #[error("qwen3-asr llm logits head internal allocation overflowed")]
     AllocationOverflow,
     #[error(
@@ -81,7 +101,37 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
 struct OwnedGgmlLogitsWeight {
     ggml_type: i32,
     dims: Vec<usize>,
-    bytes: Vec<u8>,
+    payload: LogitsWeightPayload,
+}
+
+#[derive(Debug, Clone)]
+enum LogitsWeightPayload {
+    Mapped(GgufOwnedWeightTensorPayload),
+    #[cfg(test)]
+    TestBytes(Vec<u8>),
+}
+
+impl LogitsWeightPayload {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Mapped(payload) => payload.bytes(),
+            #[cfg(test)]
+            Self::TestBytes(bytes) => bytes,
+        }
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        match self {
+            Self::Mapped(payload) => payload.retained_system_memory_bytes(),
+            #[cfg(test)]
+            Self::TestBytes(bytes) => {
+                let mut capacity =
+                    crate::models::system_memory_owner::SystemMemoryCapacity::default();
+                capacity.add_vec(bytes, "qwen test logits payload")?;
+                Ok(capacity.finish())
+            }
+        }
+    }
 }
 
 pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
@@ -96,6 +146,99 @@ pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
 }
 
 impl Qwen3AsrLlmLogitsHead {
+    /// Quotes the exact host representation branch used by the logits loader.
+    /// A directly executable canonical output matrix remains mmap-backed;
+    /// otherwise the loader retains one dequantized f32 matrix. The native
+    /// graph arena is quoted independently by the backend allocator.
+    pub(crate) fn quoted_system_memory_bytes_from_reader(
+        reader: &GgufTensorDataReader,
+        output_weight_tensor_name: &'static str,
+        d_model: usize,
+        vocab_size: usize,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<(u64, u64), String> {
+        let output = reader
+            .tensor_index()
+            .get(output_weight_tensor_name)
+            .ok_or_else(|| format!("required tensor '{output_weight_tensor_name}' is missing"))?;
+        resolve_output_weight_layout(&output.dims, d_model, vocab_size)
+            .map_err(|error| error.to_string())?;
+
+        let mut retained = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        let norm_bytes = d_model
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "logits output norm quote overflowed".to_string())?;
+        retained.add_usize(norm_bytes, "logits output norm quote")?;
+
+        let direct_mapped =
+            logits_head_ggml_enabled(backend) && output.dims == [d_model as u64, vocab_size as u64];
+        if direct_mapped {
+            retained.add(
+                GgufOwnedWeightTensorPayload::quoted_retained_system_memory_bytes(output)?,
+                "mapped logits payload metadata quote",
+            )?;
+            retained.add_usize(
+                output
+                    .dims
+                    .len()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or_else(|| "mapped logits raw dims quote overflowed".to_string())?,
+                "mapped logits raw dims quote",
+            )?;
+        } else {
+            let matrix_bytes = d_model
+                .checked_mul(vocab_size)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| "logits output matrix quote overflowed".to_string())?;
+            retained.add_usize(matrix_bytes, "logits output matrix quote")?;
+        }
+        let retained = retained.finish();
+        Ok((retained, retained))
+    }
+
+    pub(crate) fn new_runtime(
+        &self,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Qwen3AsrLlmLogitsHeadRuntime, Qwen3AsrLlmLogitsHeadError> {
+        let executor = self
+            .ggml_output_weight
+            .as_ref()
+            .map(|output_weight| {
+                Qwen3AsrLlmLogitsHeadGraphExecutor::new(
+                    self.d_model,
+                    self.vocab_size,
+                    self.rms_norm_epsilon,
+                    &self.output_norm_weight,
+                    output_weight,
+                    backend,
+                )
+            })
+            .transpose()
+            .map_err(|source| Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                reason: source.to_string(),
+            })?;
+        Ok(Qwen3AsrLlmLogitsHeadRuntime {
+            head_runtime_identity: self.runtime_identity,
+            executor,
+        })
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.output_norm_weight, "qwen logits output norm")?;
+        if let Some(values) = &self.output_weight_values {
+            bytes.add_vec(values, "qwen logits output weight f32")?;
+        }
+        if let Some(weight) = &self.ggml_output_weight {
+            bytes.add_vec(&weight.dims, "qwen logits raw dims")?;
+            bytes.add(
+                weight.payload.retained_system_memory_bytes()?,
+                "qwen logits mapped payload metadata",
+            )?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn fused_top1_spec(&self) -> Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>> {
         let output_weight = self.ggml_output_weight.as_ref()?;
         Some(Qwen3AsrLlmFusedLogitsHeadSpec {
@@ -106,8 +249,16 @@ impl Qwen3AsrLlmLogitsHead {
             output_weight_tensor_name: self.output_weight_tensor_name,
             output_weight_ggml_type: output_weight.ggml_type,
             output_weight_dims: &output_weight.dims,
-            output_weight_bytes: &output_weight.bytes,
+            output_weight_bytes: output_weight.payload.bytes(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mapped_output_weight_payload(&self) -> Option<&GgufOwnedWeightTensorPayload> {
+        match &self.ggml_output_weight.as_ref()?.payload {
+            LogitsWeightPayload::Mapped(payload) => Some(payload),
+            LogitsWeightPayload::TestBytes(_) => None,
+        }
     }
 
     pub fn compute_logits_for_last_hidden(
@@ -122,24 +273,6 @@ impl Qwen3AsrLlmLogitsHead {
         }
         if hidden.iter().any(|value| !value.is_finite()) {
             return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
-        }
-
-        if let (Some(cache_key), Some(output_weight)) = (
-            self.ggml_executor_cache_key.as_ref(),
-            self.ggml_output_weight.as_ref(),
-        ) {
-            return with_thread_local_logits_head_executor(
-                cache_key.clone(),
-                self.d_model,
-                self.vocab_size,
-                self.rms_norm_epsilon,
-                &self.output_norm_weight,
-                output_weight,
-                |executor| executor.compute(hidden),
-            )
-            .map_err(|source| Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
-                reason: source.to_string(),
-            });
         }
 
         let normed = rms_norm_with_weight(hidden, &self.output_norm_weight, self.rms_norm_epsilon)?;
@@ -194,25 +327,6 @@ impl Qwen3AsrLlmLogitsHead {
             return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
         }
 
-        if let (Some(cache_key), Some(output_weight)) = (
-            self.ggml_executor_cache_key.as_ref(),
-            self.ggml_output_weight.as_ref(),
-        ) {
-            let token_id = with_thread_local_logits_head_executor(
-                cache_key.clone(),
-                self.d_model,
-                self.vocab_size,
-                self.rms_norm_epsilon,
-                &self.output_norm_weight,
-                output_weight,
-                |executor| executor.compute_top1(hidden),
-            )
-            .map_err(|source| Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
-                reason: source.to_string(),
-            })?;
-            return validate_top1_token_id(token_id, self.vocab_size);
-        }
-
         let logits = self.compute_logits_for_last_hidden(hidden)?;
         let mut best_index = 0usize;
         let mut best_value = f32::NEG_INFINITY;
@@ -223,6 +337,70 @@ impl Qwen3AsrLlmLogitsHead {
             }
         }
         u32::try_from(best_index).map_err(|_| Qwen3AsrLlmLogitsHeadError::AllocationOverflow)
+    }
+}
+
+impl Qwen3AsrLlmLogitsHeadRuntime {
+    pub(crate) fn compute_logits_for_last_hidden(
+        &mut self,
+        head: &Qwen3AsrLlmLogitsHead,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+        self.validate_head(head)?;
+        if let Some(executor) = self.executor.as_mut() {
+            if hidden.len() != head.d_model {
+                return Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenStateShape {
+                    got: hidden.len(),
+                    expected: head.d_model,
+                });
+            }
+            if hidden.iter().any(|value| !value.is_finite()) {
+                return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
+            }
+            return executor.compute(hidden).map_err(|source| {
+                Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                    reason: source.to_string(),
+                }
+            });
+        }
+        head.compute_logits_for_last_hidden(hidden)
+    }
+
+    pub(crate) fn compute_top1_token_for_last_hidden(
+        &mut self,
+        head: &Qwen3AsrLlmLogitsHead,
+        hidden: &[f32],
+    ) -> Result<u32, Qwen3AsrLlmLogitsHeadError> {
+        self.validate_head(head)?;
+        if let Some(executor) = self.executor.as_mut() {
+            if hidden.len() != head.d_model {
+                return Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenStateShape {
+                    got: hidden.len(),
+                    expected: head.d_model,
+                });
+            }
+            if hidden.iter().any(|value| !value.is_finite()) {
+                return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
+            }
+            let token_id = executor.compute_top1(hidden).map_err(|source| {
+                Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                    reason: source.to_string(),
+                }
+            })?;
+            return validate_top1_token_id(token_id, head.vocab_size);
+        }
+        head.compute_top1_token_for_last_hidden(hidden)
+    }
+
+    fn validate_head(
+        &self,
+        head: &Qwen3AsrLlmLogitsHead,
+    ) -> Result<(), Qwen3AsrLlmLogitsHeadError> {
+        if self.head_runtime_identity == head.runtime_identity {
+            Ok(())
+        } else {
+            Err(Qwen3AsrLlmLogitsHeadError::RuntimeHeadMismatch)
+        }
     }
 }
 
@@ -271,7 +449,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
 /// identical across every qwen-family decoder-only LLM.
 pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
     reader: &GgufTensorDataReader,
-    runtime_source: &GgmlRuntimeSource,
+    _runtime_source: &GgmlRuntimeSource,
     d_model: usize,
     vocab_size: usize,
     output_norm_weight_tensor_name: &'static str,
@@ -336,6 +514,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
         Some(values)
     };
     Ok(Qwen3AsrLlmLogitsHead {
+        runtime_identity: next_logits_head_runtime_identity(),
         d_model,
         vocab_size,
         rms_norm_epsilon,
@@ -343,12 +522,6 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
         output_weight_tensor_name,
         output_weight_values,
         output_weight_layout,
-        ggml_executor_cache_key: raw_output_weight.as_ref().map(|_| {
-            (
-                PackContentKey::for_runtime_source(runtime_source),
-                qwen_runtime_graph_config(backend).backend,
-            )
-        }),
         ggml_output_weight: raw_output_weight,
     })
 }
@@ -364,15 +537,15 @@ fn load_direct_output_weight_payload(
         return Ok(None);
     }
     let payload = reader
-        .weight_tensor_payload_by_name(output_weight_tensor_name)
+        .owned_weight_tensor_payload_by_name(output_weight_tensor_name)
         .map_err(map_tensor_read_error)?;
     if payload.dims.as_slice() != [d_model, vocab_size] {
         return Ok(None);
     }
     Ok(Some(OwnedGgmlLogitsWeight {
         ggml_type: payload.element_type.ggml_type(),
-        dims: payload.dims,
-        bytes: payload.bytes.to_vec(),
+        dims: payload.dims.clone(),
+        payload: LogitsWeightPayload::Mapped(payload),
     }))
 }
 
@@ -385,52 +558,6 @@ struct Qwen3AsrLlmLogitsHeadGraphExecutor {
     output_norm_weight: GgmlStaticTensor,
     output_weight: GgmlStaticTensor,
     argmax_reverse_indices: GgmlStaticTensor,
-}
-
-thread_local! {
-    // Bounded LRU (not a plain `HashMap`): each entry owns a resident ggml
-    // static-tensor arena holding the full vocab x d_model output-weight
-    // matrix. The previous design keyed this cache on a thread-local
-    // monotonic id minted once per model *load* and never evicted or
-    // reused, so every load of a qwen pack left one more multi-hundred-MB
-    // entry permanently resident per thread for the life of the process --
-    // the same "memory roller coaster" root cause already fixed for the
-    // other per-pack runtime caches (see
-    // `thread_local_runtime_cache::DEFAULT_RUNTIME_CACHE_CAPACITY`). Keying
-    // on `(canonical pack path, backend)` instead lets repeated loads of the
-    // same pack reuse one entry and bounds the worst case to
-    // `DEFAULT_RUNTIME_CACHE_CAPACITY` resident executors per thread.
-    static QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY: RefCell<
-        BoundedRuntimeCache<QwenLogitsHeadExecutorCacheKey, Qwen3AsrLlmLogitsHeadGraphExecutor>,
-    > = RefCell::new(BoundedRuntimeCache::new());
-}
-
-fn with_thread_local_logits_head_executor<R>(
-    cache_key: QwenLogitsHeadExecutorCacheKey,
-    d_model: usize,
-    vocab_size: usize,
-    rms_norm_epsilon: f32,
-    output_norm_weight: &[f32],
-    output_weight: &OwnedGgmlLogitsWeight,
-    use_executor: impl FnOnce(&mut Qwen3AsrLlmLogitsHeadGraphExecutor) -> Result<R, GgmlCpuGraphError>,
-) -> Result<R, GgmlCpuGraphError> {
-    let backend = cache_key.1;
-    with_thread_local_cached_mut_by_key(
-        &QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY,
-        cache_key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || {
-            Qwen3AsrLlmLogitsHeadGraphExecutor::new(
-                d_model,
-                vocab_size,
-                rms_norm_epsilon,
-                output_norm_weight,
-                output_weight,
-                backend,
-            )
-        },
-        use_executor,
-    )
 }
 
 impl fmt::Debug for Qwen3AsrLlmLogitsHeadGraphExecutor {
@@ -496,7 +623,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         )?;
         arena.set_bytes_slice(
             weight,
-            &output_weight.bytes,
+            output_weight.payload.bytes(),
             "qwen_llm_logits_output_weight",
         )?;
         arena.set_i32_slice(
@@ -661,7 +788,7 @@ fn render_shape(shape: &[u64]) -> String {
     format!("[{parts}]")
 }
 
-fn logits_head_ggml_enabled(backend: GgmlCpuGraphBackend) -> bool {
+pub(crate) fn logits_head_ggml_enabled(backend: GgmlCpuGraphBackend) -> bool {
     parse_env_flag(
         std::env::var(OPENASR_QWEN3_LLM_LOGITS_GGML_ENV)
             .ok()
@@ -709,11 +836,65 @@ fn resolve_output_weight_layout(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    use crate::models::qwen::token_embedding::load_token_embedding_table_from_reader_with_tensor_name;
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
     use super::*;
+
+    #[test]
+    fn tied_embedding_and_logits_share_one_mmap_payload_range() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("qwen-tied-embedding.gguf");
+        let tied_weight_name = "token_embd.weight";
+        let output_norm_name = "output_norm.weight";
+        let spec = TinyGgufFixtureSpec::new(BTreeMap::new())
+            .with_tensor_shape(tied_weight_name, [2_u64, 3_u64])
+            .with_tensor_shape(output_norm_name, [2_u64]);
+        write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write tied fixture");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&runtime_path).expect("validate tied fixture");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
+
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_QWEN3_LLM_LOGITS_GGML_ENV, Some(OsString::from("1")))],
+            || {
+                let embedding = load_token_embedding_table_from_reader_with_tensor_name(
+                    &reader,
+                    tied_weight_name,
+                    2,
+                    3,
+                )
+                .expect("mapped embedding");
+                let logits = load_llm_logits_head_from_reader_with_tensor_names(
+                    &reader,
+                    &runtime_source,
+                    2,
+                    3,
+                    output_norm_name,
+                    tied_weight_name,
+                    DEFAULT_RMS_NORM_EPSILON,
+                    GgmlCpuGraphBackend::Cpu,
+                )
+                .expect("mapped tied logits");
+                let embedding_payload = embedding.mapped_payload().expect("mapped embedding view");
+                let logits_payload = logits
+                    .mapped_output_weight_payload()
+                    .expect("mapped logits view");
+                assert!(
+                    embedding_payload.shares_backing_range(logits_payload),
+                    "tied consumers must retain views into one physical mmap range"
+                );
+            },
+        );
+    }
 
     #[test]
     fn logits_head_hidden_vocab_layout_matches_manual_matmul() {
         let head = Qwen3AsrLlmLogitsHead {
+            runtime_identity: next_logits_head_runtime_identity(),
             d_model: 2,
             vocab_size: 3,
             rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
@@ -725,7 +906,6 @@ mod tests {
             ]),
             output_weight_layout: OutputWeightLayout::HiddenVocab,
             ggml_output_weight: None,
-            ggml_executor_cache_key: None,
         };
         let logits = head
             .compute_logits_for_last_hidden(&[1.0, 2.0])
@@ -737,6 +917,7 @@ mod tests {
     #[test]
     fn logits_head_rejects_wrong_hidden_size() {
         let head = Qwen3AsrLlmLogitsHead {
+            runtime_identity: next_logits_head_runtime_identity(),
             d_model: 4,
             vocab_size: 8,
             rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
@@ -745,7 +926,6 @@ mod tests {
             output_weight_values: Some(vec![0.0; 32]),
             output_weight_layout: OutputWeightLayout::HiddenVocab,
             ggml_output_weight: None,
-            ggml_executor_cache_key: None,
         };
         let error = head
             .compute_logits_for_last_hidden(&[0.0; 3])
@@ -817,10 +997,7 @@ mod tests {
         assert_send_sync::<Qwen3AsrLlmLogitsHead>();
     }
 
-    fn ggml_logits_head_with_cache_key(
-        cache_key: QwenLogitsHeadExecutorCacheKey,
-        output_norm_weight: Vec<f32>,
-    ) -> Qwen3AsrLlmLogitsHead {
+    fn ggml_logits_head(output_norm_weight: Vec<f32>) -> Qwen3AsrLlmLogitsHead {
         // A valid rank-2 [d_model x vocab_size] f32 weight for d_model=2,
         // vocab_size=3, matching the fused-logits fixture in
         // `llm_transformer::tests::fused_logits_top1_selects_first_token_on_equal_logit_tie`.
@@ -830,6 +1007,7 @@ mod tests {
             0.3, 0.0,
         ];
         Qwen3AsrLlmLogitsHead {
+            runtime_identity: next_logits_head_runtime_identity(),
             d_model: 2,
             vocab_size: 3,
             rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
@@ -840,137 +1018,34 @@ mod tests {
             ggml_output_weight: Some(OwnedGgmlLogitsWeight {
                 ggml_type: crate::ggml_runtime::GGML_TYPE_F32,
                 dims: vec![2, 3],
-                bytes: output_weight_values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect(),
+                payload: LogitsWeightPayload::TestBytes(
+                    output_weight_values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect(),
+                ),
             }),
-            ggml_executor_cache_key: Some(cache_key),
         }
     }
 
-    fn ggml_logits_head_test_cache_key(id: usize) -> QwenLogitsHeadExecutorCacheKey {
-        (
-            // Test-only identity: a stable fixture content id stands in for
-            // the content id the production path
-            // (`PackContentKey::for_runtime_source`) would compute from an
-            // actual open pack.
-            PackContentKey::new(format!("test:logits-head-{id}")),
-            GgmlCpuGraphBackend::Cpu,
-        )
-    }
-
     #[test]
-    fn ggml_logits_head_executor_cache_reuses_same_key_without_rebuilding() {
-        let key = ggml_logits_head_test_cache_key(9_000_001);
-        let first = ggml_logits_head_with_cache_key(key.clone(), vec![1.0, 1.0]);
-        first
-            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
-            .expect("first compute builds and caches the executor");
+    fn explicit_runtime_reuses_one_native_graph_and_rejects_head_aliasing() {
+        let first = ggml_logits_head(vec![1.0, 1.0]);
+        let mut runtime = first
+            .new_runtime(GgmlCpuGraphBackend::Cpu)
+            .expect("build explicit logits runtime");
+        let first_token = runtime
+            .compute_top1_token_for_last_hidden(&first, &[1.0, 2.0])
+            .expect("first call");
+        let second_token = runtime
+            .compute_top1_token_for_last_hidden(&first, &[1.0, 2.0])
+            .expect("same owner reuses its graph");
+        assert_eq!(first_token, second_token);
 
-        // Same cache key, but a norm-weight width that would fail
-        // `Qwen3AsrLlmLogitsHeadGraphExecutor::new`'s shape validation if it
-        // were actually rebuilt. Success here proves the cached executor
-        // from `first` was reused and this (invalid) weight was never used
-        // to build a new one.
-        let second = ggml_logits_head_with_cache_key(key, vec![1.0, 1.0, 1.0]);
-        second
-            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
-            .expect("second compute must reuse the cached executor, not rebuild from bad input");
-    }
-
-    /// Unlike the fixture above (which stands in for the content id with a
-    /// fixed `test:` token), this test derives the cache key the way
-    /// production actually does --
-    /// [`PackContentKey::for_runtime_source`] from a real, already-open,
-    /// already-validated [`crate::GgmlRuntimeSource`] -- and proves the two
-    /// behaviors that make it a correctness-preserving replacement for the
-    /// removed path-based identity: unchanged bytes at the same path key
-    /// equal across two independent opens (cache hit), and an in-place
-    /// replacement at that same path keys different (cache miss, forced
-    /// rebuild).
-    #[test]
-    fn ggml_logits_head_executor_cache_keys_on_content_id_from_a_real_runtime_source() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("logits-head-content-id.gguf");
-        std::fs::write(&path, b"GGUFlogits-head-content-id-v1").expect("write v1");
-
-        // Two independent opens of the same unchanged bytes must resolve to
-        // the same content id, and therefore the same cache key -- a second
-        // executor built "under" that key must reuse the first, exactly like
-        // the fixed-token test above, but through the real derivation path.
-        let source_first_open =
-            crate::validate_ggml_runtime_source_path(&path).expect("validate first open");
-        let key_first_open = (
-            PackContentKey::for_runtime_source(&source_first_open),
-            GgmlCpuGraphBackend::Cpu,
-        );
-        let first = ggml_logits_head_with_cache_key(key_first_open, vec![1.0, 1.0]);
-        first
-            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
-            .expect("first compute builds and caches the executor");
-
-        let source_second_open = crate::validate_ggml_runtime_source_path(&path)
-            .expect("validate second, independent open of the unchanged file");
-        let key_second_open = (
-            PackContentKey::for_runtime_source(&source_second_open),
-            GgmlCpuGraphBackend::Cpu,
-        );
-        assert_eq!(
-            PackContentKey::for_runtime_source(&source_first_open),
-            key_second_open.0,
-            "two independent opens of the same unchanged bytes must resolve to the same content id"
-        );
-        // Same shape-invalid trick as the fixed-token test: if this were
-        // rebuilt instead of reused, the shape mismatch would surface as an
-        // error here.
-        let second_content_id = key_second_open.0.clone();
-        let second = ggml_logits_head_with_cache_key(key_second_open, vec![1.0, 1.0, 1.0]);
-        second
-            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
-            .expect("second compute must reuse the cached executor keyed by content id");
-
-        // Now replace the bytes at the same path (a real in-place
-        // replacement, the exact scenario the removed path-based identity
-        // used to fingerprint against). The new content id must differ, so a
-        // third executor under the new key must be built fresh -- proven by
-        // supplying a norm-weight width that would fail shape validation if
-        // it were (incorrectly) served from the old cached executor's slot
-        // reused past its actual replacement, and by succeeding once with a
-        // matching shape.
-        std::fs::write(&path, b"GGUFlogits-head-content-id-v2-different").expect("write v2");
-        let source_after_replace = crate::validate_ggml_runtime_source_path(&path)
-            .expect("validate source after replacement");
-        let key_after_replace = (
-            PackContentKey::for_runtime_source(&source_after_replace),
-            GgmlCpuGraphBackend::Cpu,
-        );
-        assert_ne!(
-            key_after_replace.0, second_content_id,
-            "an in-place byte replacement at the same path must change the content id"
-        );
-        let third = ggml_logits_head_with_cache_key(key_after_replace, vec![1.0, 1.0]);
-        third
-            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
-            .expect(
-                "third compute under the new content id must build fresh, not alias the old slot",
-            );
-    }
-
-    #[test]
-    fn ggml_logits_head_executor_cache_evicts_beyond_capacity() {
-        let base_id = 9_100_000;
-        for offset in 0..(DEFAULT_RUNTIME_CACHE_CAPACITY + 3) {
-            let key = ggml_logits_head_test_cache_key(base_id + offset);
-            let head = ggml_logits_head_with_cache_key(key, vec![1.0, 1.0]);
-            head.compute_top1_token_for_last_hidden(&[1.0, 2.0])
-                .unwrap_or_else(|error| panic!("compute for distinct key {offset}: {error}"));
-
-            let len = QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY.with(|cache| cache.borrow().len());
-            assert!(
-                len <= DEFAULT_RUNTIME_CACHE_CAPACITY,
-                "cache must never exceed the configured capacity (cap={DEFAULT_RUNTIME_CACHE_CAPACITY}), got {len}"
-            );
-        }
+        let distinct_head = ggml_logits_head(vec![1.0, 1.0]);
+        assert!(matches!(
+            runtime.compute_top1_token_for_last_hidden(&distinct_head, &[1.0, 2.0]),
+            Err(Qwen3AsrLlmLogitsHeadError::RuntimeHeadMismatch)
+        ));
     }
 }

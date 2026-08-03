@@ -1,6 +1,7 @@
 mod audio_encoder;
 mod batched_decode;
 pub(crate) mod capacity;
+mod decode_budget;
 mod decode_prompt;
 mod forced_aligner_align_text;
 mod forced_aligner_import;
@@ -39,19 +40,24 @@ pub(crate) use forced_aligner_runtime::{
 };
 pub(crate) use frontend::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;
-pub(crate) use kv_cache::Qwen3AsrLayerKvCacheState;
+pub(crate) use kv_cache::{
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrKvCacheCapacityError, Qwen3AsrLayerKvCacheState, qwen_host_kv_quoted_bytes,
+};
+#[cfg(test)]
 pub(crate) use llm_transformer::{
-    Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
-    Qwen3AsrLlmWholeStepOutput, Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames,
-    even_prefill_chunk_len, load_qwen_family_llm_layer_attention_projection_generic,
+    Qwen3AsrLlmLayerAttentionProjection, load_qwen_family_llm_layer_attention_projection_generic,
     load_qwen3_llm_attention_projections_from_reader,
-    load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv,
-    resolve_qwen_family_production_kv_cache_policy,
+};
+pub(crate) use llm_transformer::{
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
+    Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames, QwenWholeDecoderPlan,
+    even_prefill_chunk_len, resolve_qwen_family_production_kv_cache_policy,
 };
 pub(crate) use logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     load_llm_logits_head_from_reader_with_tensor_names, load_qwen3_llm_logits_head_from_reader,
-    load_qwen3_llm_logits_head_from_reader_with_output_tensor,
+    load_qwen3_llm_logits_head_from_reader_with_output_tensor, logits_head_ggml_enabled,
 };
 pub(crate) use package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
 pub use package_import::{

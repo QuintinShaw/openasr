@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -23,7 +22,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
     SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
-    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    ServeBatchEngineRegistry,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -43,10 +42,6 @@ const MOONSHINE_SERVE_BATCH_SEND_TIMEOUT: std::time::Duration = std::time::Durat
 #[cfg(test)]
 const MOONSHINE_SERVE_BATCH_REPLY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
-
-static MOONSHINE_SERVE_BATCH_ENGINES: OnceLock<
-    Mutex<HashMap<MoonshineServeBatchEngineKey, Arc<ServeBatchEngine<MoonshineFamily>>>>,
-> = OnceLock::new();
 
 /// Field-identical alias onto the generic `ServeBatchConfig`. Preserved so
 /// `ggml_executor`'s `MoonshineServeBatchConfig::from_env()` and the tests'
@@ -85,7 +80,9 @@ pub(crate) struct MoonshineServeBatchJob {
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
-    pub prepared_runtime: Arc<MoonshinePreparedRuntime>,
+    pub prepared_runtime:
+        crate::models::prepared_runtime_cache::PreparedRuntimeHandle<MoonshinePreparedRuntime>,
+    pub decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     pub encoder_output: MoonshineEncoderOutput,
     pub decode_config: Seq2SeqGreedyDecodeConfig,
     pub word_timestamps: bool,
@@ -141,15 +138,18 @@ impl MoonshineServeBatchError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MoonshineServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
-    backend: GgmlCpuGraphBackend,
-    frame_count: usize,
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+    resident_self_positions: usize,
+    resident_cross_positions: usize,
     hidden_size: usize,
     max_batch: usize,
 }
 
+pub(super) type MoonshineServeBatchEngineRegistry = ServeBatchEngineRegistry<MoonshineFamily>;
+
 /// The moonshine serve-batch ZST family wiring (`Seq2SeqServeBatchFamily`) that
 /// drives the generic `OwnerThreadState` + generic `ServeBatchEngine`.
-struct MoonshineFamily;
+pub(super) struct MoonshineFamily;
 
 #[cfg(test)]
 type MoonshineServeBatchEnvelope = Envelope<MoonshineFamily>;
@@ -167,24 +167,28 @@ pub(crate) struct MoonshineBatchSlot {
 }
 
 pub(super) fn submit_moonshine_serve_batch_job(
+    registry: &MoonshineServeBatchEngineRegistry,
     config: MoonshineServeBatchConfig,
     job: MoonshineServeBatchJob,
 ) -> Result<MoonshineDecodeOutput, MoonshineServeBatchError> {
     let config = config.validate_for_job::<MoonshineFamily>(&job)?;
     let key = MoonshineFamily::engine_key(&job, config.max_batch);
-    serve_batch_engine_for_key(&MOONSHINE_SERVE_BATCH_ENGINES, key, config)?.submit(job)
+    let engine = registry.engine_for_key(key.clone(), config)?;
+    let result = engine.submit(job);
+    registry.evict_after_candidate_failure(&key, &engine);
+    result
 }
 
-pub(super) fn shutdown_moonshine_serve_batch_engines() {
-    shutdown_and_remove_serve_batch_engines(&MOONSHINE_SERVE_BATCH_ENGINES);
+pub(super) fn shutdown_moonshine_serve_batch_engines(registry: &MoonshineServeBatchEngineRegistry) {
+    registry.shutdown();
 }
 
 fn moonshine_serve_batch_vram_slot_bytes(job: &MoonshineServeBatchJob) -> usize {
     serve_batch_estimate_seq2seq_slot_bytes(
         job.prepared_runtime.metadata.decoder_layers,
-        job.prepared_runtime.metadata.decoder_max_context,
+        job.decoder_state.self_attention.resident_positions,
         job.prepared_runtime.metadata.d_model,
-        job.encoder_output.frame_count,
+        job.decoder_state.cross_attention.resident_positions,
         job.encoder_output.hidden_size,
         std::mem::size_of::<u16>(),
         std::mem::size_of::<u16>(),
@@ -203,7 +207,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             MoonshineDecoderRuntimeInput {
                 decoder_weights: &job.prepared_runtime.decoder_weights,
                 metadata: job.prepared_runtime.metadata,
-                cross_frame_count: job.encoder_output.frame_count,
+                decoder_state: job.decoder_state,
                 backend: job.backend,
             },
             false,
@@ -217,7 +221,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
         MoonshineDecoderGraphRuntime::new_with_n_seq(
             &job.prepared_runtime.decoder_weights,
             job.prepared_runtime.metadata,
-            job.encoder_output.frame_count,
+            job.decoder_state,
             job.backend,
             false,
             Some(&job.runtime_source),
@@ -246,6 +250,11 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             &job.encoder_output,
         )
         .map_err(map_decoder_error)
+    }
+
+    fn configure_for_job(&mut self, job: &Self::Job) -> Result<(), Self::Error> {
+        self.activate_decoder_state(job.decoder_state)
+            .map_err(map_decoder_error)
     }
 
     fn compute_batched_prefill_logits(
@@ -283,15 +292,16 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
         MoonshineServeBatchEngineKey {
             build_identity: job.build_identity.clone(),
-            backend: job.backend,
-            frame_count: job.encoder_output.frame_count,
+            lane: crate::models::native_execution_services::current_execution_lane_key(job.backend),
+            resident_self_positions: job.decoder_state.self_attention.resident_positions,
+            resident_cross_positions: job.decoder_state.cross_attention.resident_positions,
             hidden_size: job.encoder_output.hidden_size,
             max_batch,
         }
     }
 
     fn engine_key_backend(key: &Self::EngineKey) -> GgmlCpuGraphBackend {
-        key.backend
+        key.lane.backend()
     }
 
     fn can_batch_with(a: &Self::Job, b: &Self::Job) -> bool {
@@ -323,7 +333,7 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
     }
 
     fn decoder_max_context(job: &Self::Job) -> usize {
-        job.prepared_runtime.metadata.decoder_max_context
+        job.decoder_state.self_attention.logical_positions
     }
 
     fn slot_new(job: Self::Job) -> Result<Self::Slot, Self::Error> {
@@ -364,6 +374,9 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
                     reason: "moonshine serve batch serial runtime cache is unexpectedly empty"
                         .to_string(),
                 })?;
+        runtime
+            .activate_decoder_state(job.decoder_state)
+            .map_err(map_decoder_error)?;
         runtime
             .populate_cross_attention_cache(&job.encoder_output)
             .map_err(map_decoder_error)?;
@@ -455,6 +468,7 @@ impl MoonshineServeBatchJob {
             && self.decode_config.vocab_size == other.decode_config.vocab_size
             && self.prepared_runtime.metadata.decoder_max_context
                 == other.prepared_runtime.metadata.decoder_max_context
+            && self.decoder_state == other.decoder_state
     }
 }
 
@@ -569,6 +583,7 @@ impl MoonshineBatchSlot {
 
 pub(super) fn moonshine_serve_batch_decode_config(
     metadata: MoonshineExecutionMetadata,
+    decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     tokenizer: &MoonshineTokenizer,
     phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<Seq2SeqGreedyDecodeConfig, MoonshineServeBatchError> {
@@ -577,6 +592,24 @@ pub(super) fn moonshine_serve_batch_decode_config(
         .decoder_max_context
         .saturating_sub(initial_prompt_tokens.len())
         .max(1);
+    let required_self_positions =
+        crate::capacity::topology::causal_prefix_positions_with_context_cap(
+            super::capacity::SELF_KV_STATE_ID,
+            initial_prompt_tokens.len(),
+            max_generated_tokens,
+            metadata.decoder_max_context,
+        )
+        .map_err(|error| MoonshineServeBatchError::DecodeFailed {
+            reason: format!("moonshine decode schedule is invalid: {error}"),
+        })?;
+    if required_self_positions != decoder_state.self_attention.logical_positions {
+        return Err(MoonshineServeBatchError::DecodeFailed {
+            reason: format!(
+                "moonshine planned self-KV span {} does not match greedy schedule requirement {}",
+                decoder_state.self_attention.logical_positions, required_self_positions
+            ),
+        });
+    }
     Ok(Seq2SeqGreedyDecodeConfig {
         initial_prompt_tokens,
         eot_token_id: metadata.eos_token_id,
@@ -845,6 +878,27 @@ mod tests {
         }
     }
 
+    fn decoder_state(
+        metadata: MoonshineExecutionMetadata,
+        logical_cross_positions: usize,
+    ) -> crate::models::seq2seq_decoder_state::Seq2SeqDecoderState {
+        use crate::models::seq2seq_decoder_state::{Seq2SeqDecoderState, Seq2SeqStateAxis};
+
+        let self_positions = metadata.decoder_max_context - 1;
+        Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: self_positions,
+                resident_positions: self_positions,
+                hard_position_cap: self_positions,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: logical_cross_positions,
+                resident_positions: logical_cross_positions + 16,
+                hard_position_cap: logical_cross_positions + 16,
+            },
+        }
+    }
+
     /// Structural proof that `MoonshineServeBatchJob::execution_context` is
     /// required, not optional: this only compiles because the field's type
     /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
@@ -897,6 +951,7 @@ mod tests {
         };
         let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
             .expect("valid runtime source path");
+        let decoder_state = decoder_state(prepared_runtime.metadata, encoder_output.frame_count);
         MoonshineServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
@@ -908,7 +963,12 @@ mod tests {
             runtime_source,
             backend,
             uses_scheduler,
-            prepared_runtime,
+            prepared_runtime: Arc::new(
+                crate::models::system_memory_owner::SystemMemoryOwner::without_allocation(
+                    (*prepared_runtime).clone(),
+                ),
+            ),
+            decoder_state,
             encoder_output,
             decode_config,
             word_timestamps: false,
@@ -1076,6 +1136,7 @@ mod tests {
             };
             let runtime_source = crate::validate_ggml_runtime_source_path(&runtime_path)
                 .expect("valid runtime source path");
+            let decoder_state = decoder_state(metadata, encoder_output.frame_count);
             MoonshineServeBatchJob {
                 runtime_cache_path: runtime_path.to_path_buf(),
                 build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
@@ -1087,7 +1148,12 @@ mod tests {
                 runtime_source,
                 backend: runtime_config.backend,
                 uses_scheduler: runtime_config.use_scheduler,
-                prepared_runtime: Arc::clone(&prepared_runtime),
+                prepared_runtime: Arc::new(
+                    crate::models::system_memory_owner::SystemMemoryOwner::without_allocation(
+                        (*prepared_runtime).clone(),
+                    ),
+                ),
+                decoder_state,
                 encoder_output,
                 decode_config,
                 word_timestamps: false,
@@ -1209,6 +1275,7 @@ mod tests {
                     MoonshineServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,
@@ -1299,6 +1366,7 @@ mod tests {
                     MoonshineServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,
@@ -1398,6 +1466,7 @@ mod tests {
                     MoonshineServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,

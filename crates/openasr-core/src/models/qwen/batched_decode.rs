@@ -2,20 +2,22 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use thiserror::Error;
 
 use super::graph_config::qwen_runtime_graph_config;
-use super::kv_cache::Qwen3AsrLayerKvCacheState;
+use super::kv_cache::{Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity};
 use super::llm_prefill::Qwen3AsrLlmPrefillInput;
+#[cfg(test)]
+use super::llm_transformer::Qwen3AsrLlmLayerAttentionProjection;
 use super::llm_transformer::{
-    Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan,
     resolve_qwen_family_production_kv_cache_policy,
 };
-use super::logits_head::Qwen3AsrLlmLogitsHead;
+use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
@@ -23,6 +25,8 @@ use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
+use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
+use crate::models::runtime_prepared_registry::BuiltinPreparedRuntime;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
     build_seq2seq_greedy_stop_token_ids,
@@ -42,10 +46,6 @@ const QWEN_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
 const QWEN_SERVE_BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const QWEN_SERVE_BATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const QWEN_ROPE_THETA: f32 = 1_000_000.0;
-
-static QWEN_SERVE_BATCH_ENGINES: OnceLock<
-    Mutex<HashMap<Qwen3AsrServeBatchEngineKey, Arc<Qwen3AsrServeBatchEngine>>>,
-> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Qwen3AsrServeBatchConfig {
@@ -71,11 +71,15 @@ pub(super) struct Qwen3AsrServeBatchJob {
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub metadata: Qwen3AsrExecutionMetadata,
-    pub tokenizer: Option<Qwen3AsrTokenizer>,
-    pub token_embedding_table: Qwen3AsrTokenEmbeddingTable,
-    pub logits_head: Qwen3AsrLlmLogitsHead,
-    pub layer_attention_projections: Arc<Vec<Qwen3AsrLlmLayerAttentionProjection>>,
+    /// Owner-bound prepared assets. The job crosses to the batch owner thread,
+    /// so it carries the admission lease itself rather than cloning large
+    /// token/logits/decoder payloads out of the cache entry.
+    pub prepared_assets: Qwen3AsrServeBatchPreparedAssets,
     pub llm_prefill_input: Qwen3AsrLlmPrefillInput,
+    /// Current invocation's exact host span plus the stable resident envelope.
+    /// The resident half is part of the engine key, so one owner never mixes
+    /// incompatible reusable graph shapes.
+    pub kv_capacity: Qwen3AsrKvCacheCapacity,
     pub decode_config: Seq2SeqGreedyDecodeConfig,
     pub text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind,
     pub word_timestamps: bool,
@@ -87,6 +91,65 @@ pub(super) struct Qwen3AsrServeBatchJob {
     /// chunk-boundary polls can observe the same cancel flag the HTTP cancel
     /// handler flips. See [`crate::RequestExecutionContext`].
     pub execution_context: Arc<crate::RequestExecutionContext>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum Qwen3AsrServeBatchPreparedAssets {
+    /// The only production representation: admission and materialized state
+    /// have one shared lifetime even after the job crosses to its owner thread.
+    Admitted(PreparedRuntimeHandle<BuiltinPreparedRuntime>),
+    /// A deliberately test-only seam for tiny decoder fixtures that do not
+    /// contain the audio/frontend tensors required to construct the complete
+    /// prepared runtime. This variant does not exist in production binaries.
+    #[cfg(test)]
+    Fixture {
+        tokenizer: Option<Qwen3AsrTokenizer>,
+        token_embedding_table: Arc<Qwen3AsrTokenEmbeddingTable>,
+        logits_head: Arc<Qwen3AsrLlmLogitsHead>,
+        decoder_plan: Arc<QwenWholeDecoderPlan>,
+    },
+}
+
+struct Qwen3AsrServeBatchPreparedRef<'a> {
+    tokenizer: Option<&'a Qwen3AsrTokenizer>,
+    token_embedding_table: &'a Arc<Qwen3AsrTokenEmbeddingTable>,
+    logits_head: &'a Arc<Qwen3AsrLlmLogitsHead>,
+    decoder_plan: &'a Arc<QwenWholeDecoderPlan>,
+}
+
+impl Qwen3AsrServeBatchJob {
+    fn prepared_runtime(
+        &self,
+    ) -> Result<Qwen3AsrServeBatchPreparedRef<'_>, Qwen3AsrServeBatchError> {
+        match &self.prepared_assets {
+            Qwen3AsrServeBatchPreparedAssets::Admitted(owner) => {
+                let runtime = owner.as_ref().as_qwen3_asr().ok_or_else(|| {
+                    Qwen3AsrServeBatchError::OwnerFailed {
+                        reason: "qwen serve batch job carries a non-qwen prepared runtime"
+                            .to_string(),
+                    }
+                })?;
+                Ok(Qwen3AsrServeBatchPreparedRef {
+                    tokenizer: runtime.tokenizer.as_ref(),
+                    token_embedding_table: &runtime.token_embedding_table,
+                    logits_head: &runtime.logits_head,
+                    decoder_plan: &runtime.decoder_plan,
+                })
+            }
+            #[cfg(test)]
+            Qwen3AsrServeBatchPreparedAssets::Fixture {
+                tokenizer,
+                token_embedding_table,
+                logits_head,
+                decoder_plan,
+            } => Ok(Qwen3AsrServeBatchPreparedRef {
+                tokenizer: tokenizer.as_ref(),
+                token_embedding_table,
+                logits_head,
+                decoder_plan,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -167,8 +230,26 @@ fn map_serve_batch_graph_error(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Qwen3AsrServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
-    backend: GgmlCpuGraphBackend,
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+    resident_positions: usize,
     max_batch: usize,
+}
+
+/// Executor-owned qwen serve-batch owners. Clones of one executor share the
+/// same map; independently constructed service roots do not. This makes owner
+/// thread lifetime a normal part of `NativeExecutionServices` instead of a
+/// process singleton partitioned by ambient scope ids.
+#[derive(Clone, Default)]
+pub(super) struct Qwen3AsrServeBatchEngineRegistry {
+    engines: Arc<Mutex<HashMap<Qwen3AsrServeBatchEngineKey, Arc<Qwen3AsrServeBatchEngine>>>>,
+}
+
+impl std::fmt::Debug for Qwen3AsrServeBatchEngineRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Qwen3AsrServeBatchEngineRegistry")
+            .finish_non_exhaustive()
+    }
 }
 
 struct Qwen3AsrServeBatchEngine {
@@ -179,21 +260,28 @@ struct Qwen3AsrServeBatchEngine {
 
 struct Qwen3AsrServeBatchEnvelope {
     job: Qwen3AsrServeBatchJob,
+    native_execution_context:
+        Option<crate::models::native_execution_services::NativeExecutionContext>,
     reply: mpsc::Sender<Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError>>,
 }
 
 struct Qwen3AsrOwnerThreadState {
     decoder: Option<Qwen3AsrLlmWholeDecoderGraphExecutor>,
+    logits_runtime: Option<Qwen3AsrLlmLogitsHeadRuntime>,
 }
 
 struct Qwen3AsrActiveBatchSlot {
     slot: Qwen3AsrBatchSlot,
+    native_execution_context:
+        Option<crate::models::native_execution_services::NativeExecutionContext>,
     reply: mpsc::Sender<Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError>>,
 }
 
 struct Qwen3AsrPendingRefillSlot {
     slot_index: usize,
     slot: Qwen3AsrBatchSlot,
+    native_execution_context:
+        Option<crate::models::native_execution_services::NativeExecutionContext>,
     reply: mpsc::Sender<Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError>>,
 }
 
@@ -204,7 +292,7 @@ struct Qwen3AsrPrefillSlotRef<'a> {
 
 struct Qwen3AsrBatchSlot {
     job: Qwen3AsrServeBatchJob,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
     stop_token_ids: Vec<u32>,
     generated_tokens: Vec<u32>,
     /// Per-token softmax probability, parallel to `generated_tokens`.
@@ -279,33 +367,41 @@ impl Qwen3AsrServeBatchConfig {
     }
 }
 
-pub(super) fn shutdown_qwen_serve_batch_engines() {
-    let Some(registry) = QWEN_SERVE_BATCH_ENGINES.get() else {
-        return;
-    };
-    if let Ok(mut engines) = registry.lock() {
+pub(super) fn shutdown_qwen_serve_batch_engines(registry: &Qwen3AsrServeBatchEngineRegistry) {
+    if let Ok(mut engines) = registry.engines.lock() {
         engines.clear();
     }
 }
 
 pub(super) fn submit_qwen_serve_batch_job(
+    registry: &Qwen3AsrServeBatchEngineRegistry,
     config: Qwen3AsrServeBatchConfig,
     job: Qwen3AsrServeBatchJob,
 ) -> Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError> {
     let config = config.validate_for_job(&job)?;
     let key = Qwen3AsrServeBatchEngineKey {
         build_identity: job.build_identity.clone(),
-        backend: job.backend,
+        lane: crate::models::native_execution_services::current_execution_lane_key(job.backend),
+        resident_positions: job.kv_capacity.resident_positions(),
         max_batch: config.max_batch,
     };
-    let engine = qwen_serve_batch_engine_for_key(key, config)?;
-    engine.submit(job)
+    let engine = qwen_serve_batch_engine_for_key(registry, key.clone(), config)?;
+    let result = engine.submit(job);
+    if crate::models::native_execution_services::current_execution_candidate_failure().is_some()
+        && let Ok(mut engines) = registry.engines.lock()
+        && engines
+            .get(&key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, &engine))
+    {
+        engines.remove(&key);
+    }
+    result
 }
 
 fn qwen_serve_batch_vram_slot_bytes(job: &Qwen3AsrServeBatchJob) -> usize {
     serve_batch_estimate_llm_kv_slot_bytes(
         job.metadata.llm_layers,
-        job.metadata.llm_max_positions,
+        job.kv_capacity.resident_positions(),
         job.metadata.llm_kv_heads,
         job.metadata.llm_head_dim,
         std::mem::size_of::<f32>(),
@@ -313,11 +409,12 @@ fn qwen_serve_batch_vram_slot_bytes(job: &Qwen3AsrServeBatchJob) -> usize {
 }
 
 fn qwen_serve_batch_engine_for_key(
+    registry: &Qwen3AsrServeBatchEngineRegistry,
     key: Qwen3AsrServeBatchEngineKey,
     config: Qwen3AsrServeBatchConfig,
 ) -> Result<Arc<Qwen3AsrServeBatchEngine>, Qwen3AsrServeBatchError> {
-    let registry = QWEN_SERVE_BATCH_ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut engines = registry
+        .engines
         .lock()
         .map_err(|_| Qwen3AsrServeBatchError::RegistryPoisoned)?;
     if let Some(engine) = engines.get(&key) {
@@ -329,7 +426,21 @@ fn qwen_serve_batch_engine_for_key(
         engines.remove(&key);
     }
     let engine = Arc::new(Qwen3AsrServeBatchEngine::spawn(key.clone(), config)?);
-    engines.insert(key, Arc::clone(&engine));
+    drop(engines);
+    let registry = registry.clone();
+    let staged_engine = Arc::clone(&engine);
+    crate::models::native_execution_services::stage_execution_cache_commit(move || {
+        let Ok(mut engines) = registry.engines.lock() else {
+            return;
+        };
+        if engines
+            .get(&key)
+            .is_some_and(|existing| serve_batch_owner_alive(&existing.is_alive))
+        {
+            return;
+        }
+        engines.insert(key, staged_engine);
+    });
     Ok(engine)
 }
 
@@ -343,7 +454,7 @@ impl Qwen3AsrServeBatchEngine {
         thread::Builder::new()
             .name(format!(
                 "openasr-qwen-serve-batch-{:?}-{}",
-                key.backend, key.max_batch
+                key.lane, key.max_batch
             ))
             .spawn(move || {
                 let _alive_guard = alive_guard;
@@ -366,7 +477,12 @@ impl Qwen3AsrServeBatchEngine {
         let (reply, reply_rx) = mpsc::channel();
         serve_batch_submit_with_timeout(
             &self.sender,
-            Qwen3AsrServeBatchEnvelope { job, reply },
+            Qwen3AsrServeBatchEnvelope {
+                job,
+                native_execution_context:
+                    crate::models::native_execution_services::current_native_execution_context(),
+                reply,
+            },
             reply_rx,
             self.config.send_timeout,
             self.config.reply_timeout,
@@ -381,7 +497,10 @@ fn qwen_owner_thread_loop(
     receiver: Receiver<Qwen3AsrServeBatchEnvelope>,
     config: Qwen3AsrServeBatchConfig,
 ) {
-    let mut state = Qwen3AsrOwnerThreadState { decoder: None };
+    let mut state = Qwen3AsrOwnerThreadState {
+        decoder: None,
+        logits_runtime: None,
+    };
     let mut deferred = VecDeque::new();
     loop {
         let Some(batch) = serve_batch_drain_compatible_batch(
@@ -407,6 +526,39 @@ fn qwen_owner_thread_loop(
 }
 
 impl Qwen3AsrOwnerThreadState {
+    fn shared_native_execution_context<'a>(
+        contexts: impl IntoIterator<
+            Item = &'a Option<crate::models::native_execution_services::NativeExecutionContext>,
+        >,
+    ) -> Result<
+        Option<crate::models::native_execution_services::NativeExecutionContext>,
+        Qwen3AsrServeBatchError,
+    > {
+        let contexts = contexts
+            .into_iter()
+            .filter_map(Option::as_ref)
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::models::native_execution_services::NativeExecutionContext::shared_lane(&contexts)
+            .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
+                reason: format!("qwen serve-batch execution lanes are incompatible: {error}"),
+            })
+    }
+
+    fn active_native_execution_context(
+        slots: &[Option<Qwen3AsrActiveBatchSlot>],
+    ) -> Result<
+        Option<crate::models::native_execution_services::NativeExecutionContext>,
+        Qwen3AsrServeBatchError,
+    > {
+        Self::shared_native_execution_context(
+            slots
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|active| &active.native_execution_context),
+        )
+    }
+
     fn run_batch(
         &mut self,
         batch: Vec<Qwen3AsrServeBatchEnvelope>,
@@ -427,41 +579,26 @@ impl Qwen3AsrOwnerThreadState {
             return deferred;
         }
 
+        let max_positions = batch[0].job.kv_capacity.resident_positions();
         let mut prepared = Vec::with_capacity(batch.len());
-        let mut batch_max_positions: Option<usize> = None;
         for envelope in batch {
             let required_positions =
                 Qwen3AsrBatchSlot::required_max_positions_for_job(&envelope.job);
-            if let Ok(required_positions) = required_positions {
-                batch_max_positions = Some(
-                    batch_max_positions
-                        .map(|current| current.max(required_positions))
-                        .unwrap_or(required_positions),
-                );
-            }
             prepared.push((envelope, required_positions));
         }
 
-        let Some(mut max_positions) = batch_max_positions else {
-            for (envelope, required_positions) in prepared {
-                let error = required_positions.err().unwrap_or_else(|| {
-                    Qwen3AsrServeBatchError::OwnerFailed {
-                        reason: "qwen serve batch max-position calculation produced no valid slots"
-                            .to_string(),
-                    }
-                });
-                let _ = envelope.reply.send(Err(error));
-            }
-            return deferred;
-        };
-
         let mut slots = Vec::with_capacity(prepared.len());
         for (envelope, required_positions) in prepared {
+            let _native_execution = envelope
+                .native_execution_context
+                .clone()
+                .map(crate::models::native_execution_services::install_native_execution_context);
             match required_positions
                 .and_then(|_| Qwen3AsrBatchSlot::new(envelope.job, max_positions))
             {
                 Ok(slot) => slots.push(Some(Qwen3AsrActiveBatchSlot {
                     slot,
+                    native_execution_context: envelope.native_execution_context,
                     reply: envelope.reply,
                 })),
                 Err(error) => {
@@ -479,15 +616,24 @@ impl Qwen3AsrOwnerThreadState {
             slots.resize_with(bucket_width, || None);
         }
 
-        let decoder_result = {
+        let native_execution_context = match Self::active_native_execution_context(&slots) {
+            Ok(context) => context,
+            Err(error) => {
+                Self::fail_all_slots(&mut slots, error);
+                return deferred;
+            }
+        };
+        let _native_execution = native_execution_context
+            .map(crate::models::native_execution_services::install_native_execution_context);
+        let decoder_and_logits_result = {
             let decoder_slot = slots
                 .iter()
                 .find_map(|slot| slot.as_ref().map(|active| &active.slot))
                 .expect("active slot count checked above");
             self.decoder_for(decoder_slot)
         };
-        let decoder = match decoder_result {
-            Ok(decoder) => decoder,
+        let (decoder, logits_runtime) = match decoder_and_logits_result {
+            Ok(runtimes) => runtimes,
             Err(error) => {
                 let reason = error.to_string();
                 for active in slots.into_iter().flatten() {
@@ -509,7 +655,8 @@ impl Qwen3AsrOwnerThreadState {
                 })
             })
             .collect();
-        let prefill_errors = Self::prefill_and_select_slot_entries(decoder, &mut prefill_entries);
+        let prefill_errors =
+            Self::prefill_and_select_slot_entries(decoder, logits_runtime, &mut prefill_entries);
         drop(prefill_entries);
         for (slot_index, error) in prefill_errors {
             Self::fail_slot(&mut slots, slot_index, decoder, max_positions, false, error);
@@ -527,32 +674,19 @@ impl Qwen3AsrOwnerThreadState {
             return deferred;
         }
 
+        // Initial owner construction + prefill is complete. Later refills and
+        // each decode iteration install a fresh aggregate context so typed
+        // failures fan out to exactly the requests participating in that
+        // operation.
+        drop(_native_execution);
+
         let mut graph_initialized = false;
         loop {
             if graph_initialized {
                 Self::refill_free_slots(
                     &mut slots,
                     decoder,
-                    max_positions,
-                    receiver,
-                    &mut deferred,
-                    config.trace_batches,
-                );
-                if let Err(error) = Self::try_expand_max_positions_for_next_candidate(
-                    &mut slots,
-                    decoder,
-                    &mut max_positions,
-                    receiver,
-                    &mut deferred,
-                    config.max_batch,
-                    config.trace_batches,
-                ) {
-                    Self::fail_all_slots(&mut slots, error);
-                    break;
-                }
-                Self::refill_free_slots(
-                    &mut slots,
-                    decoder,
+                    logits_runtime,
                     max_positions,
                     receiver,
                     &mut deferred,
@@ -561,6 +695,7 @@ impl Qwen3AsrOwnerThreadState {
                 if let Err(error) = Self::try_rebucket_active_slots(
                     &mut slots,
                     decoder,
+                    logits_runtime,
                     max_positions,
                     receiver,
                     &mut deferred,
@@ -571,6 +706,16 @@ impl Qwen3AsrOwnerThreadState {
                     break;
                 }
             }
+
+            let native_execution_context = match Self::active_native_execution_context(&slots) {
+                Ok(context) => context,
+                Err(error) => {
+                    Self::fail_all_slots(&mut slots, error);
+                    break;
+                }
+            };
+            let _native_execution = native_execution_context
+                .map(crate::models::native_execution_services::install_native_execution_context);
 
             for slot_index in 0..slots.len() {
                 let max_tokens_error = slots[slot_index].as_ref().and_then(|active| {
@@ -697,7 +842,11 @@ impl Qwen3AsrOwnerThreadState {
                     .map(|(slot_index, slot)| {
                         slot.as_ref()
                             .map(|active| active.slot.layer_kv_caches.as_slice())
-                            .or_else(|| dummy_seed_layers[slot_index].as_deref())
+                            .or_else(|| {
+                                dummy_seed_layers[slot_index]
+                                    .as_ref()
+                                    .map(|owner| owner.as_slice())
+                            })
                             .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
                                 reason: "qwen serve batch cannot seed an empty initial slot"
                                     .to_string(),
@@ -755,11 +904,12 @@ impl Qwen3AsrOwnerThreadState {
                             reason: "qwen serve batch hidden scatter out of bounds".to_string(),
                         }
                     })?;
-                    let logits = active
-                        .slot
-                        .job
-                        .logits_head
-                        .compute_logits_for_last_hidden(hidden_for_slot)
+                    let prepared_runtime = active.slot.job.prepared_runtime()?;
+                    let logits = logits_runtime
+                        .compute_logits_for_last_hidden(
+                            prepared_runtime.logits_head,
+                            hidden_for_slot,
+                        )
                         .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
                             reason: error.to_string(),
                         })?;
@@ -801,7 +951,7 @@ impl Qwen3AsrOwnerThreadState {
     fn dummy_seed_layers_for_inactive_slots(
         slots: &[Option<Qwen3AsrActiveBatchSlot>],
         max_positions: usize,
-    ) -> Result<Vec<Option<Vec<Qwen3AsrLayerKvCacheState>>>, Qwen3AsrServeBatchError> {
+    ) -> Result<Vec<Option<Qwen3AsrHostKvCacheOwner>>, Qwen3AsrServeBatchError> {
         let (template, backend) = slots
             .iter()
             .find_map(|slot| {
@@ -827,6 +977,7 @@ impl Qwen3AsrOwnerThreadState {
 
     fn prefill_and_select_slot_entries(
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         entries: &mut [Qwen3AsrPrefillSlotRef<'_>],
     ) -> Vec<(usize, Qwen3AsrServeBatchError)> {
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -849,9 +1000,13 @@ impl Qwen3AsrOwnerThreadState {
                 if let Some(chunk_size) =
                     decoder.safe_multi_query_prefill_chunk_size_for(group_token_count)
                 {
-                    if let Err(error) =
-                        Self::prefill_and_select_batched_group(decoder, entries, &group, chunk_size)
-                    {
+                    if let Err(error) = Self::prefill_and_select_batched_group(
+                        decoder,
+                        logits_runtime,
+                        entries,
+                        &group,
+                        chunk_size,
+                    ) {
                         failures.extend(group.into_iter().map(|entry_index| {
                             let mapped = match &error {
                                 // Preserve typed cancel so dispatch keeps the
@@ -870,8 +1025,9 @@ impl Qwen3AsrOwnerThreadState {
                     }
                 } else {
                     for entry_index in group {
-                        if let Err(error) =
-                            entries[entry_index].slot.run_prefill_and_select(decoder)
+                        if let Err(error) = entries[entry_index]
+                            .slot
+                            .run_prefill_and_select(decoder, logits_runtime)
                         {
                             failures.push((entries[entry_index].slot_index, error));
                         }
@@ -879,7 +1035,10 @@ impl Qwen3AsrOwnerThreadState {
                 }
             } else {
                 let entry_index = group[0];
-                if let Err(error) = entries[entry_index].slot.run_prefill_and_select(decoder) {
+                if let Err(error) = entries[entry_index]
+                    .slot
+                    .run_prefill_and_select(decoder, logits_runtime)
+                {
                     failures.push((entries[entry_index].slot_index, error));
                 }
             }
@@ -889,6 +1048,7 @@ impl Qwen3AsrOwnerThreadState {
 
     fn prefill_and_select_batched_group(
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         entries: &mut [Qwen3AsrPrefillSlotRef<'_>],
         group: &[usize],
         chunk_size: usize,
@@ -1009,11 +1169,9 @@ impl Qwen3AsrOwnerThreadState {
                         reason: "qwen serve batch grouped prefill produced no hidden state"
                             .to_string(),
                     })?;
-            let logits = entries[entry_index]
-                .slot
-                .job
-                .logits_head
-                .compute_logits_for_last_hidden(&final_hidden)
+            let prepared_runtime = entries[entry_index].slot.job.prepared_runtime()?;
+            let logits = logits_runtime
+                .compute_logits_for_last_hidden(prepared_runtime.logits_head, &final_hidden)
                 .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
                     reason: error.to_string(),
                 })?;
@@ -1036,6 +1194,7 @@ impl Qwen3AsrOwnerThreadState {
     fn refill_free_slots(
         slots: &mut [Option<Qwen3AsrActiveBatchSlot>],
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         max_positions: usize,
         receiver: &Receiver<Qwen3AsrServeBatchEnvelope>,
         deferred: &mut VecDeque<Qwen3AsrServeBatchEnvelope>,
@@ -1063,7 +1222,14 @@ impl Qwen3AsrOwnerThreadState {
                 break;
             }
 
-            let Qwen3AsrServeBatchEnvelope { job, reply } = envelope;
+            let Qwen3AsrServeBatchEnvelope {
+                job,
+                native_execution_context,
+                reply,
+            } = envelope;
+            let _native_execution = native_execution_context
+                .clone()
+                .map(crate::models::native_execution_services::install_native_execution_context);
             let slot = match Qwen3AsrBatchSlot::new(job, max_positions) {
                 Ok(slot) => slot,
                 Err(error) => {
@@ -1074,12 +1240,41 @@ impl Qwen3AsrOwnerThreadState {
             pending_refills.push(Qwen3AsrPendingRefillSlot {
                 slot_index,
                 slot,
+                native_execution_context,
                 reply,
             });
         }
         if pending_refills.is_empty() {
             return;
         }
+
+        let native_execution_context = match Self::shared_native_execution_context(
+            slots
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|active| &active.native_execution_context)
+                .chain(
+                    pending_refills
+                        .iter()
+                        .map(|pending| &pending.native_execution_context),
+                ),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                let reason = error.to_string();
+                for pending in pending_refills {
+                    let _ = pending
+                        .reply
+                        .send(Err(Qwen3AsrServeBatchError::OwnerFailed {
+                            reason: reason.clone(),
+                        }));
+                }
+                Self::fail_all_slots(slots, error);
+                return;
+            }
+        };
+        let _native_execution = native_execution_context
+            .map(crate::models::native_execution_services::install_native_execution_context);
 
         let mut prefill_entries = pending_refills
             .iter_mut()
@@ -1088,13 +1283,15 @@ impl Qwen3AsrOwnerThreadState {
                 slot: &mut pending.slot,
             })
             .collect::<Vec<_>>();
-        let prefill_errors = Self::prefill_and_select_slot_entries(decoder, &mut prefill_entries);
+        let prefill_errors =
+            Self::prefill_and_select_slot_entries(decoder, logits_runtime, &mut prefill_entries);
         drop(prefill_entries);
 
         for pending in pending_refills {
             let Qwen3AsrPendingRefillSlot {
                 slot_index,
                 slot,
+                native_execution_context,
                 reply,
             } = pending;
             if let Some((_, error)) = prefill_errors
@@ -1127,7 +1324,11 @@ impl Qwen3AsrOwnerThreadState {
                 }));
                 continue;
             }
-            slots[slot_index] = Some(Qwen3AsrActiveBatchSlot { slot, reply });
+            slots[slot_index] = Some(Qwen3AsrActiveBatchSlot {
+                slot,
+                native_execution_context,
+                reply,
+            });
             if trace_batches {
                 eprintln!("openasr qwen serve batch: refilled slot {slot_index}");
             }
@@ -1137,6 +1338,7 @@ impl Qwen3AsrOwnerThreadState {
     fn try_rebucket_active_slots(
         slots: &mut Vec<Option<Qwen3AsrActiveBatchSlot>>,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         max_positions: usize,
         receiver: &Receiver<Qwen3AsrServeBatchEnvelope>,
         deferred: &mut VecDeque<Qwen3AsrServeBatchEnvelope>,
@@ -1166,9 +1368,16 @@ impl Qwen3AsrOwnerThreadState {
                 break;
             }
 
-            let Qwen3AsrServeBatchEnvelope { job, reply } = envelope;
+            let Qwen3AsrServeBatchEnvelope {
+                job,
+                native_execution_context,
+                reply,
+            } = envelope;
+            let _native_execution = native_execution_context
+                .clone()
+                .map(crate::models::native_execution_services::install_native_execution_context);
             match Qwen3AsrBatchSlot::new(job, max_positions) {
-                Ok(slot) => pending.push((slot, reply)),
+                Ok(slot) => pending.push((slot, native_execution_context, reply)),
                 Err(error) => {
                     let _ = reply.send(Err(error));
                 }
@@ -1178,6 +1387,16 @@ impl Qwen3AsrOwnerThreadState {
             return Ok(());
         }
 
+        let native_execution_context = Self::shared_native_execution_context(
+            slots
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|active| &active.native_execution_context)
+                .chain(pending.iter().map(|(_, context, _)| context)),
+        )?;
+        let _native_execution = native_execution_context
+            .map(crate::models::native_execution_services::install_native_execution_context);
+
         let previous_width = slots.len();
         let target_active = active_count.checked_add(pending.len()).ok_or_else(|| {
             Qwen3AsrServeBatchError::OwnerFailed {
@@ -1186,9 +1405,10 @@ impl Qwen3AsrOwnerThreadState {
         })?;
         let mut bucket_width = serve_batch_bucket_width(target_active, max_batch);
         if bucket_width <= previous_width {
-            for (slot, reply) in pending.into_iter().rev() {
+            for (slot, native_execution_context, reply) in pending.into_iter().rev() {
                 deferred.push_front(Qwen3AsrServeBatchEnvelope {
                     job: slot.job,
+                    native_execution_context,
                     reply,
                 });
             }
@@ -1198,16 +1418,19 @@ impl Qwen3AsrOwnerThreadState {
         let mut prefill_entries = pending
             .iter_mut()
             .enumerate()
-            .map(|(pending_index, (slot, _))| Qwen3AsrPrefillSlotRef {
+            .map(|(pending_index, (slot, _, _))| Qwen3AsrPrefillSlotRef {
                 slot_index: previous_width + pending_index,
                 slot,
             })
             .collect::<Vec<_>>();
-        let prefill_errors = Self::prefill_and_select_slot_entries(decoder, &mut prefill_entries);
+        let prefill_errors =
+            Self::prefill_and_select_slot_entries(decoder, logits_runtime, &mut prefill_entries);
         drop(prefill_entries);
 
         let mut admitted = Vec::new();
-        for (pending_index, (slot, reply)) in pending.into_iter().enumerate() {
+        for (pending_index, (slot, native_execution_context, reply)) in
+            pending.into_iter().enumerate()
+        {
             let slot_index = previous_width + pending_index;
             if let Some((_, error)) = prefill_errors
                 .iter()
@@ -1222,7 +1445,11 @@ impl Qwen3AsrOwnerThreadState {
                 let _ = reply.send(slot.finish());
                 continue;
             }
-            admitted.push(Qwen3AsrActiveBatchSlot { slot, reply });
+            admitted.push(Qwen3AsrActiveBatchSlot {
+                slot,
+                native_execution_context,
+                reply,
+            });
         }
         if admitted.is_empty() {
             return Ok(());
@@ -1232,6 +1459,7 @@ impl Qwen3AsrOwnerThreadState {
             for active in admitted.into_iter().rev() {
                 deferred.push_front(Qwen3AsrServeBatchEnvelope {
                     job: active.slot.job,
+                    native_execution_context: active.native_execution_context,
                     reply: active.reply,
                 });
             }
@@ -1248,56 +1476,6 @@ impl Qwen3AsrOwnerThreadState {
         if trace_batches {
             eprintln!(
                 "openasr qwen serve batch: rebucketed {previous_width}->{bucket_width} slot(s)"
-            );
-        }
-        Ok(())
-    }
-
-    fn try_expand_max_positions_for_next_candidate(
-        slots: &mut [Option<Qwen3AsrActiveBatchSlot>],
-        decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
-        max_positions: &mut usize,
-        receiver: &Receiver<Qwen3AsrServeBatchEnvelope>,
-        deferred: &mut VecDeque<Qwen3AsrServeBatchEnvelope>,
-        max_batch: usize,
-        trace_batches: bool,
-    ) -> Result<(), Qwen3AsrServeBatchError> {
-        let active_count = slots.iter().filter(|slot| slot.is_some()).count();
-        if active_count == 0 {
-            return Ok(());
-        }
-        let Some(envelope) = Self::pop_refill_candidate(deferred, receiver) else {
-            return Ok(());
-        };
-        let required_positions =
-            match Qwen3AsrBatchSlot::required_max_positions_for_job(&envelope.job) {
-                Ok(required_positions) => required_positions,
-                Err(error) => {
-                    let _ = envelope.reply.send(Err(error));
-                    return Ok(());
-                }
-            };
-        deferred.push_front(envelope);
-        if required_positions <= *max_positions {
-            return Ok(());
-        }
-
-        let has_free_slot = active_count < slots.len();
-        let can_grow_width = active_count == slots.len() && slots.len() < max_batch;
-        if !has_free_slot && !can_grow_width {
-            return Ok(());
-        }
-
-        let previous_max_positions = *max_positions;
-        for active in slots.iter_mut().filter_map(Option::as_mut) {
-            active.slot.ensure_generated_host_kv_replayed(decoder)?;
-            active.slot.resize_max_positions(required_positions)?;
-        }
-        *max_positions = required_positions;
-        Self::reseed_rebucketed_slots(slots, decoder, *max_positions)?;
-        if trace_batches {
-            eprintln!(
-                "openasr qwen serve batch: expanded span {previous_max_positions}->{required_positions}"
             );
         }
         Ok(())
@@ -1343,7 +1521,11 @@ impl Qwen3AsrOwnerThreadState {
             .map(|(slot_index, slot)| {
                 slot.as_ref()
                     .map(|active| active.slot.layer_kv_caches.as_slice())
-                    .or_else(|| dummy_seed_layers[slot_index].as_deref())
+                    .or_else(|| {
+                        dummy_seed_layers[slot_index]
+                            .as_ref()
+                            .map(|owner| owner.as_slice())
+                    })
                     .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
                         reason: "qwen serve batch cannot seed an empty rebucketed slot".to_string(),
                     })
@@ -1376,7 +1558,11 @@ impl Qwen3AsrOwnerThreadState {
         let Some(active) = slots[slot_index].take() else {
             return;
         };
-        let Qwen3AsrActiveBatchSlot { slot, reply } = active;
+        let Qwen3AsrActiveBatchSlot {
+            slot,
+            native_execution_context: _,
+            reply,
+        } = active;
         Self::send_result_after_optional_zero(
             reply,
             decoder,
@@ -1443,24 +1629,50 @@ impl Qwen3AsrOwnerThreadState {
     fn decoder_for(
         &mut self,
         slot: &Qwen3AsrBatchSlot,
-    ) -> Result<&mut Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrServeBatchError> {
-        if self.decoder.is_none() {
-            self.decoder = Some(
-                Qwen3AsrLlmWholeDecoderGraphExecutor::new(
-                    slot.job.layer_attention_projections.as_slice(),
-                    Some(&slot.job.runtime_source),
-                    slot.job.backend,
-                )
+    ) -> Result<
+        (
+            &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+            &mut Qwen3AsrLlmLogitsHeadRuntime,
+        ),
+        Qwen3AsrServeBatchError,
+    > {
+        if self.decoder.is_none() && self.logits_runtime.is_none() {
+            let prepared_runtime = slot.job.prepared_runtime()?;
+            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan(
+                prepared_runtime.decoder_plan.as_ref(),
+                &slot.job.runtime_source,
+                slot.job.backend,
+            )
+            .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
+                reason: format!("qwen whole-decoder init failed: {error}"),
+            })?;
+            let logits_runtime = prepared_runtime
+                .logits_head
+                .new_runtime(slot.job.backend)
                 .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
-                    reason: format!("qwen whole-decoder init failed: {error}"),
-                })?,
-            );
+                    reason: format!("qwen logits-head runtime init failed: {error}"),
+                })?;
+            self.decoder = Some(decoder);
+            self.logits_runtime = Some(logits_runtime);
+        } else if self.decoder.is_none() || self.logits_runtime.is_none() {
+            return Err(Qwen3AsrServeBatchError::OwnerFailed {
+                reason: "qwen serve batch decoder/logits runtime cache is inconsistent".to_string(),
+            });
         }
-        self.decoder
-            .as_mut()
-            .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
-                reason: "qwen serve batch decoder cache is unexpectedly empty".to_string(),
-            })
+        let decoder =
+            self.decoder
+                .as_mut()
+                .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
+                    reason: "qwen serve batch decoder cache is unexpectedly empty".to_string(),
+                })?;
+        let logits_runtime =
+            self.logits_runtime
+                .as_mut()
+                .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
+                    reason: "qwen serve batch logits runtime cache is unexpectedly empty"
+                        .to_string(),
+                })?;
+        Ok((decoder, logits_runtime))
     }
 }
 
@@ -1468,13 +1680,21 @@ impl Qwen3AsrBatchSlot {
     fn required_max_positions_for_job(
         job: &Qwen3AsrServeBatchJob,
     ) -> Result<usize, Qwen3AsrServeBatchError> {
-        job.decode_config
-            .initial_prompt_tokens
-            .len()
-            .checked_add(job.decode_config.max_generated_tokens)
-            .ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
-                reason: "qwen serve batch max-position calculation overflowed".to_string(),
-            })
+        let measured = crate::capacity::topology::causal_prefix_positions_with_context_cap(
+            super::capacity::QWEN3_SELF_KV_STATE_ID,
+            job.decode_config.initial_prompt_tokens.len(),
+            job.decode_config.max_generated_tokens,
+            job.metadata.llm_max_positions,
+        )
+        .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
+            reason: format!("qwen serve batch max-position calculation failed: {error}"),
+        })?;
+        job.kv_capacity
+            .validate_measured_logical_positions(measured)
+            .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
+                reason: error.to_string(),
+            })?;
+        Ok(measured)
     }
 
     fn new(
@@ -1492,6 +1712,12 @@ impl Qwen3AsrBatchSlot {
             });
         }
         let required_positions = Self::required_max_positions_for_job(&job)?;
+        if max_positions != job.kv_capacity.resident_positions() {
+            return Err(Qwen3AsrServeBatchError::DecodeFailed {
+                reason: "qwen serve batch resident span does not match the job's stable reserve"
+                    .to_string(),
+            });
+        }
         if max_positions < required_positions {
             return Err(Qwen3AsrServeBatchError::DecodeFailed {
                 reason: "qwen serve batch shared max-position span is smaller than this slot"
@@ -1507,19 +1733,16 @@ impl Qwen3AsrBatchSlot {
             resolve_qwen_family_production_kv_cache_policy(job.backend, job.metadata.llm_head_dim)
                 .to_spec()
                 .host;
-        let layer_kv_caches = (0..job.metadata.llm_layers)
-            .map(|_| {
-                Qwen3AsrLayerKvCacheState::new_with_element_type(
-                    max_positions,
-                    job.metadata.llm_kv_heads,
-                    job.metadata.llm_head_dim,
-                    host,
-                )
-                .unwrap_or_else(|reason| {
-                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                })
-            })
-            .collect();
+        let layer_kv_caches = Qwen3AsrHostKvCacheOwner::try_new(
+            "qwen3-asr.serve-batch.slot.self-kv.host",
+            job.metadata.llm_layers,
+            job.kv_capacity,
+            job.metadata.llm_kv_heads,
+            job.metadata.llm_head_dim,
+            host,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
         let stop_token_ids = build_seq2seq_greedy_stop_token_ids(&job.decode_config);
         Ok(Self {
             job,
@@ -1541,8 +1764,8 @@ impl Qwen3AsrBatchSlot {
     fn zero_seed_layer_kv_caches(
         metadata: Qwen3AsrExecutionMetadata,
         backend: GgmlCpuGraphBackend,
-        max_positions: usize,
-    ) -> Result<Vec<Qwen3AsrLayerKvCacheState>, Qwen3AsrServeBatchError> {
+        resident_positions: usize,
+    ) -> Result<Qwen3AsrHostKvCacheOwner, Qwen3AsrServeBatchError> {
         if metadata.llm_layers == 0 {
             return Err(Qwen3AsrServeBatchError::DecodeFailed {
                 reason: "qwen serve batch dummy seed requires at least one llm layer".to_string(),
@@ -1558,44 +1781,39 @@ impl Qwen3AsrBatchSlot {
         let host = resolve_qwen_family_production_kv_cache_policy(backend, metadata.llm_head_dim)
             .to_spec()
             .host;
-        let mut layers = Vec::with_capacity(metadata.llm_layers);
-        for _ in 0..metadata.llm_layers {
-            let mut cache = Qwen3AsrLayerKvCacheState::new_with_element_type(
-                max_positions,
-                metadata.llm_kv_heads,
-                metadata.llm_head_dim,
-                host,
-            )
-            .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
+        if resident_positions == 0 {
+            return Err(Qwen3AsrServeBatchError::DecodeFailed {
+                reason: "qwen serve batch dummy seed requires a positive resident span".to_string(),
+            });
+        }
+        // Inactive slots seed one admitted zero row, not the resident span.
+        let capacity = Qwen3AsrKvCacheCapacity::new(1, resident_positions).map_err(|error| {
+            Qwen3AsrServeBatchError::DecodeFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let mut layers = Qwen3AsrHostKvCacheOwner::try_new(
+            "qwen3-asr.serve-batch.dummy-seed.self-kv.host",
+            metadata.llm_layers,
+            capacity,
+            metadata.llm_kv_heads,
+            metadata.llm_head_dim,
+            host,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
+        for cache in layers.iter_mut() {
             cache
                 .write(0, &zero_row, &zero_row)
                 .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
-            layers.push(cache);
         }
         Ok(layers)
-    }
-
-    fn resize_max_positions(
-        &mut self,
-        max_positions: usize,
-    ) -> Result<(), Qwen3AsrServeBatchError> {
-        let required_positions = Self::required_max_positions_for_job(&self.job)?;
-        if max_positions < required_positions {
-            return Err(Qwen3AsrServeBatchError::DecodeFailed {
-                reason: "qwen serve batch resize span is smaller than this slot".to_string(),
-            });
-        }
-        for cache in &mut self.layer_kv_caches {
-            cache
-                .resize_max_positions(max_positions)
-                .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
-        }
-        Ok(())
     }
 
     fn run_prefill(
         &mut self,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
     ) -> Result<(), Qwen3AsrServeBatchError> {
         let token_count = self.job.llm_prefill_input.token_count;
         if token_count == 0 {
@@ -1609,14 +1827,15 @@ impl Qwen3AsrBatchSlot {
             });
         }
         let Some(chunk_size) = decoder.safe_multi_query_prefill_chunk_size_for(token_count) else {
-            return self.run_prefill_serial(decoder);
+            return self.run_prefill_serial(decoder, logits_runtime);
         };
-        self.run_prefill_chunked(decoder, chunk_size)
+        self.run_prefill_chunked(decoder, logits_runtime, chunk_size)
     }
 
     fn run_prefill_chunked(
         &mut self,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         chunk_size: usize,
     ) -> Result<(), Qwen3AsrServeBatchError> {
         if chunk_size == 0 {
@@ -1633,7 +1852,7 @@ impl Qwen3AsrBatchSlot {
                     QWEN_ROPE_THETA,
                 )
                 .map_err(map_serve_batch_graph_error)?;
-            return self.write_prefill_step_outputs(token_count, step);
+            return self.write_prefill_step_outputs(token_count, step, logits_runtime);
         }
         let hidden_size = self.job.llm_prefill_input.hidden_size;
         let require_even_chunks = decoder.prefill_chunks_require_even_width();
@@ -1683,14 +1902,12 @@ impl Qwen3AsrBatchSlot {
             position_offset = total_token_count;
         }
         self.cache_prompt_tokens = token_count;
-        let logits = self
-            .job
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden.ok_or_else(|| {
-                Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: "qwen serve batch prefill produced no hidden state".to_string(),
-                }
-            })?)
+        let final_hidden = final_hidden.ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
+            reason: "qwen serve batch prefill produced no hidden state".to_string(),
+        })?;
+        let prepared_runtime = self.job.prepared_runtime()?;
+        let logits = logits_runtime
+            .compute_logits_for_last_hidden(prepared_runtime.logits_head, &final_hidden)
             .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
                 reason: error.to_string(),
             })?;
@@ -1701,6 +1918,7 @@ impl Qwen3AsrBatchSlot {
     fn run_prefill_serial(
         &mut self,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
     ) -> Result<(), Qwen3AsrServeBatchError> {
         let token_count = self.job.llm_prefill_input.token_count;
         let mut final_hidden = None;
@@ -1725,14 +1943,12 @@ impl Qwen3AsrBatchSlot {
             final_hidden = Some(step.hidden);
         }
         self.cache_prompt_tokens = token_count;
-        let logits = self
-            .job
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden.ok_or_else(|| {
-                Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: "qwen serve batch prefill produced no hidden state".to_string(),
-                }
-            })?)
+        let final_hidden = final_hidden.ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
+            reason: "qwen serve batch prefill produced no hidden state".to_string(),
+        })?;
+        let prepared_runtime = self.job.prepared_runtime()?;
+        let logits = logits_runtime
+            .compute_logits_for_last_hidden(prepared_runtime.logits_head, &final_hidden)
             .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
                 reason: error.to_string(),
             })?;
@@ -1744,13 +1960,13 @@ impl Qwen3AsrBatchSlot {
         &mut self,
         token_count: usize,
         step: super::llm_transformer::Qwen3AsrLlmWholeStepOutput,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
     ) -> Result<(), Qwen3AsrServeBatchError> {
         let final_hidden = self.write_prefill_chunk_outputs(0, token_count, step)?;
         self.cache_prompt_tokens = token_count;
-        let logits = self
-            .job
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden)
+        let prepared_runtime = self.job.prepared_runtime()?;
+        let logits = logits_runtime
+            .compute_logits_for_last_hidden(prepared_runtime.logits_head, &final_hidden)
             .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
                 reason: error.to_string(),
             })?;
@@ -1897,8 +2113,9 @@ impl Qwen3AsrBatchSlot {
     fn run_prefill_and_select(
         &mut self,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
     ) -> Result<(), Qwen3AsrServeBatchError> {
-        self.run_prefill(decoder)?;
+        self.run_prefill(decoder, logits_runtime)?;
         let logits =
             self.prefill_logits
                 .take()
@@ -1918,6 +2135,7 @@ impl Qwen3AsrBatchSlot {
                         .to_string(),
                 })?;
         self.job
+            .prepared_runtime()?
             .token_embedding_table
             .gather_rows(&[last_token])
             .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
@@ -1954,6 +2172,7 @@ impl Qwen3AsrBatchSlot {
             })?;
             let hidden = self
                 .job
+                .prepared_runtime()?
                 .token_embedding_table
                 .gather_rows(&[token_id])
                 .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
@@ -1990,7 +2209,7 @@ impl Qwen3AsrBatchSlot {
 
     fn host_kv_written_prefix(&self) -> Result<usize, Qwen3AsrServeBatchError> {
         let mut prefix = None;
-        for cache in &self.layer_kv_caches {
+        for cache in self.layer_kv_caches.iter() {
             let history = cache.full_history_storage().map_err(|reason| {
                 Qwen3AsrServeBatchError::DecodeFailed {
                     reason: format!("qwen serve batch host KV replay cache invalid: {reason}"),
@@ -2119,7 +2338,7 @@ impl Qwen3AsrBatchSlot {
     }
 
     fn decode_text_token_ids(&self, token_ids: &[u32]) -> Result<String, Qwen3AsrServeBatchError> {
-        if let Some(tokenizer) = self.job.tokenizer.as_ref() {
+        if let Some(tokenizer) = self.job.prepared_runtime()?.tokenizer.as_ref() {
             return tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
                 Qwen3AsrServeBatchError::DecodeFailed {
                     reason: error.to_string(),
@@ -2182,12 +2401,8 @@ mod tests {
             None
         );
     }
-    /// Structural proof that `Qwen3AsrServeBatchJob::execution_context` is
-    /// required, not optional: this only compiles because the field's type
-    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
-    /// purely so `cargo check`/`clippy` re-verify the contract on every
-    /// build -- this is exactly the shape Qwen converged *to* (it used to be
-    /// `control: Option<Arc<TranscriptionControl>>`).
+    /// Structural proof that the job carries the cancellation context across
+    /// the owner-thread boundary. Host-KV memory is owned by the slot itself.
     #[allow(dead_code)]
     fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
 
@@ -2207,6 +2422,7 @@ mod tests {
         metadata: Qwen3AsrExecutionMetadata,
         token_embedding_table: Qwen3AsrTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
+        decoder_plan: Arc<QwenWholeDecoderPlan>,
         layer_attention_projections: Arc<Vec<Qwen3AsrLlmLayerAttentionProjection>>,
         prompt_tokens: Vec<u32>,
     }
@@ -2271,6 +2487,10 @@ mod tests {
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen logits head");
+        let decoder_plan = Arc::new(
+            QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata)
+                .expect("qwen whole-decoder plan"),
+        );
         let layer_attention_projections = Arc::new(
             load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
                 .expect("qwen llm layers"),
@@ -2296,6 +2516,7 @@ mod tests {
             metadata,
             token_embedding_table,
             logits_head,
+            decoder_plan,
             layer_attention_projections,
             prompt_tokens,
         }
@@ -2409,8 +2630,26 @@ mod tests {
         fixture: &Qwen3AsrServeBatchFixture,
         max_generated_tokens: usize,
     ) -> Qwen3AsrServeBatchJob {
+        let logical_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            max_generated_tokens,
+        )
+        .expect("fixture decode schedule");
+        qwen_fixture_job_with_resident(fixture, max_generated_tokens, logical_positions)
+    }
+
+    fn qwen_fixture_job_with_resident(
+        fixture: &Qwen3AsrServeBatchFixture,
+        max_generated_tokens: usize,
+        resident_positions: usize,
+    ) -> Qwen3AsrServeBatchJob {
         let runtime_source = crate::validate_ggml_runtime_source_path(&fixture.runtime_path)
             .expect("valid runtime source path");
+        let logical_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            max_generated_tokens,
+        )
+        .expect("fixture decode schedule");
         Qwen3AsrServeBatchJob {
             runtime_cache_path: fixture.runtime_path.clone(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
@@ -2422,14 +2661,18 @@ mod tests {
             runtime_source,
             backend: GgmlCpuGraphConfig::runtime_default().backend,
             metadata: fixture.metadata,
-            tokenizer: None,
-            token_embedding_table: fixture.token_embedding_table.clone(),
-            logits_head: fixture.logits_head.clone(),
-            layer_attention_projections: Arc::clone(&fixture.layer_attention_projections),
+            prepared_assets: Qwen3AsrServeBatchPreparedAssets::Fixture {
+                tokenizer: None,
+                token_embedding_table: Arc::new(fixture.token_embedding_table.clone()),
+                logits_head: Arc::new(fixture.logits_head.clone()),
+                decoder_plan: Arc::clone(&fixture.decoder_plan),
+            },
             llm_prefill_input: qwen_real_pack_prefill_input(
                 &fixture.token_embedding_table,
                 &fixture.prompt_tokens,
             ),
+            kv_capacity: Qwen3AsrKvCacheCapacity::new(logical_positions, resident_positions)
+                .expect("fixture KV capacity"),
             decode_config: Seq2SeqGreedyDecodeConfig {
                 initial_prompt_tokens: fixture.prompt_tokens.clone(),
                 eot_token_id: u32::MAX,
@@ -2458,7 +2701,34 @@ mod tests {
     ) {
         let job = qwen_fixture_job(fixture, max_generated_tokens);
         let (reply, reply_rx) = mpsc::channel();
-        (Qwen3AsrServeBatchEnvelope { job, reply }, reply_rx)
+        (
+            Qwen3AsrServeBatchEnvelope {
+                job,
+                native_execution_context: None,
+                reply,
+            },
+            reply_rx,
+        )
+    }
+
+    fn qwen_fixture_envelope_with_resident(
+        fixture: &Qwen3AsrServeBatchFixture,
+        max_generated_tokens: usize,
+        resident_positions: usize,
+    ) -> (
+        Qwen3AsrServeBatchEnvelope,
+        mpsc::Receiver<Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError>>,
+    ) {
+        let job = qwen_fixture_job_with_resident(fixture, max_generated_tokens, resident_positions);
+        let (reply, reply_rx) = mpsc::channel();
+        (
+            Qwen3AsrServeBatchEnvelope {
+                job,
+                native_execution_context: None,
+                reply,
+            },
+            reply_rx,
+        )
     }
 
     fn assert_qwen_selected_backend_direct_for_real_pack_harness() {
@@ -2482,45 +2752,83 @@ mod tests {
     fn qwen_prefilled_active_slot(
         fixture: &Qwen3AsrServeBatchFixture,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         max_positions: usize,
     ) -> Qwen3AsrActiveBatchSlot {
-        qwen_prefilled_active_slot_with_token_cap(fixture, decoder, max_positions, 4)
+        qwen_prefilled_active_slot_with_token_cap(
+            fixture,
+            decoder,
+            logits_runtime,
+            max_positions,
+            4,
+        )
     }
 
     fn qwen_prefilled_active_slot_with_token_cap(
         fixture: &Qwen3AsrServeBatchFixture,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
         max_positions: usize,
         max_generated_tokens: usize,
     ) -> Qwen3AsrActiveBatchSlot {
-        let mut slot = Qwen3AsrBatchSlot::new(
-            qwen_fixture_job(fixture, max_generated_tokens),
+        qwen_prefilled_active_slot_with_token_cap_and_resident(
+            fixture,
+            decoder,
+            logits_runtime,
+            max_generated_tokens,
             max_positions,
         )
+    }
+
+    fn qwen_prefilled_active_slot_with_token_cap_and_resident(
+        fixture: &Qwen3AsrServeBatchFixture,
+        decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+        logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
+        max_generated_tokens: usize,
+        resident_positions: usize,
+    ) -> Qwen3AsrActiveBatchSlot {
+        let mut slot = Qwen3AsrBatchSlot::new(
+            qwen_fixture_job_with_resident(fixture, max_generated_tokens, resident_positions),
+            resident_positions,
+        )
         .expect("qwen slot");
-        slot.run_prefill_and_select(decoder)
+        slot.run_prefill_and_select(decoder, logits_runtime)
             .expect("qwen slot prefill");
         let (reply, _reply_rx) = mpsc::channel();
-        Qwen3AsrActiveBatchSlot { slot, reply }
+        Qwen3AsrActiveBatchSlot {
+            slot,
+            native_execution_context: None,
+            reply,
+        }
     }
 
     fn assert_qwen_rebucket_migration(fixture: &Qwen3AsrServeBatchFixture) {
-        let max_positions = fixture.prompt_tokens.len() + 4;
+        let max_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            4,
+        )
+        .expect("fixture decode schedule");
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
+        let mut logits_runtime = fixture
+            .logits_head
+            .new_runtime(GgmlCpuGraphConfig::runtime_default().backend)
+            .expect("qwen logits runtime");
         let mut slots = vec![
             Some(qwen_prefilled_active_slot(
                 fixture,
                 &mut decoder,
+                &mut logits_runtime,
                 max_positions,
             )),
             Some(qwen_prefilled_active_slot(
                 fixture,
                 &mut decoder,
+                &mut logits_runtime,
                 max_positions,
             )),
         ];
@@ -2528,15 +2836,19 @@ mod tests {
             .expect("initial qwen seed");
         assert_eq!(decoder.reused_batch_width_for_test(), Some(2));
 
-        let (queued_fast_a, _queued_fast_a_rx) = qwen_fixture_envelope(fixture, 1);
-        let (queued_fast_b, _queued_fast_b_rx) = qwen_fixture_envelope(fixture, 1);
+        // Rebucket exercises migration of live slots. A one-token budget is
+        // already complete after prefill selects its first token, so use the
+        // resident four-token budget to keep both refill slots active.
+        let (queued_live_a, _queued_live_a_rx) = qwen_fixture_envelope(fixture, 4);
+        let (queued_live_b, _queued_live_b_rx) = qwen_fixture_envelope(fixture, 4);
         let (queued_tx, queued_rx) = mpsc::sync_channel(2);
-        queued_tx.send(queued_fast_a).expect("queue qwen refill a");
-        queued_tx.send(queued_fast_b).expect("queue qwen refill b");
+        queued_tx.send(queued_live_a).expect("queue qwen refill a");
+        queued_tx.send(queued_live_b).expect("queue qwen refill b");
         let mut deferred = VecDeque::new();
         Qwen3AsrOwnerThreadState::try_rebucket_active_slots(
             &mut slots,
             &mut decoder,
+            &mut logits_runtime,
             max_positions,
             &queued_rx,
             &mut deferred,
@@ -2565,27 +2877,38 @@ mod tests {
     }
 
     fn assert_qwen_tail_shrink_migration(fixture: &Qwen3AsrServeBatchFixture) {
-        let max_positions = fixture.prompt_tokens.len() + 4;
+        let max_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            4,
+        )
+        .expect("fixture decode schedule");
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
+        let mut logits_runtime = fixture
+            .logits_head
+            .new_runtime(GgmlCpuGraphConfig::runtime_default().backend)
+            .expect("qwen logits runtime");
         let mut slots = vec![
             Some(qwen_prefilled_active_slot(
                 fixture,
                 &mut decoder,
+                &mut logits_runtime,
                 max_positions,
             )),
             Some(qwen_prefilled_active_slot(
                 fixture,
                 &mut decoder,
+                &mut logits_runtime,
                 max_positions,
             )),
             Some(qwen_prefilled_active_slot(
                 fixture,
                 &mut decoder,
+                &mut logits_runtime,
                 max_positions,
             )),
             None,
@@ -2609,86 +2932,111 @@ mod tests {
         assert_eq!(decoder.reused_batch_width_for_test(), Some(1));
     }
 
-    fn assert_qwen_span_expansion_migration(fixture: &Qwen3AsrServeBatchFixture) {
-        let initial_max_positions = fixture.prompt_tokens.len() + 2;
-        let expanded_max_positions = fixture.prompt_tokens.len() + 4;
-        let mut max_positions = initial_max_positions;
+    fn assert_qwen_stable_resident_span_accepts_distinct_logical_spans(
+        fixture: &Qwen3AsrServeBatchFixture,
+    ) {
+        let short_logical_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            2,
+        )
+        .expect("fixture decode schedule");
+        let resident_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            4,
+        )
+        .expect("fixture decode schedule");
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
+        let mut logits_runtime = fixture
+            .logits_head
+            .new_runtime(GgmlCpuGraphConfig::runtime_default().backend)
+            .expect("qwen logits runtime");
         let mut slots = vec![
             Some(qwen_prefilled_active_slot_with_token_cap(
                 fixture,
                 &mut decoder,
-                max_positions,
+                &mut logits_runtime,
+                resident_positions,
                 2,
             )),
             Some(qwen_prefilled_active_slot_with_token_cap(
                 fixture,
                 &mut decoder,
-                max_positions,
+                &mut logits_runtime,
+                resident_positions,
                 2,
             )),
         ];
-        Qwen3AsrOwnerThreadState::reseed_rebucketed_slots(&mut slots, &mut decoder, max_positions)
-            .expect("initial qwen seed");
-        assert_eq!(decoder.reused_batch_width_for_test(), Some(2));
-
-        let (queued_long_a, _queued_long_a_rx) = qwen_fixture_envelope(fixture, 4);
-        let (queued_long_b, _queued_long_b_rx) = qwen_fixture_envelope(fixture, 4);
-        let (queued_tx, queued_rx) = mpsc::sync_channel(2);
-        queued_tx.send(queued_long_a).expect("queue long qwen a");
-        queued_tx.send(queued_long_b).expect("queue long qwen b");
-        let mut deferred = VecDeque::new();
-        Qwen3AsrOwnerThreadState::try_expand_max_positions_for_next_candidate(
+        Qwen3AsrOwnerThreadState::reseed_rebucketed_slots(
             &mut slots,
             &mut decoder,
-            &mut max_positions,
-            &queued_rx,
-            &mut deferred,
-            4,
-            false,
+            resident_positions,
         )
-        .expect("qwen span expansion");
-        assert_eq!(max_positions, expanded_max_positions);
+        .expect("initial qwen seed");
         assert_eq!(decoder.reused_batch_width_for_test(), Some(2));
         for active in slots.iter().flatten() {
             assert_eq!(
                 active.slot.layer_kv_caches[0].max_positions(),
-                expanded_max_positions
+                short_logical_positions
             );
         }
 
+        let (queued_long_a, _queued_long_a_rx) =
+            qwen_fixture_envelope_with_resident(fixture, 4, resident_positions);
+        let (queued_long_b, _queued_long_b_rx) =
+            qwen_fixture_envelope_with_resident(fixture, 4, resident_positions);
+        let (queued_tx, queued_rx) = mpsc::sync_channel(2);
+        queued_tx.send(queued_long_a).expect("queue long qwen a");
+        queued_tx.send(queued_long_b).expect("queue long qwen b");
+        let mut deferred = VecDeque::new();
         Qwen3AsrOwnerThreadState::try_rebucket_active_slots(
             &mut slots,
             &mut decoder,
-            max_positions,
+            &mut logits_runtime,
+            resident_positions,
             &queued_rx,
             &mut deferred,
             4,
             false,
         )
-        .expect("qwen rebucket after span expansion");
+        .expect("qwen rebucket within stable resident span");
         assert!(deferred.is_empty());
         assert_eq!(slots.len(), 4);
         assert_eq!(slots.iter().filter(|slot| slot.is_some()).count(), 4);
         assert_eq!(decoder.reused_batch_width_for_test(), Some(4));
+        assert_eq!(
+            slots[0].as_ref().expect("short slot").slot.layer_kv_caches[0].max_positions(),
+            short_logical_positions
+        );
+        assert_eq!(
+            slots[2].as_ref().expect("long slot").slot.layer_kv_caches[0].max_positions(),
+            resident_positions
+        );
     }
 
     fn assert_qwen_generated_host_kv_replay(fixture: &Qwen3AsrServeBatchFixture) {
-        let max_positions = fixture.prompt_tokens.len() + 4;
+        let max_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            fixture.prompt_tokens.len(),
+            4,
+        )
+        .expect("fixture decode schedule");
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
+        let mut logits_runtime = fixture
+            .logits_head
+            .new_runtime(GgmlCpuGraphConfig::runtime_default().backend)
+            .expect("qwen logits runtime");
         let mut slot =
             Qwen3AsrBatchSlot::new(qwen_fixture_job(fixture, 4), max_positions).expect("qwen slot");
-        slot.run_prefill_and_select(&mut decoder)
+        slot.run_prefill_and_select(&mut decoder, &mut logits_runtime)
             .expect("qwen slot prefill");
         assert_eq!(
             slot.host_kv_written_prefix().expect("written prefix"),
@@ -2704,7 +3052,11 @@ mod tests {
             .expect("qwen generated host KV replay");
         assert_eq!(
             slot.host_kv_written_prefix().expect("written prefix"),
-            fixture.prompt_tokens.len() + 1
+            crate::capacity::decode_schedule::greedy_self_kv_positions(
+                fixture.prompt_tokens.len(),
+                2,
+            )
+            .expect("fixture decode schedule")
         );
     }
 
@@ -2717,7 +3069,7 @@ mod tests {
         )
         .expect("dummy seed");
         assert_eq!(layers.len(), 2);
-        for layer in layers {
+        for layer in layers.iter() {
             let snapshot = layer.snapshot_written().expect("snapshot");
             assert_eq!(snapshot.written_positions, 1);
             assert_eq!(snapshot.key_width, 4);
@@ -2798,10 +3150,10 @@ mod tests {
     }
 
     #[test]
-    fn qwen_owner_thread_expands_span_before_rebucket_tiny_cpu_batch() {
+    fn qwen_owner_thread_keeps_stable_span_across_logical_lengths_tiny_cpu_batch() {
         with_qwen_direct_cpu_backend_for_test(|| {
             let (_temp, fixture) = write_qwen_tiny_serve_batch_fixture();
-            assert_qwen_span_expansion_migration(&fixture);
+            assert_qwen_stable_resident_span_accepts_distinct_logical_spans(&fixture);
         });
     }
 
@@ -2831,10 +3183,10 @@ mod tests {
 
     #[test]
     #[ignore = "manual real-pack backend harness: set OPENASR_QWEN_SERVE_BATCH_REAL_PACK and OPENASR_GGML_BACKEND=hip or vulkan"]
-    fn qwen_owner_thread_expands_span_real_pack_selected_backend_batch() {
+    fn qwen_owner_thread_keeps_stable_span_real_pack_selected_backend_batch() {
         assert_qwen_selected_backend_direct_for_real_pack_harness();
         let fixture = load_qwen_serve_batch_real_pack_fixture();
-        assert_qwen_span_expansion_migration(&fixture);
+        assert_qwen_stable_resident_span_accepts_distinct_logical_spans(&fixture);
     }
 
     #[test]

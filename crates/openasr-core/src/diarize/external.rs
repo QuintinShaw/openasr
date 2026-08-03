@@ -19,12 +19,13 @@ use super::contract::{
 use super::embed::{EmbedError, SpeakerEmbedder};
 use super::pipeline::Diarization;
 use super::segment::{
-    ActivityFrameClock, LocalActivity, LocalActivityWindow, PreparedSelectedSegmenter,
-    SegmentError, SegmenterProvider, SegmenterRuntimeInput, SegmenterWorkingSetGeometry,
-    SelectedSegmenter, segmenter_working_set_geometry,
+    ActivityFrameClock, LocalActivity, LocalActivityWindow, PolicyResolvedSegmenterRuntime,
+    PreparedSelectedSegmenter, SegmentError, SegmenterProvider, SegmenterWorkingSetGeometry,
+    segmenter_working_set_geometry,
 };
+use crate::NativeExecutionServices;
 use crate::config::VoiceIdSegmenterPreference;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, RequestBackendPreference};
+use crate::device::execution_policy::ExecutionIntent;
 
 const SAMPLE_RATE_HZ: u32 = 16_000;
 const EMBEDDING_WINDOW_S: f64 = 1.5;
@@ -321,8 +322,6 @@ pub enum ExternalDiarizationError {
     UnsupportedSampleRate(u32),
     #[error("external Voice ID was canceled")]
     Canceled,
-    #[error("external Voice ID execution route could not be resolved: {0}")]
-    ExecutionRoute(#[from] crate::device::execution_route::ExecutionRouteError),
 }
 
 /// Lightweight request plan. It pins the selected provider, pack mappings,
@@ -335,23 +334,9 @@ pub(crate) struct PreparedExternalDiarizer {
 impl PreparedExternalDiarizer {
     pub(crate) fn prepare(
         preference: VoiceIdSegmenterPreference,
-        backend_preference: Option<RequestBackendPreference>,
     ) -> Result<Self, ExternalDiarizationError> {
-        let runtime_input = SegmenterRuntimeInput::resolve(backend_preference)?;
-        let segmenter = super::segment::prepare_segmenter(preference, runtime_input)?;
+        let segmenter = super::segment::prepare_segmenter(preference)?;
         Ok(Self { segmenter })
-    }
-
-    pub(crate) fn segmenter_admission_bytes(&self) -> u64 {
-        self.segmenter.admission_bytes()
-    }
-
-    pub(crate) fn segmenter_admission_backend(&self) -> GgmlCpuGraphBackend {
-        self.segmenter.admission_backend()
-    }
-
-    pub(crate) fn segmenter_discrete_vram_budget_bytes(&self) -> Option<u64> {
-        self.segmenter.discrete_vram_budget_bytes()
     }
 
     pub(crate) fn working_set_admission_bytes(
@@ -369,14 +354,20 @@ impl PreparedExternalDiarizer {
 
     #[cfg(test)]
     pub(crate) fn segmenter_content_id(&self) -> &str {
-        self.segmenter.content_id()
+        &self.segmenter.content_id
     }
 
     pub(crate) fn materialize(
         self,
+        execution_services: Arc<NativeExecutionServices>,
+        execution_intent: ExecutionIntent,
         embedder: Arc<dyn SpeakerEmbedder>,
     ) -> Result<ExternalDiarizer, ExternalDiarizationError> {
-        let segmenter = self.segmenter.materialize()?;
+        let segmenter = PolicyResolvedSegmenterRuntime::load_prepared(
+            execution_services,
+            execution_intent,
+            self.segmenter,
+        )?;
         let vad = super::vad::FireRedStreamVadProvider::shared()
             .ok_or(ExternalDiarizationError::VadUnavailable)?;
         Ok(ExternalDiarizer {
@@ -392,7 +383,7 @@ impl PreparedExternalDiarizer {
 /// retained for the full request, preventing load/inference fallback after
 /// selection.
 pub(crate) struct ExternalDiarizer {
-    segmenter: SelectedSegmenter,
+    segmenter: PolicyResolvedSegmenterRuntime,
     embedder: Arc<dyn SpeakerEmbedder>,
     vad: super::vad::FireRedStreamVadProvider,
     clusterer: AutomaticClusterer,
@@ -502,12 +493,12 @@ fn native_diagnostics_enabled(value: Option<&str>) -> bool {
 
 impl ExternalDiarizer {
     pub(crate) fn selected_segmenter(&self) -> SegmenterProvider {
-        self.segmenter.provider
+        self.segmenter.provider()
     }
 
     pub(crate) fn diarize(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
@@ -529,7 +520,7 @@ impl ExternalDiarizer {
     #[cfg(test)]
     fn diarize_with_diagnostics(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
@@ -552,7 +543,7 @@ impl ExternalDiarizer {
 
     fn diarize_with_clustering<T>(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
@@ -583,7 +574,7 @@ impl ExternalDiarizer {
 
     fn prepare_recording(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
     ) -> Result<PreparedExternalRecording, ExternalDiarizationError> {
@@ -593,18 +584,19 @@ impl ExternalDiarizer {
             ));
         }
         cancel_checkpoint(canceled)?;
-        let activity =
-            self.segmenter
-                .adapter
-                .segment_local_activity(samples, sample_rate_hz, canceled)?;
+        let activity = self.segmenter.adapter().segment_local_activity(
+            samples.clone(),
+            sample_rate_hz,
+            canceled,
+        )?;
         cancel_checkpoint(canceled)?;
-        let vad_regions = self.vad_regions(samples, sample_rate_hz, canceled)?;
+        let vad_regions = self.vad_regions(samples.as_slice(), sample_rate_hz, canceled)?;
         let activity_regions = activity.valid_regions(samples.len() as f64 / sample_rate_hz as f64);
         let speech = union_regions(vad_regions.into_iter().chain(activity_regions));
         let chunks = embedding_chunks(&speech);
         let (embedded_chunks, embeddings) = embed_chunks(
             self.embedder.as_ref(),
-            samples,
+            samples.as_slice(),
             sample_rate_hz,
             &chunks,
             canceled,
@@ -1575,22 +1567,10 @@ mod tests {
         };
         let backend = std::env::var("OPENASR_NATIVE_DIARIZATION_BACKEND")
             .unwrap_or_else(|_| "cpu".to_string());
-        let backend_preference = match backend.as_str() {
-            "cpu" => Some(RequestBackendPreference::CpuOnly),
-            "accelerated" => Some(RequestBackendPreference::Accelerated),
+        let execution_intent = match backend.as_str() {
+            "cpu" => ExecutionIntent::CpuOnly,
+            "accelerated" => ExecutionIntent::AcceleratedOnly,
             other => panic!("unsupported native diarization backend '{other}'"),
-        };
-        let requested_backend = SegmenterRuntimeInput::resolve(backend_preference.clone())
-            .expect("resolve exact acceptance backend")
-            .backend();
-        // segmentation-3.0 is a pure-Rust CPU model even when the request lets
-        // ReDimNet use Metal/GPU. DiariZen follows the requested graph backend.
-        // Keep both routes explicit so the acceptance harness mirrors the
-        // heterogeneous production pipeline instead of forcing every stage to
-        // the slowest common backend.
-        let expected_segmenter_backend = match expected_provider {
-            SegmenterProvider::Segmentation3_0 => GgmlCpuGraphBackend::Cpu,
-            SegmenterProvider::DiariZen => requested_backend,
         };
         let manifest_root = manifest
             .parent()
@@ -1601,60 +1581,28 @@ mod tests {
         )
         .expect("parse native diarization fixture manifest");
 
-        let runtime_owner = crate::NativeRuntimeShutdownGuard::new();
-        let _backend_guard =
-            crate::ggml_runtime::install_request_backend_override(backend_preference.clone());
-        let embedder_plan = crate::diarize::embed::prepare_shared_embedder_snapshot()
-            .expect("OPENASR_REDIMNET_PACK must resolve to a valid ReDimNet2-B6 pack");
-        let diarizer_plan = PreparedExternalDiarizer::prepare(preference, backend_preference)
-            .expect("prepare native external diarizer");
-        let embedder_content_id = embedder_plan.content_id().to_string();
-        let segmenter_content_id = diarizer_plan.segmenter_content_id().to_string();
-        assert_eq!(
-            diarizer_plan.segmenter_admission_backend(),
-            expected_segmenter_backend,
-            "the exact acceptance harness must use the provider's production backend"
+        let services = Arc::new(
+            NativeExecutionServices::for_local_process()
+                .expect("construct native execution services"),
         );
-        let embedder_bytes = embedder_plan.admission_bytes();
-        let segmenter_bytes = diarizer_plan.segmenter_admission_bytes();
-        if let Some(total_memory) = crate::host::host_total_memory_bytes() {
-            crate::capacity::evaluate_static_host_memory_admission(
-                0,
-                embedder_bytes.saturating_add(
-                    if expected_segmenter_backend != GgmlCpuGraphBackend::Gpu {
-                        segmenter_bytes
-                    } else {
-                        0
-                    },
-                ),
-                total_memory,
-                crate::capacity::MemoryAdmissionDomain::UnifiedMemory {
-                    swap_bytes: crate::host::host_total_swap_bytes().unwrap_or(0),
-                },
+        let speaker_runtime =
+            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
+                Arc::clone(&services),
+                execution_intent.clone(),
             )
-            .expect("native diarization fixture run must pass production-shaped admission");
-        }
-        if expected_segmenter_backend == GgmlCpuGraphBackend::Gpu {
-            let budget = diarizer_plan
-                .segmenter_discrete_vram_budget_bytes()
-                .filter(|budget| *budget > 0)
-                .expect("the exact GPU route must report a VRAM admission budget");
-            crate::capacity::evaluate_static_host_memory_admission(
-                0,
-                segmenter_bytes,
-                0,
-                crate::capacity::MemoryAdmissionDomain::DiscreteVram {
-                    budget_bytes: budget,
-                },
-            )
-            .expect("native diarization GPU fixture run must pass VRAM admission");
-        }
-        let embedder = embedder_plan
-            .materialize()
-            .expect("materialize exact ReDimNet snapshot after admission");
+            .expect("load policy-resolved ReDimNet runtime")
+            .expect("OPENASR_REDIMNET_PACK must resolve to a valid ReDimNet2-B6 pack");
+        let diarizer_plan = PreparedExternalDiarizer::prepare(preference)
+            .expect("prepare native external diarizer");
+        let embedder_content_id = speaker_runtime.identity().pack_fingerprint.clone();
+        let segmenter_content_id = diarizer_plan.segmenter_content_id().to_string();
         let diarizer = diarizer_plan
-            .materialize(embedder)
-            .expect("materialize exact segmentation snapshot after admission");
+            .materialize(
+                Arc::clone(&services),
+                execution_intent,
+                speaker_runtime.shared_embedder(),
+            )
+            .expect("materialize policy-resolved segmentation runtime");
         assert_eq!(diarizer.selected_segmenter(), expected_provider);
 
         std::fs::create_dir_all(&output).expect("create native diarization output directory");
@@ -1675,8 +1623,6 @@ mod tests {
             "embedder_content_id": embedder_content_id,
             "embedder_quant": embedder_quant,
             "requested_backend": backend,
-            "resolved_backend": format!("{requested_backend:?}").to_ascii_lowercase(),
-            "resolved_segmenter_backend": format!("{expected_segmenter_backend:?}").to_ascii_lowercase(),
             "overlap_output": "raw-turns-preserved",
         });
         std::fs::write(
@@ -1696,16 +1642,20 @@ mod tests {
                 "native diarization acceptance",
             )
             .unwrap_or_else(|error| panic!("load fixture '{}': {error}", wav.display()));
+            let samples: crate::PcmSlice = samples.into();
             let (diarization, diagnostics) = if emit_diagnostics {
                 let (diarization, diagnostics) = diarizer
-                    .diarize_with_diagnostics(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| {
-                        false
-                    })
+                    .diarize_with_diagnostics(
+                        samples.clone(),
+                        SAMPLE_RATE_HZ,
+                        DiarizeHint::Auto,
+                        &|| false,
+                    )
                     .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
                 (diarization, Some(diagnostics))
             } else {
                 let diarization = diarizer
-                    .diarize(&samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
+                    .diarize(samples, SAMPLE_RATE_HZ, DiarizeHint::Auto, &|| false)
                     .unwrap_or_else(|error| panic!("diarize fixture '{}': {error}", fixture.id));
                 (diarization, None)
             };
@@ -1746,7 +1696,6 @@ mod tests {
             );
         }
         drop(diarizer);
-        drop(runtime_owner);
         drop(_backend_guard);
     }
 }

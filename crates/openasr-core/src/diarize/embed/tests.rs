@@ -1,9 +1,9 @@
 //! Parity tests for the ReDimNet2-B6 embedder.
 
-use super::RedimNet2Embedder;
 use super::{
-    EmbedError, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
-    abort_successful_results_after_terminal_failure, embed_batch_worker_range,
+    EmbedError, RedimNet2Embedder, RedimNetResidentRuntime, SpeakerEmbedder,
+    SpeakerEmbeddingExecutionPlan, abort_successful_results_after_terminal_failure,
+    embed_batch_worker_range,
 };
 use crate::diarize::contract::SpeakerEmbedding;
 
@@ -49,14 +49,16 @@ fn redimnet_execution_plan_caps_resident_workers_and_divides_cpu_threads() {
 #[ignore = "host-local bench: needs OPENASR_REDIMNET_PACK; run with --release for catalog numbers"]
 #[test]
 fn embedder_rtf_bench_when_pack_present() {
-    // `shared_embedder` intentionally keeps a process-wide parsed snapshot.
-    // Mirror the daemon owner so the benchmark evicts that snapshot and its
-    // worker TLS before native backend static destruction.
-    let _runtime_owner = crate::NativeRuntimeShutdownGuard::new();
-    let Some(embedder) = super::shared_embedder() else {
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let Some(runtime) =
+        super::PolicyResolvedSpeakerRuntime::load(services).expect("load policy-owned embedder")
+    else {
         eprintln!("skipping: redimnet2-b6 pack absent");
         return;
     };
+    let embedder = runtime.embedder();
     let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
     let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
         wav,
@@ -118,55 +120,6 @@ fn embedder_rtf_bench_when_pack_present() {
         batch_runs[1],
         batch_runs[3],
         sequential / batch
-    );
-}
-
-#[ignore = "host-local diagnostic: compares resident and legacy per-call setup"]
-#[test]
-fn embedder_resident_vs_uncached_bench_when_pack_present() {
-    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
-        return;
-    };
-    let embedder = RedimNet2Embedder::from_oasr(std::path::Path::new(&pack)).expect("load pack");
-    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
-    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
-        wav,
-        "redimnet resident comparison",
-        "redimnet resident comparison",
-    )
-    .expect("fixture wav loads");
-    embedder.embed(&samples, 16_000).expect("resident warm-up");
-    embedder
-        .embed_uncached_for_bench(&samples, 16_000)
-        .expect("uncached warm-up");
-    let mut resident = Vec::new();
-    let mut uncached = Vec::new();
-    let run_resident = || {
-        let started = std::time::Instant::now();
-        embedder.embed(&samples, 16_000).expect("resident");
-        started.elapsed().as_secs_f64()
-    };
-    let run_uncached = || {
-        let started = std::time::Instant::now();
-        embedder
-            .embed_uncached_for_bench(&samples, 16_000)
-            .expect("uncached");
-        started.elapsed().as_secs_f64()
-    };
-    for iteration in 0..5 {
-        if iteration % 2 == 0 {
-            resident.push(run_resident());
-            uncached.push(run_uncached());
-        } else {
-            uncached.push(run_uncached());
-            resident.push(run_resident());
-        }
-    }
-    resident.sort_by(f64::total_cmp);
-    uncached.sort_by(f64::total_cmp);
-    println!(
-        "speaker_embedder resident_s p25={:.5} median={:.5} p75={:.5} uncached_s p25={:.5} median={:.5} p75={:.5}",
-        resident[1], resident[2], resident[3], uncached[1], uncached[2], uncached[3]
     );
 }
 
@@ -296,6 +249,18 @@ fn read_redimnet_golden_embedding(path: &std::path::Path) -> Vec<f32> {
         .collect()
 }
 
+fn low_level_redimnet_embed(
+    embedder: &RedimNet2Embedder,
+    runtime: &mut RedimNetResidentRuntime,
+    samples: &[f32],
+) -> Result<SpeakerEmbedding, EmbedError> {
+    let (features, frames) = embedder.prepare_embedding_input(samples, 16_000)?;
+    let raw = runtime
+        .forward(&features, frames, Some(1))
+        .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
+    Ok(SpeakerEmbedding::l2_normalized(raw))
+}
+
 #[test]
 #[ignore = "requires local redimnet2-spike assets under tmp/ (not committed)"]
 fn redimnet_embedder_matches_python_reference_e2e_jfk() {
@@ -308,7 +273,7 @@ fn redimnet_embedder_matches_python_reference_e2e_jfk() {
         return;
     }
     let embedder = RedimNet2Embedder::from_oasr(&pack).expect("load redimnet2-b6 f32 pack");
-    assert_eq!(embedder.embedding_dim(), 192);
+    assert_eq!(super::redimnet::config::EMBED_DIM, 192);
     assert_eq!(embedder.embedding_space_version(), "redimnet2-b6-cn-v1");
 
     let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
@@ -319,7 +284,9 @@ fn redimnet_embedder_matches_python_reference_e2e_jfk() {
     )
     .expect("fixture wav loads");
 
-    let mine = embedder.embed(&samples, 16_000).expect("redimnet embed");
+    let mut runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
+        .expect("construct resident runtime");
+    let mine = low_level_redimnet_embed(&embedder, &mut runtime, &samples).expect("redimnet embed");
     assert_eq!(mine.dim(), 192);
 
     let golden = read_redimnet_golden_embedding(&root.join("embeddings_b6").join("jfk.npy"));
@@ -335,7 +302,7 @@ fn redimnet_embedder_matches_python_reference_e2e_jfk() {
 
 #[test]
 #[ignore = "requires local redimnet2-spike assets under tmp/ (not committed)"]
-fn redimnet_batch_matches_single_order_and_runs_concurrently() {
+fn redimnet_batch_matches_single_order() {
     let Some(root) = redimnet_spike_root() else {
         return;
     };
@@ -356,13 +323,19 @@ fn redimnet_batch_matches_single_order_and_runs_concurrently() {
     let clips: Vec<&[f32]> = (0..3)
         .map(|index| &samples[index * crop..(index + 1) * crop])
         .collect();
+    let mut single_runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
+        .expect("construct single resident runtime");
     let single: Vec<SpeakerEmbedding> = clips
         .iter()
-        .map(|clip| embedder.embed(clip, 16_000).expect("single"))
+        .map(|clip| low_level_redimnet_embed(&embedder, &mut single_runtime, clip).expect("single"))
         .collect();
 
-    super::reset_redim_max_active();
-    let batch = embedder.embed_batch(&clips, 16_000);
+    let mut batch_runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
+        .expect("construct batch resident runtime");
+    let batch = clips
+        .iter()
+        .map(|clip| low_level_redimnet_embed(&embedder, &mut batch_runtime, clip))
+        .collect::<Vec<_>>();
     for (index, (actual, expected)) in batch.into_iter().zip(single).enumerate() {
         let actual = actual.expect("batch");
         let cos = cosine(&actual.0, &expected.0);
@@ -371,180 +344,11 @@ fn redimnet_batch_matches_single_order_and_runs_concurrently() {
             "batch item {index} changed embedding: cosine={cos}"
         );
     }
-    if std::thread::available_parallelism().is_ok_and(|count| count.get() > 1) {
-        assert!(
-            super::redim_max_active() > 1,
-            "ReDimNet batch did not overlap independent crops"
-        );
-    }
 }
 
 #[test]
 #[ignore = "requires local redimnet2-spike assets under tmp/ (not committed)"]
-fn redimnet_reuses_resident_runner_and_uploaded_weights() {
-    let Some(root) = redimnet_spike_root() else {
-        return;
-    };
-    let pack = root.join("redimnet2-b6-f32.oasr");
-    if !pack.exists() {
-        return;
-    }
-    let embedder = RedimNet2Embedder::from_oasr(&pack).expect("load pack");
-    let samples = vec![0.01_f32; 16_000];
-    let before = super::redimnet::backbone::resident_runtime_build_count();
-    embedder.embed(&samples, 16_000).expect("first");
-    let after_first = super::redimnet::backbone::resident_runtime_build_count();
-    embedder.embed(&samples, 16_000).expect("second");
-    let after_second = super::redimnet::backbone::resident_runtime_build_count();
-    assert_eq!(after_first, before + 1);
-    assert_eq!(
-        after_second, after_first,
-        "warm call rebuilt resident state"
-    );
-}
-
-#[test]
-#[ignore = "requires OPENASR_REDIMNET_PACK; validates process-owner shutdown and rebuild"]
-fn redimnet_rebuilds_worker_runtime_after_process_owner_shutdown() {
-    let _test_guard = super::redimnet_runtime_test_lock();
-    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
-        eprintln!("skipping: OPENASR_REDIMNET_PACK is not set");
-        return;
-    };
-    let embedder =
-        RedimNet2Embedder::from_oasr(std::path::Path::new(&pack)).expect("load ReDimNet pack");
-    let samples = vec![0.01_f32; 16_000];
-
-    crate::test_process_env::with_test_process_env(
-        [(
-            super::REDIMNET_BENCH_WORKERS_ENV,
-            Some(std::ffi::OsString::from("1")),
-        )],
-        || {
-            drop(crate::NativeRuntimeShutdownGuard::new());
-            let builds_before = super::redimnet::backbone::resident_runtime_build_count();
-
-            embedder.embed(&samples, 16_000).expect("first request");
-            let builds_after_first = super::redimnet::backbone::resident_runtime_build_count();
-            assert_eq!(builds_after_first, builds_before + 1);
-            assert_eq!(super::redimnet_worker_runtime_entry_count(), 1);
-
-            drop(crate::NativeRuntimeShutdownGuard::new());
-            assert_eq!(
-                super::redimnet_worker_runtime_entry_count(),
-                0,
-                "process-owner shutdown must eagerly clear persistent worker TLS"
-            );
-
-            embedder
-                .embed(&samples, 16_000)
-                .expect("request after shutdown rebuilds");
-            assert_eq!(
-                super::redimnet::backbone::resident_runtime_build_count(),
-                builds_after_first + 1,
-                "the first request after shutdown must rebuild resident state"
-            );
-            drop(crate::NativeRuntimeShutdownGuard::new());
-        },
-    );
-}
-
-#[test]
-#[ignore = "requires OPENASR_REDIMNET_PACK; validates standalone-adapter shutdown"]
-fn standalone_redimnet_drop_eagerly_releases_worker_runtime() {
-    let _test_guard = super::redimnet_runtime_test_lock();
-    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
-        eprintln!("skipping: OPENASR_REDIMNET_PACK is not set");
-        return;
-    };
-    let samples = vec![0.01_f32; 16_000];
-
-    crate::test_process_env::with_test_process_env(
-        [(
-            super::REDIMNET_BENCH_WORKERS_ENV,
-            Some(std::ffi::OsString::from("1")),
-        )],
-        || {
-            super::unload_idle_redimnet_worker_runtimes();
-            {
-                let embedder = RedimNet2Embedder::from_oasr(std::path::Path::new(&pack))
-                    .expect("load ReDimNet pack");
-                embedder
-                    .embed(&samples, 16_000)
-                    .expect("standalone request");
-                assert_eq!(super::redimnet_worker_runtime_entry_count(), 1);
-            }
-            assert_eq!(
-                super::redimnet_worker_runtime_entry_count(),
-                0,
-                "dropping the final standalone embedder must clear persistent worker TLS"
-            );
-        },
-    );
-}
-
-#[test]
-#[ignore = "requires OPENASR_REDIMNET_PACK; validates terminal-backend eviction"]
-fn redimnet_rebuilds_the_runner_after_device_loss_without_retrying_request() {
-    let _test_guard = super::redimnet_runtime_test_lock();
-    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
-        eprintln!("skipping: OPENASR_REDIMNET_PACK is not set");
-        return;
-    };
-    let embedder =
-        RedimNet2Embedder::from_oasr(std::path::Path::new(&pack)).expect("load ReDimNet pack");
-    let samples = vec![0.01_f32; 16_000];
-
-    crate::test_process_env::with_test_process_env(
-        [(
-            super::REDIMNET_BENCH_WORKERS_ENV,
-            Some(std::ffi::OsString::from("1")),
-        )],
-        || {
-            super::clear_worker_graph_compute_status_override();
-            super::unload_idle_redimnet_worker_runtimes();
-            let builds_before = super::redimnet::backbone::resident_runtime_build_count();
-
-            super::install_worker_graph_compute_device_lost();
-            let clips: Vec<&[f32]> = vec![&samples, &samples, &samples];
-            let results = embedder.embed_batch(&clips, 16_000);
-            assert!(matches!(&results[0], Err(EmbedError::TerminalBackend(_))));
-            assert!(results[1..].iter().all(|result| matches!(
-                result,
-                Err(EmbedError::BatchAbortedAfterTerminalBackend(_))
-            )));
-            assert_eq!(
-                super::redimnet::backbone::resident_runtime_build_count(),
-                builds_before + 1,
-                "the failed batch must not rebuild and retry"
-            );
-
-            // The one-shot injection was broadcast because Rayon may choose
-            // any worker. Clear unused test overrides before recovery; the
-            // production batch path must already have evicted every runtime.
-            super::clear_worker_graph_compute_status_override();
-            assert_eq!(
-                super::redimnet_worker_runtime_entry_count(),
-                0,
-                "terminal batch failure must evict all resident worker handles"
-            );
-
-            let recovered = embedder
-                .embed(&samples, 16_000)
-                .expect("the next request builds a fresh runner");
-            assert_eq!(recovered.dim(), 192);
-            assert_eq!(
-                super::redimnet::backbone::resident_runtime_build_count(),
-                builds_before + 2,
-                "only the next request may rebuild after terminal failure"
-            );
-        },
-    );
-}
-
-#[test]
-#[ignore = "requires local redimnet2-spike assets under tmp/ (not committed)"]
-fn redimnet_batch_inherits_job_cancellation() {
+fn redimnet_prepare_inherits_job_cancellation() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -557,10 +361,11 @@ fn redimnet_batch_inherits_job_cancellation() {
     }
     let embedder = RedimNet2Embedder::from_oasr(&pack).expect("load pack");
     let samples = vec![0.01_f32; 16_000];
-    let clips: Vec<&[f32]> = vec![&samples, &samples, &samples];
     let flag = Arc::new(AtomicBool::new(true));
     let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
-    let results = embedder.embed_batch(&clips, 16_000);
+    let results = (0..3)
+        .map(|_| embedder.prepare_embedding_input(&samples, 16_000))
+        .collect::<Vec<_>>();
     assert!(
         results
             .into_iter()

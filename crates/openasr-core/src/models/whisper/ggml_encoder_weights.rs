@@ -28,6 +28,24 @@ pub(crate) struct WhisperMaterializedTensor {
     pub payload: WhisperMaterializedTensorPayload,
 }
 
+impl WhisperMaterializedTensor {
+    pub(crate) fn add_retained_system_memory(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_string(&self.tensor_name, label)?;
+        bytes.add_vec(&self.dims, label)?;
+        match &self.payload {
+            WhisperMaterializedTensorPayload::F32(values) => bytes.add_vec(values, label),
+            WhisperMaterializedTensorPayload::F16Bits(values) => bytes.add_vec(values, label),
+            WhisperMaterializedTensorPayload::Quantized { bytes: values, .. } => {
+                bytes.add_vec(values, label)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WhisperEncoderPreludeWeightBundle {
     pub conv1_weight: WhisperMaterializedTensor,
@@ -76,6 +94,44 @@ impl WhisperEncoderWeightBundle {
         let layer_count = self.layers.len().saturating_mul(15);
         let final_norm_count = 2;
         prelude_count + layer_count + final_norm_count
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for tensor in [
+            &self.prelude.conv1_weight,
+            &self.prelude.conv1_bias,
+            &self.prelude.conv2_weight,
+            &self.prelude.conv2_bias,
+            &self.prelude.positional_embedding,
+            &self.final_norm.weight,
+            &self.final_norm.bias,
+        ] {
+            tensor.add_retained_system_memory(&mut bytes, "whisper encoder tensor")?;
+        }
+        bytes.add_vec(&self.layers, "whisper encoder layers")?;
+        for layer in &self.layers {
+            for tensor in [
+                &layer.self_attn_layer_norm_weight,
+                &layer.self_attn_layer_norm_bias,
+                &layer.self_attn_q_weight,
+                &layer.self_attn_q_bias,
+                &layer.self_attn_k_weight,
+                &layer.self_attn_v_weight,
+                &layer.self_attn_v_bias,
+                &layer.self_attn_out_weight,
+                &layer.self_attn_out_bias,
+                &layer.mlp_norm_weight,
+                &layer.mlp_norm_bias,
+                &layer.fc1_weight,
+                &layer.fc1_bias,
+                &layer.fc2_weight,
+                &layer.fc2_bias,
+            ] {
+                tensor.add_retained_system_memory(&mut bytes, "whisper encoder layer tensor")?;
+            }
+        }
+        Ok(bytes.finish())
     }
 }
 

@@ -1102,7 +1102,8 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     let options = NativeAsrRequestOptions::new().with_inference_threads(inference_threads);
     let session_config = NativeAsrStreamingSessionConfig::new()
         .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz());
-    let executor = NativeBackendExecutor;
+    let executor =
+        NativeBackendExecutor::new(Arc::clone(runtime.native_execution.execution_services()));
     let hardware_target = native_hardware_target_from_execution_target(execution_target_preference);
     let session = match NativeAsrExecutor::start_streaming_session(
         &executor,

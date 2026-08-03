@@ -21,14 +21,6 @@ pub fn external_diarization_available() -> bool {
     embed::embedder_pack_installed() && segment::segmenter_pack_installed()
 }
 
-/// Release process-wide Voice ID model snapshots during the native runtime's
-/// normal idle-unload cycle. Request-owned Arcs keep in-flight work valid;
-/// the next request rebuilds from the currently installed content.
-pub(crate) fn unload_idle_voice_id_runtime_caches() {
-    embed::unload_idle_embedder_cache();
-    segment::unload_idle_segmenter_caches();
-}
-
 // Pull-time contract validation for diarization support packs (ReDimNet2-B6
 // speaker embedder, pyannote speaker segmenter) is dispatched through
 // `crate::models::aux_pack_registry`, alongside the other auxiliary (non-ASR)

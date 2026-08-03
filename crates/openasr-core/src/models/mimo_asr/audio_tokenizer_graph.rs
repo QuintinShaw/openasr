@@ -123,6 +123,39 @@ pub(crate) struct MimoAudiotokEncoderRuntime {
 }
 
 impl MimoAudiotokEncoderRuntime {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &MimoAudiotokMetadata,
+    ) -> Result<u64, String> {
+        let metadata_bytes = metadata
+            .codebook_sizes
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mimo-asr audio-tokenizer metadata quote overflowed".to_string())?;
+        let layer_bytes = metadata
+            .n_layers
+            .checked_mul(std::mem::size_of::<LayerRuntime>())
+            .ok_or_else(|| "mimo-asr audio-tokenizer handle quote overflowed".to_string())?;
+        let bytes = metadata_bytes
+            .checked_add(layer_bytes)
+            .ok_or_else(|| "mimo-asr audio-tokenizer retained quote overflowed".to_string())?;
+        u64::try_from(bytes).map_err(|_| "mimo-asr audio-tokenizer quote exceeds u64".to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.metadata.retained_system_memory_bytes()?,
+            "mimo-asr audio-tokenizer metadata",
+        )?;
+        // Native graph arenas, backend buffers, and loaded zero-copy weight
+        // contexts are admitted by their constructors and intentionally do not
+        // belong to this Rust-container accounting.
+        bytes.add_vec(&self.layers, "mimo-asr audio-tokenizer layer handles")?;
+        Ok(bytes.finish())
+    }
+}
+
+impl MimoAudiotokEncoderRuntime {
     pub(crate) fn new(
         runtime_source: &GgmlRuntimeSource,
         metadata: MimoAudiotokMetadata,

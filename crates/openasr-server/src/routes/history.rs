@@ -128,6 +128,7 @@ pub(crate) async fn history_assign_speakers(
 > {
     let expected_revision = parse_required_quoted_if_match(&headers)?;
     let voice_store = super::voice_id::open_voice_id_store(&distribution)?;
+    let active_space = super::voice_id::active_space(&distribution)?;
     let mut assignments = Vec::with_capacity(request.assignments.len());
     for assignment in request.assignments {
         let speaker_label = assignment.speaker_label.trim().to_string();
@@ -144,7 +145,7 @@ pub(crate) async fn history_assign_speakers(
                 let person_id = openasr_core::diarize::voice_id::PersonId::parse(&raw_id)
                     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
                 let person = voice_store
-                    .get_person(&person_id, super::voice_id::active_space().as_ref())
+                    .get_person(&person_id, active_space.as_ref())
                     .map_err(super::voice_id::voice_id_store_error)?;
                 if !person.status.allows_matching() {
                     return Err(ApiError::BadRequest(format!(

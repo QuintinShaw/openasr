@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -13,6 +12,7 @@ use super::ggml_decoder_graph::{
     WhisperDecoderGraphExecutionError, WhisperDecoderGraphInputShape, WhisperDecoderGraphMetadata,
     WhisperDecoderGraphPlan, WhisperDecoderHiddenStateLayout, WhisperDecoderPersistentWeightCache,
     WhisperDecoderSelfKvCacheState, build_whisper_decoder_graph_plan,
+    persistent_cross_attention_layer_stride_frames,
     run_whisper_decoder_batched_prefill_step_ggml_v0,
     run_whisper_decoder_reused_batched_incremental_step_ggml_v0,
     run_whisper_decoder_reused_incremental_step_ggml_v0,
@@ -23,12 +23,14 @@ use super::runtime_contract::WhisperGgmlExecutionMetadata;
 use super::tokenizer::WhisperTokenizer;
 use crate::PhraseBiasConfig;
 use crate::Segment;
+use crate::capacity::topology::StateKind;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
     build_builtin_seq2seq_decode_policy_config, resolve_builtin_decode_policy,
 };
 use crate::models::decode_token_history::build_longform_token_history_carry;
+use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
     build_seq2seq_greedy_stop_token_ids,
@@ -37,7 +39,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
     SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
-    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    ServeBatchEngineRegistry,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -46,10 +48,6 @@ use crate::models::serve_batch_env::{
 };
 
 const WHISPER_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
-
-static WHISPER_SERVE_BATCH_ENGINES: OnceLock<
-    Mutex<HashMap<WhisperServeBatchEngineKey, Arc<ServeBatchEngine<WhisperFamily>>>>,
-> = OnceLock::new();
 
 /// Field-identical alias onto the generic `ServeBatchConfig`. Preserved so
 /// `ggml_executor`'s `WhisperServeBatchConfig::from_env()` keeps compiling
@@ -91,6 +89,7 @@ pub(crate) struct WhisperServeBatchJob {
     pub execution: WhisperGgmlExecutionMetadata,
     pub decoder_weights: WhisperDecoderWeightSeam,
     pub tokenizer: WhisperTokenizer,
+    pub decoder_state: Seq2SeqDecoderState,
     pub encoder_frames: usize,
     pub encoder_hidden_size: usize,
     pub encoder_hidden_f32: Vec<f32>,
@@ -149,23 +148,26 @@ impl WhisperServeBatchError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WhisperServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
-    backend: GgmlCpuGraphBackend,
-    frame_count: usize,
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+    resident_self_positions: usize,
+    resident_cross_positions: usize,
     hidden_size: usize,
     max_batch: usize,
 }
+
+pub(super) type WhisperServeBatchEngineRegistry = ServeBatchEngineRegistry<WhisperFamily>;
 
 /// The whisper serve-batch ZST family wiring (`Seq2SeqServeBatchFamily`) that
 /// drives the generic `OwnerThreadState` + generic `ServeBatchEngine`. Whisper
 /// is the superset: it overrides the self-KV reset, the Vulkan->serial cap, the
 /// non-flash batched execution config, the reset+incremental serial path, and
 /// the longform carry-prompt finish.
-struct WhisperFamily;
+pub(super) struct WhisperFamily;
 
 #[cfg(test)]
 type WhisperServeBatchEnvelope = Envelope<WhisperFamily>;
 
-struct WhisperServeDecoderRuntime {
+pub(super) struct WhisperServeDecoderRuntime {
     runner: GgmlCpuGraphRunner,
     persistent_weights: WhisperDecoderPersistentWeightCache,
     reuse: Option<crate::nn::decoder::Seq2SeqReusableDecodeGraph>,
@@ -174,6 +176,7 @@ struct WhisperServeDecoderRuntime {
     tensor_cache: WhisperDecoderExecutionTensorCache,
     config: WhisperDecoderGraphExecutionConfig,
     self_kv_state: WhisperDecoderSelfKvCacheState,
+    decoder_state: Seq2SeqDecoderState,
 }
 
 pub(crate) struct WhisperBatchSlot {
@@ -189,32 +192,100 @@ pub(crate) struct WhisperBatchSlot {
 }
 
 pub(super) fn submit_whisper_serve_batch_job(
+    registry: &WhisperServeBatchEngineRegistry,
     config: WhisperServeBatchConfig,
     job: WhisperServeBatchJob,
 ) -> Result<WhisperExecutionOutput, WhisperServeBatchError> {
     let config = config.validate_for_job::<WhisperFamily>(&job)?;
     let key = WhisperFamily::engine_key(&job, config.max_batch);
-    serve_batch_engine_for_key(&WHISPER_SERVE_BATCH_ENGINES, key, config)?.submit(job)
+    let engine = registry.engine_for_key(key.clone(), config)?;
+    let result = engine.submit(job);
+    registry.evict_after_candidate_failure(&key, &engine);
+    result
 }
 
-pub(super) fn shutdown_whisper_serve_batch_engines() {
-    shutdown_and_remove_serve_batch_engines(&WHISPER_SERVE_BATCH_ENGINES);
+pub(super) fn shutdown_whisper_serve_batch_engines(registry: &WhisperServeBatchEngineRegistry) {
+    registry.shutdown();
 }
 
 fn whisper_serve_batch_vram_slot_bytes(job: &WhisperServeBatchJob) -> usize {
     serve_batch_estimate_seq2seq_slot_bytes(
         job.execution.decoder_layers,
-        job.execution.max_target_positions,
+        job.decoder_state.self_attention.resident_positions,
         job.execution.decoder_hidden_size,
-        job.encoder_frames,
+        job.decoder_state.cross_attention.resident_positions,
         job.encoder_hidden_size,
         std::mem::size_of::<u16>(),
         std::mem::size_of::<u16>(),
     )
 }
 
+fn validate_whisper_serve_decoder_state(
+    job: &WhisperServeBatchJob,
+) -> Result<(), WhisperServeBatchError> {
+    let semantic_positions = job
+        .decode_config
+        .initial_prompt_tokens
+        .len()
+        .checked_add(job.decode_config.max_generated_tokens)
+        .ok_or_else(|| WhisperServeBatchError::DecodeFailed {
+            reason: "whisper semantic decoder positions overflowed".to_string(),
+        })?;
+    if semantic_positions > job.execution.max_target_positions {
+        return Err(WhisperServeBatchError::DecodeFailed {
+            reason: format!(
+                "whisper prompt plus generation budget {} exceeds semantic context {}",
+                semantic_positions, job.execution.max_target_positions
+            ),
+        });
+    }
+    let required_self_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+        job.decode_config.initial_prompt_tokens.len(),
+        job.decode_config.max_generated_tokens,
+    )
+    .map_err(|error| WhisperServeBatchError::DecodeFailed {
+        reason: format!("whisper decode schedule is invalid: {error}"),
+    })?;
+    if required_self_positions > job.decoder_state.self_attention.logical_positions {
+        return Err(WhisperServeBatchError::DecodeFailed {
+            reason: format!(
+                "whisper greedy schedule requires {} self-KV rows, planner supplied {}",
+                required_self_positions, job.decoder_state.self_attention.logical_positions
+            ),
+        });
+    }
+    let cross_resident = persistent_cross_attention_layer_stride_frames(job.encoder_frames);
+    job.decoder_state
+        .validate()
+        .and_then(|()| {
+            job.decoder_state.self_attention.validate_runtime_ceiling(
+                StateKind::SelfAttentionKv,
+                job.execution.max_target_positions,
+            )
+        })
+        .and_then(|()| {
+            job.decoder_state
+                .cross_attention
+                .validate_exact_shape(StateKind::CrossAttentionKv, job.encoder_frames)
+        })
+        .and_then(|()| {
+            job.decoder_state
+                .cross_attention
+                .validate_runtime_ceiling(StateKind::CrossAttentionKv, cross_resident)
+        })
+        .and_then(|()| {
+            job.decoder_state
+                .cross_attention
+                .validate_resident_shape(StateKind::CrossAttentionKv, cross_resident)
+        })
+        .map_err(|error| WhisperServeBatchError::DecodeFailed {
+            reason: error.to_string(),
+        })
+}
+
 impl WhisperServeDecoderRuntime {
     fn new(job: &WhisperServeBatchJob, n_seq: usize) -> Result<Self, WhisperServeBatchError> {
+        validate_whisper_serve_decoder_state(job)?;
         let mut graph_config = whisper_decoder_graph_config(job.backend);
         graph_config.use_scheduler = job.uses_scheduler;
         let plan = build_whisper_decoder_graph_plan(
@@ -223,7 +294,7 @@ impl WhisperServeDecoderRuntime {
                 decoder_hidden_size: job.execution.decoder_hidden_size,
                 decoder_attention_heads: job.execution.decoder_attention_heads,
                 vocab_size: job.execution.vocab_size,
-                max_target_positions: job.execution.max_target_positions,
+                semantic_context_positions: job.execution.max_target_positions,
             },
             &job.decoder_weights.graph_binding,
             &job.decoder_weights.graph_materialization,
@@ -246,7 +317,7 @@ impl WhisperServeDecoderRuntime {
                 &plan,
                 &job.decoder_weights.tensor_source,
                 &mut tensor_cache,
-                job.execution.max_target_positions,
+                job.decoder_state.self_attention.resident_positions,
                 Some(&job.runtime_source),
                 n_seq,
             )
@@ -263,6 +334,7 @@ impl WhisperServeDecoderRuntime {
                 n_seq,
             ),
             self_kv_state: WhisperDecoderSelfKvCacheState::new(),
+            decoder_state: job.decoder_state,
         })
     }
 
@@ -275,6 +347,15 @@ impl WhisperServeDecoderRuntime {
         slot_index: usize,
         job: &WhisperServeBatchJob,
     ) -> Result<(), WhisperServeBatchError> {
+        if job.decoder_state != self.decoder_state {
+            return Err(WhisperServeBatchError::DecodeFailed {
+                reason: format!(
+                    "whisper serve-batch resident runtime state mismatch: built={:?}, requested={:?}",
+                    self.decoder_state, job.decoder_state
+                ),
+            });
+        }
+        validate_whisper_serve_decoder_state(job)?;
         self.persistent_weights
             .populate_cross_attention_stage_slot(
                 &mut self.runner,
@@ -367,6 +448,19 @@ impl Seq2SeqServeRuntime for WhisperServeDecoderRuntime {
         WhisperServeDecoderRuntime::new(job, n_seq)
     }
 
+    fn configure_for_job(&mut self, job: &Self::Job) -> Result<(), Self::Error> {
+        validate_whisper_serve_decoder_state(job)?;
+        if job.decoder_state != self.decoder_state {
+            return Err(WhisperServeBatchError::DecodeFailed {
+                reason: format!(
+                    "whisper serve-batch resident runtime state mismatch: built={:?}, requested={:?}",
+                    self.decoder_state, job.decoder_state
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn reset_self_kv_state(&mut self) {
         WhisperServeDecoderRuntime::reset_self_kv_state(self);
     }
@@ -422,15 +516,16 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
         WhisperServeBatchEngineKey {
             build_identity: job.build_identity.clone(),
-            backend: job.backend,
-            frame_count: job.encoder_frames,
+            lane: crate::models::native_execution_services::current_execution_lane_key(job.backend),
+            resident_self_positions: job.decoder_state.self_attention.resident_positions,
+            resident_cross_positions: job.decoder_state.cross_attention.resident_positions,
             hidden_size: job.encoder_hidden_size,
             max_batch,
         }
     }
 
     fn engine_key_backend(key: &Self::EngineKey) -> GgmlCpuGraphBackend {
-        key.backend
+        key.lane.backend()
     }
 
     fn can_batch_with(a: &Self::Job, b: &Self::Job) -> bool {
@@ -489,7 +584,7 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
     }
 
     fn decoder_max_context(job: &Self::Job) -> usize {
-        job.execution.max_target_positions
+        job.decoder_state.self_attention.logical_positions
     }
 
     fn slot_new(job: Self::Job) -> Result<Self::Slot, Self::Error> {
@@ -640,6 +735,7 @@ impl WhisperServeBatchJob {
                 &other.decode_config,
             )
             && self.execution == other.execution
+            && self.decoder_state == other.decoder_state
     }
 }
 
@@ -1034,6 +1130,28 @@ mod tests {
         (frame_count, hidden_size, rows)
     }
 
+    fn decoder_state_fixture(
+        execution: &WhisperGgmlExecutionMetadata,
+        encoder_frames: usize,
+    ) -> Seq2SeqDecoderState {
+        use crate::models::seq2seq_decoder_state::Seq2SeqStateAxis;
+
+        let cross_resident = persistent_cross_attention_layer_stride_frames(encoder_frames);
+        let self_positions = execution.max_target_positions - 1;
+        Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: self_positions,
+                resident_positions: self_positions,
+                hard_position_cap: self_positions,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: encoder_frames,
+                resident_positions: cross_resident,
+                hard_position_cap: cross_resident,
+            },
+        }
+    }
+
     /// Structural proof that `WhisperServeBatchJob::execution_context` is
     /// required, not optional: this only compiles because the field's type
     /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
@@ -1108,6 +1226,7 @@ mod tests {
         .expect("decode config");
         let (encoder_frames, encoder_hidden_size, encoder_hidden_f32) =
             sample_encoder_hidden(&execution, encoder_phase);
+        let decoder_state = decoder_state_fixture(&execution, encoder_frames);
         let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
             .expect("valid runtime source path");
         WhisperServeBatchJob {
@@ -1124,6 +1243,7 @@ mod tests {
             execution,
             decoder_weights,
             tokenizer,
+            decoder_state,
             encoder_frames,
             encoder_hidden_size,
             encoder_hidden_f32,
@@ -1535,6 +1655,7 @@ mod tests {
                 WhisperServeBatchEnvelope {
                     job,
                     context,
+                    native_execution_context: None,
                     reply,
                 },
                 reply_rx,
@@ -1612,6 +1733,7 @@ mod tests {
                 WhisperServeBatchEnvelope {
                     job,
                     context,
+                    native_execution_context: None,
                     reply,
                 },
                 reply_rx,
@@ -1684,6 +1806,7 @@ mod tests {
                 WhisperServeBatchEnvelope {
                     job,
                     context,
+                    native_execution_context: None,
                     reply,
                 },
                 reply_rx,
@@ -1765,6 +1888,7 @@ mod tests {
                 WhisperServeBatchEnvelope {
                     job,
                     context,
+                    native_execution_context: None,
                     reply,
                 },
                 reply_rx,

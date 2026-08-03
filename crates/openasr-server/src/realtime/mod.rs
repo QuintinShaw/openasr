@@ -24,10 +24,10 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON;
 use openasr_core::{
-    BufferedUtterance, ClauseId, ClauseSegment, ClauseSegmenter, ClauseStatus,
-    MAX_INFERENCE_THREADS, PhraseBiasConfig, RealtimeAudioEncoding, RealtimeAudioFormat,
-    RealtimeAudioFrame, RealtimeBackendCapabilities, RealtimeBufferConfig, RealtimeErrorCode,
-    RealtimeErrorEvent, RealtimeEvent, RealtimeEventEnvelope, RealtimeEventId,
+    BufferedUtterance, ClauseId, ClauseSegment, ClauseSegmentationConfig, ClauseSegmenter,
+    ClauseStatus, MAX_INFERENCE_THREADS, PhraseBiasConfig, RealtimeAudioEncoding,
+    RealtimeAudioFormat, RealtimeAudioFrame, RealtimeBackendCapabilities, RealtimeBufferConfig,
+    RealtimeErrorCode, RealtimeErrorEvent, RealtimeEvent, RealtimeEventEnvelope, RealtimeEventId,
     RealtimeEventSequencer, RealtimeLifecycleAction, RealtimeLifecycleEvent, RealtimeSessionConfig,
     RealtimeSessionController, RealtimeSessionId, RealtimeSessionState, RealtimeTranscriptEvent,
     RealtimeTranscriptFinal, RealtimeTranscriptRevision, RealtimeTranscriptWord,
@@ -37,17 +37,17 @@ use openasr_core::{
     SpeechBoundaryEvent, StabilityGate, StabilityGateInput, TargetLang, TranscriptLifecycleResult,
     TranscriptSegmentId, TranscriptUpdate, TranscriptUtteranceId, Transcription, TranslationOutput,
     TranslationQueueError, TranslationRequest, TranslationSession, TranslationWorkerOutput,
-    VadConfig, VadMode, VadSpeechStartedEvent, VadSpeechStoppedEvent, VadState, WordTimestamp,
-    native_runtime_model_adapter_for_path, parse_model_ref,
+    TranslationWorkerReadiness, VadConfig, VadMode, VadSpeechStartedEvent, VadSpeechStoppedEvent,
+    VadState, WordTimestamp, native_runtime_model_adapter_for_path, parse_model_ref,
     realtime::history::{
         DaemonHistoryKind, DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore,
     },
     resolve_runtime_model_ref, runtime_registry,
 };
 use openasr_core::{
-    Hymt2Runtime, Hymt2TranslationSessionCache, NativeAsrExecutor, NativeAsrModelAdapter,
-    NativeAsrModelPackRef, NativeAsrRequestOptions, NativeAsrSession, NativeAsrSessionContext,
-    NativeAsrStreamingSessionConfig, NativeBackendExecutor,
+    NativeAsrExecutor, NativeAsrModelAdapter, NativeAsrModelPackRef, NativeAsrRequestOptions,
+    NativeAsrSession, NativeAsrSessionContext, NativeAsrStreamingSessionConfig,
+    NativeBackendExecutor, PolicyResolvedHymt2TranslationRuntime,
 };
 use serde::Deserialize;
 use serde_json::json;

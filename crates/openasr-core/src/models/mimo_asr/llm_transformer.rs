@@ -11,12 +11,14 @@
 
 use thiserror::Error;
 
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
+
 use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenFamilyLlmLayerTensorNames,
-    load_llm_logits_head_from_reader_with_tensor_names,
-    load_qwen_family_llm_layer_attention_projection_generic,
+    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 
@@ -24,6 +26,69 @@ use super::runtime_contract::MimoLlmMetadata;
 use super::tensor_names::{
     OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT, mimo_llm_layer_tensor_names,
 };
+
+pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
+    reader: &GgufTensorDataReader,
+    metadata: &MimoLlmMetadata,
+    backend: GgmlCpuGraphBackend,
+) -> Result<(u64, u64), String> {
+    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
+        metadata.n_layers,
+    )?;
+    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
+        metadata.n_layers,
+        |layer_index| {
+            let names = mimo_llm_layer_tensor_names(layer_index);
+            QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_output_weight,
+                q_norm_name: None,
+                k_norm_name: None,
+                q_bias_name: Some(names.attn_q_bias),
+                k_bias_name: Some(names.attn_k_bias),
+                v_bias_name: Some(names.attn_v_bias),
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            }
+        },
+    )?;
+    let (logits_peak, logits_retained) =
+        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
+            reader,
+            OUTPUT_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+            backend,
+        )?;
+    let (embedding_peak, embedding_retained) =
+        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
+            reader,
+            TOKEN_EMBD_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+        )?;
+    let retained = graph_retained
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .ok_or_else(|| "mimo-asr decoder retained quote overflowed".to_string())?;
+    let logits_phase = plan_transient
+        .checked_add(logits_peak)
+        .ok_or_else(|| "mimo-asr logits construction quote overflowed".to_string())?;
+    let graph_phase = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(graph_retained))
+        .ok_or_else(|| "mimo-asr decoder graph construction quote overflowed".to_string())?;
+    let embedding_phase = logits_retained
+        .checked_add(graph_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_peak))
+        .ok_or_else(|| "mimo-asr token embedding construction quote overflowed".to_string())?;
+    Ok((logits_phase.max(graph_phase).max(embedding_phase), retained))
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum MimoLlmDecoderError {
@@ -41,15 +106,19 @@ pub(crate) enum MimoLlmDecoderError {
     EmptyPrefillOutput,
 }
 
-fn load_layer_projections(
+fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &MimoLlmMetadata,
-) -> Result<Vec<Qwen3AsrLlmLayerAttentionProjection>, MimoLlmDecoderError> {
-    let mut projections = Vec::with_capacity(metadata.n_layers);
-    for layer_index in 0..metadata.n_layers {
-        let names = mimo_llm_layer_tensor_names(layer_index);
-        let generic = load_qwen_family_llm_layer_attention_projection_generic(
-            reader,
+) -> Result<QwenWholeDecoderPlan, MimoLlmDecoderError> {
+    QwenWholeDecoderPlan::for_qwen_family(
+        reader,
+        metadata.n_layers,
+        metadata.d_model,
+        metadata.n_heads,
+        metadata.n_kv_heads,
+        metadata.head_dim,
+        |layer_index| {
+            let names = mimo_llm_layer_tensor_names(layer_index);
             QwenFamilyLlmLayerTensorNames {
                 attn_norm_name: names.attn_norm_weight,
                 attn_q_name: names.attn_q_weight,
@@ -69,24 +138,18 @@ fn load_layer_projections(
                 ffn_gate_name: names.ffn_gate_weight,
                 ffn_up_name: names.ffn_up_weight,
                 ffn_down_name: names.ffn_down_weight,
-            },
-            metadata.d_model,
-            metadata.n_heads,
-            metadata.n_kv_heads,
-            metadata.head_dim,
-            false,
-        )
-        .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        })?;
-        projections.push(Qwen3AsrLlmLayerAttentionProjection::Generic(generic));
-    }
-    Ok(projections)
+            }
+        },
+    )
+    .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
+        reason: error.to_string(),
+    })
 }
 
 pub(crate) struct MimoLlmDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
+    logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
     token_embedding: Qwen3AsrTokenEmbeddingTable,
     metadata: MimoLlmMetadata,
 }
@@ -110,7 +173,7 @@ impl MimoLlmDecoderRuntime {
             .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
                 reason: error.to_string(),
             })?;
-        let projections = load_layer_projections(&reader, &metadata)?;
+        let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
             runtime_source,
@@ -132,9 +195,9 @@ impl MimoLlmDecoderRuntime {
         // registered policy has no suppression or phrase bias, so the shared
         // driver can always honor the hint).
         let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_source),
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+                &decoder_plan,
+                runtime_source,
                 metadata.rms_norm_epsilon,
                 logits_head.fused_top1_spec(),
                 backend,
@@ -142,6 +205,15 @@ impl MimoLlmDecoderRuntime {
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
+        // The graph constructor has copied/bound every planned tensor handle;
+        // release the heap-heavy transient plan before materializing the token
+        // embedding so construction peak follows the quoted phase topology.
+        drop(decoder_plan);
+        let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
+            MimoLlmDecoderError::LogitsHeadFailed {
+                reason: error.to_string(),
+            }
+        })?;
         let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
             &reader,
             TOKEN_EMBD_WEIGHT,
@@ -154,33 +226,53 @@ impl MimoLlmDecoderRuntime {
         Ok(Self {
             whole_decoder,
             logits_head,
+            logits_runtime,
             token_embedding,
             metadata,
         })
     }
 
-    /// `capacity` should be the request-sized bound (prompt tokens + the
-    /// generation budget), NOT the model's native `max_positions`: see
-    /// `firered_llm::llm_transformer::FireRedLlmDecoderRuntime::new_kv_caches`'s
-    /// doc comment (both families drive the same shared executor, and the
-    /// same measured regression applies here) -- `capacity` becomes the
-    /// persistent reuse graph's fixed attention span on Metal/GPU, which is a
-    /// per-token compute cost there, not just a host allocation ceiling.
-    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+    /// Exact post-build Rust container capacity retained by the resident
+    /// decoder actor. Native graph arenas and backend buffers are admitted by
+    /// their constructors and intentionally excluded here.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.whole_decoder.retained_system_memory_bytes()?,
+            "mimo-asr decoder graph handles",
+        )?;
+        bytes.add(
+            self.logits_head.retained_system_memory_bytes()?,
+            "mimo-asr logits head",
+        )?;
+        bytes.add(
+            self.token_embedding.retained_system_memory_bytes()?,
+            "mimo-asr token embedding",
+        )?;
+        Ok(bytes.finish())
+    }
+
+    /// Allocate only the invocation's exact logical host history; the stable
+    /// session reserve is passed independently to the reusable GPU graph.
+    pub(crate) fn new_kv_caches(
+        &self,
+        capacity: Qwen3AsrKvCacheCapacity,
+    ) -> Result<Qwen3AsrHostKvCacheOwner, String> {
         let host = self.whole_decoder.kv_cache_spec().host;
-        (0..self.metadata.n_layers)
-            .map(|_| {
-                Qwen3AsrLayerKvCacheState::new_with_element_type(
-                    capacity,
-                    self.metadata.n_kv_heads,
-                    self.metadata.head_dim,
-                    host,
-                )
-                .unwrap_or_else(|reason| {
-                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                })
-            })
-            .collect()
+        let mode = if self.whole_decoder.supports_graph_reuse() {
+            Qwen3AsrHostKvMode::ResidentOnly
+        } else {
+            Qwen3AsrHostKvMode::Materialized
+        };
+        Qwen3AsrHostKvCacheOwner::try_new(
+            "mimo-asr.decoder.self-kv.host",
+            self.metadata.n_layers,
+            capacity,
+            self.metadata.n_kv_heads,
+            self.metadata.head_dim,
+            host,
+            mode,
+        )
     }
 
     /// Releases the CPU per-token grow-to-fit step buffer before this decoder
@@ -217,6 +309,7 @@ impl MimoLlmDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<MimoLlmPrefillOutput, MimoLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
@@ -226,6 +319,7 @@ impl MimoLlmDecoderRuntime {
                 &prompt_embeddings.token_major_values,
                 token_count,
                 layer_kv_caches,
+                capacity,
                 self.metadata.rope_theta,
                 control,
             )
@@ -246,8 +340,8 @@ impl MimoLlmDecoderRuntime {
                 });
             }
             let logits = self
-                .logits_head
-                .compute_logits_for_last_hidden(&final_hidden)
+                .logits_runtime
+                .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
                 .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
                 })?;
@@ -268,8 +362,8 @@ impl MimoLlmDecoderRuntime {
             })?;
         let final_hidden = self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?;
         let logits = self
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden)
+            .logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
             .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })?;
@@ -284,6 +378,7 @@ impl MimoLlmDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Vec<f32>, MimoLlmDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
         // `run_step_auto` transparently reuses the persistent decode graph on
@@ -296,6 +391,7 @@ impl MimoLlmDecoderRuntime {
                 &hidden,
                 cache_position,
                 layer_kv_caches,
+                capacity,
                 self.metadata.rope_theta,
             )
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
@@ -308,8 +404,8 @@ impl MimoLlmDecoderRuntime {
             self.metadata.n_kv_heads * self.metadata.head_dim,
             layer_kv_caches,
         )?;
-        self.logits_head
-            .compute_logits_for_last_hidden(&step.hidden)
+        self.logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &step.hidden)
             .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
@@ -326,16 +422,16 @@ impl MimoLlmDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Option<u32>, MimoLlmDecoderError> {
         if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
             return Ok(None);
         }
-        let max_positions = layer_kv_caches
-            .first()
-            .map(Qwen3AsrLayerKvCacheState::max_positions)
-            .ok_or_else(|| MimoLlmDecoderError::KvCacheFailed {
+        if layer_kv_caches.is_empty() {
+            return Err(MimoLlmDecoderError::KvCacheFailed {
                 reason: "mimo-asr backbone has no layer KV caches".to_string(),
-            })?;
+            });
+        }
         let hidden = self.gather_token_embedding(token_id)?;
         let step = self
             .whole_decoder
@@ -343,7 +439,7 @@ impl MimoLlmDecoderRuntime {
                 &hidden,
                 &[cache_position],
                 self.metadata.rope_theta,
-                max_positions,
+                capacity.resident_positions(),
             )
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),

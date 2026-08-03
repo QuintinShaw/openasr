@@ -19,14 +19,17 @@
 //! silently skip.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use openasr_core::adapter_pack::{
     LoraAdapterDtype, LoraAdapterWriteRequest, LoraAdapterWriteTarget, OPENASR_ADAPTER_ENV,
     base_pack_model_id, file_sha256_hex, moonshine_lora_targetable_tensors,
     write_lora_adapter_pack,
 };
-use openasr_core::{ExecutionTarget, TranscriptionBackend, TranscriptionRequest};
+use openasr_core::{
+    ExecutionTarget, NativeBackend, NativeExecutionServices, TranscriptionBackend,
+    TranscriptionRequest,
+};
 
 static REAL_DECODE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -97,8 +100,18 @@ fn jfk_audio() -> PathBuf {
     path
 }
 
-fn transcribe(pack_path: &Path, audio_path: &Path) -> Result<String, String> {
-    openasr_core::NativeBackend
+fn native_backend() -> NativeBackend {
+    NativeBackend::new(Arc::new(
+        NativeExecutionServices::for_local_process().expect("test execution services"),
+    ))
+}
+
+fn transcribe(
+    backend: &NativeBackend,
+    pack_path: &Path,
+    audio_path: &Path,
+) -> Result<String, String> {
+    backend
         .transcribe(
             TranscriptionRequest::new(audio_path, MOONSHINE_MODEL_ID)
                 .with_model_pack_path(Some(pack_path.to_path_buf()))
@@ -108,8 +121,8 @@ fn transcribe(pack_path: &Path, audio_path: &Path) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
-fn transcribe_ok(pack_path: &Path, audio_path: &Path) -> String {
-    transcribe(pack_path, audio_path).unwrap_or_else(|error| {
+fn transcribe_ok(backend: &NativeBackend, pack_path: &Path, audio_path: &Path) -> String {
+    transcribe(backend, pack_path, audio_path).unwrap_or_else(|error| {
         panic!(
             "real native transcription failed\npack path: {}\nadapter env: {:?}\nerror: {error}",
             pack_path.display(),
@@ -194,6 +207,7 @@ fn zero_adapter_transcript_exactly_matches_base_real_speech() {
     let _guard = REAL_DECODE_LOCK.lock().expect("real decode lock");
     let pack = resolve_real_pack();
     let audio = jfk_audio();
+    let backend = native_backend();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let eligible = moonshine_lora_targetable_tensors(&pack).expect("eligible targets");
     assert!(
@@ -201,7 +215,7 @@ fn zero_adapter_transcript_exactly_matches_base_real_speech() {
         "moonshine base pack must expose LoRA-eligible tensors"
     );
 
-    let baseline = transcribe_ok(&pack, &audio);
+    let baseline = transcribe_ok(&backend, &pack, &audio);
     assert_eq!(
         baseline,
         MOONSHINE_JFK_BASELINE,
@@ -223,7 +237,7 @@ fn zero_adapter_transcript_exactly_matches_base_real_speech() {
         let adapter_path = write_adapter(dir.path(), &pack, spec);
 
         let _env = AdapterEnvGuard::set(&adapter_path);
-        let with_zero = transcribe_ok(&pack, &audio);
+        let with_zero = transcribe_ok(&backend, &pack, &audio);
         assert_eq!(
             with_zero, baseline,
             "zero adapter ({file_name}) must reproduce the base transcript exactly"
@@ -237,6 +251,7 @@ fn nonzero_cross_v_adapter_changes_transcript() {
     let _guard = REAL_DECODE_LOCK.lock().expect("real decode lock");
     let pack = resolve_real_pack();
     let audio = jfk_audio();
+    let backend = native_backend();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let eligible = moonshine_lora_targetable_tensors(&pack).expect("eligible targets");
     let cross_v = eligible
@@ -245,7 +260,7 @@ fn nonzero_cross_v_adapter_changes_transcript() {
         .cloned()
         .expect("dec.blk.0.cross_v.weight must be eligible");
 
-    let baseline = transcribe_ok(&pack, &audio);
+    let baseline = transcribe_ok(&backend, &pack, &audio);
     assert_eq!(baseline, MOONSHINE_JFK_BASELINE);
 
     // Strong single-target adapter on the cross-V projection: only reachable
@@ -256,7 +271,7 @@ fn nonzero_cross_v_adapter_changes_transcript() {
     let adapter_path = write_adapter(dir.path(), &pack, spec);
 
     let _env = AdapterEnvGuard::set(&adapter_path);
-    let with_adapter = transcribe_ok(&pack, &audio);
+    let with_adapter = transcribe_ok(&backend, &pack, &audio);
     assert_ne!(
         with_adapter, baseline,
         "a strong non-zero cross-V adapter must change the transcript (side-path disconnected?)"
@@ -269,13 +284,14 @@ fn adapter_base_binding_mismatches_fail_closed() {
     let _guard = REAL_DECODE_LOCK.lock().expect("real decode lock");
     let pack = resolve_real_pack();
     let audio = jfk_audio();
+    let backend = native_backend();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let eligible = moonshine_lora_targetable_tensors(&pack).expect("eligible targets");
     let first = eligible.first().cloned().expect("eligible target");
 
     let assert_fails_with = |adapter_path: &Path, expected_fragment: &str| {
         let _env = AdapterEnvGuard::set(adapter_path);
-        let error = transcribe(&pack, &audio).expect_err(&format!(
+        let error = transcribe(&backend, &pack, &audio).expect_err(&format!(
             "adapter '{}' must fail closed (expected error fragment {expected_fragment:?})",
             adapter_path.display()
         ));
@@ -296,7 +312,7 @@ fn adapter_base_binding_mismatches_fail_closed() {
     // (1b) the same rejection through the request-level adapter surface (the
     // CLI `--adapter` plumbing): no env var involved, proving the request
     // path reaches the executor's fail-closed validation.
-    let error = openasr_core::NativeBackend
+    let error = backend
         .transcribe(
             TranscriptionRequest::new(&audio, MOONSHINE_MODEL_ID)
                 .with_model_pack_path(Some(pack.clone()))
@@ -351,6 +367,6 @@ fn adapter_base_binding_mismatches_fail_closed() {
 
     // After all the rejected adapters, no-adapter decode still works and the
     // failures left no cached adapter state behind.
-    let baseline = transcribe_ok(&pack, &audio);
+    let baseline = transcribe_ok(&backend, &pack, &audio);
     assert_eq!(baseline, MOONSHINE_JFK_BASELINE);
 }

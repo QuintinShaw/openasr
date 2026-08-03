@@ -62,8 +62,8 @@ fn firered_runtime_graph_config_with_scheduler_default(
 pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     // `no_alloc` metadata context sized from the actual node count (see
     // `GgmlCpuGraphConfig::metadata_context_bytes`); previously a flat
-    // hardcoded 512 MiB per cached encoder runtime (see the thread-local
-    // cache in `executor.rs`).
+    // hardcoded 512 MiB per cached encoder runtime (formerly held in the
+    // thread-local cache that `executor.rs` replaced with admitted actors).
     //
     // The encoder keeps the scheduler on for Metal: the conformer forward
     // graph was built and parity-verified under multi-backend scheduling and

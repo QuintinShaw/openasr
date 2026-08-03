@@ -1,4 +1,5 @@
 mod batched_decode;
+pub(crate) mod capacity;
 mod execution_policy;
 mod execution_trace;
 mod frontend;

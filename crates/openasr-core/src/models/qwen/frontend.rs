@@ -21,6 +21,15 @@ pub(crate) struct Qwen3AsrMelFrontendPlan {
     pub mel_filters: Vec<f32>,
 }
 
+impl Qwen3AsrMelFrontendPlan {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.window, "qwen mel window")?;
+        bytes.add_vec(&self.mel_filters, "qwen mel filters")?;
+        Ok(bytes.finish())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Qwen3AsrMelFeatures {
     pub n_mels: usize,

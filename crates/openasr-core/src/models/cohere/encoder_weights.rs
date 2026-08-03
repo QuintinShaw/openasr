@@ -79,6 +79,90 @@ pub(crate) struct CohereTranscribeEncoderWeights {
     pub layers: Vec<CohereEncoderLayerWeights>,
 }
 
+impl CohereTranscribeEncoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for weight in [
+            &self.pre_conv0_weight,
+            &self.pre_conv2_weight,
+            &self.pre_conv3_weight,
+            &self.pre_conv5_weight,
+            &self.pre_conv6_weight,
+        ] {
+            weight.add_retained_system_memory(&mut bytes, "cohere encoder tensor weight")?;
+        }
+        for weight in [&self.pre_out_weight, &self.encoder_projection_weight] {
+            weight.add_retained_system_memory(&mut bytes, "cohere encoder matrix weight")?;
+        }
+        for weight in [
+            &self.pre_conv0_bias,
+            &self.pre_conv2_bias,
+            &self.pre_conv3_bias,
+            &self.pre_conv5_bias,
+            &self.pre_conv6_bias,
+            &self.pre_out_bias,
+            &self.encoder_projection_bias,
+        ] {
+            weight.add_retained_system_memory(&mut bytes, "cohere encoder vector weight")?;
+        }
+        bytes.add_vec(&self.layers, "cohere encoder layers")?;
+        for layer in &self.layers {
+            for weight in [
+                &layer.ff1_up_weight,
+                &layer.ff1_down_weight,
+                &layer.attn_q_weight,
+                &layer.attn_k_weight,
+                &layer.attn_v_weight,
+                &layer.attn_out_weight,
+                &layer.attn_pos_weight,
+                &layer.attn_pos_bias_u,
+                &layer.attn_pos_bias_v,
+                &layer.ff2_up_weight,
+                &layer.ff2_down_weight,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "cohere encoder layer matrix")?;
+            }
+            for weight in [
+                &layer.conv_pw1_weight,
+                &layer.conv_dw_weight,
+                &layer.conv_pw2_weight,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "cohere encoder layer tensor")?;
+            }
+            for weight in [
+                &layer.ff1_norm_weight,
+                &layer.ff1_norm_bias,
+                &layer.ff1_up_bias,
+                &layer.ff1_down_bias,
+                &layer.attn_norm_weight,
+                &layer.attn_norm_bias,
+                &layer.attn_q_bias,
+                &layer.attn_k_bias,
+                &layer.attn_v_bias,
+                &layer.attn_out_bias,
+                &layer.conv_norm_weight,
+                &layer.conv_norm_bias,
+                &layer.conv_pw1_bias,
+                &layer.conv_dw_bias,
+                &layer.conv_bn_weight,
+                &layer.conv_bn_bias,
+                &layer.conv_bn_mean,
+                &layer.conv_bn_var,
+                &layer.conv_pw2_bias,
+                &layer.ff2_norm_weight,
+                &layer.ff2_norm_bias,
+                &layer.ff2_up_bias,
+                &layer.ff2_down_bias,
+                &layer.out_norm_weight,
+                &layer.out_norm_bias,
+            ] {
+                weight.add_retained_system_memory(&mut bytes, "cohere encoder layer vector")?;
+            }
+        }
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) type CohereEncoderWeightsError = CohereWeightLoadError;
 const GGML_TYPE_F16: i32 = 1;
 const COHERE_ENCODER_CONV_BN_EPSILON: f32 = 1.0e-5;

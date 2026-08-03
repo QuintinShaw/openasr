@@ -30,6 +30,25 @@ impl PhraseBiasTokenEncoder for CohereTranscribeTokenizer {
 impl BuiltinSeq2SeqDecodePolicyTokenSource for CohereTranscribeTokenizer {}
 
 impl CohereTranscribeTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "cohere tokenizer id table")?;
+        for token in &self.id_to_token {
+            bytes.add_string(token, "cohere tokenizer id token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "cohere tokenizer token map byte count overflowed".to_string())?,
+            "cohere tokenizer token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "cohere tokenizer token map key")?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
         let tokenizer_model =
             required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, COHERE_TOKENIZER_FAMILY)?;

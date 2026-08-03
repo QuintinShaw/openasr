@@ -49,7 +49,7 @@ pub(crate) struct WordPiecePiece {
 #[derive(Debug, Clone)]
 pub(crate) struct FireRedPuncTokenizer {
     vocab: Vec<String>,
-    token_to_id: std::collections::HashMap<String, u32>,
+    token_to_id: std::collections::BTreeMap<String, u32>,
     cls_id: u32,
     sep_id: u32,
     unk_id: u32,
@@ -61,7 +61,7 @@ impl FireRedPuncTokenizer {
         if vocab.is_empty() {
             return Err(FireRedPuncTokenizerError::EmptyVocab);
         }
-        let mut token_to_id = std::collections::HashMap::with_capacity(vocab.len());
+        let mut token_to_id = std::collections::BTreeMap::new();
         for (idx, token) in vocab.iter().enumerate() {
             token_to_id.entry(token.clone()).or_insert(idx as u32);
         }
@@ -83,6 +83,25 @@ impl FireRedPuncTokenizer {
             unk_id,
             pad_id,
         })
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.vocab, "firered-punc tokenizer vocab")?;
+        for token in &self.vocab {
+            bytes.add_string(token, "firered-punc tokenizer vocab token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "firered-punc tokenizer map byte count overflowed".to_string())?,
+            "firered-punc tokenizer map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "firered-punc tokenizer map token")?;
+        }
+        Ok(bytes.finish())
     }
 
     pub(crate) fn vocab_size(&self) -> usize {

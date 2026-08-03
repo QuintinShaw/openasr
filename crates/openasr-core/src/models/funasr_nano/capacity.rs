@@ -1,12 +1,6 @@
-//! funasr-nano capacity derivation: the family's Qwen3 decoder KV geometry
-//! and the decoder positions a single decode of a given audio span needs,
-//! assembled from PACK METADATA (`FunasrNanoDecoderMetadata`) plus the same
-//! frontend / audio-token / generation constants the executor uses, so the
-//! shared host-memory admission check
-//! ([`crate::capacity::evaluate_host_memory_admission`]) can refuse a request
-//! that plainly cannot fit BEFORE the ggml graph build turns the shortfall
-//! into an opaque allocation failure. The funasr-nano analogue of
-//! [`crate::models::firered_llm::capacity`] / [`crate::models::qwen::capacity`].
+//! FunASR-Nano decoder-state topology. Its exact position bound is assembled
+//! from pack metadata, the tokenized prompt wrapper, and the same frontend and
+//! generation shape facts used by execution.
 //!
 //! Reuses, never re-derives:
 //! - KV geometry comes straight off the parsed pack (`funasr.llm.*` are
@@ -17,46 +11,74 @@
 //!   (`LFR_N = 6`), and the official low-frame-rate truncation
 //!   ([`super::decode_prompt::funasr_nano_audio_token_count`], the same
 //!   function the real decode path calls).
-//! - The generation budget and the single-decode window reuse the executor's
-//!   own constants ([`super::executor::FUNASR_NANO_MAX_GENERATED_TOKENS`],
-//!   [`super::executor::FUNASR_NANO_MAX_INPUT_SECONDS`]), so admission
-//!   charges the same `prompt + generation` KV capacity
-//!   `FunasrNanoDecoderRuntime::new_kv_caches` actually allocates.
+//! - The generation budget reuses the executor's own constant, so planning
+//!   and allocation share one `prompt + generation` contract.
 
 use crate::capacity::KvGeometry;
-use crate::models::sensevoice::frontend::{LFR_N, SAMPLE_RATE_HZ};
+use crate::capacity::topology::{
+    DecoderStateDemandScope, DecoderStateTopology, InvocationEnvelope, InvocationShapeInput,
+    PositionBoundProof, StateDemand, StateKind, TopologyError,
+    causal_prefix_positions_with_context_cap,
+};
+use crate::models::ggml_asr_executor::{
+    GgmlAsrDecoderStatePlanningError, GgmlAsrDecoderStatePlanningInput,
+};
+use crate::models::sensevoice::frontend::{SAMPLE_RATE_HZ, sensevoice_lfr_frame_count_for_samples};
+use crate::nn::decoder::LlmKvCacheSpec;
 
 use super::decode_prompt::funasr_nano_audio_token_count;
-use super::executor::{FUNASR_NANO_MAX_GENERATED_TOKENS, FUNASR_NANO_MAX_INPUT_SECONDS};
+use super::executor::FUNASR_NANO_MAX_GENERATED_TOKENS;
 use super::runtime_contract::FunasrNanoDecoderMetadata;
 
-/// Kaldi fbank frame length / shift the SenseVoice `WavFrontend` pins
-/// (25 ms / 10 ms @ 16 kHz) -- the same constants
-/// `crate::models::sensevoice::frontend`'s frontend config carries. Kept local
-/// (rather than reaching into the private frontend config) so the admission
-/// arithmetic stays a pure function of publicly named family facts.
-const FBANK_FRAME_LENGTH_SAMPLES: usize = 400;
-const FBANK_FRAME_SHIFT_SAMPLES: usize = 160;
+pub(crate) const FUNASR_NANO_SELF_KV_STATE_ID: &str = "funasr-nano.decoder.self_kv";
 
-/// The audio a single funasr-nano decode is estimated to fold in, for
-/// admission. The executor fails closed above this upstream hard cap
-/// (`FUNASR_NANO_MAX_INPUT_SECONDS`, ~40s OOD-repeat bound), and longer
-/// recordings reach it only as longform slices each at or under this bound --
-/// so no single decode's KV cache ever spans more audio. Clamping here is the
-/// funasr-nano analogue of firered-llm's
-/// `FIRERED_LLM_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS` clamp: a multi-hour
-/// recording is judged by what one decode actually needs, never falsely
-/// rejected as if it decoded whole.
-pub(crate) const FUNASR_NANO_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS: f32 =
-    FUNASR_NANO_MAX_INPUT_SECONDS;
+pub(crate) fn plan_funasr_nano_decoder_state(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "funasr-nano";
+    let metadata = input.preflight.metadata.as_ref();
+    let decoder =
+        super::runtime_contract::parse_funasr_nano_decoder_metadata(metadata).map_err(|error| {
+            GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+                family,
+                reason: error.to_string(),
+            }
+        })?;
+    let tokenizer =
+        super::tokenizer::FunasrNanoTokenizer::from_gguf_metadata(metadata).map_err(|error| {
+            GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            }
+        })?;
+    let prompt =
+        super::decode_prompt::build_funasr_nano_decode_prompt(&tokenizer, 1).map_err(|error| {
+            GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            }
+        })?;
+    let fixed_prompt_tokens = prompt.token_ids.len().checked_sub(1).ok_or_else(|| {
+        GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: "dummy audio span was absent from the tokenized prompt".to_string(),
+        }
+    })?;
+    let geometry = funasr_nano_kv_geometry(&decoder);
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        input.backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    crate::capacity::topology::DecoderStatePlan::build(
+        &FunasrNanoDecoderStateTopology::new(decoder, fixed_prompt_tokens, spec),
+        input.invocation,
+        input.envelope,
+    )
+    .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })
+}
 
-/// Fixed ChatML wrapper tokens around the audio span
-/// (`<|im_start|>system ... <|im_start|>user\n语音转写：` prefix +
-/// `<|im_end|>\n<|im_start|>assistant\n` suffix, see
-/// `super::decode_prompt::build_funasr_nano_decode_prompt`). A small
-/// conservative figure, dwarfed by the audio-token term at any real duration;
-/// its exact value cannot swing an admission decision.
-const FUNASR_NANO_ADMISSION_FIXED_PROMPT_TOKENS: usize = 32;
+const FUNASR_NANO_MAX_INPUT_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 40;
 
 /// The decoder KV geometry the loaded pack advertises.
 pub(crate) fn funasr_nano_kv_geometry(decoder: &FunasrNanoDecoderMetadata) -> KvGeometry {
@@ -67,44 +89,92 @@ pub(crate) fn funasr_nano_kv_geometry(decoder: &FunasrNanoDecoderMetadata) -> Kv
     }
 }
 
-/// Decoder positions a single decode of `audio_duration_seconds` requires --
-/// the admission figure `evaluate_host_memory_admission` charges KV bytes
-/// against. Mirrors the runtime's own KV-capacity sizing
-/// (`decode_prompt.token_ids.len() + FUNASR_NANO_MAX_GENERATED_TOKENS` in
-/// `super::executor`): fixed wrapper + one audio token per kept adaptor
-/// output frame + the full runaway-generation backstop, with the audio
-/// clamped to the family's single-decode window.
-pub(crate) fn funasr_nano_admission_required_positions(audio_duration_seconds: f32) -> usize {
-    let admission_seconds =
-        audio_duration_seconds.clamp(0.0, FUNASR_NANO_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS);
-    let samples = (admission_seconds * SAMPLE_RATE_HZ as f32) as usize;
-    // snip_edges fbank framing: 1 + (len - frame_length) / frame_shift.
-    let mel_frames = samples
-        .checked_sub(FBANK_FRAME_LENGTH_SAMPLES)
-        .map(|tail| 1 + tail / FBANK_FRAME_SHIFT_SAMPLES)
-        .unwrap_or(0);
-    // FunASR LFR stacking: ceil(mel_frames / LFR_N), matching
-    // `sensevoice::frontend::apply_lfr`'s output-frame count (computed from
-    // the original, pre-padding frame count).
-    let lfr_frames = if mel_frames == 0 {
-        0
-    } else {
-        mel_frames.div_ceil(LFR_N)
-    };
-    // Official low-frame-rate truncation -- the same function the executor
-    // calls after the adaptor. A degenerate frame count resolves to a tiny
-    // positive audio-token count (the formula bottoms at 1); an under-estimate
-    // resolves to "allow" per `crate::capacity`'s fail-open invariant.
-    let audio_tokens = funasr_nano_audio_token_count(lfr_frames);
-    FUNASR_NANO_ADMISSION_FIXED_PROMPT_TOKENS
-        .saturating_add(audio_tokens)
-        .saturating_add(FUNASR_NANO_MAX_GENERATED_TOKENS)
+pub(crate) fn funasr_nano_audio_token_count_for_samples(
+    samples: usize,
+) -> Result<usize, TopologyError> {
+    let lfr_frames = sensevoice_lfr_frame_count_for_samples(samples);
+    if lfr_frames == 0 {
+        return Err(TopologyError::Unavailable {
+            reason: "funasr-nano audio is too short to produce one fbank frame".to_string(),
+        });
+    }
+    Ok(funasr_nano_audio_token_count(lfr_frames))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FunasrNanoDecoderStateTopology {
+    decoder: FunasrNanoDecoderMetadata,
+    fixed_prompt_tokens: usize,
+    kv_spec: LlmKvCacheSpec,
+}
+
+impl FunasrNanoDecoderStateTopology {
+    pub(crate) const fn new(
+        decoder: FunasrNanoDecoderMetadata,
+        fixed_prompt_tokens: usize,
+        kv_spec: LlmKvCacheSpec,
+    ) -> Self {
+        Self {
+            decoder,
+            fixed_prompt_tokens,
+            kv_spec,
+        }
+    }
+}
+
+impl DecoderStateTopology for FunasrNanoDecoderStateTopology {
+    fn demands(
+        &self,
+        scope: DecoderStateDemandScope<InvocationShapeInput, InvocationEnvelope>,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        let invocation = match scope {
+            DecoderStateDemandScope::ExactInvocation(invocation) => invocation,
+            DecoderStateDemandScope::StableEnvelope(envelope) => envelope.maximum_invocation(),
+        };
+        if invocation.sample_rate_hz().get() != SAMPLE_RATE_HZ {
+            return Err(TopologyError::UnsupportedSampleRate {
+                expected_hz: SAMPLE_RATE_HZ,
+                actual_hz: invocation.sample_rate_hz().get(),
+            });
+        }
+        if invocation.samples() > FUNASR_NANO_MAX_INPUT_SAMPLES {
+            return Err(TopologyError::InvocationSampleLimitExceeded {
+                required_samples: invocation.samples(),
+                max_samples: FUNASR_NANO_MAX_INPUT_SAMPLES,
+            });
+        }
+        let audio_tokens = funasr_nano_audio_token_count_for_samples(invocation.samples())?;
+        let prompt_positions = self.fixed_prompt_tokens.checked_add(audio_tokens).ok_or(
+            TopologyError::ArithmeticOverflow {
+                operation: "funasr-nano prompt positions",
+            },
+        )?;
+        let positions = causal_prefix_positions_with_context_cap(
+            FUNASR_NANO_SELF_KV_STATE_ID,
+            prompt_positions,
+            FUNASR_NANO_MAX_GENERATED_TOKENS,
+            self.decoder.max_positions,
+        )?;
+        Ok(vec![StateDemand::from_llm_kv_geometry(
+            FUNASR_NANO_SELF_KV_STATE_ID,
+            StateKind::SelfAttentionKv,
+            positions,
+            self.decoder.max_positions,
+            funasr_nano_kv_geometry(&self.decoder),
+            self.kv_spec,
+            invocation.sequences().get() as usize,
+            PositionBoundProof::Exact,
+        )?])
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
     use crate::capacity::kv_bytes_per_position;
+    use crate::capacity::topology::{DecoderStatePlan, InvocationEnvelope, StateKind};
     use crate::nn::decoder::LlmKvCacheSpec;
 
     /// Real-checkpoint-shaped metadata (Qwen3-0.6B decoder: 28 layers, GQA
@@ -144,34 +214,56 @@ mod tests {
     }
 
     #[test]
-    fn required_positions_is_clamped_to_the_single_decode_window() {
-        // 40s and 3600s clamp to the same single-decode window: the executor
-        // hard-caps a single decode at 40s and longform slices the rest, so a
-        // multi-hour recording is never judged as one giant decode.
-        let at_window = funasr_nano_admission_required_positions(
-            FUNASR_NANO_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS,
+    fn topology_matches_the_exact_runtime_shape() {
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(40_000).unwrap(),
+        )
+        .unwrap();
+        let plan = DecoderStatePlan::for_envelope(
+            &FunasrNanoDecoderStateTopology::new(reference_decoder(), 32, LlmKvCacheSpec::DEFAULT),
+            envelope,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.reserve_positions(StateKind::SelfAttentionKv),
+            Some(627)
         );
-        let at_hour = funasr_nano_admission_required_positions(3600.0);
-        assert_eq!(at_window, at_hour);
-        // A short clip needs strictly fewer positions than a full window.
-        let short = funasr_nano_admission_required_positions(5.0);
-        assert!(short < at_window, "short={short} window={at_window}");
-        // Sanity: well under the pack's 40960 context ceiling at any window.
-        assert!(at_window < reference_decoder().max_positions);
     }
 
     #[test]
-    fn required_positions_walks_the_runtime_pipeline_arithmetic() {
-        // 40s at 16kHz snip-edges fbank: 1 + (640000-400)/160 = 3998 mel
-        // frames -> LFR ceil(3998/6) = 667 lfr frames ->
-        // funasr_nano_audio_token_count(667):
-        //   conv(t) = 1 + (t - 3 + 2) / 2
-        //   conv(667) = 1 + 666/2 = 334
-        //   conv(334) = 1 + 333/2 = 167
-        //   n_aud = (167 - 1) / 2 + 1 = 84
-        // required = 32 fixed + 84 audio + 512 generation backstop = 628.
-        let positions = funasr_nano_admission_required_positions(40.0);
-        assert_eq!(positions, 628);
-        assert_eq!(funasr_nano_audio_token_count(667), 84);
+    fn duration_and_context_boundaries_match_lfr_and_greedy_schedule() {
+        let rate = NonZeroU32::new(16_000).unwrap();
+        let topology =
+            FunasrNanoDecoderStateTopology::new(reference_decoder(), 32, LlmKvCacheSpec::DEFAULT);
+        for (seconds, expected_positions) in [(1, 546), (30, 606), (40, 627)] {
+            let envelope = InvocationEnvelope::new(rate, seconds * 16_000).unwrap();
+            let plan = DecoderStatePlan::for_envelope(&topology, envelope).unwrap();
+            assert_eq!(
+                plan.reserve_positions_by_id(FUNASR_NANO_SELF_KV_STATE_ID),
+                Some(expected_positions)
+            );
+        }
+        for seconds in [60, 300] {
+            let envelope = InvocationEnvelope::new(rate, seconds * 16_000).unwrap();
+            assert!(matches!(
+                DecoderStatePlan::for_envelope(&topology, envelope),
+                Err(TopologyError::InvocationSampleLimitExceeded { .. })
+            ));
+        }
+
+        let mut small = reference_decoder();
+        small.max_positions = 546;
+        assert!(matches!(
+            DecoderStatePlan::for_envelope(
+                &FunasrNanoDecoderStateTopology::new(small, 32, LlmKvCacheSpec::DEFAULT),
+                InvocationEnvelope::new(rate, 16_000).unwrap(),
+            ),
+            Err(TopologyError::SemanticContextCapExceeded {
+                required: 547,
+                hard_cap: 546,
+                ..
+            })
+        ));
     }
 }

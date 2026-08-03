@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -25,7 +24,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
     SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
-    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    ServeBatchEngineRegistry,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -45,10 +44,6 @@ const COHERE_SERVE_BATCH_SEND_TIMEOUT: std::time::Duration = std::time::Duration
 #[cfg(test)]
 const COHERE_SERVE_BATCH_REPLY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
-
-static COHERE_SERVE_BATCH_ENGINES: OnceLock<
-    Mutex<HashMap<CohereServeBatchEngineKey, Arc<ServeBatchEngine<CohereFamily>>>>,
-> = OnceLock::new();
 
 /// Field-identical alias onto the generic `ServeBatchConfig`. Preserved so
 /// `ggml_executor`'s `CohereServeBatchConfig::from_env()` and the tests'
@@ -81,6 +76,7 @@ pub(crate) struct CohereServeBatchJob {
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
     pub decoder_weights: Arc<CohereTranscribeDecoderWeights>,
+    pub decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     pub tokenizer: Arc<CohereTranscribeTokenizer>,
     pub metadata: CohereTranscribeExecutionMetadata,
     pub encoder_output: CohereTranscribeEncoderOutput,
@@ -140,33 +136,35 @@ impl CohereServeBatchError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CohereServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
-    backend: GgmlCpuGraphBackend,
-    frame_count: usize,
-    hidden_size: usize,
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+    resident_self_positions: usize,
+    resident_cross_positions: usize,
     max_batch: usize,
 }
+
+pub(super) type CohereServeBatchEngineRegistry = ServeBatchEngineRegistry<CohereFamily>;
 
 /// Production engine-key composition. Kept free so tests exercise the same
 /// path as `Seq2SeqServeBatchFamily::engine_key` without building a full job.
 pub(crate) fn cohere_serve_batch_engine_key(
     build_identity: crate::RuntimeBuildIdentity,
     backend: GgmlCpuGraphBackend,
-    frame_count: usize,
-    hidden_size: usize,
+    resident_self_positions: usize,
+    resident_cross_positions: usize,
     max_batch: usize,
 ) -> CohereServeBatchEngineKey {
     CohereServeBatchEngineKey {
         build_identity,
-        backend,
-        frame_count,
-        hidden_size,
+        lane: crate::models::native_execution_services::current_execution_lane_key(backend),
+        resident_self_positions,
+        resident_cross_positions,
         max_batch,
     }
 }
 
 /// The cohere serve-batch ZST family wiring (`Seq2SeqServeBatchFamily`) that
 /// drives the generic `OwnerThreadState` + generic `ServeBatchEngine`.
-struct CohereFamily;
+pub(super) struct CohereFamily;
 
 #[cfg(test)]
 type CohereServeBatchEnvelope = Envelope<CohereFamily>;
@@ -184,24 +182,28 @@ pub(crate) struct CohereBatchSlot {
 }
 
 pub(super) fn submit_cohere_serve_batch_job(
+    registry: &CohereServeBatchEngineRegistry,
     config: CohereServeBatchConfig,
     job: CohereServeBatchJob,
 ) -> Result<CohereDecoderGraphDecodeOutput, CohereServeBatchError> {
     let config = config.validate_for_job::<CohereFamily>(&job)?;
     let key = CohereFamily::engine_key(&job, config.max_batch);
-    serve_batch_engine_for_key(&COHERE_SERVE_BATCH_ENGINES, key, config)?.submit(job)
+    let engine = registry.engine_for_key(key.clone(), config)?;
+    let result = engine.submit(job);
+    registry.evict_after_candidate_failure(&key, &engine);
+    result
 }
 
-pub(super) fn shutdown_cohere_serve_batch_engines() {
-    shutdown_and_remove_serve_batch_engines(&COHERE_SERVE_BATCH_ENGINES);
+pub(super) fn shutdown_cohere_serve_batch_engines(registry: &CohereServeBatchEngineRegistry) {
+    registry.shutdown();
 }
 
 fn cohere_serve_batch_vram_slot_bytes(job: &CohereServeBatchJob) -> usize {
     serve_batch_estimate_seq2seq_slot_bytes(
         job.metadata.decoder_layers,
-        job.metadata.decoder_max_context,
+        job.decoder_state.self_attention.resident_positions,
         job.metadata.decoder_d_model,
-        job.encoder_output.frame_count,
+        job.decoder_state.cross_attention.resident_positions,
         job.encoder_output.hidden_size,
         std::mem::size_of::<u16>(),
         std::mem::size_of::<f32>(),
@@ -216,7 +218,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
         CohereDecoderGraphRuntime::new(
             &job.decoder_weights,
             job.metadata,
-            job.encoder_output.frame_count,
+            job.decoder_state,
             job.encoder_output.hidden_size,
             job.backend,
             job.prefer_cpu_backend,
@@ -228,7 +230,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
         CohereDecoderGraphRuntime::new_with_n_seq(
             &job.decoder_weights,
             job.metadata,
-            job.encoder_output.frame_count,
+            job.decoder_state,
             job.encoder_output.hidden_size,
             job.backend,
             job.prefer_cpu_backend,
@@ -256,6 +258,11 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
             &job.encoder_output,
         )
         .map_err(map_decoder_error)
+    }
+
+    fn configure_for_job(&mut self, job: &Self::Job) -> Result<(), Self::Error> {
+        self.activate_decoder_state(job.decoder_state)
+            .map_err(map_decoder_error)
     }
 
     fn compute_batched_prefill_logits(
@@ -294,14 +301,14 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
         cohere_serve_batch_engine_key(
             job.build_identity.clone(),
             job.backend,
-            job.encoder_output.frame_count,
-            job.encoder_output.hidden_size,
+            job.decoder_state.self_attention.resident_positions,
+            job.decoder_state.cross_attention.resident_positions,
             max_batch,
         )
     }
 
     fn engine_key_backend(key: &Self::EngineKey) -> GgmlCpuGraphBackend {
-        key.backend
+        key.lane.backend()
     }
 
     fn can_batch_with(a: &Self::Job, b: &Self::Job) -> bool {
@@ -333,7 +340,7 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
     }
 
     fn decoder_max_context(job: &Self::Job) -> usize {
-        job.metadata.decoder_max_context
+        job.decoder_state.self_attention.logical_positions
     }
 
     fn slot_new(job: Self::Job) -> Result<Self::Slot, Self::Error> {
@@ -374,6 +381,9 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
                     reason: "cohere serve batch serial runtime cache is unexpectedly empty"
                         .to_string(),
                 })?;
+        runtime
+            .activate_decoder_state(job.decoder_state)
+            .map_err(map_decoder_error)?;
         runtime
             .populate_cross_attention_cache(&job.encoder_output)
             .map_err(map_decoder_error)?;
@@ -466,6 +476,7 @@ impl CohereServeBatchJob {
             && self.decode_config.eot_token_id == other.decode_config.eot_token_id
             && self.decode_config.vocab_size == other.decode_config.vocab_size
             && self.metadata.decoder_max_context == other.metadata.decoder_max_context
+            && self.decoder_state == other.decoder_state
     }
 }
 
@@ -585,6 +596,7 @@ pub(super) fn cohere_serve_batch_decode_config(
     prompt_tokens: &[u32],
     metadata: CohereTranscribeExecutionMetadata,
     encoder_frame_count: usize,
+    decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     eos_token_id: u32,
     tokenizer: &CohereTranscribeTokenizer,
     phrase_bias: Option<&PhraseBiasConfig>,
@@ -592,6 +604,22 @@ pub(super) fn cohere_serve_batch_decode_config(
     let max_generated_tokens =
         decoder_max_generated_tokens_with_env(prompt_tokens, metadata, encoder_frame_count)
             .map_err(map_decoder_error)?;
+    let planned_self_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+        prompt_tokens.len(),
+        max_generated_tokens,
+    )
+    .map_err(|error| CohereServeBatchError::DecodeFailed {
+        reason: error.to_string(),
+    })?;
+    decoder_state
+        .self_attention
+        .validate_exact_shape(
+            crate::capacity::topology::StateKind::SelfAttentionKv,
+            planned_self_positions,
+        )
+        .map_err(|error| CohereServeBatchError::DecodeFailed {
+            reason: error.to_string(),
+        })?;
     let descriptor =
         crate::models::decode_policy_component_registry::resolve_builtin_decode_policy(
             crate::COHERE_TRANSCRIBE_DECODE_POLICY_ID,
@@ -923,6 +951,26 @@ mod tests {
         require_concrete_execution_context(execution_context);
     }
 
+    fn decoder_state(
+        metadata: CohereTranscribeExecutionMetadata,
+        cross_positions: usize,
+    ) -> crate::models::seq2seq_decoder_state::Seq2SeqDecoderState {
+        use crate::models::seq2seq_decoder_state::{Seq2SeqDecoderState, Seq2SeqStateAxis};
+
+        Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: metadata.decoder_max_context,
+                resident_positions: metadata.decoder_max_context,
+                hard_position_cap: metadata.decoder_max_context,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: cross_positions,
+                resident_positions: cross_positions,
+                hard_position_cap: cross_positions,
+            },
+        }
+    }
+
     fn batch_job(
         runtime_path: &Path,
         backend: GgmlCpuGraphBackend,
@@ -958,6 +1006,7 @@ mod tests {
         prefer_cpu_backend: bool,
         max_generated_tokens: usize,
     ) -> CohereServeBatchJob {
+        let decoder_state = decoder_state(metadata, encoder_output.frame_count);
         CohereServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
@@ -973,6 +1022,7 @@ mod tests {
             decoder_weights,
             tokenizer,
             metadata,
+            decoder_state,
             encoder_output,
             decode_config: Seq2SeqGreedyDecodeConfig {
                 initial_prompt_tokens: vec![0],
@@ -1031,7 +1081,7 @@ mod tests {
         let mut serial_runtime_0 = CohereDecoderGraphRuntime::new(
             &decoder_weights,
             metadata,
-            encoder_output_0.frame_count,
+            decoder_state(metadata, encoder_output_0.frame_count),
             encoder_output_0.hidden_size,
             backend,
             prefer_cpu_backend,
@@ -1047,7 +1097,7 @@ mod tests {
         let mut serial_runtime_1 = CohereDecoderGraphRuntime::new(
             &decoder_weights,
             metadata,
-            encoder_output_1.frame_count,
+            decoder_state(metadata, encoder_output_1.frame_count),
             encoder_output_1.hidden_size,
             backend,
             prefer_cpu_backend,
@@ -1063,7 +1113,7 @@ mod tests {
         let mut batched_runtime = CohereDecoderGraphRuntime::new_with_n_seq(
             &decoder_weights,
             metadata,
-            encoder_output_0.frame_count,
+            decoder_state(metadata, encoder_output_0.frame_count),
             encoder_output_0.hidden_size,
             backend,
             prefer_cpu_backend,
@@ -1182,6 +1232,7 @@ mod tests {
                 CohereServeBatchEnvelope {
                     job,
                     context,
+                    native_execution_context: None,
                     reply,
                 },
                 reply_rx,
@@ -1284,6 +1335,7 @@ mod tests {
                     CohereServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,
@@ -1376,6 +1428,7 @@ mod tests {
                     CohereServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,
@@ -1475,6 +1528,7 @@ mod tests {
                     CohereServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,
@@ -1581,6 +1635,7 @@ mod tests {
                     CohereServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,
@@ -1682,6 +1737,7 @@ mod tests {
                     CohereServeBatchEnvelope {
                         job,
                         context,
+                        native_execution_context: None,
                         reply,
                     },
                     reply_rx,

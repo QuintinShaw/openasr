@@ -31,6 +31,120 @@ pub(crate) struct CoherePreparedRuntime {
 }
 
 impl CoherePreparedRuntime {
+    pub(crate) fn system_memory_quote(
+        context: crate::models::prepared_runtime_cache::PreparedRuntimeQuoteContext<'_>,
+        pack_content_id: &str,
+    ) -> Result<
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote,
+        crate::models::system_memory_owner::SystemMemoryOwnerError,
+    > {
+        let mut quote = crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder::new::<
+            Self,
+        >(pack_content_id);
+        quote.add_tokenizer_metadata(context.metadata, true)?;
+        for tensor in context.tensor_index.tensors() {
+            // Cohere's runtime-ready matrices/vectors retain mmap-backed owned
+            // payload descriptors, not copied tensor bytes. Encoder frontend,
+            // bias/norm/statistic tensors and the few non-runtime projections
+            // are the explicit f32 materialization set.
+            add_cohere_owned_payload_metadata(&mut quote, tensor)?;
+            if cohere_tensor_materializes_f32(&tensor.name) {
+                quote.add_tensor_f32(context.tensor_index, &tensor.name)?;
+            }
+        }
+        quote.finish()
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.tokenizer.retained_system_memory_bytes()?,
+            "cohere prepared tokenizer",
+        )?;
+        bytes.add(
+            self.frontend_plan.retained_system_memory_bytes()?,
+            "cohere prepared frontend",
+        )?;
+        bytes.add(
+            self.encoder_weights.retained_system_memory_bytes()?,
+            "cohere prepared encoder weights",
+        )?;
+        bytes.add(
+            self.decoder_weights.retained_system_memory_bytes()?,
+            "cohere prepared decoder weights",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
+fn add_cohere_owned_payload_metadata(
+    quote: &mut crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder,
+    tensor: &crate::GgufTensorMetadata,
+) -> Result<(), crate::models::system_memory_owner::SystemMemoryOwnerError> {
+    use crate::models::system_memory_owner::SystemMemoryOwnerError;
+
+    let name_bytes = u64::try_from(tensor.name.len()).map_err(|_| {
+        SystemMemoryOwnerError::capacity_failure(
+            "prepared_runtime_quote",
+            "cohere tensor name length does not fit u64",
+        )
+    })?;
+    let type_name_bytes = u64::try_from(tensor.type_name.len()).map_err(|_| {
+        SystemMemoryOwnerError::capacity_failure(
+            "prepared_runtime_quote",
+            "cohere tensor type-name length does not fit u64",
+        )
+    })?;
+    let rank = u64::try_from(tensor.dims.len()).map_err(|_| {
+        SystemMemoryOwnerError::capacity_failure(
+            "prepared_runtime_quote",
+            "cohere tensor rank does not fit u64",
+        )
+    })?;
+    // Weight name + owned payload metadata name/type-name. The weight's own
+    // dims plus the two payload dim vectors account for every explicitly
+    // requested descriptor Vec; mmap tensor bytes are not copied.
+    quote.add_owned_bytes(
+        name_bytes.checked_mul(2).ok_or_else(|| {
+            SystemMemoryOwnerError::capacity_failure(
+                "prepared_runtime_quote",
+                "cohere owned tensor-name bytes overflowed",
+            )
+        })?,
+        "cohere owned tensor names",
+    )?;
+    quote.add_owned_bytes(type_name_bytes, "cohere owned tensor type name")?;
+    quote.add_owned_elements::<usize>(rank, "cohere weight dims")?;
+    quote.add_owned_elements::<usize>(rank, "cohere payload dims")?;
+    quote.add_owned_elements::<u64>(rank, "cohere payload metadata dims")
+}
+
+fn cohere_tensor_materializes_f32(name: &str) -> bool {
+    use super::tensor_names::{
+        ENC_PRE_OUT_BIAS, ENC_PRE_OUT_WEIGHT, ENC_PROJ_BIAS, FE_MEL_FB, FE_WINDOW,
+    };
+
+    if matches!(
+        name,
+        FE_MEL_FB | FE_WINDOW | ENC_PRE_OUT_WEIGHT | ENC_PRE_OUT_BIAS | ENC_PROJ_BIAS
+    ) {
+        return true;
+    }
+    if name.starts_with("enc.pre.conv.") {
+        return name.ends_with(".bias");
+    }
+    name.starts_with("enc.blk.")
+        && (name.contains(".norm.")
+            || name.ends_with(".bias")
+            || name.ends_with(".mean")
+            || name.ends_with(".var")
+            || name.ends_with("attn.pos.weight")
+            || name.ends_with("attn.pos_bias_u")
+            || name.ends_with("attn.pos_bias_v")
+            || name.ends_with("conv.dw.weight"))
+}
+
+impl CoherePreparedRuntime {
     pub(crate) fn decode_prompt(
         &self,
         language: Option<&str>,

@@ -8,14 +8,6 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
-
-use super::RedimNet2Embedder;
-use super::SpeakerEmbedder;
-use crate::models::thread_local_runtime_cache::PackContentKey;
-
-static ACTIVE_REDIMNET: LazyLock<Mutex<Option<(PackContentKey, Arc<RedimNet2Embedder>, u64)>>> =
-    LazyLock::new(|| Mutex::new(None));
 
 const REDIMNET_PACK_ENV: &str = "OPENASR_REDIMNET_PACK";
 const REDIMNET_INSTALLED_MODEL_ID_HINT: &str = "redimnet2-b6-cn";
@@ -64,159 +56,16 @@ pub struct SpeakerEmbedderIdentity {
     pub pack_fingerprint: String,
 }
 
-fn redimnet_pack_path() -> Option<PathBuf> {
+pub(crate) fn redimnet_pack_path() -> Option<PathBuf> {
     crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_INSTALLED_MODEL_ID_HINT)
 }
 
 /// Whether the ReDimNet2-B6 embedder pack is resolvable right now (env override
-/// or installed location), without loading the weights. Capability reporting
-/// uses this presence probe; the actual load and final fail-closed gate stay
-/// in [`shared_embedder`].
+/// or installed location), without loading the weights. The actual load is
+/// always performed by the injected policy-owned runtime.
 pub fn embedder_pack_installed() -> bool {
     redimnet_pack_path().is_some()
 }
-
-/// Conservative resident model based on logical f32 tensor bytes, not the
-/// quant-dependent on-disk size: one shared parsed copy plus, per bounded
-/// worker, one uploaded f32 copy and one equally-sized graph/workspace bound.
-const SHARED_PARSED_LOGICAL_MULTIPLIER: u64 = 1;
-const PER_WORKER_LOGICAL_MULTIPLIER: u64 = 2;
-const SPEAKER_ATTRIBUTION_LOGICAL_MULTIPLIER: u64 = SHARED_PARSED_LOGICAL_MULTIPLIER
-    + PER_WORKER_LOGICAL_MULTIPLIER * super::REDIMNET_MAX_BATCH_WORKERS as u64;
-
-/// Resident bytes the host-memory admission check charges for the VAD +
-/// speaker-embedder attribution pass from the exact parsed tensor snapshot.
-fn speaker_attribution_admission_bytes(logical_f32_weight_bytes: u64) -> u64 {
-    logical_f32_weight_bytes.saturating_mul(SPEAKER_ATTRIBUTION_LOGICAL_MULTIPLIER)
-}
-
-pub(crate) struct PreparedSpeakerEmbedderSnapshot {
-    source: crate::ggml_runtime::GgmlRuntimeSource,
-    key: PackContentKey,
-    admission_bytes: u64,
-}
-
-impl PreparedSpeakerEmbedderSnapshot {
-    pub(crate) const fn admission_bytes(&self) -> u64 {
-        self.admission_bytes
-    }
-
-    #[cfg(test)]
-    pub(crate) fn content_id(&self) -> &str {
-        &self.key.pack_content_id
-    }
-
-    pub(crate) fn materialize(self) -> Option<Arc<dyn SpeakerEmbedder>> {
-        let embedder = materialize_prepared_embedder(self)?;
-        let adapter: Arc<dyn SpeakerEmbedder> = embedder;
-        Some(adapter)
-    }
-}
-
-/// Snapshot of the currently resolved ReDimNet2-B6 pack. Every call reopens
-/// the resolved path and derives a content id from that exact mapping. Equal
-/// content reuses the one active parsed model; replacement atomically swaps
-/// that content slot, and deletion clears it. An `Arc` pins an in-flight or
-/// streaming-session snapshot without pinning the resolved path's identity.
-pub fn shared_embedder() -> Option<Arc<dyn SpeakerEmbedder>> {
-    prepare_shared_embedder_snapshot()?.materialize()
-}
-
-/// Metadata for a fresh snapshot of the currently resolved pack.
-pub fn shared_embedder_identity() -> Option<SpeakerEmbedderIdentity> {
-    shared_embedder()?.identity()
-}
-
-pub(crate) fn prepare_shared_embedder_snapshot() -> Option<PreparedSpeakerEmbedderSnapshot> {
-    let Some(path) = redimnet_pack_path() else {
-        clear_active_embedder();
-        return None;
-    };
-    let source = match crate::validate_ggml_runtime_source_path(&path) {
-        Ok(source) => source,
-        Err(_) => {
-            clear_active_embedder();
-            return None;
-        }
-    };
-    let key = PackContentKey::for_runtime_source(&source);
-    let logical_f32_weight_bytes =
-        match super::weights::Weights::logical_f32_bytes_from_runtime_source(&source) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                clear_active_embedder();
-                return None;
-            }
-        };
-    Some(PreparedSpeakerEmbedderSnapshot {
-        source,
-        key,
-        admission_bytes: speaker_attribution_admission_bytes(logical_f32_weight_bytes),
-    })
-}
-
-fn materialize_prepared_embedder(
-    prepared: PreparedSpeakerEmbedderSnapshot,
-) -> Option<Arc<RedimNet2Embedder>> {
-    if let Ok(cache) = ACTIVE_REDIMNET.lock()
-        && let Some((cached_key, embedder, admission_bytes)) = cache.as_ref()
-        && cached_key == &prepared.key
-    {
-        debug_assert_eq!(*admission_bytes, prepared.admission_bytes);
-        return Some(Arc::clone(embedder));
-    }
-
-    let immutable_source = match prepared
-        .source
-        .immutable_snapshot_matching_content_id(&prepared.key.pack_content_id)
-    {
-        Ok(source) => source,
-        Err(_) => {
-            clear_active_embedder();
-            return None;
-        }
-    };
-
-    // Build outside the mutex: parsing/dequantizing a pack is expensive and
-    // inference must never run under this lock. The second lookup below
-    // coalesces a benign concurrent first-load race.
-    let built = match RedimNet2Embedder::from_runtime_source(&immutable_source) {
-        Ok(embedder) => Arc::new(embedder),
-        Err(_) => {
-            clear_active_embedder();
-            return None;
-        }
-    };
-    let admission_bytes = speaker_attribution_admission_bytes(built.logical_f32_weight_bytes());
-    debug_assert_eq!(admission_bytes, prepared.admission_bytes);
-    let Ok(mut cache) = ACTIVE_REDIMNET.lock() else {
-        return Some(built);
-    };
-    if let Some((cached_key, existing, existing_admission_bytes)) = cache.as_ref()
-        && cached_key == &prepared.key
-    {
-        debug_assert_eq!(*existing_admission_bytes, prepared.admission_bytes);
-        return Some(Arc::clone(existing));
-    }
-    *cache = Some((prepared.key, Arc::clone(&built), admission_bytes));
-    Some(built)
-}
-
-fn clear_active_embedder() {
-    if let Ok(mut cache) = ACTIVE_REDIMNET.lock() {
-        *cache = None;
-    }
-}
-
-/// Drop the process-wide parsed ReDim snapshot. In-flight requests retain
-/// their own `Arc`; a later request reopens and rebuilds from the installed
-/// content snapshot. Thread-confined uploaded runtimes are invalidated by the
-/// shared unload generation in the top-level native idle-unload path.
-pub(crate) fn unload_idle_embedder_cache() {
-    clear_active_embedder();
-    super::unload_idle_redimnet_worker_runtimes();
-}
-
 /// Content fingerprint of the embedder pack: `sha256:<hex>`.
 ///
 /// An installed pack is a sealed content-addressed object *under this
@@ -299,7 +148,6 @@ mod tests {
             1_000 * SPEAKER_ATTRIBUTION_LOGICAL_MULTIPLIER
         );
     }
-
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))

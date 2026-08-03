@@ -24,7 +24,6 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -34,6 +33,10 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_AED_GGML_ADAPTER_ID;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
+};
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
@@ -41,10 +44,13 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
+use crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity;
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 
 use super::decoder_graph::{
@@ -62,76 +68,29 @@ const FIRERED_AED_STREAMING_EXECUTOR_ID: &str = "firered-aed-ggml-snapshot-strea
 const CMVN_NEG_MEAN_TENSOR: &str = "frontend.cmvn.neg_mean";
 const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
+const FIRERED_AED_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
+const FIRERED_AED_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-thread_local! {
-    static FIRERED_AED_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<FireRedAedEncoderRuntimeCacheKey, FireRedEncoderGraphRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-    static FIRERED_AED_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<FireRedAedDecoderRuntimeCacheKey, FireRedDecoderGraphRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
-
-type FireRedAedEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
-/// (pack content id, backend). The content id
+type FireRedAedEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+/// (pack content id, backend, resident self/cross spans). The content id
 /// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
 /// replacement at the same path from reusing a runtime built from the old
-/// bytes. The decoder's cross-KV cache is now
-/// allocated ONCE per pack at this architecture's chunk-cap capacity (see
-/// [`FireRedDecoderGraphRuntime::new`] / `firered_decoder_cross_capacity_frames`),
-/// not at any one utterance's exact encoder frame count -- so a cached
-/// runtime is reusable across every VAD/longform chunk regardless of that
-/// chunk's actual frame count (as long as it fits the capacity, which the
-/// shared longform safety policy already guarantees). Frame count therefore
-/// no longer belongs in this key (see issue tracking the VAD 0%-cache-hit
-/// regression this fixes).
-type FireRedAedDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// bytes. Logical per-chunk shapes do not belong in this key: the runtime
+/// activates them inside the planner-reserved spans without reallocating.
+type FireRedAedDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, Seq2SeqResidentCapacity);
 
-fn encode_with_cached_runtime(
-    runtime_source: &GgmlRuntimeSource,
-    metadata: FireRedAedExecutionMetadata,
-    cmvn_features: &[f32],
-    n_frames: usize,
-    backend: GgmlCpuGraphBackend,
-) -> Result<FireRedEncoderOutput, super::encoder_graph::FireRedEncoderError> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &FIRERED_AED_ENCODER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedEncoderGraphRuntime::new(runtime_source, metadata, backend),
-        |runtime| runtime.encode(cmvn_features, n_frames),
-    )
-}
-
-fn decode_with_cached_runtime(
-    runtime_source: &GgmlRuntimeSource,
-    metadata: FireRedAedExecutionMetadata,
-    encoder_rows: &[f32],
-    encoder_frame_count: usize,
-    decode_text: impl Fn(&[u32]) -> Result<String, String>,
-    control: &Arc<crate::api::backend::TranscriptionControl>,
-    backend: GgmlCpuGraphBackend,
-) -> Result<
-    super::decoder_graph::FireRedAedGreedyDecodeOutput,
-    super::decoder_graph::FireRedDecoderError,
-> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &FIRERED_AED_DECODER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedDecoderGraphRuntime::new(runtime_source, metadata, backend),
-        |runtime| {
-            run_firered_aed_decoder_greedy_with_runtime(
-                runtime,
-                metadata,
-                encoder_rows,
-                encoder_frame_count,
-                &decode_text,
-                control,
-            )
-        },
-    )
-}
+type FireRedAedEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    FireRedAedEncoderRuntimeCacheKey,
+    FireRedEncoderGraphRuntime,
+>;
+type FireRedAedDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    FireRedAedDecoderRuntimeCacheKey,
+    FireRedDecoderGraphRuntime,
+>;
+type FireRedAedEncoderRuntime =
+    PinnedRuntimeActorCheckout<FireRedAedEncoderRuntimeCacheKey, FireRedEncoderGraphRuntime>;
+type FireRedAedDecoderRuntime =
+    PinnedRuntimeActorCheckout<FireRedAedDecoderRuntimeCacheKey, FireRedDecoderGraphRuntime>;
 
 #[derive(Debug, Error)]
 enum FireRedAedExecutorError {
@@ -154,6 +113,8 @@ enum FireRedAedExecutorError {
     EncoderFailed { reason: String },
     #[error("firered-aed decoder failed: {reason}")]
     DecoderFailed { reason: String },
+    #[error("firered-aed {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
     #[error("firered-aed audio window ({window_seconds:.1}s) is too long for this pack: {reason}")]
     AudioWindowTooLong { window_seconds: f32, reason: String },
 }
@@ -162,10 +123,260 @@ fn window_seconds(n_samples: usize, sample_rate_hz: u32) -> f32 {
     n_samples as f32 / sample_rate_hz.max(1) as f32
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct FireRedAedGgmlExecutor;
+#[derive(Clone)]
+pub(crate) struct FireRedAedGgmlExecutor {
+    encoder_runtimes: Arc<FireRedAedEncoderRuntimePool>,
+    decoder_runtimes: Arc<FireRedAedDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for FireRedAedGgmlExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FireRedAedGgmlExecutor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for FireRedAedGgmlExecutor {
+    fn default() -> Self {
+        let max_committed_requested_bytes =
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        let limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            FIRERED_AED_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            FIRERED_AED_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        );
+        Self {
+            encoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-firered-aed-encoder-owner",
+                limits,
+            )),
+            decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-firered-aed-decoder-owner",
+                limits,
+            )),
+        }
+    }
+}
+
+fn allocate_encoder_runtime_owner(
+    runtime_source: GgmlRuntimeSource,
+    metadata: FireRedAedExecutionMetadata,
+    backend: GgmlCpuGraphBackend,
+    quote: SystemMemoryAllocationQuote,
+) -> Result<SystemMemoryOwner<FireRedEncoderGraphRuntime>, FireRedAedExecutorError> {
+    match SystemMemoryOwner::try_allocate_transaction(quote, || {
+        let runtime = FireRedEncoderGraphRuntime::new(&runtime_source, metadata, backend).map_err(
+            |error| FireRedAedExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            },
+        )?;
+        let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
+            FireRedAedExecutorError::RuntimeOwnershipFailed {
+                stage: "encoder",
+                reason,
+            }
+        })?;
+        Ok(SystemMemoryAllocationOutcome::new(
+            runtime, retained, retained,
+        ))
+    }) {
+        Ok(owner) => Ok(owner),
+        Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+        Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+            Err(FireRedAedExecutorError::RuntimeOwnershipFailed {
+                stage: "encoder",
+                reason: error.to_string(),
+            })
+        }
+    }
+}
+
+fn allocate_decoder_runtime_owner(
+    runtime_source: GgmlRuntimeSource,
+    metadata: FireRedAedExecutionMetadata,
+    decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+    backend: GgmlCpuGraphBackend,
+    quote: SystemMemoryAllocationQuote,
+) -> Result<SystemMemoryOwner<FireRedDecoderGraphRuntime>, FireRedAedExecutorError> {
+    match SystemMemoryOwner::try_allocate_transaction(quote, || {
+        let runtime =
+            FireRedDecoderGraphRuntime::new(&runtime_source, metadata, decoder_state, backend)
+                .map_err(|error| FireRedAedExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                })?;
+        let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
+            FireRedAedExecutorError::RuntimeOwnershipFailed {
+                stage: "decoder",
+                reason,
+            }
+        })?;
+        let peak = retained
+            .checked_add(
+                runtime
+                    .construction_transient_system_memory_bytes()
+                    .map_err(|reason| FireRedAedExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason,
+                    })?,
+            )
+            .ok_or_else(|| FireRedAedExecutorError::RuntimeOwnershipFailed {
+                stage: "decoder",
+                reason: "post-build SystemMemory peak overflowed".to_string(),
+            })?;
+        Ok(SystemMemoryAllocationOutcome::new(runtime, peak, retained))
+    }) {
+        Ok(owner) => Ok(owner),
+        Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+        Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+            Err(FireRedAedExecutorError::RuntimeOwnershipFailed {
+                stage: "decoder",
+                reason: error.to_string(),
+            })
+        }
+    }
+}
 
 impl FireRedAedGgmlExecutor {
+    fn map_actor_error(
+        stage: &'static str,
+        error: PinnedRuntimeActorError,
+    ) -> FireRedAedExecutorError {
+        FireRedAedExecutorError::RuntimeOwnershipFailed {
+            stage,
+            reason: error.to_string(),
+        }
+    }
+
+    fn map_runtime_ownership_error(
+        stage: &'static str,
+        reason: impl Into<String>,
+    ) -> FireRedAedExecutorError {
+        FireRedAedExecutorError::RuntimeOwnershipFailed {
+            stage,
+            reason: reason.into(),
+        }
+    }
+
+    fn checkout_encoder_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        metadata: FireRedAedExecutionMetadata,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<FireRedAedEncoderRuntime, FireRedAedExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(backend),
+        );
+        let source = runtime_source.clone();
+        let pack_content_id = runtime_source.content_id().to_string();
+        self.encoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let quote =
+                    FireRedEncoderGraphRuntime::system_memory_quote(metadata, &pack_content_id)
+                        .map_err(|reason| Self::map_runtime_ownership_error("encoder", reason))?;
+                Ok((quote.retained_bytes, (source, quote)))
+            },
+            move |(source, quote)| allocate_encoder_runtime_owner(source, metadata, backend, quote),
+            |error| Self::map_actor_error("encoder", error),
+        )
+    }
+
+    fn checkout_decoder_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        metadata: FireRedAedExecutionMetadata,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<FireRedAedDecoderRuntime, FireRedAedExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(backend),
+            decoder_state.resident_capacity(),
+        );
+        let source = runtime_source.clone();
+        let pack_content_id = runtime_source.content_id().to_string();
+        self.decoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let quote = FireRedDecoderGraphRuntime::system_memory_quote(
+                    metadata,
+                    decoder_state,
+                    backend,
+                    &pack_content_id,
+                )
+                .map_err(|reason| Self::map_runtime_ownership_error("decoder", reason))?;
+                Ok((quote.retained_bytes, (source, quote)))
+            },
+            move |(source, quote)| {
+                allocate_decoder_runtime_owner(source, metadata, decoder_state, backend, quote)
+            },
+            |error| Self::map_actor_error("decoder", error),
+        )
+    }
+
+    fn encode_with_owned_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        metadata: FireRedAedExecutionMetadata,
+        cmvn_features: Vec<f32>,
+        n_frames: usize,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<FireRedEncoderOutput, FireRedAedExecutorError> {
+        let runtime = self.checkout_encoder_runtime(runtime_source, metadata, backend)?;
+        runtime
+            .call_mut(move |runtime| runtime.encode(&cmvn_features, n_frames))
+            .map_err(|error| Self::map_actor_error("encoder", error))?
+            .map_err(|error| FireRedAedExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_with_owned_runtime(
+        &self,
+        runtime_source: &GgmlRuntimeSource,
+        metadata: FireRedAedExecutionMetadata,
+        encoder_rows: Vec<f32>,
+        encoder_frame_count: usize,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        tokenizer: FireRedTokenizer,
+        control: Arc<crate::api::backend::TranscriptionControl>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<super::decoder_graph::FireRedAedGreedyDecodeOutput, FireRedAedExecutorError> {
+        let runtime =
+            self.checkout_decoder_runtime(runtime_source, metadata, decoder_state, backend)?;
+        runtime
+            .call_mut(move |runtime| {
+                runtime.activate_decoder_state(decoder_state)?;
+                run_firered_aed_decoder_greedy_with_runtime(
+                    runtime,
+                    metadata,
+                    &encoder_rows,
+                    encoder_frame_count,
+                    |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
+                    &control,
+                )
+            })
+            .map_err(|error| Self::map_actor_error("decoder", error))?
+            .map_err(|error| FireRedAedExecutorError::DecoderFailed {
+                reason: error.to_string(),
+            })
+    }
+
+    fn clear_runtime_actors(&self) {
+        self.encoder_runtimes.clear();
+        self.decoder_runtimes.clear();
+    }
+
+    /// The checkout pool currently exposes epoch-safe whole-pool invalidation,
+    /// not targeted eviction. FireRed-AED keeps only four idle actors per
+    /// stage, so conservatively clearing both tiny pools on one pack replace
+    /// gives deterministic release without weakening content-addressed keys.
+    pub(crate) fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {
+        self.clear_runtime_actors();
+    }
+
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -176,6 +387,14 @@ impl FireRedAedGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
+        let decoder_state =
+            crate::models::seq2seq_decoder_state::Seq2SeqDecoderState::from_request_state(
+                &request.decoder_state,
+                super::capacity::FIRERED_AED_DECODER_STATE_IDS,
+            )
+            .map_err(|error| FireRedAedExecutorError::DecoderFailed {
+                reason: error.to_string(),
+            })?;
         let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| FireRedAedExecutorError::RuntimePreflightFailed {
@@ -268,29 +487,25 @@ impl FireRedAedGgmlExecutor {
 
         let runtime_source = &preflight.runtime_source;
         let backend = request.resolved_runtime.backend();
-        let encoder_output = encode_with_cached_runtime(
+        let feature_frames = features.n_frames;
+        let encoder_output = self.encode_with_owned_runtime(
             runtime_source,
             metadata,
-            &features.data,
-            features.n_frames,
+            features.data,
+            feature_frames,
             backend,
-        )
-        .map_err(|error| FireRedAedExecutorError::EncoderFailed {
-            reason: error.to_string(),
-        })?;
+        )?;
 
-        let decode = decode_with_cached_runtime(
+        let decode = self.decode_with_owned_runtime(
             runtime_source,
             metadata,
-            &encoder_output.rows,
+            encoder_output.rows,
             encoder_output.frame_count,
-            |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
-            &request.execution_context.control,
+            decoder_state,
+            tokenizer,
+            Arc::clone(&request.execution_context.control),
             backend,
-        )
-        .map_err(|error| FireRedAedExecutorError::DecoderFailed {
-            reason: error.to_string(),
-        })?;
+        )?;
 
         let audio_duration_seconds =
             samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
@@ -332,6 +547,18 @@ impl GgmlAsrViewExecutor for FireRedAedGgmlExecutor {
         false
     }
 
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_firered_aed_decoder_state,
+            ),
+        )
+    }
+
     fn execute_view(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -342,6 +569,10 @@ impl GgmlAsrViewExecutor for FireRedAedGgmlExecutor {
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -364,11 +595,20 @@ impl GgmlAsrStreamingExecutor for FireRedAedGgmlExecutor {
             FireRedAedGgmlExecutor::execute_view,
         )
     }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
     use crate::models::ggml_family_registry::firered_aed_runtime_descriptor_v1;
@@ -390,6 +630,198 @@ mod tests {
     const GOLDEN_ZH_TEXT: &str = "今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的\
          川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下";
 
+    struct TestPinnedRuntime {
+        id: usize,
+        _thread_affine: Rc<Cell<usize>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TestPinnedRuntime {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type TestRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<String, TestPinnedRuntime>;
+    type TestRuntimeCheckout = PinnedRuntimeActorCheckout<String, TestPinnedRuntime>;
+
+    fn test_runtime_pool() -> TestRuntimePool {
+        AdmittedPinnedRuntimeActorCheckoutPool::new(
+            "firered-aed-runtime-owner-test",
+            AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                FIRERED_AED_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+                1_024,
+                FIRERED_AED_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+            ),
+        )
+    }
+
+    fn checkout_test_runtime(
+        pool: &TestRuntimePool,
+        key: &str,
+        builds: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    ) -> Result<TestRuntimeCheckout, String> {
+        pool.checkout_or_try_build_with(
+            key.to_string(),
+            || Ok((32, ())),
+            move |()| {
+                let id = builds.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(SystemMemoryOwner::with_committed_requested_bytes_for_test(
+                    TestPinnedRuntime {
+                        id,
+                        _thread_affine: Rc::new(Cell::new(id)),
+                        drops,
+                    },
+                    32,
+                ))
+            },
+            |error| error.to_string(),
+        )
+    }
+
+    #[test]
+    fn executor_owned_actor_pool_reuses_a_returned_runtime() {
+        let pool = test_runtime_pool();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let first = checkout_test_runtime(
+            &pool,
+            "sha256:same",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .expect("first checkout");
+        assert_eq!(first.call_mut(|runtime| runtime.id).unwrap(), 1);
+        drop(first);
+        assert_eq!(pool.usage_for_test(), (1, 32));
+
+        let second = checkout_test_runtime(
+            &pool,
+            "sha256:same",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .expect("warm checkout");
+        assert_eq!(second.call_mut(|runtime| runtime.id).unwrap(), 1);
+        drop(second);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        pool.clear();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn executor_owned_actor_pool_runs_two_same_key_sessions_concurrently() {
+        const {
+            assert!(
+                FIRERED_AED_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY >= 2,
+                "FireRed-AED server sessions must not collapse onto one actor"
+            );
+        }
+        let pool = test_runtime_pool();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = checkout_test_runtime(
+            &pool,
+            "sha256:same",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .unwrap();
+        let second = checkout_test_runtime(
+            &pool,
+            "sha256:same",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let run = |checkout: TestRuntimeCheckout| {
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            thread::spawn(move || {
+                checkout
+                    .call_mut(move |_| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(now, Ordering::SeqCst);
+                        barrier.wait();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .unwrap();
+                drop(checkout);
+            })
+        };
+        let first = run(first);
+        let second = run(second);
+        barrier.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        pool.clear();
+    }
+
+    #[test]
+    fn clear_does_not_resurrect_an_in_flight_firered_actor() {
+        let pool = test_runtime_pool();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let in_flight = checkout_test_runtime(
+            &pool,
+            "sha256:same",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .unwrap();
+
+        pool.clear();
+        drop(in_flight);
+        assert_eq!(pool.usage_for_test(), (0, 0));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let rebuilt = checkout_test_runtime(
+            &pool,
+            "sha256:same",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.call_mut(|runtime| runtime.id).unwrap(), 2);
+        drop(rebuilt);
+        pool.clear();
+    }
+
+    #[test]
+    fn replaced_pack_content_id_never_reuses_the_old_actor() {
+        let pool = test_runtime_pool();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let old =
+            checkout_test_runtime(&pool, "sha256:old", Arc::clone(&builds), Arc::clone(&drops))
+                .unwrap();
+        assert_eq!(old.call_mut(|runtime| runtime.id).unwrap(), 1);
+        drop(old);
+
+        let replacement =
+            checkout_test_runtime(&pool, "sha256:new", Arc::clone(&builds), Arc::clone(&drops))
+                .unwrap();
+        assert_eq!(replacement.call_mut(|runtime| runtime.id).unwrap(), 2);
+        drop(replacement);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        // The product replacement callback conservatively clears both
+        // FireRed-AED stage pools; the checkout pool's epoch prevents either
+        // old-content actor from reappearing afterward.
+        pool.clear();
+        assert_eq!(pool.usage_for_test(), (0, 0));
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
     fn dev_pack_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/firered-out/firered-aed-l-fp16.oasr")
@@ -401,6 +833,72 @@ mod tests {
 
     fn zh_wav_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
+    }
+
+    fn decoder_runtime_state(
+        metadata: FireRedAedExecutionMetadata,
+        cross_positions: usize,
+    ) -> crate::models::seq2seq_decoder_state::Seq2SeqDecoderState {
+        use crate::models::seq2seq_decoder_state::{Seq2SeqDecoderState, Seq2SeqStateAxis};
+
+        let self_positions = super::super::decode_budget::firered_aed_decode_budget(
+            cross_positions,
+            metadata.decoder_pe_len,
+        )
+        .expect("test decoder budget")
+        .self_kv_positions;
+
+        Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: self_positions,
+                resident_positions: self_positions,
+                hard_position_cap: metadata.decoder_pe_len,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: cross_positions,
+                resident_positions: cross_positions,
+                hard_position_cap: metadata.encoder_max_frames(),
+            },
+        }
+    }
+
+    fn plan_request_decoder_state(
+        request: &mut GgmlAsrExecutionViewRequest<'_>,
+        envelope_samples: Option<usize>,
+    ) -> Result<(), String> {
+        use std::num::NonZeroU32;
+
+        let preflight = request
+            .resolve_runtime_source_preflight()
+            .map_err(|error| error.to_string())?
+            .into_owned();
+        let sample_rate = NonZeroU32::new(request.prepared_audio.sample_rate_hz)
+            .ok_or_else(|| "test sample rate is zero".to_string())?;
+        let invocation = crate::capacity::topology::InvocationShapeInput::new(
+            sample_rate,
+            request.prepared_audio.samples_f32.len(),
+        )
+        .map_err(|error| error.to_string())?;
+        let envelope = crate::capacity::topology::InvocationEnvelope::new(
+            sample_rate,
+            envelope_samples
+                .unwrap_or(invocation.samples())
+                .max(invocation.samples()),
+        )
+        .map_err(|error| error.to_string())?;
+        let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput {
+            preflight: &preflight,
+            invocation,
+            envelope,
+            request_options: &request.request_options,
+            backend: request.resolved_runtime.backend(),
+        };
+        let plan = super::super::capacity::plan_firered_aed_decoder_state(&planning_input)
+            .map_err(|error| error.to_string())?;
+        request.decoder_state =
+            crate::models::ggml_asr_executor::GgmlAsrDecoderState::planned_for_test(plan, envelope);
+        request.runtime_source_preflight = Some(preflight);
+        Ok(())
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<String> {
@@ -416,7 +914,10 @@ mod tests {
         )
         .expect("load wav fixture");
 
-        let request = GgmlAsrExecutionViewRequest {
+        let mut request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
@@ -431,8 +932,9 @@ mod tests {
                 "test fixture",
             )),
         };
+        plan_request_decoder_state(&mut request, None).expect("plan firered-aed decoder state");
 
-        let executor = FireRedAedGgmlExecutor;
+        let executor = FireRedAedGgmlExecutor::default();
         let result = executor
             .execute_view(&request)
             .expect("firered-aed transcribe");
@@ -480,7 +982,10 @@ mod tests {
             "firered-aed reuse-parity test",
         )
         .expect("load jfk.wav");
-        let request = GgmlAsrExecutionViewRequest {
+        let mut request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
@@ -495,6 +1000,7 @@ mod tests {
                 "test fixture",
             )),
         };
+        plan_request_decoder_state(&mut request, None).expect("plan firered-aed decoder state");
         let preflight = request
             .resolve_runtime_source_preflight()
             .expect("resolve runtime source preflight");
@@ -535,6 +1041,7 @@ mod tests {
         let mut fresh_runtime = match FireRedDecoderGraphRuntime::new(
             &preflight.runtime_source,
             metadata,
+            decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,
         ) {
             Ok(runtime) => runtime,
@@ -578,6 +1085,7 @@ mod tests {
         let mut reused_runtime = FireRedDecoderGraphRuntime::new(
             &preflight.runtime_source,
             metadata,
+            decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,
         )
         .expect("build Metal decoder runtime (reused pass)");
@@ -631,8 +1139,8 @@ mod tests {
         eprintln!("firered-aed reuse parity: {generated} incremental steps bit-identical on Metal");
     }
 
-    /// Demonstrates the thread-local encoder/decoder runtime cache: the
-    /// second same-thread transcription of the same pack must be
+    /// Demonstrates the executor-owned encoder/decoder actor pools: the
+    /// second sequential transcription of the same pack must be
     /// meaningfully faster than the first, because it skips re-loading the
     /// GGUF weight context (mmap + tensor-metadata construction) for both the
     /// encoder and the decoder. Not a strict regression gate (wall-clock,
@@ -640,7 +1148,7 @@ mod tests {
     /// module claims; skips silently without the dev-only pack.
     #[test]
     #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
-    fn second_same_thread_transcribe_is_faster_than_first_due_to_runtime_cache() {
+    fn second_sequential_transcribe_is_faster_than_first_due_to_runtime_reuse() {
         let pack_path = dev_pack_path();
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
@@ -653,22 +1161,30 @@ mod tests {
         )
         .expect("load jfk.wav");
 
-        let build_request = || GgmlAsrExecutionViewRequest {
-            runtime_source_path: pack_path.clone(),
-            runtime_source_preflight: None,
-            selected_family: firered_aed_runtime_descriptor_v1(),
-            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples.clone()),
-            request_options: Default::default(),
-            backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-            ),
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-                "test fixture",
-            )),
+        let build_request = || {
+            let mut request = GgmlAsrExecutionViewRequest {
+                execution_services:
+                    crate::models::native_execution_services::test_native_execution_services(),
+                decoder_state:
+                    crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
+                runtime_source_path: pack_path.clone(),
+                runtime_source_preflight: None,
+                selected_family: firered_aed_runtime_descriptor_v1(),
+                prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples.clone()),
+                request_options: Default::default(),
+                backend_preference: GgmlAsrBackendPreference::CpuOnly,
+                resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                    (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                    crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                ),
+                execution_context: std::sync::Arc::new(
+                    crate::RequestExecutionContext::uncancellable("test fixture"),
+                ),
+            };
+            plan_request_decoder_state(&mut request, None).expect("plan firered-aed decoder state");
+            request
         };
-        let executor = FireRedAedGgmlExecutor;
+        let executor = FireRedAedGgmlExecutor::default();
 
         let first_start = std::time::Instant::now();
         let first = executor
@@ -693,10 +1209,8 @@ mod tests {
 
     /// Structural regression test for the VAD/longform 0%-cache-hit bug this
     /// module fixes: chunks with DIFFERENT encoder frame counts on the same
-    /// thread must still land in the SAME decoder cache slot, because the
-    /// cross-KV cache is now allocated once at this pack's chunk-cap capacity
-    /// (issue tracking the VAD longform 0%-cache-hit regression) rather than
-    /// exactly at each chunk's frame count. `jfk.wav` and `zh_sample.wav` are
+    /// executor scope must still land in the SAME decoder pool slot when both carry
+    /// the same 60-second session envelope. `jfk.wav` and `zh_sample.wav` are
     /// different durations (and firered's char+SPM tokenizer makes their
     /// encoder frame counts essentially certain to differ), so this is a real
     /// cross-frame-count reuse, not a same-length coincidence.
@@ -715,7 +1229,11 @@ mod tests {
                 "firered-aed cache-reuse test",
             )
             .expect("load wav fixture");
-            GgmlAsrExecutionViewRequest {
+            let mut request = GgmlAsrExecutionViewRequest {
+                execution_services:
+                    crate::models::native_execution_services::test_native_execution_services(),
+                decoder_state:
+                    crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
                 runtime_source_path: pack_path.clone(),
                 runtime_source_preflight: None,
                 selected_family: firered_aed_runtime_descriptor_v1(),
@@ -729,14 +1247,15 @@ mod tests {
                 execution_context: std::sync::Arc::new(
                     crate::RequestExecutionContext::uncancellable("test fixture"),
                 ),
-            }
+            };
+            plan_request_decoder_state(&mut request, Some(60 * 16_000))
+                .expect("plan firered-aed shared decoder envelope");
+            request
         };
-        let executor = FireRedAedGgmlExecutor;
+        let executor = FireRedAedGgmlExecutor::default();
 
-        let decoder_cache_len =
-            || FIRERED_AED_DECODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
-        let encoder_cache_len =
-            || FIRERED_AED_ENCODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+        let decoder_cache_len = || executor.decoder_runtimes.usage_for_test().0;
+        let encoder_cache_len = || executor.encoder_runtimes.usage_for_test().0;
         assert_eq!(decoder_cache_len(), 0, "cache must start empty");
 
         let jfk = executor
@@ -771,16 +1290,9 @@ mod tests {
         );
     }
 
-    /// Issue #158 defense-in-depth: a single window past the pack's
-    /// PE-table capacity (~200s for this dev pack's `pe_len=9999`) must fail
-    /// closed with a typed `AudioWindowTooLong` error instead of reaching
-    /// `encoder_graph`'s allocation and either OOM-ing or (on a machine with
-    /// enough memory to actually build the graph) silently degrading past
-    /// the model's trained/positional-encoding range. This should never
-    /// happen on the real request path (the outer longform slicer already
-    /// caps every window to the architecture's 30s safety ceiling), so this
-    /// constructs an oversized window directly against the executor,
-    /// bypassing the slicer, to prove the guard is load-bearing on its own.
+    /// A single window past the pack's PE-table capacity must be rejected by
+    /// decoder-state planning, before executor graph construction or memory
+    /// admission can begin.
     #[test]
     #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
     fn oversized_window_fails_closed_with_typed_error_instead_of_reaching_the_encoder_graph() {
@@ -793,7 +1305,10 @@ mod tests {
         // matter -- the guard trips on shape (predicted encoder frame count)
         // before any real encoding is attempted.
         let samples = vec![0.0_f32; 210 * 16_000];
-        let request = GgmlAsrExecutionViewRequest {
+        let mut request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
@@ -808,32 +1323,20 @@ mod tests {
                 "test fixture",
             )),
         };
-        let executor = FireRedAedGgmlExecutor;
-        let error = executor
-            .execute_view(&request)
-            .expect_err("a 210s window must fail closed, not transcribe");
-        let message = error.to_string();
+        let message = plan_request_decoder_state(&mut request, None)
+            .expect_err("a 210s window must fail decoder-state planning");
         assert!(
-            message.contains("too long") || message.contains("positional-encoding capacity"),
-            "expected a PE-capacity typed error, got: {message}"
+            message.contains("hard cap") || message.contains("position"),
+            "expected a positional-cap planning error, got: {message}"
         );
     }
 
-    /// Regression for a REJECTed earlier version of this fix that made this
-    /// case fail closed: `segment_mode=off` (a real, user-reachable CLI/server
-    /// path -- `native_segment_cli.rs`'s `NativeSegmentMode::Off` /
-    /// `transcription.rs`'s equivalent) sends the WHOLE audio window straight
-    /// to the executor with no longform chunking at all, so a >32s clip
-    /// legitimately presents an encoder frame count past this pack's
-    /// chunk-cap cross-KV capacity while still being well under its
-    /// PE-table ceiling. Before this fix (still exact-per-call allocation)
-    /// this simply worked; the cross-KV capacity refactor must not turn that
-    /// into a hard failure -- growing the cache to fit must produce the
-    /// EXACT same transcript as `origin/main` (verified by hand for this
-    /// specific pack/clip; see the PR description for the recorded baseline).
+    /// A 45-second single invocation remains legal when its declared session
+    /// envelope is 60 seconds; it must fit the preplanned resident span with
+    /// no allocation growth and preserve the recorded transcript.
     #[test]
     #[ignore = "requires the private dev-only firered-aed-l-v2-q4_k.oasr pack; see module docs"]
-    fn mode_off_single_window_past_chunk_cap_grows_and_matches_baseline() {
+    fn mode_off_single_window_fits_declared_envelope_and_matches_baseline() {
         let pack_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/firered-out/firered-aed-l-v2-q4_k.oasr");
         if !pack_path.exists() {
@@ -852,11 +1355,14 @@ mod tests {
         const BASELINE_TEXT: &str = "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭晚上我们还计划去一家新开的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园";
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             wav_path,
-            "firered-aed mode=off grow test",
-            "firered-aed mode=off grow test",
+            "firered-aed mode=off envelope test",
+            "firered-aed mode=off envelope test",
         )
         .expect("load wav fixture");
-        let request = GgmlAsrExecutionViewRequest {
+        let mut request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: firered_aed_runtime_descriptor_v1(),
@@ -871,7 +1377,9 @@ mod tests {
                 "test fixture",
             )),
         };
-        let executor = FireRedAedGgmlExecutor;
+        plan_request_decoder_state(&mut request, Some(60 * 16_000))
+            .expect("plan firered-aed 60-second decoder envelope");
+        let executor = FireRedAedGgmlExecutor::default();
         let result = executor
             .execute_view(&request)
             .expect("mode=off single-window transcribe must succeed, not fail closed");

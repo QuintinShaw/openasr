@@ -1,19 +1,24 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Result, bail};
 use openasr_core::{
     CatalogPullRequest, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID, DownloadSourcePref,
     InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, ModelInstallLicenseDecision,
-    OpenAsrConfig, PullModelPackRequest, QuantPreference, ResolvedCatalogPull,
-    host_quant_recommendation_profile, install_model_pack_from_path, list_installed_packs,
-    load_config, load_model_catalog, model_install_license_decision, openasr_home,
-    remove_model_pack, resolve_catalog_pull_with_profile, resolve_chain, resolve_launch_pack,
+    NativeExecutionServices, OpenAsrConfig, PullModelPackRequest, QuantPreference,
+    ResolvedCatalogPull, host_quant_recommendation_profile,
+    install_model_pack_from_path_with_execution_services, list_installed_packs, load_config,
+    load_model_catalog, model_install_license_decision, openasr_home,
+    remove_model_pack_with_execution_services, resolve_catalog_pull_with_profile, resolve_chain,
+    resolve_launch_pack,
 };
 
 use crate::PullCommandOptions;
 use crate::consent::{self, CliExit, ExitCode, PullConsent};
 
-pub(crate) fn pull(options: PullCommandOptions<'_>) -> Result<()> {
+pub(crate) fn pull(
+    native_execution_services: &Arc<NativeExecutionServices>,
+    options: PullCommandOptions<'_>,
+) -> Result<()> {
     let home = openasr_home()?;
     let config = load_config(&home)?;
     let catalog = load_model_catalog(options.catalog_url, &home)?;
@@ -47,9 +52,16 @@ pub(crate) fn pull(options: PullCommandOptions<'_>) -> Result<()> {
     let source_chain = resolve_chain(&source_pref);
 
     let installed = if let Some(path) = options.from {
-        install_model_pack_from_path(&resolved, path, &home, progress)?
+        install_model_pack_from_path_with_execution_services(
+            &resolved,
+            path,
+            &home,
+            Some(native_execution_services.as_ref()),
+            progress,
+        )?
     } else {
         PullModelPackRequest::new(&resolved, &home)
+            .execution_services(native_execution_services.as_ref())
             .sources(&source_chain)
             .execute(progress)?
     };
@@ -175,9 +187,16 @@ pub(crate) fn list_installed() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove_installed(id: &str) -> Result<()> {
+pub(crate) fn remove_installed(
+    native_execution_services: &Arc<NativeExecutionServices>,
+    id: &str,
+) -> Result<()> {
     let home = openasr_home()?;
-    match remove_model_pack(home, id)? {
+    match remove_model_pack_with_execution_services(
+        home,
+        id,
+        Some(native_execution_services.as_ref()),
+    )? {
         Some(pack) => {
             println!("Removed {}", pack.pull);
             Ok(())
@@ -196,6 +215,7 @@ pub(crate) fn remove_installed(id: &str) -> Result<()> {
 /// become license acceptance. When the model is already installed this answers
 /// from on-disk packs with no network access.
 pub(crate) fn ensure_asr_model_installed(
+    native_execution_services: &Arc<NativeExecutionServices>,
     model: Option<&str>,
     config: &OpenAsrConfig,
     consent: &PullConsent,
@@ -303,12 +323,13 @@ pub(crate) fn ensure_asr_model_installed(
         }
     }
 
-    let installed = perform_consent_pull(&resolved, &home, config).map_err(|error| {
-        CliExit::new(
-            ExitCode::DownloadFailed,
-            format!("Download failed: {error}"),
-        )
-    })?;
+    let installed = perform_consent_pull(native_execution_services, &resolved, &home, config)
+        .map_err(|error| {
+            CliExit::new(
+                ExitCode::DownloadFailed,
+                format!("Download failed: {error}"),
+            )
+        })?;
     if should_update_default_asr_model(&catalog, &installed.model_id) {
         let preference = QuantPreference::pinned(&installed.quant);
         openasr_core::default_selection::persist(&home, &installed, preference)?;
@@ -317,6 +338,7 @@ pub(crate) fn ensure_asr_model_installed(
 }
 
 fn perform_consent_pull(
+    native_execution_services: &Arc<NativeExecutionServices>,
     resolved: &ResolvedCatalogPull,
     home: &Path,
     config: &OpenAsrConfig,
@@ -325,6 +347,7 @@ fn perform_consent_pull(
     let progress = |event| reporter.on(event);
     let source_chain = resolve_chain(&config.download_source);
     Ok(PullModelPackRequest::new(resolved, home)
+        .execution_services(native_execution_services.as_ref())
         .sources(&source_chain)
         .execute(progress)?)
 }

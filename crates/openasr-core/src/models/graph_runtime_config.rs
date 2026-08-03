@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use crate::device::execution_policy::ExecutionPlacement;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
 
 use super::ggml_graph_config::configure_model_graph_config;
@@ -53,6 +54,49 @@ pub(crate) fn apply_request_inference_threads_override(
     config
 }
 
+/// Make the policy candidate's placement an executable request contract.
+/// Family defaults and operator scheduler knobs are resolved first; an active
+/// candidate then wins because fallback must attempt a materially distinct
+/// placement rather than relabel the same graph configuration.
+pub(crate) fn apply_request_execution_placement(config: GgmlCpuGraphConfig) -> GgmlCpuGraphConfig {
+    let Some(placement) = crate::models::native_execution_services::current_execution_placement()
+    else {
+        return config;
+    };
+    apply_execution_placement(config, placement)
+}
+
+fn apply_execution_placement(
+    mut config: GgmlCpuGraphConfig,
+    placement: ExecutionPlacement,
+) -> GgmlCpuGraphConfig {
+    match placement {
+        ExecutionPlacement::CpuOnly => {
+            config.backend = GgmlCpuGraphBackend::Cpu;
+            // A scheduler is not synonymous with a CPU/device hybrid. With a
+            // CPU backend the scheduler's optional helpers are CPU-class
+            // accelerators (for example BLAS), so preserving the family's
+            // validated scheduler choice still satisfies CpuOnly. Disabling
+            // it here silently selected different kernels and changed model
+            // numerics for the same explicit CPU request.
+        }
+        ExecutionPlacement::FullDevice => {
+            // A policy plan never emits FullDevice for a CPU route.
+            if config.backend.is_gpu_class() {
+                config.use_scheduler = false;
+            }
+        }
+        ExecutionPlacement::Hybrid => {
+            // The ggml multi-backend scheduler is the implemented CPU/device
+            // split path. CPU-only stages remain direct CPU stages.
+            if config.backend.is_gpu_class() {
+                config.use_scheduler = true;
+            }
+        }
+    }
+    config
+}
+
 pub(crate) fn configure_model_runtime_graph_config(
     base: GgmlCpuGraphConfig,
     has_explicit_scheduler_override: bool,
@@ -73,7 +117,7 @@ pub(crate) fn configure_model_runtime_graph_config(
             config.n_threads = Some(default_n_threads);
         }
     }
-    config
+    apply_request_execution_placement(config)
 }
 
 pub(crate) fn configure_model_runtime_graph_config_from_env(
@@ -104,10 +148,13 @@ pub(crate) fn gpu_stage_enabled_for_backend(
     // explicitly asked for acceleration. An explicit env var still wins over
     // this (an operator-set kill switch is a deployment decision, not the
     // engine choosing on the user's behalf), so only the *default* shifts.
-    let explicit_accelerated = matches!(
-        crate::ggml_runtime::request_backend_override(),
-        Some(crate::ggml_runtime::RequestBackendPreference::Accelerated)
-    );
+    let explicit_accelerated = match crate::ggml_runtime::request_backend_override() {
+        Some(crate::ggml_runtime::RequestBackendPreference::Accelerated) => true,
+        Some(crate::ggml_runtime::RequestBackendPreference::Exact(route)) => {
+            route.provider != crate::device::execution_route::ExecutionProvider::Cpu
+        }
+        Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly) | None => false,
+    };
     gpu_stage_enabled_for_backend_raw(
         backend,
         gpu_raw.as_deref(),
@@ -247,6 +294,21 @@ mod tests {
             },
         );
         assert_eq!(config.n_threads, Some(8));
+        assert!(config.use_scheduler);
+    }
+
+    #[test]
+    fn cpu_only_preserves_cpu_scheduler_and_cpu_class_accelerators() {
+        let config = apply_execution_placement(
+            GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: true,
+                ..GgmlCpuGraphConfig::conservative_default()
+            },
+            ExecutionPlacement::CpuOnly,
+        );
+
+        assert_eq!(config.backend, GgmlCpuGraphBackend::Cpu);
         assert!(config.use_scheduler);
     }
 

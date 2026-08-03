@@ -25,10 +25,11 @@
 //! - `fixtures/longform_en_zh.wav` checked in (a ~69s recording).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use openasr_core::{
-    ExecutionTarget, LongFormMode, LongFormOptions, TranscriptionBackend, TranscriptionRequest,
+    ExecutionTarget, LongFormMode, LongFormOptions, NativeBackend, NativeExecutionServices,
+    TranscriptionBackend, TranscriptionRequest,
 };
 
 /// The pipeline width is read from a process-global env var, so the two runs
@@ -98,13 +99,18 @@ fn carry_light_multi_slice_options() -> LongFormOptions {
 /// `width` `Some(n)` pins `OPENASR_SLICE_PIPELINE_WIDTH=n`; `None` leaves the
 /// variable unset so the run exercises the carry-gated default (this is a
 /// carry-disabled run, so the default takes the concurrent pipeline).
-fn transcribe_with_width(pack: &Path, audio: &Path, width: Option<usize>) -> String {
+fn transcribe_with_width(
+    backend: &NativeBackend,
+    pack: &Path,
+    audio: &Path,
+    width: Option<usize>,
+) -> String {
     let _lock = PIPELINE_WIDTH_ENV_LOCK.lock().expect("pipeline width lock");
     match width {
         Some(width) => unsafe { std::env::set_var(SLICE_PIPELINE_WIDTH_ENV, width.to_string()) },
         None => unsafe { std::env::remove_var(SLICE_PIPELINE_WIDTH_ENV) },
     }
-    let result = openasr_core::NativeBackend.transcribe(
+    let result = backend.transcribe(
         TranscriptionRequest::new(audio, MODEL_ID)
             .with_model_pack_path(Some(pack.to_path_buf()))
             .with_execution_target(Some(ExecutionTarget::Cpu))
@@ -125,16 +131,19 @@ fn transcribe_with_width(pack: &Path, audio: &Path, width: Option<usize>) -> Str
 fn concurrent_width_matches_serial_width_byte_for_byte() {
     let pack = resolve_real_pack();
     let audio = longform_audio();
+    let backend = NativeBackend::new(Arc::new(
+        NativeExecutionServices::for_local_process().expect("test execution services"),
+    ));
 
     // Width 1: serial path, carry disabled -> carry-light serial reference.
-    let serial = transcribe_with_width(&pack, &audio, Some(1));
+    let serial = transcribe_with_width(&backend, &pack, &audio, Some(1));
     assert!(
         !serial.trim().is_empty(),
         "the ~69s recording must produce a non-empty transcript"
     );
 
     // Width 4: concurrent carry-light path over the SAME plan.
-    let concurrent = transcribe_with_width(&pack, &audio, Some(4));
+    let concurrent = transcribe_with_width(&backend, &pack, &audio, Some(4));
 
     assert_eq!(
         serial, concurrent,
@@ -145,7 +154,7 @@ fn concurrent_width_matches_serial_width_byte_for_byte() {
     // Env unset: the shipping default for this carry-disabled run, which takes
     // the concurrent pipeline via the carry-gated default width. Its transcript
     // must still match the serial reference byte for byte.
-    let default_run = transcribe_with_width(&pack, &audio, None);
+    let default_run = transcribe_with_width(&backend, &pack, &audio, None);
 
     assert_eq!(
         serial, default_run,

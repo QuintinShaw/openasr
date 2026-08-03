@@ -17,6 +17,72 @@ use crate::models::audio_frontend::{PadMode, StftFramer};
 const RESAMPLE_CHUNK_FRAMES: usize = 4096;
 const RESAMPLE_SUB_CHUNKS: usize = 2;
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub(crate) enum MimoResampleShapeError {
+    #[error("mimo resampler sample rates must be non-zero")]
+    ZeroSampleRate,
+    #[error("mimo resampler shape overflowed while computing {operation}")]
+    ArithmeticOverflow { operation: &'static str },
+}
+
+fn checked_gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+/// Exact number of samples [`resample_mono`] emits, including its mandatory
+/// terminal partial/flush call. This module owns both Rubato construction
+/// parameters and their count-only shape oracle so capacity planning never
+/// has to reproduce a dependency's chunk arithmetic.
+pub(crate) fn mimo_resampled_output_sample_count(
+    input_samples: usize,
+    from_hz: usize,
+    to_hz: usize,
+) -> Result<usize, MimoResampleShapeError> {
+    if from_hz == 0 || to_hz == 0 {
+        return Err(MimoResampleShapeError::ZeroSampleRate);
+    }
+    if input_samples == 0 || from_hz == to_hz {
+        return Ok(input_samples);
+    }
+    let gcd = checked_gcd(from_hz, to_hz);
+    let min_chunk_in = from_hz / gcd;
+    let wanted_subsize = RESAMPLE_CHUNK_FRAMES / RESAMPLE_SUB_CHUNKS;
+    let fft_chunks = wanted_subsize.div_ceil(min_chunk_in);
+    let fft_size_in =
+        fft_chunks
+            .checked_mul(min_chunk_in)
+            .ok_or(MimoResampleShapeError::ArithmeticOverflow {
+                operation: "input FFT size",
+            })?;
+    let fft_size_out =
+        fft_chunks
+            .checked_mul(to_hz / gcd)
+            .ok_or(MimoResampleShapeError::ArithmeticOverflow {
+                operation: "output FFT size",
+            })?;
+    let process_calls = input_samples
+        .checked_div(RESAMPLE_CHUNK_FRAMES)
+        .and_then(|calls| calls.checked_add(1))
+        .ok_or(MimoResampleShapeError::ArithmeticOverflow {
+            operation: "process-call count",
+        })?;
+    let padded_input = process_calls.checked_mul(RESAMPLE_CHUNK_FRAMES).ok_or(
+        MimoResampleShapeError::ArithmeticOverflow {
+            operation: "padded input length",
+        },
+    )?;
+    (padded_input / fft_size_in)
+        .checked_mul(fft_size_out)
+        .ok_or(MimoResampleShapeError::ArithmeticOverflow {
+            operation: "output sample count",
+        })
+}
+
 use super::runtime_contract::MimoMelMetadata;
 use super::tensor_names::{AUDIOTOK_MEL_FILTERS, AUDIOTOK_MEL_WINDOW};
 
@@ -43,6 +109,8 @@ pub(crate) enum MimoMelFrontendError {
 /// front-end -- mirroring the reference `mimo_audio.py::preprocess_input`'s
 /// own `resample_audio_if_needed(wav, sr)` to the tokenizer's sampling rate.
 pub(crate) fn resample_mono(input: &[f32], from_hz: u32, to_hz: u32) -> Option<Vec<f32>> {
+    let expected_output_samples =
+        mimo_resampled_output_sample_count(input.len(), from_hz as usize, to_hz as usize).ok()?;
     if from_hz == to_hz {
         return Some(input.to_vec());
     }
@@ -83,7 +151,7 @@ pub(crate) fn resample_mono(input: &[f32], from_hz: u32, to_hz: u32) -> Option<V
             .ok()?;
         output.extend_from_slice(&output_buffer[0][..out_len]);
     }
-    Some(output)
+    (output.len() == expected_output_samples).then_some(output)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +165,35 @@ pub(crate) struct MimoMelFrontendPlan {
     /// Freq-major `[n_fft/2+1][n_mels]` contiguous (GGUF ne=[n_mels, n_freqs]
     /// -> mels vary fastest), matching `qwen::frontend`'s baked-filter layout.
     pub mel_filters: Vec<f32>,
+}
+
+impl MimoMelFrontendPlan {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &MimoMelMetadata,
+    ) -> Result<u64, String> {
+        let fft_bins = metadata
+            .n_fft
+            .checked_div(2)
+            .and_then(|half| half.checked_add(1))
+            .ok_or_else(|| "mimo-asr mel FFT bin quote overflowed".to_string())?;
+        let values = metadata
+            .win_length
+            .checked_add(
+                fft_bins
+                    .checked_mul(metadata.n_mels)
+                    .ok_or_else(|| "mimo-asr mel filter quote overflowed".to_string())?,
+            )
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "mimo-asr mel plan quote overflowed".to_string())?;
+        u64::try_from(values).map_err(|_| "mimo-asr mel plan quote exceeds u64".to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.window, "mimo-asr mel window")?;
+        bytes.add_vec(&self.mel_filters, "mimo-asr mel filters")?;
+        Ok(bytes.finish())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +335,10 @@ mod tests {
         // identical chunking pattern, scaled to the output rate.
         let input = vec![0.0_f32; 160_000];
         let out = resample_mono(&input, 16_000, 24_000).expect("resample");
+        assert_eq!(
+            out.len(),
+            mimo_resampled_output_sample_count(input.len(), 16_000, 24_000).unwrap()
+        );
         let expected = input.len() * 24_000 / 16_000;
         let tolerance = RESAMPLE_CHUNK_FRAMES * 24_000 / 16_000;
         assert!(
@@ -251,6 +352,28 @@ mod tests {
     fn resample_same_rate_is_identity() {
         let input = vec![0.1_f32, -0.2, 0.3];
         assert_eq!(resample_mono(&input, 16_000, 16_000).unwrap(), input);
+        assert_eq!(
+            mimo_resampled_output_sample_count(input.len(), 16_000, 16_000),
+            Ok(input.len())
+        );
+    }
+
+    #[test]
+    fn resample_count_oracle_matches_partial_and_flush_boundaries() {
+        for input_len in [1, RESAMPLE_CHUNK_FRAMES - 1, RESAMPLE_CHUNK_FRAMES, 4097] {
+            let input = vec![0.0_f32; input_len];
+            let output = resample_mono(&input, 16_000, 24_000).expect("resample");
+            assert_eq!(
+                output.len(),
+                mimo_resampled_output_sample_count(input_len, 16_000, 24_000).unwrap(),
+                "input_len={input_len}"
+            );
+        }
+        assert_eq!(mimo_resampled_output_sample_count(0, 16_000, 24_000), Ok(0));
+        assert_eq!(
+            mimo_resampled_output_sample_count(1, 0, 24_000),
+            Err(MimoResampleShapeError::ZeroSampleRate)
+        );
     }
 
     #[test]

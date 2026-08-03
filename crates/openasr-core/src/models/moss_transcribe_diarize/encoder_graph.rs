@@ -34,6 +34,7 @@
 
 #[cfg(test)]
 use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -145,6 +146,111 @@ pub(crate) struct MossEncoderWeights {
     out_norm_bias: Vec<f32>,
 }
 
+impl MossEncoderWeights {
+    pub(crate) fn add_system_memory_quote(
+        quote: &mut crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder,
+        tensor_index: &crate::GgufTensorIndex,
+        config: MossEncoderConfig,
+    ) -> Result<(), crate::models::system_memory_owner::SystemMemoryOwnerError> {
+        quote.add_tensor_f16(tensor_index, ENC_CONV1_WEIGHT)?;
+        quote.add_tensor_f32(tensor_index, ENC_CONV1_BIAS)?;
+        quote.add_tensor_f16(tensor_index, ENC_CONV2_WEIGHT)?;
+        quote.add_tensor_f32(tensor_index, ENC_CONV2_BIAS)?;
+        quote.add_tensor_f32(tensor_index, ENC_POS_EMBD_WEIGHT)?;
+        quote.add_tensor_f32(tensor_index, ENC_OUT_NORM_WEIGHT)?;
+        quote.add_tensor_f32(tensor_index, ENC_OUT_NORM_BIAS)?;
+        quote.add_owned_elements::<MossEncoderLayerWeights>(
+            u64::try_from(config.n_layers).map_err(|_| {
+                crate::models::system_memory_owner::SystemMemoryOwnerError::capacity_failure(
+                    "prepared_runtime_quote",
+                    "moss encoder layer count does not fit u64",
+                )
+            })?,
+            "moss encoder layer table",
+        )?;
+        for layer_index in 0..config.n_layers {
+            let names = moss_encoder_layer_tensor_names(layer_index);
+            for name in [
+                &names.attn_norm_weight,
+                &names.attn_norm_bias,
+                &names.attn_q_bias,
+                &names.attn_v_bias,
+                &names.attn_out_bias,
+                &names.ffn_norm_weight,
+                &names.ffn_norm_bias,
+                &names.ffn_up_bias,
+                &names.ffn_down_bias,
+            ] {
+                quote.add_tensor_f32(tensor_index, name)?;
+            }
+            for name in [
+                names.attn_q_weight,
+                names.attn_k_weight,
+                names.attn_v_weight,
+                names.attn_out_weight,
+                names.ffn_up_weight,
+                names.ffn_down_weight,
+            ] {
+                quote.add_owned_bytes(
+                    u64::try_from(name.len()).map_err(|_| {
+                        crate::models::system_memory_owner::SystemMemoryOwnerError::capacity_failure(
+                            "prepared_runtime_quote",
+                            "moss encoder tensor-name length does not fit u64",
+                        )
+                    })?,
+                    "moss encoder projection tensor name",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.conv1_weight_f16_bits, "moss encoder conv1 weight")?;
+        bytes.add_vec(&self.conv1_bias, "moss encoder conv1 bias")?;
+        bytes.add_vec(&self.conv2_weight_f16_bits, "moss encoder conv2 weight")?;
+        bytes.add_vec(&self.conv2_bias, "moss encoder conv2 bias")?;
+        bytes.add_vec(&self.pos_embd, "moss encoder positional embedding")?;
+        bytes.add_vec(&self.layers, "moss encoder layer table")?;
+        for layer in &self.layers {
+            for (values, label) in [
+                (
+                    &layer.attn_norm_weight,
+                    "moss encoder attention norm weight",
+                ),
+                (&layer.attn_norm_bias, "moss encoder attention norm bias"),
+                (&layer.attn_q_bias, "moss encoder q bias"),
+                (&layer.attn_v_bias, "moss encoder v bias"),
+                (&layer.attn_out_bias, "moss encoder attention output bias"),
+                (&layer.ffn_norm_weight, "moss encoder ffn norm weight"),
+                (&layer.ffn_norm_bias, "moss encoder ffn norm bias"),
+                (&layer.ffn_up_bias, "moss encoder ffn up bias"),
+                (&layer.ffn_down_bias, "moss encoder ffn down bias"),
+            ] {
+                bytes.add_vec(values, label)?;
+            }
+            for projection in [
+                &layer.attn_q_weight,
+                &layer.attn_k_weight,
+                &layer.attn_v_weight,
+                &layer.attn_out_weight,
+                &layer.ffn_up_weight,
+                &layer.ffn_down_weight,
+            ] {
+                bytes.add_string(&projection.name, "moss encoder projection tensor name")?;
+                bytes.add_vec(
+                    &projection.values,
+                    "moss encoder projection fallback values",
+                )?;
+            }
+        }
+        bytes.add_vec(&self.out_norm_weight, "moss encoder output norm weight")?;
+        bytes.add_vec(&self.out_norm_bias, "moss encoder output norm bias")?;
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) fn load_moss_encoder_weights_from_reader(
     reader: &GgufTensorDataReader,
     config: MossEncoderConfig,
@@ -248,30 +354,28 @@ pub(crate) fn load_moss_encoder_weights_from_reader(
 /// and the fully-loaded [`MossEncoderWeights`]; all three are expensive to
 /// rebuild per chunk (the loaded-weight context mmaps the whole pack, and
 /// loading the weights reads every small tensor off disk), so callers build
-/// one runtime (typically via the thread-local resident cache in
-/// `executor.rs`, mirroring `firered_aed::executor`'s
+/// one runtime via the owner-actor checkout pool in `executor.rs`, mirroring
+/// `firered_aed::executor`'s
 /// `FireRedEncoderGraphRuntime`) and call [`Self::encode`] once per 30s
 /// chunk. Mirrors `qwen::audio_encoder::Qwen3AsrAudioEncoderRuntime`.
 pub(crate) struct MossEncoderRuntime {
     runner: GgmlCpuGraphRunner,
-    loaded: Option<GgmlLoadedWeightContext>,
-    weights: MossEncoderWeights,
+    loaded: GgmlLoadedWeightContext,
+    weights: Arc<MossEncoderWeights>,
 }
 
 impl MossEncoderRuntime {
-    pub(crate) fn new(
+    pub(crate) fn new_with_prepared_weights(
         runtime_source: &GgmlRuntimeSource,
-        config: MossEncoderConfig,
+        weights: Arc<MossEncoderWeights>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossEncoderError> {
         let graph_config = super::graph_config::moss_td_encoder_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
-        let loaded = runner.load_gguf_weight_context(runtime_source).ok();
-        // Shares `runtime_source`'s already-open mapping with the
-        // resident-weight load above instead of a second `File::open`.
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
-        let weights = load_moss_encoder_weights_from_reader(&reader, config)?;
+        let loaded = runner
+            .load_gguf_weight_context(runtime_source)
+            .map_err(|source| map_graph_error("load_gguf_weight_context", source))?;
         Ok(Self {
             runner,
             loaded,
@@ -315,7 +419,7 @@ impl MossEncoderRuntime {
         let head_dim = config.d_model / config.n_heads;
         let output_frames = config.max_source_positions;
 
-        let loaded = self.loaded.as_ref();
+        let loaded = Some(&self.loaded);
 
         // Resident encoder weights (conv stem, every 1D norm/bias, the fixed
         // positional embedding, the final LayerNorm) live in a WEIGHTS-usage

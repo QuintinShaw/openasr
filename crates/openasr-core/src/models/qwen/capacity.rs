@@ -1,12 +1,6 @@
-//! qwen3-asr capacity derivation: the family's decoder KV geometry and the
-//! decoder positions a single decode of a given audio span needs, assembled
-//! from PACK METADATA (`Qwen3AsrExecutionMetadata`) plus family constants, so
-//! the shared host-memory admission check
-//! ([`crate::capacity::evaluate_host_memory_admission`]) can refuse a request
-//! that plainly cannot fit BEFORE the ggml graph build turns the shortfall
-//! into an opaque `ggml cpu graph backend buffer allocation failed` (issue
-//! #159's root cause on CPU). It is the qwen3 analogue of
-//! [`crate::models::moss_transcribe_diarize::capacity`].
+//! qwen3-asr decoder-state topology, derived from pack metadata, the exact
+//! frontend shape oracle, the tokenized prompt wrapper, and the runtime decode
+//! budget.
 //!
 //! Reuses, never re-derives:
 //! - KV geometry comes straight off the parsed pack (`llm_layers` /
@@ -20,36 +14,114 @@
 //!   so admission argues from the same position ceiling the real decode does.
 
 use crate::capacity::KvGeometry;
+use crate::capacity::topology::{
+    DecoderStateDemandScope, DecoderStateTopology, InvocationEnvelope, InvocationShapeInput,
+    PositionBoundProof, StateDemand, StateKind, TopologyError,
+    causal_prefix_positions_with_context_cap,
+};
+use crate::models::audio_frontend::{PadMode, StftFramer};
 use crate::models::decode_token_history::context_window_budget;
+use crate::models::ggml_asr_executor::{
+    GgmlAsrDecoderStatePlanningError, GgmlAsrDecoderStatePlanningInput,
+};
+use crate::nn::decoder::LlmKvCacheSpec;
 
 use super::audio_encoder::qwen3_audio_token_count_for_mel_frames;
-use super::ggml_executor::{
-    QWEN3_DECODE_MIN_GENERATED_TOKENS, QWEN3_DECODE_TOKEN_BUDGET_MARGIN,
-    QWEN3_DECODE_TOKENS_PER_AUDIO_SECOND,
-};
+use super::decode_budget::qwen3_desired_generated_tokens;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 
-/// The audio a single qwen3 decode is estimated to fold in, for admission.
-/// qwen3-asr is [`crate::arch::OpenAsrLongformSliceShape::SharedWindow`]: a
-/// recording longer than this is sliced by the shared slicer and each slice is
-/// its own decode, so no single decode's KV cache ever spans more than one
-/// window's audio. Clamping the admission estimate here (the analogue of
-/// moss's `integral_seconds` clamp) is what keeps a multi-hour recording from
-/// being judged -- and falsely rejected -- as if it decoded whole. The shared
-/// slicer's generic safety chunk is the honest, backend-independent single-
-/// slice bound; a user who forces a larger `longform.chunk_seconds` only makes
-/// admission MORE permissive (an under-estimate resolves to "allow", per
-/// `crate::capacity`'s fail-open invariant), never falsely rejecting.
-pub(crate) const QWEN3_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS: f32 =
-    crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
+pub(crate) const QWEN3_SELF_KV_STATE_ID: &str = "qwen3.decoder.self_kv";
 
-/// Fixed ChatML wrapper tokens around the audio span (`<|im_start|>system ...
-/// <|audio_start|>` prefix + `<|audio_end|> ... <|im_start|>assistant` suffix,
-/// see `super::decode_prompt::build_qwen3_decode_prompt`). A small conservative
-/// figure: it is dwarfed by the audio-token term at any real duration, and the
-/// whole required-positions estimate is bounded by `llm_max_positions`, so its
-/// exact value cannot swing an admission decision.
-const QWEN3_ADMISSION_FIXED_PROMPT_TOKENS: usize = 32;
+pub(crate) fn plan_qwen3_decoder_state(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "qwen3-asr";
+    let metadata =
+        super::runtime_contract::parse_qwen3_execution_metadata(input.preflight.metadata.as_ref())
+            .map_err(
+                |error| GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+                    family,
+                    reason: error.to_string(),
+                },
+            )?;
+    let tokenizer =
+        super::tokenizer::Qwen3AsrTokenizer::from_gguf_metadata(input.preflight.metadata.as_ref())
+            .ok();
+    plan_qwen3_decoder_state_with_components(input, metadata, tokenizer.as_ref())
+}
+
+pub(crate) fn plan_qwen3_decoder_state_with_prepared_runtime(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    prepared: &super::prepared_runtime::Qwen3AsrPreparedRuntime,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    plan_qwen3_decoder_state_with_components(input, prepared.metadata, prepared.tokenizer.as_ref())
+}
+
+fn plan_qwen3_decoder_state_with_components(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    metadata: Qwen3AsrExecutionMetadata,
+    tokenizer: Option<&super::tokenizer::Qwen3AsrTokenizer>,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "qwen3-asr";
+    let prompt = super::decode_prompt::build_qwen3_decode_prompt(
+        metadata,
+        tokenizer,
+        1,
+        input.request_options,
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?;
+    let logical_fixed_prompt_tokens = prompt.token_ids.len().checked_sub(1).ok_or_else(|| {
+        GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: "dummy audio span was absent from the tokenized prompt".to_string(),
+        }
+    })?;
+    let mut base_options = input.request_options.clone();
+    base_options.prompt = None;
+    base_options.prompt_token_ids = None;
+    let base_prompt =
+        super::decode_prompt::build_qwen3_decode_prompt(metadata, tokenizer, 1, &base_options)
+            .map_err(
+                |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                    family,
+                    reason: error.to_string(),
+                },
+            )?;
+    let base_fixed_prompt_tokens = base_prompt.token_ids.len().checked_sub(1).ok_or_else(|| {
+        GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: "base prompt dummy audio span was absent".to_string(),
+        }
+    })?;
+    let stable_fixed_prompt_tokens = base_fixed_prompt_tokens
+        .checked_add(input.envelope.max_prompt_tokens())
+        .map(|positions| positions.max(logical_fixed_prompt_tokens))
+        .ok_or_else(
+            || GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: "stable prompt position budget overflowed".to_string(),
+            },
+        )?;
+    let spec =
+        super::resolve_qwen_family_production_kv_cache_policy(input.backend, metadata.llm_head_dim)
+            .to_spec();
+    crate::capacity::topology::DecoderStatePlan::build(
+        &Qwen3DecoderStateTopology::new(
+            metadata,
+            logical_fixed_prompt_tokens,
+            stable_fixed_prompt_tokens,
+            spec,
+        ),
+        input.invocation,
+        input.envelope,
+    )
+    .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })
+}
 
 /// The decoder KV geometry the loaded pack advertises.
 pub(crate) fn qwen3_kv_geometry(metadata: &Qwen3AsrExecutionMetadata) -> KvGeometry {
@@ -60,55 +132,144 @@ pub(crate) fn qwen3_kv_geometry(metadata: &Qwen3AsrExecutionMetadata) -> KvGeome
     }
 }
 
-/// Desired generation budget (before the context clamp) for `audio_seconds` of
-/// audio: the family's per-second token allowance plus a fixed margin, floored
-/// at the short-audio minimum. The seconds-based twin of the sample-count
-/// arithmetic in `super::ggml_executor::qwen3_generated_token_budget`; both
-/// read the same `QWEN3_DECODE_*` constants and
-/// `qwen3_admission_desired_generation_matches_runtime_budget` pins them equal
-/// on whole-second inputs so the two never drift.
-fn qwen3_desired_generated_tokens_for_seconds(audio_seconds: f32) -> usize {
-    let audio_rate_budget =
-        (audio_seconds.max(0.0) * QWEN3_DECODE_TOKENS_PER_AUDIO_SECOND as f32).ceil() as usize;
-    audio_rate_budget
-        .saturating_add(QWEN3_DECODE_TOKEN_BUDGET_MARGIN)
-        .max(QWEN3_DECODE_MIN_GENERATED_TOKENS)
+/// Strict decoder-state topology for one Qwen3-ASR execution candidate.
+///
+/// `fixed_prompt_tokens` is measured once from the loaded tokenizer for the
+/// ChatML wrapper excluding audio-pad and request/carry tokens. Keeping that
+/// value outside this module avoids promoting the admission-only `32` estimate
+/// above into a runtime allocation contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Qwen3DecoderStateTopology {
+    metadata: Qwen3AsrExecutionMetadata,
+    logical_fixed_prompt_tokens: usize,
+    stable_fixed_prompt_tokens: usize,
+    kv_spec: LlmKvCacheSpec,
 }
 
-/// Decoder positions a single decode of `audio_duration_seconds` requires, the
-/// admission figure `evaluate_host_memory_admission` charges KV bytes against.
-/// The audio is clamped to [`QWEN3_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS`]
-/// (one slice's worth), the prompt is the fixed wrapper plus the exact spliced
-/// audio-token count, the generation budget is the family's measured demand
-/// clamped to the remaining context, and the whole figure is capped at
-/// `llm_max_positions` -- the same ceiling the runtime allocates against.
-pub(crate) fn qwen3_admission_required_positions(
-    metadata: &Qwen3AsrExecutionMetadata,
-    audio_duration_seconds: f32,
-) -> usize {
-    let admission_seconds =
-        audio_duration_seconds.clamp(0.0, QWEN3_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS);
-    let sample_rate = metadata.sample_rate_hz.max(1) as f32;
-    let hop = metadata.hop_length.max(1) as f32;
-    let mel_frames = (admission_seconds * sample_rate / hop) as usize;
-    let audio_tokens = qwen3_audio_token_count_for_mel_frames(mel_frames);
-    let prompt_tokens = QWEN3_ADMISSION_FIXED_PROMPT_TOKENS.saturating_add(audio_tokens);
-    let desired_generation = qwen3_desired_generated_tokens_for_seconds(admission_seconds);
-    // Same context clamp the runtime applies: generation may only use what the
-    // decoder positions past the prompt leave; a prompt that already fills the
-    // context leaves nothing to generate (the runtime fails that request
-    // closed separately -- admission just stops charging past the ceiling).
-    let generation = context_window_budget(metadata.llm_max_positions, prompt_tokens)
-        .map(|remaining| desired_generation.min(remaining))
-        .unwrap_or(0);
-    prompt_tokens
-        .saturating_add(generation)
-        .min(metadata.llm_max_positions)
+impl Qwen3DecoderStateTopology {
+    pub(crate) const fn new(
+        metadata: Qwen3AsrExecutionMetadata,
+        logical_fixed_prompt_tokens: usize,
+        stable_fixed_prompt_tokens: usize,
+        kv_spec: LlmKvCacheSpec,
+    ) -> Self {
+        Self {
+            metadata,
+            logical_fixed_prompt_tokens,
+            stable_fixed_prompt_tokens,
+            kv_spec,
+        }
+    }
+
+    fn mel_frames(&self, invocation: InvocationShapeInput) -> Result<usize, TopologyError> {
+        if invocation.sample_rate_hz().get() != self.metadata.sample_rate_hz {
+            return Err(TopologyError::UnsupportedSampleRate {
+                expected_hz: self.metadata.sample_rate_hz,
+                actual_hz: invocation.sample_rate_hz().get(),
+            });
+        }
+        // Reuse the actual frontend framer's allocation-free shape oracle,
+        // then mirror Qwen's deliberate final-row drop.
+        StftFramer::output_frame_count_for(
+            self.metadata.n_fft,
+            self.metadata.hop_length,
+            PadMode::ZeroCenter,
+            invocation.samples(),
+        )
+        .map_err(|error| TopologyError::Unavailable {
+            reason: format!("qwen3-asr STFT shape is invalid: {error}"),
+        })?
+        .checked_sub(1)
+        .filter(|&frames| frames > 0)
+        .ok_or(TopologyError::Unavailable {
+            reason: "qwen3-asr audio is too short after the final mel-row drop".to_string(),
+        })
+    }
+
+    fn desired_generated_tokens(
+        &self,
+        invocation: InvocationShapeInput,
+    ) -> Result<usize, TopologyError> {
+        qwen3_desired_generated_tokens(
+            invocation.samples(),
+            invocation.sample_rate_hz().get() as usize,
+        )
+        .map_err(|error| TopologyError::Unavailable {
+            reason: format!("qwen generation budget is unavailable: {error}"),
+        })
+    }
+}
+
+impl DecoderStateTopology for Qwen3DecoderStateTopology {
+    fn demands(
+        &self,
+        scope: DecoderStateDemandScope<InvocationShapeInput, InvocationEnvelope>,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        match scope {
+            DecoderStateDemandScope::ExactInvocation(invocation) => {
+                self.demands_for(invocation, self.logical_fixed_prompt_tokens)
+            }
+            DecoderStateDemandScope::StableEnvelope(envelope) => self.demands_for(
+                envelope.maximum_invocation(),
+                self.stable_fixed_prompt_tokens,
+            ),
+        }
+    }
+}
+
+impl Qwen3DecoderStateTopology {
+    fn demands_for(
+        &self,
+        invocation: InvocationShapeInput,
+        fixed_prompt_tokens: usize,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        let audio_tokens = qwen3_audio_token_count_for_mel_frames(self.mel_frames(invocation)?);
+        let prompt_positions = fixed_prompt_tokens.checked_add(audio_tokens).ok_or(
+            TopologyError::ArithmeticOverflow {
+                operation: "qwen prompt positions",
+            },
+        )?;
+        let context_remaining =
+            context_window_budget(self.metadata.llm_max_positions, prompt_positions).ok_or_else(
+                || TopologyError::Unavailable {
+                    reason: format!(
+                        "qwen prompt positions {prompt_positions} exhaust llm_max_positions {}",
+                        self.metadata.llm_max_positions
+                    ),
+                },
+            )?;
+        // This is decode semantics, not a memory-pressure clamp: the runtime's
+        // qwen3_generated_token_budget applies the same min before creating
+        // its DecodeConfig, so the topology must reserve that legal budget
+        // rather than reject a near-context request the runtime accepts.
+        let generated_positions = self
+            .desired_generated_tokens(invocation)?
+            .min(context_remaining);
+        let positions = causal_prefix_positions_with_context_cap(
+            QWEN3_SELF_KV_STATE_ID,
+            prompt_positions,
+            generated_positions,
+            self.metadata.llm_max_positions,
+        )?;
+        Ok(vec![StateDemand::from_llm_kv_geometry(
+            QWEN3_SELF_KV_STATE_ID,
+            StateKind::SelfAttentionKv,
+            positions,
+            self.metadata.llm_max_positions,
+            qwen3_kv_geometry(&self.metadata),
+            self.kv_spec,
+            invocation.sequences().get() as usize,
+            PositionBoundProof::Exact,
+        )?])
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
+    use crate::capacity::topology::{DecoderStatePlan, InvocationEnvelope, StateKind};
     use crate::capacity::{KvGeometry, kv_bytes_per_position};
     use crate::nn::decoder::LlmKvCacheSpec;
 
@@ -157,68 +318,143 @@ mod tests {
     }
 
     #[test]
-    fn required_positions_is_clamped_to_the_single_decode_window() {
-        let metadata = reference_metadata();
-        // 30s and 3600s clamp to the same single-decode window, so a multi-hour
-        // recording is never judged as one giant decode (the false-reject the
-        // clamp exists to prevent).
-        let at_window = qwen3_admission_required_positions(
-            &metadata,
-            QWEN3_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS,
+    fn frontend_count_oracle_pins_final_row_drop_boundary() {
+        let topology =
+            Qwen3DecoderStateTopology::new(reference_metadata(), 32, 32, LlmKvCacheSpec::DEFAULT);
+        let rate = NonZeroU32::new(16_000).unwrap();
+        assert!(
+            topology
+                .mel_frames(InvocationShapeInput::new(rate, 159).unwrap())
+                .is_err()
         );
-        let at_hour = qwen3_admission_required_positions(&metadata, 3600.0);
-        assert_eq!(at_window, at_hour);
-        // A short clip needs strictly fewer positions than a full window.
-        let short = qwen3_admission_required_positions(&metadata, 5.0);
-        assert!(short < at_window, "short={short} window={at_window}");
-        // Every estimate stays within the pack's advertised context ceiling.
-        assert!(at_window <= metadata.llm_max_positions);
+        assert_eq!(
+            topology
+                .mel_frames(InvocationShapeInput::new(rate, 160).unwrap())
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
-    fn required_positions_counts_audio_tokens_and_generation() {
-        let metadata = reference_metadata();
-        // 30s at 16kHz/160-hop = 3000 mel frames -> ceil(3000/100)=30 chunks *
-        // conv_out_len^3(100)=13 = 390 audio tokens; prompt = 32 + 390 = 422.
-        // Desired generation = ceil(30*12)+32 = 392 (> the 128 floor).
-        // required = 422 + 392 = 814, well under the 40960 ceiling.
-        let positions = qwen3_admission_required_positions(&metadata, 30.0);
-        assert_eq!(positions, 814);
+    fn topology_uses_exact_integer_audio_and_generation_counts() {
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        let plan = DecoderStatePlan::for_envelope(
+            &Qwen3DecoderStateTopology::new(reference_metadata(), 32, 32, LlmKvCacheSpec::DEFAULT),
+            envelope,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.reserve_positions(StateKind::SelfAttentionKv),
+            Some(813)
+        );
     }
 
     #[test]
-    fn required_positions_is_capped_at_llm_max_positions() {
-        // A pack with a tiny context ceiling: the prompt alone overruns it, so
-        // admission charges exactly the ceiling and never more (saturating, not
-        // wrapping into a small "fits" number).
-        let mut metadata = reference_metadata();
-        metadata.llm_max_positions = 64;
-        let positions = qwen3_admission_required_positions(&metadata, 30.0);
-        assert_eq!(positions, 64);
-    }
-
-    #[test]
-    fn qwen3_admission_desired_generation_matches_runtime_budget() {
-        // The seconds-based generation budget equals the runtime's sample-count
-        // arithmetic (`prepared_audio.len() * 12 / sample_rate`, ceil) on a
-        // whole-second input -- the shared-constant contract that keeps the
-        // admission estimate from drifting off the real decode budget.
-        for seconds in [1usize, 3, 10, 30] {
-            let sample_rate = 16_000usize;
-            let samples = seconds * sample_rate;
-            let runtime_audio_rate = samples
-                .checked_mul(QWEN3_DECODE_TOKENS_PER_AUDIO_SECOND)
-                .and_then(|value| value.checked_add(sample_rate - 1))
-                .and_then(|value| value.checked_div(sample_rate))
-                .expect("no overflow");
-            let runtime_desired = runtime_audio_rate
-                .saturating_add(QWEN3_DECODE_TOKEN_BUDGET_MARGIN)
-                .max(QWEN3_DECODE_MIN_GENERATED_TOKENS);
-            let admission_desired = qwen3_desired_generated_tokens_for_seconds(seconds as f32);
+    fn duration_boundaries_follow_frontend_prompt_and_greedy_schedule() {
+        let rate = NonZeroU32::new(16_000).unwrap();
+        let topology =
+            Qwen3DecoderStateTopology::new(reference_metadata(), 32, 32, LlmKvCacheSpec::DEFAULT);
+        // 100 mel frames per second, padded in 100-frame encoder chunks;
+        // every chunk emits 13 decoder audio positions. Generation is the
+        // family 12 token/s + 32 rule with a 128-token floor.
+        for (seconds, expected_positions) in [(1, 172), (30, 813), (60, 1_563), (300, 7_563)] {
+            let envelope = InvocationEnvelope::new(rate, seconds * 16_000).unwrap();
+            let plan = DecoderStatePlan::for_envelope(&topology, envelope).unwrap();
             assert_eq!(
-                admission_desired, runtime_desired,
-                "generation budget drifted at {seconds}s"
+                plan.reserve_positions_by_id(QWEN3_SELF_KV_STATE_ID),
+                Some(expected_positions),
+                "unexpected qwen capacity at {seconds}s"
             );
+            assert!(expected_positions < reference_metadata().llm_max_positions);
         }
+    }
+
+    #[test]
+    fn stable_prompt_budget_is_reserved_without_inflating_logical_shape() {
+        let rate = NonZeroU32::new(16_000).unwrap();
+        let invocation = InvocationShapeInput::new(rate, 30 * 16_000).unwrap();
+        let envelope =
+            InvocationEnvelope::from_milliseconds(rate, NonZeroU32::new(30_000).unwrap())
+                .unwrap()
+                .with_max_prompt_tokens(512);
+        let plan = DecoderStatePlan::build(
+            &Qwen3DecoderStateTopology::new(
+                reference_metadata(),
+                32,
+                32 + envelope.max_prompt_tokens(),
+                LlmKvCacheSpec::DEFAULT,
+            ),
+            invocation,
+            envelope,
+        )
+        .unwrap();
+        let axis = plan
+            .position_axis(QWEN3_SELF_KV_STATE_ID, StateKind::SelfAttentionKv)
+            .unwrap();
+        assert_eq!(axis.logical_positions, 813);
+        assert_eq!(axis.resident_positions, 1_325);
+    }
+
+    #[test]
+    fn topology_matches_runtime_context_clamp_for_generation() {
+        let mut metadata = reference_metadata();
+        metadata.llm_max_positions = 800;
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        let plan = DecoderStatePlan::for_envelope(
+            &Qwen3DecoderStateTopology::new(metadata, 32, 32, LlmKvCacheSpec::DEFAULT),
+            envelope,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.reserve_positions(StateKind::SelfAttentionKv),
+            Some(799)
+        );
+    }
+
+    #[test]
+    fn topology_rejects_a_prompt_that_exhausts_context() {
+        let mut metadata = reference_metadata();
+        // 30s fixed+audio prompt is 422 positions before generation.
+        metadata.llm_max_positions = 422;
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            DecoderStatePlan::for_envelope(
+                &Qwen3DecoderStateTopology::new(metadata, 32, 32, LlmKvCacheSpec::DEFAULT),
+                envelope,
+            ),
+            Err(TopologyError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn semantic_context_rejects_the_one_row_physical_false_positive() {
+        let mut metadata = reference_metadata();
+        // 1s has P=45 and G=128, hence semantic=173 and physical K=172.
+        // A 172-position context used to pass the physical-only cap check.
+        metadata.llm_max_positions = 172;
+        let envelope = InvocationEnvelope::new(NonZeroU32::new(16_000).unwrap(), 16_000).unwrap();
+        // Qwen intentionally clamps G to remaining context, so it stays legal
+        // and proves the runtime/planner shared clamp rather than rejecting.
+        let plan = DecoderStatePlan::for_envelope(
+            &Qwen3DecoderStateTopology::new(metadata, 32, 32, LlmKvCacheSpec::DEFAULT),
+            envelope,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.reserve_positions_by_id(QWEN3_SELF_KV_STATE_ID),
+            Some(171)
+        );
     }
 }

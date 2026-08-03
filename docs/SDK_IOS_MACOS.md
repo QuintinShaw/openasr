@@ -109,8 +109,17 @@ authoritative, fully-documented signatures. Shape:
 ```c
 const char *openasr_version(void);
 
+// One process-owned execution root. Reuse it across every model, stream, and
+// catalog handle so runtime caches and device-memory admission share a scope.
+OpenAsrStatus openasr_engine_create(OpenAsrEngine **out_engine);
+void openasr_engine_free(OpenAsrEngine *engine);
+OpenAsrStatus openasr_engine_unload_idle_runtime_caches(const OpenAsrEngine *engine);
+
 // Load / free a validated .oasr pack handle.
 OpenAsrStatus openasr_model_open(const char *path, OpenAsrModel **out_model);
+OpenAsrStatus openasr_model_open_with_engine(const OpenAsrEngine *engine,
+                                             const char *path,
+                                             OpenAsrModel **out_model);
 void openasr_model_close(OpenAsrModel *model);
 
 // Transcribe one in-memory 16 kHz mono PCM buffer.
@@ -138,9 +147,16 @@ Example (C), transcribing 16-bit PCM already in memory:
 ```c
 #include "openasr.h"
 
+OpenAsrEngine *engine = NULL;
+if (openasr_engine_create(&engine) != OPEN_ASR_STATUS_OK) {
+    fprintf(stderr, "engine init failed: %s\n", openasr_last_error_message());
+    return 1;
+}
+
 OpenAsrModel *model = NULL;
-if (openasr_model_open("/path/to/model.oasr", &model) != OPEN_ASR_STATUS_OK) {
+if (openasr_model_open_with_engine(engine, "/path/to/model.oasr", &model) != OPEN_ASR_STATUS_OK) {
     fprintf(stderr, "load failed: %s\n", openasr_last_error_message());
+    openasr_engine_free(engine);
     return 1;
 }
 
@@ -151,6 +167,7 @@ OpenAsrStatus status = openasr_transcribe_pcm(
 if (status != OPEN_ASR_STATUS_OK) {
     fprintf(stderr, "transcribe failed: %s\n", openasr_last_error_message());
     openasr_model_close(model);
+    openasr_engine_free(engine);
     return 1;
 }
 
@@ -162,7 +179,15 @@ for (uintptr_t i = 0; i < openasr_result_segment_count(result); i++) {
 
 openasr_result_free(result);
 openasr_model_close(model);
+openasr_engine_free(engine);
 ```
+
+The original `openasr_model_open`, `openasr_streaming_session_open`,
+`openasr_catalog_fetch`, and `openasr_remove_model` symbols remain supported for
+source and ABI compatibility. Each legacy long-lived handle owns its own
+execution root. New applications should create one `OpenAsrEngine` per process
+and use the `*_with_engine` entries; this is required for cross-handle cache
+reuse and byte-accurate device-memory coordination.
 
 ### Streaming (live captioning)
 
@@ -177,6 +202,9 @@ the header for the full accessor set and ownership rules):
 OpenAsrStatus openasr_streaming_session_open(const char *path,
                                              const OpenAsrStreamingConfig *config,  // NULL = defaults
                                              OpenAsrStreamingSession **out_session);
+OpenAsrStatus openasr_streaming_session_open_with_engine(
+    const OpenAsrEngine *engine, const char *path,
+    const OpenAsrStreamingConfig *config, OpenAsrStreamingSession **out_session);
 OpenAsrStatus openasr_streaming_feed(OpenAsrStreamingSession *session,
                                      const float *pcm, uintptr_t pcm_len_samples,  // 16 kHz mono f32
                                      OpenAsrStreamingEvents **out_events);
@@ -232,6 +260,10 @@ for full ownership rules):
 // Fetch + verify the signed catalog (NULL url = the built-in production endpoint).
 OpenAsrStatus openasr_catalog_fetch(const char *catalog_url, const char *home_dir,
                                     OpenAsrCatalog **out_catalog);
+OpenAsrStatus openasr_catalog_fetch_with_engine(const OpenAsrEngine *engine,
+                                                const char *catalog_url,
+                                                const char *home_dir,
+                                                OpenAsrCatalog **out_catalog);
 const char   *openasr_catalog_json(const OpenAsrCatalog *catalog);  // verified catalog, borrowed
 void          openasr_catalog_free(OpenAsrCatalog *catalog);
 
@@ -262,15 +294,20 @@ OpenAsrStatus openasr_install_local_pack_v2(const OpenAsrCatalog *catalog,
 
 OpenAsrStatus openasr_list_installed_json(const char *home_dir, char **out_json);  // JSON array
 OpenAsrStatus openasr_remove_model(const char *home_dir, const char *reference, bool *out_removed);
+OpenAsrStatus openasr_remove_model_with_engine(const OpenAsrEngine *engine,
+                                               const char *home_dir,
+                                               const char *reference,
+                                               bool *out_removed);
 void          openasr_string_free(char *string);   // free out_*_json strings only
 ```
 
-Typical flow: `openasr_catalog_fetch` -> parse `openasr_catalog_json` to render
+Typical flow: `openasr_engine_create` -> `openasr_catalog_fetch_with_engine` -> parse `openasr_catalog_json` to render
 the market and the per-model download disclosure (size, host, license) -> on the
 user's tap, `openasr_pull_model(catalog, "moonshine-tiny", NULL, ...)` with a
 progress callback and a cancel flag -> the installed pack's `path` (from
 `out_installed_json` or `openasr_list_installed_json`) is what you hand to
-`openasr_model_open` / `openasr_streaming_session_open`. Run the pull off the main
+`openasr_model_open_with_engine` / `openasr_streaming_session_open_with_engine`.
+Run the pull off the main
 thread: it blocks for the whole download, invoking the progress/cancel callbacks
 synchronously on that same thread.
 

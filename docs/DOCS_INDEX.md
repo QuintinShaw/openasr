@@ -38,6 +38,7 @@ in the root [README](../README.md#docker).
 | Doc | What it covers |
 | --- | --- |
 | [Model Onboarding Contract](design/model-onboarding-contract.md) | Reviewer-facing anti-fragmentation contract for new ASR-architecture PRs: the shared registration/decode/packaging/tokenizer/`nn/`/capabilities/progress facilities every family must reuse instead of re-implementing, plus a PR checklist. Written after the FireRedASR-AED long-audio repetition bug (issue #60) showed the cost of a family bypassing the shared decode driver. |
+| [Decoder State and Native Memory Planning](design/decoder-state-memory-planning.md) | Four-layer contract for family token topology, native backend physical-footprint quotes, process-wide atomic memory admission, and semantics-preserving execution fallback. Includes the 30/60-second product envelope and decoder-family onboarding checklist. |
 
 ## Speaker diarization
 

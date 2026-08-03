@@ -480,6 +480,7 @@ pub struct PullModelPackRequest<'a> {
     resolved: &'a ResolvedCatalogPull,
     home: &'a Path,
     sources: Option<&'a [DownloadSource]>,
+    execution_services: Option<&'a crate::NativeExecutionServices>,
     should_cancel: Option<Box<dyn Fn() -> bool + 'a>>,
     should_pause: Option<Box<dyn Fn() -> bool + 'a>>,
 }
@@ -491,9 +492,24 @@ impl<'a> PullModelPackRequest<'a> {
             resolved,
             home,
             sources: None,
+            execution_services: None,
             should_cancel: None,
             should_pause: None,
         }
+    }
+
+    /// Attach the execution-service root whose resident runtime caches should
+    /// be reclaimed when this install replaces an already-loaded pack.
+    ///
+    /// Standalone pack-management tools that cannot have resident native
+    /// runtimes may omit this. Long-lived hosts must pass the same service
+    /// root they use for offline and streaming execution.
+    pub fn execution_services(
+        mut self,
+        execution_services: &'a crate::NativeExecutionServices,
+    ) -> Self {
+        self.execution_services = Some(execution_services);
+        self
     }
 
     /// Override the download source chain. Defaults to the environment chain.
@@ -520,6 +536,7 @@ impl<'a> PullModelPackRequest<'a> {
             resolved,
             home,
             sources,
+            execution_services,
             should_cancel,
             should_pause,
         } = self;
@@ -552,6 +569,7 @@ impl<'a> PullModelPackRequest<'a> {
             PullOptions::default(),
             sources,
             Some(parallel),
+            execution_services,
             progress,
             || should_cancel.as_ref().is_some_and(|f| f()),
             || should_pause.as_ref().is_some_and(|f| f()),
@@ -575,8 +593,32 @@ pub fn install_model_pack_from_path(
     home: impl AsRef<Path>,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
+    install_model_pack_from_path_with_execution_services(
+        resolved,
+        source_path,
+        home,
+        None,
+        progress,
+    )
+}
+
+/// Installs a local pack and reclaims any superseded resident runtime from the
+/// explicitly supplied execution-service root.
+pub fn install_model_pack_from_path_with_execution_services(
+    resolved: &ResolvedCatalogPull,
+    source_path: impl AsRef<Path>,
+    home: impl AsRef<Path>,
+    execution_services: Option<&crate::NativeExecutionServices>,
+    progress: impl FnMut(PullProgress),
+) -> Result<InstalledPack, PullError> {
     let target = PullTarget::from_resolved(resolved)?.with_source("local");
-    install_model_pack_from_path_with_target(&target, source_path, home, progress)
+    install_model_pack_from_path_with_target(
+        &target,
+        source_path,
+        home,
+        execution_services,
+        progress,
+    )
 }
 
 pub fn install_catalog_model_pack_from_path(
@@ -585,9 +627,32 @@ pub fn install_catalog_model_pack_from_path(
     home: impl AsRef<Path>,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
+    install_catalog_model_pack_from_path_with_execution_services(
+        catalog,
+        source_path,
+        home,
+        None,
+        progress,
+    )
+}
+
+/// Catalog-verified local install with explicit resident-runtime reclamation.
+pub fn install_catalog_model_pack_from_path_with_execution_services(
+    catalog: &ModelCatalog,
+    source_path: impl AsRef<Path>,
+    home: impl AsRef<Path>,
+    execution_services: Option<&crate::NativeExecutionServices>,
+    progress: impl FnMut(PullProgress),
+) -> Result<InstalledPack, PullError> {
     let source_path = source_path.as_ref();
     let resolved = resolve_catalog_model_pack_from_path(catalog, source_path)?;
-    install_model_pack_from_path(&resolved, source_path, home, progress)
+    install_model_pack_from_path_with_execution_services(
+        &resolved,
+        source_path,
+        home,
+        execution_services,
+        progress,
+    )
 }
 
 /// Resolve a local `.oasr` pack to the immutable signed-catalog entry whose
@@ -646,6 +711,7 @@ fn install_model_pack_from_path_with_target(
     target: &PullTarget,
     source_path: impl AsRef<Path>,
     home: impl AsRef<Path>,
+    execution_services: Option<&crate::NativeExecutionServices>,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
     // Reject an unusable target before copying potentially gigabytes of pack.
@@ -663,13 +729,20 @@ fn install_model_pack_from_path_with_target(
     // object is keyed by its own digest. The pull lock is taken once, by
     // `install_admitted_model_pack`, around publishing the ref.
     let admitted = admit_model_content(source_path, home.as_ref())?;
-    install_admitted_model_pack(target, home.as_ref(), admitted, progress)
+    install_admitted_model_pack(
+        target,
+        home.as_ref(),
+        admitted,
+        execution_services,
+        progress,
+    )
 }
 
 fn install_admitted_model_pack(
     target: &PullTarget,
     home: &Path,
     admitted: content_store::AdmittedContent,
+    execution_services: Option<&crate::NativeExecutionServices>,
     mut progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
     if admitted.size_bytes != target.size_bytes {
@@ -700,7 +773,7 @@ fn install_admitted_model_pack(
     let _validated_lease = admitted.into_lease();
     let pack = write_installed_record(target, &paths)?;
     if let Some(old_content_id) = previous_pack_content_id {
-        evict_resident_runtime_caches_for_content_id(&old_content_id);
+        evict_resident_runtime_caches_for_content_id(execution_services, &old_content_id);
     }
     progress(PullProgress::Installed {
         path: pack.path.clone(),
@@ -1082,6 +1155,16 @@ pub fn remove_model_pack(
     home: impl AsRef<Path>,
     reference: &str,
 ) -> Result<Option<InstalledPack>, PullError> {
+    remove_model_pack_with_execution_services(home, reference, None)
+}
+
+/// Removes a pack and reclaims its resident runtime from the explicitly
+/// supplied execution-service root.
+pub fn remove_model_pack_with_execution_services(
+    home: impl AsRef<Path>,
+    reference: &str,
+    execution_services: Option<&crate::NativeExecutionServices>,
+) -> Result<Option<InstalledPack>, PullError> {
     let home = home.as_ref();
     let Some(pack) = find_installed_pack(home, reference)? else {
         return Ok(None);
@@ -1116,6 +1199,7 @@ pub fn remove_model_pack(
             .any(|candidate| candidate.sha256 == pack.sha256);
         content_store::remove_object_if_unreferenced(&root, &pack.sha256, still_referenced)?;
         evict_resident_runtime_caches_for_content_id(
+            execution_services,
             &crate::models::runtime_cache_coordinator::content_id_from_sha256_hex(&pack.sha256),
         );
         return Ok(Some(pack));
@@ -1151,6 +1235,7 @@ pub fn remove_model_pack(
         }
     }
     evict_resident_runtime_caches_for_content_id(
+        execution_services,
         &crate::models::runtime_cache_coordinator::content_id_from_sha256_hex(&pack.sha256),
     );
     Ok(Some(pack))
@@ -1288,6 +1373,7 @@ fn pull_model_pack_with_client_and_cancel<C: DownloadClient>(
         options,
         &[DownloadSource::Hf],
         None,
+        None,
         progress,
         should_cancel,
         should_pause,
@@ -1317,6 +1403,7 @@ fn pull_model_pack_with_client_parallel<C: DownloadClient>(
         options,
         &[DownloadSource::Hf],
         Some(parallel),
+        None,
         progress,
         should_cancel,
         should_pause,
@@ -1331,6 +1418,7 @@ fn pull_model_pack_with_client_sources_and_cancel<C: DownloadClient>(
     options: PullOptions,
     sources: &[DownloadSource],
     parallel: Option<ParallelDownloadConfig>,
+    execution_services: Option<&crate::NativeExecutionServices>,
     mut progress: impl FnMut(PullProgress),
     should_cancel: impl Fn() -> bool,
     should_pause: impl Fn() -> bool,
@@ -1372,6 +1460,7 @@ fn pull_model_pack_with_client_sources_and_cancel<C: DownloadClient>(
                 target,
                 &paths,
                 Some(downloaded),
+                execution_services,
                 &should_cancel,
                 &mut progress,
             )
@@ -2663,6 +2752,7 @@ fn verify_partial_and_install(
     target: &PullTarget,
     paths: &PullPaths,
     downloaded: Option<DownloadedPartial>,
+    execution_services: Option<&crate::NativeExecutionServices>,
     should_cancel: &impl Fn() -> bool,
     mut progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
@@ -2725,7 +2815,7 @@ fn verify_partial_and_install(
     let _ = fs::remove_file(&paths.partial_segments_meta_path);
     let pack = write_installed_record(target, paths)?;
     if let Some(old_content_id) = previous_pack_content_id {
-        evict_resident_runtime_caches_for_content_id(&old_content_id);
+        evict_resident_runtime_caches_for_content_id(execution_services, &old_content_id);
     }
     progress(PullProgress::Installed {
         path: pack.path.clone(),
@@ -2753,8 +2843,8 @@ fn existing_pack_content_id_for_eviction(paths: &PullPaths) -> Option<String> {
         .then_some(content_id)
 }
 
-/// Evicts `pack_content_id`'s resident state from every process-wide runtime
-/// cache that could hold it, without touching any other content identity.
+/// Evicts `pack_content_id`'s resident state from the explicitly supplied
+/// execution-service root.
 ///
 /// This is a memory-reclaim step, not a correctness requirement: every one of
 /// these caches is already content-addressed, so a request against the newly
@@ -2763,17 +2853,13 @@ fn existing_pack_content_id_for_eviction(paths: &PullPaths) -> Option<String> {
 /// across every builtin family -- a `HashMap` removal for a content id that
 /// family never cached is just a no-op lookup miss, so this does not need to
 /// know which architecture the replaced pack belonged to.
-fn evict_resident_runtime_caches_for_content_id(pack_content_id: &str) {
-    use crate::models::executor_component_registry::{
-        shared_cohere_transcribe_executor, shared_moonshine_executor, shared_qwen3_asr_executor,
-        shared_whisper_executor,
-    };
-
-    shared_whisper_executor().evict_prepared_runtime_content_id(pack_content_id);
-    shared_moonshine_executor().evict_prepared_runtime_content_id(pack_content_id);
-    shared_cohere_transcribe_executor().evict_prepared_runtime_content_id(pack_content_id);
-    shared_qwen3_asr_executor().evict_prepared_runtime_content_id(pack_content_id);
-    crate::models::dolphin::executor::evict_dolphin_pool_entry_for_content_id(pack_content_id);
+fn evict_resident_runtime_caches_for_content_id(
+    execution_services: Option<&crate::NativeExecutionServices>,
+    pack_content_id: &str,
+) {
+    if let Some(execution_services) = execution_services {
+        execution_services.evict_prepared_runtime_content_id(pack_content_id);
+    }
 }
 
 fn cancel_before_commit(

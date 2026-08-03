@@ -1,57 +1,102 @@
-//! moss-transcribe-diarize capacity derivation: assembles the family's
-//! [`IntegralWindowDerivation`] from PACK METADATA (the loaded checkpoint's
-//! decoder geometry + adaptor merge size) and family constants, so the
-//! integral window is a computed quantity rather than margin-note arithmetic
-//! beside `integral_seconds: 300.0`.
+//! MOSS-TD decoder-state topology.
 //!
-//! Phase 0: ZERO production callers. The family still serves the declared
-//! `OpenAsrLongformSliceShape::ScopedSlices` constants; the tests below run
-//! the derivation in parallel and pin it equal to those constants (the
-//! regression anchors that make Phase 1's switchover behavior-preserving).
-//! Reject-not-degrade is already the live behavior this derivation protects:
-//! an over-limit request fails closed via
-//! `moss_td_request_kv_cache_positions` -> `AudioExceedsContext`, and the
-//! derived window never depends on host memory (see `crate::capacity`'s
-//! invariants).
-//!
-//! Same Phase 0 dead-code semantics as `crate::capacity` itself: no
-//! production caller consumes the assembly yet, so release builds are
-//! permitted to leave it uncalled. Remove the allowance when Phase 1 wires
-//! the derivation into pack load.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The product window (30s target, 60s maximum) is a semantic envelope, not a
+//! quantity inferred from available VRAM. This module proves the exact
+//! logical and session-stable KV spans from the same integer frontend,
+//! time-marker, and generation-budget counters used by execution. The 8192
+//! family limit validates those spans but is never substituted as capacity.
 
-use std::num::NonZeroU32;
-
-use crate::capacity::{IntegralWindowDerivation, KvGeometry};
-
-use super::decode_prompt::{AUDIO_TOKENS_PER_SECOND, TIME_MARKER_EVERY_SECONDS};
-use super::executor::{
-    CHUNK_SAMPLES, HOP_LENGTH, MOSS_TD_MAX_GENERATED_TOKENS, SAMPLE_RATE_HZ,
-    WHISPER_ENCODER_CONV_STRIDE, moss_td_chunk_token_length,
+use crate::capacity::KvGeometry;
+use crate::capacity::topology::{
+    DecoderStateDemandScope, DecoderStateTopology, InvocationEnvelope, InvocationShapeInput,
+    PositionBoundProof, StateDemand, StateKind, TopologyError,
+    causal_prefix_positions_with_context_cap,
 };
+use crate::models::ggml_asr_executor::{
+    GgmlAsrDecoderStatePlanningError, GgmlAsrDecoderStatePlanningInput,
+};
+use crate::nn::decoder::LlmKvCacheSpec;
+
+use super::decode_budget::moss_td_generated_token_budget;
+use super::executor::{
+    CHUNK_SAMPLES, HOP_LENGTH, SAMPLE_RATE_HZ, WHISPER_ENCODER_CONV_STRIDE,
+    moss_td_aligned_frame_count, moss_td_chunk_keep_frames, moss_td_chunk_token_length,
+};
+use super::runtime_contract::MossTdEncoderMetadata;
 use super::runtime_contract::{MossTdDecoderMetadata, moss_td_kv_cache_positions};
 
-/// Tokens of the fixed ChatML wrapper around the audio span: the 14-token
+pub(crate) const MOSS_TD_SELF_KV_STATE_ID: &str = "moss-td.decoder.self_kv";
+
+pub(crate) fn plan_moss_td_decoder_state(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "moss-transcribe-diarize";
+    let metadata = input.preflight.metadata.as_ref();
+    let encoder = super::runtime_contract::parse_encoder_metadata(metadata).map_err(|error| {
+        GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+            family,
+            reason: error.to_string(),
+        }
+    })?;
+    let decoder = super::runtime_contract::parse_decoder_metadata(metadata).map_err(|error| {
+        GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+            family,
+            reason: error.to_string(),
+        }
+    })?;
+    let adaptor = super::runtime_contract::parse_adaptor_metadata(metadata).map_err(|error| {
+        GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+            family,
+            reason: error.to_string(),
+        }
+    })?;
+    let tokenizer =
+        super::tokenizer::MossTdTokenizer::from_gguf_metadata(metadata).map_err(|error| {
+            GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            }
+        })?;
+    let fixed_prompt_tokens = super::decode_prompt::moss_td_fixed_prompt_token_count(&tokenizer)
+        .map_err(
+            |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            },
+        )?;
+    let geometry = moss_td_kv_geometry(&decoder);
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        input.backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    let topology = MossTdDecoderStateTopology::new(
+        encoder,
+        decoder,
+        adaptor.merge_size,
+        fixed_prompt_tokens,
+        spec,
+    )
+    .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })?;
+    crate::capacity::topology::DecoderStatePlan::build(&topology, input.invocation, input.envelope)
+        .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })
+}
+
+/// Shipped-pack regression for the fixed ChatML wrapper around the audio span:
+/// the 14-token
 /// `<|im_start|>system...<|im_start|>user\n` prefix + the `audio_start`
 /// delimiter + the `audio_end` delimiter + the 70-token instruction/ChatML
 /// suffix. Measured token-for-token against the real golden fixture
 /// (`tmp/moss-td/golden/jfk.json`'s `prompt_input_ids`: 227 tokens = 14
 /// prefix + 1 audio-start + 141 audio span + 1 audio-end + 70 suffix, where
 /// the 141-token span at 11s is 138 pad tokens + 3 marker digits -- the
-/// markers are modeled separately by `marker_every_seconds`, and
-/// `crate::capacity::tests::marker_digit_tokens_matches_the_real_prompt_construction`
-/// pins that split against the same fixture). The flat 512-token overhead
-/// this replaced was only conservatively correct by luck below ~1000s; this
-/// number is the honest fixed term and the growth term is derived.
-pub(crate) const MOSS_TD_FIXED_PROMPT_TOKENS: usize = 86;
-
-/// Densest generation demand this family has actually been measured against
-/// (dense overlapping Mandarin meeting audio -- AliMeeting `R8001_M8004`,
-/// `R8007_M8010` -- exhausted a 12 tokens/s allowance on a 180s slice, so it
-/// needs upwards of 12.7; the same figure `executor.rs`'s per-second
-/// allowance doc comment cites). The integral window's required generation
-/// is `ceil(window * this)`, clamped at the runaway backstop.
-pub(crate) const MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+/// markers are modeled separately by `marker_every_seconds`). Production does
+/// not consume this number: it invokes
+/// `decode_prompt::moss_td_fixed_prompt_token_count` on the loaded tokenizer,
+/// while the real-pack prompt regression pins that result to 86 for the
+/// shipped artifact.
+#[cfg(test)]
+pub(crate) const MOSS_TD_SHIPPED_FIXED_PROMPT_TOKENS: usize = 86;
 
 /// The decoder KV geometry the loaded pack advertises.
 pub(crate) fn moss_td_kv_geometry(decoder: &MossTdDecoderMetadata) -> KvGeometry {
@@ -62,26 +107,158 @@ pub(crate) fn moss_td_kv_geometry(decoder: &MossTdDecoderMetadata) -> KvGeometry
     }
 }
 
-/// The family's integral-window derivation inputs, assembled from the loaded
-/// pack (`decoder` geometry + `merge_size` from `moss_td.adaptor.merge_size`)
-/// and family constants. The position ceiling is the pack's advertised
-/// `max_positions` clamped to the family preallocation cap -- the same clamp
-/// the runtime decoder applies (`moss_td_kv_cache_positions`), so derivation
-/// and runtime argue from one ceiling.
-pub(crate) fn moss_td_integral_window_derivation(
-    decoder: &MossTdDecoderMetadata,
+/// Session-stable MOSS causal-prefix topology. Every term is the same integer
+/// shape arithmetic the real frontend/prompt/decode path uses; the 8192
+/// family cap remains validation only.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MossTdDecoderStateTopology {
+    encoder: MossTdEncoderMetadata,
+    decoder: MossTdDecoderMetadata,
     merge_size: usize,
-) -> IntegralWindowDerivation {
-    let token_stride = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * merge_size.max(1);
-    IntegralWindowDerivation {
-        kv_position_ceiling: moss_td_kv_cache_positions(decoder.max_positions),
-        chunk_seconds: CHUNK_SAMPLES as f32 / SAMPLE_RATE_HZ as f32,
-        audio_tokens_per_chunk: moss_td_chunk_token_length(CHUNK_SAMPLES, token_stride),
-        audio_tokens_per_second: AUDIO_TOKENS_PER_SECOND,
-        fixed_prompt_tokens: MOSS_TD_FIXED_PROMPT_TOKENS,
-        marker_every_seconds: NonZeroU32::new(TIME_MARKER_EVERY_SECONDS),
-        densest_generated_tokens_per_second: MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND,
-        max_generated_tokens: MOSS_TD_MAX_GENERATED_TOKENS,
+    fixed_prompt_tokens: usize,
+    kv_spec: LlmKvCacheSpec,
+}
+
+impl MossTdDecoderStateTopology {
+    pub(crate) fn new(
+        encoder: MossTdEncoderMetadata,
+        decoder: MossTdDecoderMetadata,
+        merge_size: usize,
+        fixed_prompt_tokens: usize,
+        kv_spec: LlmKvCacheSpec,
+    ) -> Result<Self, TopologyError> {
+        if merge_size == 0 {
+            return Err(TopologyError::Unavailable {
+                reason: "moss adaptor merge_size is zero".to_string(),
+            });
+        }
+        Ok(Self {
+            encoder,
+            decoder,
+            merge_size,
+            fixed_prompt_tokens,
+            kv_spec,
+        })
+    }
+
+    fn audio_token_count(&self, sample_count: usize) -> Result<usize, TopologyError> {
+        let token_stride = HOP_LENGTH
+            .checked_mul(WHISPER_ENCODER_CONV_STRIDE)
+            .and_then(|value| value.checked_mul(self.merge_size))
+            .ok_or(TopologyError::ArithmeticOverflow {
+                operation: "moss audio token stride",
+            })?;
+        let mut total_kept_frames = 0usize;
+        let mut remaining = sample_count;
+        while remaining > 0 {
+            let chunk_samples = remaining.min(CHUNK_SAMPLES);
+            let token_length = moss_td_chunk_token_length(chunk_samples, token_stride);
+            let kept_frames = moss_td_chunk_keep_frames(
+                token_length,
+                self.merge_size,
+                self.encoder.max_source_positions,
+            );
+            total_kept_frames = total_kept_frames.checked_add(kept_frames).ok_or(
+                TopologyError::ArithmeticOverflow {
+                    operation: "moss kept encoder frames",
+                },
+            )?;
+            remaining -= chunk_samples;
+        }
+        Ok(moss_td_aligned_frame_count(total_kept_frames, self.merge_size) / self.merge_size)
+    }
+
+    fn marker_tokens(audio_token_count: usize) -> Result<usize, TopologyError> {
+        let marker_seconds = super::decode_prompt::moss_td_time_marker_seconds(audio_token_count)
+            .map_err(|error| TopologyError::Unavailable {
+            reason: format!("moss marker topology is unavailable: {error}"),
+        })?;
+        let mut tokens = 0usize;
+        for mut seconds in marker_seconds {
+            let mut digits = 1usize;
+            while seconds >= 10 {
+                seconds /= 10;
+                digits = digits
+                    .checked_add(1)
+                    .ok_or(TopologyError::ArithmeticOverflow {
+                        operation: "moss marker digit count",
+                    })?;
+            }
+            tokens = tokens
+                .checked_add(digits)
+                .ok_or(TopologyError::ArithmeticOverflow {
+                    operation: "moss marker token sum",
+                })?;
+        }
+        Ok(tokens)
+    }
+
+    fn positions(&self, invocation: InvocationShapeInput) -> Result<usize, TopologyError> {
+        if invocation.sample_rate_hz().get() as usize != SAMPLE_RATE_HZ {
+            return Err(TopologyError::UnsupportedSampleRate {
+                expected_hz: SAMPLE_RATE_HZ as u32,
+                actual_hz: invocation.sample_rate_hz().get(),
+            });
+        }
+        let max_samples = SAMPLE_RATE_HZ
+            .checked_mul(crate::arch::MOSS_TD_MAX_INVOCATION_SECONDS as usize)
+            .ok_or(TopologyError::ArithmeticOverflow {
+                operation: "moss product invocation sample ceiling",
+            })?;
+        if invocation.samples() > max_samples {
+            return Err(TopologyError::InvocationSampleLimitExceeded {
+                required_samples: invocation.samples(),
+                max_samples,
+            });
+        }
+        let audio_tokens = self.audio_token_count(invocation.samples())?;
+        let marker_tokens = Self::marker_tokens(audio_tokens)?;
+        let prompt_tokens = self
+            .fixed_prompt_tokens
+            .checked_add(audio_tokens)
+            .and_then(|value| value.checked_add(marker_tokens))
+            .ok_or(TopologyError::ArithmeticOverflow {
+                operation: "moss prompt positions",
+            })?;
+        let context_cap = moss_td_kv_cache_positions(self.decoder.max_positions);
+        let generated = moss_td_generated_token_budget(
+            invocation.samples(),
+            SAMPLE_RATE_HZ,
+            prompt_tokens,
+            context_cap,
+        )
+        .map_err(|error| TopologyError::Unavailable {
+            reason: format!("moss generation budget is unavailable: {error}"),
+        })?;
+        causal_prefix_positions_with_context_cap(
+            MOSS_TD_SELF_KV_STATE_ID,
+            prompt_tokens,
+            generated,
+            context_cap,
+        )
+    }
+}
+
+impl DecoderStateTopology for MossTdDecoderStateTopology {
+    fn demands(
+        &self,
+        scope: DecoderStateDemandScope<InvocationShapeInput, InvocationEnvelope>,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        let invocation = match scope {
+            DecoderStateDemandScope::ExactInvocation(invocation) => invocation,
+            DecoderStateDemandScope::StableEnvelope(envelope) => envelope.maximum_invocation(),
+        };
+        let positions = self.positions(invocation)?;
+        Ok(vec![StateDemand::from_llm_kv_geometry(
+            MOSS_TD_SELF_KV_STATE_ID,
+            StateKind::SelfAttentionKv,
+            positions,
+            moss_td_kv_cache_positions(self.decoder.max_positions),
+            moss_td_kv_geometry(&self.decoder),
+            self.kv_spec,
+            invocation.sequences().get() as usize,
+            PositionBoundProof::Exact,
+        )?])
     }
 }
 
@@ -114,14 +291,14 @@ pub(crate) const SHIPPED_MERGE_SIZE: usize = 4;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
-    use crate::capacity::{
-        AudioFrontendCapacityBasis, FrontendGeometry, audio_tokens_per_second,
-        frontend_capacity_basis, kv_bytes_at_positions, kv_bytes_per_position,
+    use crate::capacity::kv_bytes_per_position;
+    use crate::capacity::topology::{
+        DecoderStatePlan, InvocationEnvelope, InvocationShapeInput, StateKind,
     };
-    use crate::host::{MIN_SPEC_TOTAL_MEMORY_BYTES, host_memory_budget_bytes};
     use crate::nn::decoder::LlmKvCacheSpec;
+    use std::num::NonZeroU32;
 
+    use super::super::decode_prompt::AUDIO_TOKENS_PER_SECOND;
     use super::super::executor::AUDIO_TOKENS_PER_SECOND_FOR_LIMIT;
     use super::super::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
 
@@ -129,66 +306,125 @@ mod tests {
         shipped_pack_decoder_fixture()
     }
 
-    fn declared_integral_seconds() -> f32 {
-        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
-            integral_seconds, ..
-        } = crate::arch::longform_slice_shape_for_model_architecture(MOSS_TD_GGML_ARCHITECTURE_ID)
-        else {
-            panic!("moss-transcribe-diarize must declare ScopedSlices");
-        };
-        integral_seconds
+    fn shipped_encoder() -> MossTdEncoderMetadata {
+        MossTdEncoderMetadata {
+            n_layers: 24,
+            d_model: 1024,
+            n_heads: 16,
+            ffn_dim: 4096,
+            n_mels: 80,
+            max_source_positions: 1500,
+        }
     }
 
-    /// THE regression anchor: feeding the real pack's metadata through the
-    /// derivation reproduces the declared `integral_seconds` exactly. If this
-    /// ever moves, the derived window changed shipped behavior -- update it
-    /// deliberately, with the reason in the commit (same discipline as the
-    /// golden diffs).
     #[test]
-    fn derived_integral_window_equals_the_declared_constant() {
-        let derivation =
-            moss_td_integral_window_derivation(&shipped_pack_decoder(), SHIPPED_MERGE_SIZE);
-        let derived = crate::capacity::derive_integral_seconds(&derivation)
-            .expect("the shipped pack geometry must admit an integral window");
+    fn topology_separates_current_30s_demand_from_stable_60s_reserve() {
+        let topology = MossTdDecoderStateTopology::new(
+            shipped_encoder(),
+            shipped_pack_decoder(),
+            SHIPPED_MERGE_SIZE,
+            MOSS_TD_SHIPPED_FIXED_PROMPT_TOKENS,
+            LlmKvCacheSpec::DEFAULT,
+        )
+        .unwrap();
+        let rate = NonZeroU32::new(SAMPLE_RATE_HZ as u32).unwrap();
+        let logical = InvocationShapeInput::new(
+            rate,
+            crate::arch::MOSS_TD_TARGET_INVOCATION_SECONDS as usize * SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let envelope = InvocationEnvelope::from_milliseconds(
+            rate,
+            NonZeroU32::new(crate::arch::MOSS_TD_MAX_INVOCATION_SECONDS * 1_000).unwrap(),
+        )
+        .unwrap();
+        let plan = DecoderStatePlan::build(&topology, logical, envelope).unwrap();
         assert_eq!(
-            derived, 300.0,
-            "derived integral window moved off the declared value"
+            plan.logical_positions(StateKind::SelfAttentionKv),
+            Some(1_289)
         );
         assert_eq!(
-            derived,
-            declared_integral_seconds(),
-            "derivation and the architecture descriptor must agree"
+            plan.reserve_positions(StateKind::SelfAttentionKv),
+            Some(2_366)
+        );
+        assert_eq!(plan.reserve_bytes().resident, 2_366 * 112 * 1024);
+    }
+
+    #[test]
+    fn one_and_sixty_second_boundaries_include_marker_digits_exactly() {
+        let topology = MossTdDecoderStateTopology::new(
+            shipped_encoder(),
+            shipped_pack_decoder(),
+            SHIPPED_MERGE_SIZE,
+            MOSS_TD_SHIPPED_FIXED_PROMPT_TOKENS,
+            LlmKvCacheSpec::DEFAULT,
+        )
+        .unwrap();
+        let rate = NonZeroU32::new(SAMPLE_RATE_HZ as u32).unwrap();
+        for (seconds, expected_positions) in [(1, 249), (30, 1_289), (60, 2_366)] {
+            let envelope = InvocationEnvelope::new(rate, seconds * SAMPLE_RATE_HZ).unwrap();
+            let plan = DecoderStatePlan::for_envelope(&topology, envelope).unwrap();
+            assert_eq!(
+                plan.reserve_positions_by_id(MOSS_TD_SELF_KV_STATE_ID),
+                Some(expected_positions),
+                "unexpected MOSS capacity at {seconds}s"
+            );
+        }
+    }
+
+    #[test]
+    fn smaller_legal_pack_context_uses_the_runtime_context_clamp() {
+        let mut decoder = shipped_pack_decoder();
+        decoder.max_positions = 1_024;
+        let topology = MossTdDecoderStateTopology::new(
+            shipped_encoder(),
+            decoder,
+            SHIPPED_MERGE_SIZE,
+            MOSS_TD_SHIPPED_FIXED_PROMPT_TOKENS,
+            LlmKvCacheSpec::DEFAULT,
+        )
+        .unwrap();
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(SAMPLE_RATE_HZ as u32).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        let plan = DecoderStatePlan::for_envelope(&topology, envelope)
+            .expect("runtime-valid context clamp must also be planner-valid");
+        assert_eq!(
+            plan.reserve_positions(StateKind::SelfAttentionKv),
+            Some(1_023)
         );
     }
 
-    /// The derived window is maximal, pinned from both sides: 300s fits the
-    /// 8192-position ceiling and the next 30s chunk up does not (the 4096
-    /// generation backstop is what binds at 330s: 4389 prompt + 4096 = 8485).
     #[test]
-    fn derived_window_is_the_largest_one_the_context_can_serve() {
-        let derivation =
-            moss_td_integral_window_derivation(&shipped_pack_decoder(), SHIPPED_MERGE_SIZE);
-        assert_eq!(
-            derivation.kv_position_ceiling,
-            MOSS_TD_MAX_KV_CACHE_POSITIONS
-        );
-        assert!(derivation.required_positions_for_chunks(10) <= derivation.kv_position_ceiling);
-        assert!(derivation.required_positions_for_chunks(11) > derivation.kv_position_ceiling);
-    }
+    fn topology_rejects_direct_audio_beyond_the_product_envelope() {
+        let topology = MossTdDecoderStateTopology::new(
+            shipped_encoder(),
+            shipped_pack_decoder(),
+            SHIPPED_MERGE_SIZE,
+            MOSS_TD_SHIPPED_FIXED_PROMPT_TOKENS,
+            LlmKvCacheSpec::DEFAULT,
+        )
+        .unwrap();
+        let rate = NonZeroU32::new(SAMPLE_RATE_HZ as u32).unwrap();
+        let max_samples = crate::arch::MOSS_TD_MAX_INVOCATION_SECONDS as usize * SAMPLE_RATE_HZ;
+        let envelope = InvocationEnvelope::new(rate, max_samples + 1).unwrap();
+        let error = DecoderStatePlan::for_envelope(&topology, envelope)
+            .expect_err("MOSS direct invocation must not bypass the 60-second product envelope");
+        assert!(matches!(
+            error,
+            TopologyError::InvocationSampleLimitExceeded {
+                required_samples,
+                max_samples: rejected_max,
+            } if required_samples == max_samples + 1 && rejected_max == max_samples
+        ));
 
-    /// The derivation assembles the same prompt arithmetic the pin tests in
-    /// `executor.rs` hold the declared constants to (Phase 0's parallel
-    /// equality): honest fixed wrapper + audio tokens + derived marker
-    /// digits, not the flat 512 overhead those tests used before.
-    #[test]
-    fn derived_prompt_arithmetic_is_pinned() {
-        let derivation =
-            moss_td_integral_window_derivation(&shipped_pack_decoder(), SHIPPED_MERGE_SIZE);
-        assert_eq!(derivation.chunk_seconds, 30.0);
-        assert_eq!(derivation.audio_tokens_per_chunk, 375);
-        assert_eq!(derivation.max_generated_tokens, 4096);
-        // 300s: 86 fixed + 10 chunks * 375 audio + 160 marker digits = 3996.
-        assert_eq!(derivation.prompt_tokens_for_chunks(10), 3996);
+        let five_minutes = InvocationEnvelope::new(rate, 300 * SAMPLE_RATE_HZ).unwrap();
+        assert!(matches!(
+            DecoderStatePlan::for_envelope(&topology, five_minutes),
+            Err(TopologyError::InvocationSampleLimitExceeded { .. })
+        ));
     }
 
     /// Worst-case KV bytes per position, split by copy (the figure the old
@@ -209,72 +445,30 @@ mod tests {
         assert_eq!(q8_0.total(), 2 * 28 * 2 * 8 * 136); // 119 KiB
     }
 
-    /// The declared 8192-position preallocation cap fits the min-spec
-    /// machine's memory budget under EVERY runtime KV policy -- the
-    /// derivation-verification pin that keeps 8192 a DECLARED constant
-    /// rather than a runtime-derived one (deriving it from a min-spec
-    /// rationale would take worst-case DEFAULT bytes/position and could
-    /// silently tighten the shipped cap; pinning the fit checks the same
-    /// arithmetic without moving the number).
+    /// The family cap is a validation ceiling, not the allocation request.
+    /// Pin the concrete reduction for the product's 60s session envelope.
     #[test]
-    fn declared_position_cap_fits_min_spec_budget_under_every_policy() {
-        let geometry = moss_td_kv_geometry(&shipped_pack_decoder());
-        let budget = host_memory_budget_bytes(MIN_SPEC_TOTAL_MEMORY_BYTES);
-        assert_eq!(MIN_SPEC_TOTAL_MEMORY_BYTES, 8 * 1024 * 1024 * 1024);
-        assert_eq!(budget, 6 * 1024 * 1024 * 1024); // 75% precedent
-
-        // Worst case DEFAULT: 8192 * 336 KiB = 2.625 GiB << 6 GiB.
-        let default = kv_bytes_at_positions(
-            &geometry,
-            LlmKvCacheSpec::DEFAULT,
-            MOSS_TD_MAX_KV_CACHE_POSITIONS,
-        )
-        .expect("default");
-        assert_eq!(default.total(), 8192 * 336 * 1024); // 2.625 GiB
-        assert!(
-            default.total() <= budget,
-            "8192 positions at the worst-case DEFAULT policy must fit the 8 GiB min-spec budget"
-        );
-        // Q8_0: 8192 * 119 KiB = 952 MiB << 6 GiB.
-        let q8_0 = kv_bytes_at_positions(
-            &geometry,
-            LlmKvCacheSpec::Q8_0,
-            MOSS_TD_MAX_KV_CACHE_POSITIONS,
-        )
-        .expect("q8_0");
-        assert_eq!(q8_0.total(), 8192 * 2 * 28 * 2 * 8 * 136);
-        assert!(q8_0.total() <= budget);
+    fn stable_envelope_is_below_the_hard_cap_without_allocating_the_cap() {
+        assert_eq!(MOSS_TD_MAX_KV_CACHE_POSITIONS, 8_192);
+        assert_eq!(2_366 * 112 * 1024, 271_351_808);
+        assert_eq!(8_192 * 112 * 1024, 939_524_096);
+        const {
+            assert!(2_366 < MOSS_TD_MAX_KV_CACHE_POSITIONS);
+        }
     }
 
-    /// Drift guard: the capacity frontend registry's constant geometry is the
-    /// same architectural fact the executor's constants and the decode
-    /// prompt's marker cadence state -- three places, one pinned number.
+    /// Drift guard: the actual frontend stride and both runtime marker-rate
+    /// declarations are one exact rational architectural fact.
     #[test]
-    fn frontend_registry_agrees_with_the_family_constants() {
-        let AudioFrontendCapacityBasis::Constant(geometry) =
-            frontend_capacity_basis(crate::arch::MOSS_TD_AUDIO_FRONTEND_ID).expect("moss row")
-        else {
-            panic!("moss frontend basis must be a Constant");
-        };
-        assert_eq!(
-            geometry,
-            &FrontendGeometry {
-                sample_rate_hz: SAMPLE_RATE_HZ,
-                hop_length: HOP_LENGTH,
-                encoder_conv_stride: WHISPER_ENCODER_CONV_STRIDE,
-                adaptor_merge_size: SHIPPED_MERGE_SIZE,
-            }
-        );
-        // The derived rate equals both copies the family already states.
-        let rate = audio_tokens_per_second(geometry);
-        assert_eq!(rate, AUDIO_TOKENS_PER_SECOND);
-        assert_eq!(rate, AUDIO_TOKENS_PER_SECOND_FOR_LIMIT);
+    fn frontend_stride_agrees_with_the_family_constants() {
+        let samples_per_audio_token = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * SHIPPED_MERGE_SIZE;
+        // 16_000 / 1_280 = 12.5 exactly, proven without floating point.
+        assert_eq!(SAMPLE_RATE_HZ * 2, samples_per_audio_token * 25);
+        assert_eq!(AUDIO_TOKENS_PER_SECOND, 12.5);
+        assert_eq!(AUDIO_TOKENS_PER_SECOND_FOR_LIMIT, 12.5);
         // And the stride product reproduces the chunk's audio-token count.
         assert_eq!(
-            moss_td_chunk_token_length(
-                CHUNK_SAMPLES,
-                geometry.hop_length * geometry.encoder_conv_stride * geometry.adaptor_merge_size
-            ),
+            moss_td_chunk_token_length(CHUNK_SAMPLES, samples_per_audio_token),
             375
         );
     }

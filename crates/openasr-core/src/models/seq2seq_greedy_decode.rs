@@ -763,6 +763,76 @@ mod tests {
         assert!(!output.stop_reason.is_truncated());
     }
 
+    #[test]
+    fn budget_exhaustion_never_feeds_the_final_sampled_token_back_into_kv() {
+        struct RecordingStepExecutor {
+            observations: Vec<(usize, usize)>,
+        }
+
+        impl Seq2SeqGreedyDecodeStepExecutor for RecordingStepExecutor {
+            fn decode_step_logits(
+                &mut self,
+                input: Seq2SeqGreedyDecodeStepInput<'_>,
+            ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
+                self.observations
+                    .push((input.step_index, input.generated_tokens.len()));
+                let mut logits = vec![-1000.0; 8];
+                logits[input.step_index + 1] = 1000.0;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                })
+            }
+        }
+
+        let prompt_len = 3;
+        let generated_budget = 3;
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![40, 41, 42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 8,
+            max_generated_tokens: generated_budget,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut executor = RecordingStepExecutor {
+            observations: Vec::new(),
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(1, "a"), (2, "b"), (3, "c")]),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let error = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens { .. }
+        ));
+        // Step zero writes the P-row prefill. Each later step writes exactly
+        // the previously sampled token, so G steps observe generated lengths
+        // 0..G-1 and consume only G-1 incremental rows.
+        assert_eq!(executor.observations, vec![(0, 0), (1, 1), (2, 2)]);
+        let required_rows = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            prompt_len,
+            generated_budget,
+        )
+        .unwrap();
+        assert_eq!(required_rows, 5);
+        assert_eq!(prompt_len + generated_budget - 2, required_rows - 1);
+    }
+
     /// A decode the guard cut short must not report itself as a normal
     /// completion. Families use this to decide what an unterminated tail means:
     /// mistaking "we stopped it" for "the model finished" is what lets a family

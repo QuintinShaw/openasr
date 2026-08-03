@@ -6,12 +6,11 @@ use std::{
 use memmap2::Mmap;
 use thiserror::Error;
 
-use crate::nn::half::f16_bits_slice_to_f32;
-
 use super::{
-    GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadataReadError, GgufTensorIndex,
-    GgufTensorIndexReadError, GgufTensorMetadata, ffi, read_gguf_metadata_from_runtime_source,
-    read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
+    GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadata, GgufMetadataReadError,
+    GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata, ffi,
+    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
+    validate_ggml_runtime_source_path,
 };
 
 const GGUF_DEFAULT_ALIGNMENT_BYTES: u64 = 32;
@@ -19,6 +18,79 @@ const GGUF_MIN_ALIGNMENT_BYTES: u64 = 8;
 const GGUF_MAX_WEIGHT_TENSOR_RANK: usize = 4;
 const GGML_TYPE_F32: i32 = 0;
 const GGML_TYPE_F16: i32 = 1;
+
+fn try_copy_tensor_slice<T: Copy>(
+    path: &Path,
+    tensor_name: &str,
+    values: &[T],
+) -> Result<Vec<T>, GgufTensorDataReadError> {
+    let mut copy = try_reserve_tensor_vec::<T>(path, tensor_name, values.len())?;
+    copy.extend_from_slice(values);
+    Ok(copy)
+}
+
+fn try_reserve_tensor_vec<T>(
+    path: &Path,
+    tensor_name: &str,
+    elements: usize,
+) -> Result<Vec<T>, GgufTensorDataReadError> {
+    try_reserve_tensor_vec_with(path, tensor_name, elements, |values, elements| {
+        values
+            .try_reserve_exact(elements)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn try_reserve_tensor_vec_with<T>(
+    path: &Path,
+    tensor_name: &str,
+    elements: usize,
+    reserve: impl FnOnce(&mut Vec<T>, usize) -> Result<(), String>,
+) -> Result<Vec<T>, GgufTensorDataReadError> {
+    let element_size_bytes = std::mem::size_of::<T>();
+    let requested_bytes = elements.checked_mul(element_size_bytes).ok_or_else(|| {
+        host_tensor_allocation_error(
+            path,
+            tensor_name,
+            u64::MAX,
+            format!("{elements} elements x {element_size_bytes} bytes overflow usize"),
+        )
+    })?;
+    let requested_bytes = u64::try_from(requested_bytes).map_err(|_| {
+        host_tensor_allocation_error(
+            path,
+            tensor_name,
+            u64::MAX,
+            "requested byte count does not fit u64".to_string(),
+        )
+    })?;
+    let mut values = Vec::new();
+    reserve(&mut values, elements).map_err(|reason| {
+        host_tensor_allocation_error(path, tensor_name, requested_bytes, reason)
+    })?;
+    Ok(values)
+}
+
+fn host_tensor_allocation_error(
+    path: &Path,
+    tensor_name: &str,
+    requested_bytes: u64,
+    reason: String,
+) -> GgufTensorDataReadError {
+    crate::models::native_execution_services::record_current_execution_candidate_failure(
+        crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+            "gguf_host_tensor_allocate",
+            format!("tensor '{tensor_name}' requested {requested_bytes} host bytes: {reason}"),
+        ),
+    );
+    GgufTensorDataReadError::HostAllocationFailed {
+        path: path.to_path_buf(),
+        tensor_name: tensor_name.to_string(),
+        requested_bytes,
+        reason,
+    }
+}
+
 #[derive(Debug)]
 pub struct GgufTensorDataReader {
     tensor_index: Arc<GgufTensorIndex>,
@@ -50,6 +122,33 @@ impl GgufTensorDataReader {
             parse_tensor_alignment(runtime_source.path(), metadata.get_u32("general.alignment"))?;
         Self::from_tensor_index_alignment_and_mmap(
             Arc::new(tensor_index),
+            tensor_data_alignment_bytes,
+            runtime_source.backing_mmap(),
+        )
+    }
+
+    /// Reuses the metadata and tensor index produced by the sandboxed runtime
+    /// preflight instead of parsing the same open mapping a second time.
+    ///
+    /// The caller must pass parts from one `GgmlAsrRuntimeSourcePreflight`.
+    /// Keeping this constructor crate-private makes that provenance contract
+    /// enforceable while avoiding a potentially large unadmitted parser
+    /// transient immediately before a model materialization transaction.
+    pub(crate) fn from_preflight_parts(
+        runtime_source: &GgmlRuntimeSource,
+        metadata: &GgufMetadata,
+        tensor_index: Arc<GgufTensorIndex>,
+    ) -> Result<Self, GgufTensorDataReadError> {
+        if tensor_index.path() != runtime_source.path() {
+            return Err(GgufTensorDataReadError::PreflightPathMismatch {
+                runtime_source_path: runtime_source.path().to_path_buf(),
+                tensor_index_path: tensor_index.path().to_path_buf(),
+            });
+        }
+        let tensor_data_alignment_bytes =
+            parse_tensor_alignment(runtime_source.path(), metadata.get_u32("general.alignment"))?;
+        Self::from_tensor_index_alignment_and_mmap(
+            tensor_index,
             tensor_data_alignment_bytes,
             runtime_source.backing_mmap(),
         )
@@ -99,7 +198,11 @@ impl GgufTensorDataReader {
         tensor_name: &str,
     ) -> Result<Vec<u8>, GgufTensorDataReadError> {
         let payload = self.host_tensor_bytes_by_name(tensor_name)?;
-        Ok(payload.bytes.to_vec())
+        try_copy_tensor_slice(
+            self.tensor_index.path(),
+            &payload.metadata.name,
+            payload.bytes,
+        )
     }
 
     pub fn host_tensor_f32_copy_by_name(
@@ -281,15 +384,26 @@ impl GgufTensorDataReader {
             // GGUF tensor data is little-endian; mmap offsets are normally alignment padded.
             let (prefix, aligned, suffix) = unsafe { payload.bytes.align_to::<f32>() };
             if prefix.is_empty() && suffix.is_empty() && aligned.len() == num_elements_usize {
-                return Ok(aligned.to_vec());
+                return try_copy_tensor_slice(
+                    self.tensor_index.path(),
+                    &payload.metadata.name,
+                    aligned,
+                );
             }
         }
 
-        Ok(payload
-            .bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect())
+        let mut values = try_reserve_tensor_vec::<f32>(
+            self.tensor_index.path(),
+            &payload.metadata.name,
+            num_elements_usize,
+        )?;
+        values.extend(
+            payload
+                .bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+        );
+        Ok(values)
     }
 
     fn host_tensor_f16_bits_copy_from_payload(
@@ -314,15 +428,26 @@ impl GgufTensorDataReader {
             // F16 is stored as raw little-endian bits; keep it lossless.
             let (prefix, aligned, suffix) = unsafe { payload.bytes.align_to::<u16>() };
             if prefix.is_empty() && suffix.is_empty() && aligned.len() == num_elements_usize {
-                return Ok(aligned.to_vec());
+                return try_copy_tensor_slice(
+                    self.tensor_index.path(),
+                    &payload.metadata.name,
+                    aligned,
+                );
             }
         }
 
-        Ok(payload
-            .bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect())
+        let mut values = try_reserve_tensor_vec::<u16>(
+            self.tensor_index.path(),
+            &payload.metadata.name,
+            num_elements_usize,
+        )?;
+        values.extend(
+            payload
+                .bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
+        );
+        Ok(values)
     }
 
     fn host_tensor_f32_copy_dequantized_from_payload(
@@ -336,7 +461,13 @@ impl GgufTensorDataReader {
             GGML_TYPE_F16 => {
                 let values =
                     self.host_tensor_f16_bits_copy_from_payload(payload, expected_shape)?;
-                Ok(f16_bits_slice_to_f32(&values))
+                let mut converted = try_reserve_tensor_vec::<f32>(
+                    self.tensor_index.path(),
+                    &payload.metadata.name,
+                    values.len(),
+                )?;
+                converted.extend(values.iter().copied().map(crate::nn::half::f16_bits_to_f32));
+                Ok(converted)
             }
             _ => self.host_tensor_quantized_dequantize_to_f32_from_payload(payload),
         }
@@ -467,7 +598,12 @@ impl GgufTensorDataReader {
                 dim_value: ne0,
             }
         })?;
-        let mut values = vec![0.0_f32; num_elements_usize];
+        let mut values = try_reserve_tensor_vec::<f32>(
+            self.tensor_index.path(),
+            &payload.metadata.name,
+            num_elements_usize,
+        )?;
+        values.resize(num_elements_usize, 0.0_f32);
         for row_idx in 0..rows_usize {
             let src_offset = row_idx * row_size;
             let src_ptr = payload.bytes[src_offset..]
@@ -515,7 +651,11 @@ impl GgufTensorDataReader {
             );
         }
 
-        let mut dims = Vec::with_capacity(rank);
+        let mut dims = try_reserve_tensor_vec::<usize>(
+            self.tensor_index.path(),
+            &payload.metadata.name,
+            rank,
+        )?;
         for (dim_index, dim_value) in payload.metadata.dims.iter().enumerate() {
             let dim_value_usize = usize::try_from(*dim_value).map_err(|_| {
                 GgufTensorDataReadError::TensorDimPlatformOverflow {
@@ -728,6 +868,56 @@ impl GgufOwnedWeightTensorPayload {
     pub fn bytes(&self) -> &[u8] {
         &self.mmap[self.start..self.start + self.len]
     }
+
+    /// Returns true when both handles name the exact same byte range in the
+    /// same already-open GGUF mapping. This is stronger than comparing tensor
+    /// names: tied weights may be requested independently by two prepared
+    /// components, but must remain one physical host payload.
+    #[cfg(test)]
+    pub(crate) fn shares_backing_range(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.mmap, &other.mmap) && self.start == other.start && self.len == other.len
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_string(&self.metadata.name, "owned GGUF tensor name")?;
+        bytes.add_vec(&self.metadata.dims, "owned GGUF tensor metadata dims")?;
+        bytes.add_string(&self.metadata.type_name, "owned GGUF tensor type name")?;
+        bytes.add_vec(&self.dims, "owned GGUF tensor dims")?;
+        Ok(bytes.finish())
+    }
+
+    /// Shape-only lower bound for the heap metadata an owned mmap view keeps.
+    /// The mapped tensor bytes themselves remain file-backed and are not a
+    /// Rust heap allocation. Post-build reconciliation accounts for allocator
+    /// capacity rounding above these exact logical string/vector lengths.
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &GgufTensorMetadata,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(metadata.name.len(), "owned GGUF tensor name quote")?;
+        bytes.add_usize(
+            metadata
+                .dims
+                .len()
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or_else(|| "owned GGUF tensor metadata dims quote overflowed".to_string())?,
+            "owned GGUF tensor metadata dims quote",
+        )?;
+        bytes.add_usize(
+            metadata.type_name.len(),
+            "owned GGUF tensor type name quote",
+        )?;
+        bytes.add_usize(
+            metadata
+                .dims
+                .len()
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| "owned GGUF tensor platform dims quote overflowed".to_string())?,
+            "owned GGUF tensor platform dims quote",
+        )?;
+        Ok(bytes.finish())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -738,6 +928,13 @@ pub enum GgufTensorDataReadError {
     TensorIndexRead(#[from] GgufTensorIndexReadError),
     #[error(transparent)]
     MetadataRead(#[from] GgufMetadataReadError),
+    #[error(
+        "preflight tensor index path '{tensor_index_path}' does not match runtime source path '{runtime_source_path}'"
+    )]
+    PreflightPathMismatch {
+        runtime_source_path: PathBuf,
+        tensor_index_path: PathBuf,
+    },
     #[error("could not inspect gguf runtime source metadata for '{path}': {source}")]
     SourceMetadata {
         path: PathBuf,
@@ -762,6 +959,15 @@ pub enum GgufTensorDataReadError {
     },
     #[error("mapped file length does not fit in u64 for '{path}': length={length}")]
     MappedLengthPlatformOverflow { path: PathBuf, length: usize },
+    #[error(
+        "could not reserve {requested_bytes} host bytes for gguf tensor '{tensor_name}' in '{path}': {reason}"
+    )]
+    HostAllocationFailed {
+        path: PathBuf,
+        tensor_name: String,
+        requested_bytes: u64,
+        reason: String,
+    },
     #[error(
         "mapped file length mismatch for '{path}': mapped_len={mapped_len}, file_size={file_size}"
     )]
@@ -1146,11 +1352,24 @@ fn checked_row_major_ggml_tensor_bytes(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use tempfile::NamedTempFile;
 
-    use super::{GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType};
+    use crate::ggml_runtime::{
+        GgufMetadata, GgufMetadataValue, read_gguf_tensor_index_from_runtime_source,
+        validate_ggml_runtime_source_path,
+    };
+
+    use super::{
+        GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
+        try_reserve_tensor_vec_with,
+    };
 
     const GGUF_VERSION_V3: u32 = 3;
     const GGUF_TYPE_UINT32: u32 = 4;
@@ -1243,6 +1462,66 @@ mod tests {
 
         bytes.extend_from_slice(&data_blob);
         fs::write(path, bytes).expect("write gguf fixture");
+    }
+
+    #[test]
+    fn preflight_parts_rejects_tensor_index_from_other_source() {
+        let file = NamedTempFile::new().expect("temp file");
+        write_fixture(file.path(), 32, &[]);
+
+        let runtime_source =
+            validate_ggml_runtime_source_path(file.path()).expect("validate runtime source");
+        let tensor_index = Arc::new(crate::GgufTensorIndex::empty_for_test(PathBuf::from(
+            "other-source.gguf",
+        )));
+
+        let error = GgufTensorDataReader::from_preflight_parts(
+            &runtime_source,
+            &GgufMetadata::default(),
+            tensor_index,
+        )
+        .expect_err("a tensor index from another source must fail closed");
+
+        assert!(matches!(
+            error,
+            GgufTensorDataReadError::PreflightPathMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn preflight_parts_reuses_metadata_and_tensor_index() {
+        let file = NamedTempFile::new().expect("temp file");
+        write_fixture(
+            file.path(),
+            32,
+            &[TensorFixture {
+                name: "encoder.weight",
+                dims: vec![1],
+                ggml_type: GGML_TYPE_F32,
+                payload: 1.0_f32.to_le_bytes().to_vec(),
+                offset_override: None,
+            }],
+        );
+
+        let runtime_source =
+            validate_ggml_runtime_source_path(file.path()).expect("validate runtime source");
+        let tensor_index = Arc::new(
+            read_gguf_tensor_index_from_runtime_source(&runtime_source)
+                .expect("read tensor index during preflight"),
+        );
+        let tensor_index_ptr = Arc::as_ptr(&tensor_index);
+        let metadata = GgufMetadata::from_values_for_test(BTreeMap::from([(
+            "general.alignment".to_string(),
+            GgufMetadataValue::U32(64),
+        )]));
+
+        let reader =
+            GgufTensorDataReader::from_preflight_parts(&runtime_source, &metadata, tensor_index)
+                .expect("construct reader from preflight parts");
+
+        assert_eq!(reader.tensor_data_alignment_bytes(), 64);
+        assert_eq!(reader.tensor_index() as *const _, tensor_index_ptr);
+        assert_eq!(reader.tensor_index().path(), runtime_source.path());
     }
 
     #[test]
@@ -1430,5 +1709,41 @@ mod tests {
         let error = GgufTensorDataReader::from_path(file.path())
             .expect_err("misaligned tensor offset must fail during tensor-index read");
         assert!(matches!(error, GgufTensorDataReadError::TensorIndexRead(_)));
+    }
+
+    #[test]
+    fn fallible_host_tensor_reservation_preserves_typed_capacity_failure() {
+        let error = try_reserve_tensor_vec_with::<f32>(
+            Path::new("fixture.gguf"),
+            "large.weight",
+            1024,
+            |_values, _elements| Err("injected reserve failure".to_string()),
+        )
+        .expect_err("injected reserve failure must be returned");
+        assert!(matches!(
+            error,
+            GgufTensorDataReadError::HostAllocationFailed {
+                requested_bytes: 4096,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn host_tensor_reservation_byte_count_is_checked_before_allocating() {
+        let error = try_reserve_tensor_vec_with::<u64>(
+            Path::new("fixture.gguf"),
+            "overflow.weight",
+            usize::MAX,
+            |_values, _elements| panic!("overflow must fail before reserve is called"),
+        )
+        .expect_err("byte-count overflow must fail closed");
+        assert!(matches!(
+            error,
+            GgufTensorDataReadError::HostAllocationFailed {
+                requested_bytes: u64::MAX,
+                ..
+            }
+        ));
     }
 }

@@ -119,6 +119,49 @@ impl Weights {
         })
     }
 
+    pub(crate) fn quoted_persistent_host_commitment_bytes(
+        tensor_index: &crate::GgufTensorIndex,
+    ) -> Result<u64, WeightsError> {
+        let mut bytes = allocation_commitment(std::mem::size_of::<Self>())?;
+        for tensor in tensor_index.tensors() {
+            let elements = tensor.num_elements().ok_or_else(|| {
+                WeightsError::InvalidInput(format!(
+                    "redimnet tensor '{}' element count overflow",
+                    tensor.name
+                ))
+            })?;
+            let data_bytes = elements
+                .checked_mul(std::mem::size_of::<f32>() as u64)
+                .ok_or_else(|| {
+                    WeightsError::InvalidInput(format!(
+                        "redimnet tensor '{}' f32 byte count overflow",
+                        tensor.name
+                    ))
+                })?;
+            let shape_bytes = (tensor.dims.len() as u64)
+                .checked_mul(std::mem::size_of::<usize>() as u64)
+                .ok_or_else(|| {
+                    WeightsError::InvalidInput(format!(
+                        "redimnet tensor '{}' shape byte count overflow",
+                        tensor.name
+                    ))
+                })?;
+            for commitment in [
+                allocation_commitment_u64(tensor.name.len() as u64)?,
+                allocation_commitment_u64(shape_bytes)?,
+                allocation_commitment_u64(data_bytes)?,
+                HOST_ALLOCATION_PAGE_BYTES,
+            ] {
+                bytes = bytes.checked_add(commitment).ok_or_else(|| {
+                    WeightsError::InvalidInput(
+                        "redimnet quoted weight byte sum overflow".to_string(),
+                    )
+                })?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Parse a safetensors byte buffer.
     pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
         if bytes.len() < 8 {
@@ -221,6 +264,43 @@ impl Weights {
         Ok(Self { tensors })
     }
 
+    /// Capacity-derived commitment upper bound for every retained heap owner.
+    /// Each independently allocated payload is page-rounded with allocator
+    /// header room; a full page per logical tensor conservatively covers the
+    /// private BTree node layout without depending on std internals.
+    pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {
+        let mut bytes = allocation_commitment(std::mem::size_of::<Self>())?;
+        for (name, tensor) in &self.tensors {
+            let shape_bytes = tensor
+                .shape
+                .capacity()
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| {
+                    WeightsError::InvalidInput("redimnet shape capacity byte overflow".to_string())
+                })?;
+            let data_bytes = tensor
+                .data
+                .capacity()
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    WeightsError::InvalidInput("redimnet tensor capacity byte overflow".to_string())
+                })?;
+            for commitment in [
+                allocation_commitment(name.capacity())?,
+                allocation_commitment(shape_bytes)?,
+                allocation_commitment(data_bytes)?,
+                HOST_ALLOCATION_PAGE_BYTES,
+            ] {
+                bytes = bytes.checked_add(commitment).ok_or_else(|| {
+                    WeightsError::InvalidInput(
+                        "redimnet retained weight byte sum overflow".to_string(),
+                    )
+                })?;
+            }
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn get(&self, name: &str) -> Result<&[f32], WeightsError> {
         self.tensors
             .get(name)
@@ -233,5 +313,32 @@ impl Weights {
             .get(name)
             .map(|t| t.shape.as_slice())
             .ok_or_else(|| WeightsError::Missing(name.to_string()))
+    }
+}
+
+pub(crate) const HOST_ALLOCATION_PAGE_BYTES: u64 = 4096;
+
+pub(crate) fn allocation_commitment(requested_bytes: usize) -> Result<u64, WeightsError> {
+    let requested = u64::try_from(requested_bytes).map_err(|_| {
+        WeightsError::InvalidInput("redimnet allocation size does not fit u64".to_string())
+    })?;
+    allocation_commitment_u64(requested)
+}
+
+pub(crate) fn allocation_commitment_u64(requested: u64) -> Result<u64, WeightsError> {
+    let with_header = requested
+        .checked_add((std::mem::size_of::<usize>() * 2) as u64)
+        .ok_or_else(|| {
+            WeightsError::InvalidInput("redimnet allocation header byte overflow".to_string())
+        })?;
+    let remainder = with_header % HOST_ALLOCATION_PAGE_BYTES;
+    if remainder == 0 {
+        Ok(with_header)
+    } else {
+        with_header
+            .checked_add(HOST_ALLOCATION_PAGE_BYTES - remainder)
+            .ok_or_else(|| {
+                WeightsError::InvalidInput("redimnet allocation rounding overflow".to_string())
+            })
     }
 }

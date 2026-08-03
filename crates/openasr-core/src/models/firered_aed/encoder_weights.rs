@@ -78,6 +78,20 @@ fn tensor(
 }
 
 impl FireRedEncoderWeights {
+    pub(crate) fn quoted_retained_system_memory_bytes(n_layers: usize) -> Result<u64, String> {
+        let bytes = n_layers
+            .checked_mul(std::mem::size_of::<FireRedEncoderLayerWeights>())
+            .ok_or_else(|| "firered-aed encoder layer-handle quote overflowed".to_string())?;
+        u64::try_from(bytes)
+            .map_err(|_| "firered-aed encoder layer-handle quote does not fit u64".to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "firered-aed encoder layer handles")?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn load(
         loaded: &GgmlLoadedWeightContext,
         n_layers: usize,

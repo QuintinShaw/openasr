@@ -34,6 +34,89 @@ pub(crate) struct MimoAsrTokenizer {
 }
 
 impl MimoAsrTokenizer {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &GgufMetadata,
+    ) -> Result<u64, String> {
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            MIMO_ASR_TOKENIZER_FAMILY,
+        )
+        .map_err(|error| error.to_string())?;
+        let merges = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_MERGES_KEY,
+            MIMO_ASR_TOKENIZER_FAMILY,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            tokens
+                .len()
+                .checked_mul(std::mem::size_of::<Option<String>>())
+                .ok_or_else(|| "mimo tokenizer id table quote overflowed".to_string())?,
+            "mimo tokenizer id table quote",
+        )?;
+        for (label, values, entry_size, copies) in [
+            (
+                "mimo tokenizer token quote",
+                tokens,
+                std::mem::size_of::<(String, u32)>(),
+                2usize,
+            ),
+            (
+                "mimo tokenizer merge quote",
+                merges,
+                std::mem::size_of::<(String, usize)>(),
+                1usize,
+            ),
+        ] {
+            bytes.add_usize(
+                values
+                    .len()
+                    .checked_mul(entry_size)
+                    .ok_or_else(|| format!("{label} entry bytes overflowed"))?,
+                label,
+            )?;
+            let strings = values
+                .iter()
+                .try_fold(0usize, |total, value| total.checked_add(value.len()))
+                .and_then(|bytes| bytes.checked_mul(copies))
+                .ok_or_else(|| format!("{label} string bytes overflowed"))?;
+            bytes.add_usize(strings, label)?;
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "mimo-asr tokenizer id table")?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, "mimo-asr tokenizer id token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "mimo-asr tokenizer token map byte count overflowed".to_string())?,
+            "mimo-asr tokenizer token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "mimo-asr tokenizer token map key")?;
+        }
+        bytes.add_usize(
+            self.merge_rank
+                .len()
+                .checked_mul(std::mem::size_of::<(String, usize)>())
+                .ok_or_else(|| "mimo-asr tokenizer merge map byte count overflowed".to_string())?,
+            "mimo-asr tokenizer merge map entries",
+        )?;
+        for merge in self.merge_rank.keys() {
+            bytes.add_string(merge, "mimo-asr tokenizer merge key")?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub fn from_gguf_metadata(
         metadata: &GgufMetadata,
         special: MimoSpecialTokens,

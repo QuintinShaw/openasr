@@ -24,6 +24,15 @@ pub(crate) struct CohereTranscribeFrontendPlan {
     pub mel_filters: Vec<f32>,
 }
 
+impl CohereTranscribeFrontendPlan {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.window, "cohere frontend window")?;
+        bytes.add_vec(&self.mel_filters, "cohere frontend mel filters")?;
+        Ok(bytes.finish())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CohereTranscribeMelFeatures {
     pub n_frames: usize,

@@ -63,6 +63,9 @@ where
         .partial_floor_ms(tuning.min_partial_interval_ms());
 
     let runtime_source_path = request.runtime_source_path.clone();
+    let partial_execution_services = std::sync::Arc::clone(&request.execution_services);
+    let partial_decode_execution_services = std::sync::Arc::clone(&request.execution_services);
+    let partial_decoder_state = request.decoder_state.clone();
     let runtime_source_preflight = request.runtime_source_preflight.clone();
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
@@ -74,6 +77,8 @@ where
     let resolved_runtime = request.resolved_runtime;
     let make_request =
         move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
+            execution_services: std::sync::Arc::clone(&partial_execution_services),
+            decoder_state: partial_decoder_state.clone(),
             runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
@@ -96,6 +101,10 @@ where
 
     let partial_executor = executor.clone();
     let partial_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudioView<'static>| {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                partial_decode_execution_services.as_ref(),
+            );
         let _thread_override = install_request_inference_threads_override(inference_threads);
         // This closure calls the per-family decode fn directly instead of
         // going through GgmlAsrExecutionDispatch::execute_view, so the request's
@@ -110,6 +119,9 @@ where
     });
 
     let final_executor = executor;
+    let final_execution_services = std::sync::Arc::clone(&request.execution_services);
+    let final_decode_execution_services = std::sync::Arc::clone(&request.execution_services);
+    let final_decoder_state = request.decoder_state.clone();
     let runtime_source_path = request.runtime_source_path.clone();
     let runtime_source_preflight = request.runtime_source_preflight.clone();
     let selected_family = request.selected_family.clone();
@@ -117,6 +129,8 @@ where
     let backend_preference = request.backend_preference;
     let make_final_request =
         move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
+            execution_services: std::sync::Arc::clone(&final_execution_services),
+            decoder_state: final_decoder_state.clone(),
             runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
@@ -135,6 +149,10 @@ where
             )),
         };
     let final_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudioView<'static>| {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                final_decode_execution_services.as_ref(),
+            );
         let _thread_override = install_request_inference_threads_override(inference_threads);
         let _backend_override =
             install_request_backend_override(backend_preference.request_backend_override());
@@ -472,6 +490,10 @@ mod tests {
                 ),
             );
             GgmlAsrStreamingSessionRequest {
+                execution_services:
+                    crate::models::native_execution_services::test_native_execution_services(),
+                decoder_state:
+                    crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
                 runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
                 runtime_source_preflight: None,
                 selected_family: crate::wav2vec2_ctc_runtime_descriptor_v1(),
@@ -479,6 +501,7 @@ mod tests {
                 configured_diarize: false,
                 backend_preference,
                 resolved_runtime,
+                final_text_processor: None,
                 session_context: crate::NativeAsrSessionContext::new(
                     "rt_ctc_backend_override_test",
                 ),

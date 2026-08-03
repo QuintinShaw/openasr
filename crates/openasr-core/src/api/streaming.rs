@@ -25,15 +25,15 @@
 //! The engine is fail-closed and offline: it only ever runs the local `.oasr`
 //! pack it is handed and never reaches for the network.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use crate::realtime::{RealtimeEvent, RealtimeTranscriptEvent, RealtimeTranscriptWord};
 use crate::{
     NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrModelAdapter,
     NativeAsrModelPackRef, NativeAsrRequestOptions, NativeAsrSession, NativeAsrSessionContext,
-    NativeAsrStreamingSessionConfig, NativeBackendExecutor, RealtimeAudioFormat,
-    RealtimeAudioFrame, RealtimeEventEnvelope, Segment, Transcription, VadConfig, VadStateMachine,
-    native_runtime_model_adapter_for_path,
+    NativeAsrStreamingSessionConfig, NativeBackendExecutor, NativeExecutionServices,
+    RealtimeAudioFormat, RealtimeAudioFrame, RealtimeEventEnvelope, Segment, Transcription,
+    VadConfig, VadStateMachine, native_runtime_model_adapter_for_path,
 };
 
 /// The kind of a [`StreamingEvent`].
@@ -165,7 +165,11 @@ impl StreamingSession {
     /// Fails closed with a typed [`NativeAsrError`] if the pack cannot be
     /// resolved to a known model family or the family cannot start a streaming
     /// session. Never touches the network.
-    pub fn new(pack_path: &Path, cfg: StreamingConfig) -> Result<Self, NativeAsrError> {
+    pub fn new(
+        execution_services: Arc<NativeExecutionServices>,
+        pack_path: &Path,
+        cfg: StreamingConfig,
+    ) -> Result<Self, NativeAsrError> {
         let adapter = native_runtime_model_adapter_for_path(pack_path).ok_or_else(|| {
             NativeAsrError::SessionFailed {
                 message: format!(
@@ -190,7 +194,7 @@ impl StreamingSession {
             .with_partial_results(cfg.partial_results)
             .with_word_timestamps(cfg.word_timestamps)
             .with_min_partial_interval_ms(cfg.min_partial_interval_ms);
-        let executor = NativeBackendExecutor;
+        let executor = NativeBackendExecutor::new(execution_services);
         let session = NativeAsrExecutor::start_streaming_session(
             &executor,
             &adapter,

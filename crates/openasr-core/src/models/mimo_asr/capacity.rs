@@ -1,44 +1,89 @@
-//! mimo-asr capacity derivation: the family's Qwen2 backbone KV geometry and
-//! the decoder positions a single decode of a given audio span needs,
-//! assembled from PACK METADATA (`MimoLlmMetadata` + `MimoMelMetadata` +
-//! `MimoAudiotokMetadata` + `MimoInlocalMetadata`) plus family constants, for
-//! the shared host-memory admission check
-//! ([`crate::capacity::evaluate_host_memory_admission`]). The mimo-asr
-//! analogue of [`crate::models::qwen::capacity`].
+//! MiMo-ASR decoder-state topology. Its exact position bound is assembled
+//! from pack metadata, the tokenized prompt wrapper, and the same frontend and
+//! generation shape facts used by execution.
 //!
 //! Reuses, never re-derives:
 //! - KV geometry comes straight off the parsed pack (`mimo.llm.*` keys).
-//! - The audio-token rate is the pack-carried stride product the registry row
-//!   in `crate::capacity` records: mel `sample_rate/hop_length` through the
+//! - The audio-token shape is the pack-carried stride product: mel
+//!   `sample_rate/hop_length` through the
 //!   tokenizer conv stem (`conv1_stride * conv2_stride * down_sample_stride`,
 //!   25Hz RVQ frames for the shipped pack) down to one LLM position per
 //!   `group_size` frames (the input-local group downcast).
-//! - The generation budget and the single-decode window reuse the executor's
-//!   own constants ([`super::executor::MIMO_ASR_MAX_GENERATED_TOKENS`],
-//!   [`super::executor::MIMO_ASR_MAX_INPUT_SECONDS`]), so admission charges
-//!   the same `prompt + generation` KV capacity
-//!   `MimoLlmDecoderRuntime::new_kv_caches` actually allocates.
+//! - The generation budget reuses the executor's own constant, so planning
+//!   and allocation share one `prompt + generation` contract.
 
 use crate::capacity::KvGeometry;
+use crate::capacity::topology::{
+    DecoderStateDemandScope, DecoderStateTopology, InvocationEnvelope, InvocationShapeInput,
+    PositionBoundProof, StateDemand, StateKind, TopologyError,
+    causal_prefix_positions_with_context_cap,
+};
+use crate::models::audio_frontend::{PadMode, StftFramer};
+use crate::models::ggml_asr_executor::{
+    GgmlAsrDecoderStatePlanningError, GgmlAsrDecoderStatePlanningInput,
+};
+use crate::nn::decoder::LlmKvCacheSpec;
 
-use super::executor::{MIMO_ASR_MAX_GENERATED_TOKENS, MIMO_ASR_MAX_INPUT_SECONDS};
+use super::executor::MIMO_ASR_MAX_GENERATED_TOKENS;
+use super::mel_frontend::{MimoResampleShapeError, mimo_resampled_output_sample_count};
 use super::runtime_contract::{
     MimoAudiotokMetadata, MimoInlocalMetadata, MimoLlmMetadata, MimoMelMetadata,
 };
 
-/// The audio a single mimo-asr decode is estimated to fold in, for admission.
-/// The executor fails closed above this per-chunk cap (the reference
-/// `preprocess_input`'s own 30s re-chunk bound), and longer recordings reach
-/// it only as longform slices each at or under this bound -- so no single
-/// decode's KV cache ever spans more audio. Same clamp rationale as qwen3's
-/// `QWEN3_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS`.
-pub(crate) const MIMO_ASR_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS: f32 = MIMO_ASR_MAX_INPUT_SECONDS;
+pub(crate) const MIMO_ASR_SELF_KV_STATE_ID: &str = "mimo-asr.decoder.self_kv";
 
-/// Fixed ChatML/`<|sosp|>`/`<|eosp|>` wrapper tokens around the audio span
-/// (see `super::decode_prompt::build_mimo_asr_decode_prompt`). A small
-/// conservative figure, dwarfed by the audio-group term at any real duration;
-/// its exact value cannot swing an admission decision.
-const MIMO_ASR_ADMISSION_FIXED_PROMPT_TOKENS: usize = 32;
+pub(crate) fn plan_mimo_asr_decoder_state(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "mimo-asr";
+    let metadata = input.preflight.metadata.as_ref();
+    let map_metadata = |error: super::runtime_contract::MimoMetadataError| {
+        GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+            family,
+            reason: error.to_string(),
+        }
+    };
+    let llm = super::runtime_contract::parse_mimo_llm_metadata(metadata).map_err(map_metadata)?;
+    let mel = super::runtime_contract::parse_mimo_mel_metadata(metadata).map_err(map_metadata)?;
+    let audiotok =
+        super::runtime_contract::parse_mimo_audiotok_metadata(metadata).map_err(map_metadata)?;
+    let inlocal =
+        super::runtime_contract::parse_mimo_inlocal_metadata(metadata).map_err(map_metadata)?;
+    let special =
+        super::runtime_contract::parse_mimo_special_tokens(metadata).map_err(map_metadata)?;
+    let tokenizer = super::tokenizer::MimoAsrTokenizer::from_gguf_metadata(metadata, special)
+        .map_err(
+            |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            },
+        )?;
+    let prompt =
+        super::decode_prompt::build_mimo_asr_decode_prompt(&tokenizer, 1).map_err(|error| {
+            GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            }
+        })?;
+    let fixed_prompt_tokens = prompt.token_ids.len().checked_sub(1).ok_or_else(|| {
+        GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: "dummy audio span was absent from the tokenized prompt".to_string(),
+        }
+    })?;
+    let geometry = mimo_asr_kv_geometry(&llm);
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        input.backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    crate::capacity::topology::DecoderStatePlan::build(
+        &MimoAsrDecoderStateTopology::new(llm, mel, audiotok, inlocal, fixed_prompt_tokens, spec),
+        input.invocation,
+        input.envelope,
+    )
+    .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })
+}
 
 /// The backbone KV geometry the loaded pack advertises.
 pub(crate) fn mimo_asr_kv_geometry(llm: &MimoLlmMetadata) -> KvGeometry {
@@ -49,44 +94,190 @@ pub(crate) fn mimo_asr_kv_geometry(llm: &MimoLlmMetadata) -> KvGeometry {
     }
 }
 
-/// Decoder positions a single decode of `audio_duration_seconds` requires --
-/// the admission figure `evaluate_host_memory_admission` charges KV bytes
-/// against. Mirrors the runtime's own KV-capacity sizing
-/// (`decode_prompt.token_ids.len() + MIMO_ASR_MAX_GENERATED_TOKENS` in
-/// `super::executor`): fixed wrapper + one position per `group_size` RVQ
-/// frames + the full runaway-generation backstop, with the audio clamped to
-/// the family's single-decode window.
-pub(crate) fn mimo_asr_admission_required_positions(
+const MIMO_MAX_INPUT_MILLISECONDS: u128 = 30_000;
+
+fn mimo_conv_out_len(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<usize, TopologyError> {
+    if stride == 0 {
+        return Err(TopologyError::DivisionByZero);
+    }
+    let padded = input
+        .checked_add(
+            padding
+                .checked_mul(2)
+                .ok_or(TopologyError::ArithmeticOverflow {
+                    operation: "mimo convolution padding",
+                })?,
+        )
+        .ok_or(TopologyError::ArithmeticOverflow {
+            operation: "mimo convolution padded length",
+        })?;
+    let Some(tail) = padded.checked_sub(kernel) else {
+        return Ok(0);
+    };
+    (tail / stride)
+        .checked_add(1)
+        .ok_or(TopologyError::ArithmeticOverflow {
+            operation: "mimo convolution output length",
+        })
+}
+
+/// Exact number of MiMo LLM audio positions produced from prepared input
+/// samples, following resample -> centered STFT -> conv1/conv2/downsample ->
+/// input-local whole-group truncation.
+pub(crate) fn mimo_asr_audio_group_count_for_samples(
     mel: &MimoMelMetadata,
     audiotok: &MimoAudiotokMetadata,
     inlocal: &MimoInlocalMetadata,
-    audio_duration_seconds: f32,
-) -> usize {
-    let admission_seconds =
-        audio_duration_seconds.clamp(0.0, MIMO_ASR_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS);
-    let mel_frames =
-        (admission_seconds * mel.sample_rate_hz as f32 / mel.hop_length.max(1) as f32) as usize;
-    // The tokenizer conv stem's time-axis stride product (conv1 is stride 1
-    // for the shipped pack; all three are pack-carried facts).
-    let stem_stride = audiotok
-        .conv1_stride
-        .max(1)
-        .saturating_mul(audiotok.conv2_stride.max(1))
-        .saturating_mul(audiotok.down_sample_stride.max(1));
-    let rvq_frames = mel_frames / stem_stride;
-    // The input-local group downcast folds `group_size` RVQ frames into one
-    // spliced LLM position (trailing remainder truncated, exactly as the
-    // executor truncates codes to a whole-group multiple).
-    let audio_groups = rvq_frames / inlocal.group_size.max(1);
-    MIMO_ASR_ADMISSION_FIXED_PROMPT_TOKENS
-        .saturating_add(audio_groups)
-        .saturating_add(MIMO_ASR_MAX_GENERATED_TOKENS)
+    input_samples: usize,
+    input_sample_rate_hz: usize,
+) -> Result<usize, TopologyError> {
+    if mel.hop_length == 0 || inlocal.group_size == 0 {
+        return Err(TopologyError::DivisionByZero);
+    }
+    let resampled =
+        mimo_resampled_output_sample_count(input_samples, input_sample_rate_hz, mel.sample_rate_hz)
+            .map_err(|error| match error {
+                MimoResampleShapeError::ZeroSampleRate => TopologyError::DivisionByZero,
+                MimoResampleShapeError::ArithmeticOverflow { operation } => {
+                    TopologyError::ArithmeticOverflow { operation }
+                }
+            })?;
+    let mel_frames = StftFramer::output_frame_count_for(
+        mel.n_fft,
+        mel.hop_length,
+        PadMode::ReflectCenter,
+        resampled,
+    )
+    .map_err(|error| TopologyError::Unavailable {
+        reason: format!("mimo-asr STFT shape is invalid: {error}"),
+    })?;
+    let conv_padding = audiotok.conv_kernel_size / 2;
+    let conv1 = mimo_conv_out_len(
+        mel_frames,
+        audiotok.conv_kernel_size,
+        audiotok.conv1_stride,
+        conv_padding,
+    )?;
+    let conv2 = mimo_conv_out_len(
+        conv1,
+        audiotok.conv_kernel_size,
+        audiotok.conv2_stride,
+        conv_padding,
+    )?;
+    let rvq_frames = mimo_conv_out_len(conv2, 2, audiotok.down_sample_stride, 0)?;
+    let audio_groups = rvq_frames / inlocal.group_size;
+    if audio_groups == 0 {
+        return Err(TopologyError::Unavailable {
+            reason: "mimo-asr audio is too short to produce one input-local group".to_string(),
+        });
+    }
+    Ok(audio_groups)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MimoAsrDecoderStateTopology {
+    llm: MimoLlmMetadata,
+    mel: MimoMelMetadata,
+    audiotok: MimoAudiotokMetadata,
+    inlocal: MimoInlocalMetadata,
+    fixed_prompt_tokens: usize,
+    kv_spec: LlmKvCacheSpec,
+}
+
+impl MimoAsrDecoderStateTopology {
+    pub(crate) fn new(
+        llm: MimoLlmMetadata,
+        mel: MimoMelMetadata,
+        audiotok: MimoAudiotokMetadata,
+        inlocal: MimoInlocalMetadata,
+        fixed_prompt_tokens: usize,
+        kv_spec: LlmKvCacheSpec,
+    ) -> Self {
+        Self {
+            llm,
+            mel,
+            audiotok,
+            inlocal,
+            fixed_prompt_tokens,
+            kv_spec,
+        }
+    }
+}
+
+impl DecoderStateTopology for MimoAsrDecoderStateTopology {
+    fn demands(
+        &self,
+        scope: DecoderStateDemandScope<InvocationShapeInput, InvocationEnvelope>,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        let invocation = match scope {
+            DecoderStateDemandScope::ExactInvocation(invocation) => invocation,
+            DecoderStateDemandScope::StableEnvelope(envelope) => envelope.maximum_invocation(),
+        };
+        let duration_numerator = u128::try_from(invocation.samples())
+            .ok()
+            .and_then(|samples| samples.checked_mul(1_000))
+            .ok_or(TopologyError::ArithmeticOverflow {
+                operation: "mimo-asr input duration numerator",
+            })?;
+        let duration_limit = u128::from(invocation.sample_rate_hz().get())
+            .checked_mul(MIMO_MAX_INPUT_MILLISECONDS)
+            .ok_or(TopologyError::ArithmeticOverflow {
+                operation: "mimo-asr input duration limit",
+            })?;
+        if duration_numerator > duration_limit {
+            let max_samples = usize::try_from(duration_limit / 1_000).map_err(|_| {
+                TopologyError::ArithmeticOverflow {
+                    operation: "mimo-asr input duration limit conversion",
+                }
+            })?;
+            return Err(TopologyError::InvocationSampleLimitExceeded {
+                required_samples: invocation.samples(),
+                max_samples,
+            });
+        }
+        let audio_groups = mimo_asr_audio_group_count_for_samples(
+            &self.mel,
+            &self.audiotok,
+            &self.inlocal,
+            invocation.samples(),
+            invocation.sample_rate_hz().get() as usize,
+        )?;
+        let prompt_positions = self.fixed_prompt_tokens.checked_add(audio_groups).ok_or(
+            TopologyError::ArithmeticOverflow {
+                operation: "mimo-asr prompt positions",
+            },
+        )?;
+        let positions = causal_prefix_positions_with_context_cap(
+            MIMO_ASR_SELF_KV_STATE_ID,
+            prompt_positions,
+            MIMO_ASR_MAX_GENERATED_TOKENS,
+            self.llm.max_positions,
+        )?;
+        Ok(vec![StateDemand::from_llm_kv_geometry(
+            MIMO_ASR_SELF_KV_STATE_ID,
+            StateKind::SelfAttentionKv,
+            positions,
+            self.llm.max_positions,
+            mimo_asr_kv_geometry(&self.llm),
+            self.kv_spec,
+            invocation.sequences().get() as usize,
+            PositionBoundProof::Exact,
+        )?])
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
     use crate::capacity::kv_bytes_per_position;
+    use crate::capacity::topology::{DecoderStatePlan, InvocationEnvelope, StateKind};
     use crate::nn::decoder::LlmKvCacheSpec;
 
     /// Real-checkpoint-shaped facts (the same values `runtime_contract`'s
@@ -167,32 +358,111 @@ mod tests {
     }
 
     #[test]
-    fn required_positions_is_clamped_to_the_single_decode_window() {
-        let (mel, audiotok, inlocal) = (reference_mel(), reference_audiotok(), reference_inlocal());
-        let at_window = mimo_asr_admission_required_positions(
-            &mel,
-            &audiotok,
-            &inlocal,
-            MIMO_ASR_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS,
+    fn exact_topology_includes_the_resampler_terminal_flush() {
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            mimo_resampled_output_sample_count(480_000, 16_000, 24_000).unwrap(),
+            724_992
         );
-        let at_hour = mimo_asr_admission_required_positions(&mel, &audiotok, &inlocal, 3600.0);
-        assert_eq!(at_window, at_hour);
-        let short = mimo_asr_admission_required_positions(&mel, &audiotok, &inlocal, 5.0);
-        assert!(short < at_window, "short={short} window={at_window}");
-        assert!(at_window < reference_llm().max_positions);
+        assert_eq!(
+            mimo_asr_audio_group_count_for_samples(
+                &reference_mel(),
+                &reference_audiotok(),
+                &reference_inlocal(),
+                480_000,
+                16_000,
+            )
+            .unwrap(),
+            188
+        );
+        let plan = DecoderStatePlan::for_envelope(
+            &MimoAsrDecoderStateTopology::new(
+                reference_llm(),
+                reference_mel(),
+                reference_audiotok(),
+                reference_inlocal(),
+                32,
+                LlmKvCacheSpec::DEFAULT,
+            ),
+            envelope,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.reserve_positions(StateKind::SelfAttentionKv),
+            Some(731)
+        );
     }
 
     #[test]
-    fn required_positions_walks_the_runtime_pipeline_arithmetic() {
-        // 30s at 24kHz/240-hop = 3000 mel frames -> stem stride 1*2*2 = 750
-        // RVQ frames (25Hz) -> group 4 = 187 audio groups (truncated).
-        // required = 32 fixed + 187 groups + 512 generation backstop = 731.
-        let positions = mimo_asr_admission_required_positions(
+    fn duration_and_context_boundaries_follow_resample_group_and_greedy_schedule() {
+        let rate = NonZeroU32::new(16_000).unwrap();
+        let topology = MimoAsrDecoderStateTopology::new(
+            reference_llm(),
+            reference_mel(),
+            reference_audiotok(),
+            reference_inlocal(),
+            32,
+            LlmKvCacheSpec::DEFAULT,
+        );
+        for seconds in [1, 30] {
+            let samples = seconds * 16_000;
+            let groups = mimo_asr_audio_group_count_for_samples(
+                &reference_mel(),
+                &reference_audiotok(),
+                &reference_inlocal(),
+                samples,
+                16_000,
+            )
+            .unwrap();
+            let expected_positions = 32 + groups + MIMO_ASR_MAX_GENERATED_TOKENS - 1;
+            let plan = DecoderStatePlan::for_envelope(
+                &topology,
+                InvocationEnvelope::new(rate, samples).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.reserve_positions_by_id(MIMO_ASR_SELF_KV_STATE_ID),
+                Some(expected_positions)
+            );
+        }
+        for seconds in [60, 300] {
+            assert!(matches!(
+                DecoderStatePlan::for_envelope(
+                    &topology,
+                    InvocationEnvelope::new(rate, seconds * 16_000).unwrap(),
+                ),
+                Err(TopologyError::InvocationSampleLimitExceeded { .. })
+            ));
+        }
+
+        let one_second_groups = mimo_asr_audio_group_count_for_samples(
             &reference_mel(),
             &reference_audiotok(),
             &reference_inlocal(),
-            30.0,
-        );
-        assert_eq!(positions, 731);
+            16_000,
+            16_000,
+        )
+        .unwrap();
+        let physical = 32 + one_second_groups + MIMO_ASR_MAX_GENERATED_TOKENS - 1;
+        let mut small = reference_llm();
+        small.max_positions = physical;
+        assert!(matches!(
+            DecoderStatePlan::for_envelope(
+                &MimoAsrDecoderStateTopology::new(
+                    small,
+                    reference_mel(),
+                    reference_audiotok(),
+                    reference_inlocal(),
+                    32,
+                    LlmKvCacheSpec::DEFAULT,
+                ),
+                InvocationEnvelope::new(rate, 16_000).unwrap(),
+            ),
+            Err(TopologyError::SemanticContextCapExceeded { .. })
+        ));
     }
 }

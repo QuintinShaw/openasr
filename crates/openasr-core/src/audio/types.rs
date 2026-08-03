@@ -274,7 +274,6 @@ impl PcmSlice {
     }
 
     /// Creates a sub-view with a range relative to this view.
-    #[cfg(test)]
     pub(crate) fn slice(&self, range: Range<usize>) -> Self {
         assert!(range.start <= range.end, "PCM sub-range start exceeds end");
         assert!(range.end <= self.range.len(), "PCM sub-range exceeds view");

@@ -40,6 +40,10 @@ pub struct GgmlBackendDevice {
     /// null (system-default device only). Consumed by execution-route Exact
     /// resolution and cache/worker isolation keys.
     pub device_id: Option<String>,
+    /// PCI vendor id reported by an optional backend registry procedure.
+    /// `None` is deliberately preserved as unknown; routing code must never
+    /// substitute a device-description/name heuristic for this fact.
+    pub pci_vendor_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +165,18 @@ impl GgmlBackendDevice {
         memory: Option<GgmlDeviceMemory>,
         device_id: Option<&str>,
     ) -> Self {
+        Self::for_test_with_hardware_facts(name, description, kind, memory, device_id, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_hardware_facts(
+        name: &str,
+        description: &str,
+        kind: GgmlBackendKind,
+        memory: Option<GgmlDeviceMemory>,
+        device_id: Option<&str>,
+        pci_vendor_id: Option<u32>,
+    ) -> Self {
         Self {
             raw: NonNull::dangling(),
             name: name.to_string(),
@@ -169,6 +185,7 @@ impl GgmlBackendDevice {
             memory,
             buffer_alignment: None,
             device_id: device_id.map(str::to_string),
+            pci_vendor_id,
         }
     }
 }
@@ -629,6 +646,7 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
             let trimmed = raw_id.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         };
+        let pci_vendor_id = unsafe { device_pci_vendor_id(raw) };
 
         devices.push(GgmlBackendDevice {
             raw,
@@ -638,10 +656,32 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
             memory,
             buffer_alignment,
             device_id,
+            pci_vendor_id,
         });
     }
 
     devices
+}
+
+/// Optional backend procedure added without extending ggml's device interface,
+/// so an older dynamically loaded plugin remains ABI-safe and simply reports
+/// `None`. A zero return is the backend's explicit "unknown" value.
+unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
+    const PROC_NAME: &[u8] = b"ggml_backend_device_pci_vendor_id\0";
+    let registry = unsafe { ffi::ggml_backend_dev_backend_reg(device.as_ptr()) };
+    if registry.is_null() {
+        return None;
+    }
+    let procedure = unsafe {
+        ffi::ggml_backend_reg_get_proc_address(registry, PROC_NAME.as_ptr().cast::<c_char>())
+    };
+    if procedure.is_null() {
+        return None;
+    }
+    type DevicePciVendorId = unsafe extern "C" fn(ffi::GgmlBackendDevRaw) -> u32;
+    let query: DevicePciVendorId = unsafe { std::mem::transmute(procedure) };
+    let vendor_id = unsafe { query(device.as_ptr()) };
+    (vendor_id != 0).then_some(vendor_id)
 }
 
 impl GgmlCpuFeatures {
@@ -775,6 +815,7 @@ mod tests {
                 }),
                 buffer_alignment: Some(16),
                 device_id: Some("0000:01:00.0".to_string()),
+                pci_vendor_id: Some(0x10de),
             }],
             cpu_features: GgmlCpuFeatures::default(),
         };

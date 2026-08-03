@@ -11,22 +11,19 @@
 //! prefill-chunk/persistent-session machinery here: correctness-first single-
 //! shot decode, GPU perf tuning is out of scope this stage).
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
-use crate::ggml_runtime::GgufTensorDataReadError;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
-    QwenFamilyLlmLayerTensorNames, load_llm_logits_head_from_reader_with_tensor_names,
-    load_qwen_family_llm_layer_attention_projection_generic,
-    load_token_embedding_table_from_reader_with_tensor_name,
+    QwenWholeDecoderPlan,
 };
 
 use super::runtime_contract::{
-    MOSS_TD_RMS_NORM_EPSILON, MOSS_TD_ROPE_THETA, MossTdDecoderMetadata, moss_td_kv_cache_positions,
-};
-use super::tensor_names::{
-    LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, moss_llm_layer_tensor_names,
+    MOSS_TD_RMS_NORM_EPSILON, MOSS_TD_ROPE_THETA, MossTdDecoderMetadata,
 };
 
 /// Host-path prefill segment width (see [`MossTdDecoderRuntime::prefill`]). A
@@ -40,8 +37,6 @@ const MOSS_TD_PREFILL_CHUNK_TOKENS: usize = 512;
 
 #[derive(Debug, Error)]
 pub(crate) enum MossTdDecoderError {
-    #[error("moss-transcribe-diarize decoder tensor read failed: {reason}")]
-    TensorReadFailed { reason: String },
     #[error("moss-transcribe-diarize decoder graph failed: {reason}")]
     GraphFailed { reason: String },
     #[error("moss-transcribe-diarize decoder token-embedding gather failed: {reason}")]
@@ -54,47 +49,6 @@ pub(crate) enum MossTdDecoderError {
     EmptyPrefillOutput,
 }
 
-fn load_moss_layer_projections(
-    reader: &crate::ggml_runtime::GgufTensorDataReader,
-    metadata: &MossTdDecoderMetadata,
-) -> Result<Vec<Qwen3AsrLlmLayerAttentionProjection>, MossTdDecoderError> {
-    let mut projections = Vec::with_capacity(metadata.n_layers);
-    for layer_index in 0..metadata.n_layers {
-        let names = moss_llm_layer_tensor_names(layer_index);
-        let generic = load_qwen_family_llm_layer_attention_projection_generic(
-            reader,
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                // Qwen3 has QK-norm (unlike Qwen2/firered-llm).
-                q_norm_name: Some(names.attn_q_norm_weight),
-                k_norm_name: Some(names.attn_k_norm_weight),
-                // Qwen3 has no attention bias (unlike Qwen2/firered-llm).
-                q_bias_name: None,
-                k_bias_name: None,
-                v_bias_name: None,
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            },
-            metadata.d_model,
-            metadata.n_heads,
-            metadata.n_kv_heads,
-            metadata.head_dim,
-            false,
-        )
-        .map_err(|error| MossTdDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        })?;
-        projections.push(Qwen3AsrLlmLayerAttentionProjection::Generic(generic));
-    }
-    Ok(projections)
-}
-
 /// The Qwen3-0.6B decoder-only stack for one loaded pack: layer weights +
 /// logits head + token embedding table (tied to the same tensor as the
 /// logits head's output weight -- `config.tie_word_embeddings=true`, see
@@ -102,8 +56,9 @@ fn load_moss_layer_projections(
 /// set of per-utterance KV caches (`new_kv_caches`).
 pub(crate) struct MossTdDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
-    logits_head: Qwen3AsrLlmLogitsHead,
-    token_embedding: Qwen3AsrTokenEmbeddingTable,
+    logits_head: Arc<Qwen3AsrLlmLogitsHead>,
+    logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
+    token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
     metadata: MossTdDecoderMetadata,
 }
 
@@ -113,47 +68,26 @@ pub(crate) struct MossTdPrefillOutput {
 }
 
 impl MossTdDecoderRuntime {
-    pub(crate) fn new(
+    pub(crate) fn quoted_resident_system_memory_bytes(layer_count: usize) -> Result<u64, String> {
+        Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(layer_count)
+    }
+
+    pub(crate) fn resident_system_memory_bytes(&self) -> Result<u64, String> {
+        self.whole_decoder.retained_system_memory_bytes()
+    }
+
+    pub(crate) fn new_with_prepared_state(
         runtime_source: &crate::GgmlRuntimeSource,
         metadata: MossTdDecoderMetadata,
+        decoder_plan: Arc<QwenWholeDecoderPlan>,
+        logits_head: Arc<Qwen3AsrLlmLogitsHead>,
+        token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(map_tensor_read_error)?;
-        let projections = load_moss_layer_projections(&reader, &metadata)?;
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
-            &reader,
-            runtime_source,
-            metadata.d_model,
-            metadata.vocab_size,
-            LLM_OUTPUT_NORM_WEIGHT,
-            // Tied embeddings: the output projection reuses the token
-            // embedding tensor -- no separate lm_head tensor exists in the
-            // pack (see `package_import`).
-            LLM_TOKEN_EMBD_WEIGHT,
-            MOSS_TD_RMS_NORM_EPSILON,
-            backend,
-        )
-        .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
-            reason: error.to_string(),
-        })?;
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
-            &reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )
-        .map_err(|error| MossTdDecoderError::TokenEmbeddingFailed {
-            reason: error.to_string(),
-        })?;
-        // Keep the output projection in the same static arena as the resident
-        // decoder graph. Metal can then return a device-side top-1 token for
-        // every post-prefill step instead of constructing a separate full-vocab
-        // logits graph per token.
         let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_source),
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+                &decoder_plan,
+                runtime_source,
                 MOSS_TD_RMS_NORM_EPSILON,
                 logits_head.fused_top1_spec(),
                 backend,
@@ -161,9 +95,15 @@ impl MossTdDecoderRuntime {
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
+        let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
+            MossTdDecoderError::LogitsHeadFailed {
+                reason: error.to_string(),
+            }
+        })?;
         Ok(Self {
             whole_decoder,
             logits_head,
+            logits_runtime,
             token_embedding,
             metadata,
         })
@@ -175,7 +115,7 @@ impl MossTdDecoderRuntime {
 
     /// Frees this decoder's per-token grow-to-fit host step buffer. Call
     /// after every decode, right before this runtime goes back into
-    /// `executor.rs`'s thread-local resident cache -- without it, a session-
+    /// `executor.rs`'s owner-actor checkout pool -- without it, a session-
     /// scoped allocation sized for one utterance would otherwise ride along
     /// on the cached runtime into the next, unrelated request. Mirrors
     /// `qwen::ggml_executor`'s identical call around its own resident
@@ -184,37 +124,28 @@ impl MossTdDecoderRuntime {
         self.whole_decoder.release_session_scoped_buffers();
     }
 
-    /// `capacity` is the request-sized bound (prompt tokens + the generation
-    /// budget), NOT the checkpoint's native `max_positions` (131072, a RoPE
-    /// context ceiling -- see `moss_td_kv_cache_positions`'s doc comment).
-    /// It becomes the persistent Metal/GPU reuse graph's fixed KV/mask/RoPE
-    /// span (`run_prefill_auto_last_hidden`/`run_step_auto` size it from this
-    /// cache's `max_positions()`), so it is a per-token compute and
-    /// device-resident-allocation cost, not just a host bound. The executor
-    /// validates this complete request against the pack's capped metadata
-    /// ceiling before calling here. Keeping the metadata minimum here as
-    /// defense in depth preserves a pack whose declared context is smaller
-    /// than the family cap; it must never be silently expanded. Mirrors
-    /// `firered_llm::llm_transformer`'s and `mimo_asr::llm_transformer`'s
-    /// request-sized `new_kv_caches(capacity)` sizing, and
-    /// `qwen::ggml_executor`'s own
-    /// `decode_prompt.token_ids.len().saturating_add(decode_config.max_generated_tokens)`.
-    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
-        let cache_positions = capacity.min(moss_td_kv_cache_positions(self.metadata.max_positions));
+    /// Allocate only the exact current-invocation host history. The executor
+    /// validates both logical and stable resident spans against the family cap
+    /// before this call; no allocation path clamps or substitutes that cap.
+    pub(crate) fn new_kv_caches(
+        &self,
+        capacity: Qwen3AsrKvCacheCapacity,
+    ) -> Result<Qwen3AsrHostKvCacheOwner, String> {
         let host = self.whole_decoder.kv_cache_spec().host;
-        (0..self.metadata.n_layers)
-            .map(|_| {
-                Qwen3AsrLayerKvCacheState::new_with_element_type(
-                    cache_positions,
-                    self.metadata.n_kv_heads,
-                    self.metadata.head_dim,
-                    host,
-                )
-                .unwrap_or_else(|reason| {
-                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                })
-            })
-            .collect()
+        let mode = if self.whole_decoder.supports_graph_reuse() {
+            Qwen3AsrHostKvMode::ResidentOnly
+        } else {
+            Qwen3AsrHostKvMode::Materialized
+        };
+        Qwen3AsrHostKvCacheOwner::try_new(
+            "moss-transcribe-diarize.decoder.self-kv.host",
+            self.metadata.n_layers,
+            capacity,
+            self.metadata.n_kv_heads,
+            self.metadata.head_dim,
+            host,
+            mode,
+        )
     }
 
     pub(crate) fn gather_token_embedding(
@@ -249,6 +180,7 @@ impl MossTdDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<MossTdPrefillOutput, MossTdDecoderError> {
         let token_count = prompt_embeddings.token_count;
@@ -266,6 +198,7 @@ impl MossTdDecoderRuntime {
                 &prompt_embeddings.token_major_values,
                 token_count,
                 layer_kv_caches,
+                capacity,
                 MOSS_TD_ROPE_THETA,
                 control,
             )
@@ -286,8 +219,8 @@ impl MossTdDecoderRuntime {
                 });
             }
             let logits = self
-                .logits_head
-                .compute_logits_for_last_hidden(&final_hidden)
+                .logits_runtime
+                .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
                 .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
                 })?;
@@ -316,8 +249,8 @@ impl MossTdDecoderRuntime {
             self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?
         };
         let logits = self
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden)
+            .logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
             .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })?;
@@ -388,6 +321,7 @@ impl MossTdDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Vec<f32>, MossTdDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
         // `run_step_auto` transparently reuses the persistent decode graph on
@@ -402,7 +336,13 @@ impl MossTdDecoderRuntime {
         // empty slice as intentional rather than a count-mismatch error.
         let step = self
             .whole_decoder
-            .run_step_auto(&hidden, cache_position, layer_kv_caches, MOSS_TD_ROPE_THETA)
+            .run_step_auto(
+                &hidden,
+                cache_position,
+                layer_kv_caches,
+                capacity,
+                MOSS_TD_ROPE_THETA,
+            )
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
@@ -413,8 +353,8 @@ impl MossTdDecoderRuntime {
             self.metadata.n_kv_heads * self.metadata.head_dim,
             layer_kv_caches,
         )?;
-        self.logits_head
-            .compute_logits_for_last_hidden(&step.hidden)
+        self.logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &step.hidden)
             .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
@@ -430,16 +370,16 @@ impl MossTdDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Option<u32>, MossTdDecoderError> {
         if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
             return Ok(None);
         }
-        let max_positions = layer_kv_caches
-            .first()
-            .map(Qwen3AsrLayerKvCacheState::max_positions)
-            .ok_or_else(|| MossTdDecoderError::KvCacheFailed {
+        if layer_kv_caches.is_empty() {
+            return Err(MossTdDecoderError::KvCacheFailed {
                 reason: "moss-transcribe-diarize decoder has no layer KV caches".to_string(),
-            })?;
+            });
+        }
         let hidden = self.gather_token_embedding(token_id)?;
         let step = self
             .whole_decoder
@@ -447,7 +387,7 @@ impl MossTdDecoderRuntime {
                 &hidden,
                 &[cache_position],
                 MOSS_TD_ROPE_THETA,
-                max_positions,
+                capacity.resident_positions(),
             )
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),
@@ -534,10 +474,4 @@ fn write_layer_kv(
         }
     }
     Ok(())
-}
-
-fn map_tensor_read_error(error: GgufTensorDataReadError) -> MossTdDecoderError {
-    MossTdDecoderError::TensorReadFailed {
-        reason: error.to_string(),
-    }
 }

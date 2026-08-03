@@ -11,11 +11,10 @@
 //! - Exact resolution is typed fail-closed: no silent card swap, no CPU fallback
 //! - Metal devices are enumerable but [`DeviceAddressability::NotExactlyAddressable`]
 //!   because ggml Metal still initializes via `MTLCreateSystemDefaultDevice` only
-//! - Admission capacity stays **per model identity** (route does not split slots).
-//!   Route identity isolates thread-local ggml backend handles and streaming
-//!   workers only. Family prepared-runtime caches and serve-batch engine keys are
-//!   still coarse `(path, backend)` -- not route-isolated -- until a follow-up
-//!   runtime-cache coordinator lands (hard gate before public Exact).
+//! - Admission capacity stays **per physical device** through the device-memory
+//!   broker. Route identity also feeds the unified execution-lane key used by
+//!   every resident backend owner and serve-batch engine. Content-only prepared
+//!   caches are compile-time restricted to host-neutral values.
 
 use std::fmt;
 
@@ -148,6 +147,28 @@ impl DeviceAddressability {
 pub enum RouteDeviceKind {
     Cpu,
     Accelerated,
+}
+
+/// Stable hardware-vendor identity used only when a product target names a
+/// vendor. Provider-specific backends are authoritative by construction;
+/// shared providers such as Vulkan require an explicit PCI vendor id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionHardwareVendor {
+    Apple,
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+impl fmt::Display for ExecutionHardwareVendor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Apple => "Apple",
+            Self::Nvidia => "NVIDIA",
+            Self::Amd => "AMD",
+            Self::Intel => "Intel",
+        })
+    }
 }
 
 impl RouteDeviceKind {
@@ -355,9 +376,18 @@ pub struct EnumeratedComputeDevice {
     pub registry_ordinal: usize,
     pub kind: RouteDeviceKind,
     pub ggml_kind: GgmlBackendKind,
+    /// Live memory observation reported by the backend at enumeration time.
+    /// Selection policy must not reinterpret this as an allocation guarantee;
+    /// the memory broker refreshes/validates it when admitting a candidate.
+    pub memory: Option<crate::ggml_runtime::GgmlDeviceMemory>,
+    /// Default backend-buffer alignment for physical-footprint rounding.
+    pub buffer_alignment: Option<usize>,
     pub addressability: DeviceAddressability,
     /// Raw ggml `device_id` string when present (pre-normalization).
     pub device_id: Option<String>,
+    /// Proven hardware vendor. Vulkan is populated only from the backend's
+    /// numeric PCI vendor procedure; a missing fact remains `None`.
+    pub hardware_vendor: Option<ExecutionHardwareVendor>,
 }
 
 impl EnumeratedComputeDevice {
@@ -429,8 +459,32 @@ fn enumerated_from_ggml_device(
         registry_ordinal,
         kind,
         ggml_kind: device.kind,
+        memory: device.memory,
+        buffer_alignment: device.buffer_alignment,
         addressability,
         device_id: device.device_id.clone(),
+        hardware_vendor: hardware_vendor_for_device(provider, device.pci_vendor_id),
+    }
+}
+
+fn hardware_vendor_for_device(
+    provider: ExecutionProvider,
+    pci_vendor_id: Option<u32>,
+) -> Option<ExecutionHardwareVendor> {
+    match provider {
+        ExecutionProvider::Metal => cfg!(all(target_vendor = "apple", target_arch = "aarch64"))
+            .then_some(ExecutionHardwareVendor::Apple),
+        ExecutionProvider::Cuda => Some(ExecutionHardwareVendor::Nvidia),
+        ExecutionProvider::Hip => Some(ExecutionHardwareVendor::Amd),
+        ExecutionProvider::Vulkan => match pci_vendor_id {
+            Some(0x1002) | Some(0x1022) => Some(ExecutionHardwareVendor::Amd),
+            Some(0x8086) => Some(ExecutionHardwareVendor::Intel),
+            Some(0x10de) => Some(ExecutionHardwareVendor::Nvidia),
+            _ => None,
+        },
+        ExecutionProvider::Cpu | ExecutionProvider::Accelerator | ExecutionProvider::Unknown => {
+            None
+        }
     }
 }
 
@@ -684,8 +738,14 @@ mod tests {
             registry_ordinal: ordinal,
             kind: route_kind,
             ggml_kind: kind,
+            memory: Some(GgmlDeviceMemory {
+                free_bytes: 8 * 1024 * 1024 * 1024,
+                total_bytes: 8 * 1024 * 1024 * 1024,
+            }),
+            buffer_alignment: Some(256),
             addressability: addressability_for_device(provider, device_id),
             device_id: device_id.map(str::to_string),
+            hardware_vendor: hardware_vendor_for_device(provider, None),
         }
     }
 
@@ -891,5 +951,31 @@ mod tests {
                 .map(PhysicalResourceKey::as_str),
             Some("0000:c1:00.0")
         );
+    }
+
+    #[test]
+    fn vulkan_vendor_is_accepted_only_from_numeric_backend_fact() {
+        let proven = GgmlBackendDevice::for_test_with_hardware_facts(
+            "Vulkan0",
+            "arbitrary description",
+            GgmlBackendKind::Gpu,
+            None,
+            Some("0000:01:00.0"),
+            Some(0x1002),
+        );
+        let unknown = GgmlBackendDevice::for_test_with_hardware_facts(
+            "Vulkan1",
+            "AMD words are not evidence",
+            GgmlBackendKind::Gpu,
+            None,
+            Some("0000:02:00.0"),
+            None,
+        );
+        let inventory = enumerate_compute_devices_from_ggml(&[proven, unknown]);
+        assert_eq!(
+            inventory[0].hardware_vendor,
+            Some(ExecutionHardwareVendor::Amd)
+        );
+        assert_eq!(inventory[1].hardware_vendor, None);
     }
 }

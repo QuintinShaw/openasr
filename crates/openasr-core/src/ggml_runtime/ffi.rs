@@ -5,6 +5,7 @@ pub(crate) type GgmlBackendDevRaw = *mut c_void;
 pub(crate) type GgmlBackendBufferRaw = *mut c_void;
 pub(crate) type GgmlBackendBufferTypeRaw = *mut c_void;
 pub(crate) type GgmlBackendSchedRaw = *mut c_void;
+pub(crate) type GgmlBackendSchedMemoryPlanRaw = *mut c_void;
 pub(crate) type GgmlBackendRegRaw = *mut c_void;
 pub(crate) type GgmlContextRaw = *mut c_void;
 pub(crate) type GgmlTensorRaw = *mut c_void;
@@ -100,6 +101,195 @@ pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
+pub(crate) const GGML_BACKEND_BUFFER_USAGE_COMPUTE: c_int = 2;
+
+pub(crate) const GGML_BACKEND_MEMORY_ABI_V1: u32 = 1;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL: u32 = 1;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE: u32 = 2;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED: u32 = 3;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_UNIFIED: u32 = 4;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED: u32 = 5;
+pub(crate) const GGML_BACKEND_MEMORY_REQUEST_BUFFER: u32 = 1;
+pub(crate) const GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT: u32 = 2;
+pub(crate) const GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE: u32 = 3;
+pub(crate) const GGML_BACKEND_MEMORY_REQUEST_TRANSFER: u32 = 4;
+pub(crate) const GGML_BACKEND_MEMORY_QUOTE_PROVISIONAL: u32 = 1 << 0;
+pub(crate) const GGML_BACKEND_MEMORY_QUOTE_HAS_RESIDUAL_UNCERTAINTY: u32 = 1 << 1;
+pub(crate) const GGML_BACKEND_MEMORY_QUOTE_OPAQUE_DRIVER_COSTS_REQUIRE_DOMAIN_HEADROOM: u32 =
+    1 << 2;
+#[cfg(test)]
+pub(crate) const GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE: u32 = 1 << 0;
+pub(crate) const GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE: u32 = 1 << 0;
+pub(crate) const GGML_BACKEND_MEMORY_CLAIM_EXACT: u32 = 1 << 0;
+pub(crate) const GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER: u32 = 1 << 1;
+pub(crate) const GGML_BACKEND_MEMORY_CLAIM_DRIVER_ESTIMATE: u32 = 1 << 2;
+pub(crate) const GGML_BACKEND_MEMORY_CLAIM_PROVISIONAL: u32 = 1 << 6;
+pub(crate) const GGML_BACKEND_MEMORY_HEALTHY: u32 = 0;
+pub(crate) const GGML_BACKEND_MEMORY_DEGRADED: u32 = 1;
+pub(crate) const GGML_BACKEND_MEMORY_QUARANTINED: u32 = 2;
+pub(crate) const GGML_BACKEND_MEMORY_DEVICE_LOST: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct GgmlBackendMemoryDomainIdV1 {
+    pub physical_device_uuid: [u8; 16],
+    pub heap_index: u32,
+    pub kind: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GgmlBackendMemoryDomainV1 {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub id: GgmlBackendMemoryDomainIdV1,
+    pub name: [c_char; 48],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GgmlBackendMemoryRequestV1 {
+    pub struct_size: u32,
+    pub kind: u32,
+    pub flags: u32,
+    pub usage: u32,
+    pub request_id: u64,
+    pub backend: GgmlBackendRaw,
+    pub peer_backend: GgmlBackendRaw,
+    pub buft: GgmlBackendBufferTypeRaw,
+    pub graph: GgmlCgraphRaw,
+    pub host_ptr: *const c_void,
+    pub requested_bytes: u64,
+    pub currently_allocated_bytes: u64,
+    pub max_tensor_bytes: u64,
+}
+
+impl Default for GgmlBackendMemoryRequestV1 {
+    fn default() -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>() as u32,
+            kind: 0,
+            flags: 0,
+            usage: 0,
+            request_id: 0,
+            backend: std::ptr::null_mut(),
+            peer_backend: std::ptr::null_mut(),
+            buft: std::ptr::null_mut(),
+            graph: std::ptr::null_mut(),
+            host_ptr: std::ptr::null(),
+            requested_bytes: 0,
+            currently_allocated_bytes: 0,
+            max_tensor_bytes: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct GgmlBackendMemoryClaimV1 {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub request_id: u64,
+    pub domain: GgmlBackendMemoryDomainIdV1,
+    pub payload_requested_bytes: u64,
+    pub committed_before_bytes: u64,
+    pub committed_after_upper_bytes: u64,
+    pub commit_peak_extra_upper_bytes: u64,
+    pub resident_after_upper_bytes: u64,
+    pub retained_after_use_upper_bytes: u64,
+    pub releasable_after_use_upper_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct GgmlBackendMemoryQuoteV1 {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub residual_flags: u32,
+    pub residual_request_count: u32,
+    pub provisional_requested_upper_bytes: u64,
+    pub stats_generation: u64,
+    pub quote_token: u64,
+    pub request_fingerprint: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct GgmlBackendMemoryStatsV1 {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub domain: GgmlBackendMemoryDomainIdV1,
+    pub generation: u64,
+    pub timestamp_monotonic_ns: u64,
+    pub total_bytes: u64,
+    pub budget_bytes: u64,
+    pub device_used_bytes: u64,
+    pub device_free_bytes: u64,
+    pub backend_owned_live_bytes: u64,
+    pub backend_owned_cached_bytes: u64,
+    pub backend_owned_workspace_bytes: u64,
+    pub backend_owned_high_water_bytes: u64,
+    pub allocation_count: u64,
+    pub allocation_failure_count: u64,
+    pub health: u32,
+    pub last_ggml_status: i32,
+    pub last_native_error: i64,
+    pub quarantine_generation: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GgmlBackendMemoryQuarantineV1 {
+    pub struct_size: u32,
+    pub flags: u32,
+    pub reason: u32,
+    pub ggml_status: i32,
+    pub native_error: i64,
+    pub message: [c_char; 96],
+}
+
+pub(crate) type GgmlMemoryGetDomainsFn =
+    unsafe extern "C" fn(GgmlBackendDevRaw, *mut GgmlBackendMemoryDomainV1, *mut u32) -> c_int;
+pub(crate) type GgmlMemoryQuoteFn = unsafe extern "C" fn(
+    *const GgmlBackendMemoryRequestV1,
+    u32,
+    *mut GgmlBackendMemoryQuoteV1,
+    *mut GgmlBackendMemoryClaimV1,
+    *mut u32,
+) -> c_int;
+pub(crate) type GgmlMemoryReservePrivateFn = unsafe extern "C" fn(
+    *const GgmlBackendMemoryRequestV1,
+    u32,
+    *const GgmlBackendMemoryQuoteV1,
+    *mut GgmlBackendMemoryClaimV1,
+    *mut u32,
+) -> c_int;
+pub(crate) type GgmlMemoryGetStatsFn = unsafe extern "C" fn(
+    GgmlBackendDevRaw,
+    GgmlBackendRaw,
+    *mut GgmlBackendMemoryStatsV1,
+    *mut u32,
+) -> c_int;
+pub(crate) type GgmlMemoryTrimFn = unsafe extern "C" fn(GgmlBackendRaw, u64) -> c_int;
+pub(crate) type GgmlMemoryQuarantineFn =
+    unsafe extern "C" fn(GgmlBackendRaw, *const GgmlBackendMemoryQuarantineV1) -> c_int;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GgmlBackendMemoryApiV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub capabilities: u64,
+    pub get_domains: Option<GgmlMemoryGetDomainsFn>,
+    pub quote: Option<GgmlMemoryQuoteFn>,
+    pub reserve_private: Option<GgmlMemoryReservePrivateFn>,
+    pub get_stats: Option<GgmlMemoryGetStatsFn>,
+    pub trim: Option<GgmlMemoryTrimFn>,
+    pub quarantine: Option<GgmlMemoryQuarantineFn>,
+}
+
+pub(crate) type GgmlBackendMemoryGetApiV1Fn =
+    unsafe extern "C" fn() -> *const GgmlBackendMemoryApiV1;
 
 /// ggml abort predicate: return true to abort the in-flight graph. Called from
 /// ggml worker threads -- must stay panic-free and lock-light.
@@ -203,11 +393,23 @@ unsafe extern "C" {
         op_offload: bool,
     ) -> GgmlBackendSchedRaw;
     pub(crate) fn ggml_backend_sched_free(sched: GgmlBackendSchedRaw);
-    pub(crate) fn ggml_backend_sched_reset(sched: GgmlBackendSchedRaw);
-    pub(crate) fn ggml_backend_sched_alloc_graph(
+    pub(crate) fn ggml_backend_sched_memory_plan_create_v1(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
+        out_plan: *mut GgmlBackendSchedMemoryPlanRaw,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_sched_memory_plan_get_item_count_v1(
+        plan: GgmlBackendSchedMemoryPlanRaw,
+    ) -> u32;
+    pub(crate) fn ggml_backend_sched_memory_plan_get_item_v1(
+        plan: GgmlBackendSchedMemoryPlanRaw,
+        index: u32,
+        out_item: *mut GgmlBackendMemoryRequestV1,
     ) -> bool;
+    pub(crate) fn ggml_backend_sched_memory_plan_commit_v1(
+        plan: GgmlBackendSchedMemoryPlanRaw,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_sched_memory_plan_free_v1(plan: GgmlBackendSchedMemoryPlanRaw);
     pub(crate) fn ggml_backend_sched_graph_compute(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,

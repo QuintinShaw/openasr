@@ -43,6 +43,53 @@ pub(crate) struct MimoRvqCodebooks {
     vocab_sizes: Vec<usize>,
 }
 
+impl MimoRvqCodebooks {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &MimoAudiotokMetadata,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            metadata
+                .rvq_packed
+                .checked_mul(std::mem::size_of::<Vec<f32>>())
+                .ok_or_else(|| "mimo-asr RVQ table descriptors quote overflowed".to_string())?,
+            "mimo-asr RVQ table descriptors quote",
+        )?;
+        let value_count = metadata
+            .codebook_sizes
+            .iter()
+            .try_fold(0usize, |total, &vocab_size| {
+                let level = (vocab_size as usize).checked_mul(metadata.d_model)?;
+                total.checked_add(level)
+            })
+            .ok_or_else(|| "mimo-asr RVQ values quote overflowed".to_string())?;
+        bytes.add_usize(
+            value_count
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "mimo-asr RVQ value bytes quote overflowed".to_string())?,
+            "mimo-asr RVQ values quote",
+        )?;
+        bytes.add_usize(
+            metadata
+                .rvq_packed
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| "mimo-asr RVQ vocabulary quote overflowed".to_string())?,
+            "mimo-asr RVQ vocabulary quote",
+        )?;
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.levels, "mimo-asr RVQ level tables")?;
+        for level in &self.levels {
+            bytes.add_vec(level, "mimo-asr RVQ level table values")?;
+        }
+        bytes.add_vec(&self.vocab_sizes, "mimo-asr RVQ vocabulary sizes")?;
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) fn load_mimo_rvq_codebooks_from_reader(
     reader: &GgufTensorDataReader,
     metadata: &MimoAudiotokMetadata,

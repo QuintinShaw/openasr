@@ -7,7 +7,6 @@
 //! `docs/design/redimnet2-b6-embedder.md` and `HANDOFF.md` for the staged
 //! bring-up plan and golden anchors this module's tests pin against.
 
-use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::ggml_runtime::{
@@ -15,9 +14,6 @@ use crate::ggml_runtime::{
     GgmlPersistentGraphSession, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::ggml_runtime::{GgmlCpuGraphRunner, GgmlRuntimeSource};
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, PackContentKey, with_thread_local_cached_mut_by_key,
-};
 
 use super::super::weights::{Weights, WeightsError};
 use super::config::{self, StageConfig};
@@ -55,17 +51,31 @@ fn shape_err(reason: impl Into<String>) -> RedimNetBackboneError {
     }
 }
 
-enum PendingData {
-    PackTensor(String),
+/// Data waiting to be uploaded into the per-forward ggml arena.
+///
+/// Pack tensors already have a session-resident owner in [`Weights`]. Keeping
+/// another `Vec<f32>` for every one of them until the arena freezes used to
+/// create an almost model-sized, unaccounted host-memory copy on every
+/// embedding. Borrow those buffers through upload instead. Only values which
+/// do not exist in the pack (BatchNorm eval affines, static softmax weights,
+/// and graph constants) need an owned buffer.
+enum PendingData<'p> {
+    Borrowed(&'p [f32]),
     Owned(Vec<f32>),
 }
 
-/// Pending weight upload. Pack tensors retain only their name and borrow the
-/// one shared parsed `Weights` buffer during upload; only host-derived
-/// transforms (BatchNorm affines, softmax weights, scalars) own new data.
-struct Pending {
+impl PendingData<'_> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+}
+
+struct Pending<'p> {
     handle: GgmlStaticTensor,
-    data: PendingData,
+    data: PendingData<'p>,
 }
 
 /// Loads every backbone weight into the arena, on demand, by GGUF tensor name
@@ -76,7 +86,7 @@ struct Pending {
 /// uploaded once.
 struct WBuilder<'p> {
     weights: &'p Weights,
-    pending: Vec<Pending>,
+    pending: Vec<Pending<'p>>,
 }
 
 impl<'p> WBuilder<'p> {
@@ -87,19 +97,11 @@ impl<'p> WBuilder<'p> {
         }
     }
 
-    fn shape(&self, name: &str) -> Result<Vec<usize>, RedimNetBackboneError> {
-        Ok(self.weights.shape(name)?.to_vec())
-    }
-
     /// Fetch a tensor's flat f32 data and assert its pack shape (ne-order)
     /// against the caller's expectation before it is ever bound to a
     /// graph-tensor shape -- a mismatch here is a converter/name-formula bug,
     /// and must fail closed instead of silently reinterpreting bytes.
-    fn fetch<'a>(
-        &'a self,
-        name: &str,
-        expect_ne: &[usize],
-    ) -> Result<&'a [f32], RedimNetBackboneError> {
+    fn fetch(&self, name: &str, expect_ne: &[usize]) -> Result<&'p [f32], RedimNetBackboneError> {
         let shape = self.weights.shape(name)?;
         if shape != expect_ne {
             return Err(shape_err(format!(
@@ -116,11 +118,11 @@ impl<'p> WBuilder<'p> {
     /// `[1,CF,N]` otherwise (only the final `1` collapses) -- the underlying
     /// flat byte order is unaffected either way, which is all
     /// `weigth1d_softmax_host` depends on.
-    fn fetch_flat<'a>(
-        &'a self,
+    fn fetch_flat(
+        &self,
         name: &str,
         expect_len: usize,
-    ) -> Result<&'a [f32], RedimNetBackboneError> {
+    ) -> Result<&'p [f32], RedimNetBackboneError> {
         let data = self.weights.get(name)?;
         if data.len() != expect_len {
             return Err(shape_err(format!(
@@ -137,11 +139,11 @@ impl<'p> WBuilder<'p> {
         name: &str,
         len: usize,
     ) -> Result<GgmlCpuTensor<'a>, RedimNetBackboneError> {
-        self.fetch(name, &[len])?;
+        let data = self.fetch(name, &[len])?;
         let handle = arena.new_tensor_1d_f32(len, "redimnet_weight")?;
         self.pending.push(Pending {
             handle,
-            data: PendingData::PackTensor(name.to_string()),
+            data: PendingData::Borrowed(data),
         });
         Ok(arena.graph_tensor(handle))
     }
@@ -153,11 +155,11 @@ impl<'p> WBuilder<'p> {
         ne0: usize,
         ne1: usize,
     ) -> Result<GgmlCpuTensor<'a>, RedimNetBackboneError> {
-        self.fetch(name, &[ne0, ne1])?;
+        let data = self.fetch(name, &[ne0, ne1])?;
         let handle = arena.new_tensor_2d_f32(ne0, ne1, "redimnet_weight")?;
         self.pending.push(Pending {
             handle,
-            data: PendingData::PackTensor(name.to_string()),
+            data: PendingData::Borrowed(data),
         });
         Ok(arena.graph_tensor(handle))
     }
@@ -170,11 +172,11 @@ impl<'p> WBuilder<'p> {
         ne1: usize,
         ne2: usize,
     ) -> Result<GgmlCpuTensor<'a>, RedimNetBackboneError> {
-        self.fetch(name, &[ne0, ne1, ne2])?;
+        let data = self.fetch(name, &[ne0, ne1, ne2])?;
         let handle = arena.new_tensor_3d_f32(ne0, ne1, ne2, "redimnet_weight")?;
         self.pending.push(Pending {
             handle,
-            data: PendingData::PackTensor(name.to_string()),
+            data: PendingData::Borrowed(data),
         });
         Ok(arena.graph_tensor(handle))
     }
@@ -188,11 +190,11 @@ impl<'p> WBuilder<'p> {
         ne2: usize,
         ne3: usize,
     ) -> Result<GgmlCpuTensor<'a>, RedimNetBackboneError> {
-        self.fetch(name, &[ne0, ne1, ne2, ne3])?;
+        let data = self.fetch(name, &[ne0, ne1, ne2, ne3])?;
         let handle = arena.new_tensor_4d_f32(ne0, ne1, ne2, ne3, "redimnet_weight")?;
         self.pending.push(Pending {
             handle,
-            data: PendingData::PackTensor(name.to_string()),
+            data: PendingData::Borrowed(data),
         });
         Ok(arena.graph_tensor(handle))
     }
@@ -207,7 +209,8 @@ impl<'p> WBuilder<'p> {
         arena: &GgmlStaticTensorArena,
         name: &str,
     ) -> Result<(GgmlCpuTensor<'a>, [usize; 4]), RedimNetBackboneError> {
-        let shape = self.shape(name)?;
+        let weights = self.weights;
+        let shape = weights.shape(name)?;
         if shape.len() != 4 {
             return Err(shape_err(format!(
                 "tensor '{name}' has rank {}, expected 4",
@@ -215,12 +218,12 @@ impl<'p> WBuilder<'p> {
             )));
         }
         let dims = [shape[0], shape[1], shape[2], shape[3]];
-        self.weights.get(name)?;
+        let data = weights.get(name)?;
         let handle =
             arena.new_tensor_4d_f32(dims[0], dims[1], dims[2], dims[3], "redimnet_weight")?;
         self.pending.push(Pending {
             handle,
-            data: PendingData::PackTensor(name.to_string()),
+            data: PendingData::Borrowed(data),
         });
         Ok((arena.graph_tensor(handle), dims))
     }
@@ -273,14 +276,44 @@ impl<'p> WBuilder<'p> {
 
     fn upload(&self, arena: &mut GgmlStaticTensorArena) -> Result<(), RedimNetBackboneError> {
         for p in &self.pending {
-            let data = match &p.data {
-                PendingData::PackTensor(name) => self.weights.get(name)?,
-                PendingData::Owned(data) => data,
-            };
-            arena.set_f32_slice(p.handle, data, "redimnet_weight")?;
+            arena.set_f32_slice(p.handle, p.data.as_slice(), "redimnet_weight")?;
         }
         Ok(())
     }
+
+    fn owned_upload_elements(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|pending| match &pending.data {
+                PendingData::Borrowed(_) => 0,
+                PendingData::Owned(data) => data.len(),
+            })
+            .sum()
+    }
+}
+
+/// Exact logical f32 payload which B6 derives on the host before arena upload.
+/// This intentionally excludes pack tensors (borrowed), ggml arena/graph
+/// buffers (quoted by the native backend), and small Rust container metadata.
+/// Keep the derivation structural so a topology change trips the assertion in
+/// [`load_weights`] instead of silently changing the transient footprint.
+fn expected_derived_upload_elements() -> usize {
+    let softmax =
+        ((1..=config::STAGES.len()).sum::<usize>() + config::FIN_WGHT1D_N) * config::AGG_CHANNELS;
+
+    let mut batchnorm = 0usize;
+    for stage in config::STAGES {
+        // Two BN modules per residual block, each materialized as scale+shift.
+        batchnorm += stage.num_blocks * 4 * stage.block_channels;
+        // Four depthwise TCM blocks, again scale+shift per BN.
+        batchnorm += 8 * stage.tcm_hidden;
+        if (stage.conv_exp - 1.0).abs() > 1e-6 {
+            batchnorm += 2 * stage.c_out_2d;
+        }
+    }
+    batchnorm += 2 * config::POOL_OUT_DIM;
+
+    softmax + batchnorm + 1 // ASTP epsilon scalar.
 }
 
 /// Weight handles for one `ResBasicBlock` (`ConvBlock2d`).
@@ -804,6 +837,12 @@ fn load_weights<'a>(
 
     let eps_1e7 = b.scalar(arena, 1e-7)?;
 
+    debug_assert_eq!(
+        b.owned_upload_elements(),
+        expected_derived_upload_elements(),
+        "redimnet derived-upload footprint oracle drifted from load topology"
+    );
+
     Ok(RedimNetBackboneWeights {
         stem_conv_w,
         stem_conv_b,
@@ -981,34 +1020,6 @@ pub(crate) fn arena_context_bytes() -> usize {
     GgmlCpuGraphConfig::metadata_context_bytes(1usize << 16)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct RedimNetRuntimeKey {
-    pack: PackContentKey,
-}
-
-thread_local! {
-    /// ggml runner/scheduler handles are thread-confined. Rayon workers are
-    /// persistent, so this is a bounded per-worker session pool rather than a
-    /// per-batch rebuild. Content ids make a same-path replacement miss.
-    static REDIMNET_RUNTIME_BY_KEY: RefCell<
-        BoundedRuntimeCache<RedimNetRuntimeKey, RedimNetResidentRuntime>
-    > = RefCell::new(BoundedRuntimeCache::new());
-}
-
-pub(crate) fn clear_current_thread_runtime_cache() {
-    REDIMNET_RUNTIME_BY_KEY.with(|cache| cache.borrow_mut().clear_for_idle_unload());
-}
-
-#[cfg(test)]
-pub(crate) fn current_thread_runtime_cache_len() -> usize {
-    REDIMNET_RUNTIME_BY_KEY.with(|cache| cache.borrow().len())
-}
-
-/// Each dedicated ReDim worker retains at most one uploaded weight arena.
-/// Thread-count changes or same-path pack replacement evict the previous
-/// entry instead of accumulating multiple ~50 MiB resident copies per worker.
-const REDIMNET_RUNTIME_CACHE_CAPACITY: usize = 1;
-
 /// The arena owns every pointer in `weights`. Declaration order is
 /// load-bearing: Rust drops fields top-to-bottom, so the handle tree goes away
 /// before its native tensor context and backend buffer.
@@ -1019,7 +1030,7 @@ struct RedimNetResidentWeights {
 
 /// One thread-confined resident runtime. `resident` drops before `runner`, so
 /// its arena cannot outlive the backend that allocated it.
-struct RedimNetResidentRuntime {
+pub(crate) struct RedimNetResidentRuntime {
     graph: Option<RedimNetPersistentGraph>,
     resident: RedimNetResidentWeights,
     runner: GgmlCpuGraphRunner,
@@ -1035,7 +1046,10 @@ struct RedimNetPersistentGraph {
 }
 
 impl RedimNetResidentRuntime {
-    fn new(weights: Arc<Weights>, n_threads: Option<usize>) -> Result<Self, RedimNetBackboneError> {
+    pub(crate) fn new(
+        weights: Arc<Weights>,
+        n_threads: Option<usize>,
+    ) -> Result<Self, RedimNetBackboneError> {
         #[cfg(test)]
         REDIMNET_RUNTIME_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let runner = GgmlCpuGraphRunner::new(runner_config_with_threads(n_threads))?;
@@ -1068,7 +1082,7 @@ impl RedimNetResidentRuntime {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         feats: &[f32],
         frames: usize,
@@ -1128,7 +1142,7 @@ pub(crate) fn resident_runtime_build_count() -> usize {
 /// remain outside the hot path.
 pub(crate) struct RedimNet2Model {
     weights: Arc<Weights>,
-    pack_key: PackContentKey,
+    pack_content_id: String,
 }
 
 impl RedimNet2Model {
@@ -1143,12 +1157,25 @@ impl RedimNet2Model {
     ) -> Result<Self, RedimNetBackboneError> {
         Ok(Self {
             weights: Arc::new(Weights::from_runtime_source(source)?),
-            pack_key: PackContentKey::for_runtime_source(source),
+            pack_content_id: source.content_id().to_string(),
         })
     }
 
     pub(crate) fn pack_content_id(&self) -> &str {
-        &self.pack_key.pack_content_id
+        &self.pack_content_id
+    }
+
+    pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, RedimNetBackboneError> {
+        self.weights
+            .persistent_host_commitment_bytes()
+            .map_err(RedimNetBackboneError::from)
+    }
+
+    pub(crate) fn quoted_persistent_host_commitment_bytes(
+        tensor_index: &crate::GgufTensorIndex,
+    ) -> Result<u64, RedimNetBackboneError> {
+        Weights::quoted_persistent_host_commitment_bytes(tensor_index)
+            .map_err(RedimNetBackboneError::from)
     }
 
     pub(crate) fn embedding_dim(&self) -> usize {
@@ -1159,55 +1186,8 @@ impl RedimNet2Model {
         self.weights.logical_f32_bytes()
     }
 
-    pub(crate) fn forward(
-        &self,
-        feats: &[f32],
-        frames: usize,
-    ) -> Result<Vec<f32>, RedimNetBackboneError> {
-        self.forward_with_threads(feats, frames, None)
-    }
-
-    pub(crate) fn forward_with_threads(
-        &self,
-        feats: &[f32],
-        frames: usize,
-        n_threads: Option<usize>,
-    ) -> Result<Vec<f32>, RedimNetBackboneError> {
-        if frames < config::TIME_STRIDE {
-            return Err(shape_err(format!(
-                "redimnet backbone needs at least {} frames (TIME_STRIDE) to produce any output, got {frames}",
-                config::TIME_STRIDE
-            )));
-        }
-        if feats.len() != frames * config::F {
-            return Err(shape_err(format!(
-                "redimnet backbone expected {} spec values for {frames} frames at {} mel bins, got {}",
-                frames * config::F,
-                config::F,
-                feats.len()
-            )));
-        }
-        let key = RedimNetRuntimeKey {
-            pack: self.pack_key.clone(),
-        };
-        let result = with_thread_local_cached_mut_by_key(
-            &REDIMNET_RUNTIME_BY_KEY,
-            key,
-            REDIMNET_RUNTIME_CACHE_CAPACITY,
-            || RedimNetResidentRuntime::new(Arc::clone(&self.weights), n_threads),
-            |runtime| runtime.forward(feats, frames, n_threads),
-        );
-        if result
-            .as_ref()
-            .is_err_and(RedimNetBackboneError::is_terminal_backend_failure)
-        {
-            // The runner/backend handle is terminal, not merely this graph.
-            // Evict it on the owning worker before returning; the failed
-            // request is never retried, while the next request builds a fresh
-            // backend under the same content key.
-            clear_current_thread_runtime_cache();
-        }
-        result
+    pub(crate) fn shared_weights(&self) -> Arc<Weights> {
+        Arc::clone(&self.weights)
     }
 
     #[cfg(test)]
@@ -1237,6 +1217,101 @@ impl RedimNet2Model {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    fn one_tensor_weights(name: &str, shape: &[usize], values: &[f32]) -> Weights {
+        let shape_json = serde_json::to_string(shape).expect("serialize shape");
+        let data_bytes = std::mem::size_of_val(values);
+        let header = format!(
+            "{{\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape_json},\"data_offsets\":[0,{data_bytes}]}}}}"
+        );
+        let mut bytes = Vec::with_capacity(8 + header.len() + data_bytes);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Weights::from_safetensors(&bytes).expect("parse synthetic weights")
+    }
+
+    fn tiny_static_arena() -> (GgmlCpuGraphRunner, GgmlStaticTensorArena) {
+        let runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default()).expect("runner");
+        let arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(16))
+            .expect("static arena");
+        (runner, arena)
+    }
+
+    #[test]
+    fn pack_tensor_pending_upload_borrows_the_retained_weight_buffer() {
+        let values = [1.25_f32, -2.5, 7.0];
+        let weights = one_tensor_weights("test.weight", &[values.len()], &values);
+        let retained = weights.get("test.weight").expect("retained tensor");
+        let retained_ptr = retained.as_ptr();
+        let (_runner, arena) = tiny_static_arena();
+        let mut builder = WBuilder::new(&weights);
+
+        builder
+            .tensor_1d(&arena, "test.weight", values.len())
+            .expect("declare borrowed tensor");
+
+        assert_eq!(builder.pending.len(), 1);
+        let PendingData::Borrowed(pending) = &builder.pending[0].data else {
+            panic!("pack tensor must not allocate an owned upload copy");
+        };
+        assert_eq!(pending.as_ptr(), retained_ptr);
+        assert_eq!(*pending, retained);
+
+        // Upload happens after every tensor has been declared. A successful
+        // late upload proves the source borrow remains live across that whole
+        // declaration phase; Rust then prevents `weights` from being dropped
+        // before `builder` at compile time.
+        let mut arena = arena;
+        builder.upload(&mut arena).expect("upload borrowed data");
+    }
+
+    #[test]
+    fn borrowed_pending_upload_propagates_length_errors_without_copying() {
+        let values = [3.0_f32];
+        let weights = one_tensor_weights("test.weight", &[values.len()], &values);
+        let retained_ptr = weights
+            .get("test.weight")
+            .expect("retained tensor")
+            .as_ptr();
+        let (_runner, arena) = tiny_static_arena();
+        let handle = arena
+            .new_tensor_1d_f32(2, "redimnet_weight")
+            .expect("declare mismatched destination");
+        let mut builder = WBuilder::new(&weights);
+        builder.pending.push(Pending {
+            handle,
+            data: PendingData::Borrowed(weights.get("test.weight").expect("retained tensor")),
+        });
+        let mut arena = arena;
+
+        let error = builder
+            .upload(&mut arena)
+            .expect_err("short borrowed input must fail closed");
+
+        assert!(matches!(
+            error,
+            RedimNetBackboneError::Ggml(GgmlCpuGraphError::InputByteSizeMismatch {
+                expected: 4,
+                actual: 8,
+                ..
+            })
+        ));
+        assert_eq!(builder.pending[0].data.as_slice().as_ptr(), retained_ptr);
+    }
+
+    #[test]
+    fn b6_derived_upload_payload_oracle_is_exact() {
+        assert_eq!(expected_derived_upload_elements(), 167_425);
+        assert_eq!(
+            expected_derived_upload_elements() * std::mem::size_of::<f32>(),
+            669_700
+        );
+    }
 
     /// Synthetic (no pack/arena needed) check of `to1d`'s `ne` derivation
     /// (risk #1): builds a tiny `ne=[T=2,F=3,C=2,N=1]` tensor with

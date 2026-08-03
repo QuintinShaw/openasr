@@ -1,13 +1,138 @@
+use std::ops::{Deref, DerefMut};
+
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuTensor, GgmlKvElementType,
 };
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote, SystemMemoryOwner,
+};
+
+fn host_kv_allocation_failure(detail: String) -> String {
+    crate::models::native_execution_services::record_current_execution_candidate_failure(
+        crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+            "decoder_host_state_allocate",
+            detail.clone(),
+        ),
+    );
+    detail
+}
+
+/// Validated logical and resident position spans for one Qwen-shaped causal
+/// decoder invocation.
+///
+/// The two numbers are intentionally carried as one typed value so a caller
+/// cannot accidentally size host history to the session reserve, or size a
+/// reusable device graph to the current chunk. `logical_positions` is the
+/// exact physical greedy-write span for this invocation: `P + G - 1` for a
+/// non-empty generation budget, because the final sampled token is returned
+/// rather than fed back into the decoder. The semantic `P + G` context limit is
+/// validated separately. `resident_positions` is the stable physical-write
+/// envelope shared by every legal chunk in the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Qwen3AsrKvCacheCapacity {
+    logical_positions: usize,
+    resident_positions: usize,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub(crate) enum Qwen3AsrKvCacheCapacityError {
+    #[error("causal decoder request carries no planned persistent state")]
+    DecoderStateNotPlanned,
+    #[error("causal decoder state axis '{state}' is invalid: {source}")]
+    InvalidStateAxis {
+        state: &'static str,
+        #[source]
+        source: crate::capacity::topology::TopologyError,
+    },
+    #[error("causal decoder logical KV span must be positive")]
+    ZeroLogicalPositions,
+    #[error(
+        "causal decoder resident KV span {resident_positions} does not cover logical span {logical_positions}"
+    )]
+    ResidentDoesNotCoverLogical {
+        logical_positions: usize,
+        resident_positions: usize,
+    },
+    #[error(
+        "causal decoder runtime measured {measured_positions} KV positions, but the planner proved {planned_positions}"
+    )]
+    LogicalPositionMismatch {
+        planned_positions: usize,
+        measured_positions: usize,
+    },
+}
+
+impl Qwen3AsrKvCacheCapacity {
+    pub(crate) fn from_decoder_state(
+        state: &crate::models::ggml_asr_executor::GgmlAsrDecoderState,
+        state_id: &'static str,
+    ) -> Result<Self, Qwen3AsrKvCacheCapacityError> {
+        let crate::models::ggml_asr_executor::GgmlAsrDecoderState::Planned(plan) = state else {
+            return Err(Qwen3AsrKvCacheCapacityError::DecoderStateNotPlanned);
+        };
+        let axis = plan
+            .position_axis(
+                state_id,
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+            )
+            .map_err(|source| Qwen3AsrKvCacheCapacityError::InvalidStateAxis {
+                state: state_id,
+                source,
+            })?;
+        Self::new(axis.logical_positions, axis.resident_positions)
+    }
+
+    pub(crate) fn new(
+        logical_positions: usize,
+        resident_positions: usize,
+    ) -> Result<Self, Qwen3AsrKvCacheCapacityError> {
+        if logical_positions == 0 {
+            return Err(Qwen3AsrKvCacheCapacityError::ZeroLogicalPositions);
+        }
+        if resident_positions < logical_positions {
+            return Err(Qwen3AsrKvCacheCapacityError::ResidentDoesNotCoverLogical {
+                logical_positions,
+                resident_positions,
+            });
+        }
+        Ok(Self {
+            logical_positions,
+            resident_positions,
+        })
+    }
+
+    pub(crate) const fn logical_positions(self) -> usize {
+        self.logical_positions
+    }
+
+    pub(crate) const fn resident_positions(self) -> usize {
+        self.resident_positions
+    }
+
+    /// Cross-check the planner against the real prompt and generation budget
+    /// materialized by the executor. The planner is never allowed to silently
+    /// replace runtime semantics, and the runtime is never allowed to fall
+    /// back to a historical constant when the two drift.
+    pub(crate) fn validate_measured_logical_positions(
+        self,
+        measured_positions: usize,
+    ) -> Result<Self, Qwen3AsrKvCacheCapacityError> {
+        if measured_positions != self.logical_positions {
+            return Err(Qwen3AsrKvCacheCapacityError::LogicalPositionMismatch {
+                planned_positions: self.logical_positions,
+                measured_positions,
+            });
+        }
+        Ok(self)
+    }
+}
 
 /// Per-layer host KV cache shared by every Qwen-shaped decoder family.
 ///
 /// Default storage is f32 (byte-identical to the historical path). Opt-in
 /// `q8_0` stores native ggml q8_0 rows so host and resident paths share the
 /// same packed layout without a full f32 staging buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Qwen3AsrLayerKvCacheState {
     max_positions: usize,
     kv_heads: usize,
@@ -18,7 +143,7 @@ pub(crate) struct Qwen3AsrLayerKvCacheState {
     written_positions: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum HostKvStorage {
     F32(Vec<f32>),
     Q8(Vec<u8>),
@@ -80,6 +205,328 @@ pub(crate) struct Qwen3AsrLayerKvCacheHistory<'a> {
     pub values_q8: Option<&'a [u8]>,
 }
 
+/// Whether one Qwen-shaped execution route owns a Rust host KV payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen3AsrHostKvMode {
+    /// CPU/growing-graph and serve-batch refill paths read and update host KV.
+    Materialized,
+    /// Single-sequence persistent graph reuse keeps K/V entirely resident.
+    ResidentOnly,
+}
+
+/// One transactionally-admitted host-KV owner for every layer of a
+/// Qwen-shaped decoder invocation.
+///
+/// A single owner/lease covers the complete batch of K/V Vec allocations; no
+/// layer can commit independently and leave a partially-accounted decoder.
+#[derive(Debug)]
+pub(crate) struct Qwen3AsrHostKvCacheOwner(SystemMemoryOwner<Vec<Qwen3AsrLayerKvCacheState>>);
+
+impl Qwen3AsrHostKvCacheOwner {
+    pub(crate) const fn empty() -> Self {
+        Self(SystemMemoryOwner::without_allocation(Vec::new()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        resource_id: &'static str,
+        layer_count: usize,
+        capacity: Qwen3AsrKvCacheCapacity,
+        kv_heads: usize,
+        head_dim: usize,
+        element_type: GgmlKvElementType,
+        mode: Qwen3AsrHostKvMode,
+    ) -> Result<Self, String> {
+        Self::try_new_with_ownership(
+            resource_id,
+            layer_count,
+            capacity,
+            kv_heads,
+            head_dim,
+            element_type,
+            mode,
+            HostKvLeaseOwnership::Standalone,
+        )
+    }
+
+    /// Builds materialized host KV inside an already-provisional parent
+    /// [`SystemMemoryOwner`] transaction. The returned value owns the buffers
+    /// but deliberately has no nested lease; the parent outcome must measure
+    /// [`Self::retained_system_memory_bytes`] and bind the one candidate lease
+    /// to the aggregate runtime + every session arena.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_inside_parent_transaction(
+        resource_id: &'static str,
+        layer_count: usize,
+        capacity: Qwen3AsrKvCacheCapacity,
+        kv_heads: usize,
+        head_dim: usize,
+        element_type: GgmlKvElementType,
+        mode: Qwen3AsrHostKvMode,
+    ) -> Result<Self, String> {
+        Self::try_new_with_ownership(
+            resource_id,
+            layer_count,
+            capacity,
+            kv_heads,
+            head_dim,
+            element_type,
+            mode,
+            HostKvLeaseOwnership::ParentTransaction,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_with_ownership(
+        resource_id: &'static str,
+        layer_count: usize,
+        capacity: Qwen3AsrKvCacheCapacity,
+        kv_heads: usize,
+        head_dim: usize,
+        element_type: GgmlKvElementType,
+        mode: Qwen3AsrHostKvMode,
+        ownership: HostKvLeaseOwnership,
+    ) -> Result<Self, String> {
+        let logical_positions = capacity.logical_positions();
+        match mode {
+            Qwen3AsrHostKvMode::ResidentOnly => {
+                let layers = build_empty_layers(
+                    layer_count,
+                    logical_positions,
+                    kv_heads,
+                    head_dim,
+                    element_type,
+                )?;
+                Ok(Self(SystemMemoryOwner::without_allocation(layers)))
+            }
+            Qwen3AsrHostKvMode::Materialized => {
+                let quoted_bytes = qwen_host_kv_quoted_bytes(
+                    layer_count,
+                    logical_positions,
+                    kv_heads,
+                    head_dim,
+                    element_type,
+                )?;
+                let allocate_layers =
+                    || -> Result<(Vec<Qwen3AsrLayerKvCacheState>, u64), String> {
+                        let mut layers = build_empty_layers(
+                            layer_count,
+                            logical_positions,
+                            kv_heads,
+                            head_dim,
+                            element_type,
+                        )?;
+                        for layer in &mut layers {
+                            layer.materialize_storage_for_owner()?;
+                        }
+                        let actual_bytes =
+                            qwen_host_kv_actual_capacity_bytes(&layers, layers.capacity())?;
+                        Ok((layers, actual_bytes))
+                    };
+                match ownership {
+                    HostKvLeaseOwnership::Standalone => {
+                        let quote = SystemMemoryAllocationQuote::new(
+                            resource_id,
+                            quoted_bytes,
+                            quoted_bytes,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let owner = SystemMemoryOwner::try_allocate(quote, || {
+                            let (layers, actual_bytes) = allocate_layers()?;
+                            Ok(SystemMemoryAllocationOutcome::new(
+                                layers,
+                                actual_bytes,
+                                actual_bytes,
+                            ))
+                        })
+                        .map_err(|error| error.to_string())?;
+                        Ok(Self(owner))
+                    }
+                    HostKvLeaseOwnership::ParentTransaction => {
+                        let (layers, _actual_bytes) = allocate_layers()?;
+                        Ok(Self(SystemMemoryOwner::without_allocation(layers)))
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Reconciled by aggregate owners such as Hy-MT2.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        qwen_host_kv_actual_capacity_bytes(&self.0, self.0.capacity())
+    }
+
+    /// Allocate a second admitted owner and copy one written prefix from an
+    /// existing owner. The source remains charged while the destination is
+    /// pending/committed, so the broker accounts for the real fork peak.
+    #[cfg(test)]
+    pub(crate) fn try_fork_prefix(
+        resource_id: &'static str,
+        source: &Self,
+        written_positions: usize,
+        max_positions: usize,
+    ) -> Result<Self, String> {
+        let first = source
+            .first()
+            .ok_or_else(|| "qwen-shaped host KV fork requires at least one layer".to_string())?;
+        if source.iter().any(|layer| {
+            layer.kv_heads != first.kv_heads
+                || layer.head_dim != first.head_dim
+                || layer.element_type != first.element_type
+                || layer.written_positions < written_positions
+        }) {
+            return Err("qwen-shaped host KV fork source geometry/prefix mismatch".to_string());
+        }
+        if max_positions == 0 {
+            return Err("qwen-shaped host KV fork max_positions must be positive".to_string());
+        }
+        let quoted_bytes = qwen_host_kv_quoted_bytes(
+            source.len(),
+            max_positions,
+            first.kv_heads,
+            first.head_dim,
+            first.element_type,
+        )?;
+        let quote = SystemMemoryAllocationQuote::new(resource_id, quoted_bytes, quoted_bytes)
+            .map_err(|error| error.to_string())?;
+        let owner = SystemMemoryOwner::try_allocate(quote, || {
+            let mut layers = Vec::new();
+            layers.try_reserve_exact(source.len()).map_err(|error| {
+                host_kv_allocation_failure(format!(
+                    "qwen-shaped host KV fork layer table allocation failed: {error}"
+                ))
+            })?;
+            for layer in source.iter() {
+                layers.push(layer.fork_prefix_for_owner(written_positions, max_positions)?);
+            }
+            let actual_bytes = qwen_host_kv_actual_capacity_bytes(&layers, layers.capacity())?;
+            Ok(SystemMemoryAllocationOutcome::new(
+                layers,
+                actual_bytes,
+                actual_bytes,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(Self(owner))
+    }
+
+    /// Copy a written prefix between two already-admitted, materialized owners
+    /// without allocating. Long-lived session scratch can therefore reuse its
+    /// stable envelope while a separate prefix-cache owner remains intact.
+    pub(crate) fn replace_prefix_from(
+        &mut self,
+        source: &Self,
+        written_positions: usize,
+    ) -> Result<(), String> {
+        if self.len() != source.len() || self.is_empty() {
+            return Err(format!(
+                "qwen-shaped host KV prefix copy layer mismatch: destination={} source={}",
+                self.len(),
+                source.len()
+            ));
+        }
+        for (destination, source) in self.iter().zip(source.iter()) {
+            destination.validate_prefix_copy_from(source, written_positions)?;
+        }
+        for (destination, source) in self.iter_mut().zip(source.iter()) {
+            destination.copy_prefix_from_for_owner(source, written_positions)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_materialized_payload(&self) -> bool {
+        self.iter()
+            .all(Qwen3AsrLayerKvCacheState::has_materialized_storage)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostKvLeaseOwnership {
+    Standalone,
+    ParentTransaction,
+}
+
+impl Deref for Qwen3AsrHostKvCacheOwner {
+    type Target = Vec<Qwen3AsrLayerKvCacheState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Qwen3AsrHostKvCacheOwner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+fn build_empty_layers(
+    layer_count: usize,
+    max_positions: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    element_type: GgmlKvElementType,
+) -> Result<Vec<Qwen3AsrLayerKvCacheState>, String> {
+    let mut layers = Vec::new();
+    layers.try_reserve_exact(layer_count).map_err(|error| {
+        host_kv_allocation_failure(format!(
+            "qwen-shaped host KV layer table allocation failed for {layer_count} layers: {error}"
+        ))
+    })?;
+    for _ in 0..layer_count {
+        layers.push(Qwen3AsrLayerKvCacheState::new_with_element_type(
+            max_positions,
+            kv_heads,
+            head_dim,
+            element_type,
+        )?);
+    }
+    Ok(layers)
+}
+
+pub(crate) fn qwen_host_kv_quoted_bytes(
+    layer_count: usize,
+    max_positions: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    element_type: GgmlKvElementType,
+) -> Result<u64, String> {
+    let row_bytes = element_type.row_nbytes(head_dim)?;
+    let payload = layer_count
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(max_positions))
+        .and_then(|value| value.checked_mul(kv_heads))
+        .and_then(|value| value.checked_mul(row_bytes))
+        .ok_or_else(|| "qwen-shaped host KV quoted payload bytes overflowed".to_string())?;
+    let table = layer_count
+        .checked_mul(std::mem::size_of::<Qwen3AsrLayerKvCacheState>())
+        .ok_or_else(|| "qwen-shaped host KV layer table bytes overflowed".to_string())?;
+    u64::try_from(
+        payload
+            .checked_add(table)
+            .ok_or_else(|| "qwen-shaped host KV quoted total bytes overflowed".to_string())?,
+    )
+    .map_err(|_| "qwen-shaped host KV quoted bytes exceed u64".to_string())
+}
+
+fn qwen_host_kv_actual_capacity_bytes(
+    layers: &[Qwen3AsrLayerKvCacheState],
+    layer_table_capacity: usize,
+) -> Result<u64, String> {
+    let table = layer_table_capacity
+        .checked_mul(std::mem::size_of::<Qwen3AsrLayerKvCacheState>())
+        .ok_or_else(|| "qwen-shaped host KV actual layer table bytes overflowed".to_string())?;
+    let mut bytes = u64::try_from(table)
+        .map_err(|_| "qwen-shaped host KV actual table bytes exceed u64".to_string())?;
+    for layer in layers {
+        bytes = bytes
+            .checked_add(layer.storage_capacity_bytes()?)
+            .ok_or_else(|| "qwen-shaped host KV actual capacity bytes overflowed".to_string())?;
+    }
+    Ok(bytes)
+}
+
 impl Qwen3AsrLayerKvCacheState {
     /// Host-F32 convenience constructor for tests and F32-pinned harnesses.
     /// Production whole-decoder paths use [`Self::new_with_element_type`] with
@@ -116,6 +563,38 @@ impl Qwen3AsrLayerKvCacheState {
 
     pub(crate) fn element_type(&self) -> GgmlKvElementType {
         self.element_type
+    }
+
+    fn materialize_storage_for_owner(&mut self) -> Result<(), String> {
+        if self.keys.is_empty() {
+            self.keys = self.allocate_storage()?;
+        }
+        if self.values.is_empty() {
+            self.values = self.allocate_storage()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn has_materialized_storage(&self) -> bool {
+        !self.keys.is_empty() && !self.values.is_empty()
+    }
+
+    fn storage_capacity_bytes(&self) -> Result<u64, String> {
+        fn bytes(storage: &HostKvStorage) -> Result<u64, String> {
+            let bytes = match storage {
+                HostKvStorage::F32(values) => {
+                    values.capacity().checked_mul(std::mem::size_of::<f32>())
+                }
+                HostKvStorage::Q8(values) => Some(values.capacity()),
+            }
+            .ok_or_else(|| "qwen-shaped host KV Vec capacity bytes overflowed".to_string())?;
+            u64::try_from(bytes)
+                .map_err(|_| "qwen-shaped host KV Vec capacity exceeds u64".to_string())
+        }
+        bytes(&self.keys)?
+            .checked_add(bytes(&self.values)?)
+            .ok_or_else(|| "qwen-shaped host KV K/V capacity sum overflowed".to_string())
     }
 
     pub(crate) fn write(
@@ -392,7 +871,23 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn fork_prefix(
+        &self,
+        written_positions: usize,
+        max_positions: usize,
+    ) -> Result<Self, String> {
+        if crate::models::native_execution_services::current_native_execution_scope_id().is_some() {
+            return Err(host_kv_allocation_failure(
+                "qwen-shaped host KV fork attempted without an admitted owner transaction"
+                    .to_string(),
+            ));
+        }
+        self.fork_prefix_for_owner(written_positions, max_positions)
+    }
+
+    #[cfg(test)]
+    fn fork_prefix_for_owner(
         &self,
         written_positions: usize,
         max_positions: usize,
@@ -415,6 +910,10 @@ impl Qwen3AsrLayerKvCacheState {
             self.head_dim,
             self.element_type,
         )?;
+        // An owner fork is a materialized host cache even when the copied
+        // prefix is empty. Otherwise its first production write would need an
+        // unadmitted lazy allocation after this transaction committed.
+        forked.materialize_storage_for_owner()?;
         if written_positions == 0 {
             return Ok(forked);
         }
@@ -434,31 +933,32 @@ impl Qwen3AsrLayerKvCacheState {
                         values.len()
                     ));
                 }
-                let new_len = max_positions
-                    .checked_mul(width)
-                    .ok_or_else(|| "qwen3-asr kv-cache fork new length overflowed".to_string())?;
-                let mut new_keys = vec![0.0; new_len];
-                let mut new_values = vec![0.0; new_len];
+                let new_keys = match &mut forked.keys {
+                    HostKvStorage::F32(values) => values,
+                    HostKvStorage::Q8(_) => unreachable!("f32 fork allocated q8 storage"),
+                };
                 Self::copy_history_prefix_to_span_f32(
                     keys,
-                    &mut new_keys,
+                    new_keys,
                     self.max_positions,
                     max_positions,
                     self.kv_heads,
                     self.head_dim,
                     written_positions,
                 )?;
+                let new_values = match &mut forked.values {
+                    HostKvStorage::F32(values) => values,
+                    HostKvStorage::Q8(_) => unreachable!("f32 fork allocated q8 storage"),
+                };
                 Self::copy_history_prefix_to_span_f32(
                     values,
-                    &mut new_values,
+                    new_values,
                     self.max_positions,
                     max_positions,
                     self.kv_heads,
                     self.head_dim,
                     written_positions,
                 )?;
-                forked.keys = HostKvStorage::F32(new_keys);
-                forked.values = HostKvStorage::F32(new_values);
             }
             GgmlKvElementType::Q8_0 => {
                 let row_nbytes = self.element_type.row_nbytes(self.head_dim)?;
@@ -478,34 +978,32 @@ impl Qwen3AsrLayerKvCacheState {
                         values.len()
                     ));
                 }
-                let new_len = max_positions
-                    .checked_mul(self.kv_heads)
-                    .and_then(|n| n.checked_mul(row_nbytes))
-                    .ok_or_else(|| {
-                        "qwen3-asr kv-cache fork new q8 length overflowed".to_string()
-                    })?;
-                let mut new_keys = vec![0_u8; new_len];
-                let mut new_values = vec![0_u8; new_len];
+                let new_keys = match &mut forked.keys {
+                    HostKvStorage::Q8(values) => values,
+                    HostKvStorage::F32(_) => unreachable!("q8 fork allocated f32 storage"),
+                };
                 Self::copy_history_prefix_to_span_bytes(
                     keys,
-                    &mut new_keys,
+                    new_keys,
                     self.max_positions,
                     max_positions,
                     self.kv_heads,
                     row_nbytes,
                     written_positions,
                 )?;
+                let new_values = match &mut forked.values {
+                    HostKvStorage::Q8(values) => values,
+                    HostKvStorage::F32(_) => unreachable!("q8 fork allocated f32 storage"),
+                };
                 Self::copy_history_prefix_to_span_bytes(
                     values,
-                    &mut new_values,
+                    new_values,
                     self.max_positions,
                     max_positions,
                     self.kv_heads,
                     row_nbytes,
                     written_positions,
                 )?;
-                forked.keys = HostKvStorage::Q8(new_keys);
-                forked.values = HostKvStorage::Q8(new_values);
             }
             GgmlKvElementType::F16 => unreachable!("host KV rejects f16"),
         }
@@ -513,6 +1011,148 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(forked)
     }
 
+    fn validate_prefix_copy_from(
+        &self,
+        source: &Self,
+        written_positions: usize,
+    ) -> Result<(), String> {
+        if self.kv_heads != source.kv_heads
+            || self.head_dim != source.head_dim
+            || self.element_type != source.element_type
+        {
+            return Err("qwen-shaped host KV prefix copy geometry mismatch".to_string());
+        }
+        if written_positions > source.written_positions || written_positions > self.max_positions {
+            return Err(format!(
+                "qwen-shaped host KV prefix copy span {written_positions} exceeds source written={} or destination max={}",
+                source.written_positions, self.max_positions
+            ));
+        }
+        let source_expected = source.storage_len()?;
+        let destination_expected = self.storage_len()?;
+        match (&self.keys, &self.values, &source.keys, &source.values) {
+            (
+                HostKvStorage::F32(destination_keys),
+                HostKvStorage::F32(destination_values),
+                HostKvStorage::F32(source_keys),
+                HostKvStorage::F32(source_values),
+            ) if destination_keys.len() == destination_expected
+                && destination_values.len() == destination_expected
+                && source_keys.len() == source_expected
+                && source_values.len() == source_expected => {}
+            (
+                HostKvStorage::Q8(destination_keys),
+                HostKvStorage::Q8(destination_values),
+                HostKvStorage::Q8(source_keys),
+                HostKvStorage::Q8(source_values),
+            ) if destination_keys.len() == destination_expected
+                && destination_values.len() == destination_expected
+                && source_keys.len() == source_expected
+                && source_values.len() == source_expected => {}
+            _ => {
+                return Err(
+                    "qwen-shaped host KV prefix copy requires fully materialized matching storage"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_prefix_from_for_owner(
+        &mut self,
+        source: &Self,
+        written_positions: usize,
+    ) -> Result<(), String> {
+        self.validate_prefix_copy_from(source, written_positions)?;
+        match self.element_type {
+            GgmlKvElementType::F32 => {
+                let source_keys = source.keys.f32_slice()?;
+                let source_values = source.values.f32_slice()?;
+                let destination_keys = match &mut self.keys {
+                    HostKvStorage::F32(values) => values,
+                    HostKvStorage::Q8(_) => unreachable!("validated f32 destination became q8"),
+                };
+                Self::copy_history_prefix_to_span_f32(
+                    source_keys,
+                    destination_keys,
+                    source.max_positions,
+                    self.max_positions,
+                    self.kv_heads,
+                    self.head_dim,
+                    written_positions,
+                )?;
+                let destination_values = match &mut self.values {
+                    HostKvStorage::F32(values) => values,
+                    HostKvStorage::Q8(_) => unreachable!("validated f32 destination became q8"),
+                };
+                Self::copy_history_prefix_to_span_f32(
+                    source_values,
+                    destination_values,
+                    source.max_positions,
+                    self.max_positions,
+                    self.kv_heads,
+                    self.head_dim,
+                    written_positions,
+                )?;
+            }
+            GgmlKvElementType::Q8_0 => {
+                let row_nbytes = self.element_type.row_nbytes(self.head_dim)?;
+                let source_keys = source.keys.q8_slice()?;
+                let source_values = source.values.q8_slice()?;
+                let destination_keys = match &mut self.keys {
+                    HostKvStorage::Q8(values) => values,
+                    HostKvStorage::F32(_) => unreachable!("validated q8 destination became f32"),
+                };
+                Self::copy_history_prefix_to_span_bytes(
+                    source_keys,
+                    destination_keys,
+                    source.max_positions,
+                    self.max_positions,
+                    self.kv_heads,
+                    row_nbytes,
+                    written_positions,
+                )?;
+                let destination_values = match &mut self.values {
+                    HostKvStorage::Q8(values) => values,
+                    HostKvStorage::F32(_) => unreachable!("validated q8 destination became f32"),
+                };
+                Self::copy_history_prefix_to_span_bytes(
+                    source_values,
+                    destination_values,
+                    source.max_positions,
+                    self.max_positions,
+                    self.kv_heads,
+                    row_nbytes,
+                    written_positions,
+                )?;
+            }
+            GgmlKvElementType::F16 => unreachable!("host KV rejects f16"),
+        }
+        self.written_positions = written_positions;
+        Ok(())
+    }
+
+    fn storage_len(&self) -> Result<usize, String> {
+        match self.element_type {
+            GgmlKvElementType::F32 => self
+                .max_positions
+                .checked_mul(self.key_width())
+                .ok_or_else(|| "qwen-shaped host KV f32 storage length overflowed".to_string()),
+            GgmlKvElementType::Q8_0 => {
+                let row_bytes = self.element_type.row_nbytes(self.head_dim)?;
+                self.max_positions
+                    .checked_mul(self.kv_heads)
+                    .and_then(|positions| positions.checked_mul(row_bytes))
+                    .ok_or_else(|| "qwen-shaped host KV q8 storage length overflowed".to_string())
+            }
+            GgmlKvElementType::F16 => {
+                Err("host KV storage length does not support f16".to_string())
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn resize_max_positions(&mut self, new_max_positions: usize) -> Result<(), String> {
         if new_max_positions == self.max_positions {
             return Ok(());
@@ -526,6 +1166,12 @@ impl Qwen3AsrLayerKvCacheState {
         if self.keys.is_empty() && self.values.is_empty() {
             self.max_positions = new_max_positions;
             return Ok(());
+        }
+        if crate::models::native_execution_services::current_native_execution_scope_id().is_some() {
+            return Err(host_kv_allocation_failure(
+                "qwen-shaped host KV resize attempted without an admitted owner replacement"
+                    .to_string(),
+            ));
         }
 
         match self.element_type {
@@ -710,6 +1356,15 @@ impl Qwen3AsrLayerKvCacheState {
                 self.value_width()
             ));
         }
+        if (self.keys.is_empty() || self.values.is_empty())
+            && crate::models::native_execution_services::current_native_execution_scope_id()
+                .is_some()
+        {
+            return Err(host_kv_allocation_failure(
+                "qwen-shaped host KV attempted lazy allocation inside a native execution scope; construct an admitted Qwen3AsrHostKvCacheOwner first"
+                    .to_string(),
+            ));
+        }
         if self.keys.is_empty() {
             self.keys = self.allocate_storage()?;
         }
@@ -726,7 +1381,14 @@ impl Qwen3AsrLayerKvCacheState {
                     .max_positions
                     .checked_mul(self.key_width())
                     .ok_or_else(|| "qwen3-asr kv-cache f32 allocation overflowed".to_string())?;
-                Ok(HostKvStorage::F32(vec![0.0; len]))
+                let mut values = Vec::new();
+                values.try_reserve_exact(len).map_err(|error| {
+                    host_kv_allocation_failure(format!(
+                        "qwen3-asr host KV f32 allocation failed for {len} elements: {error}"
+                    ))
+                })?;
+                values.resize(len, 0.0);
+                Ok(HostKvStorage::F32(values))
             }
             GgmlKvElementType::Q8_0 => {
                 let row_nbytes = self.element_type.row_nbytes(self.head_dim)?;
@@ -735,7 +1397,14 @@ impl Qwen3AsrLayerKvCacheState {
                     .checked_mul(self.kv_heads)
                     .and_then(|n| n.checked_mul(row_nbytes))
                     .ok_or_else(|| "qwen3-asr kv-cache q8 allocation overflowed".to_string())?;
-                Ok(HostKvStorage::Q8(vec![0_u8; len]))
+                let mut values = Vec::new();
+                values.try_reserve_exact(len).map_err(|error| {
+                    host_kv_allocation_failure(format!(
+                        "qwen3-asr host KV q8 allocation failed for {len} bytes: {error}"
+                    ))
+                })?;
+                values.resize(len, 0_u8);
+                Ok(HostKvStorage::Q8(values))
             }
             GgmlKvElementType::F16 => Err("host KV rejects f16 storage".to_string()),
         }
@@ -970,6 +1639,227 @@ impl Qwen3AsrLayerKvCacheState {
 mod tests {
     use super::*;
     use crate::ggml_runtime::dequantize_q8_0_rows;
+
+    #[test]
+    fn resident_only_owner_has_no_host_payload_or_system_memory_charge() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let capacity = Qwen3AsrKvCacheCapacity::new(4, 8).unwrap();
+        let owner = Qwen3AsrHostKvCacheOwner::try_new(
+            "test.qwen.resident-only",
+            2,
+            capacity,
+            2,
+            32,
+            GgmlKvElementType::F32,
+            Qwen3AsrHostKvMode::ResidentOnly,
+        )
+        .unwrap();
+        assert!(!owner.has_materialized_payload());
+        assert_eq!(
+            services
+                .memory_broker()
+                .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+                .committed_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn materialized_owner_commits_actual_vec_capacities_until_drop() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let capacity = Qwen3AsrKvCacheCapacity::new(4, 8).unwrap();
+        let owner = Qwen3AsrHostKvCacheOwner::try_new(
+            "test.qwen.materialized",
+            2,
+            capacity,
+            2,
+            32,
+            GgmlKvElementType::F32,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .unwrap();
+        assert!(owner.has_materialized_payload());
+        let actual = qwen_host_kv_actual_capacity_bytes(&owner, owner.capacity()).unwrap();
+        assert_eq!(
+            services
+                .memory_broker()
+                .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+                .committed_bytes,
+            actual
+        );
+        drop(owner);
+        assert_eq!(
+            services
+                .memory_broker()
+                .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+                .committed_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn admitted_owner_fork_accounts_for_overlap_and_preserves_prefix() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let capacity = Qwen3AsrKvCacheCapacity::new(4, 4).unwrap();
+        let mut source = Qwen3AsrHostKvCacheOwner::try_new(
+            "test.qwen.fork-source",
+            1,
+            capacity,
+            2,
+            2,
+            GgmlKvElementType::F32,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .unwrap();
+        source[0]
+            .write(0, &[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])
+            .unwrap();
+        source[0]
+            .write(1, &[5.0, 6.0, 7.0, 8.0], &[50.0, 60.0, 70.0, 80.0])
+            .unwrap();
+        let source_bytes = qwen_host_kv_actual_capacity_bytes(&source, source.capacity()).unwrap();
+
+        let fork =
+            Qwen3AsrHostKvCacheOwner::try_fork_prefix("test.qwen.fork-destination", &source, 2, 6)
+                .unwrap();
+        let fork_bytes = qwen_host_kv_actual_capacity_bytes(&fork, fork.capacity()).unwrap();
+        assert_eq!(
+            services
+                .memory_broker()
+                .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+                .committed_bytes,
+            source_bytes + fork_bytes
+        );
+        let history = fork[0].full_history_storage().unwrap();
+        assert_eq!(history.written_positions, 2);
+        assert_eq!(
+            history.keys_f32.unwrap(),
+            &[
+                1.0, 2.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 7.0, 8.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]
+        );
+
+        drop(fork);
+        assert_eq!(
+            services
+                .memory_broker()
+                .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+                .committed_bytes,
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn admitted_owner_reuses_destination_capacity_for_prefix_copy() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let mut source = Qwen3AsrHostKvCacheOwner::try_new(
+            "test.qwen.copy-source",
+            1,
+            Qwen3AsrKvCacheCapacity::new(4, 4).unwrap(),
+            1,
+            2,
+            GgmlKvElementType::F32,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .unwrap();
+        source[0].write(0, &[1.0, 2.0], &[10.0, 20.0]).unwrap();
+        source[0].write(1, &[3.0, 4.0], &[30.0, 40.0]).unwrap();
+        let mut destination = Qwen3AsrHostKvCacheOwner::try_new(
+            "test.qwen.copy-destination",
+            1,
+            Qwen3AsrKvCacheCapacity::new(6, 6).unwrap(),
+            1,
+            2,
+            GgmlKvElementType::F32,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .unwrap();
+        let committed_before = services
+            .memory_broker()
+            .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+            .committed_bytes;
+
+        destination.replace_prefix_from(&source, 2).unwrap();
+
+        assert_eq!(
+            services
+                .memory_broker()
+                .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+                .committed_bytes,
+            committed_before
+        );
+        let history = destination[0].full_history_storage().unwrap();
+        assert_eq!(history.written_positions, 2);
+        assert_eq!(
+            history.keys_f32.unwrap(),
+            &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn production_scope_rejects_unadmitted_lazy_host_kv_allocation() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let mut cache = Qwen3AsrLayerKvCacheState::new(2, 1, 32);
+        let row = vec![0.0_f32; 32];
+        let error = cache.write(0, &row, &row).unwrap_err();
+        assert!(error.contains("admitted Qwen3AsrHostKvCacheOwner"));
+    }
+
+    #[test]
+    fn planned_capacity_keeps_logical_and_resident_spans_distinct() {
+        let capacity = Qwen3AsrKvCacheCapacity::new(1_290, 2_367).expect("capacity");
+        assert_eq!(capacity.logical_positions(), 1_290);
+        assert_eq!(capacity.resident_positions(), 2_367);
+        assert_eq!(
+            capacity
+                .validate_measured_logical_positions(1_289)
+                .expect_err("runtime/planner drift must fail closed"),
+            Qwen3AsrKvCacheCapacityError::LogicalPositionMismatch {
+                planned_positions: 1_290,
+                measured_positions: 1_289,
+            }
+        );
+    }
+
+    #[test]
+    fn planned_capacity_rejects_resident_span_below_logical_span() {
+        assert_eq!(
+            Qwen3AsrKvCacheCapacity::new(2_367, 1_290)
+                .expect_err("reserve below logical must fail"),
+            Qwen3AsrKvCacheCapacityError::ResidentDoesNotCoverLogical {
+                logical_positions: 2_367,
+                resident_positions: 1_290,
+            }
+        );
+    }
+
+    #[test]
+    fn planned_capacity_requires_request_plan() {
+        assert_eq!(
+            Qwen3AsrKvCacheCapacity::from_decoder_state(
+                &crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
+                crate::models::qwen::capacity::QWEN3_SELF_KV_STATE_ID,
+            )
+            .expect_err("causal runtime must not invent a fallback capacity"),
+            Qwen3AsrKvCacheCapacityError::DecoderStateNotPlanned,
+        );
+    }
 
     #[test]
     fn host_kv_cache_tracks_written_prefix() {

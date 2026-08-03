@@ -11,8 +11,6 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -22,6 +20,10 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FUNASR_NANO_DECODE_POLICY_ID;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
@@ -33,20 +35,22 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, Qwen3AsrPromptEmbeddings,
-    build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
+    Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
 };
+use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::sensevoice::encoder_graph::build_sensevoice_encoder_input;
 use crate::models::sensevoice::frontend::{SenseVoiceFbankFrontend, apply_lfr};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
 };
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey, current_unload_generation,
-    take_generation_tagged, with_thread_local_cached_mut_by_key,
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 
 use super::adapter_graph::FunasrNanoAdapterGraph;
@@ -66,54 +70,63 @@ const FUNASR_NANO_STREAMING_EXECUTOR_ID: &str = "funasr-nano-ggml-snapshot-strea
 /// it). The executor fails closed rather than silently running an OOD
 /// multi-minute prefill; longer audio is the shared longform slicing
 /// orchestrator's job (see the `ConservativeSeq2SeqV1` longform profile).
-/// Also the single-decode clamp host-memory admission reads
-/// ([`super::capacity::FUNASR_NANO_ADMISSION_SINGLE_DECODE_WINDOW_SECONDS`]).
 pub(crate) const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
 /// Fail-closed backstop against a non-terminating decode -- greedy decode stops
-/// at `<|im_end|>` well before this in practice. Admission charges the same
-/// figure (`super::capacity::funasr_nano_admission_required_positions`).
+/// at `<|im_end|>` well before this in practice. The decoder-state topology
+/// reserves the same limit.
 pub(crate) const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
 
-type FunasrNanoRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+type FunasrNanoEncoderAdapterRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
 
 /// Resident encoder-side runtime: the SAN-M encoder graph + transformer
 /// adaptor with their weights already uploaded to (or bound zero-copy in)
-/// backend memory. Cached per (pack content id, backend) below -- the
-/// sensevoice `SenseVoicePreparedRuntime` / dolphin prepared-runtime pattern
-/// -- so a repeat request rebuilds only the transient forward graph and
-/// uploads only the utterance features instead of re-loading and re-uploading
-/// every encoder + adaptor weight. Idle unload flows through the central
-/// `bump_unload_generation` epoch that `BoundedRuntimeCache` syncs to.
+/// backend memory. It is owned by a finite service-root actor pool so each
+/// graph remains on the thread that created it while repeat requests reuse
+/// the immutable weights and only rebuild transient forward graphs.
 struct FunasrNanoEncoderAdapterRuntime {
     encoder: FunasrNanoEncoderGraph,
     adapter: FunasrNanoAdapterGraph,
 }
 
-thread_local! {
-    static FUNASR_NANO_DECODER_BY_KEY: RefCell<HashMap<FunasrNanoRuntimeCacheKey, (u64, FunasrNanoDecoderRuntime)>> =
-        RefCell::new(HashMap::new());
-    static FUNASR_NANO_ENCODER_ADAPTER_BY_KEY: RefCell<
-        BoundedRuntimeCache<FunasrNanoRuntimeCacheKey, FunasrNanoEncoderAdapterRuntime>,
-    > = RefCell::new(BoundedRuntimeCache::new());
+struct FunasrNanoEncoderAdapterActorState {
+    runtime: FunasrNanoEncoderAdapterRuntime,
 }
 
-fn take_cached_decoder_runtime(
-    key: &FunasrNanoRuntimeCacheKey,
-    unload_generation: u64,
-) -> Option<FunasrNanoDecoderRuntime> {
-    FUNASR_NANO_DECODER_BY_KEY
-        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
+struct FunasrNanoDecoderActorState {
+    runtime: FunasrNanoDecoderRuntime,
 }
 
-fn store_cached_decoder_runtime(
-    key: FunasrNanoRuntimeCacheKey,
-    unload_generation: u64,
-    decoder: FunasrNanoDecoderRuntime,
-) {
-    FUNASR_NANO_DECODER_BY_KEY.with(|cache| {
-        cache.borrow_mut().insert(key, (unload_generation, decoder));
-    });
+impl std::fmt::Debug for FunasrNanoEncoderAdapterActorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FunasrNanoEncoderAdapterActorState")
+            .finish_non_exhaustive()
+    }
 }
+
+impl std::fmt::Debug for FunasrNanoDecoderActorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FunasrNanoDecoderActorState")
+            .finish_non_exhaustive()
+    }
+}
+
+type FunasrNanoEncoderAdapterRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    FunasrNanoEncoderAdapterRuntimeCacheKey,
+    FunasrNanoEncoderAdapterActorState,
+>;
+type FunasrNanoDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    FunasrNanoDecoderRuntimeCacheKey,
+    FunasrNanoDecoderActorState,
+>;
+type FunasrNanoEncoderAdapterRuntimeActor = PinnedRuntimeActorCheckout<
+    FunasrNanoEncoderAdapterRuntimeCacheKey,
+    FunasrNanoEncoderAdapterActorState,
+>;
+type FunasrNanoDecoderRuntimeActor =
+    PinnedRuntimeActorCheckout<FunasrNanoDecoderRuntimeCacheKey, FunasrNanoDecoderActorState>;
 
 #[derive(Debug, Error)]
 enum FunasrNanoExecutorError {
@@ -140,14 +153,51 @@ enum FunasrNanoExecutorError {
     DecodePromptFailed { reason: String },
     #[error("funasr-nano prompt embedding splice failed: {reason}")]
     PromptEmbeddingFailed { reason: String },
+    #[error("funasr-nano decoder-state capacity contract failed: {source}")]
+    DecoderStateCapacity {
+        #[source]
+        source: Qwen3AsrKvCacheCapacityError,
+    },
     #[error("funasr-nano decoder failed: {reason}")]
     DecoderFailed { reason: String },
+    #[error("funasr-nano {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
     #[error("funasr-nano greedy decode failed: {reason}")]
     GreedyDecodeFailed { reason: String },
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct FunasrNanoGgmlExecutor;
+const FUNASR_NANO_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
+const FUNASR_NANO_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
+
+#[derive(Debug, Clone)]
+pub(crate) struct FunasrNanoGgmlExecutor {
+    encoder_adapter_runtimes: Arc<FunasrNanoEncoderAdapterRuntimePool>,
+    decoder_runtimes: Arc<FunasrNanoDecoderRuntimePool>,
+}
+
+impl Default for FunasrNanoGgmlExecutor {
+    fn default() -> Self {
+        let max_committed_requested_bytes =
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+        let limits = || {
+            AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                FUNASR_NANO_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+                max_committed_requested_bytes,
+                FUNASR_NANO_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+            )
+        };
+        Self {
+            encoder_adapter_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-funasr-nano-encoder-adapter-owner",
+                limits(),
+            )),
+            decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-funasr-nano-decoder-owner",
+                limits(),
+            )),
+        }
+    }
+}
 
 /// No-op phrase-bias shim: funasr-nano's decode policy never consults these
 /// (no phrase bias, single config-supplied eot token) -- mirrors
@@ -167,7 +217,8 @@ impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 /// on CPU). Mirrors `moss_transcribe_diarize::executor::MossTdGreedyStepExecutor`.
 struct FunasrNanoGreedyStepExecutor<'a> {
     decoder: &'a mut FunasrNanoDecoderRuntime,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
     prompt_embeddings: Option<Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
     control: Arc<crate::api::backend::TranscriptionControl>,
@@ -182,7 +233,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let prefill = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
+                .prefill(
+                    &prompt_embeddings,
+                    &mut self.layer_kv_caches,
+                    self.kv_capacity,
+                    &self.control,
+                )
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -205,7 +261,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
             })?;
         if let Some(token_id) = self
             .decoder
-            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .decode_step_reused_top1(
+                last_token,
+                cache_position,
+                &self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?
@@ -217,7 +278,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
         }
         let logits = self
             .decoder
-            .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
+            .decode_step(
+                last_token,
+                cache_position,
+                &mut self.layer_kv_caches,
+                self.kv_capacity,
+            )
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             })?;
@@ -229,6 +295,208 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
 }
 
 impl FunasrNanoGgmlExecutor {
+    fn map_actor_error(
+        stage: &'static str,
+        error: PinnedRuntimeActorError,
+    ) -> FunasrNanoExecutorError {
+        FunasrNanoExecutorError::RuntimeOwnershipFailed {
+            stage,
+            reason: error.to_string(),
+        }
+    }
+
+    fn checkout_encoder_adapter_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
+        adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<FunasrNanoEncoderAdapterRuntimeActor, FunasrNanoExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(backend),
+        );
+        let source = runtime_source.clone();
+        self.encoder_adapter_runtimes.checkout_or_try_build_with(
+            key,
+            move || Ok((0, source)),
+            move |source| {
+                let encoder = FunasrNanoEncoderGraph::new(&source, encoder_metadata, backend)
+                    .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                let adapter = FunasrNanoAdapterGraph::new(&source, adapter_metadata, backend)
+                    .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
+                        reason: error.to_string(),
+                    })?;
+                Ok(SystemMemoryOwner::without_allocation(
+                    FunasrNanoEncoderAdapterActorState {
+                        runtime: FunasrNanoEncoderAdapterRuntime { encoder, adapter },
+                    },
+                ))
+            },
+            |error| Self::map_actor_error("encoder-adapter", error),
+        )
+    }
+
+    fn encode_with_owned_encoder_adapter_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
+        adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
+        encoder_input: crate::models::sensevoice::encoder_graph::SenseVoiceEncoderInput,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<(Vec<f32>, usize), FunasrNanoExecutorError> {
+        let actor = self.checkout_encoder_adapter_runtime(
+            runtime_source,
+            encoder_metadata,
+            adapter_metadata,
+            backend,
+        )?;
+        actor
+            .call_mut(move |state| {
+                let encoder_output = state
+                    .runtime
+                    .encoder
+                    .encode(
+                        &encoder_input.data,
+                        encoder_input.n_frames,
+                        encoder_input.feature_dim,
+                    )
+                    .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                let (adapter_rows, adapter_frames) = state
+                    .runtime
+                    .adapter
+                    .run(
+                        &encoder_output.rows,
+                        encoder_output.frame_count,
+                        encoder_output.d_model,
+                    )
+                    .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
+                        reason: error.to_string(),
+                    })?;
+                let audio_token_count =
+                    funasr_nano_audio_token_count(encoder_output.frame_count).min(adapter_frames);
+                if audio_token_count == 0 {
+                    return Err(FunasrNanoExecutorError::AdapterFailed {
+                        reason: "no audio tokens produced".to_string(),
+                    });
+                }
+                let speech_value_count = audio_token_count
+                    .checked_mul(adapter_metadata.llm_dim)
+                    .ok_or_else(|| FunasrNanoExecutorError::AdapterFailed {
+                        reason: "audio token row length overflowed".to_string(),
+                    })?;
+                let speech_rows = adapter_rows
+                    .get(..speech_value_count)
+                    .ok_or_else(|| FunasrNanoExecutorError::AdapterFailed {
+                        reason: format!(
+                            "adapter returned {} values, expected at least {speech_value_count}",
+                            adapter_rows.len()
+                        ),
+                    })?
+                    .to_vec();
+                Ok((speech_rows, audio_token_count))
+            })
+            .map_err(|error| Self::map_actor_error("encoder-adapter", error))?
+    }
+
+    fn checkout_decoder_runtime(
+        &self,
+        runtime_source: &crate::GgmlRuntimeSource,
+        metadata: FunasrNanoDecoderMetadata,
+        kv_capacity: Qwen3AsrKvCacheCapacity,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<FunasrNanoDecoderRuntimeActor, FunasrNanoExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(runtime_source),
+            current_execution_lane_key(backend),
+            kv_capacity.resident_positions(),
+        );
+        let quote_source = runtime_source.clone();
+        let build_source = runtime_source.clone();
+        let content_id = runtime_source.content_id().to_string();
+        self.decoder_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let reader =
+                    crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(&quote_source)
+                        .map_err(|error| FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: format!("decoder quote tensor reader failed: {error}"),
+                    })?;
+                let (peak_bytes, retained_bytes) =
+                    super::llm_transformer::quoted_funasr_nano_decoder_system_memory_bytes(
+                        &reader, &metadata, backend,
+                    )
+                    .map_err(|reason| {
+                        FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason,
+                        }
+                    })?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!(
+                        "funasr-nano-decoder-runtime:{content_id}:positions={}",
+                        kv_capacity.resident_positions()
+                    ),
+                    peak_bytes,
+                    retained_bytes,
+                )
+                .map_err(|error| {
+                    FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok((retained_bytes, (build_source, quote)))
+            },
+            move |(source, quote)| match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let runtime =
+                    FunasrNanoDecoderRuntime::new(&source, metadata, backend).map_err(|error| {
+                        FunasrNanoExecutorError::DecoderFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
+                let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
+                    FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason,
+                    }
+                })?;
+                Ok(SystemMemoryAllocationOutcome::new(
+                    FunasrNanoDecoderActorState { runtime },
+                    retained,
+                    retained,
+                ))
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: error.to_string(),
+                    })
+                }
+            },
+            |error| Self::map_actor_error("decoder", error),
+        )
+    }
+
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.encoder_adapter_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.decoder_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+    }
+
+    fn clear_runtime_actors(&self) {
+        self.encoder_adapter_runtimes.clear();
+        self.decoder_runtimes.clear();
+    }
+
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -313,13 +581,11 @@ impl FunasrNanoGgmlExecutor {
 
         let runtime_source = &preflight.runtime_source;
         let backend = request.resolved_runtime.backend();
-        let (speech_rows, audio_token_count) = run_encoder_and_adapter(
+        let (speech_rows, audio_token_count) = self.encode_with_owned_encoder_adapter_runtime(
             runtime_source,
             encoder_metadata,
             adapter_metadata,
-            &encoder_input.data,
-            encoder_input.n_frames,
-            encoder_input.feature_dim,
+            encoder_input,
             backend,
         )?;
 
@@ -328,28 +594,40 @@ impl FunasrNanoGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        let decoder_cache_key: FunasrNanoRuntimeCacheKey =
-            (PackContentKey::for_runtime_source(runtime_source), backend);
-        let unload_generation = current_unload_generation();
-        let mut decoder = match take_cached_decoder_runtime(&decoder_cache_key, unload_generation) {
-            Some(decoder) => decoder,
-            None => FunasrNanoDecoderRuntime::new(runtime_source, decoder_metadata, backend)
-                .map_err(|error| FunasrNanoExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                })?,
-        };
-
-        let decode_result = decode_with_decoder(
-            &mut decoder,
-            &decoder_metadata,
-            &decode_prompt,
-            &speech_rows,
-            &tokenizer,
-            &request.execution_context.control,
-        );
-        decoder.release_session_scoped_buffers();
-        store_cached_decoder_runtime(decoder_cache_key, unload_generation, decoder);
-        let result = decode_result?;
+        let measured_positions =
+            crate::capacity::topology::causal_prefix_positions_with_context_cap(
+                super::capacity::FUNASR_NANO_SELF_KV_STATE_ID,
+                decode_prompt.token_ids.len(),
+                FUNASR_NANO_MAX_GENERATED_TOKENS,
+                decoder_metadata.max_positions,
+            )
+            .map_err(|error| FunasrNanoExecutorError::RuntimeContractViolation {
+                reason: error.to_string(),
+            })?;
+        let kv_capacity = Qwen3AsrKvCacheCapacity::from_decoder_state(
+            &request.decoder_state,
+            super::capacity::FUNASR_NANO_SELF_KV_STATE_ID,
+        )
+        .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
+        .map_err(|source| FunasrNanoExecutorError::DecoderStateCapacity { source })?;
+        let decoder_actor =
+            self.checkout_decoder_runtime(runtime_source, decoder_metadata, kv_capacity, backend)?;
+        let decoder_control = Arc::clone(&request.execution_context.control);
+        let result = decoder_actor
+            .call_mut(move |state| {
+                let result = decode_with_decoder(
+                    &mut state.runtime,
+                    &decoder_metadata,
+                    &decode_prompt,
+                    &speech_rows,
+                    &tokenizer,
+                    kv_capacity,
+                    &decoder_control,
+                );
+                state.runtime.release_session_scoped_buffers();
+                result
+            })
+            .map_err(|error| Self::map_actor_error("decoder", error))??;
         let decode_truncation = result.stop_reason.into_decode_truncation(None);
 
         let text = result.text.trim().to_string();
@@ -378,84 +656,23 @@ impl FunasrNanoGgmlExecutor {
     }
 }
 
-/// Run the resident SAN-M encoder + transformer adaptor for this pack+backend
-/// over the prepared encoder input, and return the leading `n_aud` audio-token
-/// rows (low-frame-rate truncation) plus that count. The encoder + adaptor
-/// runtime comes out of the per-(pack content id, backend) thread-local cache
-/// ([`FunasrNanoEncoderAdapterRuntime`]); only the transient forward graph and
-/// the utterance features are per-request. Output is bit-identical to a fresh
-/// build: residency changes where the weights live, never the forward math
-/// (pinned by the `cached_encoder_adapter_matches_fresh_build_bit_for_bit`
-/// golden test below).
-#[allow(clippy::too_many_arguments)]
-fn run_encoder_and_adapter(
-    runtime_source: &crate::GgmlRuntimeSource,
-    encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
-    adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
-    encoder_input: &[f32],
-    n_frames: usize,
-    feature_dim: usize,
-    backend: GgmlCpuGraphBackend,
-) -> Result<(Vec<f32>, usize), FunasrNanoExecutorError> {
-    let key: FunasrNanoRuntimeCacheKey =
-        (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &FUNASR_NANO_ENCODER_ADAPTER_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || {
-            let encoder = FunasrNanoEncoderGraph::new(runtime_source, encoder_metadata, backend)
-                .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                })?;
-            let adapter = FunasrNanoAdapterGraph::new(runtime_source, adapter_metadata, backend)
-                .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
-                    reason: error.to_string(),
-                })?;
-            Ok(FunasrNanoEncoderAdapterRuntime { encoder, adapter })
-        },
-        |runtime| {
-            let encoder_output = runtime
-                .encoder
-                .encode(encoder_input, n_frames, feature_dim)
-                .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                })?;
-            let (adapter_rows, adapter_frames) = runtime
-                .adapter
-                .run(
-                    &encoder_output.rows,
-                    encoder_output.frame_count,
-                    encoder_output.d_model,
-                )
-                .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
-                    reason: error.to_string(),
-                })?;
-
-            let n_aud =
-                funasr_nano_audio_token_count(encoder_output.frame_count).min(adapter_frames);
-            if n_aud == 0 {
-                return Err(FunasrNanoExecutorError::AdapterFailed {
-                    reason: "no audio tokens produced".to_string(),
-                });
-            }
-            let llm_dim = adapter_metadata.llm_dim;
-            let speech_rows = adapter_rows[..n_aud * llm_dim].to_vec();
-            Ok((speech_rows, n_aud))
-        },
-    )
-}
-
 fn decode_with_decoder(
     decoder: &mut FunasrNanoDecoderRuntime,
     decoder_metadata: &FunasrNanoDecoderMetadata,
     decode_prompt: &crate::models::qwen::Qwen3AsrDecodePrompt,
     speech_rows: &[f32],
     tokenizer: &FunasrNanoTokenizer,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
     control: &Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<Seq2SeqGreedyDecodeResult, FunasrNanoExecutorError> {
-    let mut token_rows =
-        Vec::with_capacity(decode_prompt.token_ids.len() * decoder_metadata.d_model);
+    let token_value_count = decode_prompt
+        .token_ids
+        .len()
+        .checked_mul(decoder_metadata.d_model)
+        .ok_or_else(|| FunasrNanoExecutorError::PromptEmbeddingFailed {
+            reason: "token embedding row allocation overflowed".to_string(),
+        })?;
+    let mut token_rows = Vec::with_capacity(token_value_count);
     for &token_id in &decode_prompt.token_ids {
         let row = decoder.gather_token_embedding(token_id).map_err(|error| {
             FunasrNanoExecutorError::DecoderFailed {
@@ -474,15 +691,13 @@ fn decode_with_decoder(
         reason: error.to_string(),
     })?;
 
-    let layer_kv_caches = decoder.new_kv_caches(
-        decode_prompt
-            .token_ids
-            .len()
-            .saturating_add(FUNASR_NANO_MAX_GENERATED_TOKENS),
-    );
+    let layer_kv_caches = decoder
+        .new_kv_caches(kv_capacity)
+        .map_err(|reason| FunasrNanoExecutorError::DecoderFailed { reason })?;
     let mut step_executor = FunasrNanoGreedyStepExecutor {
         decoder,
         layer_kv_caches,
+        kv_capacity,
         prompt_embeddings: Some(prompt_embeddings),
         cache_prompt_tokens: 0,
         control: Arc::clone(control),
@@ -534,6 +749,18 @@ impl GgmlAsrViewExecutor for FunasrNanoGgmlExecutor {
         false
     }
 
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_funasr_nano_decoder_state,
+            ),
+        )
+    }
+
     fn execute_view(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -544,6 +771,10 @@ impl GgmlAsrViewExecutor for FunasrNanoGgmlExecutor {
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -565,6 +796,10 @@ impl GgmlAsrStreamingExecutor for FunasrNanoGgmlExecutor {
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
             FunasrNanoGgmlExecutor::execute_view,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -696,6 +931,11 @@ mod tests {
                 &decode_prompt,
                 &speech_rows,
                 &tokenizer,
+                Qwen3AsrKvCacheCapacity::new(
+                    decode_prompt.token_ids.len() + FUNASR_NANO_MAX_GENERATED_TOKENS,
+                    decode_prompt.token_ids.len() + FUNASR_NANO_MAX_GENERATED_TOKENS,
+                )
+                .expect("test KV capacity"),
                 &control,
             )
             .expect("decode");
@@ -708,9 +948,9 @@ mod tests {
         }
     }
 
-    /// Residency must not change output: the resident cached encoder+adaptor
-    /// path (`run_encoder_and_adapter` -- cache miss on the first call, then
-    /// hits at both a different and a previously seen frame count) must
+    /// Residency must not change output: the resident encoder+adaptor actor
+    /// path (pool miss on the first call, then actor reuse at both a different
+    /// and a previously seen frame count) must
     /// produce bit-for-bit the same audio-token rows as a freshly built
     /// one-shot encoder + adaptor over the same reference LFR features
     /// (the dolphin prepared-runtime bit-identity pinning pattern).
@@ -723,8 +963,6 @@ mod tests {
             eprintln!("skipping: set OPENASR_FUNASR_NANO_GOLDEN_DIR and OPENASR_FUNASR_NANO_PACK");
             return;
         };
-        let _generation_guard =
-            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
@@ -732,6 +970,7 @@ mod tests {
             parse_funasr_nano_encoder_metadata(&gguf_metadata).expect("encoder metadata");
         let adapter_metadata =
             parse_funasr_nano_adapter_metadata(&gguf_metadata).expect("adapter metadata");
+        let executor = FunasrNanoGgmlExecutor::default();
 
         // en = cache miss (build + insert), zh = cache hit at a different
         // frame count, en again = cache hit at a previously seen frame count.
@@ -772,16 +1011,15 @@ mod tests {
             let fresh_rows = &full_rows[..fresh_n_aud * adapter_metadata.llm_dim];
 
             // Resident cached path (what execute_inner runs).
-            let (cached_rows, cached_n_aud) = run_encoder_and_adapter(
-                &runtime_source,
-                encoder_metadata,
-                adapter_metadata,
-                &encoder_input.data,
-                encoder_input.n_frames,
-                encoder_input.feature_dim,
-                GgmlCpuGraphBackend::Cpu,
-            )
-            .expect("cached encoder+adapter");
+            let (cached_rows, cached_n_aud) = executor
+                .encode_with_owned_encoder_adapter_runtime(
+                    &runtime_source,
+                    encoder_metadata,
+                    adapter_metadata,
+                    encoder_input,
+                    GgmlCpuGraphBackend::Cpu,
+                )
+                .expect("cached encoder+adapter");
 
             assert_eq!(cached_n_aud, fresh_n_aud, "[{tag}] audio token count");
             assert_eq!(cached_rows.len(), fresh_rows.len(), "[{tag}] row length");

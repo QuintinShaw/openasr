@@ -26,6 +26,68 @@ use std::path::Path;
 
 use crate::GgufMetadata;
 use crate::arch::GENERAL_ARCHITECTURE_KEY;
+use crate::device::{
+    execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
+    execution_route::ExecutionProvider,
+};
+use crate::ggml_runtime::AutoGpuPolicy;
+
+/// Runtime placement contract for a non-ASR model stage.
+///
+/// Auxiliary packs deliberately do not masquerade as ASR architecture
+/// descriptors, but their execution placement is still mandatory data. This
+/// keeps request-level hardware targets truthful across post-processing and
+/// speaker attribution instead of letting each auxiliary caller rediscover a
+/// backend from environment defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxiliaryExecutionPolicy {
+    /// The implementation is CPU-only. This is a declared stage shape, not a
+    /// fallback from a failed accelerated candidate.
+    FixedCpu,
+    /// The stage follows the request intent using these provider/placement
+    /// rows and its own Auto default.
+    RequestScoped {
+        capabilities: ExecutionCapabilities,
+        auto_gpu_policy: AutoGpuPolicy,
+    },
+}
+
+const AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION: ExecutionCapabilities =
+    ExecutionCapabilities::new(true)
+        .with_provider(
+            ExecutionProvider::Metal,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Hip,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Vulkan,
+            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+        );
+
+const AUX_CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
+    .with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Cuda,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Hip,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Vulkan,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    );
 
 /// Which pull-time error prefix a matched aux family reports, preserving the
 /// exact wording `api::backend::native`'s tests assert on.
@@ -40,6 +102,29 @@ pub(crate) enum AuxPackKind {
     Punctuation,
     /// Forced-alignment word-timestamp refiner packs (Qwen3-ForcedAligner).
     ForcedAlignment,
+}
+
+/// Persistent-state ownership contract for one auxiliary family. Every new
+/// descriptor must make this choice explicitly; a validation-only registry
+/// entry can no longer silently grow a process singleton later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxiliaryRuntimeOwnership {
+    /// Send-safe host materialization held by an admitted owner cache.
+    AdmittedHostOwner,
+    /// `!Send` backend runtime held and destroyed on a dedicated actor thread.
+    AdmittedPinnedActor,
+    /// Fresh per invocation; no state survives the stage boundary.
+    InvocationTransient,
+}
+
+impl AuxiliaryRuntimeOwnership {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdmittedHostOwner => "admitted-host-owner",
+            Self::AdmittedPinnedActor => "admitted-pinned-actor",
+            Self::InvocationTransient => "invocation-transient",
+        }
+    }
 }
 
 impl AuxPackKind {
@@ -59,6 +144,8 @@ struct AuxPackDescriptor {
     /// `general.architecture` value that identifies this aux family's packs.
     architecture_id: &'static str,
     kind: AuxPackKind,
+    execution_policy: AuxiliaryExecutionPolicy,
+    ownership: AuxiliaryRuntimeOwnership,
     /// Cheap pull-time contract probe: constructs/parses just enough of the
     /// pack to prove the runtime loader can build from it, without
     /// materializing full weights for execution.
@@ -112,34 +199,81 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
     AuxPackDescriptor {
         architecture_id: REDIMNET2_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_redimnet2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
+        ownership: AuxiliaryRuntimeOwnership::AdmittedHostOwner,
         validate: validate_pyannote,
     },
     AuxPackDescriptor {
         architecture_id: crate::diarize::segment::DIARIZEN_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_diarizen,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
         kind: AuxPackKind::Translation,
+        // Hy-MT2 selects one complete ggml backend; it has no implemented
+        // partial-offload topology, so advertising Hybrid here would create a
+        // semantically false candidate even though both rows currently map to
+        // the same coarse backend enum.
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_hymt2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
         kind: AuxPackKind::Punctuation,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
         validate: validate_firered_punc,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::ForcedAlignment,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        },
+        ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         validate: validate_forced_aligner,
     },
 ];
+
+/// Execution contract for one known auxiliary architecture.
+pub(crate) fn auxiliary_execution_policy(
+    architecture_id: &str,
+) -> Option<AuxiliaryExecutionPolicy> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.architecture_id == architecture_id)
+        .map(|descriptor| descriptor.execution_policy)
+}
+
+pub(crate) fn auxiliary_runtime_ownership(
+    architecture_id: &str,
+) -> Option<AuxiliaryRuntimeOwnership> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.architecture_id == architecture_id)
+        .map(|descriptor| descriptor.ownership)
+}
 
 /// Every aux family's `general.architecture` id. Lets a caller that needs the
 /// full non-ASR family list (e.g. `models::pack_quant_audit`'s quant-floor
@@ -205,6 +339,18 @@ mod tests {
                     .is_none(),
                 "aux architecture id '{}' collides with a registered ASR architecture",
                 descriptor.architecture_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_auxiliary_family_has_an_explicit_runtime_ownership_contract() {
+        for descriptor in AUX_PACK_DESCRIPTORS {
+            assert_eq!(
+                auxiliary_runtime_ownership(descriptor.architecture_id),
+                Some(descriptor.ownership),
+                "auxiliary family '{}' lost its ownership contract",
+                descriptor.architecture_id,
             );
         }
     }

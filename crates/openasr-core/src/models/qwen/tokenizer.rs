@@ -33,6 +33,42 @@ pub(crate) struct Qwen3AsrTokenizer {
 }
 
 impl Qwen3AsrTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "qwen tokenizer id table")?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, "qwen tokenizer id token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "qwen tokenizer token map byte count overflowed".to_string())?,
+            "qwen tokenizer token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "qwen tokenizer token map key")?;
+        }
+        bytes.add_usize(
+            self.merge_rank
+                .len()
+                .checked_mul(std::mem::size_of::<(String, usize)>())
+                .ok_or_else(|| "qwen tokenizer merge map byte count overflowed".to_string())?,
+            "qwen tokenizer merge map entries",
+        )?;
+        for merge in self.merge_rank.keys() {
+            bytes.add_string(merge, "qwen tokenizer merge key")?;
+        }
+        bytes.add_usize(
+            self.special_token_ids
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| "qwen tokenizer special-token byte count overflowed".to_string())?,
+            "qwen tokenizer special-token entries",
+        )?;
+        Ok(bytes.finish())
+    }
+
     pub fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
         let tokenizer_model =
             required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, QWEN3_TOKENIZER_FAMILY)?;

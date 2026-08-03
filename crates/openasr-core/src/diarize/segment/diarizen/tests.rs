@@ -134,6 +134,43 @@ fn postprocess_preserves_frame_geometry() {
 }
 
 #[test]
+fn local_activity_owns_complete_windows_without_copying_the_source() {
+    let samples: crate::PcmSlice =
+        vec![0.0_f32; super::config::WINDOW_SAMPLES + super::config::WINDOW_STEP_SAMPLES / 2]
+            .into();
+    let source_identity = samples.backing_identity();
+    let mut observed = Vec::new();
+    let frames = super::config::output_frames(super::config::WINDOW_SAMPLES);
+    let local = super::super::segment_diarizen_local_activity(
+        samples,
+        super::config::SAMPLE_RATE_HZ,
+        &|| false,
+        |window| {
+            observed.push((window.backing_identity(), window.len()));
+            Ok(DiariZenWindowOutput {
+                frame_count: frames,
+                logits: vec![0.0; frames * POWERSET_CLASSES],
+                powerset_class: vec![0; frames],
+                activity: vec![0; frames * LOCAL_SPEAKERS],
+            })
+        },
+    )
+    .expect("owned DiariZen windows");
+
+    assert_eq!(local.windows.len(), 2);
+    assert_eq!(observed.len(), 2);
+    assert_eq!(
+        observed[0],
+        (source_identity, super::config::WINDOW_SAMPLES)
+    );
+    assert_ne!(
+        observed[1].0, source_identity,
+        "only the padded tail should allocate a new backing"
+    );
+    assert_eq!(observed[1].1, super::config::WINDOW_SAMPLES);
+}
+
+#[test]
 #[ignore = "requires OPENASR_DIARIZEN_LEGACY_PACK"]
 fn legacy_long_name_pack_is_rejected_by_the_compact_schema_runtime() {
     let pack = external_path("OPENASR_DIARIZEN_LEGACY_PACK");
@@ -152,22 +189,7 @@ fn native_graph_matches_external_pytorch_golden() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let golden = external_path("OPENASR_DIARIZEN_GOLDEN");
     DiariZenSegmenter::probe_oasr(&pack).expect("strict pack probe");
-    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production adapter");
     let waveform = npy_f32(&golden, "waveform");
-    assert!(matches!(
-        segmenter.infer_window(&waveform, super::config::SAMPLE_RATE_HZ),
-        Err(DiariZenSegmenterError::WindowSize {
-            expected: super::config::WINDOW_SAMPLES,
-            actual: 16_000,
-        })
-    ));
-    assert!(matches!(
-        segmenter.infer_window(
-            &vec![0.0; super::config::WINDOW_SAMPLES],
-            super::config::SAMPLE_RATE_HZ / 2,
-        ),
-        Err(DiariZenSegmenterError::UnsupportedSampleRate { actual: 8_000 })
-    ));
     let mut runtime = DiariZenRuntime::new(
         &pack,
         16_000,
@@ -238,21 +260,23 @@ fn native_graph_matches_external_pytorch_golden() {
 #[ignore = "requires OPENASR_DIARIZEN_PACK; native release benchmark"]
 fn native_fp16_exact_window_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
-    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
     let samples = synthetic_exact_window();
+    let mut runtime = DiariZenRuntime::new(
+        &pack,
+        samples.len(),
+        false,
+        Some(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu),
+    )
+    .expect("construct production runtime");
 
-    let warmup = segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect("warmup inference");
+    let warmup = runtime.infer(&samples).expect("warmup inference");
     assert_eq!(warmup.logits.len(), warmup.frame_count * POWERSET_CLASSES);
 
     let mut seconds = Vec::with_capacity(5);
     let mut checksum = 0.0_f64;
     for _ in 0..5 {
         let started = Instant::now();
-        let output = segmenter
-            .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-            .expect("timed inference");
+        let output = runtime.infer(&samples).expect("timed inference");
         seconds.push(started.elapsed().as_secs_f64());
         checksum += output.logits.iter().map(|value| *value as f64).sum::<f64>();
         std::hint::black_box(output);
@@ -269,126 +293,18 @@ fn native_fp16_exact_window_benchmark() {
 }
 
 #[test]
-#[ignore = "requires OPENASR_DIARIZEN_PACK; validates failed-compute recovery"]
-fn native_runtime_rebuilds_only_the_poisoned_graph_after_abort() {
-    let _test_guard = diarizen_runtime_test_lock();
-    let pack = external_path("OPENASR_DIARIZEN_PACK");
-    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
-    let samples = synthetic_exact_window();
-
-    install_worker_graph_compute_abort();
-    let error = segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect_err("injected abort must fail this inference");
-    assert!(error.is_canceled());
-
-    let recovered = segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect("the same resident weights must rebuild a clean graph");
-    assert_eq!(
-        recovered.logits.len(),
-        recovered.frame_count * POWERSET_CLASSES
-    );
-}
-
-#[test]
-#[ignore = "requires OPENASR_DIARIZEN_PACK; validates process-owner shutdown and rebuild"]
-fn native_runtime_rebuilds_after_process_owner_shutdown() {
-    let _test_guard = diarizen_runtime_test_lock();
-    let pack = external_path("OPENASR_DIARIZEN_PACK");
-    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
-    let samples = synthetic_exact_window();
-
-    drop(crate::NativeRuntimeShutdownGuard::new());
-    segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect("first request");
-    assert_eq!(diarizen_worker_runtime_entry_count(), 1);
-
-    drop(crate::NativeRuntimeShutdownGuard::new());
-    assert_eq!(
-        diarizen_worker_runtime_entry_count(),
-        0,
-        "process-owner shutdown must eagerly clear persistent worker TLS"
-    );
-
-    segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect("request after shutdown rebuilds");
-    assert_eq!(
-        diarizen_worker_runtime_entry_count(),
-        1,
-        "the first request after shutdown must rebuild resident state"
-    );
-    drop(crate::NativeRuntimeShutdownGuard::new());
-}
-
-#[test]
-#[ignore = "requires OPENASR_DIARIZEN_PACK; validates standalone-adapter shutdown"]
-fn standalone_segmenter_drop_eagerly_releases_worker_runtime() {
-    let _test_guard = diarizen_runtime_test_lock();
-    unload_idle_worker_runtimes();
-    let pack = external_path("OPENASR_DIARIZEN_PACK");
-    let samples = synthetic_exact_window();
-
-    {
-        let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
-        segmenter
-            .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-            .expect("standalone request");
-        assert_eq!(diarizen_worker_runtime_entry_count(), 1);
-    }
-
-    assert_eq!(
-        diarizen_worker_runtime_entry_count(),
-        0,
-        "dropping the final standalone adapter must clear persistent worker TLS"
-    );
-}
-
-#[test]
-#[ignore = "requires OPENASR_DIARIZEN_PACK; validates terminal-backend eviction"]
-fn native_runtime_rebuilds_the_runner_after_device_loss_without_retrying_request() {
-    let _test_guard = diarizen_runtime_test_lock();
-    let pack = external_path("OPENASR_DIARIZEN_PACK");
-    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
-    let samples = synthetic_exact_window();
-
-    install_worker_graph_compute_device_lost();
-    let error = segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect_err("device loss must fail this request without retry");
-    assert!(matches!(
-        error,
-        DiariZenSegmenterError::Graph {
-            source: crate::ggml_runtime::GgmlCpuGraphError::DeviceLost,
-            ..
-        }
-    ));
-    assert_eq!(
-        diarizen_worker_runtime_entry_count(),
-        0,
-        "a terminal backend handle must be evicted on its owner worker"
-    );
-
-    let recovered = segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect("the next request builds a fresh runner");
-    assert_eq!(
-        recovered.logits.len(),
-        recovered.frame_count * POWERSET_CLASSES
-    );
-}
-
-#[test]
 #[ignore = "requires OPENASR_DIARIZEN_PACK; native release benchmark"]
 fn native_fp16_sixty_second_window_throughput_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
-    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
     let samples = synthetic_exact_window();
-    segmenter
-        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-        .expect("warmup inference");
+    let mut runtime = DiariZenRuntime::new(
+        &pack,
+        samples.len(),
+        false,
+        Some(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu),
+    )
+    .expect("construct production runtime");
+    runtime.infer(&samples).expect("warmup inference");
 
     // Match pyannote Inference.slide: all complete 16 s windows at the pinned
     // 1.6 s step, followed by one zero-padded tail when needed.
@@ -407,9 +323,7 @@ fn native_fp16_sixty_second_window_throughput_benchmark() {
     let started = Instant::now();
     let mut checksum = 0.0_f64;
     for _ in 0..windows {
-        let output = segmenter
-            .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
-            .expect("window inference");
+        let output = runtime.infer(&samples).expect("window inference");
         checksum += output.logits.iter().map(|value| *value as f64).sum::<f64>();
         std::hint::black_box(output);
     }

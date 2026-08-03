@@ -17,6 +17,8 @@ use crate::ggml_runtime::{
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
 };
+use crate::models::runtime_memory::{checked_sum, element_bytes};
+use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
 use crate::models::wav2vec2_ctc::graph_config::wav2vec2_ctc_encoder_graph_config;
 use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -166,6 +168,33 @@ struct LayerArena {
     final_norm_bias: GgmlStaticTensor,
 }
 
+/// Count only the Rust handle vectors retained by a built graph. Native ggml
+/// arenas, contexts, and mmap-backed weight buffers are charged to their own
+/// physical-memory owners and are intentionally excluded.
+pub(crate) fn quoted_graph_retained_bytes(
+    feature_extractor_capacity: usize,
+    pos_conv_capacity: usize,
+    layer_capacity: usize,
+) -> Result<u64, SystemMemoryOwnerError> {
+    checked_sum(
+        [
+            element_bytes::<FeArena>(
+                feature_extractor_capacity,
+                "wav2vec2-ctc",
+                "graph feature extractor handles",
+            )?,
+            element_bytes::<(GgmlStaticTensor, GgmlStaticTensor)>(
+                pos_conv_capacity,
+                "wav2vec2-ctc",
+                "graph positional convolution handles",
+            )?,
+            element_bytes::<LayerArena>(layer_capacity, "wav2vec2-ctc", "graph layer handles")?,
+        ],
+        "wav2vec2-ctc",
+        "graph retained bytes",
+    )
+}
+
 pub(crate) struct Wav2Vec2CtcEncoderGraph {
     metadata: Wav2Vec2CtcExecutionMetadata,
     runner: GgmlCpuGraphRunner,
@@ -187,6 +216,20 @@ pub(crate) struct Wav2Vec2CtcEncoderGraph {
 }
 
 impl Wav2Vec2CtcEncoderGraph {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add_vec(
+            &self.feature_extractor,
+            "wav2vec2-ctc graph feature extractor handles",
+        )?;
+        bytes.add_vec(
+            &self.pos_conv,
+            "wav2vec2-ctc graph positional convolution handles",
+        )?;
+        bytes.add_vec(&self.layers, "wav2vec2-ctc graph layer handles")?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn new(
         weights: &Wav2Vec2EncoderWeights,
         metadata: Wav2Vec2CtcExecutionMetadata,

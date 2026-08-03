@@ -173,15 +173,14 @@ fn required_env_path(name: &str) -> PathBuf {
     path
 }
 
-fn write_native_streaming_fixture_pack(
-    path: &std::path::Path,
+fn native_streaming_fixture_metadata(
     model_id: &str,
     family: &str,
     architecture: &str,
     audio_frontend: &str,
     decode_policy: &str,
     tokenizer: &str,
-) {
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("openasr.model.id".to_string(), model_id.to_string());
     metadata.insert(
@@ -208,6 +207,26 @@ fn write_native_streaming_fixture_pack(
         openasr_core::GGML_TOKENIZER_ID_KEY.to_string(),
         tokenizer.to_string(),
     );
+    metadata
+}
+
+fn write_native_streaming_fixture_pack(
+    path: &std::path::Path,
+    model_id: &str,
+    family: &str,
+    architecture: &str,
+    audio_frontend: &str,
+    decode_policy: &str,
+    tokenizer: &str,
+) {
+    let metadata = native_streaming_fixture_metadata(
+        model_id,
+        family,
+        architecture,
+        audio_frontend,
+        decode_policy,
+        tokenizer,
+    );
     let spec = openasr_core::testing::TinyGgufFixtureSpec::new(metadata);
     openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
         .expect("write native streaming fixture pack");
@@ -226,8 +245,7 @@ fn write_xasr_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
 }
 
 fn write_qwen_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
-    write_native_streaming_fixture_pack(
-        path,
+    let mut metadata = native_streaming_fixture_metadata(
         model_id,
         openasr_core::QWEN3_ASR_MODEL_FAMILY,
         openasr_core::QWEN3_ASR_GGML_ARCHITECTURE_ID,
@@ -235,6 +253,39 @@ fn write_qwen_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
         openasr_core::QWEN3_ASR_DECODE_POLICY_ID,
         openasr_core::QWEN3_ASR_TOKENIZER_ID,
     );
+    // Session construction now proves the decoder-state envelope before it
+    // accepts audio. This fixture therefore declares the complete semantic
+    // shape contract used by that planner, while deliberately omitting real
+    // weights: these realtime tests exercise lifecycle/capability plumbing,
+    // not Qwen graph execution.
+    for (key, value) in [
+        ("general.architecture", "qwen3-asr"),
+        ("qwen3-asr.sample_rate", "16000"),
+        ("qwen3-asr.n_mels", "8"),
+        ("qwen3-asr.n_fft", "400"),
+        ("qwen3-asr.win_length", "400"),
+        ("qwen3-asr.hop_length", "160"),
+        ("qwen3-asr.audio.n_layers", "2"),
+        ("qwen3-asr.audio.d_model", "16"),
+        ("qwen3-asr.audio.n_heads", "2"),
+        ("qwen3-asr.llm.n_layers", "2"),
+        ("qwen3-asr.llm.d_model", "16"),
+        ("qwen3-asr.llm.n_heads", "2"),
+        ("qwen3-asr.llm.n_kv_heads", "2"),
+        ("qwen3-asr.llm.head_dim", "8"),
+        ("qwen3-asr.llm.vocab_size", "32"),
+        ("qwen3-asr.llm.max_pos", "4096"),
+        ("qwen3-asr.audio_start_token_id", "2"),
+        ("qwen3-asr.audio_end_token_id", "3"),
+        ("qwen3-asr.audio_pad_token_id", "4"),
+        ("qwen3-asr.eos_token_id", "0"),
+        ("qwen3-asr.pad_token_id", "6"),
+    ] {
+        metadata.insert(key.to_string(), value.to_string());
+    }
+    let spec = openasr_core::testing::TinyGgufFixtureSpec::new(metadata);
+    openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
+        .expect("write qwen native streaming fixture pack");
 }
 
 fn write_moonshine_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
@@ -623,6 +674,128 @@ impl NativeAsrSession for TestServerNativeSession {
     }
 }
 
+/// Warmable native session used only by protocol/lifecycle tests whose fixture
+/// pack is metadata-only. Runtime-readiness tests must use executable tensor
+/// fixtures and never install this factory.
+struct ReadyLifecycleNativeSession {
+    inner: TestServerNativeSession,
+    startup_events: Option<Vec<RealtimeEventEnvelope>>,
+}
+
+impl NativeAsrSession for ReadyLifecycleNativeSession {
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+
+    fn push_audio(
+        &mut self,
+        frame: RealtimeAudioFrame,
+    ) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.push_audio(frame)
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        Ok(self.startup_events.take().unwrap_or_default())
+    }
+
+    fn finish(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.finish()
+    }
+
+    fn cancel(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.cancel()
+    }
+}
+
+/// Deterministic warm-up gate for the full `session.start` readiness test. The
+/// wrapped session still owns the normal lifecycle events; only `warm_up` is
+/// held until the test explicitly releases it.
+struct GatedWarmNativeSession {
+    inner: Box<dyn NativeAsrSession>,
+    warm_started: std::sync::mpsc::Sender<()>,
+    warm_release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl NativeAsrSession for GatedWarmNativeSession {
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+
+    fn warm_up(&mut self) -> Result<(), openasr_core::NativeAsrError> {
+        self.warm_started.send(()).map_err(|error| {
+            openasr_core::NativeAsrError::SessionFailed {
+                message: format!("test warm-start signal failed: {error}"),
+            }
+        })?;
+        self.warm_release
+            .lock()
+            .map_err(|_| openasr_core::NativeAsrError::SessionFailed {
+                message: "test warm-release lock is poisoned".to_string(),
+            })?
+            .recv()
+            .map_err(|error| openasr_core::NativeAsrError::SessionFailed {
+                message: format!("test warm-release signal failed: {error}"),
+            })?;
+        Ok(())
+    }
+
+    fn push_audio(
+        &mut self,
+        frame: RealtimeAudioFrame,
+    ) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.push_audio(frame)
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.poll_events()
+    }
+
+    fn finish(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.finish()
+    }
+
+    fn cancel(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.cancel()
+    }
+}
+
+fn ready_native_lifecycle_session_factory(
+    session_id: RealtimeSessionId,
+    model_id: impl Into<String>,
+    partial_results: bool,
+    word_timestamps: bool,
+    diarize: bool,
+) -> NativeStreamingSessionFactory {
+    let model_id = model_id.into();
+    Arc::new(move || {
+        let mut config =
+            RealtimeSessionConfig::new(session_id.0.clone(), model_id.clone(), timestamp_now());
+        config.partial_results = partial_results;
+        config.word_timestamps = word_timestamps;
+        config.diarize = diarize;
+        let mut controller = RealtimeSessionController::new(config).map_err(|error| {
+            openasr_core::NativeAsrError::SessionFailed {
+                message: format!("test lifecycle controller failed: {error}"),
+            }
+        })?;
+        let created = controller.session_created_event(timestamp_now());
+        let configured = controller
+            .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+            .map_err(|error| openasr_core::NativeAsrError::SessionFailed {
+                message: format!("test lifecycle configure failed: {error}"),
+            })?;
+        let started = controller
+            .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+            .map_err(|error| openasr_core::NativeAsrError::SessionFailed {
+                message: format!("test lifecycle start failed: {error}"),
+            })?;
+        Ok(Box::new(ReadyLifecycleNativeSession {
+            inner: TestServerNativeSession::new(session_id.0.clone()),
+            startup_events: Some(vec![created, configured, started]),
+        }) as Box<dyn NativeAsrSession>)
+    })
+}
+
 /// Native streaming stub whose `push_audio` can hang past the decode watchdog
 /// or fail, to exercise the A2 worker failure paths the real packs can't.
 enum StubDecodeBehavior {
@@ -782,6 +955,41 @@ struct SlowWarmNativeSession {
     inner: TestServerNativeSession,
     warm_sleep: Duration,
     warm_calls: Arc<AtomicUsize>,
+}
+
+struct WarmFailingNativeSession {
+    inner: TestServerNativeSession,
+}
+
+impl NativeAsrSession for WarmFailingNativeSession {
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+
+    fn warm_up(&mut self) -> Result<(), openasr_core::NativeAsrError> {
+        Err(openasr_core::NativeAsrError::SessionFailed {
+            message: "simulated warm-up allocation failure".to_string(),
+        })
+    }
+
+    fn push_audio(
+        &mut self,
+        frame: RealtimeAudioFrame,
+    ) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.push_audio(frame)
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.poll_events()
+    }
+
+    fn finish(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.finish()
+    }
+
+    fn cancel(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.cancel()
+    }
 }
 
 impl NativeAsrSession for SlowWarmNativeSession {
@@ -998,6 +1206,66 @@ async fn start_energy_fallback_test_session(
     session.emit_envelope(started).await?;
     session.controller = Some(controller);
     Ok(())
+}
+
+#[tokio::test]
+async fn fallback_first_frame_is_rejected_without_buffering_before_required_stages_are_ready() {
+    let (event_sender, mut event_receiver) = mpsc::channel(16);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    start_energy_fallback_test_session(&mut session, "readiness-fallback")
+        .await
+        .expect("construct fallback fixture");
+    let _ = collect_events(&mut event_receiver).await;
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+
+    let result = session.handle_binary(&vec![0; 640]).await;
+
+    assert!(result.is_err());
+    assert!(session.carry.is_empty(), "no pre-ready byte buffering");
+    assert_eq!(session.next_frame_seq, 1, "no pre-ready frame admission");
+    assert_eq!(session.next_frame_start_ms, 0, "no pre-ready clock advance");
+    assert!(session.captured_audio_frames.is_empty());
+    assert_eq!(session.pending_backend_jobs, 0);
+    assert!(matches!(
+        session.audio_frame_receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let events = collect_events(&mut event_receiver).await;
+    assert_eq!(
+        first_error_code(&events),
+        Some(RealtimeErrorCode::StartupConfigError)
+    );
+}
+
+#[tokio::test]
+async fn native_first_frame_is_rejected_without_buffering_before_required_stages_are_ready() {
+    let (event_sender, mut event_receiver) = mpsc::channel(16);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    session
+        .attach_native_streaming_session(
+            test_native_streaming_worker_key("readiness-native"),
+            Box::new(TestServerNativeSession::new(session.session_id.0.clone())),
+        )
+        .await
+        .expect("attach native fixture");
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+
+    let result = session.handle_native_streaming_binary(&vec![0; 640]).await;
+
+    assert!(result.is_err());
+    assert!(session.carry.is_empty(), "no pre-ready byte buffering");
+    assert_eq!(session.next_frame_seq, 1, "no pre-ready frame admission");
+    assert_eq!(session.next_frame_start_ms, 0, "no pre-ready clock advance");
+    assert!(!session.native_had_speech_since_last_poll);
+    assert!(session.native_command_watchdogs.is_empty());
+    let events = collect_events(&mut event_receiver).await;
+    assert_eq!(
+        first_error_code(&events),
+        Some(RealtimeErrorCode::StartupConfigError)
+    );
+    if let Some(worker) = session.native_streaming.take() {
+        worker.detach_cancel();
+    }
 }
 
 async fn start_test_session_with_vad(
@@ -2149,7 +2417,7 @@ async fn native_streaming_slow_poll_does_not_block_audio_ingest() {
 }
 
 #[tokio::test]
-async fn native_streaming_warm_up_does_not_block_audio_ingest() {
+async fn native_streaming_warm_up_keeps_audio_admission_closed_until_ready() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     let warm_calls = Arc::new(AtomicUsize::new(0));
@@ -2164,6 +2432,7 @@ async fn native_streaming_warm_up_does_not_block_audio_ingest() {
         )
         .await
         .unwrap();
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
 
     let started = Instant::now();
     session
@@ -2175,24 +2444,164 @@ async fn native_streaming_warm_up_does_not_block_audio_ingest() {
         "Warm must be queued asynchronously, not awaited inline"
     );
 
-    tokio::time::timeout(
-        Duration::from_millis(30),
-        session.handle_binary(&vec![0; 640]),
-    )
-    .await
-    .expect("audio ingest must not wait for the slow Warm")
-    .unwrap();
-    assert_eq!(session.next_frame_seq, 2);
+    assert!(session.handle_binary(&vec![0; 640]).await.is_err());
+    assert!(session.carry.is_empty());
+    assert_eq!(session.next_frame_seq, 1);
 
-    let event = recv_native_event(&mut session, &mut event_receiver).await;
-    assert_eq!(event.event_type, "transcript.partial");
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    session.drain_native_streaming_outcomes().await.unwrap();
     assert_eq!(
         warm_calls.load(Ordering::Acquire),
         1,
-        "Warm must actually run (paying the cold build before first speech); \
-         audio queued behind it is processed right after"
+        "Warm must pay the cold build before audio admission"
     );
+    let pre_ready_events = collect_events(&mut event_receiver).await;
+    assert_eq!(
+        first_error_code(&pre_ready_events),
+        Some(RealtimeErrorCode::StartupConfigError)
+    );
+    session
+        .required_stage_readiness
+        .mark_ready(RequiredStage::Asr)
+        .expect("open ASR readiness after warm-up");
+    session.handle_binary(&vec![0; 640]).await.unwrap();
+    let event = recv_native_event(&mut session, &mut event_receiver).await;
+    assert_eq!(event.event_type, "transcript.partial");
+    assert_eq!(session.next_frame_seq, 2);
     session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_id = "moonshine-readiness-barrier-test";
+    let pack_path = temp.path().join("moonshine-readiness-barrier-test.oasr");
+    write_moonshine_streaming_fixture_pack(&pack_path, model_id);
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path),
+    };
+    let (event_sender, mut event_receiver) = mpsc::channel(16);
+    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
+    let lifecycle_factory = ready_native_lifecycle_session_factory(
+        session.session_id.clone(),
+        model_id,
+        true,
+        false,
+        false,
+    );
+    let (warm_started_tx, warm_started_rx) = std::sync::mpsc::channel();
+    let (warm_release_tx, warm_release_rx) = std::sync::mpsc::channel();
+    let warm_release_rx = Arc::new(Mutex::new(warm_release_rx));
+    session.test_native_streaming_session_factory = Some(Arc::new(move || {
+        Ok(Box::new(GatedWarmNativeSession {
+            inner: lifecycle_factory()?,
+            warm_started: warm_started_tx.clone(),
+            warm_release: Arc::clone(&warm_release_rx),
+        }) as Box<dyn NativeAsrSession>)
+    }));
+
+    let mut start = Box::pin(session.start_session(StartSession {
+        model: Some(model_id.to_string()),
+        source_name: Some("Live".to_string()),
+        partial_results: Some(true),
+        ..StartSession::default()
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match warm_started_rx.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("native warm worker exited before signalling readiness work")
+                }
+            }
+            tokio::select! {
+                result = start.as_mut() => {
+                    panic!("session.start returned before gated warm-up: {result:?}")
+                }
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    })
+    .await
+    .expect("session.start should reach native warm-up");
+
+    assert!(
+        event_receiver.try_recv().is_err(),
+        "session lifecycle must remain unpublished while required warm-up is pending"
+    );
+    warm_release_tx.send(()).unwrap();
+    start.as_mut().await.unwrap();
+    drop(start);
+
+    session
+        .required_stage_readiness
+        .ensure_audio_ready()
+        .expect("successful native warm-up must open audio admission");
+    let lifecycle = collect_events(&mut event_receiver)
+        .await
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            "session.created",
+            "session.configured",
+            "audio.input.started"
+        ]
+    );
+    session.handle_binary(&vec![0; 640]).await.unwrap();
+    let event = recv_native_event(&mut session, &mut event_receiver).await;
+    assert_eq!(event.event_type, "transcript.partial");
+    session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_warm_failure_is_startup_fatal_and_publishes_no_lifecycle_or_audio() {
+    let (event_sender, mut event_receiver) = mpsc::channel(16);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+    session
+        .attach_native_streaming_session(
+            test_native_streaming_worker_key("warm-failure-readiness"),
+            Box::new(WarmFailingNativeSession {
+                inner: TestServerNativeSession::new(session.session_id.0.clone()),
+            }),
+        )
+        .await
+        .expect("attach warm-failing fixture");
+
+    let result = session
+        .complete_native_streaming_readiness(Vec::new())
+        .await;
+
+    assert!(result.is_err());
+    assert!(session.carry.is_empty());
+    assert_eq!(session.next_frame_seq, 1);
+    assert_eq!(session.next_frame_start_ms, 0);
+    assert!(session.handle_binary(&vec![0; 640]).await.is_err());
+    assert!(session.carry.is_empty());
+    assert_eq!(session.next_frame_seq, 1);
+    let events = collect_events(&mut event_receiver).await;
+    assert_eq!(
+        first_error_code(&events),
+        Some(RealtimeErrorCode::BackendCrashed)
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.event_type,
+            "session.created" | "session.configured" | "audio.input.started"
+        )),
+        "warm-up failure must not publish an audio-ready lifecycle"
+    );
+    if let Some(worker) = session.native_streaming.take() {
+        worker.detach_cancel();
+    }
 }
 
 #[tokio::test]
@@ -2932,8 +3341,10 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
         "OPENASR_NATIVE_STREAMING_SMOKE_MAX_FIRST_PARTIAL_PREFIX_WER",
         0.0,
     );
-    let max_session_start_ms =
-        env_u64("OPENASR_NATIVE_STREAMING_SMOKE_MAX_SESSION_START_MS", 1_000);
+    let max_session_start_ms = env_u64(
+        "OPENASR_NATIVE_STREAMING_SMOKE_MAX_SESSION_START_MS",
+        120_000,
+    );
     let pre_audio_idle_ms = env_u64("OPENASR_NATIVE_STREAMING_SMOKE_PRE_AUDIO_IDLE_MS", 0);
     let frame_pace_ms = env_u64("OPENASR_NATIVE_STREAMING_SMOKE_FRAME_PACE_MS", 0);
     let expected_final_text = std::env::var("OPENASR_NATIVE_STREAMING_SMOKE_EXPECTED_FINAL")
@@ -2963,7 +3374,18 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
     let session_start_ms = session_start_started.elapsed().as_millis() as u64;
     assert!(
         session_start_ms <= max_session_start_ms,
-        "session.start took {session_start_ms}ms, above {max_session_start_ms}ms; warm-up must stay asynchronous"
+        "session.start took {session_start_ms}ms, above {max_session_start_ms}ms; required-stage preparation must finish before audio admission"
+    );
+    session
+        .required_stage_readiness
+        .ensure_audio_ready()
+        .expect("real runtime warm-up must open the ASR readiness barrier");
+    assert!(
+        !session
+            .native_command_watchdogs
+            .iter()
+            .any(|(kind, _)| *kind == NativeStreamingCommandKind::Warm),
+        "session.start must not return with native warm-up still pending"
     );
 
     let frame_samples = 320;
@@ -2971,22 +3393,10 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
     let mut events = Vec::new();
     let pre_audio_idle_started = Instant::now();
     if pre_audio_idle_ms > 0 {
-        let deadline = pre_audio_idle_started + Duration::from_millis(pre_audio_idle_ms);
-        loop {
-            session.drain_native_streaming_outcomes().await.unwrap();
-            while let Ok(event) = event_receiver.try_recv() {
-                events.push(event);
-            }
-            let warm_pending = session
-                .native_command_watchdogs
-                .iter()
-                .any(|(kind, _)| *kind == NativeStreamingCommandKind::Warm);
-            if !warm_pending || Instant::now() >= deadline {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            tokio::time::sleep(remaining.min(Duration::from_millis(20))).await;
-        }
+        // Warm-up is now part of session.start. Preserve this knob as a true
+        // post-readiness idle interval so the smoke can also prove that a
+        // prepared resident session remains usable before its first frame.
+        tokio::time::sleep(Duration::from_millis(pre_audio_idle_ms)).await;
         session.drain_native_streaming_outcomes().await.unwrap();
         while let Ok(event) = event_receiver.try_recv() {
             events.push(event);
@@ -2997,6 +3407,10 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
         .native_command_watchdogs
         .iter()
         .any(|(kind, _)| *kind == NativeStreamingCommandKind::Warm);
+    assert!(
+        !warm_pending_after_pre_audio_idle,
+        "audio admission cannot open while real runtime warm-up is pending"
+    );
     let audio_started_at = Instant::now();
     let mut first_partial_wall_ms = None;
     let mut final_wall_ms = None;
@@ -3750,6 +4164,13 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
     };
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
+    session.test_native_streaming_session_factory = Some(ready_native_lifecycle_session_factory(
+        session.session_id.clone(),
+        model_id,
+        true,
+        false,
+        false,
+    ));
 
     session
         .start_session(StartSession {
@@ -4146,7 +4567,7 @@ async fn session_start_rejects_translation_without_hymt2_pack() {
 }
 
 #[tokio::test]
-async fn translation_async_init_does_not_block_session_start_and_announces_ready() {
+async fn session_start_waits_for_required_translation_readiness_without_publishing_lifecycle() {
     let (event_sender, mut event_receiver) = mpsc::channel(32);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     let (release_init_sender, release_init_receiver) = std::sync::mpsc::channel::<()>();
@@ -4167,17 +4588,36 @@ async fn translation_async_init_does_not_block_session_start_and_announces_ready
             })
     }));
 
-    // session.start must be accepted while the translation model is still
-    // loading: this is the cold-load-off-critical-path contract.
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
+    // Keep polling session.start while the worker initializes. The future is
+    // intentionally pending, and no lifecycle event may advertise an
+    // audio-ready session yet.
+    let mut start = Box::pin(session.start_session(StartSession {
+        model: Some("whisper-large-v3-turbo".to_string()),
+        language: Some("zh".to_string()),
+        translation: Some(translation_options_enabled()),
+        ..StartSession::default()
+    }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), start.as_mut())
+            .await
+            .is_err(),
+        "session.start must remain pending while a required translation stage initializes"
+    );
+    let pre_ready_events = collect_events(&mut event_receiver).await;
+    assert!(
+        !pre_ready_events.iter().any(|event| matches!(
+            event.event_type,
+            "session.created" | "session.configured" | "audio.input.started" | "translation.status"
+        )),
+        "no audio-ready lifecycle may escape before every required stage is ready: {pre_ready_events:?}"
+    );
+
+    release_init_sender.send(()).expect("release init");
+    start
+        .as_mut()
         .await
-        .expect("start while translation worker is still initializing");
+        .expect("session.start succeeds after translation readiness");
+    drop(start);
     let startup_events = collect_events(&mut event_receiver).await;
     assert!(
         startup_events
@@ -4185,13 +4625,13 @@ async fn translation_async_init_does_not_block_session_start_and_announces_ready
             .any(|event| event.event_type == "session.created")
     );
     assert!(
-        !startup_events
+        startup_events
             .iter()
-            .any(|event| event.event_type == "translation.status"),
-        "ready must not be announced before the worker finished loading"
+            .any(|event| event.event_type == "audio.input.started")
     );
 
-    // Source transcripts arriving during the load are buffered, not dropped.
+    // Source reaches translation only after the shared readiness barrier has
+    // opened; there is no pre-ready transcript buffering/replay path.
     session
         .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
             "我们需要保持流式路径很快。",
@@ -4199,9 +4639,7 @@ async fn translation_async_init_does_not_block_session_start_and_announces_ready
             500,
         )))
         .await
-        .expect("emit transcript final during load");
-
-    release_init_sender.send(()).expect("release init");
+        .expect("emit transcript final after readiness");
     session
         .drain_translation_until_idle()
         .await
@@ -4225,7 +4663,7 @@ async fn translation_async_init_does_not_block_session_start_and_announces_ready
             RealtimeEvent::Translation(RealtimeTranslationEvent::Final(event)) => Some(event),
             _ => None,
         })
-        .expect("buffered source translated after init");
+        .expect("post-ready source translated");
     assert_eq!(translation_final.text, "en:我们需要保持流式路径很快。");
 
     // The announcement is one-shot.
@@ -4242,7 +4680,7 @@ async fn translation_async_init_does_not_block_session_start_and_announces_ready
 }
 
 #[tokio::test]
-async fn translation_async_init_failure_fails_session_via_error_event() {
+async fn required_translation_init_failure_rejects_session_before_lifecycle_or_audio() {
     let (event_sender, mut event_receiver) = mpsc::channel(32);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     session.test_translation_worker = Some(fake_translation_worker(|request| {
@@ -4258,29 +4696,15 @@ async fn translation_async_init_failure_fails_session_via_error_event() {
         })
     }));
 
-    session
+    let result = session
         .start_session(StartSession {
             model: Some("whisper-large-v3-turbo".to_string()),
             language: Some("zh".to_string()),
             translation: Some(translation_options_enabled()),
             ..StartSession::default()
         })
-        .await
-        .expect("start is accepted before the load failure is known");
-    let _ = collect_events(&mut event_receiver).await;
-
-    // The failure must surface as a session-fatal error on the next drain.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if session.drain_translation_outputs().await.is_err() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "translation init failure never surfaced"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        .await;
+    assert!(result.is_err(), "required-stage failure must reject start");
 
     let events = collect_events(&mut event_receiver).await;
     assert_eq!(
@@ -4296,11 +4720,16 @@ async fn translation_async_init_failure_fails_session_via_error_event() {
         .expect("translation load failure error");
     assert!(message.contains("Hy-MT2 runtime could not be loaded"));
     assert!(
-        !events
-            .iter()
-            .any(|event| event.event_type == "translation.status"),
-        "a failed load must never claim readiness"
+        !events.iter().any(|event| matches!(
+            event.event_type,
+            "session.created" | "session.configured" | "audio.input.started" | "translation.status"
+        )),
+        "a failed required stage must publish neither readiness nor session lifecycle"
     );
+    assert!(session.carry.is_empty());
+    assert_eq!(session.next_frame_seq, 1);
+    assert_eq!(session.next_frame_start_ms, 0);
+    assert!(session.controller.is_none());
 }
 
 #[tokio::test]
@@ -4898,6 +5327,18 @@ fn true_streaming_sessions_use_native_for_live_and_dictation() {
         capabilities
     ));
     assert!(should_use_native_streaming_session(None, capabilities));
+}
+
+#[test]
+fn file_per_utterance_fallback_is_mock_only_and_rejects_native_wiring_drift() {
+    assert!(
+        prepare_file_per_utterance_fallback_asr(openasr_core::BackendKind::Mock).is_ok(),
+        "the allocation-free mock backend may become synchronously ready"
+    );
+    let error = prepare_file_per_utterance_fallback_asr(openasr_core::BackendKind::Native)
+        .expect_err("native must never defer real model preparation to the first utterance");
+    assert!(error.contains("true-streaming executor"));
+    assert!(error.contains("before audio admission"));
 }
 
 #[test]

@@ -464,7 +464,10 @@ fn streaming_matches_batch_transcribe() {
         hardware_target: NativeAsrHardwareTarget::Cpu,
         ..Default::default()
     };
-    let mut session = StreamingSession::new(&pack, cfg).expect("start streaming session");
+    let execution_services =
+        crate::models::native_execution_services::test_native_execution_services();
+    let mut session = StreamingSession::new(Arc::clone(&execution_services), &pack, cfg)
+        .expect("start streaming session");
     let mut partial_count = 0usize;
     let mut last_partial_len = 0usize;
     let mut growing = 0usize;
@@ -490,7 +493,7 @@ fn streaming_matches_batch_transcribe() {
     let model_pack =
         NativeAsrModelPackRef::new(identity.model_id, adapter.model_family(), pack.clone());
     let batch = NativeAsrExecutor::transcribe(
-        &NativeBackendExecutor,
+        &NativeBackendExecutor::new(execution_services),
         &adapter,
         &model_pack,
         NativeAsrHardwareTarget::Cpu,

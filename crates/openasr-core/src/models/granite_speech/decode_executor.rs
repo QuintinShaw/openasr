@@ -27,7 +27,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 
-use super::decode_session::GraniteSpeechDecodeSession;
+use super::decode_session::{GraniteSpeechDecodeSession, GraniteSpeechKvCacheCapacity};
 use super::decoder_graph::{
     GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, GraniteSpeechDecoderWeightProvider,
     embed_token_row,
@@ -78,6 +78,7 @@ pub(crate) struct GraniteSpeechDecodeStepExecutor<'p> {
     backend: GgmlCpuGraphBackend,
     session: Option<GraniteSpeechDecodeSession>,
     prompt_len: usize,
+    capacity: GraniteSpeechKvCacheCapacity,
 }
 
 impl<'p> GraniteSpeechDecodeStepExecutor<'p> {
@@ -85,6 +86,7 @@ impl<'p> GraniteSpeechDecodeStepExecutor<'p> {
         config: GraniteSpeechDecoderConfig,
         provider: &'p dyn GraniteSpeechDecoderWeightProvider,
         backend: GgmlCpuGraphBackend,
+        capacity: GraniteSpeechKvCacheCapacity,
     ) -> Self {
         Self {
             config,
@@ -92,6 +94,7 @@ impl<'p> GraniteSpeechDecodeStepExecutor<'p> {
             backend,
             session: None,
             prompt_len: 0,
+            capacity,
         }
     }
 }
@@ -124,7 +127,11 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
         let mut session = GraniteSpeechDecodeSession::new(self.config, self.provider, self.backend)
             .map_err(map_step_error(input.step_index, "text"))?;
         let logits = session
-            .prefill(&embeddings, input.initial_prompt_tokens.len())
+            .prefill(
+                &embeddings,
+                input.initial_prompt_tokens.len(),
+                self.capacity,
+            )
             .map_err(map_step_error(input.step_index, "text"))?;
         self.prompt_len = input.initial_prompt_tokens.len();
         self.session = Some(session);
@@ -151,6 +158,7 @@ pub(crate) struct GraniteSpeechAudioDecodeStepExecutor<'p> {
     initial_prompt_embeddings: Vec<f32>,
     session: Option<GraniteSpeechDecodeSession>,
     prompt_len: usize,
+    capacity: GraniteSpeechKvCacheCapacity,
 }
 
 impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
@@ -164,6 +172,7 @@ impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
         provider: &'p dyn GraniteSpeechDecoderWeightProvider,
         backend: GgmlCpuGraphBackend,
         initial_prompt_embeddings: Vec<f32>,
+        capacity: GraniteSpeechKvCacheCapacity,
     ) -> Self {
         Self {
             config,
@@ -172,6 +181,7 @@ impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
             initial_prompt_embeddings,
             session: None,
             prompt_len: 0,
+            capacity,
         }
     }
 }
@@ -201,6 +211,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
             .prefill(
                 &self.initial_prompt_embeddings,
                 input.initial_prompt_tokens.len(),
+                self.capacity,
             )
             .map_err(map_step_error(input.step_index, "audio"))?;
         self.prompt_len = input.initial_prompt_tokens.len();
@@ -231,6 +242,7 @@ pub(crate) struct GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
     initial_prompt_embeddings: Vec<f32>,
     prompt_len: usize,
     prefilled: bool,
+    capacity: GraniteSpeechKvCacheCapacity,
 }
 
 impl<'s> GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
@@ -238,6 +250,7 @@ impl<'s> GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
         session: &'s mut GraniteSpeechDecodeSession,
         provider: &'s dyn GraniteSpeechDecoderWeightProvider,
         initial_prompt_embeddings: Vec<f32>,
+        capacity: GraniteSpeechKvCacheCapacity,
     ) -> Self {
         Self {
             session,
@@ -245,6 +258,7 @@ impl<'s> GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
             initial_prompt_embeddings,
             prompt_len: 0,
             prefilled: false,
+            capacity,
         }
     }
 }
@@ -274,6 +288,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
             .prefill(
                 &self.initial_prompt_embeddings,
                 input.initial_prompt_tokens.len(),
+                self.capacity,
             )
             .map_err(map_step_error(input.step_index, "audio"))?;
         self.prompt_len = input.initial_prompt_tokens.len();
@@ -405,6 +420,11 @@ mod tests {
         // driver's `eot_token_id` stop check does the same (the generated
         // list it returns also includes the token that triggered the stop).
         let eot_token_id = 100_257u32;
+        let logical_positions =
+            crate::capacity::decode_schedule::greedy_self_kv_positions(prompt.len(), 16)
+                .expect("test decode schedule");
+        let kv_capacity = GraniteSpeechKvCacheCapacity::new(logical_positions, logical_positions)
+            .expect("test KV capacity");
 
         let decode_config = Seq2SeqGreedyDecodeConfig {
             initial_prompt_tokens: prompt,
@@ -417,8 +437,12 @@ mod tests {
             phrase_biases: vec![],
         };
 
-        let mut executor =
-            GraniteSpeechDecodeStepExecutor::new(config, &weights, GgmlCpuGraphBackend::Cpu);
+        let mut executor = GraniteSpeechDecodeStepExecutor::new(
+            config,
+            &weights,
+            GgmlCpuGraphBackend::Cpu,
+            kv_capacity,
+        );
 
         let decode_text_token_ids =
             |_token_ids: &[u32]| -> Result<String, Seq2SeqGreedyDecodeError> { Ok(String::new()) };
@@ -542,6 +566,13 @@ mod tests {
             .expect("build prompt");
 
         let eot_token_id = 100_257u32;
+        let logical_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+            prompt_token_ids.len(),
+            max_generated_tokens,
+        )
+        .expect("test decode schedule");
+        let kv_capacity = GraniteSpeechKvCacheCapacity::new(logical_positions, logical_positions)
+            .expect("test KV capacity");
         let decode_config = Seq2SeqGreedyDecodeConfig {
             initial_prompt_tokens: prompt_token_ids,
             eot_token_id,
@@ -558,6 +589,7 @@ mod tests {
             &decoder_weights,
             GgmlCpuGraphBackend::Cpu,
             prompt_embeddings,
+            kv_capacity,
         );
 
         let decode_text_token_ids =

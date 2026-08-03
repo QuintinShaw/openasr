@@ -152,6 +152,52 @@ pub(crate) struct GraniteSpeechEncoderRuntime {
 }
 
 impl GraniteSpeechEncoderRuntime {
+    pub(crate) fn quoted_system_memory_bytes(
+        config: &GraniteSpeechEncoderConfig,
+    ) -> Result<(u64, u64), String> {
+        let retained = config
+            .num_layers
+            .checked_mul(std::mem::size_of::<(GgmlStaticTensor, GgmlStaticTensor)>())
+            .ok_or_else(|| "granite encoder handle quote overflowed".to_string())?;
+        let upload_entries = config
+            .num_layers
+            .checked_mul(2)
+            .and_then(|count| {
+                count.checked_mul(std::mem::size_of::<(
+                    GgmlStaticTensor,
+                    Vec<f32>,
+                    &'static str,
+                )>())
+            })
+            .ok_or_else(|| "granite encoder upload descriptor quote overflowed".to_string())?;
+        // At the final layer, all prior folded scale/bias vectors remain in
+        // `uploads` while gamma/beta/mean/variance and the new scale/bias are
+        // simultaneously live: 2*N + 4 vectors in total.
+        let value_vectors = config
+            .num_layers
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(4))
+            .and_then(|count| count.checked_mul(config.conv_inner_dim()))
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "granite encoder BN construction quote overflowed".to_string())?;
+        let peak = retained
+            .checked_add(upload_entries)
+            .and_then(|bytes| bytes.checked_add(value_vectors))
+            .ok_or_else(|| "granite encoder construction peak quote overflowed".to_string())?;
+        Ok((
+            u64::try_from(peak)
+                .map_err(|_| "granite encoder peak quote exceeds u64".to_string())?,
+            u64::try_from(retained)
+                .map_err(|_| "granite encoder retained quote exceeds u64".to_string())?,
+        ))
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.bn_affines, "granite encoder BN handle pairs")?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn new(
         source: &GgmlRuntimeSource,
         config: &GraniteSpeechEncoderConfig,

@@ -15,19 +15,22 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::fmt;
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::path::PathBuf;
 
-use crate::GgmlRuntimeSource;
-use crate::PhraseBiasConfig;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{OpenAsrArchitectureRegistry, SENSEVOICE_GGML_ARCHITECTURE_ID};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout,
+};
 use crate::models::ctc_greedy_decode::{CtcGreedyDecodeError, CtcGreedyDecodeResult};
 use crate::models::ctc_streaming_driver::build_ctc_streaming_driver;
 use crate::models::decode_policy_component_registry::{
@@ -39,26 +42,34 @@ use crate::models::ggml_asr_executor::{
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::runtime_cache_coordinator::PackContentKey;
+use crate::models::runtime_memory::checked_sum;
+use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner, SystemMemoryOwnerError,
 };
+use crate::{GgmlRuntimeSource, PhraseBiasConfig};
 use crate::{NativeAsrSession, SENSEVOICE_GGML_ADAPTER_ID};
 
 use super::encoder_graph::{SenseVoiceEncoderGraph, build_sensevoice_encoder_input};
-use super::encoder_weights::load_sensevoice_encoder_weights;
+use super::encoder_weights::{load_sensevoice_encoder_weights, plan_sensevoice_system_memory};
 use super::frontend::{SenseVoiceFbankFrontend, apply_cmvn, apply_lfr};
+use super::graph_config::sensevoice_encoder_graph_config;
 use super::language::build_sensevoice_prompt;
 use super::runtime_contract::{SenseVoiceExecutionMetadata, parse_sensevoice_execution_metadata};
 use super::tokenizer::SenseVoiceTokenizer;
 use super::{SenseVoiceTagShadow, strip_sensevoice_tag_prefix};
 
-type SenseVoiceRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+type SenseVoiceRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type SenseVoiceRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<SenseVoiceRuntimeCacheKey, SenseVoicePreparedRuntime>;
+type SenseVoiceRuntimeActor =
+    PinnedRuntimeActorCheckout<SenseVoiceRuntimeCacheKey, SenseVoicePreparedRuntime>;
 
-thread_local! {
-    static SENSEVOICE_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<SenseVoiceRuntimeCacheKey, SenseVoicePreparedRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
+const SENSEVOICE_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
+const SENSEVOICE_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 4;
 
 const SENSEVOICE_STREAMING_EXECUTOR_ID: &str = "sensevoice-ggml-snapshot-streaming-executor-v1";
 
@@ -94,6 +105,25 @@ struct SenseVoicePreparedRuntime {
     cmvn_inv_stddev: Vec<f32>,
 }
 
+impl SenseVoicePreparedRuntime {
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut direct = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        direct.add_vec(&self.prompt_embed, "sensevoice prompt embedding clone")?;
+        direct.add_vec(&self.cmvn_neg_mean, "sensevoice CMVN mean clone")?;
+        direct.add_vec(&self.cmvn_inv_stddev, "sensevoice CMVN stddev clone")?;
+        checked_sum(
+            [
+                self.tokenizer.retained_system_memory_bytes()?,
+                self.graph.retained_system_memory_bytes()?,
+                direct.finish(),
+            ],
+            "sensevoice",
+            "runtime retained bytes",
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SenseVoiceTranscription {
     pub text: String,
@@ -103,18 +133,15 @@ pub(crate) struct SenseVoiceTranscription {
     pub language: Option<String>,
 }
 
-fn build_sensevoice_prepared_runtime(
+fn materialize_sensevoice_prepared_runtime(
     runtime_source: &GgmlRuntimeSource,
+    reader: &crate::ggml_runtime::GgufTensorDataReader,
+    gguf_metadata: &crate::ggml_runtime::GgufMetadata,
+    metadata: SenseVoiceExecutionMetadata,
     backend: GgmlCpuGraphBackend,
 ) -> Result<SenseVoicePreparedRuntime, String> {
-    let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
-        .map_err(|e| e.to_string())?;
-    let gguf_metadata = crate::ggml_runtime::read_gguf_metadata_from_runtime_source(runtime_source)
-        .map_err(|e| e.to_string())?;
-    let metadata =
-        parse_sensevoice_execution_metadata(&gguf_metadata).map_err(|e| e.to_string())?;
-    let tokenizer = SenseVoiceTokenizer::from_metadata(&gguf_metadata)?;
-    let weights = load_sensevoice_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
+    let tokenizer = SenseVoiceTokenizer::from_metadata(gguf_metadata)?;
+    let weights = load_sensevoice_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_sensevoice_block_stack(metadata, weights.enc_layers.len())?;
     let prompt_embed = weights.prompt_embed.values.clone();
     let cmvn_neg_mean = weights.cmvn_neg_mean.values.clone();
@@ -256,42 +283,185 @@ fn strip_tags_in_result(mut result: CtcGreedyDecodeResult) -> CtcGreedyDecodeRes
 }
 
 fn decode_sensevoice_pcm_cached(
+    runtime_pool: &SenseVoiceRuntimePool,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &SENSEVOICE_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_sensevoice_prepared_runtime(runtime_source, backend),
-        |runtime| runtime.decode_result(samples, language, phrase_bias),
-    )
+    let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
+    let samples = samples.to_vec();
+    let language = language.map(str::to_owned);
+    let phrase_bias = phrase_bias.cloned();
+    actor
+        .call_mut(move |runtime| {
+            runtime.decode_result(&samples, language.as_deref(), phrase_bias.as_ref())
+        })
+        .map_err(|error| error.to_string())?
 }
 
 fn transcribe_sensevoice_pcm_cached(
+    runtime_pool: &SenseVoiceRuntimePool,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
 ) -> Result<SenseVoiceTranscription, String> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &SENSEVOICE_RUNTIME_BY_KEY,
+    let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
+    let samples = samples.to_vec();
+    let language = language.map(str::to_owned);
+    let phrase_bias = phrase_bias.cloned();
+    actor
+        .call_mut(move |runtime| {
+            runtime.transcribe(&samples, language.as_deref(), phrase_bias.as_ref())
+        })
+        .map_err(|error| error.to_string())?
+}
+
+fn new_sensevoice_runtime_pool() -> Arc<SenseVoiceRuntimePool> {
+    Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+        "openasr-sensevoice-runtime-owner",
+        AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            SENSEVOICE_RUNTIME_MAX_IDLE_ENTRIES,
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+            SENSEVOICE_RUNTIME_MAX_INSTANCES_PER_KEY,
+        ),
+    ))
+}
+
+fn checkout_sensevoice_prepared_runtime(
+    runtime_pool: &SenseVoiceRuntimePool,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    resolved_backend: GgmlCpuGraphBackend,
+) -> Result<SenseVoiceRuntimeActor, String> {
+    let backend = sensevoice_encoder_graph_config(resolved_backend).backend;
+    let key = (
+        PackContentKey::for_runtime_source(&preflight.runtime_source),
+        current_execution_lane_key(backend),
+    );
+    let preflight = preflight.clone();
+    let pack_content_id = preflight.runtime_source.content_id().to_string();
+    runtime_pool.checkout_or_try_build_with(
         key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_sensevoice_prepared_runtime(runtime_source, backend),
-        |runtime| runtime.transcribe(samples, language, phrase_bias),
+        move || {
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+                .map_err(|error| error.to_string())?;
+            let metadata = parse_sensevoice_execution_metadata(&preflight.metadata)
+                .map_err(|error| error.to_string())?;
+            let quote = sensevoice_runtime_system_memory_quote(
+                &preflight.metadata,
+                &preflight.tensor_index,
+                metadata,
+                &pack_content_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((
+                quote.retained_bytes,
+                (preflight, reader, metadata, quote, backend),
+            ))
+        },
+        |(preflight, reader, metadata, quote, backend)| {
+            let measured_peak = quote.peak_bytes;
+            match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let runtime = materialize_sensevoice_prepared_runtime(
+                    &preflight.runtime_source,
+                    &reader,
+                    &preflight.metadata,
+                    metadata,
+                    backend,
+                )?;
+                let retained = runtime.retained_system_memory_bytes()?;
+                Ok(SystemMemoryAllocationOutcome::new(
+                    runtime,
+                    measured_peak,
+                    retained,
+                ))
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(reason)) => Err(reason),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(error.to_string())
+                }
+            }
+        },
+        |error| error.to_string(),
+    )
+}
+
+fn sensevoice_runtime_system_memory_quote(
+    gguf_metadata: &crate::ggml_runtime::GgufMetadata,
+    tensor_index: &crate::GgufTensorIndex,
+    metadata: SenseVoiceExecutionMetadata,
+    pack_content_id: &str,
+) -> Result<SystemMemoryAllocationQuote, SystemMemoryOwnerError> {
+    let tokenizer_bytes =
+        crate::models::runtime_memory::tokenizer_btree_quote_bytes(gguf_metadata, "sensevoice")?;
+    let plan = plan_sensevoice_system_memory(tensor_index, metadata)?;
+    let cloned_frontend_bytes = checked_sum(
+        [
+            plan.prompt_embed_bytes,
+            plan.cmvn_neg_mean_bytes,
+            plan.cmvn_inv_stddev_bytes,
+        ],
+        "sensevoice",
+        "quoted frontend clones",
+    )?;
+    let retained_bytes = checked_sum(
+        [
+            tokenizer_bytes,
+            plan.graph_retained_bytes,
+            cloned_frontend_bytes,
+        ],
+        "sensevoice",
+        "quoted runtime retained bytes",
+    )?;
+    let graph_construction_bytes = checked_sum(
+        [
+            plan.weights_stable_bytes,
+            cloned_frontend_bytes,
+            plan.graph_retained_bytes,
+        ],
+        "sensevoice",
+        "quoted graph construction bytes",
+    )?;
+    let peak_bytes = tokenizer_bytes
+        .checked_add(plan.weights_peak_bytes.max(graph_construction_bytes))
+        .ok_or_else(|| {
+            SystemMemoryOwnerError::capacity_failure(
+                "sensevoice_runtime_quote",
+                "quoted runtime peak overflowed",
+            )
+        })?;
+    SystemMemoryAllocationQuote::new(
+        format!("sensevoice-prepared-runtime:{pack_content_id}"),
+        peak_bytes,
+        retained_bytes,
     )
 }
 
 /// Dedicated GgmlAsrViewExecutor for sensevoice (DedicatedRuntimeExecutorV1).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SenseVoiceGgmlExecutor;
+#[derive(Clone)]
+pub(crate) struct SenseVoiceGgmlExecutor {
+    runtime_pool: Arc<SenseVoiceRuntimePool>,
+}
+
+impl fmt::Debug for SenseVoiceGgmlExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SenseVoiceGgmlExecutor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for SenseVoiceGgmlExecutor {
+    fn default() -> Self {
+        Self {
+            runtime_pool: new_sensevoice_runtime_pool(),
+        }
+    }
+}
 
 impl SenseVoiceGgmlExecutor {
     fn execute_ctc_result(
@@ -307,8 +477,9 @@ impl SenseVoiceGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         decode_sensevoice_pcm_cached(
+            &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight.runtime_source,
+            &preflight,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
@@ -325,6 +496,14 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
 
     fn supports_phrase_bias(&self) -> bool {
         true
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
     }
 
     fn execute_view(
@@ -345,8 +524,9 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_sensevoice_pcm_cached(
+            &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight.runtime_source,
+            &preflight,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
@@ -381,6 +561,10 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
             carry_context: None,
             decode_truncation: None,
         })
+    }
+
+    fn unload_idle_state(&self) {
+        self.runtime_pool.clear();
     }
 }
 
@@ -418,6 +602,10 @@ impl GgmlAsrStreamingExecutor for SenseVoiceGgmlExecutor {
             driver,
         )?;
         Ok(Box::new(session))
+    }
+
+    fn unload_idle_state(&self) {
+        self.runtime_pool.clear();
     }
 }
 
@@ -478,13 +666,21 @@ mod tests {
             panic!("no data chunk in {name}");
         };
 
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(&pack)
+                .expect("runtime preflight");
         let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        let runtime_pool = new_sensevoice_runtime_pool();
         let zh = read_wav("zh.wav");
-        let zh_out =
-            transcribe_sensevoice_pcm_cached(&zh, &runtime_source, Some("zh"), None, backend)
-                .expect("zh transcribe");
+        let zh_out = transcribe_sensevoice_pcm_cached(
+            runtime_pool.as_ref(),
+            &zh,
+            &preflight,
+            Some("zh"),
+            None,
+            backend,
+        )
+        .expect("zh transcribe");
         eprintln!(
             "sensevoice zh: {:?} (lang {:?})",
             zh_out.text, zh_out.language
@@ -508,9 +704,15 @@ mod tests {
         assert_eq!(zh_out.language.as_deref(), Some("zh"));
 
         let en = read_wav("en.wav");
-        let en_out =
-            transcribe_sensevoice_pcm_cached(&en, &runtime_source, Some("en"), None, backend)
-                .expect("en transcribe");
+        let en_out = transcribe_sensevoice_pcm_cached(
+            runtime_pool.as_ref(),
+            &en,
+            &preflight,
+            Some("en"),
+            None,
+            backend,
+        )
+        .expect("en transcribe");
         eprintln!(
             "sensevoice en: {:?} (lang {:?})",
             en_out.text, en_out.language
@@ -535,8 +737,15 @@ mod tests {
         }
 
         // auto (LID): zh clip must detect zh.
-        let auto_out = transcribe_sensevoice_pcm_cached(&zh, &runtime_source, None, None, backend)
-            .expect("auto transcribe");
+        let auto_out = transcribe_sensevoice_pcm_cached(
+            runtime_pool.as_ref(),
+            &zh,
+            &preflight,
+            None,
+            None,
+            backend,
+        )
+        .expect("auto transcribe");
         eprintln!(
             "sensevoice auto: {:?} (lang {:?})",
             auto_out.text, auto_out.language
@@ -575,16 +784,32 @@ mod tests {
         // Warm (load + first decode), then measure steady-state decodes. Reads
         // `OPENASR_GGML_BACKEND` (see the doc comment above) so this probe can
         // report either the CPU or the Metal figure.
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(&pack)
+                .expect("runtime preflight");
         let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
-        transcribe_sensevoice_pcm_cached(&samples, &runtime_source, Some("en"), None, backend)
-            .expect("warm");
+        let runtime_pool = new_sensevoice_runtime_pool();
+        transcribe_sensevoice_pcm_cached(
+            runtime_pool.as_ref(),
+            &samples,
+            &preflight,
+            Some("en"),
+            None,
+            backend,
+        )
+        .expect("warm");
         let runs = 3;
         let start = std::time::Instant::now();
         for _ in 0..runs {
-            transcribe_sensevoice_pcm_cached(&samples, &runtime_source, Some("en"), None, backend)
-                .expect("run");
+            transcribe_sensevoice_pcm_cached(
+                runtime_pool.as_ref(),
+                &samples,
+                &preflight,
+                Some("en"),
+                None,
+                backend,
+            )
+            .expect("run");
         }
         let per_run = start.elapsed().as_secs_f32() / runs as f32;
         eprintln!(

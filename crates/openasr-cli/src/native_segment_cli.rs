@@ -25,6 +25,7 @@ pub(super) fn expand_transcribe_inputs(inputs: &[PathBuf]) -> Result<(Vec<PathBu
 /// then prints a summary. With `continue_on_error`, per-file failures are
 /// collected and reported instead of stopping at the first.
 pub(super) fn transcribe_many(
+    native_execution_services: &Arc<NativeExecutionServices>,
     prepared_run: &PreparedBackendRun,
     files: &[PathBuf],
     output_dir: &Path,
@@ -55,7 +56,7 @@ pub(super) fn transcribe_many(
     let mut outputs = Vec::new();
     let mut failures = Vec::new();
     for file in files {
-        match transcribe_batch_item(file, &context) {
+        match transcribe_batch_item(native_execution_services, file, &context) {
             Ok(output) => outputs.push(output),
             Err(error) if options.continue_on_error => failures.push(BatchFailure {
                 input_path: file.clone(),
@@ -109,6 +110,7 @@ pub(super) fn transcribe_many(
 }
 
 pub(super) fn transcribe_batch_item(
+    native_execution_services: &Arc<NativeExecutionServices>,
     input_path: &Path,
     context: &BatchRunContext<'_>,
 ) -> Result<BatchOutput> {
@@ -123,7 +125,8 @@ pub(super) fn transcribe_batch_item(
     print_audio_input_notes(prepared.original());
     print_audio_preparation_notes(&prepared);
     let request = batch_item_transcription_request(input_path, context, &prepared);
-    let transcription = transcribe_with_backend(context.backend_kind, request)?;
+    let transcription =
+        transcribe_with_backend(native_execution_services, context.backend_kind, request)?;
     let written = write_rendered_formats(
         &transcription,
         context.formats,
@@ -203,6 +206,7 @@ fn benchmark_format_from_response_format(format: ResponseFormat) -> BenchmarkFor
 /// Runs one transcription and prints timing metadata (elapsed, audio duration,
 /// real-time factor) instead of the transcript. Backs `transcribe --benchmark`.
 pub(super) fn run_benchmark(
+    native_execution_services: &Arc<NativeExecutionServices>,
     prepared_run: &PreparedBackendRun,
     file: &Path,
     format: ResponseFormat,
@@ -227,7 +231,11 @@ pub(super) fn run_benchmark(
     };
     let request = benchmark_transcription_request(prepared_run, file, longform, &prepared);
     let started = Instant::now();
-    let transcription = transcribe_with_backend(prepared_run.backend_kind, request)?;
+    let transcription = transcribe_with_backend(
+        native_execution_services,
+        prepared_run.backend_kind,
+        request,
+    )?;
     let elapsed = started.elapsed();
 
     let audio_duration_seconds = prepared.duration_seconds();
@@ -521,6 +529,7 @@ pub(super) fn resolve_serve_model_source(
 }
 
 pub(super) async fn serve(
+    native_execution_services: Arc<NativeExecutionServices>,
     addr: SocketAddr,
     model: Option<&str>,
     backend_kind: Option<BackendKind>,
@@ -600,8 +609,9 @@ pub(super) async fn serve(
         addr,
         openasr_server::ServerRuntime {
             backend,
-            native_execution: openasr_server::NativeExecutionSupervisor::new(
+            native_execution: openasr_server::NativeExecutionSupervisor::with_execution_services(
                 max_native_sessions_per_model,
+                native_execution_services,
             ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
@@ -713,6 +723,7 @@ pub(super) fn resolve_native_runtime_model_id_from_source(
 }
 
 pub(crate) fn transcribe_with_backend(
+    native_execution_services: &Arc<NativeExecutionServices>,
     backend_kind: BackendKind,
     request: TranscriptionRequest,
 ) -> Result<openasr_core::Transcription> {
@@ -720,7 +731,9 @@ pub(crate) fn transcribe_with_backend(
         BackendKind::Mock => transcribe_with_mock_backend(request).map_err(Into::into),
         BackendKind::Native => {
             configure_native_cpu_inference_threads();
-            NativeBackend.transcribe(request).map_err(Into::into)
+            NativeBackend::new(Arc::clone(native_execution_services))
+                .transcribe(request)
+                .map_err(Into::into)
         }
     }
 }
@@ -909,6 +922,7 @@ fn diarization_supported(backend: BackendKind, model_pack_path: Option<&Path>) -
 }
 
 pub(super) fn ensure_cli_diarization_packs_installed(
+    native_execution_services: &Arc<NativeExecutionServices>,
     backend: BackendKind,
     model_pack_path: Option<&Path>,
     diarize: bool,
@@ -943,6 +957,7 @@ pub(super) fn ensure_cli_diarization_packs_installed(
         })?;
 
     install_cli_capability_pack_if_missing(
+        native_execution_services,
         &installed_packs,
         &catalog,
         required_embedder,
@@ -950,6 +965,7 @@ pub(super) fn ensure_cli_diarization_packs_installed(
         &source_chain,
     )?;
     install_cli_capability_pack_if_missing(
+        native_execution_services,
         &installed_packs,
         &catalog,
         required_segmenter,
@@ -982,6 +998,7 @@ pub(super) fn ensure_word_timestamps_alignment_supported(
 /// auto-install above -- `approximate` (or an omitted flag) never touches the
 /// network.
 pub(super) fn ensure_cli_word_timestamps_pack_installed(
+    native_execution_services: &Arc<NativeExecutionServices>,
     backend: BackendKind,
     word_timestamps_mode: Option<WordTimestampsMode>,
 ) -> Result<()> {
@@ -1006,6 +1023,7 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
     })?;
 
     install_cli_capability_pack_if_missing(
+        native_execution_services,
         &installed_packs,
         &catalog,
         required_pack,
@@ -1015,6 +1033,7 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
 }
 
 fn install_cli_capability_pack_if_missing(
+    native_execution_services: &Arc<NativeExecutionServices>,
     installed_packs: &[openasr_core::InstalledPack],
     catalog: &openasr_core::ModelCatalog,
     model: &openasr_core::CatalogModel,
@@ -1041,10 +1060,11 @@ fn install_cli_capability_pack_if_missing(
     if let Some(message) = crate::pull_cli::automatic_pull_license_refusal(&resolved) {
         bail!(message);
     }
-    install_cli_capability_pack(&resolved, home, source_chain)
+    install_cli_capability_pack(native_execution_services, &resolved, home, source_chain)
 }
 
 fn install_cli_capability_pack(
+    native_execution_services: &Arc<NativeExecutionServices>,
     resolved: &openasr_core::ResolvedCatalogPull,
     home: &Path,
     source_chain: &[openasr_core::DownloadSource],
@@ -1056,6 +1076,7 @@ fn install_cli_capability_pack(
     let mut reporter = crate::progress::PullReporter::new(&resolved.pull);
     let progress = |event| reporter.on(event);
     openasr_core::PullModelPackRequest::new(resolved, home)
+        .execution_services(native_execution_services.as_ref())
         .sources(source_chain)
         .execute(progress)?;
     Ok(())
@@ -1337,6 +1358,13 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tower::ServiceExt;
+
+    fn test_native_execution_services() -> Arc<NativeExecutionServices> {
+        Arc::new(
+            NativeExecutionServices::for_local_process()
+                .expect("test execution services must construct"),
+        )
+    }
 
     fn sample_wav_fixture_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1833,14 +1861,17 @@ mod tests {
         let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
 
         // Neither absent nor approximate ever touches the catalog/network.
-        ensure_cli_word_timestamps_pack_installed(BackendKind::Native, None)
+        let execution_services = test_native_execution_services();
+        ensure_cli_word_timestamps_pack_installed(&execution_services, BackendKind::Native, None)
             .expect("no word-timestamps request never installs a pack");
         ensure_cli_word_timestamps_pack_installed(
+            &execution_services,
             BackendKind::Native,
             Some(WordTimestampsMode::Approximate),
         )
         .expect("approximate word timestamps never install the forced-aligner pack");
         ensure_cli_word_timestamps_pack_installed(
+            &execution_services,
             BackendKind::Mock,
             Some(WordTimestampsMode::Aligned),
         )

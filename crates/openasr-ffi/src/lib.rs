@@ -41,11 +41,12 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::{Arc, OnceLock};
 
 use openasr_core::{
-    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrHardwareTarget, NativeBackend, StreamingConfig,
-    StreamingEvent, StreamingEventKind, StreamingSession, Transcription, TranscriptionBackend,
-    TranscriptionRequest, validate_local_native_model_pack_path,
+    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrHardwareTarget, NativeBackend, NativeExecutionServices,
+    StreamingConfig, StreamingEvent, StreamingEventKind, StreamingSession, Transcription,
+    TranscriptionBackend, TranscriptionRequest, validate_local_native_model_pack_path,
 };
 
 /// Model-market C ABI: fetch/verify the signed catalog, pull (download +
@@ -57,6 +58,12 @@ mod market;
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
+
+/// All C ABI handles share one lazily-created process root. `OpenAsrEngine`
+/// makes that ownership explicit for new callers; compatibility entry points
+/// route through the same root because their signatures cannot receive it.
+static PROCESS_EXECUTION_SERVICES: OnceLock<Result<Arc<NativeExecutionServices>, String>> =
+    OnceLock::new();
 
 pub(crate) fn set_last_error(message: impl Into<String>) {
     let message = message.into();
@@ -127,6 +134,8 @@ pub enum OpenAsrStatus {
     /// A pull was stopped because the caller's cancel callback returned true.
     /// Any partial download is cleaned up; nothing is installed.
     PullCanceled = 8,
+    /// The process-owned native execution services could not be constructed.
+    InitializationFailed = 9,
 }
 
 /// PCM sample encoding accepted by [`openasr_transcribe_pcm`].
@@ -147,8 +156,13 @@ pub enum OpenAsrPcmFormat {
 /// own per-request load path), so the handle's job is to validate the pack
 /// once up front and fail closed before any transcription is attempted with a
 /// bad path.
+pub struct OpenAsrEngine {
+    execution_services: Arc<NativeExecutionServices>,
+}
+
 pub struct OpenAsrModel {
     pack_path: PathBuf,
+    execution_services: Arc<NativeExecutionServices>,
 }
 
 struct OwnedSegment {
@@ -282,6 +296,90 @@ pub extern "C" fn openasr_version() -> *const c_char {
         .as_ptr()
 }
 
+pub(crate) fn process_execution_services(
+    context: &str,
+) -> Result<Arc<NativeExecutionServices>, OpenAsrStatus> {
+    match PROCESS_EXECUTION_SERVICES.get_or_init(|| {
+        NativeExecutionServices::for_local_process()
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(services) => Ok(Arc::clone(services)),
+        Err(reason) => {
+            set_last_error(format!("{context}: {reason}"));
+            Err(OpenAsrStatus::InitializationFailed)
+        }
+    }
+}
+
+/// Creates the explicit process-owned execution root shared by batch,
+/// streaming, model-market eviction, and idle unload. Free it with
+/// [`openasr_engine_free`] after every dependent handle has been released.
+///
+/// # Safety
+/// `out_engine` must point to writable storage for one `*mut OpenAsrEngine`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_engine_create(
+    out_engine: *mut *mut OpenAsrEngine,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::InitializationFailed, || {
+        if out_engine.is_null() {
+            set_last_error("openasr_engine_create: out_engine must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: checked non-null above.
+        unsafe { *out_engine = ptr::null_mut() };
+        let execution_services = match process_execution_services("openasr_engine_create") {
+            Ok(execution_services) => execution_services,
+            Err(status) => return status,
+        };
+        // SAFETY: checked non-null above.
+        unsafe {
+            *out_engine = Box::into_raw(Box::new(OpenAsrEngine { execution_services }));
+        }
+        OpenAsrStatus::Ok
+    })
+}
+
+/// Frees an engine handle. Null is accepted and is a no-op. Dependent model,
+/// catalog, and streaming handles retain their own `Arc`, so destruction order
+/// is safe, though callers should normally release dependents first.
+///
+/// # Safety
+/// `engine`, if non-null, must be a live handle from [`openasr_engine_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_engine_free(engine: *mut OpenAsrEngine) {
+    let _ = catch(OpenAsrStatus::Ok, || {
+        if !engine.is_null() {
+            // SAFETY: required by the function contract.
+            drop(unsafe { Box::from_raw(engine) });
+        }
+        OpenAsrStatus::Ok
+    });
+}
+
+/// Releases idle native runtime caches owned by `engine` while preserving the
+/// engine and its memory broker for later requests.
+///
+/// # Safety
+/// `engine` must be a live handle from [`openasr_engine_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_engine_unload_idle_runtime_caches(
+    engine: *const OpenAsrEngine,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::InitializationFailed, || {
+        if engine.is_null() {
+            set_last_error("openasr_engine_unload_idle_runtime_caches: engine must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: required by the function contract.
+        unsafe { &*engine }
+            .execution_services
+            .unload_idle_native_model_runtime_caches();
+        OpenAsrStatus::Ok
+    })
+}
+
 /// Loads (validates) a local `.oasr` model pack and returns an opaque handle
 /// through `out_model`. Fails closed -- with [`OpenAsrStatus::ModelLoadFailed`]
 /// and no handle written -- if the path is missing, not UTF-8, a directory, or
@@ -296,35 +394,80 @@ pub unsafe extern "C" fn openasr_model_open(
     out_model: *mut *mut OpenAsrModel,
 ) -> OpenAsrStatus {
     catch(OpenAsrStatus::ModelLoadFailed, || {
-        if out_model.is_null() {
-            set_last_error("openasr_model_open: out_model must not be null");
-            return OpenAsrStatus::InvalidArgument;
-        }
-        // SAFETY: caller contract requires `out_model` to be a valid pointer.
-        unsafe {
-            *out_model = ptr::null_mut();
-        }
-        let path = match unsafe { c_str_to_path(path) } {
-            Ok(path) => path,
+        let execution_services = match process_execution_services("openasr_model_open") {
+            Ok(execution_services) => execution_services,
             Err(status) => return status,
         };
-        match validate_local_native_model_pack_path(&path) {
-            Ok(validated) => {
-                let handle = Box::new(OpenAsrModel {
-                    pack_path: validated,
-                });
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_model = Box::into_raw(handle);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                set_last_error(format!("openasr_model_open: {error}"));
-                OpenAsrStatus::ModelLoadFailed
-            }
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            open_model_with_services(execution_services, path, out_model, "openasr_model_open")
         }
     })
+}
+
+/// Engine-aware form of [`openasr_model_open`]. Every model opened from the
+/// same engine participates in the same execution policy and memory broker.
+///
+/// # Safety
+/// `engine` must be a live handle from [`openasr_engine_create`]; the remaining
+/// arguments follow [`openasr_model_open`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_model_open_with_engine(
+    engine: *const OpenAsrEngine,
+    path: *const c_char,
+    out_model: *mut *mut OpenAsrModel,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::ModelLoadFailed, || {
+        if engine.is_null() {
+            set_last_error("openasr_model_open_with_engine: engine must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: required by the function contract.
+        let execution_services = Arc::clone(&unsafe { &*engine }.execution_services);
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            open_model_with_services(
+                execution_services,
+                path,
+                out_model,
+                "openasr_model_open_with_engine",
+            )
+        }
+    })
+}
+
+unsafe fn open_model_with_services(
+    execution_services: Arc<NativeExecutionServices>,
+    path: *const c_char,
+    out_model: *mut *mut OpenAsrModel,
+    context: &str,
+) -> OpenAsrStatus {
+    if out_model.is_null() {
+        set_last_error(format!("{context}: out_model must not be null"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    // SAFETY: checked non-null above.
+    unsafe { *out_model = ptr::null_mut() };
+    // SAFETY: inherited from the caller.
+    let path = match unsafe { c_str_to_path(path) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    match validate_local_native_model_pack_path(&path) {
+        Ok(validated) => {
+            let handle = Box::new(OpenAsrModel {
+                pack_path: validated,
+                execution_services,
+            });
+            // SAFETY: checked non-null above.
+            unsafe { *out_model = Box::into_raw(handle) };
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            set_last_error(format!("{context}: {error}"));
+            OpenAsrStatus::ModelLoadFailed
+        }
+    }
 }
 
 /// Frees a handle returned by [`openasr_model_open`]. Null is accepted and is
@@ -455,7 +598,7 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
 
         let request = ffi_transcription_request(staging_path, model_ref.pack_path.clone());
 
-        match NativeBackend.transcribe(request) {
+        match NativeBackend::new(Arc::clone(&model_ref.execution_services)).transcribe(request) {
             Ok(transcription) => {
                 let result = Box::new(build_result(transcription, with_segments));
                 // SAFETY: checked non-null above.
@@ -614,37 +757,93 @@ pub unsafe extern "C" fn openasr_streaming_session_open(
     out_session: *mut *mut OpenAsrStreamingSession,
 ) -> OpenAsrStatus {
     catch(OpenAsrStatus::ModelLoadFailed, || {
-        if out_session.is_null() {
-            set_last_error("openasr_streaming_session_open: out_session must not be null");
-            return OpenAsrStatus::InvalidArgument;
-        }
-        // SAFETY: caller contract requires `out_session` to be a valid pointer.
+        let execution_services = match process_execution_services("openasr_streaming_session_open")
+        {
+            Ok(execution_services) => execution_services,
+            Err(status) => return status,
+        };
+        // SAFETY: forwarded from this function's contract.
         unsafe {
-            *out_session = ptr::null_mut();
-        }
-        let path = match unsafe { c_str_to_path(path) } {
-            Ok(path) => path,
-            Err(status) => return status,
-        };
-        let cfg = match unsafe { streaming_config_from_c(config) } {
-            Ok(cfg) => cfg,
-            Err(status) => return status,
-        };
-        match StreamingSession::new(&path, cfg) {
-            Ok(session) => {
-                let handle = Box::new(OpenAsrStreamingSession { inner: session });
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_session = Box::into_raw(handle);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                set_last_error(format!("openasr_streaming_session_open: {error}"));
-                OpenAsrStatus::ModelLoadFailed
-            }
+            open_streaming_session_with_services(
+                execution_services,
+                path,
+                config,
+                out_session,
+                "openasr_streaming_session_open",
+            )
         }
     })
+}
+
+/// Engine-aware form of [`openasr_streaming_session_open`]. Offline and
+/// streaming handles opened from one engine share runtime caches and device
+/// memory accounting.
+///
+/// # Safety
+/// `engine` must be a live handle from [`openasr_engine_create`]; the remaining
+/// arguments follow [`openasr_streaming_session_open`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_session_open_with_engine(
+    engine: *const OpenAsrEngine,
+    path: *const c_char,
+    config: *const OpenAsrStreamingConfig,
+    out_session: *mut *mut OpenAsrStreamingSession,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::ModelLoadFailed, || {
+        if engine.is_null() {
+            set_last_error("openasr_streaming_session_open_with_engine: engine must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: required by the function contract.
+        let execution_services = Arc::clone(&unsafe { &*engine }.execution_services);
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            open_streaming_session_with_services(
+                execution_services,
+                path,
+                config,
+                out_session,
+                "openasr_streaming_session_open_with_engine",
+            )
+        }
+    })
+}
+
+unsafe fn open_streaming_session_with_services(
+    execution_services: Arc<NativeExecutionServices>,
+    path: *const c_char,
+    config: *const OpenAsrStreamingConfig,
+    out_session: *mut *mut OpenAsrStreamingSession,
+    context: &str,
+) -> OpenAsrStatus {
+    if out_session.is_null() {
+        set_last_error(format!("{context}: out_session must not be null"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    // SAFETY: checked non-null above.
+    unsafe { *out_session = ptr::null_mut() };
+    // SAFETY: inherited from caller.
+    let path = match unsafe { c_str_to_path(path) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    // SAFETY: inherited from caller.
+    let cfg = match unsafe { streaming_config_from_c(config) } {
+        Ok(cfg) => cfg,
+        Err(status) => return status,
+    };
+    match StreamingSession::new(execution_services, &path, cfg) {
+        Ok(session) => {
+            let handle = Box::new(OpenAsrStreamingSession { inner: session });
+            // SAFETY: checked non-null above.
+            unsafe { *out_session = Box::into_raw(handle) };
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            set_last_error(format!("{context}: {error}"));
+            OpenAsrStatus::ModelLoadFailed
+        }
+    }
 }
 
 /// Feeds a chunk of 16 kHz mono `f32` PCM (any length, including zero) into an
@@ -1193,6 +1392,63 @@ mod tests {
     }
 
     #[test]
+    fn engine_handle_owns_one_shareable_execution_root() {
+        let mut engine: *mut OpenAsrEngine = ptr::null_mut();
+        // SAFETY: `engine` is a valid writable out-parameter.
+        assert_eq!(
+            unsafe { openasr_engine_create(&mut engine) },
+            OpenAsrStatus::Ok
+        );
+        assert!(!engine.is_null());
+
+        // SAFETY: the create call above returned a live engine handle.
+        let engine_ref = unsafe { &*engine };
+        let dependent = OpenAsrModel {
+            pack_path: PathBuf::from("/nonexistent/model.oasr"),
+            execution_services: Arc::clone(&engine_ref.execution_services),
+        };
+        assert!(Arc::ptr_eq(
+            &engine_ref.execution_services,
+            &dependent.execution_services
+        ));
+        assert_eq!(
+            // SAFETY: `engine` remains live until the free below.
+            unsafe { openasr_engine_unload_idle_runtime_caches(engine) },
+            OpenAsrStatus::Ok
+        );
+
+        // Dependents retain the service root, so freeing the engine first is
+        // memory-safe and does not invalidate their owned Arc.
+        // SAFETY: `engine` came from `openasr_engine_create` and is freed once.
+        unsafe { openasr_engine_free(engine) };
+        assert!(Arc::strong_count(&dependent.execution_services) >= 2);
+    }
+
+    #[test]
+    fn compatibility_entry_points_share_one_process_execution_root() {
+        let first = process_execution_services("ffi legacy root test").unwrap();
+        let second = process_execution_services("ffi legacy root test").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn engine_entry_points_reject_null_handles_and_out_params() {
+        // SAFETY: null is intentionally supplied for the invalid out-parameter case.
+        assert_eq!(
+            unsafe { openasr_engine_create(ptr::null_mut()) },
+            OpenAsrStatus::InvalidArgument
+        );
+        assert!(last_error().contains("out_engine"));
+
+        // SAFETY: null is intentionally supplied for the invalid handle case.
+        assert_eq!(
+            unsafe { openasr_engine_unload_idle_runtime_caches(ptr::null()) },
+            OpenAsrStatus::InvalidArgument
+        );
+        assert!(last_error().contains("engine"));
+    }
+
+    #[test]
     fn model_open_rejects_null_out_param() {
         let path = StdCString::new("/nonexistent/model.oasr").unwrap();
         // SAFETY: `path` is a valid C string; passing a null `out_model`
@@ -1264,6 +1520,8 @@ mod tests {
         // wants to isolate the latter.
         let fake_model = Box::into_raw(Box::new(OpenAsrModel {
             pack_path: PathBuf::from("/nonexistent/model.oasr"),
+            execution_services: process_execution_services("ffi test")
+                .expect("builtin native execution services must construct for tests"),
         }));
         let samples = [0i16; 8_000];
         let mut result: *mut OpenAsrResult = ptr::null_mut();

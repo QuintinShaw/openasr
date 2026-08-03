@@ -1,14 +1,12 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::api::native::NativeStreamingTranscriptEmitter;
-use crate::arch::emits_punctuation_for_model_architecture;
 use crate::models::firered_punc::config::PUNC_LABELS;
-use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
-use crate::models::firered_punc::runtime::SendableFireRedPuncRuntime;
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrStreamingSessionConfig, GgmlAsrStreamingSessionRequest,
+    GgmlAsrExecutionError, GgmlAsrStreamingFinalTextProcessorSlot, GgmlAsrStreamingSessionConfig,
+    GgmlAsrStreamingSessionRequest,
 };
-use crate::punctuation::{PunctuationError, should_apply_punctuation};
+use crate::punctuation::PunctuationError;
 use crate::realtime::events::realtime_timestamp_now;
 use crate::{
     NativeAsrError, NativeAsrRequestOptions, NativeAsrSession, NativeAsrStreamingSessionConfig,
@@ -22,15 +20,6 @@ use crate::{
 /// per revision and reintroduces caption flicker).
 pub(crate) type StreamingFinalPunctuator =
     Box<dyn Fn(&str) -> Result<String, PunctuationError> + Send>;
-
-/// Whether the punctuation stage applies to this model architecture: same
-/// capability fact the batch path reads from the pack's
-/// `general.architecture` (see `model_emits_punctuation` in
-/// `native_transcribe`), sourced here from the already-selected adapter
-/// descriptor so no pack re-read is needed.
-fn streaming_punctuation_stage_applies(model_architecture: &str) -> bool {
-    should_apply_punctuation(emits_punctuation_for_model_architecture(model_architecture))
-}
 
 /// Whether `c` is one of FireRedPunc's *sentence-ending* marks. Its full
 /// label space (`PUNC_LABELS`) is `<none>`, `，`, `。`, `？`, `！`; the comma
@@ -61,26 +50,6 @@ fn strip_soft_boundary_terminal(text: &str) -> String {
     let mut result: String = chars.into_iter().collect();
     result.push_str(trailing_ws);
     result
-}
-
-/// Streaming counterpart of the batch `apply_punctuation_stage_if_applicable`
-/// gate, resolved once at session construction: the stage activates only for
-/// a model family the catalog honestly declares unpunctuated AND when the
-/// FireRedPunc capability pack is installed ("pack installed => stage on",
-/// no protocol field). A missing or unloadable pack deactivates the stage
-/// (fail-closed, never an error); the loaded runtime is cached on the session
-/// so finals do not reload BERT weights.
-fn resolve_streaming_final_punctuator(
-    request: &GgmlAsrStreamingSessionRequest,
-) -> Option<StreamingFinalPunctuator> {
-    if !streaming_punctuation_stage_applies(request.selected_family.model_architecture) {
-        return None;
-    }
-    let pack_path = resolve_firered_punc_pack_path()?;
-    let runtime =
-        SendableFireRedPuncRuntime::from_pack(&pack_path, request.resolved_runtime.backend())
-            .ok()?;
-    Some(Box::new(move |text| runtime.punctuate(text)))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,10 +181,10 @@ where
     emitter: NativeStreamingTranscriptEmitter,
     driver: D,
     clock: Box<dyn FnMut() -> String + Send>,
-    /// FINAL-segment punctuation stage (see [`StreamingFinalPunctuator`]);
-    /// `None` when the stage does not apply to this model family or no
-    /// FireRedPunc pack is installed.
-    final_punctuator: Option<StreamingFinalPunctuator>,
+    /// Session-stable FINAL-text stage. Its policy owner lives above this
+    /// family-neutral transcript module; this session only applies it at the
+    /// single FINAL emission seam.
+    final_text_processor: Option<GgmlAsrStreamingFinalTextProcessorSlot>,
     queued_audio_frames: usize,
     closed: bool,
 }
@@ -246,7 +215,7 @@ where
             request,
             driver,
             Box::new(realtime_timestamp_now),
-            resolve_streaming_final_punctuator(request),
+            None,
         )
     }
 
@@ -269,6 +238,25 @@ where
         final_punctuator: Option<StreamingFinalPunctuator>,
     ) -> Result<Self, GgmlAsrExecutionError> {
         let adapter_id = request.selected_family.adapter_id;
+        let final_text_processor = match final_punctuator {
+            Some(punctuator) => {
+                let punctuator = std::sync::Mutex::new(punctuator);
+                let slot = GgmlAsrStreamingFinalTextProcessorSlot::default();
+                slot.install(std::sync::Arc::new(move |text| {
+                    punctuator
+                        .lock()
+                        .map_err(|_| "test streaming punctuator is poisoned".to_string())?(
+                        text
+                    )
+                    .map_err(|error| error.to_string())
+                }))
+                .map_err(|reason| {
+                    GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, reason)
+                })?;
+                Some(slot)
+            }
+            None => request.final_text_processor.clone(),
+        };
         let native_options = NativeAsrRequestOptions::new()
             .with_language(request.request_options.language.clone())
             .with_prompt(request.request_options.prompt.clone())
@@ -304,7 +292,7 @@ where
             emitter,
             driver,
             clock,
-            final_punctuator,
+            final_text_processor,
             queued_audio_frames: 0,
             closed: false,
         })
@@ -336,8 +324,8 @@ where
     /// `emitter.finalize_pending_output_at` from anywhere else in this
     /// session, or a final can bypass the stage.
     fn punctuate_final_update(&self, update: &mut TranscriptUpdate, is_hard_boundary: bool) {
-        if let Some(punctuate) = &self.final_punctuator
-            && let Ok(punctuated) = punctuate(&update.text)
+        if let Some(processor) = &self.final_text_processor
+            && let Ok(punctuated) = processor.process(&update.text)
         {
             update.text = if is_hard_boundary {
                 punctuated
@@ -642,7 +630,6 @@ mod tests {
     use std::{collections::VecDeque, path::PathBuf};
 
     use super::*;
-    use crate::models::ggml_family_registry::firered_aed_runtime_descriptor_v1;
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, RealtimeEvent, RealtimeTranscriptEvent,
         qwen3_asr_runtime_descriptor_v1,
@@ -704,6 +691,9 @@ mod tests {
 
     fn request(partial_results: bool) -> GgmlAsrStreamingSessionRequest {
         GgmlAsrStreamingSessionRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
             runtime_source_preflight: None,
             selected_family: qwen3_asr_runtime_descriptor_v1(),
@@ -714,6 +704,7 @@ mod tests {
                 (GgmlAsrBackendPreference::Auto).request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
+            final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_transcript_session"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(partial_results)
@@ -943,20 +934,6 @@ mod tests {
             &["transcript.final", "audio.input.started"],
         );
         assert_transcript_text(&second_finalized[0], "second final", 4);
-    }
-
-    #[test]
-    fn punctuation_stage_applies_only_to_unpunctuated_architectures() {
-        // Same capability fact as the batch gate: firered (catalog
-        // emits_punctuation = false) opts in; qwen (already punctuates) and
-        // unknown architectures stay off.
-        assert!(streaming_punctuation_stage_applies(
-            firered_aed_runtime_descriptor_v1().model_architecture
-        ));
-        assert!(!streaming_punctuation_stage_applies(
-            qwen3_asr_runtime_descriptor_v1().model_architecture
-        ));
-        assert!(!streaming_punctuation_stage_applies("no-such-architecture"));
     }
 
     #[test]

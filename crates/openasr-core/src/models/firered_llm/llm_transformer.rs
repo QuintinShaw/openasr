@@ -31,14 +31,18 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::GgufTensorDataReadError;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReadError, GgufTensorDataReader};
 use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenFamilyLlmLayerTensorNames,
-    load_llm_logits_head_from_reader_with_tensor_names,
-    load_qwen_family_llm_layer_attention_projection_generic,
+    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
+};
+#[cfg(test)]
+use crate::models::qwen::{
+    Qwen3AsrLlmLayerAttentionProjection, load_qwen_family_llm_layer_attention_projection_generic,
 };
 
 use super::runtime_contract::{
@@ -47,6 +51,88 @@ use super::runtime_contract::{
 use super::tensor_names::{
     LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, qwen2_llm_layer_tensor_names,
 };
+
+/// Quotes the host-memory shape retained by one FireRed-LLM decoder actor.
+///
+/// The actor owns only Rust-side graph handles and the small f32 fallback
+/// matrices. GGUF tensor payloads are views into the request's already-open
+/// mmap, so their file-backed bytes are deliberately absent from this quote;
+/// only the payload metadata vectors/strings are counted. The native ggml
+/// arenas and backend allocations are admitted by their graph constructors,
+/// not duplicated here.
+///
+/// `peak_bytes` differs from `retained_bytes` only for a quantized
+/// hidden-major token embedding. That compatibility path first materializes a
+/// source f32 matrix and then transposes it into the retained token-major
+/// matrix, so both matrices are live during construction. All arithmetic is
+/// checked because malformed GGUF dimensions must fail closed rather than
+/// wrap into an under-quote.
+pub(crate) fn quoted_firered_llm_decoder_system_memory_bytes(
+    reader: &GgufTensorDataReader,
+    metadata: &FireRedLlmDecoderMetadata,
+    backend: GgmlCpuGraphBackend,
+) -> Result<(u64, u64), String> {
+    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
+        metadata.n_layers,
+    )?;
+    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
+        metadata.n_layers,
+        |layer_index| {
+            let names = qwen2_llm_layer_tensor_names(layer_index);
+            QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_out_weight,
+                q_norm_name: None,
+                k_norm_name: None,
+                q_bias_name: Some(names.attn_q_bias),
+                k_bias_name: Some(names.attn_k_bias),
+                v_bias_name: Some(names.attn_v_bias),
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            }
+        },
+    )?;
+    let (logits_peak, logits_retained) =
+        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
+            reader,
+            LLM_OUTPUT_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+            backend,
+        )?;
+    let (embedding_peak, embedding_retained) =
+        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
+            reader,
+            LLM_TOKEN_EMBD_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+        )?;
+    let retained_bytes = graph_retained
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .ok_or_else(|| "firered-llm decoder retained quote overflowed".to_string())?;
+    let logits_phase_peak = plan_transient
+        .checked_add(logits_peak)
+        .ok_or_else(|| "firered-llm logits construction peak quote overflowed".to_string())?;
+    let graph_phase_peak = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(graph_retained))
+        .ok_or_else(|| "firered-llm graph construction peak quote overflowed".to_string())?;
+    let embedding_phase_peak = plan_transient
+        .checked_add(graph_retained)
+        .and_then(|bytes| bytes.checked_add(logits_retained))
+        .and_then(|bytes| bytes.checked_add(embedding_peak))
+        .ok_or_else(|| "firered-llm decoder construction peak quote overflowed".to_string())?;
+    let peak_bytes = logits_phase_peak
+        .max(graph_phase_peak)
+        .max(embedding_phase_peak);
+    Ok((peak_bytes, retained_bytes))
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum FireRedLlmDecoderError {
@@ -64,15 +150,19 @@ pub(crate) enum FireRedLlmDecoderError {
     EmptyPrefillOutput,
 }
 
-fn load_qwen2_layer_projections(
+fn plan_qwen2_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FireRedLlmDecoderMetadata,
-) -> Result<Vec<Qwen3AsrLlmLayerAttentionProjection>, FireRedLlmDecoderError> {
-    let mut projections = Vec::with_capacity(metadata.n_layers);
-    for layer_index in 0..metadata.n_layers {
-        let names = qwen2_llm_layer_tensor_names(layer_index);
-        let generic = load_qwen_family_llm_layer_attention_projection_generic(
-            reader,
+) -> Result<QwenWholeDecoderPlan, FireRedLlmDecoderError> {
+    QwenWholeDecoderPlan::for_qwen_family(
+        reader,
+        metadata.n_layers,
+        metadata.d_model,
+        metadata.n_heads,
+        metadata.n_kv_heads,
+        metadata.head_dim,
+        |layer_index| {
+            let names = qwen2_llm_layer_tensor_names(layer_index);
             QwenFamilyLlmLayerTensorNames {
                 attn_norm_name: names.attn_norm_weight,
                 attn_q_name: names.attn_q_weight,
@@ -92,19 +182,12 @@ fn load_qwen2_layer_projections(
                 ffn_gate_name: names.ffn_gate_weight,
                 ffn_up_name: names.ffn_up_weight,
                 ffn_down_name: names.ffn_down_weight,
-            },
-            metadata.d_model,
-            metadata.n_heads,
-            metadata.n_kv_heads,
-            metadata.head_dim,
-            false,
-        )
-        .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        })?;
-        projections.push(Qwen3AsrLlmLayerAttentionProjection::Generic(generic));
-    }
-    Ok(projections)
+            }
+        },
+    )
+    .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
+        reason: error.to_string(),
+    })
 }
 
 /// The Qwen2 decoder-only stack for one loaded pack: layer weights + logits
@@ -113,6 +196,7 @@ fn load_qwen2_layer_projections(
 pub(crate) struct FireRedLlmDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
+    logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
     token_embedding: Qwen3AsrTokenEmbeddingTable,
     metadata: FireRedLlmDecoderMetadata,
 }
@@ -134,7 +218,7 @@ impl FireRedLlmDecoderRuntime {
     ) -> Result<Self, FireRedLlmDecoderError> {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(map_tensor_read_error)?;
-        let projections = load_qwen2_layer_projections(&reader, &metadata)?;
+        let decoder_plan = plan_qwen2_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
             runtime_source,
@@ -156,9 +240,9 @@ impl FireRedLlmDecoderRuntime {
         // (firered-llm's registered policy has no suppression or phrase bias,
         // so the shared driver can always honor the hint).
         let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_source),
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+                &decoder_plan,
+                runtime_source,
                 FIRERED_LLM_RMS_NORM_EPSILON,
                 logits_head.fused_top1_spec(),
                 backend,
@@ -166,6 +250,11 @@ impl FireRedLlmDecoderRuntime {
             .map_err(|error| FireRedLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
+        let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
+            FireRedLlmDecoderError::LogitsHeadFailed {
+                reason: error.to_string(),
+            }
+        })?;
         let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
             &reader,
             LLM_TOKEN_EMBD_WEIGHT,
@@ -178,6 +267,7 @@ impl FireRedLlmDecoderRuntime {
         Ok(Self {
             whole_decoder,
             logits_head,
+            logits_runtime,
             token_embedding,
             metadata,
         })
@@ -191,6 +281,26 @@ impl FireRedLlmDecoderRuntime {
         self.whole_decoder.backend_label()
     }
 
+    /// Exact post-build Rust container capacity retained by the resident
+    /// decoder actor. Native backend arenas are intentionally excluded: their
+    /// graph constructors own admission for the concrete device/lane.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.whole_decoder.retained_system_memory_bytes()?,
+            "firered-llm decoder graph handles",
+        )?;
+        bytes.add(
+            self.logits_head.retained_system_memory_bytes()?,
+            "firered-llm logits head",
+        )?;
+        bytes.add(
+            self.token_embedding.retained_system_memory_bytes()?,
+            "firered-llm token embedding",
+        )?;
+        Ok(bytes.finish())
+    }
+
     /// Releases the CPU per-token grow-to-fit step buffer this decoder's
     /// runner accumulated over the just-finished decode session/slice.
     /// `store_cached_decoder_runtime`'s caller MUST call this before storing
@@ -201,35 +311,29 @@ impl FireRedLlmDecoderRuntime {
         self.whole_decoder.release_session_scoped_buffers();
     }
 
-    /// `capacity` should be the request-sized bound (prompt tokens + the
-    /// generation budget), NOT the model's native `max_positions` (32768 for
-    /// the Qwen2-7B decoder): `capacity` becomes the persistent reuse
-    /// graph's fixed attention span on Metal/GPU (`run_step_auto` sizes it
-    /// from this cache's `max_positions()`), and that span is a per-token
-    /// COMPUTE cost there, not just a host allocation ceiling -- attending
-    /// over the model's full native context on every token of a
-    /// several-hundred-token ASR utterance is >100x more attention work than
-    /// the utterance needs, and made decode+prefill both regress when a
-    /// prior version of this method sized it to `self.metadata.max_positions`
-    /// unconditionally (measured: prefill 151 tokens 8.4s -> 19.0s, decode
-    /// ~15.8s -> ~25.2s on an M1). Mirrors
-    /// `qwen::ggml_executor`'s own `decode_prompt.token_ids.len()
-    /// .saturating_add(decode_config.max_generated_tokens)` sizing.
-    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+    /// Host history is sized to the current invocation's exact logical bound.
+    /// The stable session reserve is carried separately into the reusable GPU
+    /// graph, so changing chunk length within one envelope neither inflates
+    /// host memory nor rebuilds the resident graph.
+    pub(crate) fn new_kv_caches(
+        &self,
+        capacity: Qwen3AsrKvCacheCapacity,
+    ) -> Result<Qwen3AsrHostKvCacheOwner, String> {
         let host = self.whole_decoder.kv_cache_spec().host;
-        (0..self.metadata.n_layers)
-            .map(|_| {
-                Qwen3AsrLayerKvCacheState::new_with_element_type(
-                    capacity,
-                    self.metadata.n_kv_heads,
-                    self.metadata.head_dim,
-                    host,
-                )
-                .unwrap_or_else(|reason| {
-                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                })
-            })
-            .collect()
+        let mode = if self.whole_decoder.supports_graph_reuse() {
+            Qwen3AsrHostKvMode::ResidentOnly
+        } else {
+            Qwen3AsrHostKvMode::Materialized
+        };
+        Qwen3AsrHostKvCacheOwner::try_new(
+            "firered-llm.decoder.self-kv.host",
+            self.metadata.n_layers,
+            capacity,
+            self.metadata.n_kv_heads,
+            self.metadata.head_dim,
+            host,
+            mode,
+        )
     }
 
     pub(crate) fn gather_token_embedding(
@@ -262,6 +366,7 @@ impl FireRedLlmDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<FireRedLlmPrefillOutput, FireRedLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
@@ -271,6 +376,7 @@ impl FireRedLlmDecoderRuntime {
                 &prompt_embeddings.token_major_values,
                 token_count,
                 layer_kv_caches,
+                capacity,
                 FIRERED_LLM_ROPE_THETA,
                 control,
             )
@@ -291,8 +397,8 @@ impl FireRedLlmDecoderRuntime {
                 });
             }
             let logits = self
-                .logits_head
-                .compute_logits_for_last_hidden(&final_hidden)
+                .logits_runtime
+                .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
                 .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
                 })?;
@@ -313,8 +419,8 @@ impl FireRedLlmDecoderRuntime {
             })?;
         let final_hidden = self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?;
         let logits = self
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden)
+            .logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
             .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })?;
@@ -332,6 +438,7 @@ impl FireRedLlmDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Vec<f32>, FireRedLlmDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
         // `run_step_auto` transparently reuses the persistent decode graph on
@@ -344,6 +451,7 @@ impl FireRedLlmDecoderRuntime {
                 &hidden,
                 cache_position,
                 layer_kv_caches,
+                capacity,
                 FIRERED_LLM_ROPE_THETA,
             )
             .map_err(|error| FireRedLlmDecoderError::GraphFailed {
@@ -356,8 +464,8 @@ impl FireRedLlmDecoderRuntime {
             self.metadata.n_kv_heads * self.metadata.head_dim,
             layer_kv_caches,
         )?;
-        self.logits_head
-            .compute_logits_for_last_hidden(&step.hidden)
+        self.logits_runtime
+            .compute_logits_for_last_hidden(&self.logits_head, &step.hidden)
             .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
@@ -374,16 +482,16 @@ impl FireRedLlmDecoderRuntime {
         token_id: u32,
         cache_position: usize,
         layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Option<u32>, FireRedLlmDecoderError> {
         if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
             return Ok(None);
         }
-        let max_positions = layer_kv_caches
-            .first()
-            .map(Qwen3AsrLayerKvCacheState::max_positions)
-            .ok_or_else(|| FireRedLlmDecoderError::KvCacheFailed {
+        if layer_kv_caches.is_empty() {
+            return Err(FireRedLlmDecoderError::KvCacheFailed {
                 reason: "firered-llm decoder has no layer KV caches".to_string(),
-            })?;
+            });
+        }
         let hidden = self.gather_token_embedding(token_id)?;
         let step = self
             .whole_decoder
@@ -391,7 +499,7 @@ impl FireRedLlmDecoderRuntime {
                 &hidden,
                 &[cache_position],
                 FIRERED_LLM_ROPE_THETA,
-                max_positions,
+                capacity.resident_positions(),
             )
             .map_err(|error| FireRedLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
@@ -751,9 +859,12 @@ mod parity_tests {
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("load logits head");
+        let mut logits_runtime = logits_head
+            .new_runtime(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu)
+            .expect("build logits runtime");
         let final_hidden = deterministic_f32_vec(0xF14A_1000, decoder_metadata.d_model);
-        let logits = logits_head
-            .compute_logits_for_last_hidden(&final_hidden)
+        let logits = logits_runtime
+            .compute_logits_for_last_hidden(&logits_head, &final_hidden)
             .expect("compute final logits");
         write_f32_dump(&dir, "final_norm_lm_head_input", &final_hidden);
         write_f32_dump(&dir, "final_norm_lm_head_output", &logits);

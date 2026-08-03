@@ -1765,7 +1765,9 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_serve_batch_max_native_sessions(
                             request.serve_batch_max_native_sessions,
                         );
-                    let executor = NativeBackendExecutor;
+                    let executor = NativeBackendExecutor::new(Arc::clone(
+                        runtime.native_execution.execution_services(),
+                    ));
                     let mut transcription = NativeAsrExecutor::transcribe(
                         &executor,
                         &adapter,

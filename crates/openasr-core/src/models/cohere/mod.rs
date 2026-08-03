@@ -1,5 +1,6 @@
 mod batched_decode;
 pub(crate) mod capacity;
+mod decode_budget;
 mod decoder_graph;
 mod decoder_weights;
 pub(crate) mod encoder_graph;

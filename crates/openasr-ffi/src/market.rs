@@ -36,16 +36,21 @@
 
 use std::ffi::{CString, c_char, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use openasr_core::{
     CatalogPullRequest, DownloadSourcePref, InstalledPack, LicenseClass, ModelCatalog,
-    ModelInstallLicenseDecision, PullError, PullModelPackRequest, PullProgress,
-    ResolvedCatalogPull, install_model_pack_from_path, list_installed_packs, load_model_catalog,
-    model_install_license_decision, remove_model_pack, resolve_catalog_model_pack_from_path,
+    ModelInstallLicenseDecision, NativeExecutionServices, PullError, PullModelPackRequest,
+    PullProgress, ResolvedCatalogPull,
+    install_catalog_model_pack_from_path_with_execution_services, list_installed_packs,
+    load_model_catalog, model_install_license_decision, remove_model_pack,
+    remove_model_pack_with_execution_services, resolve_catalog_model_pack_from_path,
     resolve_catalog_pull_with_profile, resolve_chain,
 };
 
-use crate::{OpenAsrStatus, c_str_to_path, catch, set_last_error};
+use crate::{
+    OpenAsrEngine, OpenAsrStatus, c_str_to_path, catch, process_execution_services, set_last_error,
+};
 
 /// Opaque handle to a fetched-and-verified model catalog. Obtained from
 /// [`openasr_catalog_fetch`], read as JSON with [`openasr_catalog_json`], passed
@@ -60,6 +65,7 @@ use crate::{OpenAsrStatus, c_str_to_path, catch, set_last_error};
 pub struct OpenAsrCatalog {
     inner: ModelCatalog,
     json: CString,
+    execution_services: Arc<NativeExecutionServices>,
 }
 
 /// The stage a [`openasr_pull_model`], [`openasr_install_local_pack`], or
@@ -129,49 +135,103 @@ pub unsafe extern "C" fn openasr_catalog_fetch(
     out_catalog: *mut *mut OpenAsrCatalog,
 ) -> OpenAsrStatus {
     catch(OpenAsrStatus::CatalogFailed, || {
-        if out_catalog.is_null() {
-            set_last_error("openasr_catalog_fetch: out_catalog must not be null");
-            return OpenAsrStatus::InvalidArgument;
-        }
-        // SAFETY: caller contract requires `out_catalog` to be a valid pointer.
+        let execution_services = match process_execution_services("openasr_catalog_fetch") {
+            Ok(execution_services) => execution_services,
+            Err(status) => return status,
+        };
+        // SAFETY: forwarded from this function's contract.
         unsafe {
-            *out_catalog = ptr::null_mut();
-        }
-        let home = match unsafe { c_str_to_path(home_dir) } {
-            Ok(home) => home,
-            Err(status) => return status,
-        };
-        let url = match unsafe { opt_c_str(catalog_url, "catalog_url") } {
-            Ok(url) => url,
-            Err(status) => return status,
-        };
-        match load_model_catalog(url.as_deref(), &home) {
-            Ok(catalog) => {
-                let json = match serde_json::to_string(&catalog) {
-                    Ok(json) => crate::cstring_lossy(json),
-                    Err(error) => {
-                        set_last_error(format!(
-                            "openasr_catalog_fetch: could not serialize catalog: {error}"
-                        ));
-                        return OpenAsrStatus::CatalogFailed;
-                    }
-                };
-                let handle = Box::new(OpenAsrCatalog {
-                    inner: catalog,
-                    json,
-                });
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_catalog = Box::into_raw(handle);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                set_last_error(format!("openasr_catalog_fetch: {error}"));
-                OpenAsrStatus::CatalogFailed
-            }
+            fetch_catalog_with_services(
+                execution_services,
+                catalog_url,
+                home_dir,
+                out_catalog,
+                "openasr_catalog_fetch",
+            )
         }
     })
+}
+
+/// Engine-aware form of [`openasr_catalog_fetch`]. Pull, install, and removal
+/// operations using this catalog reclaim caches owned by the same engine that
+/// serves batch and streaming requests.
+///
+/// # Safety
+/// `engine` must be a live handle from [`crate::openasr_engine_create`]; the
+/// remaining arguments follow [`openasr_catalog_fetch`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_catalog_fetch_with_engine(
+    engine: *const OpenAsrEngine,
+    catalog_url: *const c_char,
+    home_dir: *const c_char,
+    out_catalog: *mut *mut OpenAsrCatalog,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::CatalogFailed, || {
+        if engine.is_null() {
+            set_last_error("openasr_catalog_fetch_with_engine: engine must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: required by this function's contract.
+        let execution_services = Arc::clone(&unsafe { &*engine }.execution_services);
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            fetch_catalog_with_services(
+                execution_services,
+                catalog_url,
+                home_dir,
+                out_catalog,
+                "openasr_catalog_fetch_with_engine",
+            )
+        }
+    })
+}
+
+unsafe fn fetch_catalog_with_services(
+    execution_services: Arc<NativeExecutionServices>,
+    catalog_url: *const c_char,
+    home_dir: *const c_char,
+    out_catalog: *mut *mut OpenAsrCatalog,
+    context: &str,
+) -> OpenAsrStatus {
+    if out_catalog.is_null() {
+        set_last_error(format!("{context}: out_catalog must not be null"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    // SAFETY: checked non-null above.
+    unsafe { *out_catalog = ptr::null_mut() };
+    // SAFETY: inherited from caller.
+    let home = match unsafe { c_str_to_path(home_dir) } {
+        Ok(home) => home,
+        Err(status) => return status,
+    };
+    // SAFETY: inherited from caller.
+    let url = match unsafe { opt_c_str(catalog_url, "catalog_url") } {
+        Ok(url) => url,
+        Err(status) => return status,
+    };
+    match load_model_catalog(url.as_deref(), &home) {
+        Ok(catalog) => {
+            let json = match serde_json::to_string(&catalog) {
+                Ok(json) => crate::cstring_lossy(json),
+                Err(error) => {
+                    set_last_error(format!("{context}: could not serialize catalog: {error}"));
+                    return OpenAsrStatus::CatalogFailed;
+                }
+            };
+            let handle = Box::new(OpenAsrCatalog {
+                inner: catalog,
+                json,
+                execution_services,
+            });
+            // SAFETY: checked non-null above.
+            unsafe { *out_catalog = Box::into_raw(handle) };
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            set_last_error(format!("{context}: {error}"));
+            OpenAsrStatus::CatalogFailed
+        }
+    }
 }
 
 /// Returns the verified catalog as a UTF-8, NUL-terminated JSON string (the
@@ -336,6 +396,7 @@ pub unsafe extern "C" fn openasr_pull_model(
         };
 
         let result = PullModelPackRequest::new(&resolved, &home)
+            .execution_services(catalog.execution_services.as_ref())
             .sources(&source_chain)
             .cancel(should_cancel)
             .execute(progress);
@@ -461,7 +522,17 @@ unsafe fn install_local_pack_impl(
             set_last_error(format!("{context}: {message}"));
             return OpenAsrStatus::PullFailed;
         }
-        let result = install_model_pack_from_path(&resolved, &source_path, &home, progress);
+        // Keep the explicit catalog/license decision above separate from the
+        // service-aware installer: the former is the trust/consent gate, while
+        // the latter attaches the native execution-service root to the install
+        // transaction and any runtime-cache reclamation it triggers.
+        let result = install_catalog_model_pack_from_path_with_execution_services(
+            &catalog.inner,
+            &source_path,
+            &home,
+            Some(catalog.execution_services.as_ref()),
+            progress,
+        );
         finish_install(result, out_installed_json, context)
     })
 }
@@ -546,36 +617,92 @@ pub unsafe extern "C" fn openasr_remove_model(
     out_removed: *mut bool,
 ) -> OpenAsrStatus {
     catch(OpenAsrStatus::IoError, || {
-        if !out_removed.is_null() {
-            // SAFETY: caller contract requires a writable pointer when non-null.
-            unsafe {
-                *out_removed = false;
-            }
-        }
-        let home = match unsafe { c_str_to_path(home_dir) } {
-            Ok(home) => home,
-            Err(status) => return status,
-        };
-        let reference = match unsafe { required_c_str(reference, "reference") } {
-            Ok(reference) => reference,
-            Err(status) => return status,
-        };
-        match remove_model_pack(&home, &reference) {
-            Ok(removed) => {
-                if !out_removed.is_null() {
-                    // SAFETY: checked non-null above.
-                    unsafe {
-                        *out_removed = removed.is_some();
-                    }
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                set_last_error(format!("openasr_remove_model: {error}"));
-                OpenAsrStatus::IoError
-            }
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            remove_model_with_services(
+                None,
+                home_dir,
+                reference,
+                out_removed,
+                "openasr_remove_model",
+            )
         }
     })
+}
+
+/// Engine-aware form of [`openasr_remove_model`] that immediately reclaims
+/// the removed pack's resident runtime caches from the supplied engine.
+///
+/// # Safety
+/// `engine` must be a live handle from [`crate::openasr_engine_create`]; the
+/// remaining arguments follow [`openasr_remove_model`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_remove_model_with_engine(
+    engine: *const OpenAsrEngine,
+    home_dir: *const c_char,
+    reference: *const c_char,
+    out_removed: *mut bool,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::IoError, || {
+        if engine.is_null() {
+            set_last_error("openasr_remove_model_with_engine: engine must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: required by this function's contract.
+        let execution_services = unsafe { &*engine }.execution_services.as_ref();
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            remove_model_with_services(
+                Some(execution_services),
+                home_dir,
+                reference,
+                out_removed,
+                "openasr_remove_model_with_engine",
+            )
+        }
+    })
+}
+
+unsafe fn remove_model_with_services(
+    execution_services: Option<&NativeExecutionServices>,
+    home_dir: *const c_char,
+    reference: *const c_char,
+    out_removed: *mut bool,
+    context: &str,
+) -> OpenAsrStatus {
+    if !out_removed.is_null() {
+        // SAFETY: caller contract requires a writable pointer when non-null.
+        unsafe { *out_removed = false };
+    }
+    // SAFETY: inherited from caller.
+    let home = match unsafe { c_str_to_path(home_dir) } {
+        Ok(home) => home,
+        Err(status) => return status,
+    };
+    // SAFETY: inherited from caller.
+    let reference = match unsafe { required_c_str(reference, "reference") } {
+        Ok(reference) => reference,
+        Err(status) => return status,
+    };
+    let result = match execution_services {
+        Some(execution_services) => {
+            remove_model_pack_with_execution_services(&home, &reference, Some(execution_services))
+        }
+        None => remove_model_pack(&home, &reference),
+    };
+    match result {
+        Ok(removed) => {
+            if !out_removed.is_null() {
+                // SAFETY: checked non-null above.
+                unsafe { *out_removed = removed.is_some() };
+            }
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            set_last_error(format!("{context}: {error}"));
+            OpenAsrStatus::IoError
+        }
+    }
 }
 
 /// Frees a string returned through an `out_*_json` out-parameter by

@@ -6,7 +6,8 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::fmt;
+use std::sync::Arc;
 
 use crate::GgmlRuntimeSource;
 use crate::PARAKEET_CTC_DECODE_POLICY_ID;
@@ -17,8 +18,10 @@ use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{OpenAsrArchitectureRegistry, PARAKEET_CTC_GGML_ARCHITECTURE_ID};
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader, read_gguf_metadata_from_runtime_source,
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout,
 };
 use crate::models::ctc_greedy_decode::{CtcGreedyDecodeError, CtcGreedyDecodeResult};
 use crate::models::ctc_streaming_driver::build_ctc_streaming_driver;
@@ -31,9 +34,16 @@ use crate::models::ggml_asr_executor::{
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::parakeet_runtime_memory::{
+    FastConformerMemoryTopology, FastConformerSystemMemoryPlan, checked_sum,
+    plan_fastconformer_system_memory, tokenizer_quote_bytes,
+};
+use crate::models::runtime_cache_coordinator::PackContentKey;
+use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner, SystemMemoryOwnerError,
 };
 use crate::{NativeAsrSession, PARAKEET_CTC_GGML_ADAPTER_ID};
 
@@ -45,12 +55,14 @@ use super::runtime_contract::{
 };
 use super::tokenizer::ParakeetTokenizer;
 
-type ParakeetRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+const PARAKEET_CTC_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
+const PARAKEET_CTC_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 4;
 
-thread_local! {
-    static PARAKEET_CTC_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<ParakeetRuntimeCacheKey, ParakeetCtcPreparedRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
+type ParakeetCtcRuntimeKey = (PackContentKey, ExecutionLaneKey);
+type ParakeetCtcRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<ParakeetCtcRuntimeKey, ParakeetCtcPreparedRuntime>;
+type ParakeetCtcRuntimeActor =
+    PinnedRuntimeActorCheckout<ParakeetCtcRuntimeKey, ParakeetCtcPreparedRuntime>;
 
 /// Resolves the parakeet block-stack `layer_count_hparam` against the parsed
 /// metadata (HONESTY CONTRACT: reads the named hparam, NOT `weights.layers.len()`,
@@ -124,59 +136,172 @@ pub(crate) fn transcribe_parakeet_ctc_pcm(
 }
 
 fn transcribe_parakeet_ctc_pcm_cached(
+    runtime_pool: &ParakeetCtcRuntimePool,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetCtcTranscription, String> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &PARAKEET_CTC_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_prepared_runtime(runtime_source, backend),
-        |runtime| runtime.transcribe(samples, phrase_bias, word_timestamps),
-    )
+    let actor = checkout_parakeet_ctc_prepared_runtime(runtime_pool, preflight, backend)?;
+    let samples = samples.to_vec();
+    let phrase_bias = phrase_bias.cloned();
+    actor
+        .call_mut(move |runtime| {
+            runtime.transcribe(&samples, phrase_bias.as_ref(), word_timestamps)
+        })
+        .map_err(|error| error.to_string())?
 }
 
 fn decode_parakeet_ctc_pcm_cached(
+    runtime_pool: &ParakeetCtcRuntimePool,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &PARAKEET_CTC_RUNTIME_BY_KEY,
+    let actor = checkout_parakeet_ctc_prepared_runtime(runtime_pool, preflight, backend)?;
+    let samples = samples.to_vec();
+    let phrase_bias = phrase_bias.cloned();
+    actor
+        .call_mut(move |runtime| runtime.decode_result(&samples, phrase_bias.as_ref()))
+        .map_err(|error| error.to_string())?
+}
+
+fn new_parakeet_ctc_runtime_pool() -> Arc<ParakeetCtcRuntimePool> {
+    Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+        "openasr-parakeet-ctc-runtime-owner",
+        AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            PARAKEET_CTC_RUNTIME_MAX_IDLE_ENTRIES,
+            crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+            PARAKEET_CTC_RUNTIME_MAX_INSTANCES_PER_KEY,
+        ),
+    ))
+}
+
+fn checkout_parakeet_ctc_prepared_runtime(
+    pool: &ParakeetCtcRuntimePool,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    resolved_backend: GgmlCpuGraphBackend,
+) -> Result<ParakeetCtcRuntimeActor, String> {
+    let backend = crate::models::parakeet_ctc::graph_config::parakeet_ctc_encoder_graph_config(
+        resolved_backend,
+    )
+    .backend;
+    let key = (
+        PackContentKey::for_runtime_source(&preflight.runtime_source),
+        current_execution_lane_key(backend),
+    );
+    let preflight = preflight.clone();
+    let pack_content_id = preflight.runtime_source.content_id().to_string();
+    pool.checkout_or_try_build_with(
         key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_prepared_runtime(runtime_source, backend),
-        |runtime| runtime.decode_result(samples, phrase_bias),
+        move || {
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+                .map_err(|error| error.to_string())?;
+            let metadata = parse_parakeet_ctc_execution_metadata(&preflight.metadata)
+                .map_err(|error| error.to_string())?;
+            let (quote, plan) = parakeet_ctc_runtime_system_memory_quote(
+                &preflight.metadata,
+                &preflight.tensor_index,
+                metadata,
+                &pack_content_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((
+                quote.retained_bytes,
+                (preflight, reader, metadata, quote, plan, backend),
+            ))
+        },
+        |(preflight, reader, metadata, quote, plan, backend)| {
+            match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let tokenizer = ParakeetTokenizer::from_metadata(&preflight.metadata)?;
+                let tokenizer_bytes = tokenizer.retained_system_memory_bytes()?;
+                let weights = load_parakeet_ctc_encoder_weights(&reader, &metadata)
+                    .map_err(|error| error.to_string())?;
+                validate_parakeet_block_stack(metadata, &weights)?;
+                let weights_bytes = weights.retained_system_memory_bytes()?;
+                let graph = ParakeetCtcEncoderGraph::new(
+                    &weights,
+                    metadata,
+                    Some(&preflight.runtime_source),
+                    backend,
+                )
+                .map_err(|error| error.to_string())?;
+                let graph_bytes = graph.retained_system_memory_bytes()?;
+                drop(weights);
+
+                let retained = checked_sum(
+                    [tokenizer_bytes, graph_bytes],
+                    "parakeet-ctc measured runtime retained bytes",
+                )
+                .map_err(|error| error.to_string())?;
+                let measured_build_peak = checked_sum(
+                    [tokenizer_bytes, weights_bytes, graph_bytes],
+                    "parakeet-ctc measured runtime build peak",
+                )
+                .map_err(|error| error.to_string())?;
+                let planned_build_peak = tokenizer_bytes
+                    .checked_add(plan.build_peak_bytes)
+                    .ok_or_else(|| "parakeet-ctc measured build peak overflowed".to_string())?;
+                let runtime = ParakeetCtcPreparedRuntime {
+                    metadata,
+                    tokenizer,
+                    graph,
+                };
+                Ok(SystemMemoryAllocationOutcome::new(
+                    runtime,
+                    measured_build_peak.max(planned_build_peak),
+                    retained,
+                ))
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(reason)) => Err(reason),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(error.to_string())
+                }
+            }
+        },
+        |error| error.to_string(),
     )
 }
 
-fn build_parakeet_prepared_runtime(
-    runtime_source: &GgmlRuntimeSource,
-    backend: GgmlCpuGraphBackend,
-) -> Result<ParakeetCtcPreparedRuntime, String> {
-    let reader =
-        GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|e| e.to_string())?;
-    let gguf_metadata =
-        read_gguf_metadata_from_runtime_source(runtime_source).map_err(|e| e.to_string())?;
-    let metadata =
-        parse_parakeet_ctc_execution_metadata(&gguf_metadata).map_err(|e| e.to_string())?;
-    let tokenizer = ParakeetTokenizer::from_metadata(&gguf_metadata)?;
-    let weights =
-        load_parakeet_ctc_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    validate_parakeet_block_stack(metadata, &weights)?;
-    let graph = ParakeetCtcEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
-        .map_err(|e| e.to_string())?;
-    Ok(ParakeetCtcPreparedRuntime {
-        metadata,
-        tokenizer,
-        graph,
-    })
+fn parakeet_ctc_runtime_system_memory_quote(
+    gguf_metadata: &GgufMetadata,
+    tensor_index: &crate::GgufTensorIndex,
+    metadata: ParakeetCtcExecutionMetadata,
+    pack_content_id: &str,
+) -> Result<(SystemMemoryAllocationQuote, FastConformerSystemMemoryPlan), SystemMemoryOwnerError> {
+    let tokenizer_bytes = tokenizer_quote_bytes(gguf_metadata, "parakeet-ctc")?;
+    let plan = plan_fastconformer_system_memory(
+        tensor_index,
+        FastConformerMemoryTopology {
+            n_layers: metadata.n_layers,
+            hidden_size: metadata.hidden_size,
+            ffn_dim: metadata.ffn_dim,
+            checkpoint_has_projection_biases: true,
+            bound_tail_weight: "ctc.head.weight",
+            retained_tail_bias: "ctc.head.bias",
+        },
+    )?;
+    let retained_bytes = checked_sum(
+        [tokenizer_bytes, plan.graph_retained_bytes],
+        "parakeet-ctc quoted runtime retained bytes",
+    )?;
+    let peak_bytes = tokenizer_bytes
+        .checked_add(plan.build_peak_bytes)
+        .ok_or_else(|| {
+            SystemMemoryOwnerError::capacity_failure(
+                "parakeet_ctc_runtime_quote",
+                "parakeet-ctc quoted runtime peak overflowed",
+            )
+        })?;
+    let quote = SystemMemoryAllocationQuote::new(
+        format!("parakeet-ctc-prepared-runtime:{pack_content_id}"),
+        peak_bytes,
+        retained_bytes,
+    )?;
+    Ok((quote, plan))
 }
 
 impl ParakeetCtcPreparedRuntime {
@@ -294,8 +419,26 @@ pub(crate) fn parakeet_ctc_result_to_transcription(
 /// Dedicated GgmlAsrViewExecutor for parakeet-ctc (DedicatedRuntimeExecutorV1).
 /// Reuses a prepared runtime by `(canonical path, backend)`, runs the CTC
 /// pipeline, returns a single-segment transcription.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ParakeetCtcGgmlExecutor;
+#[derive(Clone)]
+pub(crate) struct ParakeetCtcGgmlExecutor {
+    runtime_pool: Arc<ParakeetCtcRuntimePool>,
+}
+
+impl fmt::Debug for ParakeetCtcGgmlExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParakeetCtcGgmlExecutor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ParakeetCtcGgmlExecutor {
+    fn default() -> Self {
+        Self {
+            runtime_pool: new_parakeet_ctc_runtime_pool(),
+        }
+    }
+}
 
 impl ParakeetCtcGgmlExecutor {
     fn execute_ctc_result(
@@ -311,8 +454,9 @@ impl ParakeetCtcGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         decode_parakeet_ctc_pcm_cached(
+            &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight.runtime_source,
+            &preflight,
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
         )
@@ -327,6 +471,16 @@ impl GgmlAsrViewExecutor for ParakeetCtcGgmlExecutor {
 
     fn supports_phrase_bias(&self) -> bool {
         true
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<
+        crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract,
+        crate::GgmlAsrExecutionError,
+    > {
+        Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
     }
 
     fn execute_view(
@@ -349,8 +503,9 @@ impl GgmlAsrViewExecutor for ParakeetCtcGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_parakeet_ctc_pcm_cached(
+            &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight.runtime_source,
+            &preflight,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
@@ -424,11 +579,16 @@ impl GgmlAsrStreamingExecutor for ParakeetCtcGgmlExecutor {
         )?;
         Ok(Box::new(session))
     }
+
+    fn unload_idle_state(&self) {
+        self.runtime_pool.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source;
     use std::path::Path;
 
     /// Minimal RIFF/WAVE reader for the fixed test clips (16 kHz mono 16-bit PCM).
@@ -511,14 +671,15 @@ mod tests {
         let samples = read_wav_mono_16k(&clip).expect("wav");
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
-        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
-        let metadata = read_gguf_metadata_from_runtime_source(&runtime_source).expect("metadata");
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .expect("preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
 
         let hypothesis = transcribe_parakeet_ctc_pcm(
             &reader,
-            &metadata,
+            &preflight.metadata,
             &samples,
-            &runtime_source,
+            &preflight.runtime_source,
             None,
             false,
             GgmlCpuGraphBackend::Cpu,

@@ -14,6 +14,15 @@ pub(crate) struct XasrZipformerTokenizer {
 }
 
 impl XasrZipformerTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.tokens, "xasr tokenizer token descriptors")?;
+        for token in &self.tokens {
+            bytes.add_string(token, "xasr tokenizer token text")?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn from_metadata(metadata: &GgufMetadata, blank_id: u32) -> Result<Self, String> {
         let tokens = metadata
             .get_string_array("tokenizer.ggml.tokens")

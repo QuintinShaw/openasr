@@ -43,8 +43,7 @@ pub(crate) use service::load_person_matcher_for_embedder;
 pub use service::{
     EnrollmentClip, VoiceIdLibraryError, VoiceIdServiceError, add_sample_from_pcm,
     add_sample_from_pcm_idempotent, enroll_person_from_clips, enroll_person_from_clips_idempotent,
-    load_person_matcher_for_active_embedder, person_library_is_non_empty, prepare_sample_from_pcm,
-    prepare_sample_from_wav_file,
+    person_library_is_non_empty, prepare_sample_from_pcm, prepare_sample_from_wav_file,
 };
 pub use space::{
     EmbeddingSpace, LEGACY_UNVERIFIABLE_V1_MARKER, MATCHER_POLICY_VERSION,

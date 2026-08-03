@@ -127,6 +127,43 @@ pub struct WhisperTokenizer {
 }
 
 impl WhisperTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "whisper tokenizer id table")?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, "whisper tokenizer id token")?;
+        }
+        for (label, len, entry_size) in [
+            (
+                "whisper tokenizer token map",
+                self.token_to_id.len(),
+                std::mem::size_of::<(String, u32)>(),
+            ),
+            (
+                "whisper tokenizer merge map",
+                self.merge_rank.len(),
+                std::mem::size_of::<(String, usize)>(),
+            ),
+        ] {
+            bytes.add_usize(
+                len.checked_mul(entry_size)
+                    .ok_or_else(|| format!("{label} byte count overflowed"))?,
+                label,
+            )?;
+        }
+        for key in self.token_to_id.keys().chain(self.merge_rank.keys()) {
+            bytes.add_string(key, "whisper tokenizer map key")?;
+        }
+        bytes.add_usize(
+            self.special_token_ids
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| "whisper tokenizer special-token bytes overflowed".to_string())?,
+            "whisper tokenizer special-token entries",
+        )?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn from_ggml_runtime_source(
         runtime_source: &GgmlRuntimeSource,
     ) -> Result<Self, NativeAsrError> {

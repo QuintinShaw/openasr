@@ -58,6 +58,18 @@ pub(crate) struct KaldiFbankConfig {
     pub window: KaldiWindowKind,
 }
 
+impl KaldiFbankConfig {
+    /// Exact `snip_edges=true` row count for this frontend geometry.
+    pub(crate) fn frame_count(self, samples: usize) -> usize {
+        if self.frame_shift == 0 {
+            return 0;
+        }
+        samples
+            .checked_sub(self.frame_length)
+            .map_or(0, |tail| tail / self.frame_shift + 1)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum KaldiFbankError {
     #[error("kaldi fbank frontend requires finite audio")]
@@ -117,12 +129,12 @@ impl KaldiFbankFrontend {
         if samples.iter().any(|v| !v.is_finite()) {
             return Err(KaldiFbankError::UnsupportedAudio);
         }
-        if samples.len() < cfg.frame_length {
+        let n_frames = cfg.frame_count(samples.len());
+        if n_frames == 0 {
             return Err(KaldiFbankError::NoFrames {
                 samples: samples.len(),
             });
         }
-        let n_frames = 1 + (samples.len() - cfg.frame_length) / cfg.frame_shift;
         let r2c = &self.fft;
         let mut fft_in = r2c.make_input_vec();
         let mut fft_out = r2c.make_output_vec();

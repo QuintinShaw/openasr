@@ -41,7 +41,10 @@ use super::tokenizer::MossTdTokenizer;
 /// from the same numbers -- see `super::capacity`); 12.5 is itself the
 /// capacity frontend registry's derived rate for this family's frontend id,
 /// pinned equal there.
-pub(crate) const AUDIO_TOKENS_PER_SECOND: f32 = 12.5;
+pub(crate) const AUDIO_TOKEN_RATE_NUMERATOR: usize = 25;
+pub(crate) const AUDIO_TOKEN_RATE_DENOMINATOR: usize = 2;
+pub(crate) const AUDIO_TOKENS_PER_SECOND: f32 =
+    AUDIO_TOKEN_RATE_NUMERATOR as f32 / AUDIO_TOKEN_RATE_DENOMINATOR as f32;
 pub(crate) const TIME_MARKER_EVERY_SECONDS: u32 = 5;
 
 /// Upstream's hard-coded ChatML system turn (`processing_moss_transcribe_diarize.py`
@@ -71,6 +74,25 @@ pub(crate) enum MossTdDecodePromptError {
     EmptyAudioTokens,
     #[error("moss-transcribe-diarize decode prompt tokenization failed: {reason}")]
     TokenizationFailed { reason: String },
+    #[error("moss-transcribe-diarize decode prompt shape arithmetic overflowed during {operation}")]
+    ArithmeticOverflow { operation: &'static str },
+}
+
+/// Integer marker clock shared by prompt construction and capacity planning.
+/// The trained 12.5-token/s rate is represented as 25/2, so no floating-point
+/// duration rounding can make the two paths disagree at a boundary.
+pub(crate) fn moss_td_time_marker_seconds(
+    audio_token_count: usize,
+) -> Result<Vec<usize>, MossTdDecodePromptError> {
+    let whole_seconds = audio_token_count
+        .checked_mul(AUDIO_TOKEN_RATE_DENOMINATOR)
+        .ok_or(MossTdDecodePromptError::ArithmeticOverflow {
+            operation: "audio tokens to whole seconds",
+        })?
+        / AUDIO_TOKEN_RATE_NUMERATOR;
+    Ok((TIME_MARKER_EVERY_SECONDS as usize..=whole_seconds)
+        .step_by(TIME_MARKER_EVERY_SECONDS as usize)
+        .collect())
 }
 
 /// Port of `MossTranscribeDiarizeProcessor._audio_span_ids`: returns the
@@ -78,43 +100,67 @@ pub(crate) enum MossTdDecodePromptError {
 /// time anchors every `TIME_MARKER_EVERY_SECONDS` seconds) plus the list of
 /// indices (relative to the returned `Vec`'s start) holding a literal pad
 /// token.
-fn audio_span_ids(tokenizer: &MossTdTokenizer, audio_token_count: usize) -> (Vec<u32>, Vec<usize>) {
-    let tokens_per_marker = (AUDIO_TOKENS_PER_SECOND * TIME_MARKER_EVERY_SECONDS as f32) as i64;
-    if audio_token_count == 0 || tokens_per_marker <= 0 {
+fn audio_span_ids(
+    tokenizer: &MossTdTokenizer,
+    audio_token_count: usize,
+) -> Result<(Vec<u32>, Vec<usize>), MossTdDecodePromptError> {
+    let tokens_per_marker = AUDIO_TOKEN_RATE_NUMERATOR
+        .checked_mul(TIME_MARKER_EVERY_SECONDS as usize)
+        .ok_or(MossTdDecodePromptError::ArithmeticOverflow {
+            operation: "audio tokens per marker",
+        })?
+        / AUDIO_TOKEN_RATE_DENOMINATOR;
+    if audio_token_count == 0 || tokens_per_marker == 0 {
         let ids = vec![tokenizer.audio_pad_token_id; audio_token_count];
         let positions = (0..audio_token_count).collect();
-        return (ids, positions);
+        return Ok((ids, positions));
     }
 
-    let duration = audio_token_count as f32 / AUDIO_TOKENS_PER_SECOND;
     let mut ids = Vec::with_capacity(audio_token_count + audio_token_count / 40);
     let mut pad_positions = Vec::with_capacity(audio_token_count);
-    let mut consumed: i64 = 0;
-    let mut sec = TIME_MARKER_EVERY_SECONDS as i64;
-    while sec <= duration as i64 {
-        let pos = (sec / TIME_MARKER_EVERY_SECONDS as i64) * tokens_per_marker;
-        let segment_len = pos - consumed;
+    let mut consumed = 0usize;
+    for (marker_index, sec) in moss_td_time_marker_seconds(audio_token_count)?
+        .into_iter()
+        .enumerate()
+    {
+        let pos = (marker_index + 1).checked_mul(tokens_per_marker).ok_or(
+            MossTdDecodePromptError::ArithmeticOverflow {
+                operation: "time marker audio position",
+            },
+        )?;
+        let segment_len =
+            pos.checked_sub(consumed)
+                .ok_or(MossTdDecodePromptError::ArithmeticOverflow {
+                    operation: "monotone time marker positions",
+                })?;
         if segment_len > 0 {
             for _ in 0..segment_len {
                 pad_positions.push(ids.len());
                 ids.push(tokenizer.audio_pad_token_id);
             }
-            consumed += segment_len;
+            consumed = consumed.checked_add(segment_len).ok_or(
+                MossTdDecodePromptError::ArithmeticOverflow {
+                    operation: "time marker consumed audio tokens",
+                },
+            )?;
         }
         for ch in sec.to_string().chars() {
             let digit = ch.to_digit(10).expect("decimal digit") as usize;
             ids.push(tokenizer.digit_token_ids[digit]);
         }
-        sec += TIME_MARKER_EVERY_SECONDS as i64;
     }
-    let remainder = audio_token_count as i64 - consumed;
+    let remainder = audio_token_count.checked_sub(consumed).ok_or(
+        MossTdDecodePromptError::ArithmeticOverflow {
+            operation: "audio span remainder",
+        },
+    )?;
     if remainder > 0 {
         for _ in 0..remainder {
             pad_positions.push(ids.len());
             ids.push(tokenizer.audio_pad_token_id);
         }
     }
-    (ids, pad_positions)
+    Ok((ids, pad_positions))
 }
 
 pub(crate) fn build_moss_td_decode_prompt(
@@ -137,7 +183,7 @@ pub(crate) fn build_moss_td_decode_prompt(
 
     let prefix_ids = encode(&prefix)?;
     let suffix_ids = encode(&suffix)?;
-    let (span_ids, span_pad_positions) = audio_span_ids(tokenizer, audio_token_count);
+    let (span_ids, span_pad_positions) = audio_span_ids(tokenizer, audio_token_count)?;
 
     let mut token_ids =
         Vec::with_capacity(prefix_ids.len() + 1 + span_ids.len() + 1 + suffix_ids.len());
@@ -157,6 +203,22 @@ pub(crate) fn build_moss_td_decode_prompt(
         token_ids,
         audio_pad_positions,
     })
+}
+
+/// Exact count of the tokenizer-dependent ChatML and instruction tokens,
+/// including the audio start/end delimiters but excluding the audio span and
+/// its duration-dependent marker digits. Capacity planning calls this on the
+/// loaded pack; execution calls the same prompt builder below, so a legal BPE
+/// merge-table change cannot invalidate an `Exact` topology proof.
+pub(crate) fn moss_td_fixed_prompt_token_count(
+    tokenizer: &MossTdTokenizer,
+) -> Result<usize, MossTdDecodePromptError> {
+    let one_audio_token = build_moss_td_decode_prompt(tokenizer, 1)?;
+    one_audio_token.token_ids.len().checked_sub(1).ok_or(
+        MossTdDecodePromptError::TokenizationFailed {
+            reason: "one-token prompt did not contain its audio span".to_string(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -183,7 +245,7 @@ mod tests {
         // at span-relative positions 62 (single digit '5') and 125/126
         // (digits '1'/'0' for "10"), not 140/a single marker).
         let tokenizer = tokenizer_fixture();
-        let (ids, positions) = audio_span_ids(&tokenizer, 138);
+        let (ids, positions) = audio_span_ids(&tokenizer, 138).expect("audio span");
         assert_eq!(positions.len(), 138);
         // Two markers: 3 extra (digit) tokens ('5', '1', '0') beyond the 138
         // pad tokens.
@@ -208,6 +270,17 @@ mod tests {
     }
 
     #[test]
+    fn integer_marker_clock_is_exact_at_half_token_boundaries() {
+        assert_eq!(
+            moss_td_time_marker_seconds(62).unwrap(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(moss_td_time_marker_seconds(63).unwrap(), vec![5]);
+        assert_eq!(moss_td_time_marker_seconds(124).unwrap(), vec![5]);
+        assert_eq!(moss_td_time_marker_seconds(125).unwrap(), vec![5, 10]);
+    }
+
+    #[test]
     fn builds_full_chatml_prompt_with_audio_span() {
         let tokenizer = tokenizer_fixture();
         let prompt = build_moss_td_decode_prompt(&tokenizer, 4).expect("prompt");
@@ -218,6 +291,14 @@ mod tests {
         assert_eq!(
             prompt.token_ids[prompt.audio_pad_positions[0] - 1],
             tokenizer.audio_start_token_id
+        );
+        assert_eq!(
+            moss_td_fixed_prompt_token_count(&tokenizer).unwrap(),
+            build_moss_td_decode_prompt(&tokenizer, 1)
+                .unwrap()
+                .token_ids
+                .len()
+                - 1
         );
     }
 
@@ -364,5 +445,10 @@ mod tests {
         ];
         assert_eq!(prompt.token_ids.len(), golden_prompt_input_ids.len());
         assert_eq!(prompt.token_ids, golden_prompt_input_ids);
+        assert_eq!(
+            moss_td_fixed_prompt_token_count(&tokenizer).expect("fixed prompt count"),
+            super::super::capacity::MOSS_TD_SHIPPED_FIXED_PROMPT_TOKENS,
+            "86 is a shipped-tokenizer regression anchor, not a production formula input"
+        );
     }
 }

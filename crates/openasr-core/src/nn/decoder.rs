@@ -268,6 +268,10 @@ pub(crate) struct Seq2SeqLayerConfig {
     /// `n_seq == 1`: `[hidden_size, frame_count]`;
     /// `n_seq > 1`: `[hidden_size, frame_count, n_seq]`.
     pub cross_frame_count: usize,
+    /// Allocated cross-KV position span. It may exceed the active
+    /// `cross_frame_count`; batched views use it as the physical sequence
+    /// stride while masks/attention use only the active logical frames.
+    pub cross_kv_max_positions: usize,
     pub cross_hidden_size: usize,
 }
 
@@ -646,6 +650,7 @@ fn view_cross_kv_heads<'a, E, F>(
     hidden: usize,
     head_dim: usize,
     sequence_len: usize,
+    storage_sequence_len: usize,
     attention_heads: usize,
     n_seq: usize,
     step: &'static str,
@@ -665,6 +670,17 @@ where
             ),
         ));
     }
+    if sequence_len == 0 || sequence_len > storage_sequence_len {
+        return Err(map_err_tuple(
+            map_err,
+            (
+                step,
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "seq2seq cross-KV logical span must be in 1..=resident span",
+                },
+            ),
+        ));
+    }
     let element_size = std::mem::size_of::<f32>();
     let nb1 = hidden
         .checked_mul(element_size)
@@ -674,7 +690,7 @@ where
         .ok_or_else(|| map_err_tuple(map_err, overflow(step)))?;
     if n_seq > 1 {
         let nb3 = hidden
-            .checked_mul(sequence_len)
+            .checked_mul(storage_sequence_len)
             .and_then(|value| value.checked_mul(element_size))
             .ok_or_else(|| map_err_tuple(map_err, overflow(step)))?;
         return graph
@@ -1040,6 +1056,7 @@ where
         config.cross_hidden_size,
         head_dim,
         config.cross_frame_count,
+        config.cross_kv_max_positions,
         heads,
         n_seq,
         "decoder_cross_k",
@@ -1051,6 +1068,7 @@ where
         config.cross_hidden_size,
         head_dim,
         config.cross_frame_count,
+        config.cross_kv_max_positions,
         heads,
         n_seq,
         "decoder_cross_v",
@@ -1194,11 +1212,24 @@ pub(crate) struct LlmLoraSlot<'a> {
     pub b_scaled: GgmlCpuTensor<'a>,
 }
 
+/// Mutually-exclusive resident storage for one layer's Q/K/V projections.
+/// Keeping this as an enum is load-bearing: a normal fused decoder must not
+/// retain three dead split tensors beside the fused tensor merely to represent
+/// a fallback graph it will never execute.
+#[derive(Clone, Copy)]
+pub(crate) enum LlmQkvWeights<'a> {
+    Fused(GgmlCpuTensor<'a>),
+    Split {
+        q: GgmlCpuTensor<'a>,
+        k: GgmlCpuTensor<'a>,
+        v: GgmlCpuTensor<'a>,
+    },
+}
+
 /// Per-block graph weights, submodule order: attn-norm → fused-or-split QKV →
 /// (optional bias) → (optional q/k-norm) → out-proj → ffn-norm → gate/up/down.
-/// `qkv_weight` present ⇒ fused path (single `mul_mat` + `view_2d` split);
-/// absent ⇒ three separate `mul_mat`. The fused-vs-split decision is already
-/// resolved (fail-closed) by the caller.
+/// The fused-vs-split decision is resolved before native tensors are declared;
+/// the representation cannot own both shapes at once.
 ///
 /// LoRA slots are optional and default to `None`. When ANY of `q_lora`,
 /// `k_lora`, `v_lora` is `Some`, the QKV projection uses the SPLIT path
@@ -1221,10 +1252,7 @@ pub(crate) struct LlmLoraSlot<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct LlmLayerWeights<'a> {
     pub attn_norm_weight: GgmlCpuTensor<'a>,
-    pub qkv_weight: Option<GgmlCpuTensor<'a>>,
-    pub q_weight: GgmlCpuTensor<'a>,
-    pub k_weight: GgmlCpuTensor<'a>,
-    pub v_weight: GgmlCpuTensor<'a>,
+    pub qkv: LlmQkvWeights<'a>,
     pub q_bias: Option<GgmlCpuTensor<'a>>,
     pub k_bias: Option<GgmlCpuTensor<'a>>,
     pub v_bias: Option<GgmlCpuTensor<'a>>,
@@ -1522,17 +1550,13 @@ where
 /// Split path: three separate `mul_mat`. Byte strides assume f32 (matching the
 /// qwen layout the fused weight is built against).
 ///
-/// If ANY of `q_lora`, `k_lora`, `v_lora` is `Some`, the SPLIT path is used
-/// regardless of `qkv_weight` so each projection can be independently adapted.
-/// When all three are `None` the existing fused/split logic is unchanged.
+/// If any per-projection QKV LoRA is present, construction must select
+/// [`LlmQkvWeights::Split`] so each adapter can be applied independently.
 #[allow(clippy::too_many_arguments)]
 fn build_projected_qkv<'a, E, F>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     normed: GgmlCpuTensor<'a>,
-    qkv_weight: Option<GgmlCpuTensor<'a>>,
-    q_weight: GgmlCpuTensor<'a>,
-    k_weight: GgmlCpuTensor<'a>,
-    v_weight: GgmlCpuTensor<'a>,
+    qkv: LlmQkvWeights<'a>,
     q_lora: Option<LlmLoraSlot<'a>>,
     k_lora: Option<LlmLoraSlot<'a>>,
     v_lora: Option<LlmLoraSlot<'a>>,
@@ -1546,11 +1570,16 @@ where
     F: Fn(&'static str, GgmlCpuGraphError) -> E + Copy,
 {
     let element = std::mem::size_of::<f32>();
-    // When any QKV projection has a LoRA slot, force the SPLIT path so each
-    // projection can be independently adapted. The fused path cannot apply
-    // per-projection LoRA because the output is a single concatenated tensor.
     let any_qkv_lora = q_lora.is_some() || k_lora.is_some() || v_lora.is_some();
-    if let Some(qkv_weight) = qkv_weight.filter(|_| !any_qkv_lora) {
+    if any_qkv_lora && matches!(qkv, LlmQkvWeights::Fused(_)) {
+        return Err(map_err(
+            "llm_qkv_storage",
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "per-projection QKV LoRA requires split resident weights",
+            },
+        ));
+    }
+    if let LlmQkvWeights::Fused(qkv_weight) = qkv {
         let qkv_width = q_width
             .checked_add(k_width)
             .and_then(|width| width.checked_add(v_width))
@@ -1613,6 +1642,14 @@ where
         }
         return Ok((q, k, v));
     }
+    let LlmQkvWeights::Split {
+        q: q_weight,
+        k: k_weight,
+        v: v_weight,
+    } = qkv
+    else {
+        unreachable!("fused QKV returned above")
+    };
     let q = llm_lora_matmul(graph, q_weight, q_lora, normed, "llm_q_proj", map_err)?;
     let k = llm_lora_matmul(graph, k_weight, k_lora, normed, "llm_k_proj", map_err)?;
     let v = llm_lora_matmul(graph, v_weight, v_lora, normed, "llm_v_proj", map_err)?;
@@ -1722,10 +1759,7 @@ where
     let (q, k, v) = build_projected_qkv(
         graph,
         normed,
-        weights.qkv_weight,
-        weights.q_weight,
-        weights.k_weight,
-        weights.v_weight,
+        weights.qkv,
         weights.q_lora,
         weights.k_lora,
         weights.v_lora,
@@ -2587,6 +2621,7 @@ mod tests {
                 ffn_activation: FeedForwardActivation::Relu,
                 self_kv_max_positions: MAX_POSITIONS,
                 cross_frame_count: CROSS_FRAMES,
+                cross_kv_max_positions: CROSS_FRAMES,
                 cross_hidden_size: HIDDEN,
             },
             Seq2SeqLayerWeights {
@@ -2914,9 +2949,6 @@ mod tests {
 
         let norm = graph.new_tensor_1d_f32(2, "norm").expect("norm");
         let qkv = graph.new_tensor_2d_f32(2, 8, "qkv").expect("qkv");
-        let q = graph.new_tensor_2d_f32(2, 4, "q").expect("q");
-        let k = graph.new_tensor_2d_f32(2, 2, "k").expect("k");
-        let v = graph.new_tensor_2d_f32(2, 2, "v").expect("v");
         let output = graph.new_tensor_2d_f32(4, 2, "output").expect("output");
         let ffn = graph.new_tensor_2d_f32(2, 2, "ffn").expect("ffn");
 
@@ -2951,10 +2983,7 @@ mod tests {
             None,
             |_layer_index| LlmLayerWeights {
                 attn_norm_weight: norm,
-                qkv_weight: Some(qkv),
-                q_weight: q,
-                k_weight: k,
-                v_weight: v,
+                qkv: LlmQkvWeights::Fused(qkv),
                 q_bias: None,
                 k_bias: None,
                 v_bias: None,
@@ -3123,10 +3152,7 @@ mod tests {
             None,
             |_layer_index| LlmLayerWeights {
                 attn_norm_weight: norm,
-                qkv_weight: None,
-                q_weight: q,
-                k_weight: k,
-                v_weight: v,
+                qkv: LlmQkvWeights::Split { q, k, v },
                 q_bias: None,
                 k_bias: None,
                 v_bias: None,
@@ -3549,10 +3575,10 @@ mod tests {
             None,
             |_layer_index| LlmLayerWeights {
                 attn_norm_weight: hidden_norm,
-                qkv_weight: qkv,
-                q_weight: q,
-                k_weight: k,
-                v_weight: v,
+                qkv: match qkv {
+                    Some(qkv) => LlmQkvWeights::Fused(qkv),
+                    None => LlmQkvWeights::Split { q, k, v },
+                },
                 q_bias,
                 k_bias,
                 v_bias,

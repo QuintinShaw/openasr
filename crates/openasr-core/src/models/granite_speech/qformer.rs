@@ -123,6 +123,25 @@ pub(crate) struct GraniteSpeechProjectorRuntime {
 }
 
 impl GraniteSpeechProjectorRuntime {
+    pub(crate) fn quoted_system_memory_bytes(
+        config: &GraniteSpeechProjectorConfig,
+    ) -> Result<(u64, u64), String> {
+        let transient = config
+            .num_queries()
+            .checked_mul(config.encoder_hidden_size)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "granite projector query quote overflowed".to_string())?;
+        Ok((
+            u64::try_from(transient)
+                .map_err(|_| "granite projector query quote exceeds u64".to_string())?,
+            0,
+        ))
+    }
+
+    pub(crate) const fn retained_system_memory_bytes(&self) -> u64 {
+        0
+    }
+
     pub(crate) fn new(
         source: &GgmlRuntimeSource,
         config: &GraniteSpeechProjectorConfig,

@@ -34,10 +34,7 @@ use super::frontend::{
     qwen3_mel_features_from_prepared_audio,
 };
 use super::llm_prefill::{Qwen3AsrLlmPrefillInputError, build_qwen3_llm_prefill_input};
-use super::llm_transformer::{
-    Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
-    load_qwen3_llm_attention_projections_from_reader,
-};
+use super::llm_transformer::{Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan};
 use super::logits_head::{
     Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor,
@@ -344,7 +341,7 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
     pub audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
     pub token_embedding_table: Qwen3AsrTokenEmbeddingTable,
     pub logits_head: Qwen3AsrLlmLogitsHead,
-    pub layer_attention_projections: Vec<Qwen3AsrLlmLayerAttentionProjection>,
+    pub decoder_plan: QwenWholeDecoderPlan,
 }
 
 pub(crate) fn load_forced_aligner_prepared_assets(
@@ -389,8 +386,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
         DEFAULT_RMS_NORM_EPSILON,
         backend,
     )?;
-    let layer_attention_projections =
-        load_qwen3_llm_attention_projections_from_reader(&reader, embedding_metadata)?;
+    let decoder_plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, embedding_metadata)?;
 
     Ok(Qwen3ForcedAlignerPreparedAssets {
         metadata,
@@ -399,7 +395,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
         audio_encoder_weights,
         token_embedding_table,
         logits_head,
-        layer_attention_projections,
+        decoder_plan,
     })
 }
 
@@ -455,14 +451,15 @@ pub(crate) fn align_forced(
     )?;
     let prefill_input = build_qwen3_llm_prefill_input(prompt_embeddings)?;
 
-    let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
-        &assets.layer_attention_projections,
-        Some(runtime_source),
+    let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan(
+        &assets.decoder_plan,
+        runtime_source,
         backend,
     )
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
+    let mut logits_runtime = assets.logits_head.new_runtime(backend)?;
     let prefill_output = whole_decoder
         .run_prefill(
             &prefill_input.token_major_embeddings,
@@ -490,9 +487,8 @@ pub(crate) fn align_forced(
         let start = position * hidden_size;
         let end = start + hidden_size;
         let hidden_row = &prefill_output.hidden[start..end];
-        let bin = assets
-            .logits_head
-            .compute_top1_token_for_last_hidden(hidden_row)?;
+        let bin =
+            logits_runtime.compute_top1_token_for_last_hidden(&assets.logits_head, hidden_row)?;
         raw_timestamps_ms
             .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
     }
@@ -538,19 +534,12 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
     audio_samples_16khz_mono: crate::PcmSlice,
     text: &str,
     language: &str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
-    // This tier runs its own one-shot decode against a separate,
-    // independently-resolved pack (not the main transcription request's
-    // runtime_source), so there is no upstream `resolved_runtime` to inherit
-    // -- resolve fresh here, through this family's own (`AllBackends`)
-    // policy, exactly like the main request-construction sites do.
-    let backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        None,
-        crate::arch::family_auto_gpu_policy_for_model_architecture(
-            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-        ),
-    )
-    .backend();
+    // This tier is an independent auxiliary stage. Its caller resolves a
+    // stage-level execution candidate and passes the backend explicitly; do
+    // not re-derive from process defaults here or a vendor-constrained request
+    // could silently run the aligner on another GPU.
     // Open once: `load_forced_aligner_prepared_assets` and `align_forced`
     // both need this pack's tensor data, and this tier's own doc comment
     // above already promises "loads the pack fresh... at most once per

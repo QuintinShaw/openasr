@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
 };
 
 use super::{
@@ -17,10 +14,20 @@ use crate::api::native::{
     NativeAsrRuntimeReadiness, NativeAsrSession, NativeAsrSessionContext,
     NativeAsrStreamingSessionConfig, NativeAsrTensorLayoutRef,
 };
-use crate::ggml_runtime::{
-    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
+use crate::arch::{OpenAsrArchitectureRegistry, StreamingPartialGranularity};
+use crate::device::{
+    execution_policy::{
+        AcceleratedDeviceConstraint, ExecutionCandidate, ExecutionIntent, ExecutionPlacement,
+        ExecutionPlan, ExecutionPolicyError,
+    },
+    execution_route::{
+        ExecutionHardwareVendor, ExecutionProvider, enumerate_compute_devices_from_ggml,
+    },
 };
-use crate::models::builtin_execution_dispatch::build_builtin_ggml_streaming_execution_dispatch;
+use crate::ggml_runtime::{
+    RequestBackendPreference, read_gguf_metadata_from_runtime_source,
+    read_gguf_tensor_index_from_runtime_source,
+};
 use crate::models::executor_component_registry::builtin_executor_supports_phrase_bias_for_model_architecture;
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
 use crate::models::ggml_family_registry::{
@@ -33,8 +40,8 @@ use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::realtime::RealtimeBackendCapabilities;
 use crate::{
-    ExecutionTarget, GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
-    GgmlAsrExecutionOptions, GgmlAsrStreamingSessionRequest,
+    ExecutionTarget, GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionOptions,
+    GgmlAsrStreamingSessionRequest, NativeExecutionServices,
 };
 
 #[path = "cue_segmentation.rs"]
@@ -62,60 +69,35 @@ pub use transcription_control::{
     GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
 };
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NativeBackend;
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NativeBackendExecutor;
-
-/// Process-owner guard for native model runtimes.
-///
-/// Keep this alive until every native request/session has stopped. Dropping it
-/// runs the same ordered eviction as the daemon idle-unload path while the
-/// process and its dedicated model workers are still alive, rather than
-/// leaving device-resident worker TLS to C/C++ static-destruction order.
-/// Nested owners are reference-counted; only the last guard performs shutdown.
-#[derive(Debug)]
-#[must_use = "keep the guard alive for the native runtime owner's lifetime"]
-pub struct NativeRuntimeShutdownGuard {
-    _private: (),
+#[derive(Debug, Clone)]
+pub struct NativeBackend {
+    execution_services: Arc<NativeExecutionServices>,
 }
 
-static NATIVE_RUNTIME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[derive(Debug, Clone)]
+pub struct NativeBackendExecutor {
+    execution_services: Arc<NativeExecutionServices>,
+}
 
-impl NativeRuntimeShutdownGuard {
-    pub fn new() -> Self {
-        NATIVE_RUNTIME_OWNER_COUNT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("native runtime owner count overflow");
-        Self { _private: () }
+impl NativeBackend {
+    pub fn new(execution_services: Arc<NativeExecutionServices>) -> Self {
+        Self { execution_services }
+    }
+
+    pub fn execution_services(&self) -> &Arc<NativeExecutionServices> {
+        &self.execution_services
     }
 }
 
-impl Default for NativeRuntimeShutdownGuard {
-    fn default() -> Self {
-        Self::new()
+impl NativeBackendExecutor {
+    pub fn new(execution_services: Arc<NativeExecutionServices>) -> Self {
+        Self { execution_services }
+    }
+
+    pub fn execution_services(&self) -> &Arc<NativeExecutionServices> {
+        &self.execution_services
     }
 }
-
-impl Drop for NativeRuntimeShutdownGuard {
-    fn drop(&mut self) {
-        let previous = NATIVE_RUNTIME_OWNER_COUNT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(1)
-            })
-            .expect("native runtime owner count underflow");
-        if previous == 1 {
-            unload_idle_native_model_runtime_caches();
-        }
-    }
-}
-
-static NATIVE_GGML_STREAMING_EXECUTION_DISPATCH: OnceLock<
-    Result<GgmlAsrExecutionDispatch, String>,
-> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeRuntimeModelAdapter {
@@ -173,18 +155,20 @@ fn native_runtime_streaming_capabilities_for_descriptor(
     // that does not -- so no real pack falls to the buffered file-per-utterance
     // path anymore. The pack no longer needs to self-declare streaming; a stale
     // declaration on an already-published pack is simply ignored.
-    let Ok(dispatch) = shared_native_ggml_streaming_execution_dispatch() else {
+    let Some(architecture) = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(descriptor.model_architecture)
+    else {
         return NativeAsrCapabilities::native_offline();
     };
-    if !dispatch.has_streaming_executor_for(descriptor) {
-        return NativeAsrCapabilities::native_offline();
-    }
     // Partial granularity is a property of the registered streaming executor:
     // frame-sync (append-only, never revises) vs buffered (re-decodes a growing
     // window). Only xasr-zipformer is frame-sync today.
     NativeAsrCapabilities::native_true_streaming()
         .with_partial_results(true)
-        .with_frame_sync_partials(dispatch.is_frame_sync_for(descriptor))
+        .with_frame_sync_partials(matches!(
+            architecture.integration.streaming_partial_granularity,
+            StreamingPartialGranularity::FrameSync
+        ))
 }
 
 /// Phrase-bias capability for one runtime pack.
@@ -242,6 +226,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
 
     fn start_streaming_session(
         &self,
+        execution_services: Arc<NativeExecutionServices>,
         model_pack: &NativeAsrModelPackRef,
         target: NativeAsrHardwareTarget,
         context: NativeAsrSessionContext,
@@ -281,29 +266,442 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             options.language.as_deref(),
         )
         .map_err(native_backend_error_to_asr)?;
-        let backend_preference = native_ggml_backend_preference_from_hardware_target(target)?;
         let request_options = native_streaming_request_options_from_session_options(&options);
-        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-            backend_preference.request_backend_override(),
-            crate::arch::family_auto_gpu_policy_for_model_architecture(
+        let runtime_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &model_pack.root,
+            )
+            .map_err(|error| NativeAsrError::SessionFailed {
+                message: format!("native decoder-state preflight failed: {error}"),
+            })?;
+        let request_intent = execution_intent_from_hardware_target(target)?;
+        let execution_plan = resolve_native_execution_plan_for_hardware_target(
+            execution_services.as_ref(),
+            &self.descriptor,
+            target,
+        )?;
+        let streaming_punctuator =
+            crate::models::firered_punc::streaming_runtime::PolicyResolvedStreamingPunctuator::prepare(
+                Arc::clone(&execution_services),
                 self.descriptor.model_architecture,
-            ),
-        );
-        let request = GgmlAsrStreamingSessionRequest {
-            runtime_source_path: model_pack.root.clone(),
-            runtime_source_preflight: None,
-            selected_family: self.descriptor.clone(),
-            request_options,
-            configured_diarize: options.voice_id,
-            backend_preference,
-            resolved_runtime,
-            session_context: context,
-            session_config: session_config.into(),
-        };
-        shared_native_ggml_streaming_execution_dispatch()?
-            .start_streaming_session(&request)
-            .map_err(|error| native_ggml_streaming_error_to_asr(self.adapter_id(), error))
+                self.descriptor.adapter_id,
+                &request_intent,
+            )
+            .map_err(|error| {
+                native_ggml_streaming_error_to_asr(self.descriptor.adapter_id, error)
+            })?;
+        let factory: Arc<dyn NativeStreamingSessionCandidateBuilder> =
+            Arc::new(NativeStreamingSessionCandidateFactory {
+                execution_services,
+                runtime_source_path: model_pack.root.clone(),
+                runtime_preflight,
+                selected_family: self.descriptor.clone(),
+                request_options,
+                configured_diarize: options.voice_id,
+                session_context: context,
+                session_config: session_config.into(),
+                auto_gpu_policy: crate::arch::family_auto_gpu_policy_for_model_architecture(
+                    self.descriptor.model_architecture,
+                ),
+                streaming_punctuator,
+            });
+        PolicyResolvedNativeStreamingSession::start(factory, execution_plan)
     }
+}
+
+/// Immutable inputs needed to construct a streaming session on any one
+/// semantics-equivalent execution candidate. Keeping this factory at the API
+/// boundary lets session acquisition and worker-thread warm-up share the same
+/// policy without teaching model-family executors about product fallback.
+struct NativeStreamingSessionCandidateFactory {
+    execution_services: Arc<NativeExecutionServices>,
+    runtime_source_path: PathBuf,
+    runtime_preflight: crate::GgmlAsrRuntimeSourcePreflight,
+    selected_family: GgmlFamilyAdapterDescriptor,
+    request_options: GgmlAsrExecutionOptions,
+    configured_diarize: bool,
+    session_context: NativeAsrSessionContext,
+    session_config: crate::models::ggml_asr_executor::GgmlAsrStreamingSessionConfig,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    streaming_punctuator: Option<
+        Arc<crate::models::firered_punc::streaming_runtime::PolicyResolvedStreamingPunctuator>,
+    >,
+}
+
+trait NativeStreamingSessionCandidateBuilder: Send + Sync {
+    fn execution_services(&self) -> Arc<NativeExecutionServices>;
+
+    fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
+        Ok(())
+    }
+
+    fn build(
+        &self,
+        candidate: &ExecutionCandidate,
+    ) -> crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<
+        Box<dyn NativeAsrSession>,
+        NativeAsrError,
+    >;
+}
+
+impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateFactory {
+    fn execution_services(&self) -> Arc<NativeExecutionServices> {
+        Arc::clone(&self.execution_services)
+    }
+
+    fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
+        if let Some(punctuator) = self.streaming_punctuator.as_ref() {
+            punctuator.initialize().map_err(|error| {
+                native_ggml_streaming_error_to_asr(self.selected_family.adapter_id, error)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn build(
+        &self,
+        candidate: &ExecutionCandidate,
+    ) -> crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<
+        Box<dyn NativeAsrSession>,
+        NativeAsrError,
+    > {
+        crate::models::native_execution_services::run_execution_candidate_attempt(
+            self.execution_services.as_ref(),
+            candidate,
+            || {
+                let resolved_runtime =
+                    resolved_runtime_for_candidate(candidate, self.auto_gpu_policy);
+                let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_session(
+                    &self.runtime_preflight,
+                    &self.request_options,
+                    resolved_runtime.backend(),
+                )
+                .map_err(|error| NativeAsrError::SessionFailed {
+                    message: format!("native decoder-state planning failed: {error}"),
+                })?;
+                let decoder_state = self
+                    .execution_services
+                    .streaming_dispatch()
+                    .plan_decoder_state(&self.selected_family, &planning_input)
+                    .map_err(|error| {
+                        native_ggml_streaming_error_to_asr(self.selected_family.adapter_id, error)
+                    })?;
+                let request = GgmlAsrStreamingSessionRequest {
+                    execution_services: Arc::clone(&self.execution_services),
+                    decoder_state,
+                    runtime_source_path: self.runtime_source_path.clone(),
+                    runtime_source_preflight: Some(self.runtime_preflight.clone()),
+                    selected_family: self.selected_family.clone(),
+                    request_options: self.request_options.clone(),
+                    configured_diarize: self.configured_diarize,
+                    backend_preference: coarse_backend_preference_for_candidate(candidate),
+                    resolved_runtime,
+                    final_text_processor: self
+                        .streaming_punctuator
+                        .as_ref()
+                        .map(|punctuator| punctuator.slot()),
+                    session_context: self.session_context.clone(),
+                    session_config: self.session_config.clone(),
+                };
+                self.execution_services
+                    .streaming_dispatch()
+                    .start_streaming_session(&request)
+                    .map_err(|error| {
+                        native_ggml_streaming_error_to_asr(self.selected_family.adapter_id, error)
+                    })
+            },
+        )
+    }
+}
+
+/// A streaming session pinned to one resolved execution candidate. The wrapper
+/// reinstalls that candidate on every worker-thread call. Construction and
+/// warm-up may advance through typed candidate-local failures; once the first
+/// audio frame is handed to the model, replay would be semantically ambiguous
+/// and fallback is permanently disabled for the session.
+struct PolicyResolvedNativeStreamingSession {
+    factory: Arc<dyn NativeStreamingSessionCandidateBuilder>,
+    execution_plan: ExecutionPlan,
+    candidate_index: usize,
+    session_id: String,
+    session: Option<Box<dyn NativeAsrSession>>,
+    terminal_error: Option<NativeAsrError>,
+    cancellation_token: Option<Arc<AtomicBool>>,
+    audio_started: bool,
+    auxiliary_ready: bool,
+}
+
+impl PolicyResolvedNativeStreamingSession {
+    fn start(
+        factory: Arc<dyn NativeStreamingSessionCandidateBuilder>,
+        execution_plan: ExecutionPlan,
+    ) -> Result<Box<dyn NativeAsrSession>, NativeAsrError> {
+        let (candidate_index, session) =
+            Self::construct_from(factory.as_ref(), &execution_plan, 0)?;
+        let session_id = session.session_id().to_string();
+        Ok(Box::new(Self {
+            factory,
+            execution_plan,
+            candidate_index,
+            session_id,
+            session: Some(session),
+            terminal_error: None,
+            cancellation_token: None,
+            audio_started: false,
+            auxiliary_ready: false,
+        }))
+    }
+
+    fn construct_from(
+        factory: &dyn NativeStreamingSessionCandidateBuilder,
+        execution_plan: &ExecutionPlan,
+        start_index: usize,
+    ) -> Result<(usize, Box<dyn NativeAsrSession>), NativeAsrError> {
+        for (candidate_index, candidate) in execution_plan
+            .candidates()
+            .iter()
+            .enumerate()
+            .skip(start_index)
+        {
+            let attempt = factory.build(candidate);
+            match (attempt.result, attempt.candidate_failure) {
+                (Ok(session), None) => return Ok((candidate_index, session)),
+                (Err(error), None) => return Err(error),
+                (result, Some(failure)) => {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => candidate_success_with_failure_error("session-build", &failure),
+                    };
+                    if candidate_index + 1 == execution_plan.candidates().len() {
+                        return Err(error);
+                    }
+                    log_streaming_candidate_retry("session-build", candidate, &failure);
+                }
+            }
+        }
+        Err(NativeAsrError::SessionFailed {
+            message: "execution policy produced no streaming candidate attempts".to_string(),
+        })
+    }
+
+    fn candidate(&self) -> &ExecutionCandidate {
+        &self.execution_plan.candidates()[self.candidate_index]
+    }
+
+    fn run_current<T>(
+        &mut self,
+        operation: impl FnOnce(&mut dyn NativeAsrSession) -> Result<T, NativeAsrError>,
+    ) -> crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<T, NativeAsrError>
+    {
+        if let Some(error) = self.terminal_error.clone() {
+            return crate::models::native_execution_services::ExecutionCandidateAttemptOutcome {
+                result: Err(error),
+                candidate_failure: None,
+            };
+        }
+        let candidate = self.candidate().clone();
+        let services = self.factory.execution_services();
+        crate::models::native_execution_services::run_execution_candidate_attempt(
+            services.as_ref(),
+            &candidate,
+            || {
+                operation(
+                    self.session
+                        .as_deref_mut()
+                        .expect("a non-terminal policy session owns an active candidate"),
+                )
+            },
+        )
+    }
+
+    fn replace_with_next_candidate(
+        &mut self,
+        previous_error: NativeAsrError,
+    ) -> Result<(), NativeAsrError> {
+        let next_index = self.candidate_index.saturating_add(1);
+        if next_index >= self.execution_plan.candidates().len() {
+            return Err(previous_error);
+        }
+        // Drop every resource owned by the failed candidate before the next
+        // candidate quotes or allocates anything.
+        self.session.take();
+        let (candidate_index, mut session) =
+            match Self::construct_from(self.factory.as_ref(), &self.execution_plan, next_index) {
+                Ok(constructed) => constructed,
+                Err(error) => {
+                    // The wrapper remains a valid, fail-closed object even when
+                    // every later candidate failed to construct. Callers may
+                    // legally inspect/cancel a session after warm_up returned an
+                    // error; retaining a terminal error prevents that path from
+                    // panicking on an empty session slot.
+                    self.terminal_error = Some(error.clone());
+                    return Err(error);
+                }
+            };
+        debug_assert_eq!(
+            session.session_id(),
+            self.session_id,
+            "a replacement candidate must preserve the public session identity"
+        );
+        if let Some(token) = self.cancellation_token.as_ref() {
+            session.set_cancellation_token(Arc::clone(token));
+        }
+        self.candidate_index = candidate_index;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn ensure_auxiliary_ready(&mut self) -> Result<(), NativeAsrError> {
+        if self.auxiliary_ready {
+            return Ok(());
+        }
+        self.factory.initialize_auxiliary_runtimes()?;
+        self.auxiliary_ready = true;
+        Ok(())
+    }
+
+    fn ensure_auxiliary_ready_for_buffered_audio(&mut self) -> Result<(), NativeAsrError> {
+        if self.audio_started {
+            self.ensure_auxiliary_ready()?;
+        }
+        Ok(())
+    }
+}
+
+impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn set_cancellation_token(&mut self, cancelled: Arc<AtomicBool>) {
+        self.cancellation_token = Some(Arc::clone(&cancelled));
+        let _ = self.run_current(|session| {
+            session.set_cancellation_token(cancelled);
+            Ok::<_, NativeAsrError>(())
+        });
+    }
+
+    fn push_audio(
+        &mut self,
+        frame: crate::RealtimeAudioFrame,
+    ) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        self.ensure_auxiliary_ready()?;
+        // Conservative boundary: after control enters the family session we
+        // cannot prove whether a failing implementation consumed part of the
+        // frame, so retry is disabled before making the call.
+        self.audio_started = true;
+        candidate_attempt_result(
+            "push-audio",
+            self.run_current(|session| session.push_audio(frame)),
+        )
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        candidate_attempt_result(
+            "poll-events",
+            self.run_current(|session| session.poll_events()),
+        )
+    }
+
+    fn flush(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        self.ensure_auxiliary_ready_for_buffered_audio()?;
+        candidate_attempt_result("flush", self.run_current(|session| session.flush()))
+    }
+
+    fn warm_up(&mut self) -> Result<(), NativeAsrError> {
+        loop {
+            let candidate = self.candidate().clone();
+            let attempt = self.run_current(|session| session.warm_up());
+            match (attempt.result, attempt.candidate_failure) {
+                (Ok(()), None) => return self.ensure_auxiliary_ready(),
+                (Err(error), None) => return Err(error),
+                (result, Some(failure)) => {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(()) => candidate_success_with_failure_error("warm-up", &failure),
+                    };
+                    if self.audio_started {
+                        return Err(error);
+                    }
+                    log_streaming_candidate_retry("warm-up", &candidate, &failure);
+                    self.replace_with_next_candidate(error)?;
+                }
+            }
+        }
+    }
+
+    fn finalize_utterance(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        self.ensure_auxiliary_ready_for_buffered_audio()?;
+        candidate_attempt_result(
+            "finalize-utterance",
+            self.run_current(|session| session.finalize_utterance()),
+        )
+    }
+
+    fn split_utterance(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        self.ensure_auxiliary_ready_for_buffered_audio()?;
+        candidate_attempt_result(
+            "split-utterance",
+            self.run_current(|session| session.split_utterance()),
+        )
+    }
+
+    fn finish(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        self.ensure_auxiliary_ready_for_buffered_audio()?;
+        candidate_attempt_result("finish", self.run_current(|session| session.finish()))
+    }
+
+    fn close(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        self.ensure_auxiliary_ready_for_buffered_audio()?;
+        candidate_attempt_result("close", self.run_current(|session| session.close()))
+    }
+
+    fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+        // Cancellation is cleanup, never an inference boundary. It must stay
+        // allocation-free even when the session was canceled before warmup or
+        // the first audio frame.
+        candidate_attempt_result("cancel", self.run_current(|session| session.cancel()))
+    }
+}
+
+fn candidate_success_with_failure_error(
+    operation: &'static str,
+    failure: &crate::device::execution_policy::ExecutionCandidateFailure,
+) -> NativeAsrError {
+    NativeAsrError::SessionFailed {
+        message: format!(
+            "execution candidate reported {:?} during {operation} ({}) despite returning success",
+            failure.kind, failure.operation
+        ),
+    }
+}
+
+fn candidate_attempt_result<T>(
+    operation: &'static str,
+    attempt: crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<
+        T,
+        NativeAsrError,
+    >,
+) -> Result<T, NativeAsrError> {
+    match (attempt.result, attempt.candidate_failure) {
+        (result, None) => result,
+        (Err(error), Some(_)) => Err(error),
+        (Ok(_), Some(failure)) => Err(candidate_success_with_failure_error(operation, &failure)),
+    }
+}
+
+fn log_streaming_candidate_retry(
+    operation: &'static str,
+    candidate: &ExecutionCandidate,
+    failure: &crate::device::execution_policy::ExecutionCandidateFailure,
+) {
+    crate::stage_timing::log_detail_event(
+        "native_streaming",
+        format_args!(
+            "stage=execution_candidate event=retry operation={operation} provider={} placement={:?} failure={:?} failure_operation={}",
+            candidate.device.route.provider, candidate.placement, failure.kind, failure.operation,
+        ),
+    );
 }
 
 fn native_streaming_request_options_from_session_options(
@@ -328,7 +726,7 @@ fn native_streaming_request_options_from_session_options(
 
 impl TranscriptionBackend for NativeBackend {
     fn transcribe(&self, request: TranscriptionRequest) -> Result<Transcription, BackendError> {
-        native_transcribe::run_native_transcription(request)
+        native_transcribe::run_native_transcription(request, Arc::clone(&self.execution_services))
     }
 }
 
@@ -361,8 +759,20 @@ impl NativeAsrExecutor for NativeBackendExecutor {
                 ),
             };
         }
-        if native_execution_target_from_hardware_target(target).is_none() {
-            return NativeAsrRuntimeReadiness::UnsupportedHardwareTarget { target };
+        let intent = match execution_intent_from_hardware_target(target) {
+            Ok(intent) => intent,
+            Err(_) => return NativeAsrRuntimeReadiness::UnsupportedHardwareTarget { target },
+        };
+        if let ExecutionIntent::ConstrainedAcceleratedOnly(constraint) = intent {
+            let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+            if !inventory
+                .iter()
+                .any(|device| accelerated_constraint_matches(constraint, device))
+            {
+                return NativeAsrRuntimeReadiness::ProviderUnavailable {
+                    provider: hardware_target_provider_label(target).to_string(),
+                };
+            }
         }
         if !model_pack.root.exists() {
             return NativeAsrRuntimeReadiness::MissingLocalModelAsset {
@@ -393,6 +803,7 @@ impl NativeAsrExecutor for NativeBackendExecutor {
         }
         let execution_target = native_execution_target_from_hardware_target(target)
             .ok_or(NativeAsrError::UnsupportedHardwareTarget { target })?;
+        let execution_intent = execution_intent_from_hardware_target(target)?;
         let adapter_capabilities = adapter.capabilities();
         reject_unsupported_native_phrase_bias(
             adapter.adapter_id(),
@@ -402,7 +813,12 @@ impl NativeAsrExecutor for NativeBackendExecutor {
         )?;
         let request =
             native_offline_request_to_transcription_request(model_pack, execution_target, request);
-        native_transcribe::run_native_transcription(request).map_err(native_backend_error_to_asr)
+        native_transcribe::run_native_transcription_with_intent(
+            request,
+            Arc::clone(&self.execution_services),
+            Some(execution_intent),
+        )
+        .map_err(native_backend_error_to_asr)
     }
 
     fn start_session(
@@ -455,7 +871,14 @@ impl NativeAsrExecutor for NativeBackendExecutor {
         session_config.word_timestamps = session_config.word_timestamps
             && options.word_timestamps
             && adapter_capabilities.supports_timestamps;
-        adapter.start_streaming_session(model_pack, target, context, options, session_config)
+        adapter.start_streaming_session(
+            Arc::clone(&self.execution_services),
+            model_pack,
+            target,
+            context,
+            options,
+            session_config,
+        )
     }
 }
 
@@ -476,90 +899,130 @@ fn native_execution_target_from_hardware_target(
     }
 }
 
-fn native_ggml_backend_preference_from_hardware_target(
+fn execution_intent_from_hardware_target(
     target: NativeAsrHardwareTarget,
-) -> Result<GgmlAsrBackendPreference, NativeAsrError> {
+) -> Result<ExecutionIntent, NativeAsrError> {
     match target {
-        NativeAsrHardwareTarget::Auto => Ok(GgmlAsrBackendPreference::Auto),
+        NativeAsrHardwareTarget::Auto => Ok(ExecutionIntent::Auto),
         NativeAsrHardwareTarget::Cpu | NativeAsrHardwareTarget::IntelCpu => {
-            Ok(GgmlAsrBackendPreference::CpuOnly)
+            Ok(ExecutionIntent::CpuOnly)
         }
-        NativeAsrHardwareTarget::Accelerated
-        | NativeAsrHardwareTarget::AppleSilicon
-        | NativeAsrHardwareTarget::NvidiaCuda
-        | NativeAsrHardwareTarget::AmdGpu
-        | NativeAsrHardwareTarget::IntelGpu => {
-            let has_accelerated_device = crate::ggml_available_devices()
-                .iter()
-                .any(|device| device.kind.is_gpu());
-            if has_accelerated_device {
-                Ok(GgmlAsrBackendPreference::Accelerated)
-            } else {
-                Err(NativeAsrError::from_execution_route_error(
-                    crate::device::execution_route::ExecutionRouteError::AcceleratedUnavailable,
+        NativeAsrHardwareTarget::Accelerated => Ok(ExecutionIntent::AcceleratedOnly),
+        NativeAsrHardwareTarget::AppleSilicon => {
+            if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+                Ok(ExecutionIntent::ConstrainedAcceleratedOnly(
+                    AcceleratedDeviceConstraint::Provider(ExecutionProvider::Metal),
                 ))
+            } else {
+                Err(NativeAsrError::UnsupportedHardwareTarget { target })
             }
         }
+        NativeAsrHardwareTarget::NvidiaCuda => Ok(ExecutionIntent::ConstrainedAcceleratedOnly(
+            AcceleratedDeviceConstraint::Provider(ExecutionProvider::Cuda),
+        )),
+        NativeAsrHardwareTarget::AmdGpu => Ok(ExecutionIntent::ConstrainedAcceleratedOnly(
+            AcceleratedDeviceConstraint::HardwareVendor(ExecutionHardwareVendor::Amd),
+        )),
+        NativeAsrHardwareTarget::IntelGpu => Ok(ExecutionIntent::ConstrainedAcceleratedOnly(
+            AcceleratedDeviceConstraint::HardwareVendor(ExecutionHardwareVendor::Intel),
+        )),
         NativeAsrHardwareTarget::IntelNpu => {
             Err(NativeAsrError::UnsupportedHardwareTarget { target })
         }
     }
 }
 
-fn shared_native_ggml_streaming_execution_dispatch()
--> Result<&'static GgmlAsrExecutionDispatch, NativeAsrError> {
-    match NATIVE_GGML_STREAMING_EXECUTION_DISPATCH.get_or_init(|| {
-        build_builtin_ggml_streaming_execution_dispatch().map_err(|error| error.to_string())
-    }) {
-        Ok(dispatch) => Ok(dispatch),
-        Err(message) => Err(NativeAsrError::SessionFailed {
-            message: format!("could not build builtin ggml streaming dispatch: {message}"),
-        }),
+fn resolve_native_execution_plan_for_hardware_target(
+    execution_services: &NativeExecutionServices,
+    descriptor: &GgmlFamilyAdapterDescriptor,
+    target: NativeAsrHardwareTarget,
+) -> Result<ExecutionPlan, NativeAsrError> {
+    let intent = execution_intent_from_hardware_target(target)?;
+    let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+    execution_services
+        .policy_resolver()
+        .resolve(
+            intent,
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                descriptor.model_architecture,
+            ),
+            descriptor.execution_capabilities,
+            &inventory,
+        )
+        .map_err(|error| execution_policy_error_to_native(error, target))
+}
+
+fn execution_policy_error_to_native(
+    error: ExecutionPolicyError,
+    target: NativeAsrHardwareTarget,
+) -> NativeAsrError {
+    match error {
+        ExecutionPolicyError::Route(error) => NativeAsrError::from_execution_route_error(error),
+        ExecutionPolicyError::ConstrainedAcceleratedUnavailable { .. } => {
+            NativeAsrError::ProviderUnavailable {
+                provider: hardware_target_provider_label(target).to_string(),
+            }
+        }
+        ExecutionPolicyError::UnsupportedPlacement { .. }
+        | ExecutionPolicyError::NoAcceleratedPlacement
+        | ExecutionPolicyError::NoAcceleratedPlacementForProvider { .. }
+        | ExecutionPolicyError::NoAcceleratedPlacementForConstraint { .. }
+        | ExecutionPolicyError::NoSupportedCandidate { .. } => {
+            NativeAsrError::UnsupportedHardwareTarget { target }
+        }
+        other => NativeAsrError::SessionFailed {
+            message: format!("could not resolve native execution policy: {other}"),
+        },
     }
 }
 
-/// Idle-unload for the realtime-streaming dispatch. Like its offline
-/// counterpart, uses `get()` so a daemon that never started a streaming
-/// session does not build the dispatch just to unload nothing.
-pub(crate) fn unload_idle_native_streaming_runtime_caches() {
-    if let Some(Ok(dispatch)) = NATIVE_GGML_STREAMING_EXECUTION_DISPATCH.get() {
-        dispatch.unload_all();
+fn hardware_target_provider_label(target: NativeAsrHardwareTarget) -> &'static str {
+    match target {
+        NativeAsrHardwareTarget::AppleSilicon => "Metal on Apple silicon",
+        NativeAsrHardwareTarget::NvidiaCuda => "NVIDIA CUDA",
+        NativeAsrHardwareTarget::AmdGpu => "AMD GPU (HIP or proven AMD Vulkan)",
+        NativeAsrHardwareTarget::IntelGpu => "Intel GPU (proven Intel Vulkan)",
+        NativeAsrHardwareTarget::Accelerated => "accelerated",
+        NativeAsrHardwareTarget::Cpu | NativeAsrHardwareTarget::IntelCpu => "CPU",
+        NativeAsrHardwareTarget::IntelNpu => "Intel NPU",
+        NativeAsrHardwareTarget::Auto => "auto",
     }
 }
 
-/// Evicts every process-lifetime native model runtime cache (offline
-/// transcription dispatch + realtime streaming dispatch), releasing the
-/// resident mmap/tensor/Metal state a bound model pack accumulates after use.
-/// The `idle_unload` server preference calls this from a background reaper
-/// once the daemon has been idle (no active request/session) past its
-/// configured threshold; a subsequent request just rebuilds via the normal
-/// load-on-first-use path (paying the cold build cost again, same as the
-/// very first request after boot).
-///
-/// This deliberately does not touch the process-lifetime GGUF
-/// metadata/adapter/identity caches (`NATIVE_RUNTIME_MODEL_ADAPTER_CACHE`,
-/// `NATIVE_RUNTIME_MODEL_IDENTITY_CACHE`): those hold small parsed metadata,
-/// not resident weights/device state, and idle-unload's contract is "release
-/// what the model actually costs memory/device-residency for", not "forget
-/// what we know about an installed pack's identity/capabilities". Re-deriving
-/// them is also unconditionally safe (installed-pack content immutability),
-/// so there is no correctness reason to evict them here either.
-pub fn unload_idle_native_model_runtime_caches() {
-    native_transcribe::unload_idle_native_offline_runtime_caches();
-    unload_idle_native_streaming_runtime_caches();
-    // The per-family *thread-local* runtime caches (device-resident decoder /
-    // encoder sessions living in reused spawn_blocking worker TLS) cannot be
-    // dropped from this thread. Bumping the unload generation makes each
-    // owning thread discard its pre-unload runtimes on next use instead of
-    // handing them back out as cache hits -- without it, a worker thread that
-    // tokio keeps alive pins those weights (e.g. the qwen whole-decoder's
-    // device-uploaded LLM layers) across the unload indefinitely.
-    crate::models::thread_local_runtime_cache::bump_unload_generation();
-    // Voice ID also owns process-wide model snapshots plus a dedicated,
-    // long-lived ReDim Rayon pool. Run this after the generation advances so
-    // every worker eagerly clears and synchronizes its TLS cache to the new
-    // generation; no future request is required to release uploaded arenas.
-    crate::diarize::unload_idle_voice_id_runtime_caches();
+fn accelerated_constraint_matches(
+    constraint: AcceleratedDeviceConstraint,
+    device: &crate::device::execution_route::EnumeratedComputeDevice,
+) -> bool {
+    match constraint {
+        AcceleratedDeviceConstraint::Provider(provider) => device.provider == provider,
+        AcceleratedDeviceConstraint::HardwareVendor(vendor) => {
+            device.hardware_vendor == Some(vendor)
+        }
+    }
+}
+
+fn coarse_backend_preference_for_candidate(
+    candidate: &ExecutionCandidate,
+) -> GgmlAsrBackendPreference {
+    match candidate.placement {
+        ExecutionPlacement::CpuOnly => GgmlAsrBackendPreference::CpuOnly,
+        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => {
+            GgmlAsrBackendPreference::Accelerated
+        }
+    }
+}
+
+fn resolved_runtime_for_candidate(
+    candidate: &ExecutionCandidate,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
+    let preference = match candidate.placement {
+        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
+        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
+            RequestBackendPreference::Exact(candidate.device.route.clone()),
+        ),
+    };
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
 }
 
 fn native_ggml_streaming_error_to_asr(
@@ -1155,7 +1618,20 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
     };
+
+    fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
+        crate::models::native_execution_services::test_native_execution_services()
+    }
+
+    fn native_backend_for_test() -> NativeBackend {
+        NativeBackend::new(native_execution_services_for_test())
+    }
+
+    fn native_executor_for_test() -> NativeBackendExecutor {
+        NativeBackendExecutor::new(native_execution_services_for_test())
+    }
 
     fn sample_wav_fixture_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1219,6 +1695,16 @@ mod tests {
             bytes.extend_from_slice(&0_i16.to_le_bytes());
         }
         fs::write(path, bytes).expect("write short wav fixture");
+    }
+
+    fn whisper_tiny_context_wav_fixture(temp: &tempfile::TempDir) -> PathBuf {
+        let path = temp.path().join("whisper-tiny-context.wav");
+        // Tiny Whisper metadata fixtures advertise only 128 encoder positions
+        // (2.56 s at the real frontend geometry). Keep these boundary tests
+        // inside that truthful contract so they reach the tensor/tokenizer
+        // condition each test is intended to assert.
+        write_mono_pcm16_wav(&path, 16_000, 3_200);
+        path
     }
 
     fn read_wav_mono_16k_pcm16(path: &Path) -> Result<Vec<i16>, String> {
@@ -1337,6 +1823,10 @@ mod tests {
             crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
             architecture.to_string(),
         );
+        // Decoder-state topology reads the model's native GGUF architecture,
+        // just as the production pack contracts do. Keep the generic fixture
+        // valid at both the OpenASR routing layer and the model-semantic layer.
+        metadata.insert("general.architecture".to_string(), architecture.to_string());
         metadata.insert(
             crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
             frontend.to_string(),
@@ -1349,32 +1839,20 @@ mod tests {
         TinyGgufFixtureSpec::new(metadata)
     }
 
-    fn qwen_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
-        streaming_runtime_fixture_spec(
-            crate::models::qwen::QWEN3_ASR_MODEL_FAMILY,
-            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            crate::QWEN3_ASR_AUDIO_FRONTEND_ID,
-            crate::QWEN3_ASR_DECODE_POLICY_ID,
-            crate::QWEN3_ASR_TOKENIZER_ID,
-        )
+    fn qwen_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
+        TinyGgufFixtureSpec::qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id)
     }
 
     fn whisper_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
-        TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(model_id)
+        TinyGgufFixtureSpec::whisper_oasr_v1_metadata_ready_for_streaming_fail_closed(model_id)
     }
 
     fn cohere_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
         TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(model_id)
     }
 
-    fn moonshine_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
-        streaming_runtime_fixture_spec(
-            crate::MOONSHINE_MODEL_FAMILY,
-            crate::MOONSHINE_GGML_ARCHITECTURE_ID,
-            crate::MOONSHINE_AUDIO_FRONTEND_ID,
-            crate::MOONSHINE_DECODE_POLICY_ID,
-            crate::MOONSHINE_TOKENIZER_ID,
-        )
+    fn moonshine_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
+        TinyGgufFixtureSpec::moonshine_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id)
     }
 
     fn parakeet_ctc_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
@@ -1533,6 +2011,7 @@ mod tests {
 
         fn start_streaming_session(
             &self,
+            _execution_services: Arc<NativeExecutionServices>,
             _model_pack: &NativeAsrModelPackRef,
             _target: NativeAsrHardwareTarget,
             context: NativeAsrSessionContext,
@@ -1620,57 +2099,10 @@ mod tests {
     }
 
     #[test]
-    fn unload_idle_native_model_runtime_caches_is_a_safe_no_op_before_any_dispatch_use() {
-        // The common daemon-boot-with-no-request-yet case (and the general
-        // "idle_unload reaper fires before either dispatch was ever built"
-        // case, since both use `OnceLock::get()` rather than
-        // `get_or_init()`): must not build the dispatch just to unload
-        // nothing from it, and must never panic.
-        let _generation_guard =
-            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
-        unload_idle_native_model_runtime_caches();
-    }
-
-    #[test]
-    fn unload_idle_native_model_runtime_caches_advances_the_thread_local_unload_generation() {
-        // The thread-local per-family runtime caches (e.g. the qwen
-        // whole-decoder's device-uploaded weights in a spawn_blocking
-        // thread's TLS) are unreachable from the reaper thread; the unload
-        // generation bump is the only signal that makes their owning threads
-        // discard them, so an unload sweep that does not advance it would
-        // silently reintroduce the post-unload residency leak.
-        let _generation_guard =
-            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
-        let before = crate::models::thread_local_runtime_cache::current_unload_generation();
-        unload_idle_native_model_runtime_caches();
-        assert!(
-            crate::models::thread_local_runtime_cache::current_unload_generation() > before,
-            "idle unload must advance the thread-local cache unload generation"
-        );
-    }
-
-    #[test]
-    fn last_native_runtime_shutdown_guard_runs_the_ordered_unload_once() {
-        let _generation_guard =
-            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
-        let before = crate::models::thread_local_runtime_cache::current_unload_generation();
-        let outer = NativeRuntimeShutdownGuard::new();
-        let inner = NativeRuntimeShutdownGuard::default();
-
-        drop(inner);
-        assert_eq!(
-            crate::models::thread_local_runtime_cache::current_unload_generation(),
-            before,
-            "an inner owner must not unload runtimes still owned by its caller"
-        );
-
-        drop(outer);
-
-        assert_eq!(
-            crate::models::thread_local_runtime_cache::current_unload_generation(),
-            before + 1,
-            "the last process owner must run exactly one ordered unload"
-        );
+    fn service_scoped_unload_is_safe_before_any_dispatch_use() {
+        // Constructing a service builds registry tables but not model weights;
+        // unloading before the first request is therefore a safe no-op.
+        native_execution_services_for_test().unload_idle_native_model_runtime_caches();
     }
 
     #[test]
@@ -1783,7 +2215,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn native_streaming_rejects_voice_id_and_keeps_speakers_out_of_decode_options() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-redimnet-only-streaming.gguf");
@@ -1907,7 +2338,7 @@ mod tests {
         let phrase_bias = crate::PhraseBiasConfig::from_phrases([("OpenASR", 2.0)]).unwrap();
 
         let error = NativeAsrExecutor::transcribe(
-            &NativeBackendExecutor,
+            &native_executor_for_test(),
             &adapter,
             &model_pack,
             NativeAsrHardwareTarget::Cpu,
@@ -1938,7 +2369,7 @@ mod tests {
         let phrase_bias = crate::PhraseBiasConfig::from_phrases([("OpenASR", 2.0)]).unwrap();
 
         let error = match NativeAsrExecutor::start_streaming_session(
-            &NativeBackendExecutor,
+            &native_executor_for_test(),
             &adapter,
             &model_pack,
             NativeAsrHardwareTarget::Cpu,
@@ -1993,7 +2424,7 @@ mod tests {
 
             let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
             let model_pack = NativeAsrModelPackRef::new(case.model_id, case.family, &runtime_path);
-            let backend = NativeBackendExecutor;
+            let backend = native_executor_for_test();
             let session_id = format!("rt_{}_backend_streaming", case.slug.replace('-', "_"));
             let mut session = NativeAsrExecutor::start_streaming_session(
                 &backend,
@@ -2098,7 +2529,7 @@ mod tests {
             .unwrap_or("native-streaming-smoke-runtime");
         let model_pack =
             NativeAsrModelPackRef::new(model_id, adapter.model_family(), &runtime_path);
-        let backend = NativeBackendExecutor;
+        let backend = native_executor_for_test();
         let mut session = NativeAsrExecutor::start_streaming_session(
             &backend,
             &adapter,
@@ -2253,7 +2684,7 @@ mod tests {
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let backend = NativeBackendExecutor;
+        let backend = native_executor_for_test();
         let adapter = TestNativeRuntimeAdapter { family: "cohere" };
         let model_pack =
             NativeAsrModelPackRef::new("cohere-runtime-fixture", "cohere", runtime_path.clone());
@@ -2317,23 +2748,324 @@ mod tests {
     }
 
     #[test]
-    fn native_hardware_target_mapping_preserves_ggml_streaming_backend_preferences() {
+    fn native_hardware_target_mapping_preserves_policy_constraints() {
         assert_eq!(
-            native_ggml_backend_preference_from_hardware_target(NativeAsrHardwareTarget::Auto)
-                .unwrap(),
-            GgmlAsrBackendPreference::Auto
+            execution_intent_from_hardware_target(NativeAsrHardwareTarget::Auto).unwrap(),
+            ExecutionIntent::Auto
         );
         assert_eq!(
-            native_ggml_backend_preference_from_hardware_target(NativeAsrHardwareTarget::Cpu)
-                .unwrap(),
-            GgmlAsrBackendPreference::CpuOnly
+            execution_intent_from_hardware_target(NativeAsrHardwareTarget::Cpu).unwrap(),
+            ExecutionIntent::CpuOnly
         );
+        assert_eq!(
+            execution_intent_from_hardware_target(NativeAsrHardwareTarget::NvidiaCuda).unwrap(),
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Cuda
+            ))
+        );
+        assert_eq!(
+            execution_intent_from_hardware_target(NativeAsrHardwareTarget::AmdGpu).unwrap(),
+            ExecutionIntent::ConstrainedAcceleratedOnly(
+                AcceleratedDeviceConstraint::HardwareVendor(ExecutionHardwareVendor::Amd)
+            )
+        );
+        let apple_silicon =
+            execution_intent_from_hardware_target(NativeAsrHardwareTarget::AppleSilicon);
+        if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+            assert_eq!(
+                apple_silicon.unwrap(),
+                ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                    ExecutionProvider::Metal
+                ))
+            );
+        } else {
+            assert!(matches!(
+                apple_silicon,
+                Err(NativeAsrError::UnsupportedHardwareTarget {
+                    target: NativeAsrHardwareTarget::AppleSilicon
+                })
+            ));
+        }
         assert!(matches!(
-            native_ggml_backend_preference_from_hardware_target(NativeAsrHardwareTarget::IntelNpu),
+            execution_intent_from_hardware_target(NativeAsrHardwareTarget::IntelNpu),
             Err(NativeAsrError::UnsupportedHardwareTarget {
                 target: NativeAsrHardwareTarget::IntelNpu
             })
         ));
+    }
+
+    struct TestStreamingCandidateBuilder {
+        services: Arc<NativeExecutionServices>,
+        builds: Arc<Mutex<Vec<ExecutionProvider>>>,
+        fail_build_on_accelerated: bool,
+        fail_build_on_cpu_untyped: bool,
+        fail_warmup_on_accelerated: bool,
+        fail_push_on_accelerated: bool,
+        auxiliary_initializations: Arc<AtomicUsize>,
+    }
+
+    impl NativeStreamingSessionCandidateBuilder for TestStreamingCandidateBuilder {
+        fn execution_services(&self) -> Arc<NativeExecutionServices> {
+            Arc::clone(&self.services)
+        }
+
+        fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
+            self.auxiliary_initializations
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn build(
+            &self,
+            candidate: &ExecutionCandidate,
+        ) -> crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<
+            Box<dyn NativeAsrSession>,
+            NativeAsrError,
+        > {
+            crate::models::native_execution_services::run_execution_candidate_attempt(
+                self.services.as_ref(),
+                candidate,
+                || {
+                    let provider = candidate.device.route.provider;
+                    self.builds.lock().unwrap().push(provider);
+                    let accelerated = provider != ExecutionProvider::Cpu;
+                    if accelerated && self.fail_build_on_accelerated {
+                        crate::models::native_execution_services::record_current_execution_candidate_failure(
+                            crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                                "test-session-build",
+                                "typed build failure",
+                            ),
+                        );
+                        return Err(NativeAsrError::SessionFailed {
+                            message: "opaque build error".to_string(),
+                        });
+                    }
+                    if !accelerated && self.fail_build_on_cpu_untyped {
+                        return Err(NativeAsrError::SessionFailed {
+                            message: "opaque CPU build error".to_string(),
+                        });
+                    }
+                    Ok(Box::new(TestPolicyNativeSession {
+                        provider,
+                        fail_warmup_on_accelerated: self.fail_warmup_on_accelerated,
+                        fail_push_on_accelerated: self.fail_push_on_accelerated,
+                    }) as Box<dyn NativeAsrSession>)
+                },
+            )
+        }
+    }
+
+    struct TestPolicyNativeSession {
+        provider: ExecutionProvider,
+        fail_warmup_on_accelerated: bool,
+        fail_push_on_accelerated: bool,
+    }
+
+    impl NativeAsrSession for TestPolicyNativeSession {
+        fn session_id(&self) -> &str {
+            "policy-streaming-test"
+        }
+
+        fn push_audio(
+            &mut self,
+            _frame: crate::RealtimeAudioFrame,
+        ) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+            if self.provider != ExecutionProvider::Cpu && self.fail_push_on_accelerated {
+                crate::models::native_execution_services::record_current_execution_candidate_failure(
+                    crate::device::execution_policy::ExecutionCandidateFailure::device_lost(
+                        "test-push",
+                        "typed post-audio failure",
+                    ),
+                );
+                return Err(NativeAsrError::SessionFailed {
+                    message: "opaque push error".to_string(),
+                });
+            }
+            Ok(Vec::new())
+        }
+
+        fn poll_events(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+            Ok(Vec::new())
+        }
+
+        fn warm_up(&mut self) -> Result<(), NativeAsrError> {
+            if self.provider != ExecutionProvider::Cpu && self.fail_warmup_on_accelerated {
+                crate::models::native_execution_services::record_current_execution_candidate_failure(
+                    crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                        "test-warm-up",
+                        "typed warm-up failure",
+                    ),
+                );
+                return Err(NativeAsrError::SessionFailed {
+                    message: "opaque warm-up error".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+            Ok(Vec::new())
+        }
+
+        fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn streaming_policy_candidate(
+        provider: ExecutionProvider,
+        placement: ExecutionPlacement,
+    ) -> ExecutionCandidate {
+        let kind = if provider == ExecutionProvider::Cpu {
+            crate::RouteDeviceKind::Cpu
+        } else {
+            crate::RouteDeviceKind::Accelerated
+        };
+        ExecutionCandidate {
+            device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                route: crate::ResolvedExecutionRoute {
+                    provider,
+                    stable_id: format!("{provider}-test"),
+                    registry_ordinal: 0,
+                    kind,
+                    addressability: crate::DeviceAddressability::NotExactlyAddressable {
+                        reason: "test candidate",
+                    },
+                },
+                ggml_kind: if provider == ExecutionProvider::Cpu {
+                    crate::GgmlBackendKind::Cpu
+                } else {
+                    crate::GgmlBackendKind::Gpu
+                },
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement,
+        }
+    }
+
+    fn streaming_auto_test_plan() -> ExecutionPlan {
+        ExecutionPlan::for_test(
+            ExecutionIntent::Auto,
+            vec![
+                streaming_policy_candidate(ExecutionProvider::Vulkan, ExecutionPlacement::Hybrid),
+                streaming_policy_candidate(ExecutionProvider::Cpu, ExecutionPlacement::CpuOnly),
+            ],
+        )
+    }
+
+    fn streaming_test_builder(
+        fail_build: bool,
+        fail_warmup: bool,
+        fail_push: bool,
+    ) -> (
+        Arc<dyn NativeStreamingSessionCandidateBuilder>,
+        Arc<Mutex<Vec<ExecutionProvider>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let auxiliary_initializations = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(TestStreamingCandidateBuilder {
+                services: native_execution_services_for_test(),
+                builds: Arc::clone(&builds),
+                fail_build_on_accelerated: fail_build,
+                fail_build_on_cpu_untyped: false,
+                fail_warmup_on_accelerated: fail_warmup,
+                fail_push_on_accelerated: fail_push,
+                auxiliary_initializations: Arc::clone(&auxiliary_initializations),
+            }),
+            builds,
+            auxiliary_initializations,
+        )
+    }
+
+    #[test]
+    fn streaming_session_acquisition_advances_only_on_typed_candidate_failure() {
+        let (builder, builds, _) = streaming_test_builder(true, false, false);
+        let session =
+            PolicyResolvedNativeStreamingSession::start(builder, streaming_auto_test_plan())
+                .expect("typed accelerated build failure should construct CPU candidate");
+        assert_eq!(session.session_id(), "policy-streaming-test");
+        assert_eq!(
+            *builds.lock().unwrap(),
+            vec![ExecutionProvider::Vulkan, ExecutionProvider::Cpu]
+        );
+    }
+
+    #[test]
+    fn streaming_warmup_can_replace_candidate_before_audio() {
+        let (builder, builds, auxiliary_initializations) =
+            streaming_test_builder(false, true, false);
+        let mut session =
+            PolicyResolvedNativeStreamingSession::start(builder, streaming_auto_test_plan())
+                .unwrap();
+        session
+            .warm_up()
+            .expect("typed warm-up failure should rebuild and warm CPU candidate");
+        assert_eq!(
+            *builds.lock().unwrap(),
+            vec![ExecutionProvider::Vulkan, ExecutionProvider::Cpu]
+        );
+        assert_eq!(auxiliary_initializations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn streaming_never_retries_after_first_audio_enters_session() {
+        let (builder, builds, _) = streaming_test_builder(false, false, true);
+        let mut session =
+            PolicyResolvedNativeStreamingSession::start(builder, streaming_auto_test_plan())
+                .unwrap();
+        let format = crate::RealtimeAudioFormat::pcm16_mono_16khz();
+        let frame = crate::RealtimeAudioFrame::new(0, 0, format, vec![0; 320]).unwrap();
+        let error = session
+            .push_audio(frame)
+            .expect_err("post-audio typed device failure must fail without replay");
+        assert!(error.to_string().contains("opaque push error"));
+        assert_eq!(*builds.lock().unwrap(), vec![ExecutionProvider::Vulkan]);
+    }
+
+    #[test]
+    fn streaming_cancel_before_audio_never_initializes_auxiliary_models() {
+        let (builder, _, auxiliary_initializations) = streaming_test_builder(false, false, false);
+        let mut session =
+            PolicyResolvedNativeStreamingSession::start(builder, streaming_auto_test_plan())
+                .unwrap();
+
+        session.cancel().unwrap();
+
+        assert_eq!(auxiliary_initializations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn streaming_failed_replacement_becomes_terminal_without_panicking() {
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let builder: Arc<dyn NativeStreamingSessionCandidateBuilder> =
+            Arc::new(TestStreamingCandidateBuilder {
+                services: native_execution_services_for_test(),
+                builds: Arc::clone(&builds),
+                fail_build_on_accelerated: false,
+                fail_build_on_cpu_untyped: true,
+                fail_warmup_on_accelerated: true,
+                fail_push_on_accelerated: false,
+                auxiliary_initializations: Arc::new(AtomicUsize::new(0)),
+            });
+        let mut session =
+            PolicyResolvedNativeStreamingSession::start(builder, streaming_auto_test_plan())
+                .unwrap();
+        let warmup_error = session
+            .warm_up()
+            .expect_err("CPU replacement construction is deliberately untyped and terminal");
+        assert!(warmup_error.to_string().contains("opaque CPU build error"));
+        assert_eq!(session.session_id(), "policy-streaming-test");
+        let later_error = session
+            .poll_events()
+            .expect_err("a terminal wrapper must fail closed instead of panicking");
+        assert_eq!(later_error, warmup_error);
+        assert_eq!(
+            *builds.lock().unwrap(),
+            vec![ExecutionProvider::Vulkan, ExecutionProvider::Cpu]
+        );
     }
 
     #[test]
@@ -2399,7 +3131,7 @@ mod tests {
             let runtime_path = temp.path().join("cohere-runtime.gguf");
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-            let backend = NativeBackendExecutor;
+            let backend = native_executor_for_test();
             let adapter = TestNativeRuntimeAdapter { family: "cohere" };
             let model_pack =
                 NativeAsrModelPackRef::new("cohere-runtime-fixture", "cohere", runtime_path);
@@ -2426,7 +3158,7 @@ mod tests {
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let backend = NativeBackendExecutor;
+        let backend = native_executor_for_test();
         let adapter = TestStreamingRuntimeAdapter {
             family: "cohere",
             supports_partials: true,
@@ -2473,7 +3205,7 @@ mod tests {
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let backend = NativeBackendExecutor;
+        let backend = native_executor_for_test();
         let adapter = TestStreamingRuntimeAdapter {
             family: "cohere",
             supports_partials: false,
@@ -2508,7 +3240,7 @@ mod tests {
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let backend = NativeBackendExecutor;
+        let backend = native_executor_for_test();
         let adapter = TestNativeRuntimeAdapter { family: "cohere" };
         let model_pack =
             NativeAsrModelPackRef::new("cohere-runtime-fixture", "cohere", runtime_path);
@@ -2535,6 +3267,13 @@ mod tests {
 
     #[test]
     fn native_runtime_model_adapter_routes_declared_true_streaming_to_ggml_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture"),
+        )
+        .unwrap();
         let descriptor = crate::cohere_transcribe_runtime_descriptor_v1();
         let adapter = NativeRuntimeModelAdapter {
             descriptor: descriptor.clone(),
@@ -2548,11 +3287,12 @@ mod tests {
         let model_pack = NativeAsrModelPackRef::new(
             "cohere-runtime-fixture",
             descriptor.model_family,
-            "/tmp/openasr/cohere-runtime.gguf",
+            runtime_path,
         );
 
         let mut session = adapter
             .start_streaming_session(
+                native_execution_services_for_test(),
                 &model_pack,
                 NativeAsrHardwareTarget::Cpu,
                 NativeAsrSessionContext::new("rt_native_adapter_ggml_streaming"),
@@ -2583,21 +3323,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        let error = session.poll_events().unwrap_err().to_string();
-
+        let events = session.poll_events().unwrap();
         assert!(
-            error.contains("cohere-transcribe-ggml-snapshot-streaming-executor-v1"),
-            "{error}"
-        );
-        assert!(
-            error.contains("could not load runtime preflight"),
-            "{error}"
+            events
+                .iter()
+                .any(|event| event.event_type == "transcript.partial"),
+            "the runtime-ready Cohere fixture must decode through the registered streaming executor"
         );
     }
 
     #[test]
     fn native_backend_requires_model_pack_path() {
-        let backend = NativeBackend;
+        let backend = native_backend_for_test();
         let request = TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-small");
 
         let error = backend.transcribe(request).unwrap_err().to_string();
@@ -2628,7 +3365,7 @@ mod tests {
                 let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
                 write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
-                let backend = NativeBackend;
+                let backend = native_backend_for_test();
                 let request =
                     TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
                         .with_model_pack_path(Some(runtime_path))
@@ -2874,7 +3611,7 @@ mod tests {
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
-            let backend = NativeBackend;
+            let backend = native_backend_for_test();
             let request =
                 TranscriptionRequest::new(sample_wav_fixture_path(), "cohere-runtime-fixture")
                     .with_model_pack_path(Some(runtime_path))
@@ -2968,7 +3705,7 @@ mod tests {
 
     #[test]
     fn native_backend_does_not_reject_phrase_bias_before_runtime_dispatch() {
-        let backend = NativeBackend;
+        let backend = native_backend_for_test();
         let phrase_bias = crate::PhraseBiasConfig::from_phrases([("OpenASR", 3.0)]).unwrap();
         let request = TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-small")
             .with_phrase_bias(Some(phrase_bias));
@@ -3171,10 +3908,12 @@ mod tests {
         );
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
-        let request =
-            TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
-                .with_model_pack_path(Some(runtime_path));
+        let backend = native_backend_for_test();
+        let request = TranscriptionRequest::new(
+            whisper_tiny_context_wav_fixture(&temp),
+            "whisper-runtime-fixture",
+        )
+        .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
@@ -3202,7 +3941,7 @@ mod tests {
         );
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
+        let backend = native_backend_for_test();
         let request =
             TranscriptionRequest::new(sample_wav_fixture_path(), "unknown-family-fixture")
                 .with_model_pack_path(Some(runtime_path));
@@ -3278,7 +4017,7 @@ mod tests {
             add_qwen_audio_layer_shapes(add_qwen_audio_layer_shapes(fixture_spec, 0), 1);
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
+        let backend = native_backend_for_test();
         let request = TranscriptionRequest::new(sample_wav_fixture_path(), "qwen3-asr-0.6b-q4_k")
             .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
@@ -3296,7 +4035,7 @@ mod tests {
                 TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-            let backend = NativeBackend;
+            let backend = native_backend_for_test();
             let request =
                 TranscriptionRequest::new(sample_wav_fixture_path(), "cohere-runtime-fixture")
                     .with_model_pack_path(Some(runtime_path));
@@ -3322,10 +4061,12 @@ mod tests {
         );
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
-        let request =
-            TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
-                .with_model_pack_path(Some(runtime_path));
+        let backend = native_backend_for_test();
+        let request = TranscriptionRequest::new(
+            whisper_tiny_context_wav_fixture(&temp),
+            "whisper-runtime-fixture",
+        )
+        .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(error.contains("whisper-ggml-executor-v1"), "{error}");
@@ -3346,7 +4087,7 @@ mod tests {
             TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
+        let backend = native_backend_for_test();
         let request = TranscriptionRequest::new(wav_path, "whisper-runtime-fixture")
             .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
@@ -3374,15 +4115,16 @@ mod tests {
         fixture_spec.metadata.remove("whisper.encoder.block_count");
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
-        let request =
-            TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
-                .with_model_pack_path(Some(runtime_path));
+        let backend = native_backend_for_test();
+        let request = TranscriptionRequest::new(
+            whisper_tiny_context_wav_fixture(&temp),
+            "whisper-runtime-fixture",
+        )
+        .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
-        assert!(error.contains("whisper-ggml-executor-v1"), "{error}");
         assert!(
-            error.contains("whisper ggml executor missing required GGUF metadata key"),
+            error.contains("model family 'whisper' decoder-state metadata is unavailable"),
             "{error}"
         );
         assert!(error.contains("whisper.encoder.block_count"), "{error}");
@@ -3401,10 +4143,12 @@ mod tests {
                 );
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
-        let request =
-            TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
-                .with_model_pack_path(Some(runtime_path));
+        let backend = native_backend_for_test();
+        let request = TranscriptionRequest::new(
+            whisper_tiny_context_wav_fixture(&temp),
+            "whisper-runtime-fixture",
+        )
+        .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
@@ -3425,10 +4169,12 @@ mod tests {
         );
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
-        let request =
-            TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
-                .with_model_pack_path(Some(runtime_path));
+        let backend = native_backend_for_test();
+        let request = TranscriptionRequest::new(
+            whisper_tiny_context_wav_fixture(&temp),
+            "whisper-runtime-fixture",
+        )
+        .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
@@ -3449,10 +4195,12 @@ mod tests {
         );
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
-        let backend = NativeBackend;
-        let request =
-            TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
-                .with_model_pack_path(Some(runtime_path));
+        let backend = native_backend_for_test();
+        let request = TranscriptionRequest::new(
+            whisper_tiny_context_wav_fixture(&temp),
+            "whisper-runtime-fixture",
+        )
+        .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(

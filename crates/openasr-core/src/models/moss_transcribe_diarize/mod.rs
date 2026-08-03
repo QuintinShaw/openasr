@@ -30,12 +30,14 @@
 
 mod adaptor_graph;
 pub(crate) mod capacity;
+mod decode_budget;
 mod decode_prompt;
 mod encoder_graph;
 pub(crate) mod executor;
 mod graph_config;
 mod llm_decoder;
 pub(crate) mod package_import;
+mod prepared_runtime;
 mod prompt_embedding;
 pub(crate) mod runtime_contract;
 pub(crate) mod speaker_segments;

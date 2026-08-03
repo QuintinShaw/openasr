@@ -1,97 +1,271 @@
-//! cohere-transcribe capacity derivation for the shared host-memory admission
-//! check ([`crate::capacity::evaluate_host_memory_admission`]).
+//! Cohere decoder-state topology for the unified capacity planner.
 //!
-//! Unlike the Qwen-shaped LLM families, this AED decoder's KV state is
-//! allocated at FIXED per-pack ceilings the moment the decoder runtime is
-//! built, independent of the request's audio length (see
-//! `super::decoder_graph`):
+//! Self-attention positions and encoder cross-attention frames are separate
+//! axes. Exact demand uses the frontend's integer frame-shape oracle for the
+//! current invocation; stable demand uses the same oracle at the session
+//! envelope. The runtime allocates those stable resident spans once and
+//! activates each invocation's logical spans inside them without growth.
 //!
-//! - the self-attention KV cache is f16 at the full `decoder_max_context`
-//!   span per layer, and
-//! - the cross-attention KV cache is f32 over the pack's chunk-cap encoder
-//!   frame capacity ([`super::decoder_graph::cohere_decoder_cross_capacity_frames`],
-//!   the shared longform safety ceiling plus margin).
-//!
-//! Admission therefore charges those exact allocations, not a per-request
-//! position walk. The split between the two return channels keeps every byte
-//! exact:
-//!
-//! - the cross-KV cache maps onto the shared position model byte-for-byte:
-//!   one "position" = one encoder frame costing `layers x 2 x d_model` f32
-//!   values, and [`COHERE_ADMISSION_KV_SPEC`] (two f16 copies, 4 B/value
-//!   total) equals one f32 copy exactly;
-//! - the f16 self-KV ceiling cannot be expressed at 2 B/value through the
-//!   two-copy spec model, so it is returned as exact fixed bytes instead
-//!   (charging it through the spec would overstate it 2x -- the false-reject
-//!   direction the admission invariant forbids).
-//!
-//! A `longform mode=off` request larger than the chunk cap can still grow
-//! the cross cache past this estimate at runtime; admission's under-estimate
-//! for that opt-in path resolves to "allow" (fail open), never to a false
-//! rejection of the default path.
-
-use crate::capacity::KvGeometry;
-use crate::ggml_runtime::GgmlKvElementType;
-use crate::nn::decoder::LlmKvCacheSpec;
-
-use super::decoder_graph::cohere_decoder_cross_capacity_frames;
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
+use crate::capacity::topology::{
+    DecoderStateDemandScope, DecoderStateTopology, InvocationEnvelope, InvocationShapeInput,
+    PositionBoundProof, StateBytes, StateDemand, StateKind, TopologyError,
+};
+use crate::models::audio_frontend::{PadMode, StftFramer};
+use crate::models::ggml_asr_executor::{
+    GgmlAsrDecoderStatePlanningError, GgmlAsrDecoderStatePlanningInput,
+};
+use crate::models::seq2seq_decoder_state::Seq2SeqStateIds;
 
-/// Two f16 copies = 4 B/value total: byte-for-byte the single f32 copy the
-/// cross-KV cache actually allocates (see the module doc). Only
-/// [`crate::capacity::KvBytesPerPosition::total`] is consumed by admission,
-/// so the host/resident split is a modeling stand-in, not a claim that a
-/// host-side copy exists.
-pub(crate) const COHERE_ADMISSION_KV_SPEC: LlmKvCacheSpec = LlmKvCacheSpec {
-    host: GgmlKvElementType::F16,
-    resident: GgmlKvElementType::F16,
+const SELF_KV_STATE_ID: &str = "cohere.decoder.self_kv";
+const CROSS_KV_STATE_ID: &str = "cohere.decoder.cross_kv";
+pub(crate) const COHERE_DECODER_STATE_IDS: Seq2SeqStateIds = Seq2SeqStateIds {
+    self_attention: SELF_KV_STATE_ID,
+    cross_attention: CROSS_KV_STATE_ID,
 };
 
-/// The decoder KV geometry the loaded pack advertises (MHA: `kv_heads` equals
-/// `decoder_heads`, so `layers x 2 x kv_heads x head_dim` values per position
-/// equals the `layers x 2 x d_model` values one cross-KV frame costs).
-pub(crate) fn cohere_kv_geometry(metadata: &CohereTranscribeExecutionMetadata) -> KvGeometry {
-    KvGeometry {
-        n_layers: metadata.decoder_layers,
-        kv_heads: metadata.decoder_heads,
-        head_dim: metadata.decoder_head_dim,
+pub(crate) fn plan_cohere_decoder_state(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "cohere-transcribe";
+    let metadata = super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+        input.preflight.metadata.as_ref(),
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::MetadataUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?;
+    let tokenizer = super::tokenizer::CohereTranscribeTokenizer::from_gguf_metadata(
+        input.preflight.metadata.as_ref(),
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?;
+    plan_cohere_decoder_state_with_components(input, metadata, &tokenizer)
+}
+
+pub(crate) fn plan_cohere_decoder_state_with_prepared_runtime(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    prepared: &super::prepared_runtime::CoherePreparedRuntime,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    plan_cohere_decoder_state_with_components(input, prepared.metadata, &prepared.tokenizer)
+}
+
+fn plan_cohere_decoder_state_with_components(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    metadata: CohereTranscribeExecutionMetadata,
+    tokenizer: &super::tokenizer::CohereTranscribeTokenizer,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "cohere-transcribe";
+    let base_prompt = super::prompt::build_cohere_transcribe_decode_prompt(
+        tokenizer,
+        metadata.decoder_start_token_id,
+        input.request_options.language.as_deref(),
+        input.request_options,
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?;
+    let base_prompt_positions = base_prompt.token_ids.len();
+    let logical_prompt_positions = super::prompt::build_cohere_initial_prompt_token_ids(
+        base_prompt.token_ids,
+        input.request_options,
+        metadata,
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?
+    .len();
+    let stable_prompt_positions = super::prompt::cohere_stable_prompt_positions(
+        logical_prompt_positions,
+        base_prompt_positions,
+        input.request_options,
+        metadata.decoder_max_context,
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?;
+    let topology = CohereDecoderStateTopology::for_envelope(
+        metadata,
+        input.envelope,
+        logical_prompt_positions,
+        stable_prompt_positions,
+    )
+    .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })?;
+    crate::capacity::topology::DecoderStatePlan::build(&topology, input.invocation, input.envelope)
+        .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })
+}
+
+fn cohere_resident_kv_bytes(
+    metadata: &CohereTranscribeExecutionMetadata,
+    positions: usize,
+    sequences: usize,
+    bytes_per_value: usize,
+) -> Result<StateBytes, TopologyError> {
+    let resident = metadata
+        .decoder_layers
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(metadata.decoder_d_model))
+        .and_then(|value| value.checked_mul(positions))
+        .and_then(|value| value.checked_mul(sequences))
+        .and_then(|value| value.checked_mul(bytes_per_value))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(TopologyError::ArithmeticOverflow {
+            operation: "cohere resident KV bytes",
+        })?;
+    Ok(StateBytes { host: 0, resident })
+}
+
+pub(crate) fn cohere_encoder_frame_count_for_samples(
+    metadata: CohereTranscribeExecutionMetadata,
+    samples: usize,
+    sample_rate_hz: u32,
+) -> Result<usize, TopologyError> {
+    if sample_rate_hz != metadata.sample_rate_hz {
+        return Err(TopologyError::UnsupportedSampleRate {
+            expected_hz: metadata.sample_rate_hz,
+            actual_hz: sample_rate_hz,
+        });
+    }
+    let mel_frames = StftFramer::output_frame_count_for(
+        metadata.n_fft,
+        metadata.hop_length,
+        PadMode::ZeroCenter,
+        samples,
+    )
+    .map_err(|error| TopologyError::Unavailable {
+        reason: format!("cohere STFT shape is invalid: {error}"),
+    })?
+    .checked_sub(1)
+    .filter(|&frames| frames > 0)
+    .ok_or(TopologyError::Unavailable {
+        reason: "cohere audio is too short after the final mel-row drop".to_string(),
+    })?;
+    super::encoder_graph::predicted_encoder_time_frames(mel_frames).map_err(|error| {
+        TopologyError::Unavailable {
+            reason: format!("cohere encoder shape is invalid: {error}"),
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CohereDecoderStateTopology {
+    metadata: CohereTranscribeExecutionMetadata,
+    cross_position_cap: usize,
+    logical_prompt_positions: usize,
+    stable_prompt_positions: usize,
+}
+
+impl CohereDecoderStateTopology {
+    /// Bind the topology to the product/session's largest legal invocation.
+    /// Cohere has no pack-carried encoder positional ceiling, so the exact
+    /// frontend count for that envelope is the only honest finite cross-KV
+    /// hard cap. A later attempt to plan a larger envelope fails closed.
+    pub(crate) fn for_envelope(
+        metadata: CohereTranscribeExecutionMetadata,
+        envelope: InvocationEnvelope,
+        logical_prompt_positions: usize,
+        stable_prompt_positions: usize,
+    ) -> Result<Self, TopologyError> {
+        let cross_position_cap = cohere_encoder_frame_count_for_samples(
+            metadata,
+            envelope.max_samples(),
+            envelope.sample_rate_hz().get(),
+        )?;
+        Ok(Self {
+            metadata,
+            cross_position_cap,
+            logical_prompt_positions,
+            stable_prompt_positions,
+        })
+    }
+
+    fn demands_for(
+        &self,
+        invocation: InvocationShapeInput,
+        prompt_positions: usize,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        let sequences = invocation.sequences().get() as usize;
+        let cross_frames = cohere_encoder_frame_count_for_samples(
+            self.metadata,
+            invocation.samples(),
+            invocation.sample_rate_hz().get(),
+        )?;
+        let decode_budget = super::decode_budget::cohere_decode_budget(
+            prompt_positions,
+            cross_frames,
+            self.metadata.decoder_max_context,
+        )
+        .map_err(|error| TopologyError::Unavailable {
+            reason: error.to_string(),
+        })?;
+        Ok(vec![
+            StateDemand::new(
+                SELF_KV_STATE_ID,
+                StateKind::SelfAttentionKv,
+                decode_budget.self_kv_positions,
+                self.metadata.decoder_max_context,
+                cohere_resident_kv_bytes(
+                    &self.metadata,
+                    decode_budget.self_kv_positions,
+                    sequences,
+                    std::mem::size_of::<u16>(),
+                )?,
+                PositionBoundProof::Exact,
+            )?,
+            StateDemand::new(
+                CROSS_KV_STATE_ID,
+                StateKind::CrossAttentionKv,
+                cross_frames,
+                self.cross_position_cap,
+                cohere_resident_kv_bytes(
+                    &self.metadata,
+                    cross_frames,
+                    sequences,
+                    std::mem::size_of::<f32>(),
+                )?,
+                PositionBoundProof::Exact,
+            )?,
+        ])
     }
 }
 
-/// The cross-KV positions admission charges through the shared position
-/// model: the pack's chunk-cap encoder frame capacity, the same figure the
-/// decoder runtime allocates its cross cache at (request-independent).
-pub(crate) fn cohere_admission_required_positions(
-    metadata: &CohereTranscribeExecutionMetadata,
-) -> usize {
-    cohere_decoder_cross_capacity_frames(*metadata)
-}
-
-/// Exact bytes of the f16 self-attention KV cache the decoder runtime
-/// allocates at construction: K + V planes of
-/// `head_dim x decoder_max_context x decoder_heads` f16 values per layer
-/// (`new_persistent_self_kv_tensor_in_arena`'s exact shape). `0` on
-/// arithmetic failure -- an under-estimate resolves to "allow", per
-/// `crate::capacity`'s fail-open invariant.
-pub(crate) fn cohere_admission_fixed_self_kv_bytes(
-    metadata: &CohereTranscribeExecutionMetadata,
-) -> u64 {
-    let plane = GgmlKvElementType::F16
-        .plane_nbytes(
-            metadata.decoder_head_dim,
-            metadata.decoder_max_context,
-            metadata.decoder_heads,
-        )
-        .unwrap_or(0) as u64;
-    plane
-        .saturating_mul(2) // K + V
-        .saturating_mul(metadata.decoder_layers as u64)
+impl DecoderStateTopology for CohereDecoderStateTopology {
+    fn demands(
+        &self,
+        scope: DecoderStateDemandScope<InvocationShapeInput, InvocationEnvelope>,
+    ) -> Result<Vec<StateDemand>, TopologyError> {
+        match scope {
+            DecoderStateDemandScope::ExactInvocation(invocation) => {
+                self.demands_for(invocation, self.logical_prompt_positions)
+            }
+            DecoderStateDemandScope::StableEnvelope(envelope) => {
+                self.demands_for(envelope.maximum_invocation(), self.stable_prompt_positions)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
-    use crate::capacity::kv_bytes_per_position;
+    use crate::capacity::topology::{DecoderStatePlan, InvocationEnvelope, StateKind};
 
     /// Real-checkpoint-shaped metadata (the same values `runtime_contract`'s
     /// `base_metadata` fixture parses: 8-layer MHA decoder at head_dim 128,
@@ -121,35 +295,126 @@ mod tests {
     }
 
     #[test]
-    fn admission_spec_prices_one_f32_copy_per_cross_frame() {
-        let geometry = cohere_kv_geometry(&reference_metadata());
-        let per_position = kv_bytes_per_position(&geometry, COHERE_ADMISSION_KV_SPEC)
-            .expect("f16 spec accepts head_dim 128");
-        // layers x 2 x d_model f32 values per cross frame:
-        // 8 * 2 * 1024 * 4 B = 64 KiB -- exactly what the shared model
-        // charges per position under the two-f16-copy spec.
-        assert_eq!(per_position.total(), 8 * 2 * 1024 * 4);
-    }
-
-    #[test]
-    fn fixed_self_kv_bytes_match_the_arena_allocation() {
-        // 8 layers x 2 (K+V) x 8 heads x 1024 positions x 128 head_dim x 2 B
-        // (f16) = 32 MiB, the allocation `new_persistent_self_kv_tensor_in_arena`
-        // makes at construction.
-        assert_eq!(
-            cohere_admission_fixed_self_kv_bytes(&reference_metadata()),
-            8 * 2 * 8 * 1024 * 128 * 2
-        );
-    }
-
-    #[test]
-    fn required_positions_are_the_chunk_cap_cross_frames() {
+    fn resident_byte_oracle_matches_runtime_tensor_shapes() {
         let metadata = reference_metadata();
+        // layers x 2 x d_model f32 values per cross frame:
+        // 8 * 2 * 1024 * 4 B = 64 KiB.
         assert_eq!(
-            cohere_admission_required_positions(&metadata),
-            cohere_decoder_cross_capacity_frames(metadata)
+            cohere_resident_kv_bytes(&metadata, 1, 1, std::mem::size_of::<f32>()).unwrap(),
+            StateBytes {
+                host: 0,
+                resident: 8 * 2 * 1024 * 4,
+            }
         );
-        // Request-independent, and non-degenerate for the shipped shape.
-        assert!(cohere_admission_required_positions(&metadata) > 0);
+        // 8 layers x 2 (K+V) x 8 heads x 1024 positions x 128 head_dim x 2 B
+        // (f16) = 32 MiB.
+        assert_eq!(
+            cohere_resident_kv_bytes(
+                &metadata,
+                metadata.decoder_max_context,
+                1,
+                std::mem::size_of::<u16>(),
+            )
+            .unwrap(),
+            StateBytes {
+                host: 0,
+                resident: 8 * 2 * 8 * 1024 * 128 * 2,
+            }
+        );
+    }
+
+    #[test]
+    fn frontend_count_oracle_pins_final_row_drop_boundary() {
+        let metadata = reference_metadata();
+        assert!(cohere_encoder_frame_count_for_samples(metadata, 159, 16_000).is_err());
+        assert_eq!(
+            cohere_encoder_frame_count_for_samples(metadata, 160, 16_000).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn topology_keeps_self_and_exact_cross_axes_independent() {
+        let metadata = reference_metadata();
+        let envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        let expected_cross =
+            cohere_encoder_frame_count_for_samples(metadata, envelope.max_samples(), 16_000)
+                .unwrap();
+        // 30s -> 3000 post-drop mel frames -> three k3/s2/p1
+        // subsampling stages: 1500 -> 750 -> 375 encoder frames.
+        assert_eq!(expected_cross, 375);
+        let topology = CohereDecoderStateTopology::for_envelope(metadata, envelope, 9, 9).unwrap();
+        let plan = DecoderStatePlan::for_envelope(&topology, envelope).unwrap();
+        assert_eq!(plan.reserve_positions_by_id(SELF_KV_STATE_ID), Some(520));
+        assert_eq!(
+            plan.reserve_positions(StateKind::CrossAttentionKv),
+            Some(expected_cross)
+        );
+    }
+
+    #[test]
+    fn duration_boundaries_keep_self_and_cross_schedules_independent() {
+        let rate = NonZeroU32::new(16_000).unwrap();
+        for (seconds, expected_cross, expected_self) in [
+            (1, 13, 72),
+            (30, 375, 520),
+            (60, 750, 520),
+            (300, 3_750, 520),
+        ] {
+            let envelope = InvocationEnvelope::new(rate, seconds * 16_000).unwrap();
+            let topology =
+                CohereDecoderStateTopology::for_envelope(reference_metadata(), envelope, 9, 9)
+                    .unwrap();
+            let plan = DecoderStatePlan::for_envelope(&topology, envelope).unwrap();
+            assert_eq!(
+                plan.reserve_positions_by_id(SELF_KV_STATE_ID),
+                Some(expected_self)
+            );
+            assert_eq!(
+                plan.reserve_positions_by_id(CROSS_KV_STATE_ID),
+                Some(expected_cross)
+            );
+            assert_ne!(expected_self, expected_self + expected_cross);
+        }
+    }
+
+    #[test]
+    fn small_decoder_context_fails_before_a_physical_state_is_declared() {
+        let mut metadata = reference_metadata();
+        metadata.decoder_max_context = 9;
+        let envelope = InvocationEnvelope::new(NonZeroU32::new(16_000).unwrap(), 16_000).unwrap();
+        let topology = CohereDecoderStateTopology::for_envelope(metadata, envelope, 9, 9).unwrap();
+        assert!(matches!(
+            DecoderStatePlan::for_envelope(&topology, envelope),
+            Err(TopologyError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn product_envelope_is_a_finite_cross_position_cap() {
+        let metadata = reference_metadata();
+        let product_envelope = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(30_000).unwrap(),
+        )
+        .unwrap();
+        let topology =
+            CohereDecoderStateTopology::for_envelope(metadata, product_envelope, 9, 9).unwrap();
+        let oversized = InvocationEnvelope::from_milliseconds(
+            NonZeroU32::new(16_000).unwrap(),
+            NonZeroU32::new(60_000).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            DecoderStatePlan::for_envelope(&topology, oversized),
+            Err(TopologyError::PositionCapExceeded {
+                state: "cohere.decoder.cross_kv",
+                ..
+            })
+        ));
     }
 }

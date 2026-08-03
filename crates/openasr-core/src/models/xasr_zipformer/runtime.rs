@@ -1,14 +1,20 @@
-use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
-
 #[cfg(test)]
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
-use crate::models::thread_local_runtime_cache::PackContentKey;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout,
+};
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::runtime_cache_coordinator::PackContentKey;
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner, SystemMemoryOwnerError,
+};
 
 use super::decoder::XasrDecoder;
 use super::encoder_graph::{
@@ -29,7 +35,8 @@ use super::weights::{load_xasr_decoder_weights, load_xasr_joiner_weights};
 
 const XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES: usize = 13;
 const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
-const MAX_IDLE_RUNTIMES_PER_KEY: usize = 2;
+const XASR_RUNTIME_ACTOR_CACHE_MAX_IDLE_ENTRIES: usize = 4;
+const XASR_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 4;
 
 /// Pool key: pack content id + the backend the runtime's prepared encoder
 /// graph was built for. CPU and Metal runtimes must never conflate -- a
@@ -37,10 +44,11 @@ const MAX_IDLE_RUNTIMES_PER_KEY: usize = 2;
 /// (or vice versa). The content id ([`PackContentKey::for_runtime_source`])
 /// keeps an in-place pack replacement at the same path from checking out a
 /// runtime built from the old bytes.
-type RuntimePoolKey = (PackContentKey, GgmlCpuGraphBackend);
-type RuntimePool = HashMap<RuntimePoolKey, Vec<SendableRuntime>>;
-
-static XASR_PROCESS_RUNTIME_POOL: OnceLock<Mutex<RuntimePool>> = OnceLock::new();
+pub(super) type XasrRuntimeActorKey = (PackContentKey, ExecutionLaneKey);
+pub(super) type XasrRuntimeActorPool =
+    AdmittedPinnedRuntimeActorCheckoutPool<XasrRuntimeActorKey, XasrZipformerPreparedRuntime>;
+pub(super) type XasrRuntimeActor =
+    PinnedRuntimeActorCheckout<XasrRuntimeActorKey, XasrZipformerPreparedRuntime>;
 
 #[derive(Debug)]
 pub(super) struct XasrZipformerPreparedRuntime {
@@ -49,6 +57,7 @@ pub(super) struct XasrZipformerPreparedRuntime {
     encoder: XasrZipformerEncoderGraph,
     decoder: XasrDecoder,
     joiner: XasrJoiner,
+    retained_system_memory_bytes: u64,
 }
 
 /// Result of decoding a single streaming hop via
@@ -156,101 +165,222 @@ impl XasrChunkedDecodeState {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct SendableRuntime(XasrZipformerPreparedRuntime);
-
-// SAFETY: the prepared runtime owns CPU-only GGML graph handles and is moved as
-// an exclusive value. Streaming sessions only access it through `&mut`, while
-// per-session encoder cache state lives in `XasrChunkedDecodeState`, not inside
-// the pooled runtime.
-unsafe impl Send for SendableRuntime {}
-
-pub(super) struct PooledRuntime {
-    key: RuntimePoolKey,
-    runtime: Option<SendableRuntime>,
-}
-
-impl Deref for PooledRuntime {
-    type Target = XasrZipformerPreparedRuntime;
-
-    fn deref(&self) -> &Self::Target {
-        &self
-            .runtime
-            .as_ref()
-            .expect("pooled xasr runtime must be present")
-            .0
-    }
-}
-
-impl DerefMut for PooledRuntime {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self
-            .runtime
-            .as_mut()
-            .expect("pooled xasr runtime must be present")
-            .0
-    }
-}
-
-impl Drop for PooledRuntime {
-    fn drop(&mut self) {
-        let Some(runtime) = self.runtime.take() else {
-            return;
-        };
-        let Ok(mut pool) = runtime_pool().lock() else {
-            return;
-        };
-        let idle = pool.entry(self.key.clone()).or_default();
-        if idle.len() < MAX_IDLE_RUNTIMES_PER_KEY {
-            idle.push(runtime);
-        }
-    }
+pub(super) fn new_runtime_actor_pool() -> XasrRuntimeActorPool {
+    let max_committed_requested_bytes =
+        crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
+    AdmittedPinnedRuntimeActorCheckoutPool::new(
+        "openasr-xasr-runtime-owner",
+        AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            XASR_RUNTIME_ACTOR_CACHE_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            XASR_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
+        ),
+    )
 }
 
 pub(super) fn checkout_prepared_runtime(
+    pool: &XasrRuntimeActorPool,
     runtime_source: &GgmlRuntimeSource,
     resolved_backend: GgmlCpuGraphBackend,
-) -> Result<PooledRuntime, String> {
+) -> Result<XasrRuntimeActor, String> {
     let backend = xasr_zipformer_encoder_graph_config(resolved_backend).backend;
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    if let Some(runtime) = runtime_pool()
-        .lock()
-        .map_err(|_| "xasr runtime pool lock poisoned".to_string())?
-        .get_mut(&key)
-        .and_then(Vec::pop)
-    {
-        return Ok(PooledRuntime {
-            key,
-            runtime: Some(runtime),
-        });
-    }
-
-    let runtime = XasrZipformerPreparedRuntime::load(runtime_source, resolved_backend)?;
-    Ok(PooledRuntime {
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        current_execution_lane_key(backend),
+    );
+    let source = runtime_source.clone();
+    let pack_content_id = runtime_source.content_id().to_string();
+    pool.checkout_or_try_build_with(
         key,
-        runtime: Some(SendableRuntime(runtime)),
-    })
+        move || {
+            let reader = GgufTensorDataReader::from_runtime_source(&source)
+                .map_err(|error| error.to_string())?;
+            let metadata = crate::ggml_runtime::read_gguf_metadata_from_runtime_source(&source)
+                .map_err(|error| error.to_string())?;
+            let quote = xasr_runtime_system_memory_quote(
+                &metadata,
+                reader.tensor_index(),
+                &pack_content_id,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((quote.retained_bytes, (reader, metadata, quote, backend)))
+        },
+        |(reader, metadata, quote, backend)| match SystemMemoryOwner::try_allocate_transaction(
+            quote,
+            || {
+                let runtime = XasrZipformerPreparedRuntime::from_reader_metadata(
+                    &reader, &metadata, backend,
+                )?;
+                let retained = runtime.retained_system_memory_bytes;
+                Ok(SystemMemoryAllocationOutcome::new(
+                    runtime, retained, retained,
+                ))
+            },
+        ) {
+            Ok(owner) => Ok(owner),
+            Err(SystemMemoryAllocationTransactionError::Allocation(reason)) => Err(reason),
+            Err(SystemMemoryAllocationTransactionError::Capacity(error)) => Err(error.to_string()),
+        },
+        |error| error.to_string(),
+    )
 }
 
-fn runtime_pool() -> &'static Mutex<RuntimePool> {
-    XASR_PROCESS_RUNTIME_POOL.get_or_init(|| Mutex::new(HashMap::new()))
-}
+fn xasr_runtime_system_memory_quote(
+    gguf_metadata: &GgufMetadata,
+    tensor_index: &crate::GgufTensorIndex,
+    pack_content_id: &str,
+) -> Result<SystemMemoryAllocationQuote, SystemMemoryOwnerError> {
+    use crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder;
 
-/// Idle-unload hook for the X-ASR streaming executor
-/// (`GgmlAsrStreamingExecutor::unload_idle_state`). Drops every pooled idle
-/// runtime for every pack+backend key, freeing the mmap'd weights and
-/// Metal/CPU graph context they hold. Unlike the other builtin families'
-/// `Arc`-shared caches, entries here are only ever pooled while genuinely idle
-/// (a session in flight holds its runtime checked out via `PooledRuntime`,
-/// which never touches the pool until `Drop`), so clearing is a plain
-/// eviction with nothing left half-referenced. The next
-/// `checkout_prepared_runtime` call after this simply misses the pool and
-/// loads a fresh runtime, exactly like a cold start -- there is no separate
-/// "rebuild" step to coordinate.
-pub(super) fn clear_idle_runtime_pool() {
-    if let Ok(mut pool) = runtime_pool().lock() {
-        pool.clear();
+    let metadata = parse_xasr_zipformer_execution_metadata(gguf_metadata).map_err(|error| {
+        SystemMemoryOwnerError::capacity_failure("xasr_runtime_quote", error.to_string())
+    })?;
+    let mut quote =
+        PreparedRuntimeQuoteBuilder::new::<XasrZipformerPreparedRuntime>(pack_content_id);
+
+    // Runtime + encoder graph each retain one metadata clone.
+    for values in [
+        &metadata.num_encoder_layers,
+        &metadata.encoder_dims,
+        &metadata.query_head_dims,
+        &metadata.value_head_dims,
+        &metadata.num_heads,
+        &metadata.cnn_module_kernels,
+        &metadata.left_context_len,
+        &metadata.downsampling_factors,
+    ] {
+        quote.add_owned_elements::<usize>(
+            u64::try_from(values.len())
+                .map_err(|_| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "xasr_runtime_quote",
+                        "xasr metadata vector length does not fit u64",
+                    )
+                })?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "xasr_runtime_quote",
+                        "xasr duplicated metadata vector length overflowed",
+                    )
+                })?,
+            "xasr metadata vectors",
+        )?;
     }
+
+    let tokens = gguf_metadata
+        .get_string_array("tokenizer.ggml.tokens")
+        .ok_or_else(|| {
+            SystemMemoryOwnerError::capacity_failure(
+                "xasr_runtime_quote",
+                "xasr tokenizer metadata is missing",
+            )
+        })?;
+    quote.add_owned_elements::<String>(
+        u64::try_from(tokens.len()).map_err(|_| {
+            SystemMemoryOwnerError::capacity_failure(
+                "xasr_runtime_quote",
+                "xasr tokenizer token count does not fit u64",
+            )
+        })?,
+        "xasr tokenizer descriptors",
+    )?;
+    for token in tokens {
+        quote.add_owned_bytes(
+            u64::try_from(token.capacity()).map_err(|_| {
+                SystemMemoryOwnerError::capacity_failure(
+                    "xasr_runtime_quote",
+                    "xasr tokenizer token capacity does not fit u64",
+                )
+            })?,
+            "xasr tokenizer token text",
+        )?;
+    }
+
+    quote.add_owned_elements::<super::encoder_weights::XasrEncoderStackWeights>(
+        u64::try_from(metadata.num_stacks).map_err(|_| {
+            SystemMemoryOwnerError::capacity_failure(
+                "xasr_runtime_quote",
+                "xasr stack count does not fit u64",
+            )
+        })?,
+        "xasr encoder stack descriptors",
+    )?;
+    quote.add_owned_elements::<super::encoder_weights::XasrEncoderLayerWeights>(
+        u64::try_from(metadata.total_encoder_layers()).map_err(|_| {
+            SystemMemoryOwnerError::capacity_failure(
+                "xasr_runtime_quote",
+                "xasr layer count does not fit u64",
+            )
+        })?,
+        "xasr encoder layer descriptors",
+    )?;
+
+    for tensor in tensor_index.tensors() {
+        let native_encoder_linear = tensor.rank() == 2
+            && tensor.name.ends_with(".weight")
+            && !tensor.name.starts_with("decoder.")
+            && !tensor.name.starts_with("joiner.");
+        if native_encoder_linear {
+            // StoredLinear name + owned-payload metadata name/type/dims +
+            // payload's platform-sized dims. Mmap bytes remain zero-copy.
+            quote.add_owned_bytes(
+                u64::try_from(tensor.name.capacity())
+                    .ok()
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or_else(|| {
+                        SystemMemoryOwnerError::capacity_failure(
+                            "xasr_runtime_quote",
+                            "xasr native tensor name bytes overflowed",
+                        )
+                    })?,
+                "xasr native tensor names",
+            )?;
+            quote.add_owned_bytes(
+                u64::try_from(tensor.type_name.capacity()).map_err(|_| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "xasr_runtime_quote",
+                        "xasr native tensor type-name bytes do not fit u64",
+                    )
+                })?,
+                "xasr native tensor type name",
+            )?;
+            let rank = u64::try_from(tensor.dims.capacity()).map_err(|_| {
+                SystemMemoryOwnerError::capacity_failure(
+                    "xasr_runtime_quote",
+                    "xasr native tensor rank does not fit u64",
+                )
+            })?;
+            quote.add_owned_elements::<u64>(rank, "xasr native metadata dims")?;
+            quote.add_owned_elements::<usize>(rank, "xasr native payload dims")?;
+            continue;
+        }
+
+        quote.add_tensor_f32(tensor_index, &tensor.name)?;
+        if tensor.rank() >= 2 {
+            quote.add_owned_bytes(
+                u64::try_from(tensor.name.capacity()).map_err(|_| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "xasr_runtime_quote",
+                        "xasr f32 tensor name bytes do not fit u64",
+                    )
+                })?,
+                "xasr f32 tensor name",
+            )?;
+        }
+        if tensor.rank() >= 3 {
+            quote.add_owned_elements::<usize>(
+                u64::try_from(tensor.dims.capacity()).map_err(|_| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "xasr_runtime_quote",
+                        "xasr f32 tensor rank does not fit u64",
+                    )
+                })?,
+                "xasr f32 tensor dims",
+            )?;
+        }
+    }
+    quote.finish()
 }
 
 impl XasrZipformerPreparedRuntime {
@@ -287,6 +417,28 @@ impl XasrZipformerPreparedRuntime {
             load_xasr_decoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
         let joiner_weights =
             load_xasr_joiner_weights(reader, &metadata).map_err(|e| e.to_string())?;
+        let mut retained = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        retained.add(
+            metadata
+                .retained_system_memory_bytes()?
+                .checked_mul(2)
+                .ok_or_else(|| "xasr duplicated metadata byte count overflowed".to_string())?,
+            "xasr runtime and encoder metadata",
+        )?;
+        retained.add(tokenizer.retained_system_memory_bytes()?, "xasr tokenizer")?;
+        retained.add(
+            encoder_weights.retained_system_memory_bytes()?,
+            "xasr encoder weights",
+        )?;
+        retained.add(
+            decoder_weights.retained_system_memory_bytes()?,
+            "xasr decoder weights",
+        )?;
+        retained.add(
+            joiner_weights.retained_system_memory_bytes()?,
+            "xasr joiner weights",
+        )?;
+        let retained_system_memory_bytes = retained.finish();
         let encoder = XasrZipformerEncoderGraph::new_ggml_cpu_full_encoder(
             metadata.clone(),
             encoder_weights,
@@ -303,6 +455,7 @@ impl XasrZipformerPreparedRuntime {
             metadata,
             tokenizer,
             encoder,
+            retained_system_memory_bytes,
         })
     }
 
@@ -634,20 +787,6 @@ fn xasr_profile_log_duration(stage: &str, elapsed: Duration, detail: std::fmt::A
 mod tests {
     use super::*;
 
-    /// Single shared lock serializing every test in this file that touches
-    /// the process-wide `XASR_PROCESS_RUNTIME_POOL` (via `checkout_prepared_runtime`
-    /// / `clear_idle_runtime_pool` / a dropped `PooledRuntime`) against each
-    /// other -- without it, `cargo test`'s default same-process parallelism
-    /// could interleave one test's pool population with another's clear.
-    /// `cargo nextest` isolates each test into its own process and would not
-    /// need this at all, but taking the lock costs nothing there either.
-    fn runtime_pool_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("runtime pool test lock poisoned")
-    }
-
     fn xasr_test_pack_or_skip(file_name: &str) -> Option<PathBuf> {
         let pack = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/xasr-test/out")
@@ -663,19 +802,6 @@ mod tests {
     #[test]
     #[ignore = "host-local: requires the X-ASR fp16 pack under tmp/xasr-test/out"]
     fn idle_unload_clears_the_pool_and_the_next_checkout_rebuilds_cleanly() {
-        // Regression test for the must-fix bug: X-ASR's streaming path pools
-        // idle runtimes in the process-lifetime `XASR_PROCESS_RUNTIME_POOL`
-        // (via `PooledRuntime::drop`), but nothing wired that pool into
-        // `idle_unload` -- unlike every other builtin family, whose
-        // `unload_idle_state` override actually drops its cache, X-ASR used
-        // the trait's no-op default, so pooled runtimes stayed resident for
-        // the rest of the process's life regardless of how long the daemon
-        // sat idle. `XasrZipformerGgmlExecutor::unload_idle_state` (in
-        // `executor.rs`) now calls `clear_idle_runtime_pool` (this file),
-        // which this test exercises directly against a real pack: checkout,
-        // return-to-pool, unload, checkout again, and confirm the rebuilt
-        // runtime still decodes.
-        let _pool_lock = runtime_pool_test_lock();
         let Some(pack) = xasr_test_pack_or_skip("xasr-zh-en-onnx-fp16.oasr") else {
             return;
         };
@@ -683,57 +809,23 @@ mod tests {
         let resolved_backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
-        let key = (
-            PackContentKey::for_runtime_source(&runtime_source),
-            xasr_zipformer_encoder_graph_config(resolved_backend).backend,
-        );
-
-        // Start from a known-empty pool for this key so pre-existing state
-        // from another (ignored, host-local) test run in this same process
-        // cannot make the "pool has an idle entry" assertion below vacuous.
-        clear_idle_runtime_pool();
-        {
-            let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
-            assert!(
-                pool.get(&key).is_none_or(Vec::is_empty),
-                "pool must start empty for this key"
-            );
-        }
-
-        let runtime = checkout_prepared_runtime(&runtime_source, resolved_backend)
+        let pool = new_runtime_actor_pool();
+        let runtime = checkout_prepared_runtime(&pool, &runtime_source, resolved_backend)
             .expect("first checkout must build");
         drop(runtime);
-        {
-            let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
-            assert_eq!(
-                pool.get(&key).map(Vec::len),
-                Some(1),
-                "returning a checked-out runtime must pool it while idle"
-            );
-        }
+        assert_eq!(pool.usage_for_test().0, 1);
 
-        clear_idle_runtime_pool();
-        {
-            let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
-            assert!(
-                pool.get(&key).is_none_or(Vec::is_empty),
-                "idle_unload's clear_idle_runtime_pool must evict every pooled \
-                 runtime, not leave it resident for the rest of the process's \
-                 life"
-            );
-        }
+        pool.clear();
+        assert_eq!(pool.usage_for_test(), (0, 0));
 
-        // The next checkout after an idle-unload eviction must miss the
-        // (now-empty) pool and build fresh, exactly like a cold start -- and
-        // the rebuilt runtime must still be fully functional, not some
-        // half-initialized leftover.
-        let mut rebuilt = checkout_prepared_runtime(&runtime_source, resolved_backend)
+        let rebuilt = checkout_prepared_runtime(&pool, &runtime_source, resolved_backend)
             .expect("checkout after clear must rebuild");
         let samples = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
             .collect::<Vec<_>>();
         let result = rebuilt
-            .transcribe(&samples)
+            .call_mut(move |runtime| runtime.transcribe(&samples))
+            .expect("rebuilt actor must remain live")
             .expect("rebuilt runtime must decode");
         assert!(result.text.is_char_boundary(result.text.len()));
     }

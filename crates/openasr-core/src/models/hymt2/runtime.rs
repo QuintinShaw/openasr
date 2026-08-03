@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::arch::HYMT2_DECODE_POLICY_ID;
+use crate::capacity::topology::{DecoderStatePlan, StateKind};
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgufMetadataReadError, GgufTensorDataReadError,
     GgufTensorDataReader, GgufTensorIndexReadError,
@@ -20,12 +21,13 @@ use crate::models::hymt2::prompt::{
 };
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
-    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLayerAttentionProjection,
-    Qwen3AsrLlmLogitsHead, Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
-    Qwen3AsrLlmWholeStepTop1Output, Qwen3AsrTokenEmbeddingTable, even_prefill_chunk_len,
-    load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv,
-    load_qwen3_llm_logits_head_from_reader_with_output_tensor,
-    load_qwen3_token_embedding_table_from_reader,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrLayerKvCacheState, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrLlmLogitsHeadRuntime, Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
+    Qwen3AsrLlmWholeStepTop1Output, Qwen3AsrTokenEmbeddingTable, QwenWholeDecoderPlan,
+    even_prefill_chunk_len, load_qwen3_llm_logits_head_from_reader_with_output_tensor,
+    load_qwen3_token_embedding_table_from_reader, logits_head_ggml_enabled,
+    resolve_qwen_family_production_kv_cache_policy,
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -36,11 +38,14 @@ use crate::{
     read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
 };
 
+use super::capacity::{
+    HYMT2_DECODE_SCRATCH_STATE_ID, HYMT2_PREFIX_CACHE_STATE_ID, Hymt2DecoderCapacityContract,
+};
 use super::config::{
     Hymt2ConfigError, Hymt2ExecutionMetadata, parse_hymt2_execution_metadata,
     validate_hymt2_runtime_tensors_with_index,
 };
-use super::tensor_names::TOKEN_EMBD_WEIGHT;
+use super::tensor_names::{OUTPUT_NORM_WEIGHT, TOKEN_EMBD_WEIGHT, llm_layer_tensor_names};
 use super::tokenizer::{
     HYMT2_ASSISTANT_TOKEN, HYMT2_ASSISTANT_TOKEN_ID, HYMT2_BOS_TOKEN, HYMT2_BOS_TOKEN_ID,
     HYMT2_EOS_TOKEN_ID, HYMT2_EOT_TOKEN, HYMT2_EOT_TOKEN_ID, HYMT2_USER_TOKEN, HYMT2_USER_TOKEN_ID,
@@ -50,6 +55,23 @@ use super::tokenizer::{
 const HYMT2_PROFILE_ENV: &str = "OPENASR_HYMT2_PROFILE";
 const HYMT2_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_HYMT2_PREFILL_CHUNK_TOKENS";
 const HYMT2_METAL_PREFILL_QUERY_TOKENS: usize = 64;
+// Product ClauseId renders as `c-` plus an unsigned u64 decimal value.
+const HYMT2_PRODUCT_CLAUSE_ID_MAX_BYTES: usize = 2 + 20;
+
+#[derive(Debug, Clone, Copy)]
+enum Hymt2CapacityMode {
+    FullContext,
+    ClauseChars(usize),
+}
+
+/// Whether host KV owns independent leases (public low-level runtime) or is
+/// being constructed inside one aggregate translation-candidate transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Selected by the thread-affine translation owner integration.
+enum Hymt2HostLeaseOwnership {
+    Standalone,
+    ParentCandidateTransaction,
+}
 
 #[derive(Debug)]
 pub struct Hymt2Runtime {
@@ -57,13 +79,16 @@ pub struct Hymt2Runtime {
     tokenizer: Hymt2Tokenizer,
     token_embedding_table: Qwen3AsrTokenEmbeddingTable,
     logits_head: Qwen3AsrLlmLogitsHead,
+    capacity: Hymt2DecoderCapacityContract,
+    host_lease_ownership: Hymt2HostLeaseOwnership,
     session: Mutex<Hymt2RuntimeSession>,
 }
 
 #[derive(Debug)]
 struct Hymt2RuntimeSession {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
+    logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,10 +147,14 @@ impl Default for Hymt2PrefixCacheConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Hymt2TranslationSessionCache {
     config: Hymt2PrefixCacheConfig,
     active: Option<Hymt2ActivePrefixCache>,
+    spare_active: Option<Hymt2ActivePrefixCache>,
+    layer_kv_caches: Qwen3AsrHostKvCacheOwner,
+    max_positions: usize,
+    clause_id_capacity_limit: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -133,8 +162,6 @@ struct Hymt2ActivePrefixCache {
     clause_id: String,
     static_context_tokens: Vec<u32>,
     source_prefix_tokens: Vec<u32>,
-    layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
-    max_positions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,15 +180,37 @@ struct Hymt2PrefixReusePlan {
 }
 
 impl Hymt2TranslationSessionCache {
-    pub fn new(config: Hymt2PrefixCacheConfig) -> Self {
+    fn with_arena(
+        config: Hymt2PrefixCacheConfig,
+        layer_kv_caches: Qwen3AsrHostKvCacheOwner,
+        max_positions: usize,
+        clause_id_capacity_limit: Option<usize>,
+    ) -> Self {
+        let clause_id_capacity = clause_id_capacity_limit.unwrap_or(0);
         Self {
             config,
             active: None,
+            spare_active: Some(Hymt2ActivePrefixCache {
+                clause_id: String::with_capacity(clause_id_capacity),
+                static_context_tokens: Vec::with_capacity(max_positions),
+                source_prefix_tokens: Vec::with_capacity(max_positions),
+            }),
+            layer_kv_caches,
+            max_positions,
+            clause_id_capacity_limit,
         }
     }
 
     pub fn invalidate(&mut self) {
-        self.active = None;
+        if let Some(mut active) = self.active.take() {
+            active.clause_id.clear();
+            active.static_context_tokens.clear();
+            active.source_prefix_tokens.clear();
+            self.spare_active = Some(active);
+        }
+        for layer in self.layer_kv_caches.iter_mut() {
+            layer.clear_written_positions();
+        }
     }
 
     pub fn active_prefix_token_count(&self) -> usize {
@@ -169,6 +218,21 @@ impl Hymt2TranslationSessionCache {
             .as_ref()
             .map(|active| active.source_prefix_tokens.len())
             .unwrap_or(0)
+    }
+
+    #[allow(dead_code)] // Consumed by the thread-affine translation owner integration.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.layer_kv_caches.retained_system_memory_bytes()?,
+            "hymt2 prefix host KV",
+        )?;
+        for active in self.active.iter().chain(self.spare_active.iter()) {
+            bytes.add_string(&active.clause_id, "hymt2 prefix clause id")?;
+            bytes.add_vec(&active.static_context_tokens, "hymt2 prefix static tokens")?;
+            bytes.add_vec(&active.source_prefix_tokens, "hymt2 prefix source tokens")?;
+        }
+        Ok(bytes.finish())
     }
 }
 
@@ -210,6 +274,15 @@ pub enum Hymt2RuntimeError {
     EmptyPrompt,
     #[error("hymt2 source clause is empty")]
     EmptySource,
+    #[error("hymt2 decoder-state capacity is invalid: {reason}")]
+    Capacity { reason: String },
+    #[error(
+        "hymt2 source clause contains {actual_chars} characters, exceeding its declared session envelope {max_chars}"
+    )]
+    SourceClauseEnvelopeExceeded {
+        actual_chars: usize,
+        max_chars: usize,
+    },
     #[error(
         "hymt2 prompt/generation length exceeds runtime context: prompt_tokens={prompt_tokens}, max_output_tokens={max_output_tokens}, runtime_context={runtime_context}"
     )]
@@ -223,80 +296,348 @@ pub enum Hymt2RuntimeError {
         #[source]
         source: GgmlCpuGraphError,
     },
+    #[error("hymt2 logits graph failed: {reason}")]
+    LogitsGraph { reason: String },
     #[error("hymt2 decode failed: {reason}")]
     Decode { reason: String },
 }
 
 impl Hymt2RuntimeSession {
     fn new(
-        projections: &[Qwen3AsrLlmLayerAttentionProjection],
+        decoder_plan: &QwenWholeDecoderPlan,
         runtime_source: &crate::GgmlRuntimeSource,
         metadata: Hymt2ExecutionMetadata,
+        logits_head: &Qwen3AsrLlmLogitsHead,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    ) -> Result<Self, GgmlCpuGraphError> {
+    ) -> Result<Self, Hymt2RuntimeError> {
         let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                projections,
-                Some(runtime_source),
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
+                decoder_plan,
+                runtime_source,
                 metadata.rms_norm_epsilon,
                 fused_logits_head,
                 backend,
-            )?;
+            )
+            .map_err(|source| Hymt2RuntimeError::Graph { source })?;
         Ok(Self {
             whole_decoder,
-            layer_kv_caches: Vec::new(),
+            logits_runtime: logits_head.new_runtime(backend).map_err(|error| {
+                Hymt2RuntimeError::LogitsGraph {
+                    reason: error.to_string(),
+                }
+            })?,
+            layer_kv_caches: Qwen3AsrHostKvCacheOwner::empty(),
         })
     }
 
     fn reset_layer_kv_caches(
         &mut self,
         metadata: Hymt2ExecutionMetadata,
-        max_positions: usize,
+        capacity: Qwen3AsrKvCacheCapacity,
+        ownership: Hymt2HostLeaseOwnership,
     ) -> Result<(), Hymt2RuntimeError> {
-        let host = self.whole_decoder.kv_cache_spec().host;
-        if self.layer_kv_caches.len() != metadata.layers
-            || self
-                .layer_kv_caches
-                .iter()
-                .any(|cache| cache.element_type() != host)
+        if capacity.logical_positions() > metadata.runtime_context_length
+            || capacity.resident_positions() > metadata.runtime_context_length
         {
-            self.layer_kv_caches = (0..metadata.layers)
-                .map(|_| {
-                    Qwen3AsrLayerKvCacheState::new_with_element_type(
-                        max_positions,
-                        metadata.kv_heads,
-                        metadata.head_dim,
-                        host,
-                    )
-                    .unwrap_or_else(|reason| {
-                        panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                    })
-                })
-                .collect();
+            return Err(Hymt2RuntimeError::Decode {
+                reason: format!(
+                    "Hy-MT2 planned KV span logical={} resident={} exceeds runtime context {}",
+                    capacity.logical_positions(),
+                    capacity.resident_positions(),
+                    metadata.runtime_context_length,
+                ),
+            });
+        }
+        let max_positions = capacity.resident_positions();
+        let host = self.whole_decoder.kv_cache_spec().host;
+        let must_replace = self.layer_kv_caches.len() != metadata.layers
+            || self.layer_kv_caches.iter().any(|cache| {
+                cache.element_type() != host || cache.max_positions() != max_positions
+            });
+        if must_replace {
+            // This session state is scratch for one decode. Release its old
+            // lease before admitting the replacement so repeated requests do
+            // not create an artificial two-cache peak.
+            self.layer_kv_caches = Qwen3AsrHostKvCacheOwner::empty();
+            let stable_capacity = Qwen3AsrKvCacheCapacity::new(max_positions, max_positions)
+                .map_err(|error| Hymt2RuntimeError::Decode {
+                    reason: error.to_string(),
+                })?;
+            let allocate = match ownership {
+                Hymt2HostLeaseOwnership::Standalone => Qwen3AsrHostKvCacheOwner::try_new,
+                Hymt2HostLeaseOwnership::ParentCandidateTransaction => {
+                    Qwen3AsrHostKvCacheOwner::try_new_inside_parent_transaction
+                }
+            };
+            self.layer_kv_caches = allocate(
+                "hymt2.runtime-session.self-kv.host",
+                metadata.layers,
+                stable_capacity,
+                metadata.kv_heads,
+                metadata.head_dim,
+                host,
+                Qwen3AsrHostKvMode::Materialized,
+            )
+            .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
             return Ok(());
         }
 
-        for cache in &mut self.layer_kv_caches {
+        for cache in self.layer_kv_caches.iter_mut() {
             cache.clear_written_positions();
-            cache
-                .resize_max_positions(max_positions)
-                .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
         }
         Ok(())
     }
 }
 
 impl Hymt2Runtime {
+    /// Conservative, topology-derived quote for the complete product
+    /// candidate: tokenizer + mmap-view metadata + resident decoder host
+    /// handles + decode scratch + the simultaneously-live prefix arena and its
+    /// preallocated metadata workspace. Device weights/workspace are quoted by
+    /// the execution-memory planner, not this SystemMemory owner.
+    #[allow(dead_code)] // Consumed by the thread-affine translation owner integration.
+    pub(crate) fn quote_candidate_system_memory(
+        runtime_source: &crate::GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+        max_source_clause_chars: usize,
+    ) -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, Hymt2RuntimeError>
+    {
+        let metadata = read_gguf_metadata_from_runtime_source(runtime_source)
+            .map_err(|source| Hymt2RuntimeError::MetadataRead { source })?;
+        let tensor_index = read_gguf_tensor_index_from_runtime_source(runtime_source)
+            .map_err(|source| Hymt2RuntimeError::TensorIndexRead { source })?;
+        let execution = parse_hymt2_execution_metadata(&metadata)
+            .map_err(|source| Hymt2RuntimeError::Config { source })?;
+        validate_hymt2_runtime_tensors_with_index(&tensor_index, execution)
+            .map_err(|source| Hymt2RuntimeError::Config { source })?;
+        let kv_spec =
+            resolve_qwen_family_production_kv_cache_policy(backend, execution.head_dim).to_spec();
+        let capacity = Hymt2DecoderCapacityContract::from_clause_envelope(
+            execution,
+            kv_spec,
+            max_source_clause_chars,
+        )
+        .map_err(|source| Hymt2RuntimeError::Capacity {
+            reason: source.to_string(),
+        })?;
+        let stable_host = capacity
+            .stable_materialized_host_state_bytes()
+            .map_err(|source| Hymt2RuntimeError::Capacity {
+                reason: source.to_string(),
+            })?;
+
+        let map_capacity = |error: crate::models::system_memory_owner::SystemMemoryOwnerError| {
+            Hymt2RuntimeError::Capacity {
+                reason: error.to_string(),
+            }
+        };
+        let mut quote = crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder::new::<
+            Self,
+        >(runtime_source.content_id());
+        quote
+            .add_tokenizer_metadata(&metadata, true)
+            .map_err(map_capacity)?;
+        quote
+            .add_stable_owned_bytes(
+                u64::try_from(6 * std::mem::size_of::<u32>()).map_err(|_| {
+                    Hymt2RuntimeError::Capacity {
+                        reason: "Hy-MT2 tokenizer special-token quote overflowed".to_string(),
+                    }
+                })?,
+                "hymt2 tokenizer special ids",
+            )
+            .map_err(map_capacity)?;
+        // Token gather owns one metadata view of the tied table.
+        quote
+            .add_owned_tensor_payload_metadata(&tensor_index, TOKEN_EMBD_WEIGHT)
+            .map_err(map_capacity)?;
+        quote
+            .add_tensor_f32(&tensor_index, OUTPUT_NORM_WEIGHT)
+            .map_err(map_capacity)?;
+        if logits_head_ggml_enabled(backend) {
+            // Logits owns a second metadata view, but the bytes remain the same
+            // mmap range. Its wrapper also owns one extra platform dims Vec.
+            quote
+                .add_owned_tensor_payload_metadata(&tensor_index, TOKEN_EMBD_WEIGHT)
+                .map_err(map_capacity)?;
+            quote
+                .add_owned_elements::<usize>(2, "hymt2 logits dims")
+                .map_err(map_capacity)?;
+        } else {
+            quote
+                .add_tensor_f32(&tensor_index, TOKEN_EMBD_WEIGHT)
+                .map_err(map_capacity)?;
+        }
+        quote
+            .add_stable_owned_bytes(
+                Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
+                    execution.layers,
+                )
+                .map_err(|reason| Hymt2RuntimeError::Capacity { reason })?,
+                "hymt2 resident decoder handles",
+            )
+            .map_err(map_capacity)?;
+        quote
+            .add_stable_owned_bytes(
+                stable_host
+                    .total()
+                    .map_err(|source| Hymt2RuntimeError::Capacity {
+                        reason: source.to_string(),
+                    })?,
+                "hymt2 stable scratch plus prefix KV",
+            )
+            .map_err(map_capacity)?;
+        let prefix_positions = capacity
+            .stable_plan()
+            .position_axis(HYMT2_PREFIX_CACHE_STATE_ID, StateKind::SelfAttentionKv)
+            .map_err(|source| Hymt2RuntimeError::Capacity {
+                reason: source.to_string(),
+            })?
+            .resident_positions;
+        let prefix_metadata_bytes = prefix_positions
+            .checked_mul(2)
+            .and_then(|tokens| tokens.checked_mul(std::mem::size_of::<u32>()))
+            .and_then(|bytes| bytes.checked_add(HYMT2_PRODUCT_CLAUSE_ID_MAX_BYTES))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| Hymt2RuntimeError::Capacity {
+                reason: "Hy-MT2 prefix metadata workspace quote overflowed".to_string(),
+            })?;
+        quote
+            .add_stable_owned_bytes(prefix_metadata_bytes, "hymt2 prefix metadata workspace")
+            .map_err(map_capacity)?;
+
+        let plan_bytes = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_qwen3_asr(
+            execution.layers,
+        )
+        .map_err(|reason| Hymt2RuntimeError::Capacity { reason })?;
+        let mut largest_decoder_staging = 0_u64;
+        for layer_index in 0..execution.layers {
+            let names = llm_layer_tensor_names(layer_index);
+            for name in [
+                names.attn_norm_weight,
+                names.attn_q_weight,
+                names.attn_k_weight,
+                names.attn_v_weight,
+                names.attn_output_weight,
+                names.attn_q_norm_weight,
+                names.attn_k_norm_weight,
+                names.ffn_norm_weight,
+                names.ffn_gate_weight,
+                names.ffn_up_weight,
+                names.ffn_down_weight,
+            ] {
+                let tensor =
+                    tensor_index
+                        .get(&name)
+                        .ok_or_else(|| Hymt2RuntimeError::Capacity {
+                            reason: format!("Hy-MT2 quote tensor '{name}' is missing"),
+                        })?;
+                let f32_bytes = tensor
+                    .num_elements()
+                    .and_then(|elements| elements.checked_mul(4))
+                    .ok_or_else(|| Hymt2RuntimeError::Capacity {
+                        reason: format!("Hy-MT2 quote tensor '{name}' size overflowed"),
+                    })?;
+                largest_decoder_staging = largest_decoder_staging.max(f32_bytes);
+            }
+        }
+        quote.observe_transient_bytes(
+            plan_bytes
+                .checked_add(largest_decoder_staging)
+                .ok_or_else(|| Hymt2RuntimeError::Capacity {
+                    reason: "Hy-MT2 decoder construction peak overflowed".to_string(),
+                })?,
+            "hymt2 decoder plan plus one-layer tensor staging",
+        );
+        quote.finish().map_err(map_capacity)
+    }
+
+    /// Exact engine-requested retained capacities after construction
+    /// transients have been released. The session-prefix cache is measured by
+    /// its sibling method and both values are reconciled into one parent owner.
+    #[allow(dead_code)] // Consumed by the thread-affine translation owner integration.
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add(
+            self.tokenizer.retained_system_memory_bytes()?,
+            "hymt2 tokenizer",
+        )?;
+        bytes.add(
+            self.token_embedding_table.retained_system_memory_bytes()?,
+            "hymt2 token embedding",
+        )?;
+        bytes.add(
+            self.logits_head.retained_system_memory_bytes()?,
+            "hymt2 logits head",
+        )?;
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| "Hy-MT2 session lock poisoned while measuring memory".to_string())?;
+        bytes.add(
+            session.whole_decoder.retained_system_memory_bytes()?,
+            "hymt2 decoder handles",
+        )?;
+        bytes.add(
+            session.layer_kv_caches.retained_system_memory_bytes()?,
+            "hymt2 scratch KV",
+        )?;
+        Ok(bytes.finish())
+    }
+
     pub fn from_path(
         path: impl AsRef<Path>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, Hymt2RuntimeError> {
         let runtime_source = validate_ggml_runtime_source_path(path.as_ref())
             .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
+        Self::from_runtime_source(&runtime_source, backend)
+    }
+
+    /// Construct from one already-admitted mapping so content identity,
+    /// metadata, tensor offsets, and materialized weights cannot observe
+    /// different file generations.
+    pub(crate) fn from_runtime_source(
+        runtime_source: &crate::GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, Hymt2RuntimeError> {
+        Self::from_runtime_source_with_capacity(
+            runtime_source,
+            backend,
+            Hymt2CapacityMode::FullContext,
+            Hymt2HostLeaseOwnership::Standalone,
+        )
+    }
+
+    /// Aggregate-candidate construction entrypoint. Host scratch and every
+    /// subsequently-created prefix arena are materialized without nested
+    /// leases because the caller encloses this runtime and its session cache in
+    /// one provisional [`crate::models::system_memory_owner::SystemMemoryOwner`]
+    /// transaction.
+    #[allow(dead_code)] // Consumed by the thread-affine translation owner integration.
+    pub(crate) fn from_runtime_source_with_clause_envelope_inside_parent_transaction(
+        runtime_source: &crate::GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+        max_source_clause_chars: usize,
+    ) -> Result<Self, Hymt2RuntimeError> {
+        Self::from_runtime_source_with_capacity(
+            runtime_source,
+            backend,
+            Hymt2CapacityMode::ClauseChars(max_source_clause_chars),
+            Hymt2HostLeaseOwnership::ParentCandidateTransaction,
+        )
+    }
+
+    fn from_runtime_source_with_capacity(
+        runtime_source: &crate::GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+        capacity_mode: Hymt2CapacityMode,
+        host_lease_ownership: Hymt2HostLeaseOwnership,
+    ) -> Result<Self, Hymt2RuntimeError> {
+        let metadata = read_gguf_metadata_from_runtime_source(runtime_source)
             .map_err(|source| Hymt2RuntimeError::MetadataRead { source })?;
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
+        let tensor_index = read_gguf_tensor_index_from_runtime_source(runtime_source)
             .map_err(|source| Hymt2RuntimeError::TensorIndexRead { source })?;
         let hymt2_metadata = parse_hymt2_execution_metadata(&metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
@@ -310,7 +651,7 @@ impl Hymt2Runtime {
         // needed for the tensor-contract check; the reader re-derives an
         // equivalent index from that same mapping, so the index and the bytes
         // it describes cannot come from different file generations.
-        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)
+        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(|source| Hymt2RuntimeError::TensorReader { source })?;
         let qwen_metadata = hymt2_metadata.qwen_llm_metadata();
         let token_embedding_table =
@@ -327,7 +668,7 @@ impl Hymt2Runtime {
         // site, never re-derived internally.
         let logits_head = load_qwen3_llm_logits_head_from_reader_with_output_tensor(
             &reader,
-            &runtime_source,
+            runtime_source,
             qwen_metadata,
             TOKEN_EMBD_WEIGHT,
             hymt2_metadata.rms_norm_epsilon,
@@ -336,31 +677,51 @@ impl Hymt2Runtime {
         .map_err(|error| Hymt2RuntimeError::WeightMaterialization {
             reason: error.to_string(),
         })?;
-        let layer_attention_projections =
-            load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv(
-                &reader,
-                qwen_metadata,
-            )
-            .map_err(|error| Hymt2RuntimeError::WeightMaterialization {
-                reason: error.to_string(),
+        let decoder_plan =
+            QwenWholeDecoderPlan::for_qwen3_asr(&reader, qwen_metadata).map_err(|error| {
+                Hymt2RuntimeError::WeightMaterialization {
+                    reason: error.to_string(),
+                }
             })?;
-        if layer_attention_projections.len() != hymt2_metadata.layers {
+        if decoder_plan.layer_count() != hymt2_metadata.layers {
             return Err(Hymt2RuntimeError::WeightMaterialization {
                 reason: format!(
                     "loaded {} LLM layers, expected {}",
-                    layer_attention_projections.len(),
+                    decoder_plan.layer_count(),
                     hymt2_metadata.layers
                 ),
             });
         }
-        let session = Hymt2RuntimeSession::new(
-            &layer_attention_projections,
-            &runtime_source,
+        let mut session = Hymt2RuntimeSession::new(
+            &decoder_plan,
+            runtime_source,
             hymt2_metadata,
+            &logits_head,
             logits_head.fused_top1_spec(),
             backend,
-        )
-        .map_err(|source| Hymt2RuntimeError::Graph { source })?;
+        )?;
+        let kv_spec = session.whole_decoder.kv_cache_spec();
+        let capacity = match capacity_mode {
+            Hymt2CapacityMode::FullContext => {
+                Hymt2DecoderCapacityContract::full_context(hymt2_metadata, kv_spec)
+            }
+            Hymt2CapacityMode::ClauseChars(max_source_clause_chars) => {
+                Hymt2DecoderCapacityContract::from_clause_envelope(
+                    hymt2_metadata,
+                    kv_spec,
+                    max_source_clause_chars,
+                )
+            }
+        }
+        .map_err(|source| Hymt2RuntimeError::Capacity {
+            reason: source.to_string(),
+        })?;
+        let stable_scratch =
+            qwen_capacity_for_state(capacity.stable_plan(), HYMT2_DECODE_SCRATCH_STATE_ID)?;
+        // Decode scratch is allocated exactly once for the declared session
+        // envelope. Every clause clears written positions but keeps both the
+        // host owner and any reusable resident graph at this stable span.
+        session.reset_layer_kv_caches(hymt2_metadata, stable_scratch, host_lease_ownership)?;
         if hymt2_profile_enabled() {
             eprintln!(
                 "openasr_hymt2_profile: stage=runtime_backend backend={}",
@@ -373,6 +734,8 @@ impl Hymt2Runtime {
             tokenizer,
             token_embedding_table,
             logits_head,
+            capacity,
+            host_lease_ownership,
             session: Mutex::new(session),
         })
     }
@@ -444,13 +807,56 @@ impl Hymt2Runtime {
         &self.tokenizer
     }
 
+    /// Allocate the per-stream prefix arena before the translation candidate
+    /// is published. Clause changes and decode errors reset only written
+    /// positions; the admitted owner remains stable for the session lifetime.
+    pub fn new_translation_session_cache(
+        &self,
+        config: Hymt2PrefixCacheConfig,
+    ) -> Result<Hymt2TranslationSessionCache, Hymt2RuntimeError> {
+        let prefix_capacity =
+            qwen_capacity_for_state(self.capacity.stable_plan(), HYMT2_PREFIX_CACHE_STATE_ID)?;
+        let stable_positions = prefix_capacity.resident_positions();
+        let stable_capacity = Qwen3AsrKvCacheCapacity::new(stable_positions, stable_positions)
+            .map_err(|error| Hymt2RuntimeError::Decode {
+                reason: error.to_string(),
+            })?;
+        let allocate = match self.host_lease_ownership {
+            Hymt2HostLeaseOwnership::Standalone => Qwen3AsrHostKvCacheOwner::try_new,
+            Hymt2HostLeaseOwnership::ParentCandidateTransaction => {
+                Qwen3AsrHostKvCacheOwner::try_new_inside_parent_transaction
+            }
+        };
+        let layer_kv_caches = allocate(
+            "hymt2.session-prefix.self-kv.host",
+            self.metadata.layers,
+            stable_capacity,
+            self.metadata.kv_heads,
+            self.metadata.head_dim,
+            self.capacity.kv_spec().host,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
+        Ok(Hymt2TranslationSessionCache::with_arena(
+            config,
+            layer_kv_caches,
+            stable_positions,
+            match self.host_lease_ownership {
+                Hymt2HostLeaseOwnership::Standalone => None,
+                Hymt2HostLeaseOwnership::ParentCandidateTransaction => {
+                    Some(HYMT2_PRODUCT_CLAUSE_ID_MAX_BYTES)
+                }
+            },
+        ))
+    }
+
     /// Returns `Hymt2RuntimeError::EmptySource` for empty or whitespace-only clauses.
     pub fn translate_clause(
         &self,
         source_clause: &str,
         finalized_context: &[(&str, &str)],
     ) -> Result<Hymt2DecodeResult, Hymt2RuntimeError> {
-        validate_non_empty_source_clause(source_clause)?;
+        self.validate_source_clause(source_clause)?;
         let prompt = build_subtitle_translation_prompt(source_clause, finalized_context);
         let prompt_tokens = build_hymt2_user_chat_prompt_tokens(&self.tokenizer, &prompt)
             .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?;
@@ -470,7 +876,7 @@ impl Hymt2Runtime {
         finalized_context: &[(&str, &str)],
         finalized: bool,
     ) -> Result<Hymt2DecodeResult, Hymt2RuntimeError> {
-        validate_non_empty_source_clause(source_clause)?;
+        self.validate_source_clause(source_clause)?;
         let clause_id = clause_id.as_ref();
         let parts = build_hymt2_subtitle_prompt_token_parts(
             &self.tokenizer,
@@ -501,12 +907,23 @@ impl Hymt2Runtime {
                 runtime_context: self.metadata.runtime_context_length,
             });
         }
-        let max_positions =
-            prompt_len
-                .checked_add(max_output_tokens)
-                .ok_or_else(|| Hymt2RuntimeError::Decode {
-                    reason: "Hy-MT2 cached decode max positions overflowed".to_string(),
-                })?;
+        let plan = self
+            .capacity
+            .plan_invocation(prompt_len, source_prefix_len, max_output_tokens)
+            .map_err(|source| Hymt2RuntimeError::Capacity {
+                reason: source.to_string(),
+            })?;
+        let scratch_capacity = qwen_capacity_for_state(&plan, HYMT2_DECODE_SCRATCH_STATE_ID)?;
+        let prefix_capacity = qwen_capacity_for_state(&plan, HYMT2_PREFIX_CACHE_STATE_ID)?;
+        if cache.max_positions != prefix_capacity.resident_positions() {
+            return Err(Hymt2RuntimeError::Decode {
+                reason: format!(
+                    "Hy-MT2 prefix arena span {} does not match planned stable span {}",
+                    cache.max_positions,
+                    prefix_capacity.resident_positions()
+                ),
+            });
+        }
 
         let total_started_at = Instant::now();
         let prefill_started_at = Instant::now();
@@ -516,21 +933,13 @@ impl Hymt2Runtime {
             &parts.source_prefix_tokens,
             parts.static_context_token_count,
             finalized,
-            max_positions,
         )?;
 
-        let active = cache
-            .active
-            .as_ref()
-            .ok_or_else(|| Hymt2RuntimeError::Decode {
+        if cache.active.is_none() {
+            return Err(Hymt2RuntimeError::Decode {
                 reason: "Hy-MT2 prefix cache missing after source prefill".to_string(),
-            })?;
-        let decode_layer_kv_caches = active
-            .layer_kv_caches
-            .iter()
-            .map(|layer| layer.fork_prefix(source_prefix_len, max_positions))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
+            });
+        }
         let marker_embeddings = self
             .token_embedding_table
             .gather_rows(&parts.generation_marker_tokens)
@@ -547,16 +956,26 @@ impl Hymt2Runtime {
             let mut session = self.session.lock().map_err(|_| Hymt2RuntimeError::Decode {
                 reason: "Hy-MT2 runtime session lock poisoned".to_string(),
             })?;
-            session.layer_kv_caches = decode_layer_kv_caches;
+            session.reset_layer_kv_caches(
+                self.metadata,
+                scratch_capacity,
+                self.host_lease_ownership,
+            )?;
+            session
+                .layer_kv_caches
+                .replace_prefix_from(&cache.layer_kv_caches, source_prefix_len)
+                .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
             hymt2_profile_log_opt("session_lock_cached_decode", session_started_at);
             let Hymt2RuntimeSession {
                 whole_decoder,
+                logits_runtime,
                 layer_kv_caches,
             } = &mut *session;
             let mut stepper = Hymt2GreedyStepper {
                 metadata: self.metadata,
                 token_embedding_table: &self.token_embedding_table,
                 logits_head: &self.logits_head,
+                logits_runtime,
                 whole_decoder,
                 layer_kv_caches: layer_kv_caches.as_mut_slice(),
                 prompt_token_count: prompt_len,
@@ -674,6 +1093,14 @@ impl Hymt2Runtime {
                 runtime_context: self.metadata.runtime_context_length,
             });
         }
+        let prefix_positions = prompt_tokens.len().saturating_sub(1).max(1);
+        let plan = self
+            .capacity
+            .plan_invocation(prompt_tokens.len(), prefix_positions, max_output_tokens)
+            .map_err(|source| Hymt2RuntimeError::Capacity {
+                reason: source.to_string(),
+            })?;
+        let scratch_capacity = qwen_capacity_for_state(&plan, HYMT2_DECODE_SCRATCH_STATE_ID)?;
 
         let total_started_at = Instant::now();
         let gather_started_at = hymt2_profile_start();
@@ -690,17 +1117,20 @@ impl Hymt2Runtime {
         })?;
         session.reset_layer_kv_caches(
             self.metadata,
-            prompt_tokens.len().saturating_add(max_output_tokens),
+            scratch_capacity,
+            self.host_lease_ownership,
         )?;
         hymt2_profile_log_opt("session_lock_reset", session_started_at);
         let Hymt2RuntimeSession {
             whole_decoder,
+            logits_runtime,
             layer_kv_caches,
         } = &mut *session;
         let mut stepper = Hymt2GreedyStepper {
             metadata: self.metadata,
             token_embedding_table: &self.token_embedding_table,
             logits_head: &self.logits_head,
+            logits_runtime,
             whole_decoder,
             layer_kv_caches: layer_kv_caches.as_mut_slice(),
             prompt_token_count: prompt_tokens.len(),
@@ -740,6 +1170,20 @@ impl Hymt2Runtime {
         })
     }
 
+    fn validate_source_clause(&self, source_clause: &str) -> Result<(), Hymt2RuntimeError> {
+        validate_non_empty_source_clause(source_clause)?;
+        if let Some(max_chars) = self.capacity.max_source_clause_chars() {
+            let actual_chars = source_clause.trim().chars().count();
+            if actual_chars > max_chars {
+                return Err(Hymt2RuntimeError::SourceClauseEnvelopeExceeded {
+                    actual_chars,
+                    max_chars,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn update_source_prefix_cache(
         &self,
         cache: &mut Hymt2TranslationSessionCache,
@@ -747,7 +1191,6 @@ impl Hymt2Runtime {
         source_prefix_tokens: &[u32],
         static_context_token_count: usize,
         finalized: bool,
-        max_positions: usize,
     ) -> Result<(usize, Hymt2PrefixReusePlan), Hymt2RuntimeError> {
         update_hymt2_source_prefix_cache(
             cache,
@@ -755,9 +1198,7 @@ impl Hymt2Runtime {
             source_prefix_tokens,
             static_context_token_count,
             finalized,
-            max_positions,
-            |max_positions| self.empty_layer_kv_caches(max_positions),
-            |mut layer_kv_caches, suffix_tokens, reused_prefix_tokens| {
+            |layer_kv_caches, suffix_tokens, reused_prefix_tokens| {
                 let suffix_embeddings = self
                     .token_embedding_table
                     .gather_rows(suffix_tokens)
@@ -769,11 +1210,17 @@ impl Hymt2Runtime {
                     reason: "Hy-MT2 runtime session lock poisoned".to_string(),
                 })?;
                 hymt2_profile_log_opt("session_lock_prefix_prefill", session_started_at);
+                let Hymt2RuntimeSession {
+                    whole_decoder,
+                    logits_runtime,
+                    ..
+                } = &mut *session;
                 let mut stepper = Hymt2GreedyStepper {
                     metadata: self.metadata,
                     token_embedding_table: &self.token_embedding_table,
                     logits_head: &self.logits_head,
-                    whole_decoder: &mut session.whole_decoder,
+                    logits_runtime,
+                    whole_decoder,
                     layer_kv_caches: layer_kv_caches.as_mut_slice(),
                     prompt_token_count: source_prefix_tokens.len(),
                     decode_graph_initialized: false,
@@ -783,35 +1230,26 @@ impl Hymt2Runtime {
                     reused_prefix_tokens,
                     suffix_tokens.len(),
                 )?;
-                Ok(layer_kv_caches)
+                Ok(())
             },
         )
     }
+}
 
-    fn empty_layer_kv_caches(&self, max_positions: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
-        // Match the production policy applied when the whole-decoder was built
-        // so host storage and graph history tensors stay element-type aligned.
-        let host = self
-            .session
-            .lock()
-            .expect("Hy-MT2 runtime session lock poisoned")
-            .whole_decoder
-            .kv_cache_spec()
-            .host;
-        (0..self.metadata.layers)
-            .map(|_| {
-                Qwen3AsrLayerKvCacheState::new_with_element_type(
-                    max_positions,
-                    self.metadata.kv_heads,
-                    self.metadata.head_dim,
-                    host,
-                )
-                .unwrap_or_else(|reason| {
-                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
-                })
-            })
-            .collect()
-    }
+fn qwen_capacity_for_state(
+    plan: &DecoderStatePlan,
+    state_id: &'static str,
+) -> Result<Qwen3AsrKvCacheCapacity, Hymt2RuntimeError> {
+    let axis = plan
+        .position_axis(state_id, StateKind::SelfAttentionKv)
+        .map_err(|source| Hymt2RuntimeError::Capacity {
+            reason: source.to_string(),
+        })?;
+    Qwen3AsrKvCacheCapacity::new(axis.logical_positions, axis.resident_positions).map_err(|error| {
+        Hymt2RuntimeError::Decode {
+            reason: format!("Hy-MT2 planned state '{state_id}' is invalid: {error}"),
+        }
+    })
 }
 
 fn update_hymt2_source_prefix_cache(
@@ -820,15 +1258,32 @@ fn update_hymt2_source_prefix_cache(
     source_prefix_tokens: &[u32],
     static_context_token_count: usize,
     finalized: bool,
-    max_positions: usize,
-    empty_layer_kv_caches: impl FnOnce(usize) -> Vec<Qwen3AsrLayerKvCacheState>,
     prefill_suffix: impl FnOnce(
-        Vec<Qwen3AsrLayerKvCacheState>,
+        &mut Qwen3AsrHostKvCacheOwner,
         &[u32],
         usize,
-    ) -> Result<Vec<Qwen3AsrLayerKvCacheState>, Hymt2RuntimeError>,
+    ) -> Result<(), Hymt2RuntimeError>,
 ) -> Result<(usize, Hymt2PrefixReusePlan), Hymt2RuntimeError> {
     let result = (|| {
+        if source_prefix_tokens.len() > cache.max_positions {
+            return Err(Hymt2RuntimeError::Decode {
+                reason: format!(
+                    "Hy-MT2 source prefix span {} exceeds stable prefix arena {}",
+                    source_prefix_tokens.len(),
+                    cache.max_positions
+                ),
+            });
+        }
+        if let Some(limit) = cache.clause_id_capacity_limit
+            && clause_id.len() > limit
+        {
+            return Err(Hymt2RuntimeError::Decode {
+                reason: format!(
+                    "Hy-MT2 clause id is {} bytes, exceeding admitted product bound {limit}",
+                    clause_id.len()
+                ),
+            });
+        }
         let static_context_tokens = source_prefix_tokens
             .get(..static_context_token_count)
             .unwrap_or(&[]);
@@ -840,30 +1295,33 @@ fn update_hymt2_source_prefix_cache(
             None => true,
         };
         if should_reset {
-            cache.active = Some(Hymt2ActivePrefixCache {
-                clause_id: clause_id.to_string(),
-                static_context_tokens: static_context_tokens.to_vec(),
-                source_prefix_tokens: Vec::new(),
-                layer_kv_caches: empty_layer_kv_caches(max_positions),
-                max_positions,
-            });
+            // Clause metadata is ephemeral; the admitted arena is not. Reset
+            // its written rows in place so a new clause never allocates after
+            // the candidate has been published/pinned.
+            cache.invalidate();
+            let mut active =
+                cache
+                    .spare_active
+                    .take()
+                    .ok_or_else(|| Hymt2RuntimeError::Decode {
+                        reason: "Hy-MT2 admitted prefix metadata workspace is missing".to_string(),
+                    })?;
+            active.clause_id.clear();
+            active.clause_id.push_str(clause_id);
+            active.static_context_tokens.clear();
+            active
+                .static_context_tokens
+                .extend_from_slice(static_context_tokens);
+            active.source_prefix_tokens.clear();
+            cache.active = Some(active);
         }
 
         let active = cache
             .active
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| Hymt2RuntimeError::Decode {
                 reason: "Hy-MT2 prefix cache missing after reset".to_string(),
             })?;
-        if active.max_positions < max_positions {
-            for layer in &mut active.layer_kv_caches {
-                layer
-                    .resize_max_positions(max_positions)
-                    .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
-            }
-            active.max_positions = max_positions;
-        }
-
         let reuse_plan = plan_hymt2_prefix_reuse(
             &active.source_prefix_tokens,
             source_prefix_tokens,
@@ -871,11 +1329,7 @@ fn update_hymt2_source_prefix_cache(
             cache.config.unstable_tail_backoff_tokens,
             finalized,
         );
-        // The pre-reuse KV caches are fully replaced by `staged_layer_kv_caches`
-        // below (on success) or discarded by `cache.invalidate()` (on error),
-        // so `mem::take` avoids cloning the whole multi-layer KV cache here.
-        let mut staged_layer_kv_caches = std::mem::take(&mut active.layer_kv_caches);
-        for layer in &mut staged_layer_kv_caches {
+        for layer in cache.layer_kv_caches.iter_mut() {
             layer
                 .truncate_written_positions(reuse_plan.reused_prefix_tokens)
                 .map_err(|reason| Hymt2RuntimeError::Decode { reason })?;
@@ -888,14 +1342,22 @@ fn update_hymt2_source_prefix_cache(
             })?;
         let suffix_len = suffix_tokens.len();
         if !suffix_tokens.is_empty() {
-            staged_layer_kv_caches = prefill_suffix(
-                staged_layer_kv_caches,
+            prefill_suffix(
+                &mut cache.layer_kv_caches,
                 suffix_tokens,
                 reuse_plan.reused_prefix_tokens,
             )?;
         }
-        active.layer_kv_caches = staged_layer_kv_caches;
-        active.source_prefix_tokens = source_prefix_tokens.to_vec();
+        let active = cache
+            .active
+            .as_mut()
+            .ok_or_else(|| Hymt2RuntimeError::Decode {
+                reason: "Hy-MT2 prefix cache disappeared during prefill".to_string(),
+            })?;
+        active.source_prefix_tokens.clear();
+        active
+            .source_prefix_tokens
+            .extend_from_slice(source_prefix_tokens);
         Ok((suffix_len, reuse_plan))
     })();
     if result.is_err() {
@@ -915,6 +1377,7 @@ struct Hymt2GreedyStepper<'a> {
     metadata: Hymt2ExecutionMetadata,
     token_embedding_table: &'a Qwen3AsrTokenEmbeddingTable,
     logits_head: &'a Qwen3AsrLlmLogitsHead,
+    logits_runtime: &'a mut Qwen3AsrLlmLogitsHeadRuntime,
     whole_decoder: &'a mut Qwen3AsrLlmWholeDecoderGraphExecutor,
     layer_kv_caches: &'a mut [Qwen3AsrLayerKvCacheState],
     prompt_token_count: usize,
@@ -1343,14 +1806,14 @@ impl Hymt2GreedyStepper<'_> {
     }
 
     fn compute_logits_for_last_hidden(
-        &self,
+        &mut self,
         hidden: &[f32],
         stage: &'static str,
     ) -> Result<Vec<f32>, Hymt2RuntimeError> {
         let started_at = hymt2_profile_start();
         let logits = self
-            .logits_head
-            .compute_logits_for_last_hidden(hidden)
+            .logits_runtime
+            .compute_logits_for_last_hidden(self.logits_head, hidden)
             .map_err(|error| Hymt2RuntimeError::Decode {
                 reason: error.to_string(),
             })?;
@@ -1359,14 +1822,14 @@ impl Hymt2GreedyStepper<'_> {
     }
 
     fn compute_top1_token_for_last_hidden(
-        &self,
+        &mut self,
         hidden: &[f32],
         stage: &'static str,
     ) -> Result<u32, Hymt2RuntimeError> {
         let started_at = hymt2_profile_start();
         let token_id = self
-            .logits_head
-            .compute_top1_token_for_last_hidden(hidden)
+            .logits_runtime
+            .compute_top1_token_for_last_hidden(self.logits_head, hidden)
             .map_err(|error| Hymt2RuntimeError::Decode {
                 reason: error.to_string(),
             })?;
@@ -2188,23 +2651,27 @@ mod tests {
 
     #[test]
     fn prefix_cache_prefill_failure_invalidates_active_cache() {
-        let mut seeded_layer = Qwen3AsrLayerKvCacheState::new(8, 1, 1);
+        let mut seeded_layers = single_layer_caches(8).expect("seeded cache owner");
         for position in 0..4 {
             let value = position as f32 + 1.0;
-            seeded_layer
+            seeded_layers[0]
                 .write(position, &[value], &[value + 10.0])
                 .expect("seed row");
         }
-        let mut cache = Hymt2TranslationSessionCache::new(Hymt2PrefixCacheConfig {
-            unstable_tail_backoff_tokens: 0,
-        });
+        let mut cache = Hymt2TranslationSessionCache::with_arena(
+            Hymt2PrefixCacheConfig {
+                unstable_tail_backoff_tokens: 0,
+            },
+            seeded_layers,
+            8,
+            None,
+        );
         cache.active = Some(Hymt2ActivePrefixCache {
             clause_id: "c-cache".to_string(),
             static_context_tokens: vec![1, 2],
             source_prefix_tokens: vec![1, 2, 3, 4],
-            layer_kv_caches: vec![seeded_layer],
-            max_positions: 8,
         });
+        let arena_ptr = cache.layer_kv_caches.as_ptr();
 
         let injected = update_hymt2_source_prefix_cache(
             &mut cache,
@@ -2212,9 +2679,7 @@ mod tests {
             &[1, 2, 3, 4, 5],
             2,
             true,
-            8,
-            single_layer_caches,
-            |mut staged, suffix_tokens, reused_prefix_tokens| {
+            |staged, suffix_tokens, reused_prefix_tokens| {
                 assert_eq!(reused_prefix_tokens, 4);
                 assert_eq!(suffix_tokens, &[5]);
                 staged[0]
@@ -2228,6 +2693,10 @@ mod tests {
 
         assert!(injected.is_err());
         assert_eq!(cache.active_prefix_token_count(), 0);
+        assert_eq!(cache.max_positions, 8);
+        assert_eq!(cache.layer_kv_caches.len(), 1);
+        assert_eq!(cache.layer_kv_caches.as_ptr(), arena_ptr);
+        assert_eq!(cache.layer_kv_caches[0].written_positions(), 0);
 
         let (prefilled_tokens, reuse_plan) = update_hymt2_source_prefix_cache(
             &mut cache,
@@ -2235,9 +2704,7 @@ mod tests {
             &[1, 2, 3, 4, 5],
             2,
             true,
-            8,
-            single_layer_caches,
-            |mut staged, suffix_tokens, reused_prefix_tokens| {
+            |staged, suffix_tokens, reused_prefix_tokens| {
                 assert_eq!(reused_prefix_tokens, 0);
                 assert_eq!(suffix_tokens, &[1, 2, 3, 4, 5]);
                 for (position, token) in suffix_tokens.iter().copied().enumerate() {
@@ -2246,7 +2713,7 @@ mod tests {
                         .write(position, &[value], &[value + 10.0])
                         .expect("write rebuilt row");
                 }
-                Ok(staged)
+                Ok(())
             },
         )
         .expect("rebuild after injected failure");
@@ -2261,7 +2728,8 @@ mod tests {
         );
         let active = cache.active.as_ref().expect("rebuilt active cache");
         assert_eq!(active.source_prefix_tokens, [1, 2, 3, 4, 5]);
-        assert_eq!(active.layer_kv_caches[0].written_positions(), 5);
+        assert_eq!(cache.layer_kv_caches.as_ptr(), arena_ptr);
+        assert_eq!(cache.layer_kv_caches[0].written_positions(), 5);
     }
 
     /// `probe_path_cached` must serve a repeat call for the same path from
@@ -2318,8 +2786,25 @@ mod tests {
         );
     }
 
-    fn single_layer_caches(max_positions: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
-        vec![Qwen3AsrLayerKvCacheState::new(max_positions, 1, 1)]
+    fn single_layer_caches(
+        max_positions: usize,
+    ) -> Result<Qwen3AsrHostKvCacheOwner, Hymt2RuntimeError> {
+        let capacity =
+            Qwen3AsrKvCacheCapacity::new(max_positions, max_positions).map_err(|error| {
+                Hymt2RuntimeError::Decode {
+                    reason: error.to_string(),
+                }
+            })?;
+        Qwen3AsrHostKvCacheOwner::try_new(
+            "hymt2.test.self-kv.host",
+            1,
+            capacity,
+            1,
+            1,
+            crate::ggml_runtime::GgmlKvElementType::F32,
+            Qwen3AsrHostKvMode::Materialized,
+        )
+        .map_err(|reason| Hymt2RuntimeError::Decode { reason })
     }
 
     #[test]
@@ -2366,7 +2851,9 @@ mod tests {
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("load Hy-MT2 runtime");
-        let mut cache = Hymt2TranslationSessionCache::default();
+        let mut cache = runtime
+            .new_translation_session_cache(Hymt2PrefixCacheConfig::default())
+            .expect("allocate translation prefix cache");
         let mut context: Vec<(String, String)> = Vec::new();
         let mut total_ms = 0.0_f64;
         let mut clause_count = 0_usize;
@@ -2443,7 +2930,9 @@ mod tests {
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("load Hy-MT2 runtime");
-        let mut cache = Hymt2TranslationSessionCache::default();
+        let mut cache = runtime
+            .new_translation_session_cache(Hymt2PrefixCacheConfig::default())
+            .expect("allocate translation prefix cache");
         let sequence = [
             "我们需要保持",
             "我们需要保持流式路径",
@@ -2520,7 +3009,9 @@ mod tests {
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("load Hy-MT2 runtime");
-        let mut cache = Hymt2TranslationSessionCache::default();
+        let mut cache = runtime
+            .new_translation_session_cache(Hymt2PrefixCacheConfig::default())
+            .expect("allocate translation prefix cache");
         // Realistic clause-retranslation traffic: each clause grows in steps
         // (provisional retranslations) and ends with its stable form, capped
         // around the 24-char clause segmentation budget from the design memo.

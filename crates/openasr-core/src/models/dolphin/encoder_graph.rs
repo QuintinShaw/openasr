@@ -461,10 +461,10 @@ fn dolphin_encoder_arena_context_bytes(num_blocks: usize) -> usize {
 
 /// Pending f32 weight upload into the static arena: `(handle, source-slice,
 /// static-label)`.
-type Upload<'p> = (GgmlStaticTensor, &'p [f32], &'static str);
-/// Pending native (quantized / f16) weight upload: `(handle, raw-bytes,
-/// static-label)`.
-type NativeUpload<'p> = (GgmlStaticTensor, &'p [u8], &'static str);
+enum PendingUpload<'p> {
+    F32(GgmlStaticTensor, &'p [f32], &'static str),
+    Native(GgmlStaticTensor, &'p [u8], &'static str),
+}
 
 /// Allocates every encoder weight into the runtime's persistent
 /// [`GgmlStaticTensorArena`] (a `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` backend
@@ -481,16 +481,14 @@ type NativeUpload<'p> = (GgmlStaticTensor, &'p [u8], &'static str);
 /// backend each op runs on changes.
 struct WeightBuilder<'p> {
     provider: &'p dyn DolphinWeightProvider,
-    uploads: Vec<Upload<'p>>,
-    native_uploads: Vec<NativeUpload<'p>>,
+    uploads: Vec<PendingUpload<'p>>,
 }
 
 impl<'p> WeightBuilder<'p> {
-    fn new(provider: &'p dyn DolphinWeightProvider) -> Self {
+    fn new(provider: &'p dyn DolphinWeightProvider, tensor_count: usize) -> Self {
         Self {
             provider,
-            uploads: Vec::new(),
-            native_uploads: Vec::new(),
+            uploads: Vec::with_capacity(tensor_count),
         }
     }
 
@@ -522,7 +520,8 @@ impl<'p> WeightBuilder<'p> {
         let handle = arena
             .new_tensor_1d_f32(len, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_1d"))?;
-        self.uploads.push((handle, data, "dolphin_weight"));
+        self.uploads
+            .push(PendingUpload::F32(handle, data, "dolphin_weight"));
         Ok(handle)
     }
 
@@ -546,15 +545,19 @@ impl<'p> WeightBuilder<'p> {
             let handle = arena
                 .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_weight")
                 .map_err(ggml_err("weight_alloc_2d_native"))?;
-            self.native_uploads
-                .push((handle, native.bytes, "dolphin_weight"));
+            self.uploads.push(PendingUpload::Native(
+                handle,
+                native.bytes,
+                "dolphin_weight",
+            ));
             return Ok(handle);
         }
         let data = self.fetch(name, ne0 * ne1)?;
         let handle = arena
             .new_tensor_2d_f32(ne0, ne1, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_2d"))?;
-        self.uploads.push((handle, data, "dolphin_weight"));
+        self.uploads
+            .push(PendingUpload::F32(handle, data, "dolphin_weight"));
         Ok(handle)
     }
 
@@ -571,7 +574,8 @@ impl<'p> WeightBuilder<'p> {
         let handle = arena
             .new_tensor_4d_f32(ne0, ne1, ne2, ne3, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_4d"))?;
-        self.uploads.push((handle, data, "dolphin_weight"));
+        self.uploads
+            .push(PendingUpload::F32(handle, data, "dolphin_weight"));
         Ok(handle)
     }
 
@@ -591,7 +595,8 @@ impl<'p> WeightBuilder<'p> {
         let handle = arena
             .new_tensor_2d_f32(d_model, max_len, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_pos"))?;
-        self.uploads.push((handle, full, "dolphin_weight"));
+        self.uploads
+            .push(PendingUpload::F32(handle, full, "dolphin_weight"));
         Ok(handle)
     }
 
@@ -601,15 +606,15 @@ impl<'p> WeightBuilder<'p> {
     /// their raw block bytes verbatim so they stay quantized in the buffer;
     /// everything else uploads dequantized f32.
     fn upload(&self, arena: &mut GgmlStaticTensorArena) -> Result<(), DolphinEncoderError> {
-        for (handle, data, name) in &self.uploads {
-            arena
-                .set_f32_slice(*handle, data, name)
-                .map_err(ggml_err("upload_weight"))?;
-        }
-        for (handle, bytes, name) in &self.native_uploads {
-            arena
-                .set_bytes_slice(*handle, bytes, name)
-                .map_err(ggml_err("upload_weight_native"))?;
+        for upload in &self.uploads {
+            match upload {
+                PendingUpload::F32(handle, data, name) => arena
+                    .set_f32_slice(*handle, data, name)
+                    .map_err(ggml_err("upload_weight"))?,
+                PendingUpload::Native(handle, bytes, name) => arena
+                    .set_bytes_slice(*handle, bytes, name)
+                    .map_err(ggml_err("upload_weight_native"))?,
+            }
         }
         Ok(())
     }
@@ -1237,6 +1242,58 @@ pub(crate) struct DolphinEncoderRuntime {
 }
 
 impl DolphinEncoderRuntime {
+    pub(crate) fn quoted_system_memory_bytes(
+        config: &DolphinEncoderConfig,
+        pos_capacity_frames: usize,
+    ) -> Result<(u64, u64), String> {
+        let retained = config
+            .num_blocks
+            .checked_mul(std::mem::size_of::<BlockStaticWeights>())
+            .ok_or_else(|| "dolphin encoder block handle quote overflowed".to_string())?;
+        let is_multilingual = matches!(
+            config.language_scheme,
+            super::package_import::DolphinLanguageScheme::Multilingual
+        );
+        let upload_count = DOLPHIN_ENCODER_ARENA_FIXED_TENSORS
+            .checked_sub(usize::from(is_multilingual))
+            .and_then(|fixed| {
+                DOLPHIN_ENCODER_ARENA_TENSORS_PER_BLOCK
+                    .checked_mul(config.num_blocks)
+                    .and_then(|blocks| fixed.checked_add(blocks))
+            })
+            .ok_or_else(|| "dolphin encoder upload count overflowed".to_string())?;
+        let upload_descriptors = upload_count
+            .checked_mul(std::mem::size_of::<PendingUpload<'static>>())
+            .ok_or_else(|| "dolphin encoder upload descriptor quote overflowed".to_string())?;
+        let computed_position_table = if is_multilingual {
+            pos_capacity_frames
+                .max(1)
+                .checked_mul(2)
+                .and_then(|positions| positions.checked_sub(1))
+                .and_then(|positions| positions.checked_mul(config.d_model))
+                .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| "dolphin encoder relative-position quote overflowed".to_string())?
+        } else {
+            0
+        };
+        let peak = retained
+            .checked_add(upload_descriptors)
+            .and_then(|bytes| bytes.checked_add(computed_position_table))
+            .ok_or_else(|| "dolphin encoder construction quote overflowed".to_string())?;
+        Ok((
+            u64::try_from(peak)
+                .map_err(|_| "dolphin encoder peak quote exceeds u64".to_string())?,
+            u64::try_from(retained)
+                .map_err(|_| "dolphin encoder retained quote exceeds u64".to_string())?,
+        ))
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.weights.blocks, "dolphin encoder block handles")?;
+        Ok(bytes.finish())
+    }
+
     /// `pos_capacity_frames` is the largest post-subsample `frames` this
     /// runtime's resident position table can serve (a [`Self::encode`] call
     /// beyond it fails closed with a typed `Shape` error; the executor falls
@@ -1282,7 +1339,15 @@ impl DolphinEncoderRuntime {
 
         // Phase A: allocate every weight tensor in the arena (allocation must
         // precede the arena's first upload, which freezes further creation).
-        let mut builder = WeightBuilder::new(provider);
+        let builder_tensor_count = DOLPHIN_ENCODER_ARENA_FIXED_TENSORS
+            .saturating_sub(usize::from(matches!(
+                config.language_scheme,
+                super::package_import::DolphinLanguageScheme::Multilingual
+            )))
+            .saturating_add(
+                DOLPHIN_ENCODER_ARENA_TENSORS_PER_BLOCK.saturating_mul(config.num_blocks),
+            );
+        let mut builder = WeightBuilder::new(provider, builder_tensor_count);
         let embed = build_embed_weights(&arena, &mut builder, config)?;
         let mut blocks = Vec::with_capacity(config.num_blocks);
         for index in 0..config.num_blocks {

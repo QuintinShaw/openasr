@@ -105,6 +105,64 @@ pub(crate) struct MimoSpeechEmbeddingTables {
     zeroemb_idx: Vec<u32>,
 }
 
+impl MimoSpeechEmbeddingTables {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        d_model: usize,
+        speech_vocab_sizes: &[u32],
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            speech_vocab_sizes
+                .len()
+                .checked_mul(std::mem::size_of::<Vec<f32>>())
+                .ok_or_else(|| "mimo-asr speech table descriptors quote overflowed".to_string())?,
+            "mimo-asr speech table descriptors quote",
+        )?;
+        let value_count = speech_vocab_sizes
+            .iter()
+            .try_fold(0usize, |total, &vocab_size| {
+                total.checked_add((vocab_size as usize).checked_mul(d_model)?)
+            })
+            .ok_or_else(|| "mimo-asr speech embedding values quote overflowed".to_string())?;
+        bytes.add_usize(
+            value_count
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "mimo-asr speech embedding bytes quote overflowed".to_string())?,
+            "mimo-asr speech embedding values quote",
+        )?;
+        for (label, entry_size) in [
+            (
+                "mimo-asr speech vocabulary sizes quote",
+                std::mem::size_of::<usize>(),
+            ),
+            (
+                "mimo-asr speech zero indices quote",
+                std::mem::size_of::<u32>(),
+            ),
+        ] {
+            bytes.add_usize(
+                speech_vocab_sizes
+                    .len()
+                    .checked_mul(entry_size)
+                    .ok_or_else(|| format!("{label} overflowed"))?,
+                label,
+            )?;
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.tables, "mimo-asr speech embedding tables")?;
+        for table in &self.tables {
+            bytes.add_vec(table, "mimo-asr speech embedding table values")?;
+        }
+        bytes.add_vec(&self.vocab_sizes, "mimo-asr speech vocabulary sizes")?;
+        bytes.add_vec(&self.zeroemb_idx, "mimo-asr speech zero-embedding indices")?;
+        Ok(bytes.finish())
+    }
+}
+
 pub(crate) fn load_speech_embedding_tables_from_reader(
     reader: &GgufTensorDataReader,
     d_model: usize,
@@ -187,6 +245,28 @@ pub(crate) struct MimoInputLocalRuntime {
     final_norm: GgmlStaticTensor,
     group_proj: GgmlLoadedTensor,
     layers: Vec<LayerRuntime>,
+}
+
+impl MimoInputLocalRuntime {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: &MimoInlocalMetadata,
+    ) -> Result<u64, String> {
+        let bytes = metadata
+            .n_layers
+            .checked_mul(std::mem::size_of::<LayerRuntime>())
+            .ok_or_else(|| "mimo-asr input-local handle quote overflowed".to_string())?;
+        u64::try_from(bytes)
+            .map_err(|_| "mimo-asr input-local handle quote exceeds u64".to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        // Native graph arenas, backend buffers, and loaded zero-copy weight
+        // contexts are admitted by their constructors and intentionally do not
+        // belong to this Rust-container accounting.
+        bytes.add_vec(&self.layers, "mimo-asr input-local layer handles")?;
+        Ok(bytes.finish())
+    }
 }
 
 fn bind(

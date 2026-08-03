@@ -131,7 +131,11 @@ pub(crate) enum LoraResolveError {
     CachePoisoned,
 }
 
-type AdapterCacheKey = (PathBuf, PathBuf);
+type AdapterCacheKey = (
+    Option<crate::models::native_execution_services::NativeExecutionScopeId>,
+    PathBuf,
+    PathBuf,
+);
 
 struct CachedAdapter {
     /// sha256 (lowercase hex) of the `.oadp` file at load time; every cache hit
@@ -163,7 +167,11 @@ pub(crate) fn resolve_lora_adapter(
         return Err(LoraResolveError::EmptyAdapterPath);
     }
     let base_pack_path = preflight.runtime_source.path().to_path_buf();
-    let key = (adapter_path.clone(), base_pack_path.clone());
+    let key = (
+        crate::models::native_execution_services::current_native_execution_scope_id(),
+        adapter_path.clone(),
+        base_pack_path.clone(),
+    );
 
     // Content identity: hash the file up front. Adapters are a few MB at most, so
     // the sha256 is cheap next to a decode, and (unlike len+mtime) it leaves no

@@ -56,6 +56,22 @@ pub(crate) const LFR_N: usize = 6;
 /// SenseVoice CMVN operates on the LFR-stacked feature: `80 * 7 = 560` dims.
 pub(crate) const LFR_FEATURE_DIM: usize = NUM_MEL_BINS * LFR_M;
 
+/// Count the exact snip-edges fbank rows produced by this frontend's live
+/// configuration without allocating feature storage.
+pub(crate) fn sensevoice_fbank_frame_count(samples: usize) -> usize {
+    FRONTEND_CONFIG.frame_count(samples)
+}
+
+/// Count FunASR LFR rows from an already-counted fbank time axis.
+pub(crate) fn sensevoice_lfr_frame_count(fbank_frames: usize) -> usize {
+    fbank_frames.div_ceil(LFR_N)
+}
+
+/// Exact count-only oracle for the full fbank -> LFR frontend time axis.
+pub(crate) fn sensevoice_lfr_frame_count_for_samples(samples: usize) -> usize {
+    sensevoice_lfr_frame_count(sensevoice_fbank_frame_count(samples))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SenseVoiceFrontendError {
     #[error("sensevoice frontend requires finite 16 kHz mono f32 audio")]
@@ -177,7 +193,7 @@ pub(crate) fn apply_lfr(
 
     // FunASR sizes the output from the ORIGINAL frame count (before the left
     // padding is prepended), not the padded length.
-    let out_frames = n_frames.div_ceil(LFR_N);
+    let out_frames = sensevoice_lfr_frame_count(n_frames);
     let out_dim = feature_dim * LFR_M;
     let mut out = vec![0.0f32; out_frames * out_dim];
     for i in 0..out_frames {
@@ -252,6 +268,8 @@ mod tests {
             .expect("fbank");
         assert_eq!(features.n_mels, 80);
         assert_eq!(features.n_frames, 236);
+        assert_eq!(sensevoice_fbank_frame_count(samples.len()), 236);
+        assert_eq!(sensevoice_lfr_frame_count_for_samples(samples.len()), 40);
         assert_eq!(features.data.len(), 236 * 80);
         assert!(features.data.iter().all(|v| v.is_finite()));
     }
@@ -263,6 +281,24 @@ mod tests {
             SenseVoiceFbankFrontend::new().compute(&samples),
             Err(SenseVoiceFrontendError::NoFrames { samples: 200 })
         ));
+        assert_eq!(sensevoice_fbank_frame_count(samples.len()), 0);
+        assert_eq!(sensevoice_lfr_frame_count_for_samples(samples.len()), 0);
+    }
+
+    #[test]
+    fn count_oracles_pin_fbank_and_lfr_boundaries() {
+        let frame_length = FRONTEND_CONFIG.frame_length;
+        let frame_shift = FRONTEND_CONFIG.frame_shift;
+        assert_eq!(sensevoice_fbank_frame_count(frame_length - 1), 0);
+        assert_eq!(sensevoice_fbank_frame_count(frame_length), 1);
+        assert_eq!(
+            sensevoice_fbank_frame_count(frame_length + frame_shift - 1),
+            1
+        );
+        assert_eq!(sensevoice_fbank_frame_count(frame_length + frame_shift), 2);
+        assert_eq!(sensevoice_lfr_frame_count(0), 0);
+        assert_eq!(sensevoice_lfr_frame_count(LFR_N), 1);
+        assert_eq!(sensevoice_lfr_frame_count(LFR_N + 1), 2);
     }
 
     /// Hand-computed LFR check with a tiny feature_dim (2) so the stacking and

@@ -41,17 +41,13 @@ const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
 /// Records the OS thread a set of thread-affine ggml runners was last built on
 /// and reports whether execution has since moved to a different thread.
 ///
-/// The streaming runtimes are handed out from a process-global pool
-/// (`XASR_PROCESS_RUNTIME_POOL`) and therefore migrate between decode worker
-/// threads. Their GPU-class (Metal/GPU) backend guards are non-owning
-/// (`free_on_drop=false`) views into the *building* thread's thread-local
-/// backend cache; that cache -- and the backend it owns -- is freed when its
-/// thread exits (a native streaming worker is hard-released after 60s idle).
-/// Reusing such a runner from another thread would dereference a freed backend
-/// and `GGML_ASSERT(device)`-abort the daemon. Returning `true` here tells the
-/// caller to drop those runners so they rebuild against the current thread's
-/// backend. Returns `false` on the first bind (nothing built yet) and while the
-/// thread is unchanged.
+/// Production prepared runtimes are pinned to an owner actor, so their
+/// GPU-class backend guards and runners are built, invoked, and dropped on one
+/// stable thread. Keep this check as a defensive invariant for direct local
+/// construction/test paths: if such a runtime is ever invoked from another
+/// thread, discard its lazy runners before touching a non-owning view into the
+/// original thread's backend cache. Returns `false` on the first bind and while
+/// the thread is unchanged.
 fn thread_moved_since_bind(bound: &Cell<Option<ThreadId>>, current: ThreadId) -> bool {
     matches!(bound.replace(Some(current)), Some(previous) if previous != current)
 }

@@ -22,7 +22,7 @@ use crate::PhraseBiasConfig;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
 };
-use crate::models::decode_token_history::context_window_budget;
+use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
@@ -46,8 +46,6 @@ const COHERE_DECODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// realistic weight+KV tensor count for any decoder layer depth.
 const COHERE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
 const COHERE_DISABLE_INCREMENTAL_SELF_KV_ENV: &str = "OPENASR_COHERE_DISABLE_INCREMENTAL_SELF_KV";
-const COHERE_MAX_GENERATED_TOKENS_OVERRIDE_ENV: &str =
-    "OPENASR_COHERE_MAX_GENERATED_TOKENS_OVERRIDE";
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
@@ -171,8 +169,6 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     audio_duration_seconds: f32,
     control: &Arc<crate::TranscriptionControl>,
 ) -> Result<CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
-    let mut step_executor =
-        CohereDecoderGraphStepExecutor::from_runtime(decoder_runtime, encoder_output)?;
     let decode_text_token_ids = |token_ids: &[u32]| {
         tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
             CohereTranscribeGreedyDecodeError::TokenizerDecodeFailed {
@@ -182,12 +178,29 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     };
     let max_generated_tokens =
         decoder_max_generated_tokens_with_env(prompt_tokens, metadata, encoder_output.frame_count)?;
+    let planned_self_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+        prompt_tokens.len(),
+        max_generated_tokens,
+    )
+    .map_err(|_| CohereDecoderGraphError::ShapeOverflow)?;
+    decoder_runtime
+        .decoder_state
+        .self_attention
+        .validate_exact_shape(
+            crate::capacity::topology::StateKind::SelfAttentionKv,
+            planned_self_positions,
+        )
+        .map_err(|error| CohereDecoderGraphError::InvalidInput {
+            reason: error.to_string(),
+        })?;
     let config = BuiltinSeq2SeqDecodePolicyConfigInput {
         initial_prompt_tokens: prompt_tokens.to_vec(),
         eot_token_id: eos_token_id,
         vocab_size: metadata.vocab_size,
         max_generated_tokens,
     };
+    let mut step_executor =
+        CohereDecoderGraphStepExecutor::from_runtime(decoder_runtime, encoder_output)?;
     let decode = match run_cohere_transcribe_greedy_decode_loop(
         &config,
         tokenizer,
@@ -472,23 +485,11 @@ pub(crate) struct CohereDecoderGraphRuntime {
     layers: Vec<CohereDecoderLayerRuntime>,
     cross_layers: Vec<CohereDecoderCrossCacheLayerRuntime>,
     self_kv_layers: Vec<CohereDecoderSelfKvLayerRuntime>,
-    /// Allocated column count of every `cross_layers[i].{key,value}` tensor
-    /// (see [`cohere_decoder_cross_capacity_frames`]). Grows (never shrinks)
-    /// via [`Self::grow_cross_capacity`] when a chunk exceeds it. Equals the
-    /// exact per-utterance frame count on the batched (`n_seq > 1`)
-    /// serve-batch path (unchanged pre-existing sizing; never observed to
-    /// grow there in practice since a cached batched runtime's jobs are
-    /// already grouped by equal frame count).
+    decoder_state: Seq2SeqDecoderState,
+    /// Stable planner-reserved column count of every cross-KV tensor. It is
+    /// fixed for the runtime's lifetime and independent of the active
+    /// utterance shape.
     cross_capacity_frames: usize,
-    /// Owned clone of the decoder weights, kept around ONLY so
-    /// [`Self::grow_cross_capacity`] can rebuild the arena (which re-uploads
-    /// every weight tensor into it, not just the cross-KV cache) without the
-    /// caller re-supplying them. Cheap to clone: the pack-native tensors are
-    /// `Arc<Mmap>`-backed (see `CohereOwnedGgmlWeightPayload`); only tensors
-    /// requiring host-side dequantization at load time carry an eagerly
-    /// materialized `Vec<f32>`, and even those only get cloned on a (rare)
-    /// grow, not per chunk.
-    decoder_weights: CohereTranscribeDecoderWeights,
     /// The active cross-frame-count [`Self::reuse`]'s persistent graph was
     /// last built for (0 if never built). `compute_reused_incremental_step_logits`
     /// compares this against the current `cross_layers[0].frame_count` and
@@ -557,67 +558,12 @@ struct CohereDecoderSelfKvLayerRuntime {
 struct CohereDecoderCrossCacheLayerRuntime {
     key: GgmlStaticTensor,
     value: GgmlStaticTensor,
-    /// The CURRENT utterance's actual encoder frame count -- mutable, updated
+    /// The current utterance's planned encoder frame count, updated
     /// on every [`CohereDecoderGraphRuntime::populate_cross_attention_cache_slot`]
-    /// call for the single-sequence (`n_seq == 1`) path (see
-    /// [`cohere_decoder_cross_capacity_frames`]). Always `<=` the tensor's
-    /// allocated column count. For the batched serve-batch path (`n_seq > 1`)
-    /// this stays equal to the allocation size, matching the pre-existing
-    /// (unchanged) behavior there.
+    /// call and always `<=` the stable resident column count.
     frame_count: usize,
+    capacity_frames: usize,
     hidden_size: usize,
-}
-
-/// Extra headroom (beyond the architecture's declared safe chunk length)
-/// folded into the single-sequence cross-KV capacity below, purely to reduce
-/// how often a chunk-boundary rounding in an upstream caller (VAD snapping,
-/// sample-count truncation) triggers
-/// [`CohereDecoderGraphRuntime::grow_cross_capacity`] -- never load-bearing
-/// for correctness: a chunk past this capacity still grows the cache to fit
-/// rather than silently truncating, overrunning the arena, or being
-/// rejected.
-const COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS: f32 = 2.0;
-
-/// Predict the pre-subsampling mel frame count for `duration_seconds` of this
-/// pack's configured audio (`metadata.sample_rate_hz`/`hop_length`), matching
-/// the `ZeroCenter`-padded STFT framing `cohere_transcribe_features_from_samples`
-/// runs (`n_frames = samples / hop_length`, after that framer's own `-1`
-/// trailing-frame drop; see `frontend.rs`).
-fn cohere_mel_frames_for_seconds(
-    duration_seconds: f32,
-    metadata: CohereTranscribeExecutionMetadata,
-) -> usize {
-    let samples = (duration_seconds.max(0.0) * metadata.sample_rate_hz as f32) as usize;
-    samples / metadata.hop_length.max(1)
-}
-
-/// Single-sequence (`n_seq == 1`) cross-attention KV cache capacity, in
-/// post-subsampling encoder frames: the decoder's cross-KV cache for the
-/// thread-local-cached single-utterance path is now allocated ONCE per pack
-/// at this size (issue #68's `GlobalQuadratic` chunk ceiling +
-/// [`COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS`] margin) instead of
-/// exactly matching each utterance's actual encoder frame count. Every
-/// VAD/longform chunk for this architecture -- which the shared longform
-/// safety policy already caps at `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` -- then
-/// reuses the SAME decoder runtime (thread-local cache keyed only by pack
-/// path + backend, no more per-frame-count fan-out) instead of rebuilding the
-/// whole GGUF weight context and cross-KV arena per differing chunk length.
-/// Not applied to the batched serve-batch path (`n_seq > 1`), which keeps its
-/// pre-existing exact-sized allocation (out of scope for the VAD/longform
-/// cache-hit fix this sizes). Reserve-once sizing follows the same convention
-/// as `references/transcribe.cpp@b6a6aca`'s `causal_lm.cpp` KV-cache init
-/// (`kv_init`: reserve at a known max, never reallocate per step) -- see
-/// `GgmlCpuStepBufferPool`'s doc in `ggml_runtime/cpu_graph.rs` for the
-/// sibling citation and `ACKNOWLEDGMENTS.md`.
-pub(crate) fn cohere_decoder_cross_capacity_frames(
-    metadata: CohereTranscribeExecutionMetadata,
-) -> usize {
-    let chunk_seconds = crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS
-        + COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS;
-    let mel_frames = cohere_mel_frames_for_seconds(chunk_seconds, metadata);
-    super::encoder_graph::predicted_encoder_time_frames(mel_frames)
-        .map(|frames| frames.max(1))
-        .unwrap_or(1)
 }
 
 struct CohereDecoderGraphStepExecutor<'a> {
@@ -661,7 +607,7 @@ impl CohereDecoderGraphRuntime {
     pub(crate) fn new(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
-        cross_frame_count: usize,
+        decoder_state: Seq2SeqDecoderState,
         cross_hidden_size: usize,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
@@ -669,7 +615,7 @@ impl CohereDecoderGraphRuntime {
         Self::new_with_n_seq(
             decoder_weights,
             metadata,
-            cross_frame_count,
+            decoder_state,
             cross_hidden_size,
             backend,
             prefer_cpu_backend,
@@ -680,12 +626,17 @@ impl CohereDecoderGraphRuntime {
     pub(crate) fn new_with_n_seq(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
-        cross_frame_count: usize,
+        decoder_state: Seq2SeqDecoderState,
         cross_hidden_size: usize,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         n_seq: usize,
     ) -> Result<Self, CohereDecoderGraphError> {
+        decoder_state
+            .validate()
+            .map_err(|error| CohereDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         if n_seq == 0 {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: "cohere decoder n_seq must be positive".to_string(),
@@ -694,21 +645,20 @@ impl CohereDecoderGraphRuntime {
         validate_decoder_runtime_shapes(decoder_weights, metadata)?;
         validate_encoder_cross_dimensions(
             cross_hidden_size,
-            cross_frame_count,
+            decoder_state.cross_attention.logical_positions,
             metadata,
             decoder_weights.layers.len(),
         )?;
-        // Single-sequence runtimes (the thread-local-cached VAD/longform decode
-        // path) allocate the cross-KV cache at this pack's chunk-cap capacity,
-        // not at `cross_frame_count` (whichever utterance happened to trigger
-        // this cache-miss build) -- see `cohere_decoder_cross_capacity_frames`.
-        // The batched serve-batch path (`n_seq > 1`) keeps its pre-existing
-        // exact-sized allocation untouched (out of scope here).
-        let cross_alloc_frames = if n_seq == 1 {
-            cohere_decoder_cross_capacity_frames(metadata)
-        } else {
-            cross_frame_count
-        };
+        decoder_state
+            .self_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+                metadata.decoder_max_context,
+            )
+            .map_err(|error| CohereDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        let cross_alloc_frames = decoder_state.cross_attention.resident_positions;
 
         let mut config = cohere_decoder_graph_config(backend, prefer_cpu_backend);
         config.graph_size = config.graph_size.max(COHERE_DECODER_GRAPH_SIZE_FLOOR);
@@ -731,6 +681,7 @@ impl CohereDecoderGraphRuntime {
             decoder_weights,
             metadata,
             cross_hidden_size,
+            decoder_state.self_attention.resident_positions,
             cross_alloc_frames,
             n_seq,
         )?;
@@ -752,69 +703,64 @@ impl CohereDecoderGraphRuntime {
             layers: arena_state.layers,
             cross_layers: arena_state.cross_layers,
             self_kv_layers: arena_state.self_kv_layers,
+            decoder_state,
             cross_capacity_frames: cross_alloc_frames,
-            decoder_weights: decoder_weights.clone(),
             reuse_cross_frame_count: 0,
             cached_positions: 0,
             n_seq,
         })
     }
 
-    /// Grow-to-fit: rebuilds the ENTIRE arena (every decoder weight tensor
-    /// plus cross-KV/self-KV caches -- this pack's weights are uploaded
-    /// directly into the arena, unlike firered-aed's, so there is no
-    /// weights-only-arena split to exploit here) at
-    /// `max(needed_frames, 2x current capacity)`. Only reachable when a
-    /// caller presents a chunk past `cross_capacity_frames` -- normal
-    /// VAD/longform chunks never do, since the shared longform safety policy
-    /// already caps every chunk at (or under) the capacity this runtime was
-    /// built with; this exists for callers that legitimately bypass longform
-    /// with a larger single window (e.g. `segment_mode=off`). Drops
-    /// [`Self::reuse`] unconditionally: the persistent GPU reuse graph holds
-    /// raw pointers into the OLD arena's tensors, which this call is about to
-    /// free -- `reuse_cross_frame_count`'s mismatch-triggered rebuild alone
-    /// is not enough here (that logic assumes the arena itself is stable and
-    /// only the active frame count within it moved), so the next Metal decode
-    /// call rebuilds a fresh reuse graph against the new arena instead of
-    /// dereferencing freed memory.
-    fn grow_cross_capacity(&mut self, needed_frames: usize) -> Result<(), CohereDecoderGraphError> {
-        let new_capacity = needed_frames.max(self.cross_capacity_frames.saturating_mul(2));
-        let cross_hidden_size = self.metadata.decoder_d_model;
-        let arena_state = build_cohere_decoder_arena_state(
-            &self.runner,
-            self.persistent_graph_context_bytes,
-            &self.decoder_weights,
-            self.metadata,
-            cross_hidden_size,
-            new_capacity,
-            self.n_seq,
-        )?;
-        self.reuse = None;
-        self.reuse_cross_frame_count = 0;
-        self.arena = arena_state.arena;
-        self.token_embedding = arena_state.token_embedding;
-        self.positional_embedding = arena_state.positional_embedding;
-        self.emb_ln_weight = arena_state.emb_ln_weight;
-        self.emb_ln_bias = arena_state.emb_ln_bias;
-        self.out_ln_weight = arena_state.out_ln_weight;
-        self.out_ln_bias = arena_state.out_ln_bias;
-        self.output_head_weight = arena_state.output_head_weight;
-        self.output_head_bias = arena_state.output_head_bias;
-        self.layers = arena_state.layers;
-        self.cross_layers = arena_state.cross_layers;
-        self.self_kv_layers = arena_state.self_kv_layers;
-        self.cross_capacity_frames = new_capacity;
+    pub(crate) fn activate_decoder_state(
+        &mut self,
+        decoder_state: Seq2SeqDecoderState,
+    ) -> Result<(), CohereDecoderGraphError> {
+        decoder_state
+            .validate()
+            .map_err(|error| CohereDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if decoder_state.self_attention.resident_positions
+            != self.decoder_state.self_attention.resident_positions
+            || decoder_state.cross_attention.resident_positions
+                != self.decoder_state.cross_attention.resident_positions
+        {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: format!(
+                    "cohere cached decoder resident capacity mismatch: cached self/cross={}/{}, requested={}/{}",
+                    self.decoder_state.self_attention.resident_positions,
+                    self.decoder_state.cross_attention.resident_positions,
+                    decoder_state.self_attention.resident_positions,
+                    decoder_state.cross_attention.resident_positions,
+                ),
+            });
+        }
+        decoder_state
+            .self_attention
+            .validate_runtime_ceiling(
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+                self.metadata.decoder_max_context,
+            )
+            .map_err(|error| CohereDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if decoder_state.self_attention.logical_positions
+            != self.decoder_state.self_attention.logical_positions
+            || decoder_state.cross_attention.logical_positions
+                != self.decoder_state.cross_attention.logical_positions
+        {
+            self.reuse = None;
+            self.reuse_cross_frame_count = 0;
+        }
+        self.decoder_state = decoder_state;
         Ok(())
     }
 }
 
 /// Bundle of everything [`build_cohere_decoder_arena_state`] allocates
 /// directly in a fresh arena: every decoder weight tensor plus the
-/// cross-KV/self-KV caches. Factored out of
-/// [`CohereDecoderGraphRuntime::new_with_n_seq`] so
-/// [`CohereDecoderGraphRuntime::grow_cross_capacity`] can rebuild the same
-/// state at a larger cross-KV capacity without duplicating this ~250-line
-/// tensor-declaration + upload sequence.
+/// cross-KV/self-KV caches. Factored out of runtime construction to keep the
+/// tensor declaration and upload transaction cohesive.
 struct CohereDecoderArenaState {
     arena: GgmlStaticTensorArena,
     token_embedding: GgmlStaticTensor,
@@ -837,6 +783,7 @@ fn build_cohere_decoder_arena_state(
     decoder_weights: &CohereTranscribeDecoderWeights,
     metadata: CohereTranscribeExecutionMetadata,
     cross_hidden_size: usize,
+    self_kv_alloc_positions: usize,
     cross_alloc_frames: usize,
     n_seq: usize,
 ) -> Result<CohereDecoderArenaState, CohereDecoderGraphError> {
@@ -998,13 +945,14 @@ fn build_cohere_decoder_arena_state(
             // this arm keeps parity with the pre-existing invariant that
             // `frame_count` is always `<=` the tensor's real column count).
             frame_count: cross_alloc_frames,
+            capacity_frames: cross_alloc_frames,
             hidden_size: cross_hidden_size,
         });
         self_kv_layers.push(CohereDecoderSelfKvLayerRuntime {
             key: new_persistent_self_kv_tensor_in_arena(
                 &arena,
                 metadata.decoder_head_dim,
-                metadata.decoder_max_context,
+                self_kv_alloc_positions,
                 metadata.decoder_heads,
                 n_seq,
                 "dec_self_k_cache",
@@ -1012,12 +960,12 @@ fn build_cohere_decoder_arena_state(
             value: new_persistent_self_kv_tensor_in_arena(
                 &arena,
                 metadata.decoder_head_dim,
-                metadata.decoder_max_context,
+                self_kv_alloc_positions,
                 metadata.decoder_heads,
                 n_seq,
                 "dec_self_v_cache",
             )?,
-            max_positions: metadata.decoder_max_context,
+            max_positions: self_kv_alloc_positions,
         });
     }
 
@@ -1116,15 +1064,29 @@ impl CohereDecoderGraphRuntime {
             });
         }
         self.cached_positions = 0;
+        self.decoder_state
+            .cross_attention
+            .validate_exact_shape(
+                crate::capacity::topology::StateKind::CrossAttentionKv,
+                encoder_output.frame_count,
+            )
+            .map_err(|error| CohereDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        if encoder_output.frame_count > self.cross_capacity_frames {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: format!(
+                    "cohere logical cross shape {} exceeds resident capacity {}",
+                    encoder_output.frame_count, self.cross_capacity_frames
+                ),
+            });
+        }
         validate_encoder_cross_dimensions(
             encoder_output.hidden_size,
             encoder_output.frame_count,
             self.metadata,
             self.layers.len(),
         )?;
-        if encoder_output.frame_count > self.cross_capacity_frames {
-            self.grow_cross_capacity(encoder_output.frame_count)?;
-        }
         let expected = encoder_output
             .frame_count
             .checked_mul(encoder_output.hidden_size)
@@ -1171,6 +1133,7 @@ impl CohereDecoderGraphRuntime {
                 self.arena.graph_tensor(cross_runtime.key),
                 encoder_output.hidden_size,
                 encoder_output.frame_count,
+                cross_runtime.capacity_frames,
                 slot_index,
                 "ggml_view_2d(dec_cross_k_cache_slot)",
             )?;
@@ -1199,6 +1162,7 @@ impl CohereDecoderGraphRuntime {
                 self.arena.graph_tensor(cross_runtime.value),
                 encoder_output.hidden_size,
                 encoder_output.frame_count,
+                cross_runtime.capacity_frames,
                 slot_index,
                 "ggml_view_2d(dec_cross_v_cache_slot)",
             )?;
@@ -1265,11 +1229,12 @@ impl CohereDecoderGraphRuntime {
                 reason: "decoder token_count must be > 0".to_string(),
             });
         }
-        if total_prefix_tokens > self.metadata.decoder_max_context {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if total_prefix_tokens > logical_max_positions {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: format!(
                     "decoder token_count {} exceeds max context {}",
-                    total_prefix_tokens, self.metadata.decoder_max_context
+                    total_prefix_tokens, logical_max_positions
                 ),
             });
         }
@@ -1605,11 +1570,12 @@ impl CohereDecoderGraphRuntime {
         token_id: u32,
         position: usize,
     ) -> Result<Vec<f32>, CohereDecoderGraphError> {
-        if position >= self.metadata.decoder_max_context {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if position >= logical_max_positions {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: format!(
                     "decoder position {position} exceeds max context {}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
@@ -1639,7 +1605,7 @@ impl CohereDecoderGraphRuntime {
             .as_ref()
             .map(|reuse| {
                 reuse.is_poisoned()
-                    || reuse.max_positions != self.metadata.decoder_max_context
+                    || reuse.max_positions != logical_max_positions
                     || reuse.n_seq != 1
                     || self.reuse_cross_frame_count != active_cross_frame_count
             })
@@ -1723,24 +1689,26 @@ impl CohereDecoderGraphRuntime {
                 ),
             });
         }
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
         if positions
             .iter()
-            .any(|&position| position >= self.metadata.decoder_max_context)
+            .any(|&position| position >= logical_max_positions)
         {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: format!(
                     "batched cohere decoder position exceeds max context {}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
-        if total_tokens_by_sequence.iter().any(|&total_tokens| {
-            total_tokens == 0 || total_tokens > self.metadata.decoder_max_context
-        }) {
+        if total_tokens_by_sequence
+            .iter()
+            .any(|&total_tokens| total_tokens == 0 || total_tokens > logical_max_positions)
+        {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: format!(
                     "batched cohere total token count must be in 1..={}",
-                    self.metadata.decoder_max_context
+                    logical_max_positions
                 ),
             });
         }
@@ -1771,7 +1739,7 @@ impl CohereDecoderGraphRuntime {
             .as_ref()
             .map(|reuse| {
                 reuse.is_poisoned()
-                    || reuse.max_positions != self.metadata.decoder_max_context
+                    || reuse.max_positions != logical_max_positions
                     || reuse.n_seq != self.n_seq
                     || self.reuse_cross_frame_count != active_cross_frame_count
             })
@@ -1847,11 +1815,12 @@ impl CohereDecoderGraphRuntime {
                 reason: "batched cohere prefill token_count must be > 0".to_string(),
             });
         }
-        if token_count > self.metadata.decoder_max_context {
+        let logical_max_positions = self.decoder_state.self_attention.logical_positions;
+        if token_count > logical_max_positions {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: format!(
                     "batched cohere prefill token_count {} exceeds max context {}",
-                    token_count, self.metadata.decoder_max_context
+                    token_count, logical_max_positions
                 ),
             });
         }
@@ -2063,7 +2032,7 @@ impl CohereDecoderGraphRuntime {
 
     fn build_reusable_decode_graph(&mut self) -> Result<(), CohereDecoderGraphError> {
         let hidden = self.metadata.decoder_d_model;
-        let max_context = self.metadata.decoder_max_context;
+        let max_context = self.decoder_state.self_attention.logical_positions;
         let n_seq = self.n_seq;
         let active_cross_frame_count = self
             .cross_layers
@@ -2395,6 +2364,7 @@ fn apply_decoder_layer<'a>(
         ffn_activation: crate::nn::ffn::FeedForwardActivation::Relu,
         self_kv_max_positions: self_kv.max_positions,
         cross_frame_count: cross_runtime.frame_count,
+        cross_kv_max_positions: cross_runtime.capacity_frames,
         cross_hidden_size: cross_runtime.hidden_size,
     };
     let weights = Seq2SeqLayerWeights {
@@ -2538,65 +2508,20 @@ fn validate_encoder_cross_dimensions(
     Ok(())
 }
 
-fn decoder_max_generated_tokens(
-    prompt_tokens: &[u32],
-    metadata: CohereTranscribeExecutionMetadata,
-) -> Result<usize, CohereDecoderGraphError> {
-    if prompt_tokens.is_empty() {
-        return Err(CohereDecoderGraphError::InvalidInput {
-            reason: "decode prompt must contain at least one token".to_string(),
-        });
-    }
-    context_window_budget(metadata.decoder_max_context, prompt_tokens.len()).ok_or_else(|| {
-        CohereDecoderGraphError::InvalidInput {
-            reason: format!(
-                "decode prompt length {} exhausts decoder max context {}",
-                prompt_tokens.len(),
-                metadata.decoder_max_context
-            ),
-        }
-    })
-}
-
 pub(super) fn decoder_max_generated_tokens_with_env(
     prompt_tokens: &[u32],
     metadata: CohereTranscribeExecutionMetadata,
     encoder_frame_count: usize,
 ) -> Result<usize, CohereDecoderGraphError> {
-    let context_limited = decoder_max_generated_tokens(prompt_tokens, metadata)?;
-    let heuristic_budget =
-        decoder_max_generated_tokens_budget_from_encoder_frames(encoder_frame_count);
-    let max_generated_tokens = context_limited.min(heuristic_budget);
-    let Some(raw) = std::env::var_os(COHERE_MAX_GENERATED_TOKENS_OVERRIDE_ENV) else {
-        return Ok(max_generated_tokens);
-    };
-    let Some(raw) = raw
-        .to_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(max_generated_tokens);
-    };
-    let override_value = raw.parse::<usize>().map_err(|_| {
-        CohereDecoderGraphError::InvalidInput {
-            reason: format!(
-                "{COHERE_MAX_GENERATED_TOKENS_OVERRIDE_ENV} must be a positive integer, got '{raw}'"
-            ),
-        }
-    })?;
-    if override_value == 0 {
-        return Err(CohereDecoderGraphError::InvalidInput {
-            reason: format!("{COHERE_MAX_GENERATED_TOKENS_OVERRIDE_ENV} must be > 0 when set"),
-        });
-    }
-    Ok(max_generated_tokens.min(override_value))
-}
-
-fn decoder_max_generated_tokens_budget_from_encoder_frames(encoder_frame_count: usize) -> usize {
-    // Guard against decoder runaway when EOT is never reached: short utterances
-    // should not consume the full decoder context budget.
-    let scaled = encoder_frame_count.saturating_mul(4);
-    scaled.clamp(64, 512)
+    super::decode_budget::cohere_decode_budget(
+        prompt_tokens.len(),
+        encoder_frame_count,
+        metadata.decoder_max_context,
+    )
+    .map(|budget| budget.max_generated_tokens)
+    .map_err(|error| CohereDecoderGraphError::InvalidInput {
+        reason: error.to_string(),
+    })
 }
 
 fn emit_cohere_debug_step_logits_if_enabled(
@@ -3168,12 +3093,13 @@ fn cross_cache_slot_target<'a>(
     cache: crate::ggml_runtime::GgmlCpuTensor<'a>,
     hidden_size: usize,
     frame_count: usize,
+    capacity_frames: usize,
     slot_index: usize,
     step: &'static str,
 ) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, CohereDecoderGraphError> {
-    // No `n_seq == 1` shortcut returning `cache` unchanged: `cache` may now be
-    // allocated at a capacity larger than `frame_count` (see
-    // `cohere_decoder_cross_capacity_frames`), so every write must target a
+    // No `n_seq == 1` shortcut returning `cache` unchanged: the planner's
+    // resident capacity may be larger than the active logical frame count,
+    // so every write must target a
     // contiguous-prefix VIEW of exactly `frame_count` columns -- for `n_seq ==
     // 1` that is `slot_index == 0` with `offset == 0`, identical to the old
     // no-op shortcut whenever `frame_count` happens to equal the tensor's
@@ -3182,7 +3108,7 @@ fn cross_cache_slot_target<'a>(
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
     let slot_stride = hidden_size
-        .checked_mul(frame_count)
+        .checked_mul(capacity_frames)
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
         .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
     let offset = slot_index
@@ -3446,6 +3372,27 @@ mod tests {
         }
     }
 
+    fn decoder_state(
+        metadata: CohereTranscribeExecutionMetadata,
+        logical_cross_positions: usize,
+        resident_cross_positions: usize,
+    ) -> Seq2SeqDecoderState {
+        use crate::models::seq2seq_decoder_state::Seq2SeqStateAxis;
+
+        Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: metadata.decoder_max_context,
+                resident_positions: metadata.decoder_max_context,
+                hard_position_cap: metadata.decoder_max_context,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: logical_cross_positions,
+                resident_positions: resident_cross_positions,
+                hard_position_cap: resident_cross_positions,
+            },
+        }
+    }
+
     fn diarization_tokenizer() -> CohereTranscribeTokenizer {
         let mut values = std::collections::BTreeMap::new();
         values.insert(
@@ -3589,7 +3536,11 @@ mod tests {
             let mut runtime = CohereDecoderGraphRuntime::new(
                 &decoder_weights,
                 metadata,
-                encoder_output.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output.frame_count,
+                    encoder_output.frame_count,
+                ),
                 encoder_output.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3608,14 +3559,10 @@ mod tests {
         });
     }
 
-    /// Structural regression for a REJECTed earlier version of this fix that
-    /// made an over-capacity chunk fail closed: `populate_cross_attention_cache`
-    /// must grow the cross-KV cache to fit (never error, never silently
-    /// truncate) when a chunk's actual frame count exceeds the runtime's
-    /// current `cross_capacity_frames`, and the grown runtime must go on to
-    /// decode successfully at the new size.
+    /// One resident arena serves multiple logical chunk shapes from the same
+    /// envelope. Shape changes are explicit and never trigger arena growth.
     #[test]
-    fn populate_cross_attention_cache_grows_capacity_instead_of_erroring() {
+    fn cross_cache_reuses_stable_resident_capacity_without_growing() {
         with_forced_cpu_backend_for_test(|| {
             let (_runtime_path, preflight) = write_runtime_ready_preflight();
             let metadata =
@@ -3630,25 +3577,7 @@ mod tests {
                 )
                 .expect("decoder weights");
             let small_encoder_output = sample_encoder_output(metadata);
-            let mut runtime = CohereDecoderGraphRuntime::new(
-                &decoder_weights,
-                metadata,
-                small_encoder_output.frame_count,
-                small_encoder_output.hidden_size,
-                GgmlCpuGraphBackend::Cpu,
-                false,
-            )
-            .expect("decoder runtime");
-            let initial_capacity = runtime.cross_capacity_frames;
-            assert!(
-                initial_capacity >= small_encoder_output.frame_count,
-                "construction must allocate at least the chunk-cap capacity"
-            );
-
-            // A chunk comfortably past the runtime's current capacity --
-            // exactly the `segment_mode=off` shape (a single window longer
-            // than the architecture's chunk-cap ceiling).
-            let big_frame_count = initial_capacity + 64;
+            let big_frame_count = small_encoder_output.frame_count + 64;
             let mut rows = Vec::with_capacity(big_frame_count * metadata.decoder_d_model);
             for frame_idx in 0..big_frame_count {
                 for hidden_idx in 0..metadata.decoder_d_model {
@@ -3663,19 +3592,39 @@ mod tests {
                 hidden_size: metadata.decoder_d_model,
                 rows,
             };
+            let initial_state =
+                decoder_state(metadata, small_encoder_output.frame_count, big_frame_count);
+            let mut runtime = CohereDecoderGraphRuntime::new(
+                &decoder_weights,
+                metadata,
+                initial_state,
+                small_encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
+                false,
+            )
+            .expect("decoder runtime");
+            let resident_capacity = runtime.cross_capacity_frames;
+            assert_eq!(resident_capacity, big_frame_count);
+            runtime
+                .populate_cross_attention_cache(&small_encoder_output)
+                .expect("initial logical shape should populate");
+
+            let mismatch = runtime
+                .populate_cross_attention_cache(&big_encoder_output)
+                .expect_err("unplanned logical shape must fail closed");
+            assert!(matches!(
+                mismatch,
+                CohereDecoderGraphError::InvalidInput { .. }
+            ));
+            assert_eq!(runtime.cross_capacity_frames, resident_capacity);
 
             runtime
+                .activate_decoder_state(decoder_state(metadata, big_frame_count, big_frame_count))
+                .expect("activate larger logical shape inside the resident envelope");
+            runtime
                 .populate_cross_attention_cache(&big_encoder_output)
-                .expect("populate must grow to fit, not error");
-            assert!(
-                runtime.cross_capacity_frames >= big_frame_count,
-                "capacity must have grown to at least the requested frame count: capacity={} needed={big_frame_count}",
-                runtime.cross_capacity_frames
-            );
-            assert!(
-                runtime.cross_capacity_frames > initial_capacity,
-                "capacity must actually have grown from its initial value"
-            );
+                .expect("larger planned logical shape should populate without reallocating");
+            assert_eq!(runtime.cross_capacity_frames, resident_capacity);
 
             let tokenizer = super::super::tokenizer::CohereTranscribeTokenizer::from_gguf_metadata(
                 &preflight.metadata,
@@ -3690,20 +3639,17 @@ mod tests {
             .expect("prompt");
             let logits = runtime
                 .compute_step_logits(&prompt.token_ids)
-                .expect("step logits after grow");
+                .expect("step logits after logical shape change");
             assert_eq!(logits.len(), metadata.vocab_size);
             assert!(logits.iter().all(|value| value.is_finite()));
 
-            // A subsequent SMALLER chunk must still work against the (now
-            // larger) grown capacity -- growth never shrinks back.
+            runtime
+                .activate_decoder_state(initial_state)
+                .expect("reactivate the smaller logical shape");
             runtime
                 .populate_cross_attention_cache(&small_encoder_output)
-                .expect("populate a smaller chunk after growth must still succeed");
-            assert_eq!(
-                runtime.cross_capacity_frames,
-                runtime.cross_capacity_frames.max(big_frame_count),
-                "capacity must not shrink back down for a smaller subsequent chunk"
-            );
+                .expect("smaller shape should reuse the same resident arena");
+            assert_eq!(runtime.cross_capacity_frames, resident_capacity);
         });
     }
 
@@ -3726,7 +3672,11 @@ mod tests {
             let mut runtime = CohereDecoderGraphRuntime::new_with_n_seq(
                 &decoder_weights,
                 metadata,
-                encoder_output.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output.frame_count,
+                    encoder_output.frame_count,
+                ),
                 encoder_output.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3799,7 +3749,11 @@ mod tests {
             let mut serial_runtime_0 = CohereDecoderGraphRuntime::new(
                 &decoder_weights,
                 metadata,
-                encoder_output_0.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output_0.frame_count,
+                    encoder_output_0.frame_count,
+                ),
                 encoder_output_0.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3815,7 +3769,11 @@ mod tests {
             let mut serial_runtime_1 = CohereDecoderGraphRuntime::new(
                 &decoder_weights,
                 metadata,
-                encoder_output_1.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output_1.frame_count,
+                    encoder_output_1.frame_count,
+                ),
                 encoder_output_1.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3831,7 +3789,11 @@ mod tests {
             let mut batched_runtime = CohereDecoderGraphRuntime::new_with_n_seq(
                 &decoder_weights,
                 metadata,
-                encoder_output_0.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output_0.frame_count,
+                    encoder_output_0.frame_count,
+                ),
                 encoder_output_0.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3893,7 +3855,11 @@ mod tests {
             let mut runtime = CohereDecoderGraphRuntime::new(
                 &decoder_weights,
                 metadata,
-                encoder_output.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output.frame_count,
+                    encoder_output.frame_count,
+                ),
                 encoder_output.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3951,7 +3917,11 @@ mod tests {
             let mut incremental_runtime = CohereDecoderGraphRuntime::new(
                 &decoder_weights,
                 metadata,
-                encoder_output.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output.frame_count,
+                    encoder_output.frame_count,
+                ),
                 encoder_output.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,
@@ -3972,7 +3942,11 @@ mod tests {
             let mut full_runtime = CohereDecoderGraphRuntime::new(
                 &decoder_weights,
                 metadata,
-                encoder_output.frame_count,
+                decoder_state(
+                    metadata,
+                    encoder_output.frame_count,
+                    encoder_output.frame_count,
+                ),
                 encoder_output.hidden_size,
                 GgmlCpuGraphBackend::Cpu,
                 false,

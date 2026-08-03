@@ -67,6 +67,13 @@ pub struct LongFormOptions {
     pub energy_split_search_seconds: f32,
     pub suppress_silent_slices: bool,
     pub carry_prompt_across_slices: bool,
+    /// Maximum carried prompt history expressed in model tokens.
+    ///
+    /// `max_context_chars` remains the product-facing text-tail limit, while
+    /// this is the allocation and decoder-context contract. Keeping both is
+    /// intentional: character count cannot provide a safe tokenizer-independent
+    /// upper bound for KV capacity.
+    pub max_context_tokens: usize,
     pub max_context_chars: usize,
     pub fallback_to_energy_when_vad_unavailable: bool,
     pub fallback_to_energy_when_vad_empty: bool,
@@ -85,12 +92,13 @@ impl Default for LongFormOptions {
             chunk_seconds: crate::arch::DEFAULT_ENCODER_CHUNK_SECONDS,
             overlap_seconds: 0.5,
             min_chunk_seconds: 1.0,
-            max_chunk_seconds: 120.0,
+            max_chunk_seconds: crate::arch::DEFAULT_ENCODER_MAX_CHUNK_SECONDS,
             padding_seconds: 0.25,
             energy_silence_threshold_db: -38.0,
             energy_split_search_seconds: 5.0,
             suppress_silent_slices: false,
             carry_prompt_across_slices: true,
+            max_context_tokens: 512,
             max_context_chars: 512,
             fallback_to_energy_when_vad_unavailable: true,
             fallback_to_energy_when_vad_empty: true,
@@ -127,6 +135,8 @@ pub enum LongFormOptionsError {
     InvalidEnergySearchSeconds { value: f32 },
     #[error("longform max_context_chars must be > 0")]
     InvalidMaxContextChars,
+    #[error("longform max_context_tokens must be > 0")]
+    InvalidMaxContextTokens,
     #[error("longform vad.threshold must be finite and between 0 and 1, got {value}")]
     InvalidVadThreshold { value: f32 },
 }
@@ -176,6 +186,9 @@ impl LongFormOptions {
                 value: self.energy_split_search_seconds,
             });
         }
+        if self.max_context_tokens == 0 {
+            return Err(LongFormOptionsError::InvalidMaxContextTokens);
+        }
         if self.max_context_chars == 0 {
             return Err(LongFormOptionsError::InvalidMaxContextChars);
         }
@@ -194,7 +207,10 @@ mod tests {
 
     #[test]
     fn default_options_validate() {
-        LongFormOptions::default().validate().unwrap();
+        let options = LongFormOptions::default();
+        options.validate().unwrap();
+        assert_eq!(options.chunk_seconds, 30.0);
+        assert_eq!(options.max_chunk_seconds, 60.0);
     }
 
     #[test]
@@ -208,5 +224,17 @@ mod tests {
             error,
             LongFormOptionsError::OverlapExceedsChunk { .. }
         ));
+    }
+
+    #[test]
+    fn prompt_token_envelope_must_be_positive() {
+        let options = LongFormOptions {
+            max_context_tokens: 0,
+            ..LongFormOptions::default()
+        };
+        assert_eq!(
+            options.validate().unwrap_err(),
+            LongFormOptionsError::InvalidMaxContextTokens
+        );
     }
 }

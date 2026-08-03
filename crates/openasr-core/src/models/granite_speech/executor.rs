@@ -31,16 +31,18 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
 use super::decode_executor::GraniteSpeechResidentAudioDecodeStepExecutor;
-use super::decode_session::GraniteSpeechDecodeSession;
+use super::decode_session::{
+    GraniteSpeechDecodeSession, GraniteSpeechKvCacheCapacity, GraniteSpeechKvCacheCapacityError,
+};
 use super::decoder_graph::GraniteSpeechDecoderConfig;
 use super::encoder_graph::{GraniteSpeechEncoderConfig, GraniteSpeechEncoderRuntime};
-use super::prompt::{GRANITE_SPEECH_AUDIO_TOKEN, build_audio_prompt_embeddings};
+use super::prompt::{build_audio_prompt_embeddings, build_granite_speech_prompt_text};
 use super::qformer::{GraniteSpeechProjectorConfig, GraniteSpeechProjectorRuntime};
 use super::runtime_contract::{
     parse_decoder_metadata, parse_encoder_metadata, parse_projector_metadata,
@@ -49,6 +51,10 @@ use super::runtime_provider::load_tensors_from_oasr_pack;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::admitted_pinned_runtime_actor_pool::{
+    AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
+    PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
@@ -57,10 +63,13 @@ use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlAsrViewExecutor,
 };
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
+use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
-use crate::models::thread_local_runtime_cache::{
-    PackContentKey, current_unload_generation, take_generation_tagged,
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
 };
 
 use crate::arch::{GRANITE_SPEECH_DECODE_POLICY_ID, GRANITE_SPEECH_GGML_ADAPTER_ID};
@@ -104,6 +113,106 @@ struct GraniteSpeechPreparedRuntime {
 }
 
 impl GraniteSpeechPreparedRuntime {
+    fn quoted_system_memory_bytes(
+        preflight: &GgmlAsrRuntimeSourcePreflight,
+    ) -> Result<(u64, u64), GraniteSpeechGgmlExecutorError> {
+        let metadata = &preflight.metadata;
+        let encoder_config = parse_encoder_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let projector_config = parse_projector_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_config = parse_decoder_metadata(metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let tokenizer_retained = GraniteSpeechTokenizer::quoted_retained_system_memory_bytes(
+            metadata,
+        )
+        .map_err(|error| GraniteSpeechGgmlExecutorError::TokenizerFailed {
+            reason: error.to_string(),
+        })?;
+        let embedding_retained = quoted_embedding_table_system_memory_bytes(&decoder_config)?;
+        let (encoder_peak, encoder_retained) =
+            GraniteSpeechEncoderRuntime::quoted_system_memory_bytes(&encoder_config).map_err(
+                |reason| GraniteSpeechGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "prepared-runtime-quote",
+                    reason,
+                },
+            )?;
+        let (projector_peak, projector_retained) =
+            GraniteSpeechProjectorRuntime::quoted_system_memory_bytes(&projector_config).map_err(
+                |reason| GraniteSpeechGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "prepared-runtime-quote",
+                    reason,
+                },
+            )?;
+        let session_retained =
+            GraniteSpeechDecodeSession::quoted_retained_system_memory_bytes(&decoder_config)
+                .map_err(
+                    |reason| GraniteSpeechGgmlExecutorError::RuntimeOwnershipFailed {
+                        stage: "prepared-runtime-quote",
+                        reason,
+                    },
+                )?;
+
+        let retained = checked_sum_u64(
+            [
+                tokenizer_retained,
+                embedding_retained,
+                encoder_retained,
+                projector_retained,
+                session_retained,
+            ],
+            "granite prepared retained quote",
+        )?;
+        let tokenizer_phase = tokenizer_retained;
+        let embedding_phase = tokenizer_retained
+            .checked_add(embedding_retained)
+            .ok_or_else(|| capacity_error("granite embedding construction quote overflowed"))?;
+        let encoder_phase = embedding_phase
+            .checked_add(encoder_peak)
+            .ok_or_else(|| capacity_error("granite encoder construction quote overflowed"))?;
+        let projector_phase = embedding_phase
+            .checked_add(encoder_retained)
+            .and_then(|bytes| bytes.checked_add(projector_peak))
+            .ok_or_else(|| capacity_error("granite projector construction quote overflowed"))?;
+        let session_phase = retained;
+        Ok((
+            tokenizer_phase
+                .max(embedding_phase)
+                .max(encoder_phase)
+                .max(projector_phase)
+                .max(session_phase),
+            retained,
+        ))
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, GraniteSpeechGgmlExecutorError> {
+        checked_sum_u64(
+            [
+                self.tokenizer
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                embedding_table_system_memory_bytes(&self.embed_table)?,
+                self.encoder
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+                self.projector.retained_system_memory_bytes(),
+                self.session
+                    .retained_system_memory_bytes()
+                    .map_err(capacity_error)?,
+            ],
+            "granite prepared measured retained bytes",
+        )
+    }
+
     /// Materialize the resident decode session + embedding table once for a
     /// given `(pack, backend)`. This is the whole ~4.2s cost the resident cache
     /// exists to pay exactly once instead of per request.
@@ -169,55 +278,97 @@ impl GraniteSpeechPreparedRuntime {
     }
 }
 
-/// Resident prepared-runtime cache keyed by (pack content id, backend), the
-/// same design + idle-unload-generation tagging `firered_llm` / `mimo_asr` use.
+fn capacity_error(reason: impl Into<String>) -> GraniteSpeechGgmlExecutorError {
+    GraniteSpeechGgmlExecutorError::RuntimeOwnershipFailed {
+        stage: "prepared-runtime",
+        reason: reason.into(),
+    }
+}
+
+fn checked_sum_u64<const N: usize>(
+    values: [u64; N],
+    label: &'static str,
+) -> Result<u64, GraniteSpeechGgmlExecutorError> {
+    values.into_iter().try_fold(0u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| capacity_error(format!("{label} overflowed")))
+    })
+}
+
+fn quoted_embedding_table_system_memory_bytes(
+    config: &GraniteSpeechDecoderConfig,
+) -> Result<u64, GraniteSpeechGgmlExecutorError> {
+    const NAME: &str = "language_model.model.embed_tokens.weight";
+    let values = config
+        .hidden_size
+        .checked_mul(config.vocab_size)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| capacity_error("granite embedding table quote overflowed"))?;
+    let map_entry = std::mem::size_of::<(String, Vec<f32>)>();
+    let bytes = values
+        .checked_add(NAME.len())
+        .and_then(|total| total.checked_add(map_entry))
+        .ok_or_else(|| capacity_error("granite embedding container quote overflowed"))?;
+    u64::try_from(bytes).map_err(|_| capacity_error("granite embedding quote exceeds u64"))
+}
+
+fn embedding_table_system_memory_bytes(
+    tensors: &HashMap<String, Vec<f32>>,
+) -> Result<u64, GraniteSpeechGgmlExecutorError> {
+    let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+    let map_entry_bytes = tensors
+        .len()
+        .checked_mul(std::mem::size_of::<(String, Vec<f32>)>())
+        .ok_or_else(|| capacity_error("granite embedding map entry count overflowed"))?;
+    bytes
+        .add_usize(map_entry_bytes, "granite embedding map entries")
+        .map_err(capacity_error)?;
+    for (name, values) in tensors {
+        bytes
+            .add_string(name, "granite embedding tensor name")
+            .map_err(capacity_error)?;
+        bytes
+            .add_vec(values, "granite embedding tensor values")
+            .map_err(capacity_error)?;
+    }
+    Ok(bytes.finish())
+}
+
+/// Resident prepared-runtime actor pool keyed by content id, execution lane,
+/// and resident KV capacity.
 /// The pack half is a [`PackContentKey`] from the request's already-open
 /// source, so an in-place `.oasr` replacement at the same path resolves a
 /// different id and the next lookup rebuilds instead of reusing a session whose
 /// device-bound weights came from the old bytes. Entries carry the idle-unload
-/// generation they were built under: `take_generation_tagged` discards any
-/// runtime built before the last idle unload (the reaper cannot reach this
-/// worker thread's TLS from its own thread), so the resident 2B decoder stays
-/// evictable under memory pressure through the shared central unload clock -- no
-/// bespoke policy. A plain `HashMap` (not the bounded LRU): the key does not
-/// explode per audio chunk (one entry is built and reused across a whole
-/// longform run for a given pack/backend), so there is no unbounded-growth
-/// hazard to bound.
-type GraniteSpeechPreparedRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
-
-thread_local! {
-    static GRANITE_SPEECH_PREPARED_BY_KEY: RefCell<
-        HashMap<GraniteSpeechPreparedRuntimeCacheKey, (u64, GraniteSpeechPreparedRuntime)>,
-    > = RefCell::new(HashMap::new());
+/// The service root can clear or target-evict these actors directly; each actor
+/// owns its memory lease and destroys the runtime on its owner thread.
+type GraniteSpeechPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+struct GraniteSpeechPreparedRuntimeActorState {
+    runtime: GraniteSpeechPreparedRuntime,
 }
 
-fn take_cached_prepared_runtime(
-    key: &GraniteSpeechPreparedRuntimeCacheKey,
-    unload_generation: u64,
-) -> Option<GraniteSpeechPreparedRuntime> {
-    GRANITE_SPEECH_PREPARED_BY_KEY
-        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
+impl std::fmt::Debug for GraniteSpeechPreparedRuntimeActorState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GraniteSpeechPreparedRuntimeActorState")
+            .finish_non_exhaustive()
+    }
 }
-
-fn store_cached_prepared_runtime(
-    key: GraniteSpeechPreparedRuntimeCacheKey,
-    unload_generation: u64,
-    prepared: GraniteSpeechPreparedRuntime,
-) {
-    GRANITE_SPEECH_PREPARED_BY_KEY.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(key, (unload_generation, prepared));
-    });
-}
+type GraniteSpeechPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    GraniteSpeechPreparedRuntimeCacheKey,
+    GraniteSpeechPreparedRuntimeActorState,
+>;
+type GraniteSpeechPreparedRuntimeActor = PinnedRuntimeActorCheckout<
+    GraniteSpeechPreparedRuntimeCacheKey,
+    GraniteSpeechPreparedRuntimeActorState,
+>;
 
 const GRANITE_SPEECH_EXECUTOR_ID: &str = "granite-speech-ggml-executor-v1";
 const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
-const GRANITE_SPEECH_DEFAULT_QUESTION: &str =
-    "can you transcribe the speech into a written format?";
 /// Fail-closed backstop against a non-terminating decode -- greedy decode stops
 /// at `<|end_of_text|>` well before this in practice. Also a first-class input
-/// to `capacity::derive_max_input_seconds` (must stay in lockstep with that
+/// to `capacity::derive_max_input_whole_seconds` (must stay in lockstep with that
 /// derivation's published limit).
 pub(crate) const GRANITE_SPEECH_MAX_GENERATED_TOKENS: usize = 256;
 
@@ -253,22 +404,29 @@ enum GraniteSpeechGgmlExecutorError {
     TokenizerFailed { reason: String },
     #[error("granite-speech ggml executor prompt assembly failed: {reason}")]
     PromptFailed { reason: String },
+    #[error("granite-speech decoder-state capacity contract failed: {source}")]
+    DecoderStateCapacity {
+        #[source]
+        source: GraniteSpeechKvCacheCapacityError,
+    },
     #[error("granite-speech ggml executor decode failed: {reason}")]
     DecodeFailed { reason: String },
+    #[error("granite-speech {stage} runtime ownership failed: {reason}")]
+    RuntimeOwnershipFailed { stage: &'static str, reason: String },
 }
 
 /// Fail-closed single-decode duration gate. Pure so unit tests can exercise the
 /// typed `AudioTooLong` path without materializing a multi-GB pack. Limit and
 /// rate come from `super::capacity` (derived, not guessed).
-fn ensure_audio_within_capacity(seconds: f32) -> Result<(), GraniteSpeechGgmlExecutorError> {
+fn ensure_audio_within_capacity(sample_count: usize) -> Result<(), GraniteSpeechGgmlExecutorError> {
     use super::capacity::{
-        GRANITE_SPEECH_DECODER_MAX_POSITIONS, GRANITE_SPEECH_MAX_INPUT_SECONDS,
-        granite_speech_audio_tokens_per_second,
+        GRANITE_SPEECH_DECODER_MAX_POSITIONS, GRANITE_SPEECH_MAX_INPUT_SAMPLES,
+        GRANITE_SPEECH_MAX_INPUT_SECONDS, granite_speech_audio_tokens_per_second,
     };
-    if seconds > GRANITE_SPEECH_MAX_INPUT_SECONDS {
+    if sample_count > GRANITE_SPEECH_MAX_INPUT_SAMPLES {
         return Err(GraniteSpeechGgmlExecutorError::AudioTooLong {
-            seconds,
-            limit: GRANITE_SPEECH_MAX_INPUT_SECONDS,
+            seconds: sample_count as f32 / super::frontend::SAMPLE_RATE_HZ,
+            limit: GRANITE_SPEECH_MAX_INPUT_SECONDS as f32,
             ctx: GRANITE_SPEECH_DECODER_MAX_POSITIONS,
             rate: granite_speech_audio_tokens_per_second(),
         });
@@ -297,10 +455,95 @@ fn map_registry_error(
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct GraniteSpeechGgmlExecutor;
+const GRANITE_SPEECH_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
+const GRANITE_SPEECH_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
+
+#[derive(Debug, Clone)]
+pub(crate) struct GraniteSpeechGgmlExecutor {
+    prepared_runtimes: Arc<GraniteSpeechPreparedRuntimePool>,
+}
+
+impl Default for GraniteSpeechGgmlExecutor {
+    fn default() -> Self {
+        Self {
+            prepared_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-granite-speech-runtime-owner",
+                AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                    GRANITE_SPEECH_RUNTIME_MAX_IDLE_ENTRIES,
+                    crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+                    GRANITE_SPEECH_RUNTIME_MAX_INSTANCES_PER_KEY,
+                ),
+            )),
+        }
+    }
+}
 
 impl GraniteSpeechGgmlExecutor {
+    fn map_actor_error(error: PinnedRuntimeActorError) -> GraniteSpeechGgmlExecutorError {
+        GraniteSpeechGgmlExecutorError::RuntimeOwnershipFailed {
+            stage: "prepared-runtime",
+            reason: error.to_string(),
+        }
+    }
+
+    fn checkout_prepared_runtime(
+        &self,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+        kv_capacity: GraniteSpeechKvCacheCapacity,
+    ) -> Result<GraniteSpeechPreparedRuntimeActor, GraniteSpeechGgmlExecutorError> {
+        let key = (
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
+            current_execution_lane_key(backend),
+            kv_capacity.resident_positions(),
+        );
+        let quote_preflight = preflight.clone();
+        let build_preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
+        self.prepared_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let (peak_bytes, retained_bytes) =
+                    GraniteSpeechPreparedRuntime::quoted_system_memory_bytes(&quote_preflight)?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!(
+                        "granite-speech-runtime:{content_id}:positions={}",
+                        kv_capacity.resident_positions()
+                    ),
+                    peak_bytes,
+                    retained_bytes,
+                )
+                .map_err(|error| capacity_error(error.to_string()))?;
+                Ok((retained_bytes, quote))
+            },
+            move |quote| match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let prepared = GraniteSpeechPreparedRuntime::build(&build_preflight, backend)?;
+                let retained = prepared.retained_system_memory_bytes()?;
+                Ok(SystemMemoryAllocationOutcome::new(
+                    GraniteSpeechPreparedRuntimeActorState { runtime: prepared },
+                    retained,
+                    retained,
+                ))
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(capacity_error(error.to_string()))
+                }
+            },
+            Self::map_actor_error,
+        )
+    }
+
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.prepared_runtimes
+            .evict_where(|key| key.0.pack_content_id == pack_content_id);
+    }
+
+    fn clear_runtime_actors(&self) {
+        self.prepared_runtimes.clear();
+    }
+
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
@@ -325,9 +568,7 @@ impl GraniteSpeechGgmlExecutor {
         // (not a magic number). Over-limit fails closed with a typed error --
         // never silent truncation. Shared longform slicing keeps ordinary
         // multi-minute work inside 30s windows well under this bound.
-        let audio_duration_seconds =
-            samples.len() as f32 / request.prepared_audio.sample_rate_hz.max(1) as f32;
-        ensure_audio_within_capacity(audio_duration_seconds)?;
+        ensure_audio_within_capacity(samples.len())?;
         let frontend = super::frontend::GraniteSpeechMelFrontend::new();
         let (features, frames) = frontend.extract(samples.as_ref()).map_err(|error| {
             GraniteSpeechGgmlExecutorError::FrontendFailed {
@@ -340,121 +581,107 @@ impl GraniteSpeechGgmlExecutor {
         // <kw2>, ..." -- not a decode-time logit bias (see the family's
         // end-to-end KWB test). `phrase_bias`'s configured phrases become
         // the `Keywords:` suffix when present.
-        let question = match request.request_options.phrase_bias.as_ref() {
-            Some(phrase_bias) if !phrase_bias.is_empty() => {
-                let keywords = phrase_bias
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.phrase())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("transcribe the speech to text. Keywords: {keywords}")
-            }
-            _ => GRANITE_SPEECH_DEFAULT_QUESTION.to_string(),
-        };
-        let prompt_text = format!("USER: {GRANITE_SPEECH_AUDIO_TOKEN}{question}\n ASSISTANT:");
-        // Cross-request resident runtime: the keep-quantized decode session
-        // (runner + mmap'd loaded weight context + zero-copy decoder weights)
-        // and the decoder embedding table are per-request-invariant for a given
-        // (pack, backend), so take a resident one from this thread's cache (or
-        // build it once on a cold miss) instead of paying the ~4.2s
-        // loaded-context rebuild every transcription.
-        let cache_key: GraniteSpeechPreparedRuntimeCacheKey = (
-            PackContentKey::for_runtime_source(&preflight.runtime_source),
-            backend,
-        );
-        // Sampled before the take and reused for the store-back below: if the
-        // idle-unload reaper bumps the generation while this decode is in
-        // flight, the runtime goes back tagged with the pre-unload generation
-        // and the *next* take discards it, so an unload is never lost to an
-        // overlapping decode (mirrors firered_llm / mimo_asr).
-        let unload_generation = current_unload_generation();
-        let mut prepared = match take_cached_prepared_runtime(&cache_key, unload_generation) {
-            Some(prepared) => prepared,
-            None => GraniteSpeechPreparedRuntime::build(&preflight, backend)?,
-        };
-        let encoder_output = prepared
-            .encoder
-            .encode(&prepared.encoder_config, &features, frames, false)
-            .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
-        let projector_output = prepared
-            .projector
-            .project(
-                &prepared.projector_config,
-                &encoder_output.encoder_out,
-                encoder_output.frames,
-            )
-            .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
-                reason: error.to_string(),
-            })?;
-        let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
-            &prepared.decoder_config,
-            &prepared.embed_table,
-            &prepared.tokenizer,
-            &prompt_text,
-            &projector_output.projected,
-            projector_output.tokens,
-        )
-        .map_err(|error| GraniteSpeechGgmlExecutorError::PromptFailed {
-            reason: error.to_string(),
-        })?;
-        // Greedy decode rides the one shared driver via the decode-policy
-        // registry (AGENTS.md single-driver invariant): the registered
-        // `GRANITE_SPEECH_DECODE_POLICY_ID` descriptor supplies the
-        // stop-token / suppression / postprocess policy, this executor only
-        // hands over the config inputs, the step executor, and the token
-        // decoder. Keyword biasing is done in the prompt above, so the token
-        // source contributes nothing and `phrase_bias` stays `None`.
-        let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
-            initial_prompt_tokens: prompt_token_ids,
-            eot_token_id: GRANITE_SPEECH_EOT_TOKEN_ID,
-            vocab_size: prepared.decoder_config.vocab_size,
-            max_generated_tokens: GRANITE_SPEECH_MAX_GENERATED_TOKENS,
-        };
-        let decode_text_token_ids =
-            |token_ids: &[u32]| -> Result<String, Seq2SeqGreedyDecodeError> {
-                prepared
-                    .tokenizer
-                    .decode_text_token_ids(token_ids)
-                    .map_err(|error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+        let prompt_text =
+            build_granite_speech_prompt_text(request.request_options.phrase_bias.as_ref());
+        let kv_capacity = GraniteSpeechKvCacheCapacity::from_decoder_state(&request.decoder_state)
+            .and_then(|capacity| {
+                capacity.validate_hard_cap(super::capacity::GRANITE_SPEECH_DECODER_MAX_POSITIONS)
+            })
+            .map_err(|source| GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source })?;
+        let actor = self.checkout_prepared_runtime(&preflight, backend, kv_capacity)?;
+        let control = Arc::clone(&request.execution_context.control);
+        let result = actor
+            .call_mut(move |state| {
+                let prepared = &mut state.runtime;
+                let decode_result = (|| {
+                    let encoder_output = prepared
+                        .encoder
+                        .encode(&prepared.encoder_config, &features, frames, false)
+                        .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
+                            reason: error.to_string(),
+                        })?;
+                    let projector_output = prepared
+                        .projector
+                        .project(
+                            &prepared.projector_config,
+                            &encoder_output.encoder_out,
+                            encoder_output.frames,
+                        )
+                        .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
+                            reason: error.to_string(),
+                        })?;
+                    let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
+                        &prepared.decoder_config,
+                        &prepared.embed_table,
+                        &prepared.tokenizer,
+                        &prompt_text,
+                        &projector_output.projected,
+                        projector_output.tokens,
+                    )
+                    .map_err(|error| GraniteSpeechGgmlExecutorError::PromptFailed {
                         reason: error.to_string(),
+                    })?;
+                    let measured_positions =
+                        crate::capacity::topology::causal_prefix_positions_with_context_cap(
+                            super::capacity::GRANITE_SPEECH_SELF_KV_STATE_ID,
+                            prompt_token_ids.len(),
+                            GRANITE_SPEECH_MAX_GENERATED_TOKENS,
+                            super::capacity::GRANITE_SPEECH_DECODER_MAX_POSITIONS,
+                        )
+                        .map_err(|_| {
+                            GraniteSpeechGgmlExecutorError::DecoderStateCapacity {
+                                source: GraniteSpeechKvCacheCapacityError::LogicalPositionOverflow,
+                            }
+                        })?;
+                    let kv_capacity =
+                        kv_capacity
+                            .validate_measured_logical_positions(measured_positions)
+                            .map_err(|source| {
+                                GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source }
+                            })?;
+                    let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
+                        initial_prompt_tokens: prompt_token_ids,
+                        eot_token_id: GRANITE_SPEECH_EOT_TOKEN_ID,
+                        vocab_size: prepared.decoder_config.vocab_size,
+                        max_generated_tokens: GRANITE_SPEECH_MAX_GENERATED_TOKENS,
+                    };
+                    let decode_text_token_ids =
+                        |token_ids: &[u32]| -> Result<String, Seq2SeqGreedyDecodeError> {
+                            prepared
+                                .tokenizer
+                                .decode_text_token_ids(token_ids)
+                                .map_err(|error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                                    reason: error.to_string(),
+                                })
+                        };
+                    let mut step_executor = GraniteSpeechResidentAudioDecodeStepExecutor::new(
+                        &mut prepared.session,
+                        &prepared.embed_table,
+                        prompt_embeddings,
+                        kv_capacity,
+                    );
+                    run_builtin_seq2seq_decode_policy(
+                        GRANITE_SPEECH_DECODE_POLICY_ID,
+                        &decode_config,
+                        &NoPhraseBiasTokenSource,
+                        None,
+                        &mut step_executor,
+                        &decode_text_token_ids,
+                        |error: Seq2SeqGreedyDecodeError| error,
+                        |error: Seq2SeqGreedyDecodeError| error,
+                        map_registry_error,
+                        &control,
+                    )
+                    .map_err(|error| {
+                        GraniteSpeechGgmlExecutorError::DecodeFailed {
+                            reason: error.to_string(),
+                        }
                     })
-            };
-        // Disjoint field borrows of the resident runtime: `&mut session` for the
-        // decode graph and `&embed_table` for the per-step token embeds are
-        // distinct fields, so both stay live for the whole decode.
-        let mut step_executor = GraniteSpeechResidentAudioDecodeStepExecutor::new(
-            &mut prepared.session,
-            &prepared.embed_table,
-            prompt_embeddings,
-        );
-        let decode_result = run_builtin_seq2seq_decode_policy(
-            GRANITE_SPEECH_DECODE_POLICY_ID,
-            &decode_config,
-            &NoPhraseBiasTokenSource,
-            None,
-            &mut step_executor,
-            &decode_text_token_ids,
-            |error: Seq2SeqGreedyDecodeError| error,
-            |error: Seq2SeqGreedyDecodeError| error,
-            map_registry_error,
-            &request.execution_context.control,
-        );
-        // Reset request-visible decode state before the session re-enters the
-        // cache. CPU host K/V is released; GPU resident K/V and its reusable
-        // graph remain allocated but become unreachable until the next prefill
-        // overwrites the visible prefix (the fixed mask hides every stale tail
-        // row). This applies regardless of decode outcome. `step_executor`'s
-        // borrows of `prepared` end here under NLL, so `prepared` is free to
-        // move into the cache.
-        prepared.session.release_session_scoped_buffers();
-        store_cached_prepared_runtime(cache_key, unload_generation, prepared);
-        let result =
-            decode_result.map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
-                reason: error.to_string(),
-            })?;
+                })();
+                prepared.session.release_session_scoped_buffers();
+                decode_result
+            })
+            .map_err(Self::map_actor_error)??;
         let audio_duration_seconds = request.prepared_audio.samples_f32.len() as f32
             / request.prepared_audio.sample_rate_hz.max(1) as f32;
         Ok(GgmlAsrExecutionResult {
@@ -511,12 +738,28 @@ impl GgmlAsrViewExecutor for GraniteSpeechGgmlExecutor {
         true
     }
 
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+                super::capacity::plan_granite_speech_decoder_state,
+            ),
+        )
+    }
+
     fn execute_view(
         &self,
         request: &GgmlAsrExecutionViewRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
             .map_err(|error| granite_speech_execute_error_to_ggml(self, error, request))
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -567,7 +810,7 @@ impl crate::models::ggml_asr_executor::GgmlAsrStreamingExecutor for GraniteSpeec
         request: &crate::models::ggml_asr_executor::GgmlAsrStreamingSessionRequest,
     ) -> Result<Box<dyn crate::NativeAsrSession>, GgmlAsrExecutionError> {
         crate::models::incremental_streaming_driver::build_seq2seq_streaming_session(
-            *self,
+            self.clone(),
             GRANITE_SPEECH_STREAMING_EXECUTOR_ID,
             GRANITE_SPEECH_GGML_ADAPTER_ID,
             "granite-speech",
@@ -575,6 +818,10 @@ impl crate::models::ggml_asr_executor::GgmlAsrStreamingExecutor for GraniteSpeec
             crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ,
             GraniteSpeechGgmlExecutor::execute_streaming,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.clear_runtime_actors();
     }
 }
 
@@ -737,6 +984,9 @@ mod tests {
             );
         }
         let request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             runtime_source_path: pack_path,
             runtime_source_preflight: None,
             selected_family: granite_speech_runtime_descriptor_v1(),
@@ -752,7 +1002,7 @@ mod tests {
             request.backend_preference.request_backend_override(),
         );
 
-        let executor = GraniteSpeechGgmlExecutor;
+        let executor = GraniteSpeechGgmlExecutor::default();
         let result = executor
             .execute_view(&request)
             .expect("granite-speech transcribe");
@@ -849,9 +1099,11 @@ mod tests {
             .with_model_pack_path(Some(pack_path))
             .with_execution_target(Some(ExecutionTarget::Cpu))
             .with_longform(Some(longform));
-        let transcription = NativeBackend
-            .transcribe(request)
-            .expect("granite-speech longform native transcribe");
+        let transcription = NativeBackend::new(
+            crate::models::native_execution_services::test_native_execution_services(),
+        )
+        .transcribe(request)
+        .expect("granite-speech longform native transcribe");
 
         let longform_meta = transcription
             .longform
@@ -946,14 +1198,16 @@ mod tests {
         };
 
         let transcribe = |target: ExecutionTarget| {
-            NativeBackend
-                .transcribe(
-                    TranscriptionRequest::new(audio.clone(), NATIVE_RUNTIME_MODEL_ID_AUTO)
-                        .with_model_pack_path(Some(pack_path.clone()))
-                        .with_execution_target(Some(target))
-                        .with_longform(Some(longform.clone())),
-                )
-                .unwrap_or_else(|error| panic!("{target:?} longform failed: {error}"))
+            NativeBackend::new(
+                crate::models::native_execution_services::test_native_execution_services(),
+            )
+            .transcribe(
+                TranscriptionRequest::new(audio.clone(), NATIVE_RUNTIME_MODEL_ID_AUTO)
+                    .with_model_pack_path(Some(pack_path.clone()))
+                    .with_execution_target(Some(target))
+                    .with_longform(Some(longform.clone())),
+            )
+            .unwrap_or_else(|error| panic!("{target:?} longform failed: {error}"))
         };
 
         let cpu = transcribe(ExecutionTarget::Cpu);
@@ -1041,20 +1295,24 @@ mod tests {
 
     #[test]
     fn audio_within_derived_capacity_is_accepted() {
-        use super::super::capacity::GRANITE_SPEECH_MAX_INPUT_SECONDS;
-        ensure_audio_within_capacity(0.0).expect("empty buffer");
-        ensure_audio_within_capacity(30.0).expect("shared-window slice");
-        ensure_audio_within_capacity(GRANITE_SPEECH_MAX_INPUT_SECONDS)
+        use super::super::capacity::{
+            GRANITE_SPEECH_MAX_INPUT_SAMPLES, GRANITE_SPEECH_SAMPLE_RATE_HZ,
+        };
+        ensure_audio_within_capacity(0).expect("empty buffer");
+        ensure_audio_within_capacity(30 * GRANITE_SPEECH_SAMPLE_RATE_HZ as usize)
+            .expect("shared-window slice");
+        ensure_audio_within_capacity(GRANITE_SPEECH_MAX_INPUT_SAMPLES)
             .expect("exactly at the derived limit must pass (strict >)");
     }
 
     #[test]
     fn audio_past_derived_capacity_fails_closed_with_typed_error() {
         use super::super::capacity::{
-            GRANITE_SPEECH_DECODER_MAX_POSITIONS, GRANITE_SPEECH_MAX_INPUT_SECONDS,
+            GRANITE_SPEECH_DECODER_MAX_POSITIONS, GRANITE_SPEECH_MAX_INPUT_SAMPLES,
+            GRANITE_SPEECH_MAX_INPUT_SECONDS, GRANITE_SPEECH_SAMPLE_RATE_HZ,
             granite_speech_audio_tokens_per_second,
         };
-        let over = GRANITE_SPEECH_MAX_INPUT_SECONDS + 0.1;
+        let over = GRANITE_SPEECH_MAX_INPUT_SAMPLES + 1;
         let err = ensure_audio_within_capacity(over).expect_err("over-limit must fail closed");
         let message = err.to_string();
         match err {
@@ -1064,8 +1322,8 @@ mod tests {
                 ctx,
                 rate,
             } => {
-                assert!((seconds - over).abs() < 1e-6);
-                assert_eq!(limit, GRANITE_SPEECH_MAX_INPUT_SECONDS);
+                assert!(seconds > GRANITE_SPEECH_MAX_INPUT_SECONDS as f32);
+                assert_eq!(limit, GRANITE_SPEECH_MAX_INPUT_SECONDS as f32);
                 assert_eq!(ctx, GRANITE_SPEECH_DECODER_MAX_POSITIONS);
                 assert_eq!(rate, granite_speech_audio_tokens_per_second());
             }
@@ -1076,12 +1334,13 @@ mod tests {
             "error text must name the derived cap: {message}"
         );
         assert!(
-            message.contains("382"),
+            message.contains("381"),
             "error text must surface the numeric limit: {message}"
         );
         // A multi-minute buffer that would previously have run OOD against the
         // 4096-token context must also hit the same typed path.
-        let long = ensure_audio_within_capacity(600.0).expect_err("10-minute buffer");
+        let long = ensure_audio_within_capacity(600 * GRANITE_SPEECH_SAMPLE_RATE_HZ as usize)
+            .expect_err("10-minute buffer");
         assert!(matches!(
             long,
             GraniteSpeechGgmlExecutorError::AudioTooLong { .. }

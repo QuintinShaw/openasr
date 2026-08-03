@@ -87,6 +87,16 @@ impl PyannetModel {
         })
     }
 
+    pub(crate) fn quoted_persistent_host_commitment_bytes(
+        tensor_index: &crate::GgufTensorIndex,
+    ) -> Result<u64, WeightsError> {
+        Weights::quoted_persistent_host_commitment_bytes(tensor_index)
+    }
+
+    pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {
+        self.w.persistent_host_commitment_bytes()
+    }
+
     /// Run the network on `samples` (16 kHz mono) and return the per-frame
     /// log-probabilities (`[frames, 7]` row-major) plus the frame count.
     pub(crate) fn forward(&self, samples: &[f32]) -> Result<(Vec<f32>, usize), WeightsError> {

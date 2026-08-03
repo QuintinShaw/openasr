@@ -8,6 +8,7 @@
 mod diarizen;
 mod ops;
 mod pack;
+mod policy_runtime;
 mod pyannet;
 
 #[cfg(test)]
@@ -17,15 +18,14 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
+pub(crate) use diarizen::DiariZenRuntime;
 pub use diarizen::{
     DIARIZEN_GGML_ARCHITECTURE_ID, DiariZenSegmenter, DiariZenSegmenterError, DiariZenWindowOutput,
-    diarizen_pack_installed, load_diarizen_segmenter, shared_diarizen_segmenter,
+    diarizen_pack_installed,
 };
-pub use pack::{DIARIZEN_PACK_ID, SEGMENTER_PACK_ID, segmenter_pack_installed, shared_segmenter};
-pub(crate) use pack::{
-    PreparedSelectedSegmenter, SegmenterExecutionKey, SegmenterProvider, SegmenterRuntimeInput,
-    SelectedSegmenter, prepare_segmenter, unload_idle_segmenter_caches,
-};
+pub use pack::{DIARIZEN_PACK_ID, SEGMENTER_PACK_ID, segmenter_pack_installed};
+pub(crate) use pack::{PreparedSelectedSegmenter, SegmenterProvider, prepare_segmenter};
+pub use policy_runtime::{PolicyResolvedPyannoteSegmenterRuntime, PolicyResolvedSegmenterRuntime};
 
 use pyannet::{NUM_CLASSES, PyannetModel};
 use thiserror::Error;
@@ -282,7 +282,7 @@ impl LocalActivity {
 pub(crate) trait LocalActivitySegmenter: Send + Sync {
     fn segment_local_activity(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
     ) -> Result<LocalActivity, SegmentError>;
@@ -333,6 +333,16 @@ impl PyannoteSegmenter {
         })
     }
 
+    pub(crate) fn quoted_persistent_host_commitment_bytes(
+        tensor_index: &crate::GgufTensorIndex,
+    ) -> Result<u64, WeightsError> {
+        PyannetModel::quoted_persistent_host_commitment_bytes(tensor_index)
+    }
+
+    pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {
+        self.model.persistent_host_commitment_bytes()
+    }
+
     /// Compatibility helper for diagnostics. Production external diarization
     /// consumes [`LocalActivity`] and performs local-to-global reconstruction;
     /// this helper only renders each window-local slot independently.
@@ -360,7 +370,7 @@ impl PyannoteSegmenter {
 impl LocalActivitySegmenter for PyannoteSegmenter {
     fn segment_local_activity(
         &self,
-        samples: &[f32],
+        samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
     ) -> Result<LocalActivity, SegmentError> {
@@ -411,33 +421,13 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
     }
 }
 
-impl LocalActivitySegmenter for diarizen::DiariZenSegmenter {
-    fn segment_local_activity(
-        &self,
-        samples: &[f32],
-        sample_rate_hz: u32,
-        canceled: &dyn Fn() -> bool,
-    ) -> Result<LocalActivity, SegmentError> {
-        segment_diarizen_local_activity(samples, sample_rate_hz, canceled, |window| {
-            self.infer_window(window, sample_rate_hz)
-                .map_err(diarizen_error_to_segment)
-        })
-    }
-}
-
-fn diarizen_error_to_segment(error: diarizen::DiariZenSegmenterError) -> SegmentError {
-    if error.is_canceled() {
-        SegmentError::Canceled
-    } else {
-        SegmentError::Inference(error.to_string())
-    }
-}
-
-fn segment_diarizen_local_activity(
-    samples: &[f32],
+pub(super) fn segment_diarizen_local_activity(
+    samples: crate::PcmSlice,
     sample_rate_hz: u32,
     canceled: &dyn Fn() -> bool,
-    mut infer_window: impl FnMut(&[f32]) -> Result<diarizen::DiariZenWindowOutput, SegmentError>,
+    mut infer_window: impl FnMut(
+        crate::PcmSlice,
+    ) -> Result<diarizen::DiariZenWindowOutput, SegmentError>,
 ) -> Result<LocalActivity, SegmentError> {
     use diarizen::{
         DIARIZEN_FRAME_DURATION_SAMPLES, DIARIZEN_FRAME_STEP_SAMPLES, DIARIZEN_LOCAL_SPEAKERS,
@@ -474,11 +464,11 @@ fn segment_diarizen_local_activity(
         }
         let end = (start + DIARIZEN_WINDOW_SAMPLES).min(samples.len());
         let output = if end - start == DIARIZEN_WINDOW_SAMPLES {
-            infer_window(&samples[start..end])?
+            infer_window(samples.slice(start..end))?
         } else {
             let mut padded = vec![0.0f32; DIARIZEN_WINDOW_SAMPLES];
             padded[..end - start].copy_from_slice(&samples[start..end]);
-            infer_window(&padded)?
+            infer_window(padded.into())?
         };
         if canceled() {
             return Err(SegmentError::Canceled);

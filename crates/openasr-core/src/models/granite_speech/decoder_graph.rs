@@ -739,6 +739,12 @@ pub(crate) struct GraniteDecoderWeightArena {
 }
 
 impl GraniteDecoderWeightArena {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "granite decoder arena layer handles")?;
+        Ok(bytes.finish())
+    }
+
     /// Allocate every weight tensor in a fresh static arena and upload the
     /// provider's f32 weights once. All allocation happens before the first
     /// upload (the arena finalizes its backend buffer on first write and
@@ -894,6 +900,20 @@ fn loaded_tensor(
 }
 
 impl GraniteDecoderLoadedWeights {
+    pub(crate) fn quoted_retained_system_memory_bytes(num_layers: usize) -> Result<u64, String> {
+        let bytes = num_layers
+            .checked_mul(std::mem::size_of::<GraniteLayerLoadedHandles>())
+            .ok_or_else(|| "granite loaded decoder handle quote overflowed".to_string())?;
+        u64::try_from(bytes)
+            .map_err(|_| "granite loaded decoder handle quote exceeds u64".to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "granite loaded decoder layer handles")?;
+        Ok(bytes.finish())
+    }
+
     /// Bind every decoder weight by its on-disk name (the converter stores the
     /// `language_model.*` tensors under their verbatim HF names, so these match
     /// the f32-arena path's `WeightBuilder` names exactly).
@@ -958,6 +978,13 @@ pub(crate) enum GraniteDecoderWeights {
 }
 
 impl GraniteDecoderWeights {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        match self {
+            Self::Arena(arena) => arena.retained_system_memory_bytes(),
+            Self::Loaded(loaded) => loaded.retained_system_memory_bytes(),
+        }
+    }
+
     pub(crate) fn layer_weights<'a>(&self, index: usize) -> DecoderLayerWeights<'a> {
         match self {
             Self::Arena(arena) => arena.layer_weights(index),

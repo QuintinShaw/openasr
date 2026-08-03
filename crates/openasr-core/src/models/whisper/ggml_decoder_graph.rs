@@ -56,7 +56,10 @@ pub(crate) struct WhisperDecoderGraphMetadata {
     pub decoder_hidden_size: usize,
     pub decoder_attention_heads: usize,
     pub vocab_size: usize,
-    pub max_target_positions: usize,
+    /// Semantic decoder context and learned positional-embedding axis. This is
+    /// deliberately not the physical self-KV row count: the greedy schedule
+    /// needs one fewer KV row because its final sampled token is not fed back.
+    pub semantic_context_positions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,11 +302,11 @@ impl<'a> WhisperDecoderGraphBuilder<'a> {
                 ),
             });
         }
-        if self.input_shape.token_count > self.metadata.max_target_positions {
+        if self.input_shape.token_count > self.metadata.semantic_context_positions {
             return Err(WhisperDecoderGraphPlanError::InvalidInputShape {
                 reason: format!(
                     "token_count {} exceeds max_target_positions {}",
-                    self.input_shape.token_count, self.metadata.max_target_positions
+                    self.input_shape.token_count, self.metadata.semantic_context_positions
                 ),
             });
         }
@@ -333,7 +336,7 @@ impl<'a> WhisperDecoderGraphBuilder<'a> {
             "decoder",
             "embed_positions.weight",
             self.binding.position_embedding_weight.as_ref(),
-            self.metadata.max_target_positions,
+            self.metadata.semantic_context_positions,
             self.input_shape.hidden_size,
         )?;
         let final_norm = self.parse_norm(
@@ -938,7 +941,7 @@ type LocalVectorPayload = Arc<[f32]>;
 
 const PERSISTENT_CROSS_ATTENTION_LAYER_STRIDE_ALIGN: usize = 256;
 
-fn persistent_cross_attention_layer_stride_frames(encoder_frames: usize) -> usize {
+pub(crate) fn persistent_cross_attention_layer_stride_frames(encoder_frames: usize) -> usize {
     if encoder_frames == 0 {
         0
     } else {
@@ -6061,7 +6064,7 @@ mod tests {
             decoder_hidden_size: 4,
             decoder_attention_heads: 2,
             vocab_size: 16,
-            max_target_positions: 8,
+            semantic_context_positions: 8,
         };
         let binding = WhisperDecoderTensorBindingSeam {
             token_embedding_weight: Some(tensor("model.decoder.embed_tokens.weight", &[16, 4])),
@@ -6101,7 +6104,7 @@ mod tests {
             decoder_hidden_size: 4,
             decoder_attention_heads: 2,
             vocab_size: 16,
-            max_target_positions: 8,
+            semantic_context_positions: 8,
         };
         let mut layer = one_layer_binding();
         layer.cross_attn_q_weight = None;
@@ -6143,7 +6146,7 @@ mod tests {
             decoder_hidden_size: 4,
             decoder_attention_heads: 2,
             vocab_size: 16,
-            max_target_positions: 8,
+            semantic_context_positions: 8,
         };
         let binding = WhisperDecoderTensorBindingSeam {
             token_embedding_weight: Some(tensor("model.decoder.embed_tokens.weight", &[16, 4])),
@@ -6487,7 +6490,7 @@ mod tests {
             decoder_hidden_size: 4,
             decoder_attention_heads: 2,
             vocab_size: 16,
-            max_target_positions: 8,
+            semantic_context_positions: 8,
         };
         let binding = WhisperDecoderTensorBindingSeam {
             token_embedding_weight: Some(tensor("model.decoder.embed_tokens.weight", &[16, 4])),
@@ -6624,7 +6627,7 @@ mod tests {
             decoder_hidden_size: 4,
             decoder_attention_heads: 2,
             vocab_size: 16,
-            max_target_positions: 8,
+            semantic_context_positions: 8,
         };
         let binding = WhisperDecoderTensorBindingSeam {
             token_embedding_weight: Some(tensor("model.decoder.embed_tokens.weight", &[16, 4])),

@@ -20,6 +20,19 @@ pub struct TranslationQueueSubmit {
     pub replaced_pending: bool,
 }
 
+/// Observable lifecycle of the worker owned by a translation queue.
+///
+/// This is deliberately separate from request/result state. Session hosts use
+/// it as a readiness barrier before accepting source audio; they must not infer
+/// initialization failure from an empty result channel or from
+/// `worker_ready() == false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationWorkerReadiness {
+    Initializing,
+    Ready,
+    Failed { reason: String },
+}
+
 #[derive(Debug, Error)]
 pub enum TranslationQueueError {
     #[error("translation queue is closed")]
@@ -163,15 +176,68 @@ impl LatestOnlyTranslationQueue {
         }
     }
 
-    /// True once the worker finished initialization and is processing
-    /// requests. Stays false forever if initialization failed; the failure
-    /// itself surfaces through `try_recv`.
+    /// Returns the worker's initialization state without consuming a result.
+    /// Initialization failure is terminal and remains observable even after
+    /// the corresponding result-channel error has been drained.
+    pub fn worker_readiness(&self) -> TranslationWorkerReadiness {
+        match self.shared.state.lock() {
+            Ok(state) => worker_readiness_from_state(&state),
+            Err(_) => TranslationWorkerReadiness::Failed {
+                reason: "translation queue state lock is poisoned".to_string(),
+            },
+        }
+    }
+
+    /// Blocks without polling until initialization reaches a terminal state or
+    /// `timeout` elapses. Hosts with async runtimes should invoke this from
+    /// their blocking pool; the queue itself intentionally has no dependency
+    /// on a particular async executor.
+    pub fn wait_for_worker_readiness(
+        &self,
+        timeout: std::time::Duration,
+    ) -> TranslationWorkerReadiness {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = match self.shared.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return TranslationWorkerReadiness::Failed {
+                    reason: "translation queue state lock is poisoned".to_string(),
+                };
+            }
+        };
+        loop {
+            let readiness = worker_readiness_from_state(&state);
+            if readiness != TranslationWorkerReadiness::Initializing {
+                return readiness;
+            }
+            let Some(deadline) = deadline else {
+                return TranslationWorkerReadiness::Initializing;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return TranslationWorkerReadiness::Initializing;
+            }
+            match self.shared.changed.wait_timeout(state, remaining) {
+                Ok((next_state, timeout_result)) => {
+                    state = next_state;
+                    if timeout_result.timed_out() {
+                        return worker_readiness_from_state(&state);
+                    }
+                }
+                Err(_) => {
+                    return TranslationWorkerReadiness::Failed {
+                        reason: "translation queue readiness wait lock is poisoned".to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Compatibility helper for callers that need only a positive readiness
+    /// answer. Use [`Self::worker_readiness`] whenever failure must be
+    /// distinguished from initialization still being in progress.
     pub fn worker_ready(&self) -> bool {
-        self.shared
-            .state
-            .lock()
-            .map(|state| state.worker_ready)
-            .unwrap_or(false)
+        matches!(self.worker_readiness(), TranslationWorkerReadiness::Ready)
     }
 
     pub fn enqueue(
@@ -287,6 +353,18 @@ impl LatestOnlyTranslationQueue {
                     || state.pending_provisional.is_some()
             })
             .unwrap_or(false)
+    }
+}
+
+fn worker_readiness_from_state(state: &QueueState) -> TranslationWorkerReadiness {
+    if let Some(reason) = state.worker_failed.as_ref() {
+        TranslationWorkerReadiness::Failed {
+            reason: reason.clone(),
+        }
+    } else if state.worker_ready {
+        TranslationWorkerReadiness::Ready
+    } else {
+        TranslationWorkerReadiness::Initializing
     }
 }
 
@@ -768,6 +846,15 @@ mod tests {
         // Spawn must return immediately even though init is still blocked.
         assert!(spawn_started.elapsed() < Duration::from_millis(500));
         assert!(!queue.worker_ready());
+        assert_eq!(
+            queue.worker_readiness(),
+            TranslationWorkerReadiness::Initializing
+        );
+        assert_eq!(
+            queue.wait_for_worker_readiness(Duration::from_millis(10)),
+            TranslationWorkerReadiness::Initializing,
+            "a bounded wait must time out without inventing readiness"
+        );
 
         // Requests enqueued before init completes are buffered, not rejected.
         queue.enqueue(request(1, "排队等待加载", true)).unwrap();
@@ -776,6 +863,10 @@ mod tests {
         let output = wait_for_output(&queue);
         assert_eq!(output.source_text, "排队等待加载");
         assert!(queue.worker_ready());
+        assert_eq!(
+            queue.wait_for_worker_readiness(Duration::from_secs(1)),
+            TranslationWorkerReadiness::Ready
+        );
     }
 
     #[test]
@@ -794,6 +885,10 @@ mod tests {
             TranslationQueueError::Worker { reason } if reason.contains("模型加载失败")
         ));
         assert!(!queue.worker_ready());
+        assert!(matches!(
+            queue.wait_for_worker_readiness(Duration::from_secs(1)),
+            TranslationWorkerReadiness::Failed { reason } if reason.contains("模型加载失败")
+        ));
 
         let error = queue
             .enqueue(request(1, "不会进入队列", false))

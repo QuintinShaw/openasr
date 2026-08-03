@@ -60,7 +60,7 @@ fn firered_punc_graph_config(
         .max(GgmlCpuGraphConfig::metadata_context_bytes(
             config.graph_size,
         ));
-    config
+    crate::models::graph_runtime_config::apply_request_execution_placement(config)
 }
 
 /// Exact byte capacity the weight arena's `no_alloc` metadata context needs
@@ -163,6 +163,20 @@ fn upload(
 }
 
 impl FireRedPuncGraph {
+    pub(crate) fn quoted_retained_system_memory_bytes(layers: usize) -> Result<u64, String> {
+        let bytes = layers
+            .checked_mul(std::mem::size_of::<LayerArena>())
+            .ok_or_else(|| "firered-punc layer-handle quote overflowed".to_string())?;
+        u64::try_from(bytes)
+            .map_err(|_| "firered-punc layer-handle quote does not fit u64".to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "firered-punc layer handles")?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn new(
         weights: &FireRedPuncWeights,
         metadata: FireRedPuncExecutionMetadata,

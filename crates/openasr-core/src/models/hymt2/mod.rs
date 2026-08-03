@@ -1,5 +1,7 @@
+pub(crate) mod capacity;
 pub(crate) mod config;
 pub mod package_import;
+mod policy_runtime;
 pub mod prompt;
 pub mod runtime;
 pub(crate) mod tensor_names;
@@ -10,6 +12,8 @@ pub use package_import::{
     HYMT2_PINNED_SOURCE_GGUF_SHA256, Hymt2ImportError, Hymt2ImportRequest, Hymt2ImportResult,
     import_hymt2_gguf_to_runtime_pack,
 };
+pub(crate) use policy_runtime::Hymt2TranslationCandidate;
+pub use policy_runtime::{PolicyResolvedHymt2Error, PolicyResolvedHymt2TranslationRuntime};
 pub use runtime::{
     Hymt2DecodeResult, Hymt2DecodeTimings, Hymt2PrefixCacheConfig, Hymt2PrefixReuseReport,
     Hymt2Runtime, Hymt2RuntimeError, Hymt2TranslationSessionCache,

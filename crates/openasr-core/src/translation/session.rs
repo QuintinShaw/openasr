@@ -6,7 +6,7 @@ use thiserror::Error;
 use super::clause::ClauseId;
 use super::queue::{
     LatestOnlyTranslationQueue, TranslationQueueError, TranslationQueueSubmit,
-    TranslationWorkerOutput,
+    TranslationWorkerOutput, TranslationWorkerReadiness,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,6 +124,18 @@ impl TranslationSession {
     /// created with `spawn` are ready at birth.
     pub fn worker_ready(&self) -> bool {
         self.queue.worker_ready()
+    }
+
+    /// Returns the worker's terminally observable initialization state without
+    /// consuming translation output.
+    pub fn worker_readiness(&self) -> TranslationWorkerReadiness {
+        self.queue.worker_readiness()
+    }
+
+    /// Waits for the worker to become ready or fail without polling. Async
+    /// hosts should call this on a blocking pool.
+    pub fn wait_for_worker_readiness(&self, timeout: Duration) -> TranslationWorkerReadiness {
+        self.queue.wait_for_worker_readiness(timeout)
     }
 
     pub fn enqueue(

@@ -32,6 +32,25 @@ impl PhraseBiasTokenEncoder for MoonshineTokenizer {
 }
 
 impl MoonshineTokenizer {
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.id_to_token, "moonshine tokenizer id table")?;
+        for token in &self.id_to_token {
+            bytes.add_string(token, "moonshine tokenizer id token")?;
+        }
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "moonshine tokenizer token map byte count overflowed".to_string())?,
+            "moonshine tokenizer token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "moonshine tokenizer token map key")?;
+        }
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
         let tokenizer_model = required_metadata_string(
             metadata,

@@ -16,6 +16,18 @@ impl CohereOwnedGgmlWeightPayload {
     pub(crate) fn bytes(&self) -> &[u8] {
         self.payload.bytes()
     }
+
+    fn add_retained_system_memory(
+        &self,
+        bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+        label: &str,
+    ) -> Result<(), String> {
+        bytes.add_vec(&self.dims, label)?;
+        bytes.add(
+            self.payload.retained_system_memory_bytes()?,
+            "cohere owned GGUF payload metadata",
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +64,29 @@ pub(crate) struct CohereTensorWeight {
     pub values: Vec<f32>,
     pub raw_ggml: Option<CohereOwnedGgmlWeightPayload>,
 }
+
+macro_rules! impl_cohere_weight_memory {
+    ($ty:ty, $($vec_field:ident),+ $(,)?) => {
+        impl $ty {
+            pub(crate) fn add_retained_system_memory(
+                &self,
+                bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+                label: &str,
+            ) -> Result<(), String> {
+                bytes.add_string(&self.name, label)?;
+                $(bytes.add_vec(&self.$vec_field, label)?;)+
+                if let Some(raw) = &self.raw_ggml {
+                    raw.add_retained_system_memory(bytes, label)?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_cohere_weight_memory!(CohereVectorWeight, values);
+impl_cohere_weight_memory!(CohereMatrixWeight, values);
+impl_cohere_weight_memory!(CohereTensorWeight, dims, values);
 
 #[derive(Debug, Error)]
 pub(crate) enum CohereWeightLoadError {

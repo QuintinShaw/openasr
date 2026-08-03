@@ -13,15 +13,14 @@ pub use mock::transcribe_with_mock_backend;
 pub use native::{
     GgmlAbortCallbackGuard, LegacyNativeTranscriptionProgress, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeRuntimeShutdownGuard,
-    NativeTranscriptionPhase, NativeTranscriptionProgress, RequestExecutionContext,
-    SliceBoundaryControl, TranscriptionControl, describe_native_runtime_model_mismatch,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
+    NativeTranscriptionProgress, RequestExecutionContext, SliceBoundaryControl,
+    TranscriptionControl, describe_native_runtime_model_mismatch,
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     native_transcription_progress_for_id, resolve_local_native_runtime_model_identity,
-    unload_idle_native_model_runtime_caches, validate_local_native_model_pack_path,
-    validate_native_runtime_model_pack_contract,
+    validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
 };
 pub use request_context::{
     FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,

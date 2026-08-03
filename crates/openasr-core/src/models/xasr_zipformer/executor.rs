@@ -1,8 +1,6 @@
 //! X-ASR Zipformer transducer runtime: fbank -> cache-aware encoder chunks ->
 //! stateless RNN-T greedy decode.
 
-use std::cell::RefCell;
-
 #[cfg(test)]
 use std::path::Path;
 
@@ -17,28 +15,13 @@ use crate::models::ggml_asr_executor::{
     GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
-use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
-    with_thread_local_cached_mut_by_key,
-};
 
 use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_SAMPLE_RATE_HZ};
-use super::graph_config::xasr_zipformer_encoder_graph_config;
 use super::runtime::{
-    XasrZipformerPreparedRuntime, checkout_prepared_runtime, clear_idle_runtime_pool,
+    XasrRuntimeActorPool, XasrZipformerPreparedRuntime, checkout_prepared_runtime,
+    new_runtime_actor_pool,
 };
 use super::streaming_decoder::XasrIncrementalDecoder;
-
-/// (pack content id, backend). The content id
-/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
-/// replacement at the same path from reusing a runtime built from the old
-/// bytes.
-type XasrRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
-
-thread_local! {
-    static XASR_ZIPFORMER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<XasrRuntimeCacheKey, XasrZipformerPreparedRuntime>> =
-        RefCell::new(BoundedRuntimeCache::new());
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct XasrZipformerTranscription {
@@ -106,6 +89,7 @@ pub(crate) fn transcribe_xasr_zipformer_pcm(
 }
 
 fn transcribe_xasr_zipformer_pcm_cached(
+    runtime_pool: &XasrRuntimeActorPool,
     samples: &[f32],
     runtime_source: &GgmlRuntimeSource,
     phrase_bias: Option<&PhraseBiasConfig>,
@@ -115,23 +99,19 @@ fn transcribe_xasr_zipformer_pcm_cached(
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());
     }
-    let backend = xasr_zipformer_encoder_graph_config(backend).backend;
-    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
-    with_thread_local_cached_mut_by_key(
-        &XASR_ZIPFORMER_RUNTIME_BY_KEY,
-        key,
-        DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || XasrZipformerPreparedRuntime::load(runtime_source, backend),
-        |runtime| {
-            let result = runtime.transcribe(samples)?;
+    let actor = checkout_prepared_runtime(runtime_pool, runtime_source, backend)?;
+    let samples = samples.to_vec();
+    actor
+        .call_mut(move |runtime| {
+            let result = runtime.transcribe(&samples)?;
             transcription_from_decode(
                 runtime,
                 result,
                 word_timestamps,
-                pcm_duration_seconds(samples),
+                pcm_duration_seconds(&samples),
             )
-        },
-    )
+        })
+        .map_err(|error| error.to_string())?
 }
 
 fn pcm_duration_seconds(samples: &[f32]) -> f32 {
@@ -147,8 +127,18 @@ fn reject_xasr_phrase_bias(
     })
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct XasrZipformerGgmlExecutor;
+#[derive(Debug)]
+pub(crate) struct XasrZipformerGgmlExecutor {
+    runtime_pool: XasrRuntimeActorPool,
+}
+
+impl Default for XasrZipformerGgmlExecutor {
+    fn default() -> Self {
+        Self {
+            runtime_pool: new_runtime_actor_pool(),
+        }
+    }
+}
 
 impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
     fn executor_id(&self) -> &'static str {
@@ -157,6 +147,14 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
 
     fn supports_phrase_bias(&self) -> bool {
         false
+    }
+
+    fn decoder_state_contract(
+        &self,
+        _selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
+    {
+        Ok(crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState)
     }
 
     fn execute_view(
@@ -182,6 +180,7 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_xasr_zipformer_pcm_cached(
+            &self.runtime_pool,
             &request.prepared_audio.samples_f32,
             &preflight.runtime_source,
             request.request_options.phrase_bias.as_ref(),
@@ -261,6 +260,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             request.backend_preference.request_backend_override(),
         );
         let runtime = checkout_prepared_runtime(
+            &self.runtime_pool,
             &preflight.runtime_source,
             request.resolved_runtime.backend(),
         )
@@ -271,7 +271,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             runtime,
-        );
+        )?;
         let driver = FrameSyncStreamingTranscriptDriver::new(
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
@@ -288,15 +288,10 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
         Ok(Box::new(session))
     }
 
-    /// The process-level `XASR_PROCESS_RUNTIME_POOL` in `runtime.rs` is the
-    /// only resident state this family's streaming path caches outside a
-    /// live session (unlike the other builtin families, X-ASR streaming has
-    /// no thread-local runtime cache to fall back on), so it must be reached
-    /// by `idle_unload` explicitly -- the trait default no-op would otherwise
-    /// leave every idle pooled runtime resident for the rest of the process's
-    /// life.
+    /// The executor-owned actor pool is the only X-ASR state resident outside
+    /// a live session, so idle unload must clear it explicitly.
     fn unload_idle_state(&self) {
-        clear_idle_runtime_pool();
+        self.runtime_pool.clear();
     }
 }
 

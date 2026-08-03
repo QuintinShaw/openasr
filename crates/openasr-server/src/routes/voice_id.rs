@@ -97,7 +97,7 @@ pub(crate) async fn list_persons(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<(HeaderMap, Json<PersonListResponse>), ApiError> {
     let store = open_voice_id_store(&distribution)?;
-    let active = active_space();
+    let active = active_space(&distribution)?;
     let data = store
         .list_persons(active.as_ref())
         .map_err(voice_id_store_error)?;
@@ -117,7 +117,7 @@ pub(crate) async fn get_person(
     let id = openasr_core::diarize::voice_id::PersonId::parse(&person_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let person = store
-        .get_person(&id, active_space().as_ref())
+        .get_person(&id, active_space(&distribution)?.as_ref())
         .map_err(voice_id_store_error)?;
     let mut headers = HeaderMap::new();
     let etag = format!("\"{}\"", person.revision);
@@ -142,7 +142,9 @@ pub(crate) async fn enroll_person(
     let parsed = parse_enroll_multipart(multipart).await?;
     let idempotency = idempotency_request(&headers, enroll_request_hash(&parsed))?;
     let store = open_voice_id_store(&distribution)?;
-    let (embedder, identity) = active_embedder_and_identity()?;
+    let speaker_runtime = active_speaker_runtime(&distribution)?;
+    let embedder = speaker_runtime.embedder();
+    let identity = speaker_runtime.identity();
     let person = match idempotency {
         Some(idempotency) => {
             openasr_core::diarize::voice_id::enroll_person_from_clips_idempotent(
@@ -150,8 +152,8 @@ pub(crate) async fn enroll_person(
                 parsed.display_name,
                 parsed.consent,
                 parsed.clips,
-                embedder.as_ref(),
-                &identity,
+                embedder,
+                identity,
                 parsed.color_preference,
                 idempotency,
             )
@@ -163,8 +165,8 @@ pub(crate) async fn enroll_person(
             parsed.display_name,
             parsed.consent,
             parsed.clips,
-            embedder.as_ref(),
-            &identity,
+            embedder,
+            identity,
             parsed.color_preference,
         )
         .map_err(voice_id_service_error)?,
@@ -193,7 +195,9 @@ pub(crate) async fn enroll_person_from_source_audio(
     let parsed = parse_source_enroll_multipart(&runtime, multipart).await?;
     let idempotency = idempotency_request(&headers, source_enroll_request_hash(&parsed))?;
     let store = open_voice_id_store(&distribution)?;
-    let (embedder, identity) = active_embedder_and_identity()?;
+    let speaker_runtime = active_speaker_runtime(&distribution)?;
+    let embedder = speaker_runtime.embedder();
+    let identity = speaker_runtime.identity();
     let person = match idempotency {
         Some(idempotency) => {
             openasr_core::diarize::voice_id::enroll_person_from_clips_idempotent(
@@ -201,8 +205,8 @@ pub(crate) async fn enroll_person_from_source_audio(
                 parsed.display_name,
                 parsed.consent,
                 vec![parsed.clip],
-                embedder.as_ref(),
-                &identity,
+                embedder,
+                identity,
                 parsed.color_preference,
                 idempotency,
             )
@@ -214,8 +218,8 @@ pub(crate) async fn enroll_person_from_source_audio(
             parsed.display_name,
             parsed.consent,
             vec![parsed.clip],
-            embedder.as_ref(),
-            &identity,
+            embedder,
+            identity,
             parsed.color_preference,
         )
         .map_err(voice_id_service_error)?,
@@ -241,7 +245,9 @@ pub(crate) async fn add_sample_from_source_audio(
     let expected = parse_if_match(&headers)?;
     let idempotency =
         idempotency_request(&headers, source_sample_request_hash(&id, expected, &parsed))?;
-    let (embedder, identity) = active_embedder_and_identity()?;
+    let speaker_runtime = active_speaker_runtime(&distribution)?;
+    let embedder = speaker_runtime.embedder();
+    let identity = speaker_runtime.identity();
     let store = open_voice_id_store(&distribution)?;
     let person = match idempotency {
         Some(idempotency) => {
@@ -252,8 +258,8 @@ pub(crate) async fn add_sample_from_source_audio(
                 parsed.consent,
                 &parsed.pcm,
                 parsed.capture_context,
-                embedder.as_ref(),
-                &identity,
+                embedder,
+                identity,
                 idempotency,
             )
             .map_err(voice_id_service_error)?
@@ -266,8 +272,8 @@ pub(crate) async fn add_sample_from_source_audio(
             parsed.consent,
             &parsed.pcm,
             parsed.capture_context,
-            embedder.as_ref(),
-            &identity,
+            embedder,
+            identity,
         )
         .map_err(voice_id_service_error)?,
     };
@@ -350,7 +356,9 @@ pub(crate) async fn add_sample(
     let expected = parse_if_match(&headers)?;
     let idempotency =
         idempotency_request(&headers, add_sample_request_hash(&id, expected, &parsed))?;
-    let (embedder, identity) = active_embedder_and_identity()?;
+    let speaker_runtime = active_speaker_runtime(&distribution)?;
+    let embedder = speaker_runtime.embedder();
+    let identity = speaker_runtime.identity();
     let person = match idempotency {
         Some(idempotency) => {
             openasr_core::diarize::voice_id::add_sample_from_pcm_idempotent(
@@ -360,8 +368,8 @@ pub(crate) async fn add_sample(
                 parsed.consent,
                 &parsed.pcm,
                 parsed.capture_context,
-                embedder.as_ref(),
-                &identity,
+                embedder,
+                identity,
                 idempotency,
             )
             .map_err(voice_id_service_error)?
@@ -374,8 +382,8 @@ pub(crate) async fn add_sample(
             parsed.consent,
             &parsed.pcm,
             parsed.capture_context,
-            embedder.as_ref(),
-            &identity,
+            embedder,
+            identity,
         )
         .map_err(voice_id_service_error)?,
     };
@@ -990,41 +998,36 @@ pub(crate) fn open_voice_id_store(
         .map_err(|e| ApiError::JobStore(format!("voice-id store open failed: {e}")))
 }
 
-pub(crate) fn active_space() -> Option<openasr_core::diarize::voice_id::EmbeddingSpace> {
-    let embedder = openasr_core::diarize::embed::shared_embedder()?;
-    // Derive both values from one pinned pack snapshot. Resolving the identity
-    // independently can observe a path replacement between the two calls and
-    // pair one model's calibration with another model's content identity.
-    let identity = embedder.identity()?;
-    Some(
-        openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(
-            &identity,
-            embedder.calibration_profile(),
-        ),
+pub(crate) fn active_space(
+    distribution: &DistributionContext,
+) -> Result<Option<openasr_core::diarize::voice_id::EmbeddingSpace>, ApiError> {
+    let Some(runtime) = openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load(
+        Arc::clone(&distribution.native_execution_services),
     )
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(
+            runtime.identity(),
+            runtime.embedder().calibration_profile(),
+        ),
+    ))
 }
 
-fn active_embedder_and_identity() -> Result<
-    (
-        std::sync::Arc<dyn openasr_core::diarize::embed::SpeakerEmbedder>,
-        openasr_core::diarize::embed::SpeakerEmbedderIdentity,
-    ),
-    ApiError,
-> {
-    let embedder = openasr_core::diarize::embed::shared_embedder().ok_or_else(|| {
+fn active_speaker_runtime(
+    distribution: &DistributionContext,
+) -> Result<openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime, ApiError> {
+    openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load(Arc::clone(
+        &distribution.native_execution_services,
+    ))
+    .map_err(|error| ApiError::BadRequest(error.to_string()))?
+    .ok_or_else(|| {
         ApiError::BadRequest(
             openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
         )
-    })?;
-    // Keep the Arc and identity coupled to the exact same resolved pack for
-    // the full enrollment operation; the configured path may be replaced by
-    // an installer while this request is in flight.
-    let identity = embedder.identity().ok_or_else(|| {
-        ApiError::BadRequest(
-            openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
-        )
-    })?;
-    Ok((embedder, identity))
+    })
 }
 
 fn idempotency_request(

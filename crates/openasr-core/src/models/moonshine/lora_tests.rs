@@ -36,6 +36,26 @@ const MOONSHINE_OADP_REAL_PACK_ENV: &str = "OPENASR_MOONSHINE_OADP_REAL_PACK";
 const MOONSHINE_PACK_HOME_RELATIVE_PATH: &str =
     ".openasr/models/moonshine-tiny/q8_0/moonshine-tiny-q8_0.oasr";
 
+fn decoder_state(
+    metadata: MoonshineExecutionMetadata,
+    cross_positions: usize,
+) -> crate::models::seq2seq_decoder_state::Seq2SeqDecoderState {
+    use crate::models::seq2seq_decoder_state::{Seq2SeqDecoderState, Seq2SeqStateAxis};
+
+    Seq2SeqDecoderState {
+        self_attention: Seq2SeqStateAxis {
+            logical_positions: metadata.decoder_max_context - 1,
+            resident_positions: metadata.decoder_max_context - 1,
+            hard_position_cap: metadata.decoder_max_context - 1,
+        },
+        cross_attention: Seq2SeqStateAxis {
+            logical_positions: cross_positions,
+            resident_positions: cross_positions,
+            hard_position_cap: cross_positions,
+        },
+    }
+}
+
 fn resolve_real_pack() -> PathBuf {
     if let Some(value) = std::env::var_os(MOONSHINE_OADP_REAL_PACK_ENV) {
         let path = PathBuf::from(value);
@@ -144,7 +164,7 @@ fn first_step_logits(
         MoonshineDecoderRuntimeInput {
             decoder_weights: &prepared.decoder_weights,
             metadata: prepared.metadata,
-            cross_frame_count: encoder_output.frame_count,
+            decoder_state: decoder_state(prepared.metadata, encoder_output.frame_count),
             backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         },
         true,
@@ -243,7 +263,7 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
             MoonshineDecoderRuntimeInput {
                 decoder_weights: &prepared.decoder_weights,
                 metadata,
-                cross_frame_count: encoder_output.frame_count,
+                decoder_state: decoder_state(metadata, encoder_output.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
             },
             true,
@@ -382,19 +402,19 @@ fn lora_cross_v_target_changes_decoder_logits() {
     );
 }
 
-fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveformFeatures<'static> {
+fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveformFeatures {
     let samples = (0..sample_count)
         .map(|index| (index as f32 * 0.011).sin() * 0.4)
         .collect();
     super::frontend::MoonshineWaveformFeatures {
-        samples: std::borrow::Cow::Owned(samples),
+        samples: samples.into(),
     }
 }
 
 fn encoder_rows(
     prepared: &MoonshinePreparedRuntime,
     runtime_source: &crate::GgmlRuntimeSource,
-    features: &super::frontend::MoonshineWaveformFeatures<'_>,
+    features: &super::frontend::MoonshineWaveformFeatures,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
     let mut runtime = super::encoder_graph::MoonshineEncoderGraphRuntime::new(

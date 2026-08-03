@@ -92,7 +92,11 @@ pub(crate) fn compact_xasr_name(name: &str) -> String {
             out = out.replace(from, to);
         }
     }
-    out
+    // The runtime's pre-allocation quote accounts compact tensor names by
+    // their stored GGUF length. Canonicalize spare capacity as well as bytes
+    // so rebuilding the same name cannot silently request a larger heap block
+    // than that count-only quote.
+    out.into_boxed_str().into_string()
 }
 
 pub type XasrZipformerQuantizationMode = PackQuant;

@@ -12,7 +12,12 @@
 
 #![allow(dead_code)]
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader, GgufTensorIndex};
+use crate::models::runtime_memory::{
+    ConstructionMemoryPlan, checked_sum, element_bytes, named_f32_tensor_quote_bytes,
+    tensor_f32_bytes,
+};
+use crate::models::system_memory_owner::SystemMemoryOwnerError;
 
 use super::runtime_contract::SenseVoiceExecutionMetadata;
 
@@ -87,6 +92,237 @@ pub(crate) struct SenseVoiceEncoderWeights {
     pub cmvn_inv_stddev: NamedTensor,
 }
 
+/// Count-only host-memory topology for one SenseVoice runtime build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SenseVoiceSystemMemoryPlan {
+    pub(crate) weights_peak_bytes: u64,
+    pub(crate) weights_stable_bytes: u64,
+    pub(crate) graph_retained_bytes: u64,
+    pub(crate) prompt_embed_bytes: u64,
+    pub(crate) cmvn_neg_mean_bytes: u64,
+    pub(crate) cmvn_inv_stddev_bytes: u64,
+}
+
+fn named_tensor_lifetime_bytes(
+    tensor_index: &GgufTensorIndex,
+    name: &str,
+    retain_values: bool,
+) -> Result<(u64, u64), SystemMemoryOwnerError> {
+    Ok((
+        named_f32_tensor_quote_bytes(tensor_index, name, true, "sensevoice")?,
+        named_f32_tensor_quote_bytes(tensor_index, name, retain_values, "sensevoice")?,
+    ))
+}
+
+fn tensor_batch_lifetime_bytes<I, S>(
+    tensor_index: &GgufTensorIndex,
+    tensors: I,
+) -> Result<(u64, u64), SystemMemoryOwnerError>
+where
+    I: IntoIterator<Item = (S, bool)>,
+    S: AsRef<str>,
+{
+    let mut materialized = 0_u64;
+    let mut retained = 0_u64;
+    for (name, retain_values) in tensors {
+        let (tensor_materialized, tensor_retained) =
+            named_tensor_lifetime_bytes(tensor_index, name.as_ref(), retain_values)?;
+        materialized = checked_sum(
+            [materialized, tensor_materialized],
+            "sensevoice",
+            "materialized tensor batch",
+        )?;
+        retained = checked_sum(
+            [retained, tensor_retained],
+            "sensevoice",
+            "retained tensor batch",
+        )?;
+    }
+    Ok((materialized, retained))
+}
+
+/// Mirrors every named tensor materialized by `load_sensevoice_encoder_weights`.
+/// Four 2-D linears per SAN-M layer and the CTC head are mmap-bound after the
+/// f32 shape check; every other tensor remains host-resident until graph build.
+pub(crate) fn plan_sensevoice_system_memory(
+    tensor_index: &GgufTensorIndex,
+    metadata: SenseVoiceExecutionMetadata,
+) -> Result<SenseVoiceSystemMemoryPlan, SystemMemoryOwnerError> {
+    let mut lifetime = ConstructionMemoryPlan::new("sensevoice");
+
+    let enc_descriptors = element_bytes::<SenseVoiceLayerWeights>(
+        metadata.n_layers,
+        "sensevoice",
+        "encoder layer descriptors",
+    )?;
+    let tp_descriptors = element_bytes::<SenseVoiceLayerWeights>(
+        metadata.tp_layers,
+        "sensevoice",
+        "transcription layer descriptors",
+    )?;
+    lifetime.retain(enc_descriptors, "encoder layer descriptor storage")?;
+
+    for (scope, count) in [("enc.blk", metadata.n_layers)] {
+        for layer in 0..count {
+            let prefix = format!("{scope}.{layer}");
+            let batch = [
+                ("attn.norm.weight", true),
+                ("attn.norm.bias", true),
+                ("attn.qkv.weight", false),
+                ("attn.qkv.bias", true),
+                ("attn.out.weight", false),
+                ("attn.out.bias", true),
+                ("attn.fsmn.weight", true),
+                ("ffn.norm.weight", true),
+                ("ffn.norm.bias", true),
+                ("ffn.up.weight", false),
+                ("ffn.up.bias", true),
+                ("ffn.down.weight", false),
+                ("ffn.down.bias", true),
+            ]
+            .map(|(suffix, retain_values)| (format!("{prefix}.{suffix}"), retain_values));
+            let (materialized, retained) = tensor_batch_lifetime_bytes(tensor_index, batch)?;
+            lifetime.materialize_then_retain(
+                materialized,
+                retained,
+                "encoder layer dequantization batch",
+            )?;
+        }
+    }
+
+    lifetime.retain(tp_descriptors, "transcription layer descriptor storage")?;
+    for layer in 0..metadata.tp_layers {
+        let prefix = format!("tp.blk.{layer}");
+        let batch = [
+            ("attn.norm.weight", true),
+            ("attn.norm.bias", true),
+            ("attn.qkv.weight", false),
+            ("attn.qkv.bias", true),
+            ("attn.out.weight", false),
+            ("attn.out.bias", true),
+            ("attn.fsmn.weight", true),
+            ("ffn.norm.weight", true),
+            ("ffn.norm.bias", true),
+            ("ffn.up.weight", false),
+            ("ffn.up.bias", true),
+            ("ffn.down.weight", false),
+            ("ffn.down.bias", true),
+        ]
+        .map(|(suffix, retain_values)| (format!("{prefix}.{suffix}"), retain_values));
+        let (materialized, retained) = tensor_batch_lifetime_bytes(tensor_index, batch)?;
+        lifetime.materialize_then_retain(
+            materialized,
+            retained,
+            "transcription layer dequantization batch",
+        )?;
+    }
+
+    // Mirror `load_sensevoice_encoder_weights` statement order. The CTC head
+    // payload is dropped before the prompt, CMVN and trailing norm tensors are
+    // loaded, so those later resident tensors cannot inflate its transient
+    // peak.
+    let (ctc_materialized, ctc_retained) = tensor_batch_lifetime_bytes(
+        tensor_index,
+        [("ctc.head.weight", false), ("ctc.head.bias", true)],
+    )?;
+    lifetime.materialize_then_retain(
+        ctc_materialized,
+        ctc_retained,
+        "CTC head dequantization batch",
+    )?;
+    for name in [
+        "embed.prompt.weight",
+        "frontend.cmvn.neg_mean",
+        "frontend.cmvn.inv_stddev",
+        "enc.after_norm.weight",
+        "enc.after_norm.bias",
+        "tp.norm.weight",
+        "tp.norm.bias",
+    ] {
+        let (materialized, retained) = named_tensor_lifetime_bytes(tensor_index, name, true)?;
+        lifetime.materialize_then_retain(materialized, retained, "retained tail tensor")?;
+    }
+
+    // The graph constructs exactly one handle Vec per SAN-M stage.
+    let graph_retained_bytes =
+        crate::models::sensevoice::encoder_graph::quoted_graph_retained_bytes(
+            metadata.n_layers,
+            metadata.tp_layers,
+        )?;
+    let prompt_embed_bytes = tensor_f32_bytes(tensor_index, "embed.prompt.weight", "sensevoice")?;
+    let cmvn_neg_mean_bytes =
+        tensor_f32_bytes(tensor_index, "frontend.cmvn.neg_mean", "sensevoice")?;
+    let cmvn_inv_stddev_bytes =
+        tensor_f32_bytes(tensor_index, "frontend.cmvn.inv_stddev", "sensevoice")?;
+
+    Ok(SenseVoiceSystemMemoryPlan {
+        weights_peak_bytes: lifetime.peak_bytes(),
+        weights_stable_bytes: lifetime.stable_bytes(),
+        graph_retained_bytes,
+        prompt_embed_bytes,
+        cmvn_neg_mean_bytes,
+        cmvn_inv_stddev_bytes,
+    })
+}
+
+pub(crate) fn retained_weights_system_memory_bytes(
+    weights: &SenseVoiceEncoderWeights,
+) -> Result<u64, String> {
+    let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+    bytes.add_vec(&weights.enc_layers, "sensevoice encoder layer descriptors")?;
+    bytes.add_vec(
+        &weights.tp_layers,
+        "sensevoice transcription layer descriptors",
+    )?;
+    for layer in weights.enc_layers.iter().chain(&weights.tp_layers) {
+        for tensor in sensevoice_layer_tensors(layer) {
+            add_named_tensor_retained(tensor, &mut bytes, "sensevoice layer tensor")?;
+        }
+    }
+    for tensor in [
+        &weights.enc_after_norm_weight,
+        &weights.enc_after_norm_bias,
+        &weights.tp_norm_weight,
+        &weights.tp_norm_bias,
+        &weights.ctc_head_weight,
+        &weights.ctc_head_bias,
+        &weights.prompt_embed,
+        &weights.cmvn_neg_mean,
+        &weights.cmvn_inv_stddev,
+    ] {
+        add_named_tensor_retained(tensor, &mut bytes, "sensevoice encoder tensor")?;
+    }
+    Ok(bytes.finish())
+}
+
+fn sensevoice_layer_tensors(layer: &SenseVoiceLayerWeights) -> [&NamedTensor; 13] {
+    [
+        &layer.attn_norm_weight,
+        &layer.attn_norm_bias,
+        &layer.attn_qkv_weight,
+        &layer.attn_qkv_bias,
+        &layer.attn_out_weight,
+        &layer.attn_out_bias,
+        &layer.attn_fsmn_weight,
+        &layer.ffn_norm_weight,
+        &layer.ffn_norm_bias,
+        &layer.ffn_up_weight,
+        &layer.ffn_up_bias,
+        &layer.ffn_down_weight,
+        &layer.ffn_down_bias,
+    ]
+}
+
+fn add_named_tensor_retained(
+    tensor: &NamedTensor,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    bytes.add_string(&tensor.name, &format!("{label} name"))?;
+    bytes.add_vec(&tensor.dims, &format!("{label} dims"))?;
+    bytes.add_vec(&tensor.values, &format!("{label} values"))
+}
+
 fn load_named(
     reader: &GgufTensorDataReader,
     name: &str,
@@ -97,9 +333,8 @@ fn load_named(
             tensor_name: name.to_string(),
         })
     })?;
+    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &tensor.dims)?;
     let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-    let shape_u64: Vec<u64> = tensor.dims.clone();
-    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &shape_u64)?;
     Ok(NamedTensor {
         name: name.to_string(),
         dims,

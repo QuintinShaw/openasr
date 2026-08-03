@@ -25,6 +25,16 @@ const CONV2_STRIDE: usize = 3;
 const CONV3_KERNEL: usize = 3;
 const CONV3_STRIDE: usize = 2;
 
+/// Exact encoder-frame count produced by Moonshine's three valid-convolution
+/// stem layers for a raw waveform of `n_samples`.
+pub(crate) fn moonshine_encoder_frame_count_for_samples(
+    n_samples: usize,
+) -> Result<usize, MoonshineEncoderError> {
+    let l1 = conv_out_len(n_samples, CONV1_KERNEL, CONV1_STRIDE)?;
+    let l2 = conv_out_len(l1, CONV2_KERNEL, CONV2_STRIDE)?;
+    conv_out_len(l2, CONV3_KERNEL, CONV3_STRIDE)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MoonshineEncoderOutput {
     pub frame_count: usize,
@@ -315,12 +325,10 @@ impl MoonshineEncoderGraphRuntime {
 
     pub(crate) fn encode(
         &mut self,
-        features: &MoonshineWaveformFeatures<'_>,
+        features: &MoonshineWaveformFeatures,
     ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
         let n_samples = features.samples.len();
-        let l1 = conv_out_len(n_samples, CONV1_KERNEL, CONV1_STRIDE)?;
-        let l2 = conv_out_len(l1, CONV2_KERNEL, CONV2_STRIDE)?;
-        let frame_count = conv_out_len(l2, CONV3_KERNEL, CONV3_STRIDE)?;
+        let frame_count = moonshine_encoder_frame_count_for_samples(n_samples)?;
         if frame_count == 0 {
             return Err(MoonshineEncoderError::InvalidFeatures {
                 reason: format!("audio too short: {n_samples} samples produce 0 encoder frames"),

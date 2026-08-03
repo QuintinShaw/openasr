@@ -9,7 +9,11 @@
 
 #![allow(dead_code)]
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader, GgufTensorIndex};
+use crate::models::runtime_memory::{
+    ConstructionMemoryPlan, checked_sum, element_bytes, named_f32_tensor_quote_bytes,
+};
+use crate::models::system_memory_owner::SystemMemoryOwnerError;
 
 use super::runtime_contract::{FEATURE_EXTRACTOR_CONV_DIM, Wav2Vec2CtcExecutionMetadata};
 
@@ -102,6 +106,288 @@ pub(crate) struct Wav2Vec2EncoderWeights {
     pub ctc_head_bias: NamedTensor,
 }
 
+/// Count-only host-memory topology for one wav2vec2-CTC runtime build.
+///
+/// The loader first materializes every named tensor as f32, then drops the
+/// mmap-bound 2-D projection payloads before graph construction. The graph
+/// retains only its Rust handle vectors; native ggml buffers are accounted for
+/// by the backend memory owner and intentionally do not appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wav2Vec2SystemMemoryPlan {
+    pub(crate) weights_peak_bytes: u64,
+    pub(crate) weights_stable_bytes: u64,
+    pub(crate) graph_retained_bytes: u64,
+}
+
+fn named_tensor_lifetime_bytes(
+    tensor_index: &GgufTensorIndex,
+    name: &str,
+    retain_values: bool,
+) -> Result<(u64, u64), SystemMemoryOwnerError> {
+    Ok((
+        named_f32_tensor_quote_bytes(tensor_index, name, true, "wav2vec2-ctc")?,
+        named_f32_tensor_quote_bytes(tensor_index, name, retain_values, "wav2vec2-ctc")?,
+    ))
+}
+
+fn tensor_batch_lifetime_bytes<I, S>(
+    tensor_index: &GgufTensorIndex,
+    tensors: I,
+) -> Result<(u64, u64), SystemMemoryOwnerError>
+where
+    I: IntoIterator<Item = (S, bool)>,
+    S: AsRef<str>,
+{
+    let mut materialized = 0_u64;
+    let mut retained = 0_u64;
+    for (name, retain_values) in tensors {
+        let (tensor_materialized, tensor_retained) =
+            named_tensor_lifetime_bytes(tensor_index, name.as_ref(), retain_values)?;
+        materialized = checked_sum(
+            [materialized, tensor_materialized],
+            "wav2vec2-ctc",
+            "materialized tensor batch",
+        )?;
+        retained = checked_sum(
+            [retained, tensor_retained],
+            "wav2vec2-ctc",
+            "retained tensor batch",
+        )?;
+    }
+    Ok((materialized, retained))
+}
+
+/// Mirrors every `load_named`/`load_optional` call in this family. Missing
+/// required tensors and every checked arithmetic failure are returned as a
+/// capacity error so admission fails closed before materialization.
+pub(crate) fn plan_wav2vec2_system_memory(
+    tensor_index: &GgufTensorIndex,
+    metadata: Wav2Vec2CtcExecutionMetadata,
+) -> Result<Wav2Vec2SystemMemoryPlan, SystemMemoryOwnerError> {
+    let mut lifetime = ConstructionMemoryPlan::new("wav2vec2-ctc");
+
+    // `Vec::with_capacity(FEATURE_EXTRACTOR_CONV_DIM.len())`.
+    let feature_count = FEATURE_EXTRACTOR_CONV_DIM.len();
+    let feature_descriptors = element_bytes::<Wav2Vec2FeatureExtractorConv>(
+        feature_count,
+        "wav2vec2-ctc",
+        "feature extractor descriptors",
+    )?;
+    lifetime.retain(feature_descriptors, "feature extractor descriptor storage")?;
+    for layer in 0..feature_count {
+        let mut names = vec![(format!("enc.fe.{layer}.conv.weight"), true)];
+        for suffix in ["conv.bias", "gn.weight", "gn.bias"] {
+            let name = format!("enc.fe.{layer}.{suffix}");
+            if tensor_index.get(&name).is_some() {
+                names.push((name, true));
+            }
+        }
+        let (materialized, retained) = tensor_batch_lifetime_bytes(tensor_index, names)?;
+        lifetime.materialize_then_retain(
+            materialized,
+            retained,
+            "feature extractor layer materialization",
+        )?;
+    }
+
+    for name in ["enc.fp.norm.weight", "enc.fp.norm.bias"] {
+        let (materialized, retained) = named_tensor_lifetime_bytes(tensor_index, name, true)?;
+        lifetime.materialize_then_retain(materialized, retained, "feature projection norm")?;
+    }
+    let (fp_materialized, fp_retained) = tensor_batch_lifetime_bytes(
+        tensor_index,
+        [("enc.fp.proj.weight", false), ("enc.fp.proj.bias", true)],
+    )?;
+    lifetime.materialize_then_retain(
+        fp_materialized,
+        fp_retained,
+        "feature projection materialization",
+    )?;
+
+    let pos_conv_capacity = metadata.pos_conv_depth.max(1);
+    let pos_conv_descriptors = element_bytes::<Wav2Vec2PosConvLayer>(
+        pos_conv_capacity,
+        "wav2vec2-ctc",
+        "positional convolution descriptors",
+    )?;
+    lifetime.retain(
+        pos_conv_descriptors,
+        "positional convolution descriptor storage",
+    )?;
+    if metadata.pos_conv_depth <= 1 {
+        let (materialized, retained) = tensor_batch_lifetime_bytes(
+            tensor_index,
+            [("enc.posconv.weight", true), ("enc.posconv.bias", true)],
+        )?;
+        lifetime.materialize_then_retain(
+            materialized,
+            retained,
+            "positional convolution materialization",
+        )?;
+    } else {
+        for layer in 0..metadata.pos_conv_depth {
+            let (materialized, retained) = tensor_batch_lifetime_bytes(
+                tensor_index,
+                [
+                    (format!("enc.posconv.{layer}.weight"), true),
+                    (format!("enc.posconv.{layer}.bias"), true),
+                ],
+            )?;
+            lifetime.materialize_then_retain(
+                materialized,
+                retained,
+                "positional convolution layer materialization",
+            )?;
+        }
+    }
+
+    for name in ["enc.norm.weight", "enc.norm.bias"] {
+        let (materialized, retained) = named_tensor_lifetime_bytes(tensor_index, name, true)?;
+        lifetime.materialize_then_retain(materialized, retained, "encoder norm")?;
+    }
+
+    let layer_descriptors = element_bytes::<Wav2Vec2EncoderLayerWeights>(
+        metadata.n_layers,
+        "wav2vec2-ctc",
+        "encoder layer descriptors",
+    )?;
+    lifetime.retain(layer_descriptors, "encoder layer descriptor storage")?;
+    for layer in 0..metadata.n_layers {
+        let prefix = format!("enc.blk.{layer}");
+        let batch = [
+            ("attn.q.weight", false),
+            ("attn.q.bias", true),
+            ("attn.k.weight", false),
+            ("attn.k.bias", true),
+            ("attn.v.weight", false),
+            ("attn.v.bias", true),
+            ("attn.out.weight", false),
+            ("attn.out.bias", true),
+            ("attn.norm.weight", true),
+            ("attn.norm.bias", true),
+            ("ffn.up.weight", false),
+            ("ffn.up.bias", true),
+            ("ffn.down.weight", false),
+            ("ffn.down.bias", true),
+            ("final.norm.weight", true),
+            ("final.norm.bias", true),
+        ]
+        .map(|(suffix, retain_values)| (format!("{prefix}.{suffix}"), retain_values));
+        let (materialized, retained) = tensor_batch_lifetime_bytes(tensor_index, batch)?;
+        lifetime.materialize_then_retain(
+            materialized,
+            retained,
+            "encoder layer dequantization batch",
+        )?;
+    }
+
+    let (ctc_materialized, ctc_retained) = tensor_batch_lifetime_bytes(
+        tensor_index,
+        [("ctc.head.weight", false), ("ctc.head.bias", true)],
+    )?;
+    lifetime.materialize_then_retain(
+        ctc_materialized,
+        ctc_retained,
+        "CTC head dequantization batch",
+    )?;
+
+    // The graph constructs these exact `with_capacity` vectors and keeps no
+    // other Rust Vec handles in its retained topology.
+    let graph_retained_bytes =
+        crate::models::wav2vec2_ctc::encoder_graph::quoted_graph_retained_bytes(
+            feature_count,
+            pos_conv_capacity,
+            metadata.n_layers,
+        )?;
+
+    Ok(Wav2Vec2SystemMemoryPlan {
+        weights_peak_bytes: lifetime.peak_bytes(),
+        weights_stable_bytes: lifetime.stable_bytes(),
+        graph_retained_bytes,
+    })
+}
+
+/// Post-build recursive count of the host containers that survive in a
+/// materialized weight bundle. Kept here for tests and future callers that
+/// inspect a loader result; the runtime itself drops the bundle after graph
+/// construction.
+pub(crate) fn retained_weights_system_memory_bytes(
+    weights: &Wav2Vec2EncoderWeights,
+) -> Result<u64, String> {
+    let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+    bytes.add_vec(
+        &weights.feature_extractor,
+        "wav2vec2-ctc feature extractor descriptors",
+    )?;
+    for feature in &weights.feature_extractor {
+        add_named_tensor_retained(
+            &feature.conv_weight,
+            &mut bytes,
+            "wav2vec2-ctc feature tensor",
+        )?;
+        for tensor in [&feature.conv_bias, &feature.norm_weight, &feature.norm_bias]
+            .into_iter()
+            .flatten()
+        {
+            add_named_tensor_retained(tensor, &mut bytes, "wav2vec2-ctc feature tensor")?;
+        }
+    }
+    for tensor in [
+        &weights.fp_norm_weight,
+        &weights.fp_norm_bias,
+        &weights.fp_proj_weight,
+        &weights.fp_proj_bias,
+        &weights.encoder_norm_weight,
+        &weights.encoder_norm_bias,
+        &weights.ctc_head_weight,
+        &weights.ctc_head_bias,
+    ] {
+        add_named_tensor_retained(tensor, &mut bytes, "wav2vec2-ctc encoder tensor")?;
+    }
+    bytes.add_vec(
+        &weights.pos_conv_layers,
+        "wav2vec2-ctc positional convolution descriptors",
+    )?;
+    for layer in &weights.pos_conv_layers {
+        add_named_tensor_retained(&layer.weight, &mut bytes, "wav2vec2-ctc positional tensor")?;
+        add_named_tensor_retained(&layer.bias, &mut bytes, "wav2vec2-ctc positional tensor")?;
+    }
+    bytes.add_vec(&weights.layers, "wav2vec2-ctc encoder layer descriptors")?;
+    for layer in &weights.layers {
+        for tensor in [
+            &layer.attn_q_weight,
+            &layer.attn_q_bias,
+            &layer.attn_k_weight,
+            &layer.attn_k_bias,
+            &layer.attn_v_weight,
+            &layer.attn_v_bias,
+            &layer.attn_out_weight,
+            &layer.attn_out_bias,
+            &layer.attn_norm_weight,
+            &layer.attn_norm_bias,
+            &layer.ffn_up_weight,
+            &layer.ffn_up_bias,
+            &layer.ffn_down_weight,
+            &layer.ffn_down_bias,
+            &layer.final_norm_weight,
+            &layer.final_norm_bias,
+        ] {
+            add_named_tensor_retained(tensor, &mut bytes, "wav2vec2-ctc layer tensor")?;
+        }
+    }
+    Ok(bytes.finish())
+}
+
+fn add_named_tensor_retained(
+    tensor: &NamedTensor,
+    bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
+    label: &str,
+) -> Result<(), String> {
+    bytes.add_string(&tensor.name, &format!("{label} name"))?;
+    bytes.add_vec(&tensor.dims, &format!("{label} dims"))?;
+    bytes.add_vec(&tensor.values, &format!("{label} values"))
+}
+
 fn load_named(
     reader: &GgufTensorDataReader,
     name: &str,
@@ -112,9 +398,8 @@ fn load_named(
             tensor_name: name.to_string(),
         })
     })?;
+    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &tensor.dims)?;
     let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-    let shape_u64: Vec<u64> = tensor.dims.clone();
-    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &shape_u64)?;
     Ok(NamedTensor {
         name: name.to_string(),
         dims,
