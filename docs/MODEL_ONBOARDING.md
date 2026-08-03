@@ -54,6 +54,10 @@ purpose — the exact symbol names drift, so read the code for current names:
   matches the descriptor's shape / kind / scope / count (`arch/`).
 - Registries for the audio frontend, tokenizer, prepared-runtime cache, and
   runtime tensor contract, keyed by the component ids on your descriptor.
+- One-open GGUF provenance through
+  [`GgufRuntimeSourcePreflight`](design/runtime-source-preflight.md): contract
+  validation, quoting, tensor readers, graph actors, and native weight contexts
+  all consume the same preflighted file generation.
 - Universal local file Voice ID routing. The architecture descriptor's
   `speaker_segmentation` selects either the family's in-decoder turns or the
   shared external FireRed/segmenter/ReDimNet/clustering path; both feed one
@@ -100,6 +104,9 @@ permits:
   at their **native quantized type** — see [Runtime contract: keep quantized
   weights quantized](#runtime-contract-keep-quantized-weights-quantized).
   Dequantizing everything to f32 here silently throws away the whole q8/q4 win.
+  Production constructors accept the shared runtime preflight, never a path or
+  bare runtime source; see the
+  [runtime-source provenance contract](design/runtime-source-preflight.md).
 - **Audio encoder** glue — assemble its stage via the shared `compose_*` walker
   over the appropriate `nn/` block; add a new block under `nn/` only if your
   attention variant or head does not exist yet.

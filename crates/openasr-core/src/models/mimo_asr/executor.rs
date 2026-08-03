@@ -443,12 +443,14 @@ impl MimoAsrPreparedRuntime {
                 }
             })?;
 
-        let runtime_source = &preflight.runtime_source;
-        let encoder_runtime =
-            MimoAudiotokEncoderRuntime::new(runtime_source, audiotok_metadata.clone(), backend)
-                .map_err(|error| MimoAsrExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                })?;
+        let encoder_runtime = MimoAudiotokEncoderRuntime::new_from_preflight(
+            preflight,
+            audiotok_metadata.clone(),
+            backend,
+        )
+        .map_err(|error| MimoAsrExecutorError::EncoderFailed {
+            reason: error.to_string(),
+        })?;
 
         let codebooks =
             load_mimo_rvq_codebooks_from_reader(&reader, &audiotok_metadata).map_err(|error| {
@@ -485,17 +487,16 @@ impl MimoAsrPreparedRuntime {
             reason: error.to_string(),
         })?;
 
-        let inlocal_runtime = MimoInputLocalRuntime::new(runtime_source, inlocal_metadata, backend)
-            .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
-                reason: error.to_string(),
-            })?;
-
-        let decoder =
-            MimoLlmDecoderRuntime::new(runtime_source, llm_metadata, backend).map_err(|error| {
-                MimoAsrExecutorError::DecoderFailed {
+        let inlocal_runtime =
+            MimoInputLocalRuntime::new_from_preflight(preflight, inlocal_metadata, backend)
+                .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
+
+        let decoder = MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, backend)
+            .map_err(|error| MimoAsrExecutorError::DecoderFailed {
+            reason: error.to_string(),
+        })?;
 
         Ok(Self {
             encoder_runtime,

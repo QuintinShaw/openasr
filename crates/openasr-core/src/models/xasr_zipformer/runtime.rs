@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::GgmlRuntimeSource;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReader,
+    build_runtime_tensor_reader_from_preflight,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout,
@@ -180,36 +182,36 @@ pub(super) fn new_runtime_actor_pool() -> XasrRuntimeActorPool {
 
 pub(super) fn checkout_prepared_runtime(
     pool: &XasrRuntimeActorPool,
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &GgufRuntimeSourcePreflight,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<XasrRuntimeActor, String> {
     let backend = xasr_zipformer_encoder_graph_config(resolved_backend).backend;
     let key = (
-        PackContentKey::for_runtime_source(runtime_source),
+        PackContentKey::for_runtime_source(&preflight.runtime_source),
         current_execution_lane_key(backend),
     );
-    let source = runtime_source.clone();
-    let pack_content_id = runtime_source.content_id().to_string();
+    let preflight = preflight.clone();
+    let pack_content_id = preflight.runtime_source.content_id().to_string();
     pool.checkout_or_try_build_with(
         key,
         move || {
-            let reader = GgufTensorDataReader::from_runtime_source(&source)
-                .map_err(|error| error.to_string())?;
-            let metadata = crate::ggml_runtime::read_gguf_metadata_from_runtime_source(&source)
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight)
                 .map_err(|error| error.to_string())?;
             let quote = xasr_runtime_system_memory_quote(
-                &metadata,
+                &preflight.metadata,
                 reader.tensor_index(),
                 &pack_content_id,
             )
             .map_err(|error| error.to_string())?;
-            Ok((quote.retained_bytes, (reader, metadata, quote, backend)))
+            Ok((quote.retained_bytes, (preflight, reader, quote, backend)))
         },
-        |(reader, metadata, quote, backend)| match SystemMemoryOwner::try_allocate_transaction(
+        |(preflight, reader, quote, backend)| match SystemMemoryOwner::try_allocate_transaction(
             quote,
             || {
                 let runtime = XasrZipformerPreparedRuntime::from_reader_metadata(
-                    &reader, &metadata, backend,
+                    &reader,
+                    &preflight.metadata,
+                    backend,
                 )?;
                 let retained = runtime.retained_system_memory_bytes;
                 Ok(SystemMemoryAllocationOutcome::new(
@@ -385,20 +387,17 @@ fn xasr_runtime_system_memory_quote(
 
 impl XasrZipformerPreparedRuntime {
     pub(super) fn load(
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, String> {
         let profile = xasr_profile_start();
         let reader =
-            GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|e| e.to_string())?;
-        let gguf_metadata =
-            crate::ggml_runtime::read_gguf_metadata_from_runtime_source(runtime_source)
-                .map_err(|e| e.to_string())?;
-        let runtime = Self::from_reader_metadata(&reader, &gguf_metadata, backend)?;
+            build_runtime_tensor_reader_from_preflight(preflight).map_err(|e| e.to_string())?;
+        let runtime = Self::from_reader_metadata(&reader, &preflight.metadata, backend)?;
         xasr_profile_log(
             "runtime_load",
             profile,
-            format_args!("pack={}", runtime_source.path().display()),
+            format_args!("pack={}", preflight.runtime_source.path().display()),
         );
         Ok(runtime)
     }
@@ -807,10 +806,10 @@ mod tests {
         };
 
         let resolved_backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&pack)
+            .expect("runtime preflight");
         let pool = new_runtime_actor_pool();
-        let runtime = checkout_prepared_runtime(&pool, &runtime_source, resolved_backend)
+        let runtime = checkout_prepared_runtime(&pool, &preflight, resolved_backend)
             .expect("first checkout must build");
         drop(runtime);
         assert_eq!(pool.usage_for_test().0, 1);
@@ -818,7 +817,7 @@ mod tests {
         pool.clear();
         assert_eq!(pool.usage_for_test(), (0, 0));
 
-        let rebuilt = checkout_prepared_runtime(&pool, &runtime_source, resolved_backend)
+        let rebuilt = checkout_prepared_runtime(&pool, &preflight, resolved_backend)
             .expect("checkout after clear must rebuild");
         let samples = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)

@@ -12,8 +12,8 @@ use std::{
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
 use crate::arch::{
-    DEFAULT_ENCODER_CHUNK_SECONDS, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
-    SpeakerSegmentationSource, emits_punctuation_for_model_architecture,
+    DEFAULT_ENCODER_CHUNK_SECONDS, OpenAsrArchitectureRegistry, SpeakerSegmentationSource,
+    emits_punctuation_for_model_architecture,
 };
 use crate::device::{
     execution_policy::{
@@ -22,9 +22,7 @@ use crate::device::{
     },
     execution_route::enumerate_compute_devices_from_ggml,
 };
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference, read_gguf_metadata,
-};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference};
 #[cfg(test)]
 use crate::longform::plan_longform_slices;
 use crate::longform::{
@@ -1050,6 +1048,15 @@ struct NativeLongformPolicyResolution {
     provenance: Vec<String>,
 }
 
+/// The offline decode result plus the immutable facts selected during the one
+/// model preflight. Post-processing consumes this outcome rather than opening
+/// the primary model path again to rediscover a descriptor capability.
+struct NativeTranscriptionOutcome {
+    transcription: Transcription,
+    prepared_audio: PcmBuffer,
+    emits_punctuation: Option<bool>,
+}
+
 /// Entry point for the native backend: runs the ordinary decode/longform/
 /// diarization pipeline unchanged (`run_native_transcription_impl`), then --
 /// gated on the resolved model's `emits_punctuation` capability and the
@@ -1169,7 +1176,6 @@ fn run_native_transcription_fallible(
     // monotonic bar rather than running uncounted.
     let _progress = ProgressRegistryHandle::new(execution_context.request_id.clone());
     let language_hint = request.language.clone();
-    let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
     // Every independent native model stage resolves from this same immutable
     // product intent. Each stage still owns its own capability matrix and
@@ -1187,7 +1193,11 @@ fn run_native_transcription_fallible(
     // finer `audio_prep` sub-stage nests inside `inference`'s span rather than
     // being disjoint from it, which is called out in both log lines' names.
     let inference_started = Instant::now();
-    let (transcription, prepared_audio) = run_native_transcription_impl(
+    let NativeTranscriptionOutcome {
+        transcription,
+        prepared_audio,
+        emits_punctuation,
+    } = run_native_transcription_impl(
         request,
         execution_services,
         Some(request_execution_intent.clone()),
@@ -1203,7 +1213,7 @@ fn run_native_transcription_fallible(
     let postprocess_started = Instant::now();
     let transcription = apply_punctuation_stage_with_policy(
         transcription,
-        model_pack_path.as_deref(),
+        emits_punctuation,
         punctuate,
         execution_services,
         &request_execution_intent,
@@ -1242,19 +1252,6 @@ fn should_run_punctuation_stage(punctuate: bool, emits_punctuation: Option<bool>
     punctuate && should_apply_punctuation(emits_punctuation)
 }
 
-/// The `general.architecture` value's `emits_punctuation` capability for the
-/// pack at `model_pack_path`, or `None` when the path is absent or its
-/// metadata cannot be read/does not declare a known architecture -- callers
-/// treat `None` exactly like an ASR family with unknown punctuation status
-/// (stage does not run), never a hard error: this is a best-effort read of
-/// metadata already validated once by `run_native_transcription_impl`.
-fn model_emits_punctuation(model_pack_path: Option<&Path>) -> Option<bool> {
-    let path = model_pack_path?;
-    let metadata = read_gguf_metadata(path).ok()?;
-    let architecture = metadata.get_string(GENERAL_ARCHITECTURE_KEY)?;
-    emits_punctuation_for_model_architecture(architecture)
-}
-
 /// Punctuation-restoration post-process: runs only for an ASR result the
 /// catalog honestly declares unpunctuated, and only when the FireRedPunc
 /// capability pack is installed. Fail-closed by design -- a missing pack, a
@@ -1264,11 +1261,11 @@ fn model_emits_punctuation(model_pack_path: Option<&Path>) -> Option<bool> {
 #[cfg(test)]
 fn apply_punctuation_stage_if_applicable(
     transcription: Transcription,
-    model_pack_path: Option<&Path>,
+    emits_punctuation: Option<bool>,
     punctuate: bool,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Transcription {
-    if !should_run_punctuation_stage(punctuate, model_emits_punctuation(model_pack_path)) {
+    if !should_run_punctuation_stage(punctuate, emits_punctuation) {
         return transcription;
     }
     let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
@@ -1282,12 +1279,12 @@ fn apply_punctuation_stage_if_applicable(
 
 fn apply_punctuation_stage_with_policy(
     transcription: Transcription,
-    model_pack_path: Option<&Path>,
+    emits_punctuation: Option<bool>,
     punctuate: bool,
     execution_services: &NativeExecutionServices,
     request_intent: &ExecutionIntent,
 ) -> Result<Transcription, BackendError> {
-    if !should_run_punctuation_stage(punctuate, model_emits_punctuation(model_pack_path)) {
+    if !should_run_punctuation_stage(punctuate, emits_punctuation) {
         return Ok(transcription);
     }
     let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
@@ -1578,7 +1575,7 @@ fn run_native_transcription_impl(
     mut request: TranscriptionRequest,
     execution_services: &Arc<NativeExecutionServices>,
     execution_intent: Option<ExecutionIntent>,
-) -> Result<(Transcription, PcmBuffer), BackendError> {
+) -> Result<NativeTranscriptionOutcome, BackendError> {
     // Captured up front and threaded explicitly through the dispatch calls
     // below (never a thread-local): every cooperative cancel checkpoint in
     // this function and the shared decode driver reads this same `Arc`.
@@ -1609,6 +1606,8 @@ fn run_native_transcription_impl(
         runtime_preflight.runtime_source.path(),
         &selection_metadata,
     )?;
+    let emits_punctuation =
+        emits_punctuation_for_model_architecture(selected_family.model_architecture);
     let request_execution_intent = execution_intent
         .unwrap_or_else(|| ExecutionIntent::from(request.execution_target.unwrap_or_default()));
     let execution_plan = resolve_native_execution_plan(
@@ -1943,8 +1942,8 @@ fn run_native_transcription_impl(
             "identity"
         };
         if plan.slices.is_empty() {
-            return Ok((
-                Transcription {
+            return Ok(NativeTranscriptionOutcome {
+                transcription: Transcription {
                     truncated_decodes: Vec::new(),
                     unnamed_speakers: Vec::new(),
                     text: String::new(),
@@ -1962,7 +1961,8 @@ fn run_native_transcription_impl(
                     language: reported_language.clone(),
                 },
                 prepared_audio,
-            ));
+                emits_punctuation,
+            });
         }
         if has_processed_audio || plan.slices.len() > 1 {
             let mut assembler =
@@ -2303,7 +2303,11 @@ fn run_native_transcription_impl(
                     reported_language.clone(),
                     fallback_truncated_decodes,
                 )?;
-                return Ok((transcription, prepared_audio));
+                return Ok(NativeTranscriptionOutcome {
+                    transcription,
+                    prepared_audio,
+                    emits_punctuation,
+                });
             }
             let transcription = finalize_native_transcription(
                 assembled,
@@ -2318,7 +2322,11 @@ fn run_native_transcription_impl(
                 reported_language.clone(),
                 truncated_decodes,
             )?;
-            return Ok((transcription, prepared_audio));
+            return Ok(NativeTranscriptionOutcome {
+                transcription,
+                prepared_audio,
+                emits_punctuation,
+            });
         }
         longform_metadata = Some(build_longform_metadata(
             &longform_options,
@@ -2398,7 +2406,11 @@ fn run_native_transcription_impl(
         reported_language,
         truncated_decodes,
     )?;
-    Ok((transcription, prepared_audio))
+    Ok(NativeTranscriptionOutcome {
+        transcription,
+        prepared_audio,
+        emits_punctuation,
+    })
 }
 
 /// Render one truncated slice for the `core.native.decode.truncated`
@@ -5902,56 +5914,27 @@ mod tests {
     }
 
     #[test]
-    fn model_emits_punctuation_reads_the_architectures_capability_from_pack_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let dolphin_pack = dir.path().join("dolphin.oasr");
-        let mut dolphin_metadata = std::collections::BTreeMap::new();
-        dolphin_metadata.insert(
-            GENERAL_ARCHITECTURE_KEY.to_string(),
-            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
-        );
-        crate::testing::write_tiny_gguf_runtime_source(
-            &dolphin_pack,
-            &crate::testing::TinyGgufFixtureSpec::new(dolphin_metadata),
-        )
-        .expect("write dolphin fixture");
+    fn punctuation_capability_is_derived_from_selected_architecture() {
         // Dolphin's cn-dialect training corpus is honestly unpunctuated.
-        assert_eq!(model_emits_punctuation(Some(&dolphin_pack)), Some(false));
-
-        let whisper_pack = dir.path().join("whisper.oasr");
-        let mut whisper_metadata = std::collections::BTreeMap::new();
-        whisper_metadata.insert(
-            GENERAL_ARCHITECTURE_KEY.to_string(),
-            crate::arch::WHISPER_GGML_ARCHITECTURE_ID.to_string(),
-        );
-        crate::testing::write_tiny_gguf_runtime_source(
-            &whisper_pack,
-            &crate::testing::TinyGgufFixtureSpec::new(whisper_metadata),
-        )
-        .expect("write whisper fixture");
-        assert_eq!(model_emits_punctuation(Some(&whisper_pack)), Some(true));
-
-        let unknown_pack = dir.path().join("unknown.oasr");
-        crate::testing::write_tiny_gguf_runtime_source(
-            &unknown_pack,
-            &crate::testing::TinyGgufFixtureSpec::new(std::collections::BTreeMap::new()),
-        )
-        .expect("write unknown fixture");
-        assert_eq!(model_emits_punctuation(Some(&unknown_pack)), None);
-
-        assert_eq!(model_emits_punctuation(None), None);
         assert_eq!(
-            model_emits_punctuation(Some(Path::new("/nonexistent/pack.oasr"))),
+            emits_punctuation_for_model_architecture(crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID),
+            Some(false)
+        );
+        assert_eq!(
+            emits_punctuation_for_model_architecture(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
+            Some(true)
+        );
+        assert_eq!(
+            emits_punctuation_for_model_architecture("unknown-architecture"),
             None
         );
     }
 
     #[test]
     fn apply_punctuation_stage_leaves_transcription_unchanged_when_stage_does_not_run() {
-        // No model pack path at all -> `model_emits_punctuation` is `None` ->
-        // the stage never runs, regardless of the FireRedPunc pack's install
-        // state on this machine -- fail-closed, never fabricated punctuation.
+        // An unknown selected architecture (`None`) means the stage never runs,
+        // regardless of the FireRedPunc pack's install state on this machine --
+        // fail-closed, never fabricated punctuation.
         let transcription = Transcription {
             truncated_decodes: Vec::new(),
             unnamed_speakers: Vec::new(),
@@ -5991,7 +5974,7 @@ mod tests {
         let pack_path = dir.join("whisper.oasr");
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert(
-            GENERAL_ARCHITECTURE_KEY.to_string(),
+            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
             crate::arch::WHISPER_GGML_ARCHITECTURE_ID.to_string(),
         );
         crate::testing::write_tiny_gguf_runtime_source(

@@ -23,6 +23,7 @@ use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
     GGML_TYPE_F32, GgmlCpuGraphBackend, GgufMetadata, GgufOwnedWeightTensorPayload,
     GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
+    build_runtime_tensor_reader_from_preflight,
 };
 use crate::models::admitted_host_object_cache::{
     AdmittedHostObjectCache, AdmittedHostObjectCacheLimits,
@@ -910,7 +911,7 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         // `auto_gpu_policy = AllBackends`), carried as an explicit field --
         // never re-derived from a thread-local here.
         let backend = request.resolved_runtime.backend();
-        let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
         // The immutable dequantized/native-mapped table is admitted once per
         // content id. Backend-bound mutable runtimes are then checked out from

@@ -435,7 +435,9 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ggml_runtime::{GgufTensorDataReader, read_gguf_metadata};
+    use crate::ggml_runtime::{
+        build_runtime_tensor_reader_from_preflight, load_runtime_source_metadata_and_tensor_index,
+    };
     use crate::models::xasr_zipformer::executor::transcribe_xasr_zipformer_pcm;
 
     #[test]
@@ -496,8 +498,10 @@ mod tests {
             "xasr accelerated parity test",
         )
         .expect("sample wav should load");
-        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
-        let metadata = read_gguf_metadata(&pack).expect("metadata");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+        let metadata = preflight.metadata.as_ref();
 
         // The encoder gate keys off the explicit request preference: CpuOnly
         // must resolve a CPU config, Accelerated must keep the GPU-class
@@ -517,7 +521,7 @@ mod tests {
             );
             let started = std::time::Instant::now();
             let text =
-                transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false, resolved)
+                transcribe_xasr_zipformer_pcm(&reader, metadata, &samples, None, false, resolved)
                     .expect("cpu xasr")
                     .text;
             (text, started.elapsed())
@@ -535,7 +539,7 @@ mod tests {
             );
             let started = std::time::Instant::now();
             let text =
-                transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false, resolved)
+                transcribe_xasr_zipformer_pcm(&reader, metadata, &samples, None, false, resolved)
                     .expect("gpu xasr")
                     .text;
             (text, started.elapsed())
@@ -567,10 +571,10 @@ mod tests {
             "xasr streaming parity test",
         )
         .expect("sample wav should load");
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
-        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
-        let metadata = read_gguf_metadata(&pack).expect("metadata");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+        let metadata = preflight.metadata.as_ref();
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
@@ -579,7 +583,7 @@ mod tests {
         );
         let batch = transcribe_xasr_zipformer_pcm(
             &reader,
-            &metadata,
+            metadata,
             &samples,
             None,
             false,
@@ -611,7 +615,7 @@ mod tests {
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             super::super::runtime::checkout_prepared_runtime(
                 &runtime_pool,
-                &runtime_source,
+                &preflight,
                 resolved_runtime.backend(),
             )
             .expect("streaming runtime"),
@@ -664,8 +668,8 @@ mod tests {
             eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
             return;
         }
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
@@ -694,7 +698,7 @@ mod tests {
             .expect("sample wav should load");
             let runtime = super::super::runtime::checkout_prepared_runtime(
                 &runtime_pool,
-                &runtime_source,
+                &preflight,
                 resolved_runtime.backend(),
             )
             .expect("streaming runtime");
@@ -760,14 +764,14 @@ mod tests {
             eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
             return;
         }
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
         let runtime_pool = super::super::runtime::new_runtime_actor_pool();
         let runtime = super::super::runtime::checkout_prepared_runtime(
             &runtime_pool,
-            &runtime_source,
+            &preflight,
             request.resolved_runtime.backend(),
         )
         .expect("streaming runtime");
@@ -851,8 +855,8 @@ mod tests {
         )
         .expect("sample wav should load");
 
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
         let runtime_pool = super::super::runtime::new_runtime_actor_pool();
@@ -860,7 +864,7 @@ mod tests {
         let transcribe = |warm_up: bool| -> String {
             let runtime = super::super::runtime::checkout_prepared_runtime(
                 &runtime_pool,
-                &runtime_source,
+                &preflight,
                 request.resolved_runtime.backend(),
             )
             .expect("streaming runtime");

@@ -20,18 +20,14 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::GgufTensorDataReadError;
+use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraniteSpeechRuntimeProviderError {
-    #[error("granite-speech runtime provider failed to open pack '{path}': {source}")]
-    Open {
-        path: String,
-        #[source]
-        source: GgufTensorDataReadError,
-    },
+    #[error("granite-speech runtime provider failed to build reader for pack '{path}': {reason}")]
+    Preflight { path: String, reason: String },
     #[error("granite-speech runtime provider failed to read tensor '{name}': {source}")]
     Read {
         name: String,
@@ -51,22 +47,16 @@ fn unmap_tensor_name(packed_name: &str) -> String {
     }
 }
 
-/// Loads every tensor in `pack_path` whose *original* (pre-remap) name starts
-/// with `prefix` into a `HashMap<original_name, f32 values>`, dequantizing
-/// F16/quantized tensors to F32 on the way. `prefix` is one of
-/// `"encoder."`/`"projector."`/`"language_model."`, matching the three
-/// `*WeightProvider` traits' expected keys.
-pub(crate) fn load_tensors_from_oasr_pack(
-    pack_path: &Path,
+pub(crate) fn load_tensors_from_preflight(
+    preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     prefix: &str,
 ) -> Result<HashMap<String, Vec<f32>>, GraniteSpeechRuntimeProviderError> {
-    let reader = GgufTensorDataReader::from_path(pack_path).map_err(|source| {
-        GraniteSpeechRuntimeProviderError::Open {
-            path: pack_path.display().to_string(),
-            source,
+    let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+        GraniteSpeechRuntimeProviderError::Preflight {
+            path: preflight.runtime_source.path().display().to_string(),
+            reason: error.to_string(),
         }
     })?;
-
     let mut out = HashMap::new();
     for tensor in reader.tensor_index().tensors() {
         let original_name = unmap_tensor_name(&tensor.name);

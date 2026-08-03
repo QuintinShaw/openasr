@@ -13,8 +13,9 @@
 
 #![allow(dead_code)]
 
-use crate::GgmlRuntimeSource;
-use crate::ggml_runtime::{GgmlCpuGraphError, GgmlStaticTensor, WeightSlot};
+use crate::ggml_runtime::{
+    GgmlCpuGraphError, GgmlStaticTensor, GgufRuntimeSourcePreflight, WeightSlot,
+};
 use crate::models::fastconformer::{
     self, FastConformerEncoderCore, FastConformerGraphError, FastConformerStackConfig,
 };
@@ -80,7 +81,7 @@ impl ParakeetCtcEncoderGraph {
     pub(crate) fn new(
         weights: &ParakeetEncoderWeights,
         metadata: ParakeetCtcExecutionMetadata,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetEncoderError> {
         let config = parakeet_ctc_encoder_graph_config(backend);
@@ -93,7 +94,7 @@ impl ParakeetCtcEncoderGraph {
         let (core, (ctc_head_weight, ctc_head_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_ENCODER_GRAPH_CONTEXT_BYTES,
-            runtime_source,
+            runtime_preflight,
             &weights.subsampling,
             &weights.layers,
             |arena, loaded| {
@@ -209,7 +210,9 @@ impl ParakeetCtcEncoderGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ggml_runtime::GgufTensorDataReader;
+    use crate::ggml_runtime::{
+        build_runtime_tensor_reader_from_preflight, load_runtime_source_metadata_and_tensor_index,
+    };
     use crate::models::fastconformer::graph::conv_out_dim;
     use crate::models::parakeet_ctc::encoder_weights::load_parakeet_ctc_encoder_weights;
     use crate::models::parakeet_ctc::runtime_contract::parse_parakeet_ctc_execution_metadata;
@@ -227,17 +230,17 @@ mod tests {
             eprintln!("skipping: parakeet-ctc-0.6b pack not present");
             return;
         };
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&path).expect("runtime source");
-        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
-        let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&path).expect("gguf metadata");
-        let metadata = parse_parakeet_ctc_execution_metadata(&gguf_metadata).expect("metadata");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&path).expect("runtime preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+        let gguf_metadata = preflight.metadata.as_ref();
+        let metadata = parse_parakeet_ctc_execution_metadata(gguf_metadata).expect("metadata");
         let weights = load_parakeet_ctc_encoder_weights(&reader, &metadata).expect("weights");
 
         let mut graph = ParakeetCtcEncoderGraph::new(
             &weights,
             metadata,
-            Some(&runtime_source),
+            Some(&preflight),
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("graph");

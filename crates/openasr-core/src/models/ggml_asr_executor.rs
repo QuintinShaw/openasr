@@ -10,14 +10,14 @@ use std::{
 use thiserror::Error;
 
 use crate::api::backend::DecodeTruncation;
+#[cfg(any(test, feature = "testing"))]
+use crate::ggml_runtime::RuntimeSourceMetadataAndTensorIndexPreflightError;
 use crate::ggml_runtime::{
     RequestBackendPreference, install_request_backend_override, request_backend_override,
 };
 use crate::models::ggml_family_registry::WHISPER_GGML_ADAPTER_ID;
-use crate::models::runtime_preflight::{
-    RuntimeSourceMetadataAndTensorIndexPreflightError,
-    load_runtime_source_metadata_and_tensor_index,
-};
+#[cfg(any(test, feature = "testing"))]
+use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index;
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, LongFormOptions,
     NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice, PhraseBiasConfig, RealtimeAudioFormat,
@@ -813,6 +813,9 @@ pub struct GgmlAsrExecutionRequest {
     /// integration fills this after request/session planning is wired.
     pub(crate) decoder_state: GgmlAsrDecoderState,
     pub runtime_source_path: PathBuf,
+    /// Required on every production request. `None` exists only so isolated
+    /// test fixtures can ask the resolver to construct their preflight; a
+    /// production build fails closed with `MissingPreflight`.
     pub runtime_source_preflight: Option<GgmlAsrRuntimeSourcePreflight>,
     pub selected_family: GgmlFamilyAdapterDescriptor,
     pub prepared_audio: GgmlAsrPreparedAudio,
@@ -968,6 +971,8 @@ pub struct GgmlAsrStreamingSessionRequest {
     pub execution_services: Arc<crate::models::native_execution_services::NativeExecutionServices>,
     pub(crate) decoder_state: GgmlAsrDecoderState,
     pub runtime_source_path: PathBuf,
+    /// Required on every production session; see
+    /// [`GgmlAsrExecutionRequest::runtime_source_preflight`].
     pub runtime_source_preflight: Option<GgmlAsrRuntimeSourcePreflight>,
     pub selected_family: GgmlFamilyAdapterDescriptor,
     pub request_options: GgmlAsrExecutionOptions,
@@ -988,6 +993,9 @@ pub struct GgmlAsrStreamingSessionRequest {
 
 #[derive(Debug, Error)]
 pub(crate) enum GgmlAsrExecutionRequestPreflightError {
+    #[error("execution request for '{request_path}' is missing its required runtime preflight")]
+    #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
+    MissingPreflight { request_path: String },
     #[error(
         "runtime preflight path '{preflight_path}' does not match execution request path '{request_path}'"
     )]
@@ -995,6 +1003,7 @@ pub(crate) enum GgmlAsrExecutionRequestPreflightError {
         preflight_path: String,
         request_path: String,
     },
+    #[cfg(any(test, feature = "testing"))]
     #[error("could not load runtime preflight from '{request_path}': {source}")]
     LoadFailed {
         request_path: String,
@@ -1072,14 +1081,21 @@ fn resolve_runtime_source_preflight<'a>(
         }
         return Ok(Cow::Borrowed(preflight));
     }
-    let preflight =
-        load_runtime_source_metadata_and_tensor_index(runtime_source_path).map_err(|source| {
-            GgmlAsrExecutionRequestPreflightError::LoadFailed {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let preflight = load_runtime_source_metadata_and_tensor_index(runtime_source_path)
+            .map_err(|source| GgmlAsrExecutionRequestPreflightError::LoadFailed {
                 request_path: runtime_source_path.display().to_string(),
                 source: Box::new(source),
-            }
-        })?;
-    Ok(Cow::Owned(preflight))
+            })?;
+        Ok(Cow::Owned(preflight))
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        Err(GgmlAsrExecutionRequestPreflightError::MissingPreflight {
+            request_path: runtime_source_path.display().to_string(),
+        })
+    }
 }
 
 impl GgmlAsrStreamingSessionRequest {
@@ -1095,12 +1111,23 @@ impl GgmlAsrStreamingSessionRequest {
             }
             return Ok(Cow::Borrowed(preflight));
         }
-        let preflight = load_runtime_source_metadata_and_tensor_index(&self.runtime_source_path)
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let preflight = load_runtime_source_metadata_and_tensor_index(
+                &self.runtime_source_path,
+            )
             .map_err(|source| GgmlAsrExecutionRequestPreflightError::LoadFailed {
                 request_path: self.runtime_source_path.display().to_string(),
                 source: Box::new(source),
             })?;
-        Ok(Cow::Owned(preflight))
+            Ok(Cow::Owned(preflight))
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            Err(GgmlAsrExecutionRequestPreflightError::MissingPreflight {
+                request_path: self.runtime_source_path.display().to_string(),
+            })
+        }
     }
 }
 

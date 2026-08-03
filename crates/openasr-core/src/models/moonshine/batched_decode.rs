@@ -13,6 +13,7 @@ use super::tokenizer::MoonshineTokenizer;
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqTextPostprocessKind;
+use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::phrase_bias_decode::build_token_phrase_biases;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
@@ -76,7 +77,7 @@ pub(crate) struct MoonshineServeBatchJob {
     /// instead of a fresh `File::open`/`load_gguf_weight_context` by path,
     /// so identity and weight bytes come from one open even across this
     /// thread boundary.
-    pub runtime_source: crate::GgmlRuntimeSource,
+    pub runtime_preflight: GgmlAsrRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -211,7 +212,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
                 backend: job.backend,
             },
             false,
-            Some(&job.runtime_source),
+            Some(&job.runtime_preflight),
             None,
         )
         .map_err(map_decoder_error)
@@ -224,7 +225,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             job.decoder_state,
             job.backend,
             false,
-            Some(&job.runtime_source),
+            Some(&job.runtime_preflight),
             n_seq,
             None,
         )
@@ -949,8 +950,8 @@ mod tests {
             suppress_token_ids: Vec::new(),
             phrase_biases: Vec::new(),
         };
-        let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
-            .expect("valid runtime source path");
+        let runtime_preflight = read_runtime_source_preflight(runtime_path);
+        let runtime_source = runtime_preflight.runtime_source.clone();
         let decoder_state = decoder_state(prepared_runtime.metadata, encoder_output.frame_count);
         MoonshineServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
@@ -960,7 +961,7 @@ mod tests {
                 "adapter=none",
                 runtime_source.content_id(),
             ),
-            runtime_source,
+            runtime_preflight,
             backend,
             uses_scheduler,
             prepared_runtime: Arc::new(
@@ -1134,8 +1135,8 @@ mod tests {
                 suppress_token_ids: vec![metadata.eos_token_id],
                 phrase_biases: Vec::new(),
             };
-            let runtime_source = crate::validate_ggml_runtime_source_path(&runtime_path)
-                .expect("valid runtime source path");
+            let runtime_preflight = read_runtime_source_preflight(&runtime_path);
+            let runtime_source = runtime_preflight.runtime_source.clone();
             let decoder_state = decoder_state(metadata, encoder_output.frame_count);
             MoonshineServeBatchJob {
                 runtime_cache_path: runtime_path.to_path_buf(),
@@ -1145,7 +1146,7 @@ mod tests {
                     "adapter=none",
                     runtime_source.content_id(),
                 ),
-                runtime_source,
+                runtime_preflight,
                 backend: runtime_config.backend,
                 uses_scheduler: runtime_config.use_scheduler,
                 prepared_runtime: Arc::new(

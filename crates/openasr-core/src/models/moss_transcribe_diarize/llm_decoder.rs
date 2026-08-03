@@ -76,25 +76,24 @@ impl MossTdDecoderRuntime {
         self.whole_decoder.retained_system_memory_bytes()
     }
 
-    pub(crate) fn new_with_prepared_state(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn new_with_prepared_state_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MossTdDecoderMetadata,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         logits_head: Arc<Qwen3AsrLlmLogitsHead>,
         token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
-                &decoder_plan,
-                runtime_source,
-                MOSS_TD_RMS_NORM_EPSILON,
-                logits_head.fused_top1_spec(),
-                backend,
-            )
-            .map_err(|error| MossTdDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
+        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
+            &decoder_plan,
+            preflight,
+            MOSS_TD_RMS_NORM_EPSILON,
+            logits_head.fused_top1_spec(),
+            backend,
+        )
+        .map_err(|error| MossTdDecoderError::GraphFailed {
+            reason: error.to_string(),
+        })?;
         let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
             MossTdDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),

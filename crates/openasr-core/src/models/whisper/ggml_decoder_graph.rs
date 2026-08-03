@@ -12,11 +12,10 @@ use std::{
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -1480,7 +1479,7 @@ impl WhisperDecoderPersistentWeightCache {
         source: &dyn WhisperDecoderTensorSource,
         tensor_cache: &mut WhisperDecoderExecutionTensorCache,
         self_kv_max_positions: usize,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         Self::build_static_stage_with_n_seq(
             runner,
@@ -1488,7 +1487,7 @@ impl WhisperDecoderPersistentWeightCache {
             source,
             tensor_cache,
             self_kv_max_positions,
-            runtime_source,
+            runtime_preflight,
             1,
         )
     }
@@ -1499,7 +1498,7 @@ impl WhisperDecoderPersistentWeightCache {
         source: &dyn WhisperDecoderTensorSource,
         tensor_cache: &mut WhisperDecoderExecutionTensorCache,
         self_kv_max_positions: usize,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         n_seq: usize,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         if n_seq == 0 {
@@ -1522,8 +1521,11 @@ impl WhisperDecoderPersistentWeightCache {
         // cross-attention K/V projections are EXCLUDED: their static arena tensors
         // are referenced directly by the cross-attention precompute task, so they
         // must remain arena-resident.
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let cross_kv_excluded_keys: HashSet<LocalLinearWeightCacheKey> = plan
             .layers
             .iter()

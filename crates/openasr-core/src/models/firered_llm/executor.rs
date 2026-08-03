@@ -304,27 +304,31 @@ impl FireRedLlmGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
         metadata: super::runtime_contract::FireRedLlmDecoderMetadata,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FireRedLlmDecoderRuntimeActor, FireRedLlmExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             kv_capacity.resident_positions(),
         );
-        let quote_source = runtime_source.clone();
-        let build_source = runtime_source.clone();
-        let content_id = runtime_source.content_id().to_string();
+        let quote_preflight = preflight.clone();
+        let build_preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
                 let reader =
-                    crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(&quote_source)
-                        .map_err(|error| FireRedLlmExecutorError::RuntimeOwnershipFailed {
-                        stage: "decoder",
-                        reason: format!("decoder quote tensor reader failed: {error}"),
+                    crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(
+                        &quote_preflight,
+                    )
+                    .map_err(|error| {
+                        FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason: format!("decoder quote tensor reader failed: {error}"),
+                        }
                     })?;
                 let (peak_bytes, retained_bytes) =
                     super::llm_transformer::quoted_firered_llm_decoder_system_memory_bytes(
@@ -350,14 +354,15 @@ impl FireRedLlmGgmlExecutor {
                         reason: error.to_string(),
                     }
                 })?;
-                Ok((retained_bytes, (build_source, metadata, backend, quote)))
+                Ok((retained_bytes, (build_preflight, metadata, backend, quote)))
             },
-            move |(source, metadata, backend, quote)| {
+            move |(preflight, metadata, backend, quote)| {
                 match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                    let runtime = FireRedLlmDecoderRuntime::new(&source, metadata, backend)
-                        .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
-                            reason: error.to_string(),
-                        })?;
+                    let runtime =
+                        FireRedLlmDecoderRuntime::new_from_preflight(&preflight, metadata, backend)
+                            .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
+                                reason: error.to_string(),
+                            })?;
                     let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
                         FireRedLlmExecutorError::RuntimeOwnershipFailed {
                             stage: "decoder",
@@ -474,9 +479,8 @@ impl FireRedLlmGgmlExecutor {
             },
         )?;
 
-        let runtime_source = &preflight.runtime_source;
-        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
-            runtime_source,
+        let mut encoder_runtime = FireRedEncoderGraphRuntime::new_from_preflight(
+            &preflight,
             encoder_metadata,
             request.resolved_runtime.backend(),
         )
@@ -490,11 +494,13 @@ impl FireRedLlmGgmlExecutor {
             })?;
 
         let adapter_profile_started_at = std::time::Instant::now();
-        let mut adapter_runtime =
-            FireRedLlmAdapterGraphRuntime::new(runtime_source, request.resolved_runtime.backend())
-                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-                    reason: error.to_string(),
-                })?;
+        let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
+            &preflight,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+            reason: error.to_string(),
+        })?;
         let (speech_rows, speech_frame_count) = adapter_runtime
             .run(
                 &encoder_output.rows,
@@ -546,7 +552,7 @@ impl FireRedLlmGgmlExecutor {
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FireRedLlmExecutorError::DecoderStateCapacity { source })?;
         let decoder_actor = self.checkout_decoder_runtime(
-            runtime_source,
+            &preflight,
             decoder_metadata,
             kv_capacity,
             decoder_backend,

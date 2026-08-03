@@ -14,7 +14,6 @@
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightContext,
 };
@@ -132,15 +131,15 @@ pub(crate) struct FunasrNanoAdapterGraph {
 }
 
 impl FunasrNanoAdapterGraph {
-    pub(crate) fn new(
-        runtime_source: &GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoAdapterMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FunasrNanoAdapterError> {
         let runner = GgmlCpuGraphRunner::new(sensevoice_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let linear1_weight = tensor(&loaded, ADAPTOR_LINEAR1_WEIGHT)?;
         let linear1_bias = tensor(&loaded, ADAPTOR_LINEAR1_BIAS)?;

@@ -79,9 +79,9 @@ use crate::{
 
 #[cfg(test)]
 use super::runtime_contract::parse_qwen3_execution_metadata;
+use crate::GgmlAsrRuntimeSourcePreflight;
 #[cfg(test)]
 use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
-use crate::{GgmlAsrRuntimeSourcePreflight, GgmlRuntimeSource};
 
 const QWEN3_EXECUTOR_ID: &str = "qwen3-asr-ggml-executor-v1";
 const QWEN3_STREAMING_EXECUTOR_ID: &str = "qwen3-asr-ggml-snapshot-streaming-executor-v1";
@@ -274,25 +274,23 @@ impl Qwen3AsrGgmlExecutor {
 
     fn checkout_audio_encoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Qwen3AsrAudioEncoderRuntimeActor, Qwen3AsrGgmlExecutorError> {
         let encoder_backend = qwen_encoder_graph_config(backend).backend;
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(encoder_backend),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.audio_encoder_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, (source, prepared_runtime_owner))),
-            move |(source, prepared_runtime_owner)| {
-                let runtime =
-                    Qwen3AsrAudioEncoderRuntime::new(Some(&source), backend).map_err(|error| {
-                        Qwen3AsrGgmlExecutorError::AudioEncoderFailed {
-                            reason: error.to_string(),
-                        }
+            move || Ok((0, (preflight, prepared_runtime_owner))),
+            move |(preflight, prepared_runtime_owner)| {
+                let runtime = Qwen3AsrAudioEncoderRuntime::new_from_preflight(&preflight, backend)
+                    .map_err(|error| Qwen3AsrGgmlExecutorError::AudioEncoderFailed {
+                        reason: error.to_string(),
                     })?;
                 Ok(SystemMemoryOwner::without_allocation(
                     Qwen3AsrAudioEncoderRuntimeActorState {
@@ -307,13 +305,13 @@ impl Qwen3AsrGgmlExecutor {
 
     fn encode_with_owned_audio_encoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         mel_features: Qwen3AsrMelFeatures,
         backend: GgmlCpuGraphBackend,
     ) -> Result<super::audio_encoder::Qwen3AsrAudioEncoderOutput, Qwen3AsrGgmlExecutorError> {
         let actor =
-            self.checkout_audio_encoder_runtime(runtime_source, prepared_runtime_owner, backend)?;
+            self.checkout_audio_encoder_runtime(preflight, prepared_runtime_owner, backend)?;
         actor
             .call_mut(move |state| {
                 let prepared_runtime = state
@@ -335,7 +333,7 @@ impl Qwen3AsrGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
@@ -343,16 +341,16 @@ impl Qwen3AsrGgmlExecutor {
     ) -> Result<Qwen3AsrDecoderRuntimeActor, Qwen3AsrGgmlExecutorError> {
         let decoder_backend = qwen_runtime_graph_config(backend).backend;
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(decoder_backend),
             qwen_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
             kv_capacity.resident_positions(),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, (source, prepared_runtime_owner, adapter))),
-            move |(source, prepared_runtime_owner, adapter)| {
+            move || Ok((0, (preflight, prepared_runtime_owner, adapter))),
+            move |(preflight, prepared_runtime_owner, adapter)| {
                 let prepared_runtime =
                     prepared_runtime_owner
                         .as_ref()
@@ -361,18 +359,19 @@ impl Qwen3AsrGgmlExecutor {
                             reason: "decoder actor received a non-qwen prepared runtime"
                                 .to_string(),
                         })?;
-                let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_lora(
-                    &prepared_runtime.decoder_plan,
-                    &source,
-                    prepared_runtime.logits_head.fused_top1_spec(),
-                    adapter.as_ref().map(resolved_lora_adapter),
-                    backend,
-                )
-                .map_err(|error| {
-                    Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
-                        reason: format!("qwen3-asr whole-decoder graph init failed: {error}"),
-                    }
-                })?;
+                let whole_decoder =
+                    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora(
+                        &prepared_runtime.decoder_plan,
+                        &preflight,
+                        prepared_runtime.logits_head.fused_top1_spec(),
+                        adapter.as_ref().map(resolved_lora_adapter),
+                        backend,
+                    )
+                    .map_err(|error| {
+                        Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+                            reason: format!("qwen3-asr whole-decoder graph init failed: {error}"),
+                        }
+                    })?;
                 let logits_head_runtime = prepared_runtime
                     .logits_head
                     .new_runtime(decoder_backend)
@@ -467,7 +466,7 @@ impl Qwen3AsrGgmlExecutor {
         )?;
         self.execute_with_runtime_assets(
             request,
-            &preflight.runtime_source,
+            preflight,
             prepared_runtime.metadata,
             prepared_runtime.tokenizer.as_ref(),
             &prepared_runtime.mel_frontend_plan,
@@ -484,7 +483,7 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionViewRequest,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         mel_frontend_plan: &Qwen3AsrMelFrontendPlan,
@@ -506,7 +505,7 @@ impl Qwen3AsrGgmlExecutor {
         qwen_decode_profile_log_opt("mel_frontend", mel_started_at);
         let result = self.decode_with_runtime_assets(
             request,
-            runtime_source,
+            preflight,
             metadata,
             tokenizer,
             token_embedding_table,
@@ -525,7 +524,7 @@ impl Qwen3AsrGgmlExecutor {
     fn decode_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionViewRequest,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         token_embedding_table: Arc<super::token_embedding::Qwen3AsrTokenEmbeddingTable>,
@@ -537,6 +536,7 @@ impl Qwen3AsrGgmlExecutor {
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         let profile_started_at = qwen_decode_profile_start();
+        let runtime_source = &preflight.runtime_source;
         // Resolved once by whoever built this request, carried as an
         // explicit field: every cache key / job field below reads this same
         // local instead of each independently re-deriving it from a
@@ -547,7 +547,7 @@ impl Qwen3AsrGgmlExecutor {
         let runtime_cache_path = canonical_runtime_cache_path(runtime_source.path());
         let audio_encoder_started_at = qwen_decode_profile_start();
         let audio_embeddings = self.encode_with_owned_audio_encoder_runtime(
-            runtime_source,
+            preflight,
             Arc::clone(&prepared_runtime_owner),
             mel_features.clone(),
             backend,
@@ -675,7 +675,7 @@ impl Qwen3AsrGgmlExecutor {
                 serve_batch_config,
                 Qwen3AsrServeBatchJob {
                     runtime_cache_path,
-                    runtime_source: runtime_source.clone(),
+                    runtime_source_preflight: preflight.clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
@@ -716,7 +716,7 @@ impl Qwen3AsrGgmlExecutor {
         let decoder_backend = qwen_runtime_graph_config(backend).backend;
         let whole_decoder_started_at = qwen_decode_profile_start();
         let decoder_actor = self.checkout_decoder_runtime(
-            runtime_source,
+            preflight,
             Arc::clone(&prepared_runtime_owner),
             adapter,
             backend,

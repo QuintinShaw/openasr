@@ -11,7 +11,7 @@ use crate::arch::hparams::{
 };
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, validate_ggml_runtime_source_path, write_gguf_file_v0,
+    read_gguf_metadata, read_gguf_tensor_index, write_gguf_file_v0,
 };
 use crate::models::{
     ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
@@ -133,13 +133,12 @@ pub fn convert_local_whisper_hf_source_to_runtime_pack(
             "Whisper local-source GGUF writer produced tensors that do not match the GGUF tensor binding contract: {error}"
         ))
     })?;
-    let runtime_source = validate_ggml_runtime_source_path(&request.output_root).map_err(|error| {
+    let runtime_metadata = read_gguf_metadata(&request.output_root).map_err(|error| {
         validate_error(format!(
-            "Whisper local-source GGUF writer produced invalid runtime source path '{}': {error}",
-            request.output_root.display()
+            "Whisper local-source GGUF writer produced unreadable metadata: {error}"
         ))
     })?;
-    WhisperTokenizer::from_ggml_runtime_source(&runtime_source).map_err(|error| {
+    WhisperTokenizer::from_gguf_metadata(&runtime_metadata).map_err(|error| {
         validate_error(format!(
             "Whisper local-source GGUF writer produced tokenizer metadata that runtime cannot load: {error}"
         ))

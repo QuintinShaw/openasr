@@ -17,12 +17,39 @@ use super::{
 /// transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgufRuntimeSourcePreflight {
-    pub runtime_source: GgmlRuntimeSource,
-    pub metadata: Arc<GgufMetadata>,
-    pub tensor_index: Arc<GgufTensorIndex>,
+    pub(crate) runtime_source: GgmlRuntimeSource,
+    pub(crate) metadata: Arc<GgufMetadata>,
+    pub(crate) tensor_index: Arc<GgufTensorIndex>,
 }
 
 impl GgufRuntimeSourcePreflight {
+    /// Opens and bounded-parses one runtime source generation for reuse by
+    /// validation, admission, and materialization.
+    pub fn from_path(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, RuntimeSourceMetadataAndTensorIndexPreflightError> {
+        load_runtime_source_metadata_and_tensor_index(path.as_ref())
+    }
+
+    /// Bounded-parses the exact mapping already held by `runtime_source`.
+    pub fn from_runtime_source(
+        runtime_source: &GgmlRuntimeSource,
+    ) -> Result<Self, RuntimeSourceMetadataAndTensorIndexPreflightError> {
+        load_runtime_source_metadata_and_tensor_index_from_source(runtime_source)
+    }
+
+    pub fn runtime_source(&self) -> &GgmlRuntimeSource {
+        &self.runtime_source
+    }
+
+    pub fn metadata(&self) -> &GgufMetadata {
+        &self.metadata
+    }
+
+    pub fn tensor_index(&self) -> &GgufTensorIndex {
+        &self.tensor_index
+    }
+
     /// Copy this exact admitted generation into anonymous immutable storage
     /// while retaining the already-validated header views. Tensor offsets are
     /// safe to reuse because the snapshot must hash to the same content id and
@@ -44,7 +71,7 @@ impl GgufRuntimeSourcePreflight {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum RuntimeSourceMetadataAndTensorIndexPreflightError {
+pub enum RuntimeSourceMetadataAndTensorIndexPreflightError {
     #[error("runtime source path is invalid: {source}")]
     RuntimeSourcePath {
         source: Box<GgmlRuntimeSourcePathError>,
@@ -176,15 +203,26 @@ mod tests {
         let before =
             crate::ggml_runtime::gguf_metadata::bounded_parse_call_count_for_current_thread();
 
-        load_runtime_source_metadata_and_tensor_index(&runtime_path)
+        let preflight = load_runtime_source_metadata_and_tensor_index(&runtime_path)
             .expect("preflight minimal GGUF");
 
-        let after =
+        let after_preflight =
             crate::ggml_runtime::gguf_metadata::bounded_parse_call_count_for_current_thread();
         assert_eq!(
-            after - before,
+            after_preflight - before,
             1,
             "preflight must parse the GGUF header once"
+        );
+
+        for _ in 0..3 {
+            build_runtime_tensor_reader_from_preflight(&preflight)
+                .expect("preflight reader must reuse parsed header views");
+        }
+        let after_readers =
+            crate::ggml_runtime::gguf_metadata::bounded_parse_call_count_for_current_thread();
+        assert_eq!(
+            after_readers, after_preflight,
+            "building any number of readers from one preflight must not parse again"
         );
     }
 }

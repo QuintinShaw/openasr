@@ -2,10 +2,9 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
@@ -154,7 +153,7 @@ impl CohereTranscribeEncoderGraphRuntime {
     pub(crate) fn new(
         weights: &CohereTranscribeEncoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, CohereTranscribeEncoderError> {
         let build_debug = std::env::var_os(COHERE_DEBUG_ENCODER_BUILD_ENV).is_some();
@@ -178,8 +177,11 @@ impl CohereTranscribeEncoderGraphRuntime {
             }
         })?;
         let runner_ms = runner_start.elapsed().as_secs_f64() * 1000.0;
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let arena_start = Instant::now();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)

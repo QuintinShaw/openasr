@@ -11,7 +11,6 @@
 
 #![allow(dead_code)]
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
     GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
@@ -273,12 +272,16 @@ pub(crate) struct FunasrNanoEncoderGraph {
 }
 
 impl FunasrNanoEncoderGraph {
-    pub(crate) fn new(
-        runtime_source: &GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoEncoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FunasrNanoEncoderError> {
-        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
+        let reader =
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| FunasrNanoEncoderError::Shape {
+                    reason: error.to_string(),
+                })?;
         let weights = load_encoder_weights(&reader, &metadata)?;
 
         let mut config = sensevoice_encoder_graph_config(backend);
@@ -291,7 +294,9 @@ impl FunasrNanoEncoderGraph {
                 source,
             }
         })?;
-        let loaded_weights = runner.load_gguf_weight_context(runtime_source).ok();
+        let loaded_weights = runner
+            .load_gguf_weight_context_from_preflight(preflight)
+            .ok();
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES)

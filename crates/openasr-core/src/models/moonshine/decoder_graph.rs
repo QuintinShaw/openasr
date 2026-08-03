@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -450,7 +449,7 @@ impl MoonshineDecoderGraphRuntime {
     pub(crate) fn new(
         input: MoonshineDecoderRuntimeInput<'_>,
         prefer_cpu_backend: bool,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq(
@@ -459,7 +458,7 @@ impl MoonshineDecoderGraphRuntime {
             input.decoder_state,
             input.backend,
             prefer_cpu_backend,
-            runtime_source,
+            runtime_preflight,
             1,
             adapter,
         )
@@ -472,7 +471,7 @@ impl MoonshineDecoderGraphRuntime {
         decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
@@ -519,8 +518,11 @@ impl MoonshineDecoderGraphRuntime {
         // mmap'd pack (native q8_0 [in,out]); the loader supplies them meta-only, so
         // binding is mandatory. The tied embedding stays arena-resident (it feeds
         // get_rows + tied-logits mul_mat and is loaded full).
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
@@ -2868,7 +2870,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight.runtime_source),
+            Some(&preflight),
             None,
         )
         .expect("serial runtime 0");
@@ -2887,7 +2889,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight.runtime_source),
+            Some(&preflight),
             None,
         )
         .expect("serial runtime 1");
@@ -2904,7 +2906,7 @@ mod tests {
             decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
-            Some(&preflight.runtime_source),
+            Some(&preflight),
             2,
             None,
         )
@@ -2953,7 +2955,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight.runtime_source),
+            Some(&preflight),
             None,
         )
         .expect("serial runtime 0");
@@ -2977,7 +2979,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight.runtime_source),
+            Some(&preflight),
             None,
         )
         .expect("serial runtime 1");
@@ -2999,7 +3001,7 @@ mod tests {
             decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
-            Some(&preflight.runtime_source),
+            Some(&preflight),
             2,
             None,
         )

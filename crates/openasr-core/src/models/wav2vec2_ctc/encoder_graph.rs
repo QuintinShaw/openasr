@@ -9,10 +9,9 @@
 
 #![allow(dead_code)]
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, WeightSlot,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
     alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
@@ -233,7 +232,7 @@ impl Wav2Vec2CtcEncoderGraph {
     pub(crate) fn new(
         weights: &Wav2Vec2EncoderWeights,
         metadata: Wav2Vec2CtcExecutionMetadata,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Wav2Vec2EncoderError> {
         let mut config = wav2vec2_ctc_encoder_graph_config(backend);
@@ -251,8 +250,11 @@ impl Wav2Vec2CtcEncoderGraph {
                 source,
             }
         })?;
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES)

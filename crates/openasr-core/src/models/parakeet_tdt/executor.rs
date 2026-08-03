@@ -124,7 +124,7 @@ fn checkout_parakeet_tdt_prepared_runtime(
                 let graph = ParakeetTdtEncoderGraph::new(
                     &encoder_weights,
                     metadata,
-                    Some(&preflight.runtime_source),
+                    Some(&preflight),
                     backend,
                 )
                 .map_err(|error| error.to_string())?;

@@ -41,8 +41,8 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlRuntimeSource, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReader,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::nn::ffn::{
     FeedForwardActivation, FeedForwardResidualSteps, apply_feed_forward_residual,
@@ -198,22 +198,22 @@ impl GraniteSpeechEncoderRuntime {
         Ok(bytes.finish())
     }
 
-    pub(crate) fn new(
-        source: &GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         config: &GraniteSpeechEncoderConfig,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechEncoderError> {
         let graph_config = encoder_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
         let loaded = runner
-            .load_gguf_weight_context(source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(ggml_err("load_gguf_weight_context"))?;
-        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
-            GraniteSpeechEncoderError::WeightRead {
-                name: "encoder.*".to_string(),
-                reason: error.to_string(),
-            }
-        })?;
+        let reader =
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| GraniteSpeechEncoderError::WeightRead {
+                    name: "encoder.*".to_string(),
+                    reason: error.to_string(),
+                })?;
         let arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(2 * config.num_layers + 16);
         let mut bn_arena = runner
             .start_static_tensor_arena(arena_bytes)

@@ -9,7 +9,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::GgmlRuntimeSource;
 use crate::PARAKEET_CTC_DECODE_POLICY_ID;
 use crate::PhraseBiasConfig;
 use crate::api::backend::WordTimestamp;
@@ -29,8 +28,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
+    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrRuntimeSourcePreflight,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
@@ -108,7 +107,7 @@ pub(crate) fn transcribe_parakeet_ctc_pcm(
     reader: &GgufTensorDataReader,
     gguf_metadata: &GgufMetadata,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -123,8 +122,9 @@ pub(crate) fn transcribe_parakeet_ctc_pcm(
     let weights =
         load_parakeet_ctc_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_parakeet_block_stack(metadata, &weights)?;
-    let mut graph = ParakeetCtcEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
-        .map_err(|e| e.to_string())?;
+    let mut graph =
+        ParakeetCtcEncoderGraph::new(&weights, metadata, Some(runtime_preflight), backend)
+            .map_err(|e| e.to_string())?;
     let output = graph.encode(&features).map_err(|e| e.to_string())?;
     decode_parakeet_output(
         output,
@@ -221,13 +221,9 @@ fn checkout_parakeet_ctc_prepared_runtime(
                     .map_err(|error| error.to_string())?;
                 validate_parakeet_block_stack(metadata, &weights)?;
                 let weights_bytes = weights.retained_system_memory_bytes()?;
-                let graph = ParakeetCtcEncoderGraph::new(
-                    &weights,
-                    metadata,
-                    Some(&preflight.runtime_source),
-                    backend,
-                )
-                .map_err(|error| error.to_string())?;
+                let graph =
+                    ParakeetCtcEncoderGraph::new(&weights, metadata, Some(&preflight), backend)
+                        .map_err(|error| error.to_string())?;
                 let graph_bytes = graph.retained_system_memory_bytes()?;
                 drop(weights);
 
@@ -679,7 +675,7 @@ mod tests {
             &reader,
             &preflight.metadata,
             &samples,
-            &preflight.runtime_source,
+            &preflight,
             None,
             false,
             GgmlCpuGraphBackend::Cpu,

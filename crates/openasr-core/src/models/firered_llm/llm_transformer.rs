@@ -31,7 +31,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
 use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
@@ -211,13 +211,17 @@ pub(crate) struct FireRedLlmPrefillOutput {
 }
 
 impl FireRedLlmDecoderRuntime {
-    pub(crate) fn new(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FireRedLlmDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedLlmDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(map_tensor_read_error)?;
+        let runtime_source = &preflight.runtime_source;
+        let reader =
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                })?;
         let decoder_plan = plan_qwen2_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
@@ -232,24 +236,16 @@ impl FireRedLlmDecoderRuntime {
         .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
             reason: error.to_string(),
         })?;
-        // Keep the output projection in the same static arena as the resident
-        // decoder graph so Metal/GPU decode can return a device-side top-1
-        // token per step instead of building a separate full-vocab logits
-        // graph and reading the whole row back to the host -- mirrors
-        // `moss_transcribe_diarize::llm_decoder`'s identical wiring
-        // (firered-llm's registered policy has no suppression or phrase bias,
-        // so the shared driver can always honor the hint).
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
-                &decoder_plan,
-                runtime_source,
-                FIRERED_LLM_RMS_NORM_EPSILON,
-                logits_head.fused_top1_spec(),
-                backend,
-            )
-            .map_err(|error| FireRedLlmDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
+        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
+            &decoder_plan,
+            preflight,
+            FIRERED_LLM_RMS_NORM_EPSILON,
+            logits_head.fused_top1_spec(),
+            backend,
+        )
+        .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+            reason: error.to_string(),
+        })?;
         let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
             FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
@@ -590,12 +586,6 @@ fn write_layer_kv(
     Ok(())
 }
 
-fn map_tensor_read_error(error: GgufTensorDataReadError) -> FireRedLlmDecoderError {
-    FireRedLlmDecoderError::TensorReadFailed {
-        reason: error.to_string(),
-    }
-}
-
 /// T5 (per-segment numeric parity against an independent PyTorch reference):
 /// dumps embedding / single-decoder-block / final_norm+lm_head outputs on
 /// fixed synthetic inputs to flat files that
@@ -890,8 +880,12 @@ mod parity_tests {
                 .expect("parse decoder metadata");
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
-        FireRedLlmDecoderRuntime::new(
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
             &runtime_source,
+        )
+        .expect("runtime preflight");
+        FireRedLlmDecoderRuntime::new_from_preflight(
+            &preflight,
             decoder_metadata,
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )

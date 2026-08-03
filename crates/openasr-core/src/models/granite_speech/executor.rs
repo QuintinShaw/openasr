@@ -47,7 +47,7 @@ use super::qformer::{GraniteSpeechProjectorConfig, GraniteSpeechProjectorRuntime
 use super::runtime_contract::{
     parse_decoder_metadata, parse_encoder_metadata, parse_projector_metadata,
 };
-use super::runtime_provider::load_tensors_from_oasr_pack;
+use super::runtime_provider::load_tensors_from_preflight;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
@@ -241,30 +241,35 @@ impl GraniteSpeechPreparedRuntime {
                 reason: error.to_string(),
             }
         })?;
-        let source = &preflight.runtime_source;
-        let pack_path = source.path();
         // Only the decoder's token-embedding table on the host (dequantized to
         // f32) -- the projection/norm/lm_head weights are bound zero-copy inside
         // the session below (see `runtime_provider` / `decode_session`).
         let embed_table =
-            load_tensors_from_oasr_pack(pack_path, "language_model.model.embed_tokens.weight")
+            load_tensors_from_preflight(preflight, "language_model.model.embed_tokens.weight")
                 .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
                     reason: error.to_string(),
                 })?;
-        let encoder = GraniteSpeechEncoderRuntime::new(source, &encoder_config, backend).map_err(
-            |error| GraniteSpeechGgmlExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            },
-        )?;
-        let projector = GraniteSpeechProjectorRuntime::new(source, &projector_config, backend)
-            .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
-                reason: error.to_string(),
-            })?;
-        let session =
-            GraniteSpeechDecodeSession::new_keep_quantized(decoder_config, source, backend)
-                .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
+        let encoder =
+            GraniteSpeechEncoderRuntime::new_from_preflight(preflight, &encoder_config, backend)
+                .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
                     reason: error.to_string(),
                 })?;
+        let projector = GraniteSpeechProjectorRuntime::new_from_preflight(
+            preflight,
+            &projector_config,
+            backend,
+        )
+        .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
+            reason: error.to_string(),
+        })?;
+        let session = GraniteSpeechDecodeSession::new_keep_quantized_from_preflight(
+            decoder_config,
+            preflight,
+            backend,
+        )
+        .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
+            reason: error.to_string(),
+        })?;
         Ok(Self {
             encoder_config,
             projector_config,

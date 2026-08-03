@@ -28,8 +28,9 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
-use crate::ggml_runtime::{GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext};
+use crate::ggml_runtime::{
+    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext, GgufRuntimeSourcePreflight,
+};
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
     RelativePositionAttentionInputs, RelativePositionAttentionSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -131,14 +132,22 @@ impl FireRedEncoderGraphRuntime {
     }
 
     pub(crate) fn new(
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
+        metadata: FireRedAedExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, FireRedEncoderError> {
+        Self::new_from_preflight(preflight, metadata, backend)
+    }
+
+    pub(crate) fn new_from_preflight(
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedEncoderError> {
         let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers)?;
         Ok(Self {
@@ -1711,8 +1720,9 @@ mod parity_tests {
     //!   by roughly an order of magnitude, not the ~2x headroom this bound
     //!   allows for.
     use super::*;
-    use crate::ggml_runtime::GgufTensorDataReader;
-    use crate::ggml_runtime::read_gguf_metadata;
+    use crate::ggml_runtime::{
+        build_runtime_tensor_reader_from_preflight, load_runtime_source_metadata_and_tensor_index,
+    };
     use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
     use crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata;
 
@@ -1733,9 +1743,11 @@ mod parity_tests {
             return;
         }
 
-        let metadata_view = read_gguf_metadata(&pack_path).expect("read gguf metadata");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack_path).expect("read gguf preflight");
+        let metadata_view = preflight.metadata.as_ref();
         let metadata =
-            parse_firered_aed_execution_metadata(&metadata_view).expect("parse firered metadata");
+            parse_firered_aed_execution_metadata(metadata_view).expect("parse firered metadata");
 
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             dev_wav_path(),
@@ -1747,10 +1759,8 @@ mod parity_tests {
         let frontend = FireRedFbankFrontend::new();
         let mut fbank = frontend.compute(&samples).expect("compute fbank");
 
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
         let reader =
-            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
+            build_runtime_tensor_reader_from_preflight(&preflight).expect("open tensor reader");
         let feature_dim = [metadata.feature_dim as u64];
         let neg_mean = reader
             .host_tensor_f32_copy_by_name("frontend.cmvn.neg_mean", &feature_dim)
@@ -1761,7 +1771,7 @@ mod parity_tests {
         apply_cmvn(&mut fbank.data, fbank.n_mels, &neg_mean, &inv_stddev).expect("apply cmvn");
 
         let mut runtime = FireRedEncoderGraphRuntime::new(
-            &runtime_source,
+            &preflight,
             metadata,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
@@ -1831,9 +1841,11 @@ mod parity_tests {
             return;
         }
 
-        let metadata_view = read_gguf_metadata(&pack_path).expect("read gguf metadata");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack_path).expect("read gguf preflight");
+        let metadata_view = preflight.metadata.as_ref();
         let metadata =
-            parse_firered_aed_execution_metadata(&metadata_view).expect("parse firered metadata");
+            parse_firered_aed_execution_metadata(metadata_view).expect("parse firered metadata");
 
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             dev_wav_path(),
@@ -1845,10 +1857,8 @@ mod parity_tests {
         let frontend = FireRedFbankFrontend::new();
         let mut fbank = frontend.compute(&samples).expect("compute fbank");
 
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
         let reader =
-            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
+            build_runtime_tensor_reader_from_preflight(&preflight).expect("open tensor reader");
         let feature_dim = [metadata.feature_dim as u64];
         let neg_mean = reader
             .host_tensor_f32_copy_by_name("frontend.cmvn.neg_mean", &feature_dim)
@@ -1867,7 +1877,7 @@ mod parity_tests {
         ))
         .expect("build runner");
         let loaded = runner
-            .load_gguf_weight_context(&runtime_source)
+            .load_gguf_weight_context_from_preflight(&preflight)
             .expect("load gguf weight context");
         let weights =
             FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers).expect("load weights");

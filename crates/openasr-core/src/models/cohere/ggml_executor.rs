@@ -24,7 +24,6 @@ use super::frontend::{
 use super::graph_config::{cohere_decoder_graph_config, cohere_encoder_graph_config};
 use super::prepared_runtime::{CoherePreparedRuntime, CoherePreparedRuntimeError};
 use crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID;
-use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::hparams::{
@@ -34,7 +33,7 @@ use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, OpenAsrArchitectureRegistry};
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufRuntimeSourcePreflight};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -282,7 +281,7 @@ impl CohereTranscribeGgmlExecutor {
         );
         emit_cohere_debug_feature_preview_if_enabled(&features);
         self.decode_with_prepared_runtime(
-            &preflight.runtime_source,
+            &preflight,
             request,
             prepared_runtime,
             Arc::clone(&prepared_runtime_owner),
@@ -295,7 +294,7 @@ impl CohereTranscribeGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_prepared_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         request: &GgmlAsrExecutionViewRequest,
         prepared_runtime: &CoherePreparedRuntime,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
@@ -303,6 +302,7 @@ impl CohereTranscribeGgmlExecutor {
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, CohereTranscribeGgmlExecutorError> {
+        let runtime_source = &preflight.runtime_source;
         let runtime_path = runtime_source.path();
         // Make the block-stack descriptor load-bearing (P4 S5e/S5f): fail closed
         // unless the conformer-encoder + seq2seq-decoder stacks this runtime
@@ -377,7 +377,7 @@ impl CohereTranscribeGgmlExecutor {
         let encoder_start = debug_timing_start();
         let encoder_output = self
             .encode_with_owned_cohere_encoder_runtime(
-                runtime_source,
+                preflight,
                 features,
                 request.resolved_runtime.backend(),
                 Arc::clone(&prepared_runtime_owner),
@@ -464,7 +464,7 @@ impl CohereTranscribeGgmlExecutor {
             })?
         } else {
             self.decode_with_owned_cohere_decoder_runtime(
-                runtime_source,
+                preflight.runtime_source.content_id(),
                 &prepared_runtime.tokenizer,
                 prepared_runtime.metadata,
                 &initial_prompt_tokens,
@@ -557,24 +557,24 @@ impl CohereTranscribeGgmlExecutor {
 
     fn checkout_encoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<CohereEncoderRuntimeActor, CohereTranscribeGgmlExecutorError> {
         let encoder_backend = cohere_encoder_graph_config(backend).backend;
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(encoder_backend),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.encoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
                 #[cfg(test)]
                 COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-                Ok((0, (source, prepared_owner)))
+                Ok((0, (preflight, prepared_owner)))
             },
-            move |(source, prepared_owner)| {
+            move |(preflight, prepared_owner)| {
                 let prepared_runtime =
                     prepared_owner
                         .as_ref()
@@ -588,7 +588,7 @@ impl CohereTranscribeGgmlExecutor {
                 let runtime = CohereTranscribeEncoderGraphRuntime::new(
                     &prepared_runtime.encoder_weights,
                     prepared_runtime.metadata,
-                    Some(&source),
+                    Some(&preflight),
                     backend,
                 )
                 .map_err(|error| {
@@ -609,14 +609,14 @@ impl CohereTranscribeGgmlExecutor {
 
     fn encode_with_owned_cohere_encoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         features: CohereTranscribeMelFeatures,
         backend: GgmlCpuGraphBackend,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
     ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError>
     {
         let actor = self
-            .checkout_encoder_runtime(runtime_source, prepared_owner, backend)
+            .checkout_encoder_runtime(preflight, prepared_owner, backend)
             .map_err(|error| CohereTranscribeEncoderError::GraphExecutionFailed {
                 reason: error.to_string(),
             })?;
@@ -629,7 +629,7 @@ impl CohereTranscribeGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        pack_content_id: &str,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         cross_hidden_size: usize,
@@ -638,19 +638,18 @@ impl CohereTranscribeGgmlExecutor {
     ) -> Result<CohereDecoderRuntimeActor, CohereTranscribeGgmlExecutorError> {
         let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::new(pack_content_id),
             current_execution_lane_key(decoder_backend),
             decoder_state.resident_capacity(),
         );
-        let source = runtime_source.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
                 #[cfg(test)]
                 COHERE_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-                Ok((0, (source, prepared_owner)))
+                Ok((0, prepared_owner))
             },
-            move |(_source, prepared_owner)| {
+            move |prepared_owner| {
                 let prepared_runtime =
                     prepared_owner
                         .as_ref()
@@ -688,7 +687,7 @@ impl CohereTranscribeGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_owned_cohere_decoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        pack_content_id: &str,
         tokenizer: &super::tokenizer::CohereTranscribeTokenizer,
         metadata: super::runtime_contract::CohereTranscribeExecutionMetadata,
         initial_prompt_tokens: &[u32],
@@ -705,7 +704,7 @@ impl CohereTranscribeGgmlExecutor {
     ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
         let actor = self
             .checkout_decoder_runtime(
-                runtime_source,
+                pack_content_id,
                 prepared_owner,
                 decoder_state,
                 encoder_output.hidden_size,
@@ -1166,7 +1165,7 @@ mod tests {
     ///
     /// 1. A second `execute()` against the *same unchanged bytes* (even
     ///    through a fresh `execute()` call, which re-validates and reopens
-    ///    the path into a brand new [`GgmlRuntimeSource`] instance every
+    ///    the path into a brand new [`crate::GgmlRuntimeSource`] instance every
     ///    time -- exactly like two independent production requests) must
     ///    hit the cached encoder/decoder runtimes, not rebuild them: the
     ///    content id survives across independent opens of the same bytes.

@@ -32,8 +32,8 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlRuntimeSource, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReader,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
@@ -142,22 +142,22 @@ impl GraniteSpeechProjectorRuntime {
         0
     }
 
-    pub(crate) fn new(
-        source: &GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         config: &GraniteSpeechProjectorConfig,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechProjectorError> {
         let graph_config = projector_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
         let loaded = runner
-            .load_gguf_weight_context(source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(ggml_err("load_gguf_weight_context"))?;
-        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
-            GraniteSpeechProjectorError::WeightRead {
-                name: "projector.query".to_string(),
-                reason: error.to_string(),
-            }
-        })?;
+        let reader =
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| GraniteSpeechProjectorError::WeightRead {
+                    name: "projector.query".to_string(),
+                    reason: error.to_string(),
+                })?;
         let num_queries = config.num_queries();
         let values = reader
             .host_tensor_f32_copy_dequantized_by_name(

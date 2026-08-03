@@ -1,10 +1,9 @@
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
     GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::half::f32_to_f16_bits;
 
@@ -171,7 +170,7 @@ impl MoonshineEncoderGraphRuntime {
     pub(crate) fn new(
         weights: &MoonshineEncoderWeights,
         metadata: MoonshineExecutionMetadata,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         adapter: Option<&MoonshineLoraAdapter>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MoonshineEncoderError> {
@@ -192,8 +191,11 @@ impl MoonshineEncoderGraphRuntime {
         // mmap'd pack (native q8_0 [in,out]) instead of dequantizing them to
         // resident f32 host Vecs. The weights loader supplies these meta-only
         // (empty values), so binding is mandatory (fails closed below).
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)

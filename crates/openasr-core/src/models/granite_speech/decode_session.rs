@@ -75,7 +75,6 @@
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlKvElementType, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlRuntimeSource,
 };
 use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote, SystemMemoryOwner,
@@ -508,23 +507,23 @@ impl GraniteSpeechDecodeSession {
         ))
     }
 
-    /// Keep-quantized session: bind every decoder weight zero-copy from `source`'s
+    /// Keep-quantized session: bind every decoder weight zero-copy from the
     /// mmap'd `.oasr` pack (native q8_0/q4_k/f16/f32) instead of dequantizing the
     /// whole 2-B decoder to an f32 host copy + arena upload. The projection/norm/
     /// lm_head weights come from the pack; the token-embedding rows are supplied
     /// by the `provider` passed to `decode_step`. The loaded weight context is
     /// loaded context and this session's runner use the same thread-cached
     /// backend/device, and both are held for the session's whole lifetime.
-    pub(crate) fn new_keep_quantized(
+    pub(crate) fn new_keep_quantized_from_preflight(
         config: GraniteSpeechDecoderConfig,
-        source: &GgmlRuntimeSource,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = decoder_graph_config(backend);
         let runner =
             GgmlCpuGraphRunner::new(graph_config).map_err(map_ggml("session_runner_init"))?;
         let loaded = runner
-            .load_gguf_weight_context(source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(map_ggml("session_load_gguf_weight_context"))?;
         let weights = GraniteDecoderLoadedWeights::load(&loaded, &config)?;
         Ok(Self::assemble(

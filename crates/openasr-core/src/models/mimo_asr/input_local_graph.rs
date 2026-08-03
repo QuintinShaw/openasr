@@ -312,8 +312,8 @@ fn upload(
 }
 
 impl MimoInputLocalRuntime {
-    pub(crate) fn new(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoInlocalMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoInputLocalError> {
@@ -321,16 +321,15 @@ impl MimoInputLocalRuntime {
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| build_err("runner_init", source))?;
         let loaded_weights = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|error| MimoInputLocalError::GraphExecutionFailed {
                 reason: format!("load_gguf_weight_context: {error}"),
             })?;
         let reader =
-            GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|error| {
-                MimoInputLocalError::GraphExecutionFailed {
-                    reason: format!("GgufTensorDataReader::from_runtime_source: {error}"),
-                }
-            })?;
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| MimoInputLocalError::GraphExecutionFailed {
+                    reason: format!("build_runtime_tensor_reader_from_preflight: {error}"),
+                })?;
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
             .map_err(|source| build_err("static_tensor_arena", source))?;

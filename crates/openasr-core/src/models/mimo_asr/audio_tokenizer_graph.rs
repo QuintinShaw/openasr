@@ -13,7 +13,6 @@
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
     GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
@@ -156,8 +155,8 @@ impl MimoAudiotokEncoderRuntime {
 }
 
 impl MimoAudiotokEncoderRuntime {
-    pub(crate) fn new(
-        runtime_source: &GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoAudiotokMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoAudiotokEncoderError> {
@@ -173,7 +172,7 @@ impl MimoAudiotokEncoderRuntime {
         // Zero-copy binding for the big 2-D attn/ffn matmul weights (mmap'd,
         // native f16 -- no host f32 duplicate).
         let loaded_weights = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|error| MimoAudiotokEncoderError::GraphExecutionFailed {
                 reason: format!("load_gguf_weight_context: {error}"),
             })?;
@@ -183,11 +182,10 @@ impl MimoAudiotokEncoderRuntime {
         // `runtime_source`'s already-open mapping with the resident-weight
         // load above instead of a second `File::open` of the same pack.
         let reader =
-            GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|error| {
-                MimoAudiotokEncoderError::GraphExecutionFailed {
-                    reason: format!("GgufTensorDataReader::from_runtime_source: {error}"),
-                }
-            })?;
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| MimoAudiotokEncoderError::GraphExecutionFailed {
+                    reason: format!("build_runtime_tensor_reader_from_preflight: {error}"),
+                })?;
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
             .map_err(|source| build_err("static_tensor_arena", source))?;

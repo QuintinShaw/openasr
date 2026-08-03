@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    hash::Hash,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
 };
@@ -24,10 +25,7 @@ use crate::device::{
         ExecutionHardwareVendor, ExecutionProvider, enumerate_compute_devices_from_ggml,
     },
 };
-use crate::ggml_runtime::{
-    RequestBackendPreference, read_gguf_metadata_from_runtime_source,
-    read_gguf_tensor_index_from_runtime_source,
-};
+use crate::ggml_runtime::RequestBackendPreference;
 use crate::models::executor_component_registry::builtin_executor_supports_phrase_bias_for_model_architecture;
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
 use crate::models::ggml_family_registry::{
@@ -1110,59 +1108,122 @@ pub fn validate_local_native_model_pack_path(
     native_path::validate_local_native_model_pack_path(path)
 }
 
-/// Process-lifetime cache key for the caches below: an installed pack is
-/// content-immutable for the life of the daemon (see the doc comment on
-/// [`native_runtime_model_adapter_for_path`]), but the same on-disk pack can
-/// be reached through different (relative, symlinked, `..`-containing) path
-/// spellings across callers, so cache on the canonicalized path rather than
-/// the raw one. Canonicalization can fail (path race, permissions); fall back
-/// to the given path rather than panicking or refusing to cache -- worst case
-/// two spellings of the same pack each get their own entry, same as before
-/// this cache existed.
-fn native_runtime_cache_key_for_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
+const NATIVE_RUNTIME_LOOKUP_CACHE_CAPACITY: usize = 64;
 
-type NativeRuntimeIdentityCacheKey = (PathBuf, Option<String>);
+type NativeRuntimeIdentityCacheKey = (String, PathBuf, Option<String>);
 type NativeRuntimeIdentityCacheValue =
     Result<NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError>;
 
 static NATIVE_RUNTIME_MODEL_IDENTITY_CACHE: OnceLock<
-    Mutex<HashMap<NativeRuntimeIdentityCacheKey, NativeRuntimeIdentityCacheValue>>,
+    Mutex<
+        HashMap<
+            NativeRuntimeIdentityCacheKey,
+            Arc<OnceLock<Option<NativeRuntimeIdentityCacheValue>>>,
+        >,
+    >,
 > = OnceLock::new();
 
-/// Cached wrapper over [`native_model_id::resolve_local_native_runtime_model_identity`].
+/// Content-keyed, bounded single-flight cache.
 ///
-/// Keyed on `(canonicalized path, explicit_model_id_fallback)`, not path
-/// alone: `explicit_model_id_fallback` is a per-request value (e.g. the
-/// server forwards the client's requested model string on every transcription
-/// request as the fallback), and it only changes the resolved identity when
-/// the pack's own GGUF metadata does not already carry a usable id -- so two
-/// calls for the same pack with different fallbacks must not share a cache
-/// entry. Errors are cached too (a pack that fails to resolve now will keep
-/// failing the same way for the rest of the process's life).
+/// A failed build is shared only by callers already waiting on the same
+/// in-flight cell, then removed immediately. This prevents permanent negative
+/// caching while ensuring concurrent cold misses parse one content generation
+/// once. Eviction never removes an in-flight entry; a burst may temporarily
+/// exceed `capacity`, then converges as completed entries become evictable.
+fn native_content_cache_get_or_build<K, V>(
+    cache: &Mutex<HashMap<K, Arc<OnceLock<Option<V>>>>>,
+    capacity: usize,
+    key: K,
+    build: impl FnOnce() -> Option<V>,
+) -> Option<V>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    debug_assert!(capacity > 0);
+    let cell = match cache.lock() {
+        Ok(mut cache) => {
+            if let Some(cell) = cache.get(&key) {
+                Arc::clone(cell)
+            } else {
+                if cache.len() >= capacity
+                    && let Some(evicted_key) = cache
+                        .iter()
+                        .find_map(|(key, cell)| cell.get().is_some().then(|| key.clone()))
+                {
+                    cache.remove(&evicted_key);
+                }
+                let cell = Arc::new(OnceLock::new());
+                cache.insert(key.clone(), Arc::clone(&cell));
+                cell
+            }
+        }
+        Err(_) => return build(),
+    };
+
+    let value = cell.get_or_init(build).clone();
+    if let Ok(mut cache) = cache.lock() {
+        if value.is_none() {
+            if cache
+                .get(&key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+            {
+                cache.remove(&key);
+            }
+        } else {
+            while cache.len() > capacity {
+                let Some(evicted_key) = cache.iter().find_map(|(candidate, cached)| {
+                    (candidate != &key && cached.get().is_some()).then(|| candidate.clone())
+                }) else {
+                    break;
+                };
+                cache.remove(&evicted_key);
+            }
+        }
+    }
+    value
+}
+
+/// Cached path ingress for
+/// [`native_model_id::resolve_native_runtime_model_identity_from_source`].
+///
+/// The content id prevents same-path replacement from inheriting stale
+/// metadata. The logical path remains part of the key because its file stem is
+/// the final identity fallback; the explicit fallback is request data and must
+/// also participate. Invalid paths are not cached. Resolution errors for a
+/// valid immutable generation are deterministic and may be cached until that
+/// bounded content entry is evicted.
 pub fn resolve_local_native_runtime_model_identity(
     runtime_path: &Path,
     explicit_model_id_fallback: Option<&str>,
 ) -> Result<NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError> {
+    let runtime_source =
+        crate::validate_ggml_runtime_source_path(runtime_path).map_err(|error| {
+            NativeRuntimeModelIdentityError::RuntimeSourceValidation {
+                path: runtime_path.display().to_string(),
+                reason: error.to_string(),
+            }
+        })?;
     let cache = NATIVE_RUNTIME_MODEL_IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let cache_key = (
-        native_runtime_cache_key_for_path(runtime_path),
+        runtime_source.content_id().to_string(),
+        runtime_source.path().to_path_buf(),
         explicit_model_id_fallback.map(str::to_string),
     );
-    if let Ok(cache) = cache.lock()
-        && let Some(cached) = cache.get(&cache_key)
-    {
-        return cached.clone();
-    }
-    let resolved = native_model_id::resolve_local_native_runtime_model_identity(
-        runtime_path,
-        explicit_model_id_fallback,
-    );
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(cache_key, resolved.clone());
-    }
-    resolved
+    native_content_cache_get_or_build(
+        cache,
+        NATIVE_RUNTIME_LOOKUP_CACHE_CAPACITY,
+        cache_key,
+        || {
+            Some(
+                native_model_id::resolve_native_runtime_model_identity_from_source(
+                    &runtime_source,
+                    explicit_model_id_fallback,
+                ),
+            )
+        },
+    )
+    .expect("identity cache builder always returns one deterministic result")
 }
 
 pub fn native_runtime_transcription_capabilities_for_path(
@@ -1246,77 +1307,56 @@ fn native_runtime_capabilities_for_adapter(
 }
 
 static NATIVE_RUNTIME_MODEL_ADAPTER_CACHE: OnceLock<
-    Mutex<HashMap<PathBuf, Option<NativeRuntimeModelAdapter>>>,
+    Mutex<HashMap<String, Arc<OnceLock<Option<NativeRuntimeModelAdapter>>>>>,
 > = OnceLock::new();
 
-/// Resolves (and process-lifetime caches) the runtime adapter for an
-/// installed native model pack: GGUF metadata + tensor-index parse, family
-/// registry selection, and the derived capability/language facets.
+/// Resolves and caches the runtime adapter for one immutable pack content.
 ///
-/// Caching is safe under the same invariant the realtime capabilities cache
-/// in `openasr-server` already relies on
-/// (`cached_native_realtime_capabilities_for_path`): an installed pack's
-/// content is immutable for the life of the process. A model switch rebinds
-/// the server to a new `--model-pack` path (a restart), and the operator-only
-/// pull API installs new/updated packs under their own path rather than
-/// overwriting the path of an already-bound, in-use pack -- so there is no
-/// live path where a cached entry's underlying bytes change out from under
-/// it. `None` results (path fails to validate, or does not match any builtin
-/// family) are cached too, since a fixed input path deterministically
-/// produces the same non-adapter answer.
-///
-/// This function used to re-open and re-parse the pack's GGUF metadata (and,
-/// best-effort, its tensor index) on every call; every capability probe,
-/// preflight check, and CLI capability summary for the same pack now shares
-/// one parse for the process's lifetime instead of paying it again per call.
+/// Validation and content-id derivation happen before the cache lookup so a
+/// same-path replacement gets a new key. A cache miss then runs the bounded
+/// metadata/index preflight exactly once on that already-open source; invalid
+/// paths, malformed packs, and unknown families are never cached as negative
+/// entries, so a later valid replacement can resolve normally.
 pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
+    let runtime_source = native_path::validate_local_native_runtime_source(path).ok()?;
+    let cache_key = runtime_source.content_id().to_string();
     let cache = NATIVE_RUNTIME_MODEL_ADAPTER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache_key = native_runtime_cache_key_for_path(path);
-    if let Ok(cache) = cache.lock()
-        && let Some(cached) = cache.get(&cache_key)
-    {
-        return cached.clone();
-    }
-    let adapter = build_native_runtime_model_adapter_for_path(path);
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(cache_key, adapter.clone());
-    }
-    adapter
+    native_content_cache_get_or_build(
+        cache,
+        NATIVE_RUNTIME_LOOKUP_CACHE_CAPACITY,
+        cache_key,
+        || {
+            let preflight =
+                crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
+                    &runtime_source,
+                )
+                .ok()?;
+            build_native_runtime_model_adapter_from_preflight(&preflight)
+        },
+    )
 }
 
-fn build_native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
-    let runtime_source = native_path::validate_local_native_runtime_source(path).ok()?;
-    let metadata = read_gguf_metadata_from_runtime_source(&runtime_source).ok()?;
-    let selection_metadata = selection_metadata_from_gguf(&metadata);
+fn build_native_runtime_model_adapter_from_preflight(
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+) -> Option<NativeRuntimeModelAdapter> {
+    let selection_metadata = selection_metadata_from_gguf(&preflight.metadata);
     let registry = GgmlFamilyRegistry::with_builtin_adapters();
     let descriptor = registry
         .select_from_gguf_metadata_v1(&selection_metadata)
         .ok()?
         .clone();
-    // Only Dolphin's phrase-bias probe
-    // (`native_runtime_descriptor_supports_phrase_bias`) ever consults the
-    // tensor index -- every other architecture answers phrase-bias support
-    // from the architecture constant alone
-    // (`builtin_executor_supports_phrase_bias_for_model_architecture`) and
-    // never looks at `tensor_index`. Gate the read on architecture so the
-    // other (large majority) of installed packs skip a full GGUF tensor
-    // directory parse (`gguf_init_from_file`) here; this build already runs
-    // at most once per pack per process thanks to
-    // `NATIVE_RUNTIME_MODEL_ADAPTER_CACHE` above, so this trims that one
-    // parse rather than a per-request cost.
-    //
-    // Best-effort: a tensor index read failure here should not fail the whole
-    // capability lookup (the adapter still resolves from metadata alone); it
-    // only narrows the Dolphin per-pack phrase-bias probe to "unsupported".
+    // Only Dolphin's phrase-bias probe consults the tensor index. The shared
+    // preflight has already parsed it for every family, so this branch merely
+    // selects the existing index instead of opening/parsing the source again.
     let tensor_index = if descriptor.model_architecture == DOLPHIN_GGML_ARCHITECTURE_ID {
-        read_gguf_tensor_index_from_runtime_source(&runtime_source).ok()
+        Some(preflight.tensor_index.as_ref())
     } else {
         None
     };
     Some(NativeRuntimeModelAdapter::new(
         descriptor,
-        &metadata,
-        tensor_index.as_ref(),
+        &preflight.metadata,
+        tensor_index,
     ))
 }
 
@@ -1622,8 +1662,58 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
+        sync::Barrier,
         sync::atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn native_content_cache_singleflights_concurrent_cold_misses() {
+        let cache: Arc<Mutex<HashMap<String, Arc<OnceLock<Option<usize>>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let barrier = Arc::new(Barrier::new(8));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                let builds = Arc::clone(&builds);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    native_content_cache_get_or_build(&cache, 4, "same-content".to_string(), || {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Some(42)
+                    })
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            assert_eq!(worker.join().expect("cache worker"), Some(42));
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_content_cache_does_not_retain_failed_builds() {
+        let cache = Mutex::new(HashMap::new());
+        let builds = AtomicUsize::new(0);
+        assert_eq!(
+            native_content_cache_get_or_build(&cache, 4, "replaceable", || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                None::<usize>
+            }),
+            None
+        );
+        assert_eq!(
+            native_content_cache_get_or_build(&cache, 4, "replaceable", || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Some(7)
+            }),
+            Some(7)
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
 
     fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
         crate::models::native_execution_services::test_native_execution_services()
@@ -2682,6 +2772,76 @@ mod tests {
             crate::realtime::RealtimeBackendMode::Unsupported
         );
         assert!(!realtime.supports_realtime_sessions);
+    }
+
+    #[test]
+    fn native_runtime_model_adapter_does_not_cache_invalid_path_before_valid_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("replacement.gguf");
+        fs::write(&runtime_path, b"not gguf").unwrap();
+
+        assert!(native_runtime_model_adapter_for_path(&runtime_path).is_none());
+
+        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("replacement-valid");
+        write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("a valid replacement must not inherit an invalid negative cache entry");
+        assert_eq!(
+            adapter.adapter_id(),
+            crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID
+        );
+    }
+
+    #[test]
+    fn native_runtime_identity_cache_rekeys_same_path_content_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("identity-replacement.gguf");
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu("identity-before"),
+        )
+        .unwrap();
+        let before = resolve_local_native_runtime_model_identity(&runtime_path, None).unwrap();
+        assert_eq!(before.model_id, "identity-before");
+
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu("identity-after"),
+        )
+        .unwrap();
+        let after = resolve_local_native_runtime_model_identity(&runtime_path, None).unwrap();
+        assert_eq!(after.model_id, "identity-after");
+    }
+
+    #[test]
+    fn native_runtime_model_adapter_cache_rekeys_same_path_content_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("dolphin-replacement.gguf");
+        let mut architecture_metadata = std::collections::BTreeMap::new();
+        architecture_metadata.insert(
+            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
+            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::new(architecture_metadata.clone()),
+        )
+        .unwrap();
+        let base_adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("base Dolphin fixture must resolve");
+        assert!(!base_adapter.capabilities().supports_phrase_bias);
+
+        let hotword_spec = TinyGgufFixtureSpec::new(architecture_metadata).with_added_tensor(
+            crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+        );
+        write_tiny_gguf_runtime_source(&runtime_path, &hotword_spec).unwrap();
+        let hotword_adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("same-path Dolphin replacement must resolve");
+        assert!(
+            hotword_adapter.capabilities().supports_phrase_bias,
+            "content-keyed cache must not reuse the base pack's negative phrase-bias result"
+        );
     }
 
     #[test]
@@ -3781,14 +3941,11 @@ mod tests {
     #[test]
     fn dolphin_adapter_builder_still_probes_tensor_index_end_to_end() {
         // Regression test for the tensor-index read gating in
-        // `build_native_runtime_model_adapter_for_path`: the read is now
-        // conditional on `descriptor.model_architecture ==
-        // DOLPHIN_GGML_ARCHITECTURE_ID`, so this exercises the full
-        // `native_runtime_model_adapter_for_path` -> family-registry
-        // selection -> conditional tensor-index read path end to end (not
-        // just the already-covered `native_runtime_descriptor_supports_phrase_bias`
-        // unit above) to confirm Dolphin's per-pack phrase-bias probe still
-        // fires correctly through the gate.
+        // The shared preflight carries both metadata and tensor index, so this
+        // exercises the full `native_runtime_model_adapter_for_path` ->
+        // family-registry selection -> Dolphin tensor-index probe path end to
+        // end (not just the already-covered
+        // `native_runtime_descriptor_supports_phrase_bias` unit above).
         let temp = tempfile::tempdir().unwrap();
         let mut architecture_only_metadata = std::collections::BTreeMap::new();
         architecture_only_metadata.insert(

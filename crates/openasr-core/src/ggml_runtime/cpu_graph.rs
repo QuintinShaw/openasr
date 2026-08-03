@@ -1476,6 +1476,7 @@ impl GgmlCpuGraphRunner {
     /// handle: a caller that already validated/opened a `GgmlRuntimeSource`
     /// for this request must pass that same source here instead of
     /// re-deriving one from a path.
+    #[cfg(test)]
     pub(crate) fn load_gguf_weight_context(
         &self,
         source: &GgmlRuntimeSource,

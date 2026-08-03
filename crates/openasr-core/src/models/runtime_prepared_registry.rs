@@ -115,7 +115,7 @@ pub(crate) struct PreparedRuntimeLookup<'a> {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct BuiltinPreparedRuntimeCache {
-    runtimes_by_path: PreparedRuntimeCache<BuiltinPreparedRuntime>,
+    runtimes_by_content: PreparedRuntimeCache<BuiltinPreparedRuntime>,
 }
 
 impl BuiltinPreparedRuntimeCache {
@@ -123,7 +123,7 @@ impl BuiltinPreparedRuntimeCache {
         &self,
         preflight: &GgmlAsrRuntimeSourcePreflight,
     ) -> Option<PreparedRuntimeHandle<BuiltinPreparedRuntime>> {
-        self.runtimes_by_path.ready(&preflight.runtime_source)
+        self.runtimes_by_content.ready(&preflight.runtime_source)
     }
 
     pub(crate) fn prepared_runtime_for_preflight<E, B, P>(
@@ -136,7 +136,7 @@ impl BuiltinPreparedRuntimeCache {
         B: Fn(BuiltinPreparedRuntimeRegistryError) -> E,
         P: Fn() -> E,
     {
-        self.runtimes_by_path.get_or_try_insert_with(
+        self.runtimes_by_content.get_or_try_insert_with(
             &lookup.preflight.runtime_source,
             PreparedRuntimeQuoteContext {
                 model_architecture: lookup.model_architecture,
@@ -204,7 +204,7 @@ impl BuiltinPreparedRuntimeCache {
     /// Evicts every cached prepared runtime (idle_unload); see
     /// `PreparedRuntimeCache::clear`.
     pub(crate) fn clear(&self) {
-        self.runtimes_by_path.clear();
+        self.runtimes_by_content.clear();
     }
 
     /// Evicts exactly the cached prepared runtime for `pack_content_id`; see
@@ -212,7 +212,7 @@ impl BuiltinPreparedRuntimeCache {
     /// install/replace to release the *old* content id's now-unreachable
     /// resident state without touching any other cached identity.
     pub(crate) fn evict_content_id(&self, pack_content_id: &str) {
-        self.runtimes_by_path.evict_content_id(pack_content_id);
+        self.runtimes_by_content.evict_content_id(pack_content_id);
     }
 }
 

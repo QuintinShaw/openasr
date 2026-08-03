@@ -38,7 +38,6 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
     GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
@@ -365,8 +364,8 @@ pub(crate) struct MossEncoderRuntime {
 }
 
 impl MossEncoderRuntime {
-    pub(crate) fn new_with_prepared_weights(
-        runtime_source: &GgmlRuntimeSource,
+    pub(crate) fn new_with_prepared_weights_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         weights: Arc<MossEncoderWeights>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossEncoderError> {
@@ -374,7 +373,7 @@ impl MossEncoderRuntime {
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_graph_error("load_gguf_weight_context", source))?;
         Ok(Self {
             runner,

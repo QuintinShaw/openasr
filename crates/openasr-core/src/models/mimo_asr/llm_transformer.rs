@@ -164,15 +164,17 @@ pub(crate) struct MimoLlmPrefillOutput {
 }
 
 impl MimoLlmDecoderRuntime {
-    pub(crate) fn new(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoLlmMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoLlmDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
-                reason: error.to_string(),
-            })?;
+        let runtime_source = &preflight.runtime_source;
+        let reader =
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                })?;
         let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
@@ -194,17 +196,16 @@ impl MimoLlmDecoderRuntime {
         // `moss_transcribe_diarize::llm_decoder`'s identical wiring (mimo's
         // registered policy has no suppression or phrase bias, so the shared
         // driver can always honor the hint).
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
-                &decoder_plan,
-                runtime_source,
-                metadata.rms_norm_epsilon,
-                logits_head.fused_top1_spec(),
-                backend,
-            )
-            .map_err(|error| MimoLlmDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
+        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
+            &decoder_plan,
+            preflight,
+            metadata.rms_norm_epsilon,
+            logits_head.fused_top1_spec(),
+            backend,
+        )
+        .map_err(|error| MimoLlmDecoderError::GraphFailed {
+            reason: error.to_string(),
+        })?;
         // The graph constructor has copied/bound every planned tensor handle;
         // release the heap-heavy transient plan before materializing the token
         // embedding so construction peak follows the quoted phase topology.

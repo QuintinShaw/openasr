@@ -11,13 +11,13 @@
 //! `set_*_slice` call freezes further `new_tensor_*` allocation) stays
 //! intact across the family-specific tail tensors too.
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
-    alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
-    upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
+    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
+    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
+    upload_static_f32 as arena_upload_static_f32,
 };
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
@@ -353,7 +353,7 @@ impl FastConformerEncoderCore {
     pub(crate) fn build<E, T>(
         mut graph_config: GgmlCpuGraphConfig,
         context_bytes: usize,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
         declare_tail: impl FnOnce(
@@ -378,8 +378,11 @@ impl FastConformerEncoderCore {
         // Bind the 2-D linears zero-copy from the mmap'd pack (no f32
         // dequantize-to-host, no arena upload). Fails closed below if the
         // load failed but a bindable weight's host payload was dropped.
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(context_bytes)

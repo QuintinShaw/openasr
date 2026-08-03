@@ -28,11 +28,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_AED_GGML_ADAPTER_ID;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufRuntimeSourcePreflight};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -159,17 +158,16 @@ impl Default for FireRedAedGgmlExecutor {
 }
 
 fn allocate_encoder_runtime_owner(
-    runtime_source: GgmlRuntimeSource,
+    preflight: GgufRuntimeSourcePreflight,
     metadata: FireRedAedExecutionMetadata,
     backend: GgmlCpuGraphBackend,
     quote: SystemMemoryAllocationQuote,
 ) -> Result<SystemMemoryOwner<FireRedEncoderGraphRuntime>, FireRedAedExecutorError> {
     match SystemMemoryOwner::try_allocate_transaction(quote, || {
-        let runtime = FireRedEncoderGraphRuntime::new(&runtime_source, metadata, backend).map_err(
-            |error| FireRedAedExecutorError::EncoderFailed {
+        let runtime = FireRedEncoderGraphRuntime::new_from_preflight(&preflight, metadata, backend)
+            .map_err(|error| FireRedAedExecutorError::EncoderFailed {
                 reason: error.to_string(),
-            },
-        )?;
+            })?;
         let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
             FireRedAedExecutorError::RuntimeOwnershipFailed {
                 stage: "encoder",
@@ -192,18 +190,17 @@ fn allocate_encoder_runtime_owner(
 }
 
 fn allocate_decoder_runtime_owner(
-    runtime_source: GgmlRuntimeSource,
+    preflight: GgufRuntimeSourcePreflight,
     metadata: FireRedAedExecutionMetadata,
     decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     backend: GgmlCpuGraphBackend,
     quote: SystemMemoryAllocationQuote,
 ) -> Result<SystemMemoryOwner<FireRedDecoderGraphRuntime>, FireRedAedExecutorError> {
     match SystemMemoryOwner::try_allocate_transaction(quote, || {
-        let runtime =
-            FireRedDecoderGraphRuntime::new(&runtime_source, metadata, decoder_state, backend)
-                .map_err(|error| FireRedAedExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                })?;
+        let runtime = FireRedDecoderGraphRuntime::new(&preflight, metadata, decoder_state, backend)
+            .map_err(|error| FireRedAedExecutorError::DecoderFailed {
+                reason: error.to_string(),
+            })?;
         let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
             FireRedAedExecutorError::RuntimeOwnershipFailed {
                 stage: "decoder",
@@ -259,43 +256,45 @@ impl FireRedAedGgmlExecutor {
 
     fn checkout_encoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FireRedAedEncoderRuntime, FireRedAedExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
         );
-        let source = runtime_source.clone();
-        let pack_content_id = runtime_source.content_id().to_string();
+        let preflight = preflight.clone();
+        let pack_content_id = preflight.runtime_source.content_id().to_string();
         self.encoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
                 let quote =
                     FireRedEncoderGraphRuntime::system_memory_quote(metadata, &pack_content_id)
                         .map_err(|reason| Self::map_runtime_ownership_error("encoder", reason))?;
-                Ok((quote.retained_bytes, (source, quote)))
+                Ok((quote.retained_bytes, (preflight, quote)))
             },
-            move |(source, quote)| allocate_encoder_runtime_owner(source, metadata, backend, quote),
+            move |(preflight, quote)| {
+                allocate_encoder_runtime_owner(preflight, metadata, backend, quote)
+            },
             |error| Self::map_actor_error("encoder", error),
         )
     }
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FireRedAedDecoderRuntime, FireRedAedExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             decoder_state.resident_capacity(),
         );
-        let source = runtime_source.clone();
-        let pack_content_id = runtime_source.content_id().to_string();
+        let preflight = preflight.clone();
+        let pack_content_id = preflight.runtime_source.content_id().to_string();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
@@ -306,10 +305,10 @@ impl FireRedAedGgmlExecutor {
                     &pack_content_id,
                 )
                 .map_err(|reason| Self::map_runtime_ownership_error("decoder", reason))?;
-                Ok((quote.retained_bytes, (source, quote)))
+                Ok((quote.retained_bytes, (preflight, quote)))
             },
-            move |(source, quote)| {
-                allocate_decoder_runtime_owner(source, metadata, decoder_state, backend, quote)
+            move |(preflight, quote)| {
+                allocate_decoder_runtime_owner(preflight, metadata, decoder_state, backend, quote)
             },
             |error| Self::map_actor_error("decoder", error),
         )
@@ -317,13 +316,13 @@ impl FireRedAedGgmlExecutor {
 
     fn encode_with_owned_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         cmvn_features: Vec<f32>,
         n_frames: usize,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FireRedEncoderOutput, FireRedAedExecutorError> {
-        let runtime = self.checkout_encoder_runtime(runtime_source, metadata, backend)?;
+        let runtime = self.checkout_encoder_runtime(preflight, metadata, backend)?;
         runtime
             .call_mut(move |runtime| runtime.encode(&cmvn_features, n_frames))
             .map_err(|error| Self::map_actor_error("encoder", error))?
@@ -335,7 +334,7 @@ impl FireRedAedGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_owned_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         encoder_rows: Vec<f32>,
         encoder_frame_count: usize,
@@ -344,8 +343,7 @@ impl FireRedAedGgmlExecutor {
         control: Arc<crate::api::backend::TranscriptionControl>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<super::decoder_graph::FireRedAedGreedyDecodeOutput, FireRedAedExecutorError> {
-        let runtime =
-            self.checkout_decoder_runtime(runtime_source, metadata, decoder_state, backend)?;
+        let runtime = self.checkout_decoder_runtime(preflight, metadata, decoder_state, backend)?;
         runtime
             .call_mut(move |runtime| {
                 runtime.activate_decoder_state(decoder_state)?;
@@ -485,11 +483,10 @@ impl FireRedAedGgmlExecutor {
             });
         }
 
-        let runtime_source = &preflight.runtime_source;
         let backend = request.resolved_runtime.backend();
         let feature_frames = features.n_frames;
         let encoder_output = self.encode_with_owned_runtime(
-            runtime_source,
+            &preflight,
             metadata,
             features.data,
             feature_frames,
@@ -497,7 +494,7 @@ impl FireRedAedGgmlExecutor {
         )?;
 
         let decode = self.decode_with_owned_runtime(
-            runtime_source,
+            &preflight,
             metadata,
             encoder_output.rows,
             encoder_output.frame_count,
@@ -1023,12 +1020,9 @@ mod tests {
         let mut features = frontend.compute(&samples).expect("fbank features");
         apply_cmvn(&mut features.data, features.n_mels, &neg_mean, &inv_stddev)
             .expect("apply cmvn");
-        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
-            &preflight.runtime_source,
-            metadata,
-            GgmlCpuGraphBackend::Cpu,
-        )
-        .expect("build cpu encoder runtime");
+        let mut encoder_runtime =
+            FireRedEncoderGraphRuntime::new(&preflight, metadata, GgmlCpuGraphBackend::Cpu)
+                .expect("build cpu encoder runtime");
         let encoder_output = encoder_runtime
             .encode(&features.data, features.n_frames)
             .expect("encode");
@@ -1040,7 +1034,7 @@ mod tests {
         // recorded fresh-pass logits for the identical prefix.
         let max_steps = 256usize;
         let mut fresh_runtime = match FireRedDecoderGraphRuntime::new(
-            &preflight.runtime_source,
+            &preflight,
             metadata,
             decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,
@@ -1084,7 +1078,7 @@ mod tests {
         );
 
         let mut reused_runtime = FireRedDecoderGraphRuntime::new(
-            &preflight.runtime_source,
+            &preflight,
             metadata,
             decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,

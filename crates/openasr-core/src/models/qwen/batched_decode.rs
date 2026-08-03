@@ -60,14 +60,9 @@ pub(super) struct Qwen3AsrServeBatchConfig {
 #[derive(Debug, Clone)]
 pub(super) struct Qwen3AsrServeBatchJob {
     pub runtime_cache_path: PathBuf,
-    /// The same already-open, already-validated source the submitting
-    /// thread's preflight resolved. Cloning it is a refcount bump on its
-    /// `Arc<Mmap>`, not a reopen -- the owner thread that actually builds the
-    /// whole-decoder graph binds resident weights from this same mapping
-    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path,
-    /// so identity and weight bytes come from one open even across this
-    /// thread boundary.
-    pub runtime_source: crate::GgmlRuntimeSource,
+    /// The exact preflight provenance unit used by the submitting executor.
+    /// The owner thread must use this instead of reparsing a path.
+    pub runtime_source_preflight: crate::GgufRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub metadata: Qwen3AsrExecutionMetadata,
@@ -1638,9 +1633,9 @@ impl Qwen3AsrOwnerThreadState {
     > {
         if self.decoder.is_none() && self.logits_runtime.is_none() {
             let prepared_runtime = slot.job.prepared_runtime()?;
-            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan(
+            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
                 prepared_runtime.decoder_plan.as_ref(),
-                &slot.job.runtime_source,
+                &slot.job.runtime_source_preflight,
                 slot.job.backend,
             )
             .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
@@ -2367,7 +2362,7 @@ mod tests {
     };
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
-    use crate::{read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path};
+    use crate::validate_ggml_runtime_source_path;
     use std::{collections::BTreeMap, ffi::OsString};
 
     const QWEN_SERVE_BATCH_REAL_PACK_ENV: &str = "OPENASR_QWEN_SERVE_BATCH_REAL_PACK";
@@ -2419,6 +2414,7 @@ mod tests {
     struct Qwen3AsrServeBatchFixture {
         runtime_path: PathBuf,
         runtime_source: crate::GgmlRuntimeSource,
+        runtime_source_preflight: crate::GgufRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
         token_embedding_table: Qwen3AsrTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
@@ -2473,9 +2469,13 @@ mod tests {
     fn load_qwen_serve_batch_fixture_from_path(runtime_path: PathBuf) -> Qwen3AsrServeBatchFixture {
         let runtime_source =
             validate_ggml_runtime_source_path(&runtime_path).expect("valid qwen runtime source");
-        let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
-            .expect("read qwen runtime metadata");
-        let metadata = parse_qwen3_execution_metadata(&metadata).expect("parse qwen metadata");
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+                &runtime_source,
+            )
+            .expect("qwen runtime preflight");
+        let metadata = runtime_source_preflight.metadata.as_ref();
+        let metadata = parse_qwen3_execution_metadata(metadata).expect("parse qwen metadata");
         let reader =
             GgufTensorDataReader::from_runtime_source(&runtime_source).expect("qwen tensor reader");
         let token_embedding_table = load_qwen3_token_embedding_table_from_reader(&reader, metadata)
@@ -2513,6 +2513,7 @@ mod tests {
         Qwen3AsrServeBatchFixture {
             runtime_path,
             runtime_source,
+            runtime_source_preflight,
             metadata,
             token_embedding_table,
             logits_head,
@@ -2658,7 +2659,7 @@ mod tests {
                 "adapter=none",
                 runtime_source.content_id(),
             ),
-            runtime_source,
+            runtime_source_preflight: fixture.runtime_source_preflight.clone(),
             backend: GgmlCpuGraphConfig::runtime_default().backend,
             metadata: fixture.metadata,
             prepared_assets: Qwen3AsrServeBatchPreparedAssets::Fixture {

@@ -21,6 +21,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::path::PathBuf;
 
+use crate::PhraseBiasConfig;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
@@ -50,7 +51,6 @@ use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
     SystemMemoryAllocationTransactionError, SystemMemoryOwner, SystemMemoryOwnerError,
 };
-use crate::{GgmlRuntimeSource, PhraseBiasConfig};
 use crate::{NativeAsrSession, SENSEVOICE_GGML_ADAPTER_ID};
 
 use super::encoder_graph::{SenseVoiceEncoderGraph, build_sensevoice_encoder_input};
@@ -134,7 +134,7 @@ pub(crate) struct SenseVoiceTranscription {
 }
 
 fn materialize_sensevoice_prepared_runtime(
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     gguf_metadata: &crate::ggml_runtime::GgufMetadata,
     metadata: SenseVoiceExecutionMetadata,
@@ -146,7 +146,7 @@ fn materialize_sensevoice_prepared_runtime(
     let prompt_embed = weights.prompt_embed.values.clone();
     let cmvn_neg_mean = weights.cmvn_neg_mean.values.clone();
     let cmvn_inv_stddev = weights.cmvn_inv_stddev.values.clone();
-    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
+    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, Some(preflight), backend)
         .map_err(|e| e.to_string())?;
     Ok(SenseVoicePreparedRuntime {
         metadata,
@@ -366,7 +366,7 @@ fn checkout_sensevoice_prepared_runtime(
             let measured_peak = quote.peak_bytes;
             match SystemMemoryOwner::try_allocate_transaction(quote, || {
                 let runtime = materialize_sensevoice_prepared_runtime(
-                    &preflight.runtime_source,
+                    &preflight,
                     &reader,
                     &preflight.metadata,
                     metadata,

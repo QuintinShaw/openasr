@@ -4,7 +4,6 @@
 #[cfg(test)]
 use std::path::Path;
 
-use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription, WordTimestamp};
@@ -12,7 +11,8 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReade
 use crate::models::frame_sync_streaming_driver::FrameSyncStreamingTranscriptDriver;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
+    GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 
@@ -91,7 +91,7 @@ pub(crate) fn transcribe_xasr_zipformer_pcm(
 fn transcribe_xasr_zipformer_pcm_cached(
     runtime_pool: &XasrRuntimeActorPool,
     samples: &[f32],
-    runtime_source: &GgmlRuntimeSource,
+    preflight: &GgmlAsrRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -99,7 +99,7 @@ fn transcribe_xasr_zipformer_pcm_cached(
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());
     }
-    let actor = checkout_prepared_runtime(runtime_pool, runtime_source, backend)?;
+    let actor = checkout_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
     actor
         .call_mut(move |runtime| {
@@ -182,7 +182,7 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
         let output = transcribe_xasr_zipformer_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight.runtime_source,
+            &preflight,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
@@ -261,7 +261,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
         );
         let runtime = checkout_prepared_runtime(
             &self.runtime_pool,
-            &preflight.runtime_source,
+            &preflight,
             request.resolved_runtime.backend(),
         )
         .map_err(fail)?;

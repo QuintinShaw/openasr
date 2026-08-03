@@ -2,7 +2,6 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, env_var_truthy,
@@ -260,23 +259,8 @@ fn qwen_audio_encoder_runtime_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
 }
 
 impl Qwen3AsrAudioEncoderRuntime {
-    pub(crate) fn new(
-        runtime_source: Option<&GgmlRuntimeSource>,
-        backend: GgmlCpuGraphBackend,
-    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
-        Self::new_internal(runtime_source, None, backend)
-    }
-
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
-    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
-        Self::new_internal(Some(&preflight.runtime_source), Some(preflight), backend)
-    }
-
-    fn new_internal(
-        runtime_source: Option<&GgmlRuntimeSource>,
-        preflight: Option<&crate::ggml_runtime::GgufRuntimeSourcePreflight>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3AsrAudioEncoderError> {
         // See `qwen_audio_encoder_runtime_graph_config` for the `EncoderPrelude`
@@ -292,12 +276,9 @@ impl Qwen3AsrAudioEncoderRuntime {
         // the mmap'd pack (native q8/f16) instead of dequantizing them to f32. The
         // loader (1b) does not materialize f32 for these — `loaded` is the only
         // source. `None` (no path) only happens off the production executor path.
-        let loaded = match preflight {
-            Some(preflight) => runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok(),
-            None => runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok()),
-        };
+        let loaded = runner
+            .load_gguf_weight_context_from_preflight(preflight)
+            .ok();
         Ok(Self { runner, loaded })
     }
 
@@ -1607,6 +1588,10 @@ mod tests {
 
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+            &runtime_source,
+        )
+        .expect("runtime preflight");
         let reader =
             GgufTensorDataReader::from_runtime_source(&runtime_source).expect("gguf reader");
         let weights = load_qwen3_audio_encoder_weights_from_reader(&reader, metadata)
@@ -1626,7 +1611,7 @@ mod tests {
         };
 
         let mut runtime =
-            Qwen3AsrAudioEncoderRuntime::new(Some(&runtime_source), GgmlCpuGraphBackend::Cpu)
+            Qwen3AsrAudioEncoderRuntime::new_from_preflight(&preflight, GgmlCpuGraphBackend::Cpu)
                 .expect("runtime");
         let output = runtime
             .encode(&weights, metadata, &mel_features)
@@ -1698,6 +1683,10 @@ mod tests {
 
         let runtime_source =
             validate_ggml_runtime_source_path(&pack_path).expect("valid qwen3-asr runtime source");
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+            &runtime_source,
+        )
+        .expect("qwen3-asr runtime preflight");
         let raw_metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
             .expect("read qwen3-asr runtime metadata");
         let metadata =
@@ -1727,7 +1716,7 @@ mod tests {
         };
 
         let mut runtime =
-            Qwen3AsrAudioEncoderRuntime::new(Some(&runtime_source), GgmlCpuGraphBackend::Cpu)
+            Qwen3AsrAudioEncoderRuntime::new_from_preflight(&preflight, GgmlCpuGraphBackend::Cpu)
                 .expect("runtime");
         let output = runtime
             .encode(&weights, metadata, &mel_features)

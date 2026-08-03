@@ -9,10 +9,9 @@
 
 #![allow(dead_code)]
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, WeightSlot,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
     alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
@@ -207,7 +206,7 @@ impl SenseVoiceEncoderGraph {
     pub(crate) fn new(
         weights: &SenseVoiceEncoderWeights,
         metadata: SenseVoiceExecutionMetadata,
-        runtime_source: Option<&GgmlRuntimeSource>,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, SenseVoiceEncoderError> {
         let mut config = sensevoice_encoder_graph_config(backend);
@@ -220,8 +219,11 @@ impl SenseVoiceEncoderGraph {
                 source,
             }
         })?;
-        let loaded_weights =
-            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
+        let loaded_weights = runtime_preflight.and_then(|preflight| {
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .ok()
+        });
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES)
@@ -570,7 +572,9 @@ pub(crate) fn build_sensevoice_encoder_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ggml_runtime::GgufTensorDataReader;
+    use crate::ggml_runtime::{
+        build_runtime_tensor_reader_from_preflight, load_runtime_source_metadata_and_tensor_index,
+    };
     use crate::models::sensevoice::encoder_weights::load_sensevoice_encoder_weights;
     use crate::models::sensevoice::runtime_contract::parse_sensevoice_execution_metadata;
 
@@ -597,11 +601,11 @@ mod tests {
         let lfr = read_f32("ref_lfr_zh.bin");
         let ref_logits = read_f32("ref_logits_zh.bin");
 
-        let runtime_source =
-            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
-        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
-        let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
-        let metadata = parse_sensevoice_execution_metadata(&gguf_metadata).expect("contract");
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+        let gguf_metadata = preflight.metadata.as_ref();
+        let metadata = parse_sensevoice_execution_metadata(gguf_metadata).expect("contract");
         let weights = load_sensevoice_encoder_weights(&reader, &metadata).expect("weights");
 
         // zh prompt: [lang=3, event=1, emotion=2, textnorm(woitn)=15].
@@ -616,7 +620,7 @@ mod tests {
         let mut graph = SenseVoiceEncoderGraph::new(
             &weights,
             metadata,
-            Some(&runtime_source),
+            Some(&preflight),
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("graph");

@@ -96,6 +96,7 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+syn = { version = "2", features = ["full", "visit"] }
 # TS binding codegen for the realtime WebSocket wire types (crate::realtime).
 # Dev-only: the derive is gated behind `#[cfg_attr(test, derive(ts_rs::TS))]`
 # on the wire structs, so this never becomes part of the shipped rlib -- it

@@ -103,10 +103,12 @@ pub use package_probe::{
     GgmlPackageProbeError, OPENASR_RUNTIME_PACK_EXTENSION, has_openasr_runtime_pack_extension,
     probe_ggml_package_model_identity, probe_ggml_package_path,
 };
-pub use runtime_preflight::GgufRuntimeSourcePreflight;
+pub use runtime_preflight::{
+    GgufRuntimeSourcePreflight, RuntimeSourceMetadataAndTensorIndexPreflightError,
+};
 pub(crate) use runtime_preflight::{
-    RuntimeSourceMetadataAndTensorIndexPreflightError, RuntimeSourceTensorReaderError,
-    build_runtime_tensor_reader_from_preflight, load_runtime_source_metadata_and_tensor_index,
+    RuntimeSourceTensorReaderError, build_runtime_tensor_reader_from_preflight,
+    load_runtime_source_metadata_and_tensor_index,
     load_runtime_source_metadata_and_tensor_index_from_source,
 };
 pub use runtime_source::{

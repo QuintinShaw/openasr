@@ -1770,7 +1770,7 @@ mod tests {
                 .expect_err("xasr phrase bias should fail early")
                 .to_string();
 
-        assert!(error.contains("--hotword is not supported"));
+        assert!(error.contains("--hotword is not supported"), "{error}");
         assert!(error.contains("xasr-zipformer"));
         assert!(error.contains("silently ignoring phrase_bias"));
     }

@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use crate::GgmlRuntimeSource;
-
 use thiserror::Error;
 
 use super::batched_decode::{
@@ -229,7 +227,7 @@ impl MoonshineGgmlExecutor {
         .map_err(map_frontend_error)?;
 
         let encoder_output = self.encode_with_owned_runtime(
-            &preflight.runtime_source,
+            preflight.as_ref(),
             Arc::clone(&prepared_runtime),
             features,
             adapter.clone(),
@@ -264,7 +262,7 @@ impl MoonshineGgmlExecutor {
                     runtime_cache_path: canonical_runtime_cache_path(
                         preflight.runtime_source.path(),
                     ),
-                    runtime_source: preflight.runtime_source.clone(),
+                    runtime_preflight: preflight.as_ref().clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
@@ -297,7 +295,7 @@ impl MoonshineGgmlExecutor {
             })?
             } else {
                 self.decode_with_owned_runtime(
-                    &preflight.runtime_source,
+                    preflight.as_ref(),
                     Arc::clone(&prepared_runtime),
                     encoder_output,
                     request.request_options.phrase_bias.clone(),
@@ -374,26 +372,26 @@ impl MoonshineGgmlExecutor {
 
     fn checkout_encoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<MoonshineEncoderRuntimeActor, MoonshineGgmlExecutorError> {
         let encoder_backend = moonshine_encoder_graph_config(backend).backend;
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(encoder_backend),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.encoder_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, (source, prepared, adapter))),
-            move |(source, prepared, adapter)| {
+            move || Ok((0, (preflight, prepared, adapter))),
+            move |(preflight, prepared, adapter)| {
                 let runtime = MoonshineEncoderGraphRuntime::new(
                     &prepared.encoder_weights,
                     prepared.metadata,
-                    Some(&source),
+                    Some(&preflight),
                     adapter.as_ref().map(resolved_lora_adapter),
                     backend,
                 )
@@ -413,7 +411,7 @@ impl MoonshineGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
@@ -421,16 +419,16 @@ impl MoonshineGgmlExecutor {
     ) -> Result<MoonshineDecoderRuntimeActor, MoonshineGgmlExecutorError> {
         let decoder_backend = moonshine_decoder_graph_config(backend, false).backend;
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(decoder_backend),
             decoder_state.resident_capacity(),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, (source, prepared, adapter))),
-            move |(source, prepared, adapter)| {
+            move || Ok((0, (preflight, prepared, adapter))),
+            move |(preflight, prepared, adapter)| {
                 let runtime = MoonshineDecoderGraphRuntime::new(
                     MoonshineDecoderRuntimeInput {
                         decoder_weights: &prepared.decoder_weights,
@@ -439,7 +437,7 @@ impl MoonshineGgmlExecutor {
                         backend,
                     },
                     false,
-                    Some(&source),
+                    Some(&preflight),
                     adapter.as_ref().map(resolved_lora_adapter),
                 )
                 .map_err(|error| MoonshineGgmlExecutorError::DecoderFailed {
@@ -458,13 +456,13 @@ impl MoonshineGgmlExecutor {
 
     fn encode_with_owned_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         features: super::frontend::MoonshineWaveformFeatures,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<MoonshineEncoderOutput, MoonshineGgmlExecutorError> {
-        let runtime = self.checkout_encoder_runtime(runtime_source, prepared, adapter, backend)?;
+        let runtime = self.checkout_encoder_runtime(preflight, prepared, adapter, backend)?;
         runtime
             .call_mut(move |state| state.runtime.encode(&features))
             .map_err(|error| Self::map_actor_error("encoder", error))?
@@ -476,7 +474,7 @@ impl MoonshineGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_owned_runtime(
         &self,
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgmlAsrRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         encoder_output: MoonshineEncoderOutput,
         phrase_bias: Option<crate::PhraseBiasConfig>,
@@ -489,13 +487,8 @@ impl MoonshineGgmlExecutor {
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
         let tokenizer = prepared.tokenizer.clone();
         let metadata = prepared.metadata;
-        let runtime = self.checkout_decoder_runtime(
-            runtime_source,
-            prepared,
-            adapter,
-            decoder_state,
-            backend,
-        )?;
+        let runtime =
+            self.checkout_decoder_runtime(preflight, prepared, adapter, decoder_state, backend)?;
         runtime
             .call_mut(move |state| {
                 state.runtime.activate_decoder_state(decoder_state)?;

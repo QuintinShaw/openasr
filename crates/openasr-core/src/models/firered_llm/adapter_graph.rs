@@ -30,8 +30,8 @@
 //! this crate (e.g. `firered_aed::encoder_graph`'s conformer projections).
 //!
 //! Runs on its own small [`GgmlCpuGraphRunner`] + [`GgmlLoadedWeightContext`],
-//! loaded from the same already-open [`crate::GgmlRuntimeSource`] the encoder
-//! stage was built from (no second `File::open`/mmap of the `.oasr` GGUF),
+//! loaded from the same [`crate::GgufRuntimeSourcePreflight`] the encoder
+//! stage was built from (no second `File::open`/mmap/parse of the `.oasr` GGUF),
 //! reusing the encoder's exact backend/thread policy
 //! ([`firered_encoder_graph_config`]) since the adapter is the very next
 //! stage in the same pipeline and should follow the same Auto-Metal/CPU
@@ -39,7 +39,6 @@
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightContext,
 };
@@ -111,14 +110,14 @@ pub(crate) struct FireRedLlmAdapterGraphRuntime {
 }
 
 impl FireRedLlmAdapterGraphRuntime {
-    pub(crate) fn new(
-        runtime_source: &GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedLlmAdapterError> {
         let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let linear1_weight = tensor(&loaded, ADAPTER_LINEAR1_WEIGHT)?;
         let linear1_bias = tensor(&loaded, ADAPTER_LINEAR1_BIAS)?;
@@ -367,8 +366,14 @@ mod tests {
 
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
-        let reader =
-            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+            &runtime_source,
+        )
+        .expect("runtime preflight");
+        let reader = crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(
+            &preflight,
+        )
+        .expect("open tensor reader");
         let feature_dim_shape = [encoder_metadata.feature_dim as u64];
         let neg_mean = reader
             .host_tensor_f32_copy_dequantized_by_name("frontend.cmvn.neg_mean", &feature_dim_shape)
@@ -385,7 +390,7 @@ mod tests {
             .expect("apply cmvn");
 
         let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
-            &runtime_source,
+            &preflight,
             encoder_metadata,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
@@ -403,8 +408,8 @@ mod tests {
             adapter_metadata.llm_dim,
         );
 
-        let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new(
-            &runtime_source,
+        let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
+            &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("build adapter runtime");

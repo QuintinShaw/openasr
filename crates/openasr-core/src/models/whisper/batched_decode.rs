@@ -30,6 +30,7 @@ use crate::models::decode_policy_component_registry::{
     build_builtin_seq2seq_decode_policy_config, resolve_builtin_decode_policy,
 };
 use crate::models::decode_token_history::build_longform_token_history_carry;
+use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
@@ -82,7 +83,7 @@ pub(crate) struct WhisperServeBatchJob {
     /// mapping instead of a fresh `File::open`/`load_gguf_weight_context` by
     /// path, so identity and weight bytes come from one open even across
     /// this thread boundary.
-    pub runtime_source: crate::GgmlRuntimeSource,
+    pub runtime_preflight: GgmlAsrRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -318,7 +319,7 @@ impl WhisperServeDecoderRuntime {
                 &job.decoder_weights.tensor_source,
                 &mut tensor_cache,
                 job.decoder_state.self_attention.resident_positions,
-                Some(&job.runtime_source),
+                Some(&job.runtime_preflight),
                 n_seq,
             )
             .map_err(map_decoder_error)?;
@@ -1227,8 +1228,8 @@ mod tests {
         let (encoder_frames, encoder_hidden_size, encoder_hidden_f32) =
             sample_encoder_hidden(&execution, encoder_phase);
         let decoder_state = decoder_state_fixture(&execution, encoder_frames);
-        let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
-            .expect("valid runtime source path");
+        let runtime_preflight = read_runtime_source_preflight(runtime_path);
+        let runtime_source = runtime_preflight.runtime_source.clone();
         WhisperServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
@@ -1237,7 +1238,7 @@ mod tests {
                 "adapter=none",
                 runtime_source.content_id(),
             ),
-            runtime_source,
+            runtime_preflight,
             backend,
             uses_scheduler,
             execution,

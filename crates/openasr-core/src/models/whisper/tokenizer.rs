@@ -9,9 +9,7 @@ use serde::Deserialize;
 use crate::NativeAsrError;
 use crate::TranscriptionTask;
 use crate::arch::hparams::WHISPER_VOCAB_SIZE_KEY;
-use crate::ggml_runtime::{
-    GgmlRuntimeSource, GgufMetadata, read_gguf_metadata_from_runtime_source,
-};
+use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
@@ -162,20 +160,6 @@ impl WhisperTokenizer {
             "whisper tokenizer special-token entries",
         )?;
         Ok(bytes.finish())
-    }
-
-    pub(crate) fn from_ggml_runtime_source(
-        runtime_source: &GgmlRuntimeSource,
-    ) -> Result<Self, NativeAsrError> {
-        let metadata = read_gguf_metadata_from_runtime_source(runtime_source).map_err(|error| {
-            NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "could not read GGUF metadata from '{}': {error}",
-                    runtime_source.path().display()
-                ),
-            }
-        })?;
-        Self::from_gguf_metadata(&metadata)
     }
 
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {

@@ -482,6 +482,17 @@ fn sandbox_mode() -> SandboxMode {
 }
 
 fn is_openasr_helper_exe(path: &Path) -> bool {
+    // Cargo test harnesses live under `target/{profile}/deps` and use names
+    // such as `openasr-<crate-hash>`. They do not implement the hidden helper
+    // argument even though their stem otherwise resembles a triple-suffixed
+    // sidecar. Auto mode must use the bounded in-process parser there.
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|parent| parent == "deps")
+    {
+        return false;
+    }
     // Accept the bundled sidecar name ("openasr") and any triple-suffixed /
     // resource-dir variant ("openasr-aarch64-apple-darwin", "openasr-cli", ...)
     // so Auto-mode engages the sandbox for every OpenASR helper, not just the
@@ -537,6 +548,20 @@ fn apply_child_limits() -> Result<(), io::Error> {
 mod tests {
     use super::*;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+    #[test]
+    fn helper_detection_excludes_cargo_test_harnesses_but_keeps_sidecars() {
+        assert!(!is_openasr_helper_exe(Path::new(
+            "/tmp/target/debug/deps/openasr-deadbeef"
+        )));
+        assert!(is_openasr_helper_exe(Path::new("/usr/local/bin/openasr")));
+        assert!(is_openasr_helper_exe(Path::new(
+            "/Applications/OpenASR.app/Contents/MacOS/openasr-aarch64-apple-darwin"
+        )));
+        assert!(!is_openasr_helper_exe(Path::new(
+            "/tmp/target/debug/deps/openasr_core-deadbeef"
+        )));
+    }
 
     #[test]
     fn child_output_round_trips_metadata_and_tensor_index() {

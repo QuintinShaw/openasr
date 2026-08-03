@@ -29,10 +29,9 @@
 
 use thiserror::Error;
 
-use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
@@ -354,7 +353,7 @@ impl FireRedDecoderGraphRuntime {
     }
 
     pub(crate) fn new(
-        runtime_source: &GgmlRuntimeSource,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
@@ -388,7 +387,7 @@ impl FireRedDecoderGraphRuntime {
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_source)
+            .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedDecoderWeights::load(&loaded, metadata.decoder_n_layers)?;
         let arena_state = build_firered_decoder_arena_state(

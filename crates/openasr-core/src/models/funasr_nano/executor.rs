@@ -307,28 +307,36 @@ impl FunasrNanoGgmlExecutor {
 
     fn checkout_encoder_adapter_runtime(
         &self,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
         encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
         adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FunasrNanoEncoderAdapterRuntimeActor, FunasrNanoExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.encoder_adapter_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, source)),
-            move |source| {
-                let encoder = FunasrNanoEncoderGraph::new(&source, encoder_metadata, backend)
-                    .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
-                        reason: error.to_string(),
-                    })?;
-                let adapter = FunasrNanoAdapterGraph::new(&source, adapter_metadata, backend)
-                    .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
-                        reason: error.to_string(),
-                    })?;
+            move || Ok((0, preflight)),
+            move |preflight| {
+                let encoder = FunasrNanoEncoderGraph::new_from_preflight(
+                    &preflight,
+                    encoder_metadata,
+                    backend,
+                )
+                .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
+                let adapter = FunasrNanoAdapterGraph::new_from_preflight(
+                    &preflight,
+                    adapter_metadata,
+                    backend,
+                )
+                .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
+                    reason: error.to_string(),
+                })?;
                 Ok(SystemMemoryOwner::without_allocation(
                     FunasrNanoEncoderAdapterActorState {
                         runtime: FunasrNanoEncoderAdapterRuntime { encoder, adapter },
@@ -341,14 +349,14 @@ impl FunasrNanoGgmlExecutor {
 
     fn encode_with_owned_encoder_adapter_runtime(
         &self,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
         encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
         adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
         encoder_input: crate::models::sensevoice::encoder_graph::SenseVoiceEncoderInput,
         backend: GgmlCpuGraphBackend,
     ) -> Result<(Vec<f32>, usize), FunasrNanoExecutorError> {
         let actor = self.checkout_encoder_adapter_runtime(
-            runtime_source,
+            preflight,
             encoder_metadata,
             adapter_metadata,
             backend,
@@ -405,27 +413,31 @@ impl FunasrNanoGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FunasrNanoDecoderRuntimeActor, FunasrNanoExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             kv_capacity.resident_positions(),
         );
-        let quote_source = runtime_source.clone();
-        let build_source = runtime_source.clone();
-        let content_id = runtime_source.content_id().to_string();
+        let quote_preflight = preflight.clone();
+        let build_preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
                 let reader =
-                    crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(&quote_source)
-                        .map_err(|error| FunasrNanoExecutorError::RuntimeOwnershipFailed {
-                        stage: "decoder",
-                        reason: format!("decoder quote tensor reader failed: {error}"),
+                    crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(
+                        &quote_preflight,
+                    )
+                    .map_err(|error| {
+                        FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason: format!("decoder quote tensor reader failed: {error}"),
+                        }
                     })?;
                 let (peak_bytes, retained_bytes) =
                     super::llm_transformer::quoted_funasr_nano_decoder_system_memory_bytes(
@@ -451,27 +463,29 @@ impl FunasrNanoGgmlExecutor {
                         reason: error.to_string(),
                     }
                 })?;
-                Ok((retained_bytes, (build_source, quote)))
+                Ok((retained_bytes, (build_preflight, quote)))
             },
-            move |(source, quote)| match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                let runtime =
-                    FunasrNanoDecoderRuntime::new(&source, metadata, backend).map_err(|error| {
-                        FunasrNanoExecutorError::DecoderFailed {
-                            reason: error.to_string(),
+            move |(preflight, quote)| match SystemMemoryOwner::try_allocate_transaction(
+                quote,
+                || {
+                    let runtime =
+                        FunasrNanoDecoderRuntime::new_from_preflight(&preflight, metadata, backend)
+                            .map_err(|error| FunasrNanoExecutorError::DecoderFailed {
+                                reason: error.to_string(),
+                            })?;
+                    let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
+                        FunasrNanoExecutorError::RuntimeOwnershipFailed {
+                            stage: "decoder",
+                            reason,
                         }
                     })?;
-                let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
-                    FunasrNanoExecutorError::RuntimeOwnershipFailed {
-                        stage: "decoder",
-                        reason,
-                    }
-                })?;
-                Ok(SystemMemoryAllocationOutcome::new(
-                    FunasrNanoDecoderActorState { runtime },
-                    retained,
-                    retained,
-                ))
-            }) {
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        FunasrNanoDecoderActorState { runtime },
+                        retained,
+                        retained,
+                    ))
+                },
+            ) {
                 Ok(owner) => Ok(owner),
                 Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
                 Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
@@ -579,10 +593,9 @@ impl FunasrNanoGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        let runtime_source = &preflight.runtime_source;
         let backend = request.resolved_runtime.backend();
         let (speech_rows, audio_token_count) = self.encode_with_owned_encoder_adapter_runtime(
-            runtime_source,
+            &preflight,
             encoder_metadata,
             adapter_metadata,
             encoder_input,
@@ -611,7 +624,7 @@ impl FunasrNanoGgmlExecutor {
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FunasrNanoExecutorError::DecoderStateCapacity { source })?;
         let decoder_actor =
-            self.checkout_decoder_runtime(runtime_source, decoder_metadata, kv_capacity, backend)?;
+            self.checkout_decoder_runtime(&preflight, decoder_metadata, kv_capacity, backend)?;
         let decoder_control = Arc::clone(&request.execution_context.control);
         let result = decoder_actor
             .call_mut(move |state| {
@@ -854,6 +867,10 @@ mod tests {
         };
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+            &runtime_source,
+        )
+        .expect("runtime preflight");
         let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
         let encoder_metadata =
             parse_funasr_nano_encoder_metadata(&gguf_metadata).expect("encoder metadata");
@@ -882,8 +899,8 @@ mod tests {
             )
             .expect("encoder input");
             let (speech_rows_full, _) = {
-                let mut encoder = FunasrNanoEncoderGraph::new(
-                    &runtime_source,
+                let mut encoder = FunasrNanoEncoderGraph::new_from_preflight(
+                    &preflight,
                     encoder_metadata,
                     GgmlCpuGraphBackend::Cpu,
                 )
@@ -895,8 +912,8 @@ mod tests {
                         encoder_input.feature_dim,
                     )
                     .expect("encode");
-                let mut adapter = FunasrNanoAdapterGraph::new(
-                    &runtime_source,
+                let mut adapter = FunasrNanoAdapterGraph::new_from_preflight(
+                    &preflight,
                     adapter_metadata,
                     GgmlCpuGraphBackend::Cpu,
                 )
@@ -919,8 +936,8 @@ mod tests {
             let speech_rows = speech_rows_full[..n_aud * adapter_metadata.llm_dim].to_vec();
             let decode_prompt =
                 build_funasr_nano_decode_prompt(&tokenizer, n_aud).expect("decode prompt");
-            let mut decoder = FunasrNanoDecoderRuntime::new(
-                &runtime_source,
+            let mut decoder = FunasrNanoDecoderRuntime::new_from_preflight(
+                &preflight,
                 decoder_metadata,
                 GgmlCpuGraphBackend::Cpu,
             )
@@ -966,6 +983,10 @@ mod tests {
         };
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+            &runtime_source,
+        )
+        .expect("runtime preflight");
         let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
         let encoder_metadata =
             parse_funasr_nano_encoder_metadata(&gguf_metadata).expect("encoder metadata");
@@ -986,8 +1007,8 @@ mod tests {
             .expect("encoder input");
 
             // Fresh one-shot reference: a brand-new encoder + adaptor per call.
-            let mut encoder = FunasrNanoEncoderGraph::new(
-                &runtime_source,
+            let mut encoder = FunasrNanoEncoderGraph::new_from_preflight(
+                &preflight,
                 encoder_metadata,
                 GgmlCpuGraphBackend::Cpu,
             )
@@ -999,8 +1020,8 @@ mod tests {
                     encoder_input.feature_dim,
                 )
                 .expect("fresh encode");
-            let mut adapter = FunasrNanoAdapterGraph::new(
-                &runtime_source,
+            let mut adapter = FunasrNanoAdapterGraph::new_from_preflight(
+                &preflight,
                 adapter_metadata,
                 GgmlCpuGraphBackend::Cpu,
             )
@@ -1014,7 +1035,7 @@ mod tests {
             // Resident cached path (what execute_inner runs).
             let (cached_rows, cached_n_aud) = executor
                 .encode_with_owned_encoder_adapter_runtime(
-                    &runtime_source,
+                    &preflight,
                     encoder_metadata,
                     adapter_metadata,
                     encoder_input,

@@ -800,21 +800,21 @@ impl MossTdGgmlExecutor {
 
     fn checkout_encoder_runtime(
         &self,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<MossTdEncoderRuntimeActor, MossTdExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(moss_td_encoder_graph_config(backend).backend),
         );
-        let source = runtime_source.clone();
+        let preflight = preflight.clone();
         self.encoder_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, (source, prepared))),
-            move |(source, prepared)| {
-                let runtime = MossEncoderRuntime::new_with_prepared_weights(
-                    &source,
+            move || Ok((0, (preflight, prepared))),
+            move |(preflight, prepared)| {
+                let runtime = MossEncoderRuntime::new_with_prepared_weights_from_preflight(
+                    &preflight,
                     Arc::clone(&prepared.encoder_weights),
                     backend,
                 )
@@ -834,18 +834,18 @@ impl MossTdGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        runtime_source: &crate::GgmlRuntimeSource,
+        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<MossTdDecoderRuntimeActor, MossTdExecutorError> {
         let key = (
-            PackContentKey::for_runtime_source(runtime_source),
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(moss_td_runtime_graph_config(backend).backend),
             kv_capacity.resident_positions(),
         );
-        let source = runtime_source.clone();
-        let content_id = runtime_source.content_id().to_string();
+        let preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
             move || {
@@ -868,13 +868,13 @@ impl MossTdGgmlExecutor {
                     stage: "decoder",
                     reason: error.to_string(),
                 })?;
-                Ok((retained, (source, prepared, quote)))
+                Ok((retained, (preflight, prepared, quote)))
             },
-            move |(source, prepared, quote)| match SystemMemoryOwner::try_allocate_transaction(
+            move |(preflight, prepared, quote)| match SystemMemoryOwner::try_allocate_transaction(
                 quote,
                 || {
-                    let runtime = MossTdDecoderRuntime::new_with_prepared_state(
-                        &source,
+                    let runtime = MossTdDecoderRuntime::new_with_prepared_state_from_preflight(
+                        &preflight,
                         prepared.decoder_metadata,
                         Arc::clone(&prepared.decoder_plan),
                         Arc::clone(&prepared.logits_head),
@@ -980,11 +980,8 @@ impl MossTdGgmlExecutor {
             n_mels: encoder_metadata.n_mels,
             max_source_positions: encoder_metadata.max_source_positions,
         };
-        let encoder_actor = self.checkout_encoder_runtime(
-            &preflight.runtime_source,
-            Arc::clone(&prepared),
-            backend,
-        )?;
+        let encoder_actor =
+            self.checkout_encoder_runtime(&preflight, Arc::clone(&prepared), backend)?;
         let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
             &encoder_actor,
             encoder_config,
@@ -1067,12 +1064,8 @@ impl MossTdGgmlExecutor {
             });
         }
 
-        let decoder_actor = self.checkout_decoder_runtime(
-            &preflight.runtime_source,
-            prepared,
-            kv_capacity_plan,
-            backend,
-        )?;
+        let decoder_actor =
+            self.checkout_decoder_runtime(&preflight, prepared, kv_capacity_plan, backend)?;
         let decoded = run_moss_td_decoder_with_cached_runtime(
             &decoder_actor,
             decoder_metadata,

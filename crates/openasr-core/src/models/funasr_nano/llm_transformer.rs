@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
@@ -172,13 +172,17 @@ pub(crate) struct FunasrNanoPrefillOutput {
 }
 
 impl FunasrNanoDecoderRuntime {
-    pub(crate) fn new(
-        runtime_source: &crate::GgmlRuntimeSource,
+    pub(crate) fn new_from_preflight(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FunasrNanoDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
-            .map_err(map_tensor_read_error)?;
+        let runtime_source = &preflight.runtime_source;
+        let reader =
+            crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
+                .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                })?;
         let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
@@ -204,17 +208,16 @@ impl FunasrNanoDecoderRuntime {
         .map_err(|error| FunasrNanoDecoderError::TokenEmbeddingFailed {
             reason: error.to_string(),
         })?;
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_rms_norm_epsilon_and_fused_logits_head(
-                &decoder_plan,
-                runtime_source,
-                FUNASR_NANO_RMS_NORM_EPSILON,
-                logits_head.fused_top1_spec(),
-                backend,
-            )
-            .map_err(|error| FunasrNanoDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
+        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
+            &decoder_plan,
+            preflight,
+            FUNASR_NANO_RMS_NORM_EPSILON,
+            logits_head.fused_top1_spec(),
+            backend,
+        )
+        .map_err(|error| FunasrNanoDecoderError::GraphFailed {
+            reason: error.to_string(),
+        })?;
         let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
             FunasrNanoDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
@@ -493,10 +496,4 @@ fn write_layer_kv(
         }
     }
     Ok(())
-}
-
-fn map_tensor_read_error(error: GgufTensorDataReadError) -> FunasrNanoDecoderError {
-    FunasrNanoDecoderError::TensorReadFailed {
-        reason: error.to_string(),
-    }
 }
