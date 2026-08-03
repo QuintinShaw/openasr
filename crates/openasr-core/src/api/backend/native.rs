@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::{
@@ -64,6 +67,51 @@ pub struct NativeBackend;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeBackendExecutor;
+
+/// Process-owner guard for native model runtimes.
+///
+/// Keep this alive until every native request/session has stopped. Dropping it
+/// runs the same ordered eviction as the daemon idle-unload path while the
+/// process and its dedicated model workers are still alive, rather than
+/// leaving device-resident worker TLS to C/C++ static-destruction order.
+/// Nested owners are reference-counted; only the last guard performs shutdown.
+#[derive(Debug)]
+#[must_use = "keep the guard alive for the native runtime owner's lifetime"]
+pub struct NativeRuntimeShutdownGuard {
+    _private: (),
+}
+
+static NATIVE_RUNTIME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl NativeRuntimeShutdownGuard {
+    pub fn new() -> Self {
+        NATIVE_RUNTIME_OWNER_COUNT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("native runtime owner count overflow");
+        Self { _private: () }
+    }
+}
+
+impl Default for NativeRuntimeShutdownGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for NativeRuntimeShutdownGuard {
+    fn drop(&mut self) {
+        let previous = NATIVE_RUNTIME_OWNER_COUNT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .expect("native runtime owner count underflow");
+        if previous == 1 {
+            unload_idle_native_model_runtime_caches();
+        }
+    }
+}
 
 static NATIVE_GGML_STREAMING_EXECUTION_DISPATCH: OnceLock<
     Result<GgmlAsrExecutionDispatch, String>,
@@ -1598,6 +1646,30 @@ mod tests {
         assert!(
             crate::models::thread_local_runtime_cache::current_unload_generation() > before,
             "idle unload must advance the thread-local cache unload generation"
+        );
+    }
+
+    #[test]
+    fn last_native_runtime_shutdown_guard_runs_the_ordered_unload_once() {
+        let _generation_guard =
+            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
+        let before = crate::models::thread_local_runtime_cache::current_unload_generation();
+        let outer = NativeRuntimeShutdownGuard::new();
+        let inner = NativeRuntimeShutdownGuard::default();
+
+        drop(inner);
+        assert_eq!(
+            crate::models::thread_local_runtime_cache::current_unload_generation(),
+            before,
+            "an inner owner must not unload runtimes still owned by its caller"
+        );
+
+        drop(outer);
+
+        assert_eq!(
+            crate::models::thread_local_runtime_cache::current_unload_generation(),
+            before + 1,
+            "the last process owner must run exactly one ordered unload"
         );
     }
 

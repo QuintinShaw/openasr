@@ -811,6 +811,7 @@ mod tests {
         )
         .expect("parse native diarization fixture manifest");
 
+        let runtime_owner = crate::NativeRuntimeShutdownGuard::new();
         let _backend_guard =
             crate::ggml_runtime::install_request_backend_override(backend_preference.clone());
         let embedder_plan = crate::diarize::embed::prepare_shared_embedder_snapshot()
@@ -933,5 +934,8 @@ mod tests {
                 fixture.id
             );
         }
+        drop(diarizer);
+        drop(runtime_owner);
+        drop(_backend_guard);
     }
 }

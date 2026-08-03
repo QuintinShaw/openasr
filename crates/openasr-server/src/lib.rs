@@ -53,12 +53,12 @@ pub use openasr_core::pairing_safety_code_for_certificate_fingerprint;
 use openasr_core::realtime::history::{DaemonHistoryEntry, DaemonHistoryStoreError};
 use openasr_core::{
     AudioPreparationError, BackendKind, CatalogError, CatalogMirror, CatalogPullRequest,
-    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, OpenAsrHomeError, PullError,
-    PullModelPackRequest, PullProgress, QuantPreference, RealtimeBackendCapabilities,
-    ResolvedCatalogPull, certificate_fingerprint_sha256, host_quant_recommendation_profile,
-    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
-    load_local_catalog_file_with_identity, load_model_catalog,
-    native_runtime_realtime_capabilities_for_path,
+    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, NativeRuntimeShutdownGuard,
+    OpenAsrHomeError, PullError, PullModelPackRequest, PullProgress, QuantPreference,
+    RealtimeBackendCapabilities, ResolvedCatalogPull, certificate_fingerprint_sha256,
+    host_quant_recommendation_profile, install_catalog_model_pack_from_path,
+    install_model_pack_from_path, list_installed_packs, load_local_catalog_file_with_identity,
+    load_model_catalog, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, openasr_home, remove_model_pack,
     resolve_catalog_pull, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog, resolve_launch_pack, resolve_runtime_catalog,
@@ -251,6 +251,7 @@ pub async fn serve_with_launch_options(
     runtime: ServerRuntime,
     launch_options: ServerLaunchOptions,
 ) -> anyhow::Result<()> {
+    let _native_runtime_owner = NativeRuntimeShutdownGuard::new();
     // Boot stage timing: each phase logged as its own timestamped line so a
     // slow daemon start (validate/bind/router-build/model-bind) can be
     // attributed to a specific phase from `daemon.log` alone, instead of

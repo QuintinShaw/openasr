@@ -13,8 +13,8 @@ use openasr_core::{
     AudioInputInfo, AudioInputIssue, AudioPreparationOptions, BackendKind, BatchFailure,
     BatchOutput, BatchSummary, BenchmarkFormat, BenchmarkResult, CATALOG_SIGNATURE_KEY_ID,
     CohereLocalSourceImportRequest, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_ID, ModelCard,
-    MossTdImportRequest, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, OpenAsrConfig,
-    PreparedAudioInput, Qwen3AsrLocalSourceImportRequest,
+    MossTdImportRequest, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeRuntimeShutdownGuard,
+    OpenAsrConfig, PreparedAudioInput, Qwen3AsrLocalSourceImportRequest,
     Qwen3ForcedAlignerLocalSourceImportRequest, ResponseFormat, TranscriptionBackend,
     TranscriptionRequest, WhisperLocalSourceImportRequest, atomic_write_text, config_path,
     convert_local_cohere_source_to_runtime_pack,
@@ -196,6 +196,7 @@ fn migrate_model_store_once() {
 }
 
 async fn run() -> Result<()> {
+    let _native_runtime_owner = NativeRuntimeShutdownGuard::new();
     let command = Cli::parse().command;
     // Installed here, before anything else `openasr serve` does, so no
     // startup panic (config/catalog loading, backend resolution, model-pack

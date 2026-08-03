@@ -283,6 +283,38 @@ fn native_runtime_rebuilds_only_the_poisoned_graph_after_abort() {
 }
 
 #[test]
+#[ignore = "requires OPENASR_DIARIZEN_PACK; validates process-owner shutdown and rebuild"]
+fn native_runtime_rebuilds_after_process_owner_shutdown() {
+    let _test_guard = diarizen_runtime_test_lock();
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
+    let samples = synthetic_exact_window();
+
+    drop(crate::NativeRuntimeShutdownGuard::new());
+    segmenter
+        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+        .expect("first request");
+    assert_eq!(diarizen_worker_runtime_entry_count(), 1);
+
+    drop(crate::NativeRuntimeShutdownGuard::new());
+    assert_eq!(
+        diarizen_worker_runtime_entry_count(),
+        0,
+        "process-owner shutdown must eagerly clear persistent worker TLS"
+    );
+
+    segmenter
+        .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+        .expect("request after shutdown rebuilds");
+    assert_eq!(
+        diarizen_worker_runtime_entry_count(),
+        1,
+        "the first request after shutdown must rebuild resident state"
+    );
+    drop(crate::NativeRuntimeShutdownGuard::new());
+}
+
+#[test]
 #[ignore = "requires OPENASR_DIARIZEN_PACK; validates terminal-backend eviction"]
 fn native_runtime_rebuilds_the_runner_after_device_loss_without_retrying_request() {
     let _test_guard = diarizen_runtime_test_lock();

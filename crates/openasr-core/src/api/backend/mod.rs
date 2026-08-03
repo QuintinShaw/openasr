@@ -13,9 +13,9 @@ pub use mock::transcribe_with_mock_backend;
 pub use native::{
     GgmlAbortCallbackGuard, LegacyNativeTranscriptionProgress, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
-    NativeTranscriptionProgress, RequestExecutionContext, SliceBoundaryControl,
-    TranscriptionControl, describe_native_runtime_model_mismatch,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeRuntimeShutdownGuard,
+    NativeTranscriptionPhase, NativeTranscriptionProgress, RequestExecutionContext,
+    SliceBoundaryControl, TranscriptionControl, describe_native_runtime_model_mismatch,
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,

@@ -400,6 +400,52 @@ fn redimnet_reuses_resident_runner_and_uploaded_weights() {
 }
 
 #[test]
+#[ignore = "requires OPENASR_REDIMNET_PACK; validates process-owner shutdown and rebuild"]
+fn redimnet_rebuilds_worker_runtime_after_process_owner_shutdown() {
+    let _test_guard = super::redimnet_runtime_test_lock();
+    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
+        eprintln!("skipping: OPENASR_REDIMNET_PACK is not set");
+        return;
+    };
+    let embedder =
+        RedimNet2Embedder::from_oasr(std::path::Path::new(&pack)).expect("load ReDimNet pack");
+    let samples = vec![0.01_f32; 16_000];
+
+    crate::test_process_env::with_test_process_env(
+        [(
+            super::REDIMNET_BENCH_WORKERS_ENV,
+            Some(std::ffi::OsString::from("1")),
+        )],
+        || {
+            drop(crate::NativeRuntimeShutdownGuard::new());
+            let builds_before = super::redimnet::backbone::resident_runtime_build_count();
+
+            embedder.embed(&samples, 16_000).expect("first request");
+            let builds_after_first = super::redimnet::backbone::resident_runtime_build_count();
+            assert_eq!(builds_after_first, builds_before + 1);
+            assert_eq!(super::redimnet_worker_runtime_entry_count(), 1);
+
+            drop(crate::NativeRuntimeShutdownGuard::new());
+            assert_eq!(
+                super::redimnet_worker_runtime_entry_count(),
+                0,
+                "process-owner shutdown must eagerly clear persistent worker TLS"
+            );
+
+            embedder
+                .embed(&samples, 16_000)
+                .expect("request after shutdown rebuilds");
+            assert_eq!(
+                super::redimnet::backbone::resident_runtime_build_count(),
+                builds_after_first + 1,
+                "the first request after shutdown must rebuild resident state"
+            );
+            drop(crate::NativeRuntimeShutdownGuard::new());
+        },
+    );
+}
+
+#[test]
 #[ignore = "requires OPENASR_REDIMNET_PACK; validates terminal-backend eviction"]
 fn redimnet_rebuilds_the_runner_after_device_loss_without_retrying_request() {
     let _test_guard = super::redimnet_runtime_test_lock();
