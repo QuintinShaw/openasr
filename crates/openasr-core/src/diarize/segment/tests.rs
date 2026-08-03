@@ -1,5 +1,97 @@
 use super::PyannetModel;
 
+#[test]
+fn bounded_pyannote_window_pool_preserves_order_and_worker_cap() {
+    let starts: Vec<usize> = (0..17).collect();
+    let output = super::bounded_pyannote_window_map(&starts, &|| false, |start| {
+        std::thread::sleep(std::time::Duration::from_micros(
+            ((17 - start) % 4) as u64 * 50,
+        ));
+        Ok(start)
+    })
+    .unwrap();
+    assert_eq!(output, starts);
+    assert!(
+        super::pyannote_window_pool()
+            .as_ref()
+            .unwrap()
+            .current_num_threads()
+            <= super::PYANNOTE_MAX_WINDOW_WORKERS
+    );
+}
+
+#[test]
+fn bounded_pyannote_window_pool_checks_cancellation_between_batches() {
+    let starts: Vec<usize> = (0..17).collect();
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let result = super::bounded_pyannote_window_map(
+        &starts,
+        &|| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0,
+        Ok,
+    );
+    assert!(matches!(result, Err(super::SegmentError::Canceled)));
+    assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+#[ignore = "needs OPENASR_PYANNOTE_F32_PACK"]
+fn parallel_pyannote_windows_match_serial_reference() {
+    let pack = std::env::var_os("OPENASR_PYANNOTE_F32_PACK")
+        .map(std::path::PathBuf::from)
+        .expect("OPENASR_PYANNOTE_F32_PACK");
+    let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load F32 segmenter");
+    let sample_count = 12 * 16_000;
+    let samples: Vec<f32> = (0..sample_count)
+        .map(|index| {
+            let t = index as f32 / 16_000.0;
+            (t * 127.0).sin() * 0.21 + (t * 391.0).cos() * 0.09
+        })
+        .collect();
+
+    let parallel = super::LocalActivitySegmenter::segment_local_activity(
+        &segmenter,
+        &samples,
+        16_000,
+        &|| false,
+    )
+    .expect("parallel segmentation");
+
+    let window_samples = (super::DEFAULT_WINDOW_S * 16_000.0) as usize;
+    let step_samples = (super::DEFAULT_STEP_S * 16_000.0).round() as usize;
+    let starts = super::sliding_window_starts(samples.len(), window_samples, step_samples);
+    let frame_clock = super::activity_frame_clock();
+    let mut windows = Vec::with_capacity(starts.len());
+    for start in starts {
+        let end = (start + window_samples).min(samples.len());
+        let frame_activity = if end - start == window_samples {
+            segmenter.infer_window(&samples[start..end])
+        } else {
+            let mut padded = vec![0.0_f32; window_samples];
+            padded[..end - start].copy_from_slice(&samples[start..end]);
+            segmenter.infer_window(&padded)
+        }
+        .expect("serial window inference");
+        windows.push(super::LocalActivityWindow {
+            start_sample: start,
+            frame_activity,
+        });
+    }
+    for window in &mut windows {
+        window.frame_activity.truncate(
+            frame_clock.frame_count_for_samples(samples.len().saturating_sub(window.start_sample)),
+        );
+    }
+    let speaker_count = super::aggregate_speaker_count(&windows, frame_clock, samples.len());
+    let serial = super::LocalActivity {
+        frame_clock,
+        windows,
+        local_speaker_slots: super::MAX_LOCAL_SPEAKERS as u8,
+        speaker_count,
+    };
+
+    assert_eq!(parallel, serial);
+}
+
 /// Parse the `<MAGIC><u32 ndim><u32 dims...><f32 data>` golden format.
 fn read_golden(path: &str, magic: &[u8]) -> (Vec<usize>, Vec<f32>) {
     let bytes = std::fs::read(path).unwrap();

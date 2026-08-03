@@ -13,6 +13,10 @@ mod pyannet;
 #[cfg(test)]
 mod tests;
 
+use std::sync::OnceLock;
+
+use rayon::prelude::*;
+
 pub use diarizen::{
     DIARIZEN_GGML_ARCHITECTURE_ID, DiariZenSegmenter, DiariZenSegmenterError, DiariZenWindowOutput,
     diarizen_pack_installed, load_diarizen_segmenter, shared_diarizen_segmenter,
@@ -38,6 +42,51 @@ const FRAME_STEP_SAMPLES: f64 = 270.0;
 const MAX_LOCAL_SPEAKERS: usize = 3;
 const DEFAULT_WINDOW_S: f64 = 10.0;
 const DEFAULT_STEP_S: f64 = 1.0;
+const PYANNOTE_MAX_WINDOW_WORKERS: usize = 4;
+
+static PYANNOTE_WINDOW_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+fn pyannote_window_pool() -> &'static Result<rayon::ThreadPool, String> {
+    PYANNOTE_WINDOW_POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(PYANNOTE_MAX_WINDOW_WORKERS);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("openasr-pyannote-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn bounded_pyannote_window_map<T, F>(
+    starts: &[usize],
+    canceled: &dyn Fn() -> bool,
+    map: F,
+) -> Result<Vec<T>, SegmentError>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, SegmentError> + Sync,
+{
+    let pool = pyannote_window_pool().as_ref().map_err(|error| {
+        SegmentError::Inference(format!(
+            "could not create bounded segmentation-3.0 window pool: {error}"
+        ))
+    })?;
+    let mut output = Vec::with_capacity(starts.len());
+    for starts_batch in starts.chunks(pool.current_num_threads().max(1)) {
+        if canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let batch: Vec<Result<T, SegmentError>> =
+            pool.install(|| starts_batch.par_iter().map(|&start| map(start)).collect());
+        for item in batch {
+            output.push(item?);
+        }
+    }
+    Ok(output)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SegmenterWorkingSetGeometry {
@@ -330,12 +379,7 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
         let window_samples = (self.protocol.window_s * sample_rate_hz as f64) as usize;
         let step_samples = (self.protocol.step_s * sample_rate_hz as f64).round() as usize;
         let starts = sliding_window_starts(samples.len(), window_samples, step_samples);
-        let mut windows = Vec::with_capacity(starts.len());
-
-        for start in starts {
-            if canceled() {
-                return Err(SegmentError::Canceled);
-            }
+        let mut windows = bounded_pyannote_window_map(&starts, canceled, |start| {
             let end = (start + window_samples).min(samples.len());
             let activity = if end - start == window_samples {
                 self.infer_window(&samples[start..end])?
@@ -344,11 +388,11 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
                 padded[..end - start].copy_from_slice(&samples[start..end]);
                 self.infer_window(&padded)?
             };
-            windows.push(LocalActivityWindow {
+            Ok(LocalActivityWindow {
                 start_sample: start,
                 frame_activity: activity,
-            });
-        }
+            })
+        })?;
 
         let frame_clock = activity_frame_clock();
         for window in &mut windows {
