@@ -76,6 +76,21 @@ jobs:
           $env:OPENASR_GGML_NATIVE = "${{ inputs.ggml_native }}"
           cargo test -p openasr-core capabilities --lib --features hip
 
+      - name: Test HIP native cancellation contract
+        shell: pwsh
+        run: |
+          $env:OPENASR_HIP_GPU_TARGETS = "${{ inputs.gpu_targets }}"
+          $env:OPENASR_GGML_NATIVE = "${{ inputs.ggml_native }}"
+          cargo test -p openasr-core --features hip --lib `
+            ggml_runtime::cpu_graph::tests::gpu_compute_scoped_cancel_reports_native_mode_and_reuses_backend `
+            -- --exact --nocapture
+          cargo test -p openasr-core --features hip --lib `
+            ggml_runtime::cpu_graph::tests::gpu_native_cancel_stops_during_graph_submission_and_reuses_backend `
+            -- --exact --nocapture
+          cargo test -p openasr-core --features hip --lib `
+            ggml_runtime::cpu_graph::tests::gpu_native_cancel_false_preserves_direct_and_scheduler_graphs `
+            -- --exact --nocapture
+
       - name: Smoke HIP doctor output
         shell: pwsh
         run: |

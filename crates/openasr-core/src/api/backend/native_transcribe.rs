@@ -857,11 +857,18 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
             for _ in 0..worker_count {
                 let result_tx = result_tx.clone();
                 scope.spawn(move || {
-                    // Arm this worker thread's ggml abort callback so a cancel
-                    // that arrives mid-graph aborts this worker's compute too;
-                    // between-step cancel is already covered by the shared
-                    // greedy driver's per-token poll of the job-carried control.
-                    let _abort_guard = execution_context.control.arm_for_native_decode();
+                    // Arm this worker thread's ggml abort callback when the
+                    // request has a cancel source, so a mid-graph cancel aborts
+                    // this worker too. Between-step cancel is already covered
+                    // by the shared greedy driver's per-token control poll.
+                    let _abort_guard = execution_context
+                        .control
+                        .arm_for_native_decode_if_cancellable();
+                    // Per-worker fallback tracker (property 4): the GPU-allocation
+                    // streak is meaningful only within one worker's own sequence
+                    // of slices, and sharing it across threads would be a data
+                    // race.
+                    let mut tracker = GpuAllocationFallbackTracker::default();
                     loop {
                         if stop_ref.load(Ordering::Relaxed) {
                             break;
@@ -1161,12 +1168,14 @@ fn run_native_transcription_fallible(
     // below: `publish_align_progress` after that call still needs this
     // request's transcription id.
     let execution_context = Arc::clone(&request.execution_context);
-    // The synchronous core entry owns every auxiliary and decoder graph run,
-    // so it also owns publication of this request's ggml abort flag. Server
-    // callers may already have armed the same control outside spawn_blocking;
-    // the guard is intentionally nestable and restores that outer publication.
-    // Direct core/CLI callers now receive the identical mid-graph cancel path.
-    let _abort_callback_guard = execution_context.control.arm_for_native_decode();
+    // Own graph-level cancellation at the shared native-core boundary. Every
+    // caller that supplies a cancellable context now publishes the request's
+    // flag for synchronous graph compute on this thread; detached contexts
+    // remain callback-free. Concurrent longform workers install the same flag
+    // separately because TLS does not cross thread boundaries.
+    let _abort_callback_guard = execution_context
+        .control
+        .arm_for_native_decode_if_cancellable();
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }

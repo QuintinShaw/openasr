@@ -83,6 +83,20 @@ jobs:
       - name: Build openasr-core test binary (vulkan feature)
         run: cargo test -p openasr-core --features vulkan --lib --no-run
 
+      - name: Run Vulkan native cancellation contract tests
+        env:
+          GGML_VK_VISIBLE_DEVICES: "0"
+        run: |
+          cargo test -p openasr-core --features vulkan --lib \
+            ggml_runtime::cpu_graph::tests::gpu_compute_scoped_cancel_reports_native_mode_and_reuses_backend \
+            -- --exact --nocapture
+          cargo test -p openasr-core --features vulkan --lib \
+            ggml_runtime::cpu_graph::tests::gpu_native_cancel_stops_during_graph_submission_and_reuses_backend \
+            -- --exact --nocapture
+          cargo test -p openasr-core --features vulkan --lib \
+            ggml_runtime::cpu_graph::tests::gpu_native_cancel_false_preserves_direct_and_scheduler_graphs \
+            -- --exact --nocapture
+
       - name: Run the Vulkan lavapipe attention-offset smoke test
         env:
           RUST_BACKTRACE: "1"

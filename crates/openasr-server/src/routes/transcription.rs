@@ -1681,14 +1681,6 @@ pub(crate) async fn transcribe_with_runtime(
                     // the idle_unload reaper never evicts the model runtime cache out
                     // from under it; dropped (any exit path) once the decode returns.
                     let _activity_guard = NativeActivityGuard::enter();
-                    // Publishes the request's cancel atomic as this thread's
-                    // ggml abort-callback data for the whole synchronous
-                    // decode below, so a mid-graph-compute cancel can
-                    // actually abort (not just stop at the next slice/token
-                    // boundary). The control itself already travels
-                    // explicitly via `execution_context` -- this only arms
-                    // the FFI trampoline, which can't see that context.
-                    let _abort_callback_guard = execution_context.control.arm_for_native_decode();
                     let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
                         TranscriptionRuntimeError::Backend(
                         openasr_core::BackendError::NativeModelPackPathRejected {

@@ -61,20 +61,38 @@ pub struct TranscriptionControl {
     /// compute-scoped callback `data` pointer published by
     /// [`Self::arm_for_native_decode`]. Pause never touches this bit.
     cancel_flag: Arc<AtomicBool>,
+    // False only for RequestExecutionContext::uncancellable. Keeping that
+    // path explicit avoids installing an always-false backend callback (and
+    // its polling cost) when no external owner can ever request cancellation.
+    has_cancel_source: bool,
 }
 
 impl TranscriptionControl {
     pub fn new() -> Self {
+        Self::with_cancel_source(true)
+    }
+
+    pub(crate) fn detached() -> Self {
+        Self::with_cancel_source(false)
+    }
+
+    fn with_cancel_source(has_cancel_source: bool) -> Self {
         Self {
             state: Mutex::new(ControlState::default()),
             resumed_or_canceled: Condvar::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            has_cancel_source,
         }
     }
 
-    /// Request cancellation at the next cooperative checkpoint (slice boundary,
-    /// token step, native CPU node, or segmented GPU graph view). Idempotent.
-    /// Wakes a paused worker so it observes the cancel instead of staying blocked.
+    pub(crate) fn has_cancel_source(&self) -> bool {
+        self.has_cancel_source
+    }
+
+    /// Request cancellation at the next cooperative checkpoint (slice
+    /// boundary, token step, native backend checkpoint, or segmented fallback
+    /// graph view). Idempotent. Wakes a paused worker so it observes the cancel
+    /// instead of staying blocked.
     pub fn request_cancel(&self) {
         // Atomic first so a concurrent ggml abort_callback poll observes cancel
         // even if it races the mutex write below.
@@ -208,12 +226,11 @@ impl TranscriptionControl {
     /// crate's types) can observe a mid-compute cancel. Pause is never
     /// written to that atomic -- the abort trampoline only recognizes cancel.
     ///
-    /// Call once at the top of a synchronous native decode this control is
-    /// tracking (e.g. the server's `spawn_blocking` closure) -- not from a
-    /// serve-batch owner thread that services many jobs in a loop, which has
-    /// no single "this thread's decode" to publish for the whole loop and
-    /// instead relies on the job-carried context at each safe boundary
-    /// between graph calls.
+    /// Call once at the shared core boundary of a synchronous native decode,
+    /// and once per worker when that decode fans out across threads. Do not
+    /// install it around a serve-batch owner loop that services many jobs: the
+    /// loop has no single request flag to publish and instead relies on each
+    /// job-carried context at safe boundaries between graph calls.
     pub fn arm_for_native_decode(self: &Arc<Self>) -> GgmlAbortCallbackGuard {
         let published_flag = self.cancel_flag();
         let previous_job_cancel = arm_thread_job_cancel_flag(Some(Arc::clone(&published_flag)));
@@ -221,6 +238,15 @@ impl TranscriptionControl {
             previous_job_cancel,
             published_flag,
         }
+    }
+
+    /// Install graph-level cancellation only when this control has an external
+    /// cancel source. Detached CLI/test contexts retain callback-free compute.
+    pub(crate) fn arm_for_native_decode_if_cancellable(
+        self: &Arc<Self>,
+    ) -> Option<GgmlAbortCallbackGuard> {
+        self.has_cancel_source()
+            .then(|| self.arm_for_native_decode())
     }
 }
 
@@ -340,12 +366,13 @@ mod tests {
 
     #[test]
     fn no_control_path_leaves_job_cancel_idle() {
-        // Bit-identical CLI path: without `arm_for_native_decode`, no abort
-        // callback data is published and callback-free compute uses the
-        // original backend API.
+        // A detached native request keeps the callback-free graph path even
+        // when it enters the shared transcription boundary.
         assert!(thread_job_cancel_flag_data().is_null());
         assert!(!thread_job_cancel_requested());
-        let orphan = TranscriptionControl::new();
+        let orphan = Arc::new(TranscriptionControl::detached());
+        let guard = orphan.arm_for_native_decode_if_cancellable();
+        assert!(guard.is_none());
         orphan.request_cancel();
         assert!(orphan.is_canceled());
         assert!(

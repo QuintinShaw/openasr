@@ -8229,6 +8229,116 @@ mod tests {
         assert_eq!(output, Some(4.0));
     }
 
+    #[cfg(any(feature = "cuda", feature = "hip", feature = "vulkan"))]
+    #[test]
+    fn gpu_compute_scoped_cancel_reports_native_mode_and_reuses_backend() {
+        use std::sync::atomic::Ordering;
+
+        let config = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Gpu,
+            use_scheduler: false,
+            ..GgmlCpuGraphConfig::default()
+        };
+        let cancel_probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            // The shared precheck owns poll 1. Poll 2 must happen inside the
+            // native backend adapter after its compute-scoped callback has
+            // been installed.
+            abort_after: 2,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            config,
+            96,
+            Some(abort_after_polls),
+            (&cancel_probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(status, ffi::GGML_STATUS_ABORTED);
+        assert_eq!(output, None);
+        assert_eq!(cancel_probe.polls.load(Ordering::SeqCst), 2);
+
+        let reuse_probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            abort_after: usize::MAX,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            config,
+            96,
+            Some(abort_after_polls),
+            (&reuse_probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
+        assert_eq!(output, Some(96.0));
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hip", feature = "vulkan"))]
+    #[test]
+    fn gpu_native_cancel_stops_during_graph_submission_and_reuses_backend() {
+        use std::sync::atomic::Ordering;
+
+        let config = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Gpu,
+            use_scheduler: false,
+            ..GgmlCpuGraphConfig::default()
+        };
+        let cancel_probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            // The public precheck and backend-entry checks consume fewer than
+            // eight polls. CUDA/HIP and Vulkan must therefore keep polling at
+            // safe per-node submission boundaries to observe this request.
+            abort_after: 8,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            config,
+            96,
+            Some(abort_after_polls),
+            (&cancel_probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(status, ffi::GGML_STATUS_ABORTED);
+        assert_eq!(output, None);
+        assert_eq!(cancel_probe.polls.load(Ordering::SeqCst), 8);
+
+        let reuse_probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            abort_after: usize::MAX,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            config,
+            96,
+            Some(abort_after_polls),
+            (&reuse_probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
+        assert_eq!(output, Some(96.0));
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hip", feature = "vulkan"))]
+    #[test]
+    fn gpu_native_cancel_false_preserves_direct_and_scheduler_graphs() {
+        for use_scheduler in [false, true] {
+            let probe = AbortAfterPolls {
+                polls: std::sync::atomic::AtomicUsize::new(0),
+                abort_after: usize::MAX,
+            };
+            let (mode, status, output) = compute_add_chain_with_callback(
+                GgmlCpuGraphConfig {
+                    backend: GgmlCpuGraphBackend::Gpu,
+                    use_scheduler,
+                    ..GgmlCpuGraphConfig::default()
+                },
+                96,
+                Some(abort_after_polls),
+                (&probe as *const AbortAfterPolls).cast_mut().cast(),
+            );
+            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+            assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
+            assert_eq!(output, Some(96.0));
+        }
+    }
+
     #[test]
     fn native_abort_can_commit_a_side_effect_before_poisoning_the_session() {
         use std::sync::atomic::Ordering;

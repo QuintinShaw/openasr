@@ -773,6 +773,24 @@ fn main() {
         "cargo:rerun-if-changed={}",
         source_dir.join("include/ggml-cpu.h").display()
     );
+    // These sources define the backend-wide submission/completion and native
+    // cancellation contract. Missing them from Cargo's dependency set can
+    // silently reuse a stale native archive after an incremental edit, making
+    // backend tests exercise different code from the worktree. BLAS is watched
+    // as a directory because CMake may enable it from platform defaults rather
+    // than a Cargo feature.
+    println!(
+        "cargo:rerun-if-changed={}",
+        source_dir.join("src/ggml-backend.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        source_dir.join("src/ggml-backend-impl.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        source_dir.join("src/ggml-blas").display()
+    );
     // The GGML_BACKEND_DL loader shim is OpenASR-authored and decides how plugin
     // DLLs (and their co-located satellite runtime DLLs) are opened on each OS, so
     // edits to it must trigger a ggml rebuild. It was previously untracked, so

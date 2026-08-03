@@ -71,8 +71,8 @@ impl RequestExecutionContext {
     /// single-shot transcribe, a public request builder's pre-opt-in
     /// default, an internal test) but still need a concrete, well-formed
     /// context to satisfy the required-field contract -- this is not a "no
-    /// context" escape hatch, it is a real, valid context whose control
-    /// simply has no other holder.
+    /// context" escape hatch, it is a real, valid context whose control is
+    /// explicitly detached so native graph execution stays callback-free.
     ///
     /// `reason` must name, in the caller's own words, *why* this particular
     /// call site has no cancel surface -- never a placeholder like `"n/a"`.
@@ -121,7 +121,7 @@ impl RequestExecutionContext {
         let _ = reason;
         Self {
             request_id: None,
-            control: Arc::new(TranscriptionControl::new()),
+            control: Arc::new(TranscriptionControl::detached()),
         }
     }
 
@@ -140,12 +140,14 @@ mod tests {
         let context = RequestExecutionContext::uncancellable("test fixture");
         assert!(context.request_id.is_none());
         assert!(!context.is_canceled());
+        assert!(!context.control.has_cancel_source());
     }
 
     #[test]
     fn new_context_carries_the_given_id_and_control() {
         let control = Arc::new(TranscriptionControl::new());
         let context = RequestExecutionContext::new(Some("job-1".to_string()), Arc::clone(&control));
+        assert!(context.control.has_cancel_source());
         assert_eq!(context.request_id.as_deref(), Some("job-1"));
         control.request_cancel();
         assert!(context.is_canceled());

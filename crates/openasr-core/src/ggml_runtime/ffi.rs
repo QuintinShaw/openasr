@@ -387,11 +387,14 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_buffer_free(buffer: GgmlBackendBufferRaw);
     pub(crate) fn ggml_backend_buffer_is_host(buffer: GgmlBackendBufferRaw) -> bool;
     pub(crate) fn ggml_backend_buffer_set_usage(buffer: GgmlBackendBufferRaw, usage: c_int);
-    pub(crate) fn ggml_backend_graph_compute(
+    // Keep raw graph execution inside ggml_runtime. Model families must use
+    // GgmlCpuGraphRunner so request cancellation and typed terminal-status
+    // mapping cannot be bypassed as new executors are added.
+    pub(super) fn ggml_backend_graph_compute(
         backend: GgmlBackendRaw,
         cgraph: GgmlCgraphRaw,
     ) -> c_int;
-    pub(crate) fn ggml_backend_graph_compute_with_abort(
+    pub(super) fn ggml_backend_graph_compute_with_abort(
         backend: GgmlBackendRaw,
         cgraph: GgmlCgraphRaw,
         abort_callback: GgmlAbortCallback,
@@ -428,7 +431,7 @@ unsafe extern "C" {
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
     ) -> c_int;
-    pub(crate) fn ggml_backend_sched_graph_compute_with_abort(
+    pub(super) fn ggml_backend_sched_graph_compute_with_abort(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
         abort_callback: GgmlAbortCallback,
