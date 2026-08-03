@@ -8766,15 +8766,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_scheduler_cancel_before_submission_reports_no_backend_mechanism() {
+    fn metal_scheduler_cancel_before_backend_entry_reports_no_backend_mechanism() {
         use std::sync::atomic::Ordering;
 
         let probe = AbortAfterPolls {
             polls: std::sync::atomic::AtomicUsize::new(0),
-            // Scheduler allocation, split, and input-transfer boundaries own
-            // the first six polls. This cancellation fires before the split is
-            // submitted, so the actual execution path reports DISABLED/NONE.
-            abort_after: 6,
+            // The public precheck, post-allocation check, split-entry check,
+            // and pre-submit check own the first four polls for this one-split
+            // graph. Abort on that last scheduler-owned boundary so the Metal
+            // backend is never entered and the actual path is DISABLED/NONE.
+            abort_after: 4,
         };
         let (capability, status, output) = compute_add_chain_with_callback(
             GgmlCpuGraphConfig {
@@ -8796,7 +8797,7 @@ mod tests {
         );
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
-        assert_eq!(probe.polls.load(Ordering::SeqCst), 6);
+        assert_eq!(probe.polls.load(Ordering::SeqCst), 4);
     }
 
     #[cfg(target_os = "macos")]
