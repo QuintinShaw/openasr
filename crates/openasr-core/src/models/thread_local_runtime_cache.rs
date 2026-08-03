@@ -2,7 +2,64 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread::LocalKey;
+
+/// Tracks model objects whose device runtimes live in a dedicated worker
+/// pool's thread-local cache.
+///
+/// A process owner normally performs the final idle unload, but the low-level
+/// model adapters are public and can also be used on their own. In that case,
+/// dropping the last adapter must clear its worker TLS while the native backend
+/// is still alive; otherwise those device handles survive until C/C++ static
+/// destruction. Acquiring and the zero-owner unload are serialized so a new
+/// adapter can never start using the pool halfway through that unload.
+pub(crate) struct DedicatedWorkerRuntimeOwnerTracker {
+    owners: Mutex<usize>,
+    unload_worker_runtimes: fn(),
+}
+
+impl DedicatedWorkerRuntimeOwnerTracker {
+    pub(crate) const fn new(unload_worker_runtimes: fn()) -> Self {
+        Self {
+            owners: Mutex::new(0),
+            unload_worker_runtimes,
+        }
+    }
+
+    pub(crate) fn acquire(&'static self) -> DedicatedWorkerRuntimeOwnerLease {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *owners = owners
+            .checked_add(1)
+            .expect("dedicated worker runtime owner count overflow");
+        DedicatedWorkerRuntimeOwnerLease { tracker: self }
+    }
+}
+
+/// Object-lifetime lease returned by
+/// [`DedicatedWorkerRuntimeOwnerTracker::acquire`].
+pub(crate) struct DedicatedWorkerRuntimeOwnerLease {
+    tracker: &'static DedicatedWorkerRuntimeOwnerTracker,
+}
+
+impl Drop for DedicatedWorkerRuntimeOwnerLease {
+    fn drop(&mut self) {
+        let mut owners = self
+            .tracker
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *owners = owners
+            .checked_sub(1)
+            .expect("dedicated worker runtime owner count underflow");
+        if *owners == 0 {
+            (self.tracker.unload_worker_runtimes)();
+        }
+    }
+}
 
 pub(crate) fn canonical_runtime_cache_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())

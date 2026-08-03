@@ -324,6 +324,29 @@ fn native_runtime_rebuilds_after_process_owner_shutdown() {
 }
 
 #[test]
+#[ignore = "requires OPENASR_DIARIZEN_PACK; validates standalone-adapter shutdown"]
+fn standalone_segmenter_drop_eagerly_releases_worker_runtime() {
+    let _test_guard = diarizen_runtime_test_lock();
+    unload_idle_worker_runtimes();
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let samples = synthetic_exact_window();
+
+    {
+        let segmenter = DiariZenSegmenter::from_oasr(&pack).expect("construct production runtime");
+        segmenter
+            .infer_window(&samples, super::config::SAMPLE_RATE_HZ)
+            .expect("standalone request");
+        assert_eq!(diarizen_worker_runtime_entry_count(), 1);
+    }
+
+    assert_eq!(
+        diarizen_worker_runtime_entry_count(),
+        0,
+        "dropping the final standalone adapter must clear persistent worker TLS"
+    );
+}
+
+#[test]
 #[ignore = "requires OPENASR_DIARIZEN_PACK; validates terminal-backend eviction"]
 fn native_runtime_rebuilds_the_runner_after_device_loss_without_retrying_request() {
     let _test_guard = diarizen_runtime_test_lock();

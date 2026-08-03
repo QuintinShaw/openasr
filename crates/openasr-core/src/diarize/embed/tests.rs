@@ -49,6 +49,10 @@ fn redimnet_execution_plan_caps_resident_workers_and_divides_cpu_threads() {
 #[ignore = "host-local bench: needs OPENASR_REDIMNET_PACK; run with --release for catalog numbers"]
 #[test]
 fn embedder_rtf_bench_when_pack_present() {
+    // `shared_embedder` intentionally keeps a process-wide parsed snapshot.
+    // Mirror the daemon owner so the benchmark evicts that snapshot and its
+    // worker TLS before native backend static destruction.
+    let _runtime_owner = crate::NativeRuntimeShutdownGuard::new();
     let Some(embedder) = super::shared_embedder() else {
         eprintln!("skipping: redimnet2-b6 pack absent");
         return;
@@ -441,6 +445,40 @@ fn redimnet_rebuilds_worker_runtime_after_process_owner_shutdown() {
                 "the first request after shutdown must rebuild resident state"
             );
             drop(crate::NativeRuntimeShutdownGuard::new());
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires OPENASR_REDIMNET_PACK; validates standalone-adapter shutdown"]
+fn standalone_redimnet_drop_eagerly_releases_worker_runtime() {
+    let _test_guard = super::redimnet_runtime_test_lock();
+    let Some(pack) = std::env::var_os("OPENASR_REDIMNET_PACK") else {
+        eprintln!("skipping: OPENASR_REDIMNET_PACK is not set");
+        return;
+    };
+    let samples = vec![0.01_f32; 16_000];
+
+    crate::test_process_env::with_test_process_env(
+        [(
+            super::REDIMNET_BENCH_WORKERS_ENV,
+            Some(std::ffi::OsString::from("1")),
+        )],
+        || {
+            super::unload_idle_redimnet_worker_runtimes();
+            {
+                let embedder = RedimNet2Embedder::from_oasr(std::path::Path::new(&pack))
+                    .expect("load ReDimNet pack");
+                embedder
+                    .embed(&samples, 16_000)
+                    .expect("standalone request");
+                assert_eq!(super::redimnet_worker_runtime_entry_count(), 1);
+            }
+            assert_eq!(
+                super::redimnet_worker_runtime_entry_count(),
+                0,
+                "dropping the final standalone embedder must clear persistent worker TLS"
+            );
         },
     );
 }

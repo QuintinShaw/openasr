@@ -28,6 +28,9 @@ use thiserror::Error;
 
 use super::calibration::{REDIMNET_CALIBRATION, SpeakerCalibrationProfile};
 use super::contract::SpeakerEmbedding;
+use crate::models::thread_local_runtime_cache::{
+    DedicatedWorkerRuntimeOwnerLease, DedicatedWorkerRuntimeOwnerTracker,
+};
 use redimnet::backbone::RedimNet2Model;
 use redimnet::frontend::RedimNetFrontend;
 
@@ -39,6 +42,8 @@ pub(crate) const REDIMNET_MAX_BATCH_WORKERS: usize = 4;
 const REDIMNET_BENCH_WORKERS_ENV: &str = "OPENASR_REDIMNET_BENCH_WORKERS";
 
 static REDIMNET_BATCH_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+static REDIMNET_RUNTIME_OWNERS: DedicatedWorkerRuntimeOwnerTracker =
+    DedicatedWorkerRuntimeOwnerTracker::new(unload_idle_redimnet_worker_runtimes);
 
 fn redimnet_batch_pool() -> &'static Result<rayon::ThreadPool, String> {
     REDIMNET_BATCH_POOL.get_or_init(|| {
@@ -193,6 +198,10 @@ pub trait SpeakerEmbedder: Send + Sync {
 /// Compatibility across packs is gated by `SpeakerProfile::is_compatible_with`
 /// (keyed on `embedding_dim` + `pack_fingerprint`).
 pub struct RedimNet2Embedder {
+    // Drop first so worker-owned device runtimes are released before the
+    // parsed model they were built from. The shared product cache retains the
+    // lease across requests; direct low-level users release on final drop.
+    _worker_runtime_owner: DedicatedWorkerRuntimeOwnerLease,
     model: RedimNet2Model,
     frontend: RedimNetFrontend,
 }
@@ -202,6 +211,7 @@ impl RedimNet2Embedder {
         let model =
             RedimNet2Model::from_oasr(path).map_err(|e| EmbedError::Unavailable(e.to_string()))?;
         Ok(Self {
+            _worker_runtime_owner: REDIMNET_RUNTIME_OWNERS.acquire(),
             model,
             frontend: RedimNetFrontend::new(),
         })
@@ -213,6 +223,7 @@ impl RedimNet2Embedder {
         let model = RedimNet2Model::from_runtime_source(source)
             .map_err(|e| EmbedError::Unavailable(e.to_string()))?;
         Ok(Self {
+            _worker_runtime_owner: REDIMNET_RUNTIME_OWNERS.acquire(),
             model,
             frontend: RedimNetFrontend::new(),
         })

@@ -22,7 +22,8 @@ use crate::ggml_runtime::{
     validate_ggml_runtime_source_path,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, PackContentKey, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DedicatedWorkerRuntimeOwnerLease, DedicatedWorkerRuntimeOwnerTracker,
+    PackContentKey, with_thread_local_cached_mut_by_key,
 };
 
 pub use config::ARCHITECTURE_ID as DIARIZEN_GGML_ARCHITECTURE_ID;
@@ -47,6 +48,8 @@ use weights::validate_tensor_contract;
 
 const DIARIZEN_RUNTIME_CACHE_CAPACITY: usize = 1;
 static DIARIZEN_WORKER_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+static DIARIZEN_RUNTIME_OWNERS: DedicatedWorkerRuntimeOwnerTracker =
+    DedicatedWorkerRuntimeOwnerTracker::new(unload_idle_worker_runtimes);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DiariZenWorkerRuntimeKey {
@@ -220,6 +223,10 @@ pub struct DiariZenWindowOutput {
 /// dedicated worker's TLS, alongside the backend cache that owns their raw
 /// handles; no `unsafe Send` bridge is needed.
 pub struct DiariZenSegmenter {
+    // Drop first so worker-owned device runtimes are gone before their mapped
+    // source and execution metadata. The active product cache keeps this lease
+    // alive across requests; standalone users release on their final drop.
+    _worker_runtime_owner: DedicatedWorkerRuntimeOwnerLease,
     source: crate::ggml_runtime::GgmlRuntimeSource,
     pack_key: PackContentKey,
     runtime_input: super::SegmenterRuntimeInput,
@@ -240,6 +247,7 @@ impl DiariZenSegmenter {
     ) -> Result<Self, DiariZenSegmenterError> {
         Self::probe_runtime_source(source)?;
         Ok(Self {
+            _worker_runtime_owner: DIARIZEN_RUNTIME_OWNERS.acquire(),
             source: source.clone(),
             pack_key: PackContentKey::for_runtime_source(source),
             runtime_input,
