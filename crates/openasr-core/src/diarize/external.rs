@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use super::clustering::AutomaticClusterer;
+use super::clustering::{AutomaticClusterer, AutomaticClusteringError};
 #[cfg(test)]
 use super::clustering::{AutomaticClusteringDiagnostics, AutomaticClusteringStrategy};
 use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
@@ -231,7 +231,11 @@ impl ExternalDiarizer {
             sample_rate_hz,
             hint,
             canceled,
-            |clusterer, _chunks, embeddings, hint| (clusterer.cluster(embeddings, hint), ()),
+            |clusterer, _chunks, embeddings, hint, canceled| {
+                clusterer
+                    .cluster(embeddings, hint, canceled)
+                    .map(|labels| (labels, ()))
+            },
         )
         .map(|(diarization, ())| diarization)
     }
@@ -249,13 +253,13 @@ impl ExternalDiarizer {
             sample_rate_hz,
             hint,
             canceled,
-            |clusterer, chunks, embeddings, hint| {
-                let clustering = clusterer.diagnostics(embeddings, hint);
+            |clusterer, chunks, embeddings, hint, canceled| {
+                let clustering = clusterer.diagnostics(embeddings, hint, canceled)?;
                 let labels = clustering.final_labels.clone();
-                (
+                Ok((
                     labels,
                     NativeDiarizationDiagnostics::from_pipeline(chunks, embeddings, clustering),
-                )
+                ))
             },
         )
     }
@@ -271,7 +275,8 @@ impl ExternalDiarizer {
             &[TimeRange],
             &[SpeakerEmbedding],
             DiarizeHint,
-        ) -> (Vec<SpeakerId>, T),
+            &dyn Fn() -> bool,
+        ) -> Result<(Vec<SpeakerId>, T), AutomaticClusteringError>,
     ) -> Result<(Diarization, T), ExternalDiarizationError> {
         let prepared = self.prepare_recording(samples, sample_rate_hz, canceled)?;
         if !prepared.embeddings.is_empty() {
@@ -282,7 +287,10 @@ impl ExternalDiarizer {
             &prepared.embedded_chunks,
             &prepared.embeddings,
             hint,
-        );
+            canceled,
+        )
+        .map_err(external_clustering_error)?;
+        cancel_checkpoint(canceled)?;
         debug_assert_eq!(labels.len(), prepared.embeddings.len());
         Ok((assemble_recording(&prepared, &labels), output))
     }
@@ -351,6 +359,12 @@ impl ExternalDiarizer {
                 super::vad::FireRedStreamVadError::Canceled => ExternalDiarizationError::Canceled,
                 other => ExternalDiarizationError::Vad(other.to_string()),
             })
+    }
+}
+
+fn external_clustering_error(error: AutomaticClusteringError) -> ExternalDiarizationError {
+    match error {
+        AutomaticClusteringError::Canceled => ExternalDiarizationError::Canceled,
     }
 }
 
@@ -905,6 +919,17 @@ mod tests {
     }
 
     #[test]
+    fn automatic_clustering_cancellation_maps_to_external_canceled() {
+        let clustering_error = AutomaticClusterer
+            .cluster(&[], DiarizeHint::Auto, &|| true)
+            .expect_err("automatic clustering must retain typed cancellation");
+        assert!(matches!(
+            external_clustering_error(clustering_error),
+            ExternalDiarizationError::Canceled
+        ));
+    }
+
+    #[test]
     fn redim_batch_cancel_is_not_stringified() {
         let error = embed_chunks(
             &CanceledEmbedder,
@@ -1059,7 +1084,9 @@ mod tests {
             SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
             SpeakerEmbedding::l2_normalized(vec![0.0, 1.0]),
         ];
-        let clustering = AutomaticClusterer.diagnostics(&embeddings, DiarizeHint::NumSpeakers(2));
+        let clustering = AutomaticClusterer
+            .diagnostics(&embeddings, DiarizeHint::NumSpeakers(2), &|| false)
+            .unwrap();
         let expected_raw: Vec<_> = clustering
             .raw_labels
             .iter()

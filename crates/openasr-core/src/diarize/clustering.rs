@@ -6,6 +6,11 @@
 //! O(n^3) merge loop is comfortably fast. When pyannote segmentation context is
 //! available, clustering also honors overlap cannot-link constraints.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+
+use thiserror::Error;
+
 use super::calibration::{
     ClusteringCalibrationProfile, ContextGapCalibrationProfile, REDIMNET_CALIBRATION,
 };
@@ -354,6 +359,12 @@ fn assign_arrival_order_labels(clusters: &[Vec<usize>], n: usize) -> Vec<Speaker
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AutomaticClusterer;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum AutomaticClusteringError {
+    #[error("automatic speaker clustering was canceled")]
+    Canceled,
+}
+
 const AUTOMATIC_SPECTRAL_MIN_EMBEDDINGS: usize = 40;
 const AUTOMATIC_AHC_COSINE_THRESHOLD: f32 = 0.4;
 const SPECTRAL_PVAL: f64 = 0.012;
@@ -362,6 +373,7 @@ const SPECTRAL_MIN_SPEAKERS: usize = 1;
 const SPECTRAL_MAX_SPEAKERS: usize = 15;
 const MINOR_CLUSTER_MAX_SIZE: usize = 4;
 const CENTROID_MERGE_COSINE_THRESHOLD: f32 = 0.8;
+const AUTOMATIC_CANCEL_CHECK_INTERVAL: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutomaticStrategy {
@@ -489,9 +501,10 @@ impl AutomaticClusterer {
         &self,
         embeddings: &[SpeakerEmbedding],
         hint: DiarizeHint,
-    ) -> Vec<SpeakerId> {
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<Vec<SpeakerId>, AutomaticClusteringError> {
         let mut observer = IgnoreAutomaticClusteringDiagnostics;
-        self.cluster_observed(embeddings, hint, &mut observer)
+        self.cluster_observed(embeddings, hint, canceled, &mut observer)
     }
 
     /// Run the exact production clustering path while retaining its
@@ -501,18 +514,21 @@ impl AutomaticClusterer {
         &self,
         embeddings: &[SpeakerEmbedding],
         hint: DiarizeHint,
-    ) -> AutomaticClusteringDiagnostics {
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<AutomaticClusteringDiagnostics, AutomaticClusteringError> {
         let mut observer = CaptureAutomaticClusteringDiagnostics::default();
-        let final_labels = self.cluster_observed(embeddings, hint, &mut observer);
-        observer.finish(final_labels)
+        let final_labels = self.cluster_observed(embeddings, hint, canceled, &mut observer)?;
+        Ok(observer.finish(final_labels))
     }
 
     fn cluster_observed<O: AutomaticClusteringObserver>(
         &self,
         embeddings: &[SpeakerEmbedding],
         hint: DiarizeHint,
+        canceled: &dyn Fn() -> bool,
         observer: &mut O,
-    ) -> Vec<SpeakerId> {
+    ) -> Result<Vec<SpeakerId>, AutomaticClusteringError> {
+        automatic_cancel_checkpoint(canceled)?;
         let strategy = match hint {
             DiarizeHint::NumSpeakers(_) => AutomaticStrategy::Spectral,
             DiarizeHint::Threshold(_) => AutomaticStrategy::Ahc,
@@ -525,42 +541,48 @@ impl AutomaticClusterer {
             observer.record_selected_speakers(embeddings.len());
             observer.record_raw_labels(&labels);
             observer.record_minor_filtered_labels(&labels);
-            return as_speaker_ids(labels);
+            return Ok(as_speaker_ids(labels));
         }
 
         let labels = match hint {
             DiarizeHint::NumSpeakers(speakers) => spectral_labels(
                 embeddings,
                 Some((speakers as usize).clamp(1, embeddings.len())),
+                canceled,
                 observer,
-            ),
+            )?,
             DiarizeHint::Threshold(distance) => {
-                let labels = ahc_labels(embeddings, 1.0 - distance.clamp(0.0, 2.0), 1);
+                let labels = ahc_labels(embeddings, 1.0 - distance.clamp(0.0, 2.0), 1, canceled)?;
                 observer.record_selected_speakers(label_count(&labels));
                 labels
             }
             DiarizeHint::Auto => match strategy {
                 AutomaticStrategy::Ahc => {
-                    let labels = ahc_labels(embeddings, AUTOMATIC_AHC_COSINE_THRESHOLD, 1);
+                    let labels =
+                        ahc_labels(embeddings, AUTOMATIC_AHC_COSINE_THRESHOLD, 1, canceled)?;
                     observer.record_selected_speakers(label_count(&labels));
                     labels
                 }
-                AutomaticStrategy::Spectral => spectral_labels(embeddings, None, observer),
+                AutomaticStrategy::Spectral => {
+                    spectral_labels(embeddings, None, canceled, observer)?
+                }
             },
         };
+        automatic_cancel_checkpoint(canceled)?;
         observer.record_raw_labels(&labels);
 
         if matches!(hint, DiarizeHint::NumSpeakers(_)) {
             observer.record_minor_filtered_labels(&labels);
-            return as_speaker_ids(compact_labels(&labels));
+            return Ok(as_speaker_ids(compact_labels(&labels)));
         }
-        let labels = filter_minor_clusters(&labels, embeddings, MINOR_CLUSTER_MAX_SIZE);
+        let labels = filter_minor_clusters(&labels, embeddings, MINOR_CLUSTER_MAX_SIZE, canceled)?;
         observer.record_minor_filtered_labels(&labels);
-        as_speaker_ids(compact_labels(&merge_similar_centroids(
+        Ok(as_speaker_ids(compact_labels(&merge_similar_centroids(
             &labels,
             embeddings,
             CENTROID_MERGE_COSINE_THRESHOLD,
-        )))
+            canceled,
+        )?)))
     }
 
     fn strategy_for_len(len: usize) -> AutomaticStrategy {
@@ -595,12 +617,17 @@ fn ahc_labels(
     embeddings: &[SpeakerEmbedding],
     cosine_threshold: f32,
     target_speakers: usize,
-) -> Vec<usize> {
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<usize>, AutomaticClusteringError> {
     let n = embeddings.len();
     let mut similarity = vec![0.0f32; n * n];
     for left in 0..n {
+        automatic_cancel_checkpoint(canceled)?;
         similarity[left * n + left] = 1.0;
         for right in (left + 1)..n {
+            if right % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
             let value = embeddings[left].cosine(&embeddings[right]);
             similarity[left * n + right] = value;
             similarity[right * n + left] = value;
@@ -608,8 +635,10 @@ fn ahc_labels(
     }
     let mut clusters: Vec<Vec<usize>> = (0..n).map(|index| vec![index]).collect();
     while clusters.len() > target_speakers.max(1) {
+        automatic_cancel_checkpoint(canceled)?;
         let mut best = None;
         for left in 0..clusters.len() {
+            automatic_cancel_checkpoint(canceled)?;
             for right in (left + 1)..clusters.len() {
                 let mean = average_similarity(&clusters[left], &clusters[right], &similarity, n);
                 let candidate = (mean, left, right);
@@ -631,19 +660,32 @@ fn ahc_labels(
         let merged = clusters.remove(right);
         clusters[left].extend(merged);
     }
-    raw_labels_from_clusters(&clusters, n)
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(raw_labels_from_clusters(&clusters, n))
 }
 
 fn spectral_labels<O: AutomaticClusteringObserver>(
     embeddings: &[SpeakerEmbedding],
     forced_speakers: Option<usize>,
+    canceled: &dyn Fn() -> bool,
     observer: &mut O,
-) -> Vec<usize> {
-    let affinity = pruned_affinity(embeddings);
+) -> Result<Vec<usize>, AutomaticClusteringError> {
+    let affinity = pruned_affinity(embeddings, canceled)?;
+    spectral_labels_from_affinity(&affinity, embeddings, forced_speakers, canceled, observer)
+}
+
+fn spectral_labels_from_affinity<O: AutomaticClusteringObserver>(
+    affinity: &SparseAffinity,
+    embeddings: &[SpeakerEmbedding],
+    forced_speakers: Option<usize>,
+    canceled: &dyn Fn() -> bool,
+    observer: &mut O,
+) -> Result<Vec<usize>, AutomaticClusteringError> {
     let vector_count = forced_speakers
         .unwrap_or(SPECTRAL_MAX_SPEAKERS + 1)
         .min(embeddings.len());
-    let (eigenvalues, eigenvectors) = smallest_laplacian_eigenvectors(&affinity, vector_count);
+    let (eigenvalues, eigenvectors) =
+        smallest_laplacian_eigenvectors(affinity, vector_count, canceled)?;
     let eigengap_speakers = forced_speakers.is_none().then(|| {
         choose_eigengap_speakers(&eigenvalues, SPECTRAL_MIN_SPEAKERS, SPECTRAL_MAX_SPEAKERS)
     });
@@ -653,56 +695,153 @@ fn spectral_labels<O: AutomaticClusteringObserver>(
         .clamp(1, embeddings.len());
     observer.record_spectral(&eigenvalues, eigengap_speakers);
     observer.record_selected_speakers(speakers);
-    let features: Vec<f64> = (0..embeddings.len())
-        .flat_map(|row| {
-            eigenvectors[row * vector_count..row * vector_count + speakers]
-                .iter()
-                .copied()
-        })
-        .collect();
-    deterministic_kmeans(&features, embeddings.len(), speakers, speakers)
+    let mut features = Vec::with_capacity(embeddings.len() * speakers);
+    for row in 0..embeddings.len() {
+        if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
+        features
+            .extend_from_slice(&eigenvectors[row * vector_count..row * vector_count + speakers]);
+    }
+    deterministic_kmeans(&features, embeddings.len(), speakers, speakers, canceled)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct SparseAffinity {
     rows: Vec<Vec<(usize, f64)>>,
     degree: Vec<f64>,
 }
 
-fn pruned_affinity(embeddings: &[SpeakerEmbedding]) -> SparseAffinity {
-    let n = embeddings.len();
+#[derive(Debug, Clone, Copy)]
+struct RankedSimilarity {
+    similarity: f32,
+    column: usize,
+}
+
+impl PartialEq for RankedSimilarity {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedSimilarity {}
+
+impl PartialOrd for RankedSimilarity {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedSimilarity {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.similarity
+            .total_cmp(&other.similarity)
+            .then_with(|| self.column.cmp(&other.column))
+    }
+}
+
+fn spectral_retained_per_row(n: usize) -> usize {
     let remove =
         (((1.0 - SPECTRAL_PVAL) * n as f64) as usize).min(n.saturating_sub(SPECTRAL_MIN_PNUM));
-    let mut directed = vec![vec![0.0f64; n]; n];
-    for row in 0..n {
-        let mut ranked: Vec<(f32, usize)> = (0..n)
-            .map(|column| (embeddings[row].cosine(&embeddings[column]), column))
-            .collect();
-        ranked.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        for &(similarity, column) in ranked.iter().skip(remove) {
-            directed[row][column] = similarity as f64;
-        }
-    }
+    n - remove
+}
 
+fn pruned_affinity(
+    embeddings: &[SpeakerEmbedding],
+    canceled: &dyn Fn() -> bool,
+) -> Result<SparseAffinity, AutomaticClusteringError> {
+    let directed = pruned_directed_rows(embeddings, canceled)?;
+    symmetrize_pruned_affinity(&directed, canceled)
+}
+
+/// Retains only the exact p-pruned directed neighborhood for each row.
+///
+/// The reference ranks every row by `(similarity, column)` and keeps the last
+/// `max(ceil(p * n), min_pnum)` entries, including self. A fixed-capacity
+/// min-heap produces the same selection without materializing either an
+/// `n * n` directed matrix or a full `n`-entry ranked row.
+fn pruned_directed_rows(
+    embeddings: &[SpeakerEmbedding],
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<RankedSimilarity>>, AutomaticClusteringError> {
+    let n = embeddings.len();
+    let retain = spectral_retained_per_row(n);
+    let mut directed = Vec::with_capacity(n);
+    for row in 0..n {
+        automatic_cancel_checkpoint(canceled)?;
+        let mut retained = BinaryHeap::with_capacity(retain);
+        for column in 0..n {
+            if column % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
+            let candidate = RankedSimilarity {
+                similarity: embeddings[row].cosine(&embeddings[column]),
+                column,
+            };
+            if retained.len() < retain {
+                retained.push(Reverse(candidate));
+            } else if retained
+                .peek()
+                .is_some_and(|Reverse(current)| candidate > *current)
+            {
+                retained.pop();
+                retained.push(Reverse(candidate));
+            }
+        }
+        automatic_cancel_checkpoint(canceled)?;
+        let mut retained: Vec<_> = retained
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect();
+        retained.sort_unstable_by_key(|candidate| candidate.column);
+        automatic_cancel_checkpoint(canceled)?;
+        debug_assert_eq!(retained.len(), retain);
+        directed.push(retained);
+    }
+    Ok(directed)
+}
+
+fn symmetrize_pruned_affinity(
+    directed: &[Vec<RankedSimilarity>],
+    canceled: &dyn Fn() -> bool,
+) -> Result<SparseAffinity, AutomaticClusteringError> {
+    let n = directed.len();
     let mut rows = vec![Vec::new(); n];
-    let mut degree = vec![0.0f64; n];
-    for left in 0..n {
-        for right in (left + 1)..n {
-            let weight = 0.5 * (directed[left][right] + directed[right][left]);
+    for source in 0..n {
+        automatic_cancel_checkpoint(canceled)?;
+        for (edge_index, candidate) in directed[source].iter().enumerate() {
+            if edge_index % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
+            let target = candidate.column;
+            if source == target {
+                continue;
+            }
+            let reverse = directed_similarity(&directed[target], source);
+            if source > target && reverse.is_some() {
+                continue;
+            }
+            let weight = 0.5 * (candidate.similarity as f64 + reverse.unwrap_or(0.0) as f64);
             if weight == 0.0 {
                 continue;
             }
-            rows[left].push((right, weight));
-            rows[right].push((left, weight));
-            degree[left] += weight.abs();
-            degree[right] += weight.abs();
+            rows[source].push((target, weight));
+            rows[target].push((source, weight));
         }
     }
-    SparseAffinity { rows, degree }
+    let mut degree = Vec::with_capacity(n);
+    for row in &mut rows {
+        automatic_cancel_checkpoint(canceled)?;
+        row.sort_unstable_by_key(|&(neighbor, _)| neighbor);
+        degree.push(row.iter().map(|&(_, weight)| weight.abs()).sum());
+    }
+    Ok(SparseAffinity { rows, degree })
+}
+
+fn directed_similarity(row: &[RankedSimilarity], column: usize) -> Option<f32> {
+    row.binary_search_by_key(&column, |candidate| candidate.column)
+        .ok()
+        .map(|index| row[index].similarity)
 }
 
 /// Orthogonal iteration on a shifted sparse Laplacian computes only the
@@ -711,7 +850,9 @@ fn pruned_affinity(embeddings: &[SpeakerEmbedding]) -> SparseAffinity {
 fn smallest_laplacian_eigenvectors(
     affinity: &SparseAffinity,
     vectors: usize,
-) -> (Vec<f64>, Vec<f64>) {
+    canceled: &dyn Fn() -> bool,
+) -> Result<(Vec<f64>, Vec<f64>), AutomaticClusteringError> {
+    automatic_cancel_checkpoint(canceled)?;
     let n = affinity.rows.len();
     let q = vectors.min(n).max(1);
     let shift = affinity
@@ -722,6 +863,9 @@ fn smallest_laplacian_eigenvectors(
         .mul_add(2.0, 1.0e-6);
     let mut basis = vec![0.0f64; n * q];
     for row in 0..n {
+        if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
         basis[row * q] = 1.0;
         for column in 1..q {
             let phase = (row + 1) as f64 * (column + 1) as f64;
@@ -729,12 +873,16 @@ fn smallest_laplacian_eigenvectors(
                 (phase * 0.754_877_666_246_692_7).sin() + (phase * 0.569_840_290_998_053_2).cos();
         }
     }
-    orthonormalize_columns(&mut basis, n, q);
+    orthonormalize_columns(&mut basis, n, q, canceled)?;
 
     let mut next = vec![0.0f64; n * q];
     for _ in 0..160 {
+        automatic_cancel_checkpoint(canceled)?;
         next.fill(0.0);
         for row in 0..n {
+            if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
             for column in 0..q {
                 next[row * q + column] = (shift - affinity.degree[row]) * basis[row * q + column];
             }
@@ -744,13 +892,14 @@ fn smallest_laplacian_eigenvectors(
                 }
             }
         }
-        orthonormalize_columns(&mut next, n, q);
+        orthonormalize_columns(&mut next, n, q, canceled)?;
         std::mem::swap(&mut basis, &mut next);
     }
 
-    let laplacian_basis = apply_laplacian(affinity, &basis, q);
+    let laplacian_basis = apply_laplacian(affinity, &basis, q, canceled)?;
     let mut projected = vec![0.0f64; q * q];
     for left in 0..q {
+        automatic_cancel_checkpoint(canceled)?;
         for right in left..q {
             let value = (0..n)
                 .map(|row| basis[row * q + left] * laplacian_basis[row * q + right])
@@ -769,18 +918,30 @@ fn smallest_laplacian_eigenvectors(
     let eigenvalues = order.iter().map(|&index| values[index]).collect();
     let mut eigenvectors = vec![0.0f64; n * q];
     for row in 0..n {
+        if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
         for (output, &input) in order.iter().enumerate() {
             eigenvectors[row * q + output] = (0..q)
                 .map(|inner| basis[row * q + inner] * rotation[inner * q + input])
                 .sum();
         }
     }
-    (eigenvalues, eigenvectors)
+    automatic_cancel_checkpoint(canceled)?;
+    Ok((eigenvalues, eigenvectors))
 }
 
-fn apply_laplacian(affinity: &SparseAffinity, input: &[f64], columns: usize) -> Vec<f64> {
+fn apply_laplacian(
+    affinity: &SparseAffinity,
+    input: &[f64],
+    columns: usize,
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<f64>, AutomaticClusteringError> {
     let mut output = vec![0.0f64; input.len()];
     for row in 0..affinity.rows.len() {
+        if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
         for column in 0..columns {
             output[row * columns + column] = affinity.degree[row] * input[row * columns + column];
         }
@@ -790,17 +951,27 @@ fn apply_laplacian(affinity: &SparseAffinity, input: &[f64], columns: usize) -> 
             }
         }
     }
-    output
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(output)
 }
 
-fn orthonormalize_columns(matrix: &mut [f64], rows: usize, columns: usize) {
+fn orthonormalize_columns(
+    matrix: &mut [f64],
+    rows: usize,
+    columns: usize,
+    canceled: &dyn Fn() -> bool,
+) -> Result<(), AutomaticClusteringError> {
     for column in 0..columns {
+        automatic_cancel_checkpoint(canceled)?;
         for _ in 0..2 {
             for previous in 0..column {
                 let projection: f64 = (0..rows)
                     .map(|row| matrix[row * columns + column] * matrix[row * columns + previous])
                     .sum();
                 for row in 0..rows {
+                    if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                        automatic_cancel_checkpoint(canceled)?;
+                    }
                     matrix[row * columns + column] -= projection * matrix[row * columns + previous];
                 }
             }
@@ -816,9 +987,14 @@ fn orthonormalize_columns(matrix: &mut [f64], rows: usize, columns: usize) {
             continue;
         }
         for row in 0..rows {
+            if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
             matrix[row * columns + column] /= norm;
         }
     }
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(())
 }
 
 fn jacobi_symmetric_eigen(mut matrix: Vec<f64>, n: usize) -> (Vec<f64>, Vec<f64>) {
@@ -895,13 +1071,16 @@ fn deterministic_kmeans(
     rows: usize,
     dimensions: usize,
     clusters: usize,
-) -> Vec<usize> {
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<usize>, AutomaticClusteringError> {
+    automatic_cancel_checkpoint(canceled)?;
     if clusters <= 1 {
-        return vec![0; rows];
+        return Ok(vec![0; rows]);
     }
     debug_assert_eq!(points.len(), rows * dimensions);
     debug_assert!(clusters <= rows);
-    let centers = deterministic_greedy_kmeans_plus_plus(points, rows, dimensions, clusters);
+    let centers =
+        deterministic_greedy_kmeans_plus_plus(points, rows, dimensions, clusters, canceled)?;
     let mut centroids: Vec<f64> = centers
         .iter()
         .flat_map(|&row| {
@@ -912,8 +1091,12 @@ fn deterministic_kmeans(
         .collect();
     let mut labels = vec![usize::MAX; rows];
     for _ in 0..300 {
+        automatic_cancel_checkpoint(canceled)?;
         let mut changed = false;
         for row in 0..rows {
+            if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
             let previous = labels[row];
             let label = (0..clusters)
                 .min_by(|&left, &right| {
@@ -937,12 +1120,16 @@ fn deterministic_kmeans(
         let mut sums = vec![0.0f64; clusters * dimensions];
         let mut counts = vec![0usize; clusters];
         for row in 0..rows {
+            if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
             counts[labels[row]] += 1;
             for dimension in 0..dimensions {
                 sums[labels[row] * dimensions + dimension] += points[row * dimensions + dimension];
             }
         }
         for cluster in 0..clusters {
+            automatic_cancel_checkpoint(canceled)?;
             if counts[cluster] == 0 {
                 let replacement = (0..rows)
                     .filter(|&row| counts[labels[row]] > 1)
@@ -984,7 +1171,8 @@ fn deterministic_kmeans(
         }
     }
     debug_assert_eq!(label_count(&labels), clusters);
-    compact_labels(&labels)
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(compact_labels(&labels))
 }
 
 /// Fixed-seed greedy k-means++ initialization, matching the reference
@@ -994,16 +1182,23 @@ fn deterministic_greedy_kmeans_plus_plus(
     rows: usize,
     dimensions: usize,
     clusters: usize,
-) -> Vec<usize> {
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<usize>, AutomaticClusteringError> {
+    automatic_cancel_checkpoint(canceled)?;
     let mut rng = SplitMix64::new(0);
     let mut centers = Vec::with_capacity(clusters);
     centers.push(rng.index(rows));
-    let mut closest: Vec<f64> = (0..rows)
-        .map(|row| point_distance(points, dimensions, row, centers[0]))
-        .collect();
+    let mut closest = Vec::with_capacity(rows);
+    for row in 0..rows {
+        if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
+        closest.push(point_distance(points, dimensions, row, centers[0]));
+    }
     let local_trials = 2 + (clusters as f64).ln() as usize;
 
     while centers.len() < clusters {
+        automatic_cancel_checkpoint(canceled)?;
         let potential: f64 = closest.iter().sum();
         let next = if potential <= f64::EPSILON {
             (0..rows)
@@ -1012,32 +1207,44 @@ fn deterministic_greedy_kmeans_plus_plus(
         } else {
             let mut cumulative = Vec::with_capacity(rows);
             let mut total = 0.0;
-            for &distance in &closest {
+            for (row, &distance) in closest.iter().enumerate() {
+                if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                    automatic_cancel_checkpoint(canceled)?;
+                }
                 total += distance;
                 cumulative.push(total);
             }
-            (0..local_trials)
-                .map(|_| {
-                    let target = rng.unit_f64() * potential;
-                    cumulative
-                        .partition_point(|&value| value <= target)
-                        .min(rows - 1)
-                })
-                .min_by(|&left, &right| {
-                    kmeans_candidate_potential(points, dimensions, &closest, left)
-                        .total_cmp(&kmeans_candidate_potential(
-                            points, dimensions, &closest, right,
-                        ))
-                        .then_with(|| left.cmp(&right))
-                })
-                .expect("greedy k-means++ always evaluates a candidate")
+            let mut best: Option<(f64, usize)> = None;
+            for _ in 0..local_trials {
+                automatic_cancel_checkpoint(canceled)?;
+                let target = rng.unit_f64() * potential;
+                let candidate = cumulative
+                    .partition_point(|&value| value <= target)
+                    .min(rows - 1);
+                let candidate_potential =
+                    kmeans_candidate_potential(points, dimensions, &closest, candidate, canceled)?;
+                if best.is_none_or(|(best_potential, best_candidate)| {
+                    candidate_potential
+                        .total_cmp(&best_potential)
+                        .then_with(|| candidate.cmp(&best_candidate))
+                        == Ordering::Less
+                }) {
+                    best = Some((candidate_potential, candidate));
+                }
+            }
+            best.expect("greedy k-means++ always evaluates a candidate")
+                .1
         };
         centers.push(next);
         for (row, distance) in closest.iter_mut().enumerate() {
+            if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+                automatic_cancel_checkpoint(canceled)?;
+            }
             *distance = distance.min(point_distance(points, dimensions, row, next));
         }
     }
-    centers
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(centers)
 }
 
 fn kmeans_candidate_potential(
@@ -1045,12 +1252,16 @@ fn kmeans_candidate_potential(
     dimensions: usize,
     closest: &[f64],
     candidate: usize,
-) -> f64 {
-    closest
-        .iter()
-        .enumerate()
-        .map(|(row, &distance)| distance.min(point_distance(points, dimensions, row, candidate)))
-        .sum()
+    canceled: &dyn Fn() -> bool,
+) -> Result<f64, AutomaticClusteringError> {
+    let mut potential = 0.0;
+    for (row, &distance) in closest.iter().enumerate() {
+        if row % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
+        potential += distance.min(point_distance(points, dimensions, row, candidate));
+    }
+    Ok(potential)
 }
 
 fn point_distance(points: &[f64], dimensions: usize, left: usize, right: usize) -> f64 {
@@ -1094,10 +1305,15 @@ fn filter_minor_clusters(
     labels: &[usize],
     embeddings: &[SpeakerEmbedding],
     max_minor_size: usize,
-) -> Vec<usize> {
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<usize>, AutomaticClusteringError> {
+    automatic_cancel_checkpoint(canceled)?;
     let cluster_count = labels.iter().copied().max().map_or(0, |label| label + 1);
     let mut sizes = vec![0usize; cluster_count];
-    for &label in labels {
+    for (index, &label) in labels.iter().enumerate() {
+        if index % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
         sizes[label] += 1;
     }
     let major: Vec<usize> = sizes
@@ -1106,16 +1322,17 @@ fn filter_minor_clusters(
         .filter_map(|(label, &size)| (size > max_minor_size).then_some(label))
         .collect();
     if major.is_empty() {
-        return vec![0; labels.len()];
+        return Ok(vec![0; labels.len()]);
     }
-    let centroids = embedding_centroids(labels, embeddings);
-    labels
-        .iter()
-        .enumerate()
-        .map(|(index, &label)| {
-            if sizes[label] > max_minor_size {
-                return label;
-            }
+    let centroids = embedding_centroids(labels, embeddings, canceled)?;
+    let mut filtered = Vec::with_capacity(labels.len());
+    for (index, &label) in labels.iter().enumerate() {
+        if index % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
+        let selected = if sizes[label] > max_minor_size {
+            label
+        } else {
             major
                 .iter()
                 .copied()
@@ -1126,23 +1343,30 @@ fn filter_minor_clusters(
                         .then_with(|| right.cmp(&left))
                 })
                 .unwrap_or(0)
-        })
-        .collect()
+        };
+        filtered.push(selected);
+    }
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(filtered)
 }
 
 fn merge_similar_centroids(
     labels: &[usize],
     embeddings: &[SpeakerEmbedding],
     threshold: f32,
-) -> Vec<usize> {
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<usize>, AutomaticClusteringError> {
+    automatic_cancel_checkpoint(canceled)?;
     let mut labels = compact_labels(labels);
     loop {
-        let centroids = embedding_centroids(&labels, embeddings);
+        automatic_cancel_checkpoint(canceled)?;
+        let centroids = embedding_centroids(&labels, embeddings, canceled)?;
         if centroids.len() <= 1 {
             break;
         }
         let mut best = None;
         for left in 0..centroids.len() {
+            automatic_cancel_checkpoint(canceled)?;
             for right in (left + 1)..centroids.len() {
                 let similarity = centroids[left].cosine(&centroids[right]);
                 let candidate = (similarity, left, right);
@@ -1168,21 +1392,42 @@ fn merge_similar_centroids(
         }
         labels = compact_labels(&labels);
     }
-    labels
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(labels)
 }
 
-fn embedding_centroids(labels: &[usize], embeddings: &[SpeakerEmbedding]) -> Vec<SpeakerEmbedding> {
+fn embedding_centroids(
+    labels: &[usize],
+    embeddings: &[SpeakerEmbedding],
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<SpeakerEmbedding>, AutomaticClusteringError> {
+    automatic_cancel_checkpoint(canceled)?;
     let count = labels.iter().copied().max().map_or(0, |label| label + 1);
     let dimensions = embeddings.first().map_or(0, SpeakerEmbedding::dim);
     let mut sums = vec![vec![0.0f32; dimensions]; count];
-    for (&label, embedding) in labels.iter().zip(embeddings) {
+    for (index, (&label, embedding)) in labels.iter().zip(embeddings).enumerate() {
+        if index % AUTOMATIC_CANCEL_CHECK_INTERVAL == 0 {
+            automatic_cancel_checkpoint(canceled)?;
+        }
         for (sum, &value) in sums[label].iter_mut().zip(&embedding.0) {
             *sum += value;
         }
     }
-    sums.into_iter()
+    automatic_cancel_checkpoint(canceled)?;
+    Ok(sums
+        .into_iter()
         .map(SpeakerEmbedding::l2_normalized)
-        .collect()
+        .collect())
+}
+
+fn automatic_cancel_checkpoint(
+    canceled: &dyn Fn() -> bool,
+) -> Result<(), AutomaticClusteringError> {
+    if canceled() {
+        Err(AutomaticClusteringError::Canceled)
+    } else {
+        Ok(())
+    }
 }
 
 fn compact_labels(labels: &[usize]) -> Vec<usize> {
@@ -1220,10 +1465,67 @@ fn raw_labels_from_clusters(clusters: &[Vec<usize>], n: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn emb(v: Vec<f32>) -> SpeakerEmbedding {
         SpeakerEmbedding::l2_normalized(v)
+    }
+
+    fn never_cancel() -> bool {
+        false
+    }
+
+    fn dense_pruned_affinity_oracle(embeddings: &[SpeakerEmbedding]) -> SparseAffinity {
+        let n = embeddings.len();
+        let remove = n - spectral_retained_per_row(n);
+        let mut directed = vec![vec![0.0f64; n]; n];
+        for row in 0..n {
+            let mut ranked: Vec<(f32, usize)> = (0..n)
+                .map(|column| (embeddings[row].cosine(&embeddings[column]), column))
+                .collect();
+            ranked.sort_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            for &(similarity, column) in ranked.iter().skip(remove) {
+                directed[row][column] = similarity as f64;
+            }
+        }
+
+        let mut rows = vec![Vec::new(); n];
+        let mut degree = vec![0.0f64; n];
+        for left in 0..n {
+            for right in (left + 1)..n {
+                let weight = 0.5 * (directed[left][right] + directed[right][left]);
+                if weight == 0.0 {
+                    continue;
+                }
+                rows[left].push((right, weight));
+                rows[right].push((left, weight));
+                degree[left] += weight.abs();
+                degree[right] += weight.abs();
+            }
+        }
+        SparseAffinity { rows, degree }
+    }
+
+    fn tied_signed_embeddings(n: usize) -> Vec<SpeakerEmbedding> {
+        const PATTERNS: [[f32; 3]; 8] = [
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        (0..n)
+            .map(|index| emb(PATTERNS[index % PATTERNS.len()].to_vec()))
+            .collect()
     }
 
     fn ctx(
@@ -1342,6 +1644,110 @@ mod tests {
     }
 
     #[test]
+    fn streaming_affinity_matches_dense_oracle_at_p_pruning_boundaries() {
+        for n in [499, 500, 501] {
+            let embeddings = tied_signed_embeddings(n);
+            let streaming = pruned_affinity(&embeddings, &never_cancel).unwrap();
+            let dense = dense_pruned_affinity_oracle(&embeddings);
+
+            assert_eq!(streaming, dense, "affinity drifted at n={n}");
+            assert_eq!(
+                spectral_retained_per_row(n),
+                if n <= 500 { 6 } else { 7 },
+                "p/min-six boundary drifted at n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_affinity_preserves_dense_oracle_spectral_labels() {
+        let embeddings = tied_signed_embeddings(64);
+        let dense = dense_pruned_affinity_oracle(&embeddings);
+        let mut observer = IgnoreAutomaticClusteringDiagnostics;
+        let dense_labels = spectral_labels_from_affinity(
+            &dense,
+            &embeddings,
+            Some(3),
+            &never_cancel,
+            &mut observer,
+        )
+        .unwrap();
+        let streaming_labels = AutomaticClusterer
+            .cluster(&embeddings, DiarizeHint::NumSpeakers(3), &never_cancel)
+            .unwrap();
+
+        assert_eq!(
+            streaming_labels,
+            as_speaker_ids(compact_labels(&dense_labels))
+        );
+    }
+
+    #[test]
+    fn one_hour_scale_retention_is_linear_in_selected_edges_and_early_cancelable() {
+        let n = 4_800;
+        let retained_per_row = spectral_retained_per_row(n);
+        let retained_entries = n * retained_per_row;
+        assert_eq!(retained_per_row, 58);
+        assert_eq!(retained_entries, 278_400);
+        assert!(retained_entries * 64 < n * n);
+
+        let embeddings = tied_signed_embeddings(n);
+        let checks = Cell::new(0usize);
+        let canceled = || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 4
+        };
+        assert_eq!(
+            pruned_directed_rows(&embeddings, &canceled),
+            Err(AutomaticClusteringError::Canceled)
+        );
+        assert_eq!(checks.get(), 4, "cancel should stop within the first row");
+    }
+
+    #[test]
+    fn cancellation_is_typed_across_affinity_solver_kmeans_and_postprocess() {
+        let embeddings = tied_signed_embeddings(40);
+
+        let checks = Cell::new(0usize);
+        let cancel_after_first_row_sort = || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 4
+        };
+        assert_eq!(
+            pruned_directed_rows(&embeddings[..8], &cancel_after_first_row_sort),
+            Err(AutomaticClusteringError::Canceled)
+        );
+
+        let directed = pruned_directed_rows(&embeddings[..8], &never_cancel).unwrap();
+        assert_eq!(
+            symmetrize_pruned_affinity(&directed, &|| true),
+            Err(AutomaticClusteringError::Canceled)
+        );
+
+        let affinity = symmetrize_pruned_affinity(&directed, &never_cancel).unwrap();
+        assert_eq!(
+            smallest_laplacian_eigenvectors(&affinity, 2, &|| true),
+            Err(AutomaticClusteringError::Canceled)
+        );
+        assert_eq!(
+            deterministic_kmeans(&[1.0, 0.0, 0.0, 1.0], 2, 2, 2, &|| true),
+            Err(AutomaticClusteringError::Canceled)
+        );
+
+        let labels: Vec<_> = (0..40).map(|index| index % 2).collect();
+        assert_eq!(
+            filter_minor_clusters(&labels, &embeddings, 4, &|| true),
+            Err(AutomaticClusteringError::Canceled)
+        );
+        assert_eq!(
+            merge_similar_centroids(&labels, &embeddings, 0.8, &|| true),
+            Err(AutomaticClusteringError::Canceled)
+        );
+    }
+
+    #[test]
     fn automatic_clustering_is_deterministic() {
         let embeddings: Vec<_> = (0..48)
             .map(|index| {
@@ -1352,9 +1758,16 @@ mod tests {
             })
             .collect();
         let clusterer = AutomaticClusterer;
-        let expected = clusterer.cluster(&embeddings, DiarizeHint::Auto);
+        let expected = clusterer
+            .cluster(&embeddings, DiarizeHint::Auto, &never_cancel)
+            .unwrap();
         for _ in 0..4 {
-            assert_eq!(clusterer.cluster(&embeddings, DiarizeHint::Auto), expected);
+            assert_eq!(
+                clusterer
+                    .cluster(&embeddings, DiarizeHint::Auto, &never_cancel)
+                    .unwrap(),
+                expected
+            );
         }
     }
 
@@ -1363,10 +1776,13 @@ mod tests {
         // Identical points force the empty-cluster path. The old implementation
         // copied a centroid without moving its label, then compacted k=3 to k=1.
         let points = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
-        let labels = deterministic_kmeans(&points, 4, 2, 3);
+        let labels = deterministic_kmeans(&points, 4, 2, 3, &never_cancel).unwrap();
 
         assert_eq!(label_count(&labels), 3);
-        assert_eq!(labels, deterministic_kmeans(&points, 4, 2, 3));
+        assert_eq!(
+            labels,
+            deterministic_kmeans(&points, 4, 2, 3, &never_cancel).unwrap()
+        );
     }
 
     #[test]
@@ -1390,10 +1806,14 @@ mod tests {
             .collect();
         let clusterer = AutomaticClusterer;
 
-        let ahc = clusterer.diagnostics(&ahc_embeddings, DiarizeHint::Auto);
+        let ahc = clusterer
+            .diagnostics(&ahc_embeddings, DiarizeHint::Auto, &never_cancel)
+            .unwrap();
         assert_eq!(
             ahc.final_labels,
-            clusterer.cluster(&ahc_embeddings, DiarizeHint::Auto)
+            clusterer
+                .cluster(&ahc_embeddings, DiarizeHint::Auto, &never_cancel)
+                .unwrap()
         );
         assert_eq!(ahc.strategy, AutomaticClusteringStrategy::Ahc);
         assert!(ahc.spectral_eigenvalues.is_empty());
@@ -1402,10 +1822,14 @@ mod tests {
         assert_eq!(ahc.raw_labels.len(), ahc_embeddings.len());
         assert_eq!(ahc.minor_filtered_labels.len(), ahc_embeddings.len());
 
-        let spectral = clusterer.diagnostics(&spectral_embeddings, DiarizeHint::Auto);
+        let spectral = clusterer
+            .diagnostics(&spectral_embeddings, DiarizeHint::Auto, &never_cancel)
+            .unwrap();
         assert_eq!(
             spectral.final_labels,
-            clusterer.cluster(&spectral_embeddings, DiarizeHint::Auto)
+            clusterer
+                .cluster(&spectral_embeddings, DiarizeHint::Auto, &never_cancel)
+                .unwrap()
         );
         assert_eq!(spectral.strategy, AutomaticClusteringStrategy::Spectral);
         assert_eq!(
@@ -1433,7 +1857,9 @@ mod tests {
             .collect();
         let clusterer = AutomaticClusterer;
 
-        let forced = clusterer.diagnostics(&embeddings, DiarizeHint::NumSpeakers(2));
+        let forced = clusterer
+            .diagnostics(&embeddings, DiarizeHint::NumSpeakers(2), &never_cancel)
+            .unwrap();
         assert_eq!(forced.strategy, AutomaticClusteringStrategy::Spectral);
         assert_eq!(forced.spectral_eigenvalues.len(), 2);
         assert_eq!(forced.eigengap_speakers, None);
@@ -1441,11 +1867,15 @@ mod tests {
         assert_eq!(forced.raw_labels, forced.minor_filtered_labels);
         assert_eq!(
             forced.final_labels,
-            clusterer.cluster(&embeddings, DiarizeHint::NumSpeakers(2))
+            clusterer
+                .cluster(&embeddings, DiarizeHint::NumSpeakers(2), &never_cancel,)
+                .unwrap()
         );
 
         let singleton = vec![emb(vec![1.0, 0.0])];
-        let short = clusterer.diagnostics(&singleton, DiarizeHint::Auto);
+        let short = clusterer
+            .diagnostics(&singleton, DiarizeHint::Auto, &never_cancel)
+            .unwrap();
         assert_eq!(short.strategy, AutomaticClusteringStrategy::Ahc);
         assert!(short.spectral_eigenvalues.is_empty());
         assert_eq!(short.eigengap_speakers, None);
@@ -1466,7 +1896,9 @@ mod tests {
                 }
             })
             .collect();
-        let labels = AutomaticClusterer.cluster(&embeddings, DiarizeHint::NumSpeakers(2));
+        let labels = AutomaticClusterer
+            .cluster(&embeddings, DiarizeHint::NumSpeakers(2), &never_cancel)
+            .unwrap();
         assert!(labels[..20].iter().all(|label| *label == labels[0]));
         assert!(labels[20..].iter().all(|label| *label == labels[20]));
         assert_ne!(labels[0], labels[20]);
@@ -1478,7 +1910,7 @@ mod tests {
         embeddings.extend(vec![emb(vec![0.0, 1.0]); 5]);
         embeddings.push(emb(vec![0.98, 0.02]));
         let labels = vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2];
-        let filtered = filter_minor_clusters(&labels, &embeddings, 4);
+        let filtered = filter_minor_clusters(&labels, &embeddings, 4, &never_cancel).unwrap();
         assert_eq!(filtered[10], 0);
     }
 }
