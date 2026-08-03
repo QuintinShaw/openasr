@@ -114,6 +114,25 @@ pub(crate) const GGML_STATUS_BACKEND_POISONED: c_int = 4;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
+pub(crate) const GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE: c_int = 0;
+pub(crate) const GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT: c_int = 1;
+pub(crate) const GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION: c_int = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GgmlBackendGraphCancelCapability {
+    pub mechanism: c_int,
+    pub observation_granularity: c_int,
+}
+
+impl Default for GgmlBackendGraphCancelCapability {
+    fn default() -> Self {
+        Self {
+            mechanism: GGML_BACKEND_GRAPH_CANCEL_DISABLED,
+            observation_granularity: GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE,
+        }
+    }
+}
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_COMPUTE: c_int = 2;
 
@@ -399,7 +418,7 @@ unsafe extern "C" {
         cgraph: GgmlCgraphRaw,
         abort_callback: GgmlAbortCallback,
         abort_callback_data: *mut c_void,
-        cancel_mode: *mut c_int,
+        cancel_capability: *mut GgmlBackendGraphCancelCapability,
     ) -> c_int;
     pub(crate) fn ggml_backend_sched_new(
         backends: *mut GgmlBackendRaw,
@@ -436,7 +455,7 @@ unsafe extern "C" {
         cgraph: GgmlCgraphRaw,
         abort_callback: GgmlAbortCallback,
         abort_callback_data: *mut c_void,
-        cancel_mode: *mut c_int,
+        cancel_capability: *mut GgmlBackendGraphCancelCapability,
     ) -> c_int;
     pub(crate) fn ggml_backend_tensor_set(
         tensor: GgmlTensorRaw,

@@ -1055,8 +1055,13 @@ pub enum GgmlCpuGraphError {
     BackendSchedulerInitFailed,
     #[error("ggml cpu graph backend scheduler is poisoned after an incomplete allocation commit")]
     BackendSchedulerPoisoned,
-    #[error("ggml backend returned an invalid graph cancellation mode: mode={mode}")]
-    GraphCancellationContractFailed { mode: i32 },
+    #[error(
+        "ggml backend returned an invalid graph cancellation capability: mechanism={mechanism}, observation_granularity={observation_granularity}"
+    )]
+    GraphCancellationContractFailed {
+        mechanism: i32,
+        observation_granularity: i32,
+    },
     #[error("ggml cpu graph backend scheduler graph allocation failed")]
     BackendSchedulerGraphAllocationFailed,
     #[error("ggml cpu graph tensor index out of bounds: index={index}, len={len}")]
@@ -6352,6 +6357,36 @@ unsafe fn read_tensor_bytes(
     unsafe { ffi::ggml_backend_tensor_get(tensor, data, offset, size) }
 }
 
+fn validate_graph_cancel_capability(
+    status: c_int,
+    capability: ffi::GgmlBackendGraphCancelCapability,
+) -> Result<(), GgmlCpuGraphError> {
+    let valid_pair = matches!(
+        (capability.mechanism, capability.observation_granularity),
+        (
+            ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE
+        ) | (
+            ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+                | ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION
+        ) | (
+            ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+                | ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION
+        )
+    );
+    let disabled_after_success = status == ffi::GGML_STATUS_SUCCESS
+        && capability.mechanism == ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    if valid_pair && !disabled_after_success {
+        return Ok(());
+    }
+    Err(GgmlCpuGraphError::GraphCancellationContractFailed {
+        mechanism: capability.mechanism,
+        observation_granularity: capability.observation_granularity,
+    })
+}
+
 /// Compute one graph under the current job's cancel flag. The cloned Arc owns
 /// the callback data for exactly this synchronous FFI call; neither the shared
 /// backend layer nor a cached backend retains the raw pointer after return.
@@ -6379,7 +6414,7 @@ fn compute_graph_with_current_job_cancel(
         });
     };
 
-    let mut mode = ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    let mut capability = ffi::GgmlBackendGraphCancelCapability::default();
     let callback = Some(openasr_ggml_abort_trampoline as unsafe extern "C" fn(*mut c_void) -> bool);
     let data = Arc::as_ptr(&flag) as *mut c_void;
     let status = unsafe {
@@ -6389,7 +6424,7 @@ fn compute_graph_with_current_job_cancel(
                 graph.as_ptr(),
                 callback,
                 data,
-                &mut mode,
+                &mut capability,
             )
         } else {
             ffi::ggml_backend_graph_compute_with_abort(
@@ -6397,16 +6432,11 @@ fn compute_graph_with_current_job_cancel(
                 graph.as_ptr(),
                 callback,
                 data,
-                &mut mode,
+                &mut capability,
             )
         }
     };
-    if !matches!(
-        mode,
-        ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE | ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED
-    ) {
-        return Err(GgmlCpuGraphError::GraphCancellationContractFailed { mode });
-    }
+    validate_graph_cancel_capability(status, capability)?;
     Ok(status)
 }
 
@@ -7725,7 +7755,7 @@ mod tests {
         GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams, GpuProbeCache,
         GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
         flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, runtime_gpu_is_available,
+        gpu_probe_log_message, runtime_gpu_is_available, validate_graph_cancel_capability,
     };
 
     fn softplus_reference(value: f32) -> f32 {
@@ -8124,7 +8154,7 @@ mod tests {
         node_count: usize,
         callback: ffi::GgmlAbortCallback,
         data: *mut std::ffi::c_void,
-    ) -> (i32, i32, Option<f32>) {
+    ) -> (ffi::GgmlBackendGraphCancelCapability, i32, Option<f32>) {
         let mut runner = GgmlCpuGraphRunner::new(config).expect("graph runner");
         let mut builder = runner.start_graph();
         let input = builder.new_tensor_1d_f32(1, "input").expect("input");
@@ -8148,7 +8178,7 @@ mod tests {
         let graph = builder
             .build_forward_graph(&[output])
             .expect("forward graph");
-        let mut mode = ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+        let mut capability = ffi::GgmlBackendGraphCancelCapability::default();
         let status = unsafe {
             if let Some(scheduler) = builder.scheduler {
                 ffi::ggml_backend_sched_graph_compute_with_abort(
@@ -8156,7 +8186,7 @@ mod tests {
                     graph.as_ptr(),
                     callback,
                     data,
-                    &mut mode,
+                    &mut capability,
                 )
             } else {
                 ffi::ggml_backend_graph_compute_with_abort(
@@ -8164,7 +8194,7 @@ mod tests {
                     graph.as_ptr(),
                     callback,
                     data,
-                    &mut mode,
+                    &mut capability,
                 )
             }
         };
@@ -8182,7 +8212,7 @@ mod tests {
         } else {
             None
         };
-        (mode, status, output)
+        (capability, status, output)
     }
 
     #[test]
@@ -8218,13 +8248,17 @@ mod tests {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: usize::MAX,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             GgmlCpuGraphConfig::conservative_default(),
             4,
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
         assert_eq!(output, Some(4.0));
     }
@@ -8246,13 +8280,17 @@ mod tests {
             // been installed.
             abort_after: 2,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             config,
             96,
             Some(abort_after_polls),
             (&cancel_probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(cancel_probe.polls.load(Ordering::SeqCst), 2);
@@ -8261,13 +8299,17 @@ mod tests {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: usize::MAX,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             config,
             96,
             Some(abort_after_polls),
             (&reuse_probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
         assert_eq!(output, Some(96.0));
     }
@@ -8289,13 +8331,17 @@ mod tests {
             // safe per-node submission boundaries to observe this request.
             abort_after: 8,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             config,
             96,
             Some(abort_after_polls),
             (&cancel_probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(cancel_probe.polls.load(Ordering::SeqCst), 8);
@@ -8304,13 +8350,17 @@ mod tests {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: usize::MAX,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             config,
             96,
             Some(abort_after_polls),
             (&reuse_probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
         assert_eq!(output, Some(96.0));
     }
@@ -8323,7 +8373,7 @@ mod tests {
                 polls: std::sync::atomic::AtomicUsize::new(0),
                 abort_after: usize::MAX,
             };
-            let (mode, status, output) = compute_add_chain_with_callback(
+            let (capability, status, output) = compute_add_chain_with_callback(
                 GgmlCpuGraphConfig {
                     backend: GgmlCpuGraphBackend::Gpu,
                     use_scheduler,
@@ -8333,7 +8383,11 @@ mod tests {
                 Some(abort_after_polls),
                 (&probe as *const AbortAfterPolls).cast_mut().cast(),
             );
-            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+            assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+            assert_eq!(
+                capability.observation_granularity,
+                ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+            );
             assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
             assert_eq!(output, Some(96.0));
         }
@@ -8388,17 +8442,21 @@ mod tests {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: 2,
         };
-        let mut mode = ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+        let mut capability = ffi::GgmlBackendGraphCancelCapability::default();
         let status = unsafe {
             ffi::ggml_backend_graph_compute_with_abort(
                 backend.as_ptr(),
                 graph_ptr.as_ptr(),
                 Some(abort_after_polls),
                 (&probe as *const AbortAfterPolls).cast_mut().cast(),
-                &mut mode,
+                &mut capability,
             )
         };
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 2);
         assert!(matches!(
@@ -8557,14 +8615,65 @@ mod tests {
         let error = session
             .builder()
             .finish_compute_result(Err(GgmlCpuGraphError::GraphCancellationContractFailed {
-                mode: 99,
+                mechanism: 99,
+                observation_granularity: 98,
             }))
             .expect_err("compute helper errors must poison persistent state");
         assert!(matches!(
             error,
-            GgmlCpuGraphError::GraphCancellationContractFailed { mode: 99 }
+            GgmlCpuGraphError::GraphCancellationContractFailed {
+                mechanism: 99,
+                observation_granularity: 98
+            }
         ));
         assert!(session.is_poisoned());
+    }
+
+    #[test]
+    fn cancellation_capability_validation_is_orthogonal_and_path_sensitive() {
+        for capability in [
+            ffi::GgmlBackendGraphCancelCapability {
+                mechanism: ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE,
+                observation_granularity:
+                    ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT,
+            },
+            ffi::GgmlBackendGraphCancelCapability {
+                mechanism: ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE,
+                observation_granularity:
+                    ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION,
+            },
+            ffi::GgmlBackendGraphCancelCapability {
+                mechanism: ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED,
+                observation_granularity:
+                    ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION,
+            },
+        ] {
+            validate_graph_cancel_capability(ffi::GGML_STATUS_SUCCESS, capability)
+                .expect("valid executed path capability");
+        }
+
+        validate_graph_cancel_capability(
+            ffi::GGML_STATUS_ABORTED,
+            ffi::GgmlBackendGraphCancelCapability::default(),
+        )
+        .expect("pre-submission cancellation runs no backend mechanism");
+
+        for capability in [
+            ffi::GgmlBackendGraphCancelCapability::default(),
+            ffi::GgmlBackendGraphCancelCapability {
+                mechanism: ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED,
+                observation_granularity:
+                    ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION,
+            },
+            ffi::GgmlBackendGraphCancelCapability {
+                mechanism: ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE,
+                observation_granularity: ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE,
+            },
+        ] {
+            assert!(
+                validate_graph_cancel_capability(ffi::GGML_STATUS_SUCCESS, capability).is_err()
+            );
+        }
     }
 
     #[test]
@@ -8635,7 +8744,7 @@ mod tests {
             polls: std::sync::atomic::AtomicUsize::new(0),
             abort_after: 2,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             GgmlCpuGraphConfig {
                 backend: GgmlCpuGraphBackend::Metal,
                 use_scheduler: false,
@@ -8645,7 +8754,11 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+        );
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 2);
@@ -8653,18 +8766,17 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_scheduler_cancel_at_a_scheduler_boundary_reports_native_capability() {
+    fn metal_scheduler_cancel_before_submission_reports_no_backend_mechanism() {
         use std::sync::atomic::Ordering;
 
         let probe = AbortAfterPolls {
             polls: std::sync::atomic::AtomicUsize::new(0),
             // Scheduler allocation, split, and input-transfer boundaries own
             // the first six polls. This cancellation fires before the split is
-            // submitted; NATIVE still records that every scheduled backend can
-            // enforce the same callback if cancellation arrives during compute.
+            // submitted, so the actual execution path reports DISABLED/NONE.
             abort_after: 6,
         };
-        let (mode, status, output) = compute_add_chain_with_callback(
+        let (capability, status, output) = compute_add_chain_with_callback(
             GgmlCpuGraphConfig {
                 backend: GgmlCpuGraphBackend::Metal,
                 use_scheduler: true,
@@ -8674,7 +8786,14 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(
+            capability.mechanism,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED
+        );
+        assert_eq!(
+            capability.observation_granularity,
+            ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE
+        );
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 6);
@@ -8688,7 +8807,7 @@ mod tests {
             abort_after: usize::MAX,
         };
         for use_scheduler in [false, true] {
-            let (mode, status, output) = compute_add_chain_with_callback(
+            let (capability, status, output) = compute_add_chain_with_callback(
                 GgmlCpuGraphConfig {
                     backend: GgmlCpuGraphBackend::Metal,
                     use_scheduler,
@@ -8698,7 +8817,11 @@ mod tests {
                 Some(abort_after_polls),
                 (&probe as *const AbortAfterPolls).cast_mut().cast(),
             );
-            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+            assert_eq!(capability.mechanism, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+            assert_eq!(
+                capability.observation_granularity,
+                ffi::GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT
+            );
             assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
             assert_eq!(output, Some(96.0));
         }
