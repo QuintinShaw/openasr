@@ -14,8 +14,8 @@ pub(crate) enum FireRedAedDecodeBudgetError {
     EmptyEncoderOutput,
     #[error("firered-aed decoder position cap must leave room for the SOS prompt")]
     DecoderPositionCapExhausted,
-    #[error("firered-aed self-KV position count overflowed")]
-    PositionOverflow,
+    #[error("firered-aed causal decode schedule is invalid: {reason}")]
+    InvalidCausalSchedule { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,11 +38,15 @@ pub(crate) fn firered_aed_decode_budget(
         .filter(|&positions| positions > 0)
         .ok_or(FireRedAedDecodeBudgetError::DecoderPositionCapExhausted)?;
     let max_generated_tokens = encoder_frame_count.min(context_budget);
-    let self_kv_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+    let self_kv_positions = crate::capacity::topology::causal_prefix_positions_with_context_cap(
+        "firered-aed.decoder.self_kv",
         PROMPT_POSITIONS,
         max_generated_tokens,
+        decoder_position_cap,
     )
-    .map_err(|_| FireRedAedDecodeBudgetError::PositionOverflow)?;
+    .map_err(|error| FireRedAedDecodeBudgetError::InvalidCausalSchedule {
+        reason: error.to_string(),
+    })?;
     Ok(FireRedAedDecodeBudget {
         prompt_positions: PROMPT_POSITIONS,
         max_generated_tokens,

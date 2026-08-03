@@ -541,8 +541,9 @@ impl GgmlAsrViewExecutor for MoonshineGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_moonshine_decoder_state,
+                super::capacity::MOONSHINE_DECODER_STATE_STREAMS,
             ),
         )
     }

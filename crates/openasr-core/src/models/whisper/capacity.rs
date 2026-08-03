@@ -3,6 +3,7 @@
 use crate::capacity::topology::{
     DecoderStateDemandScope, DecoderStateTopology, InvocationEnvelope, InvocationShapeInput,
     PositionBoundProof, StateBytes, StateDemand, StateKind, TopologyError,
+    causal_prefix_positions_with_context_cap,
 };
 
 use super::mel::{WHISPER_HOP_LENGTH, WHISPER_SAMPLE_RATE_HZ};
@@ -14,10 +15,22 @@ use crate::models::seq2seq_decoder_state::Seq2SeqStateIds;
 
 const SELF_KV_STATE_ID: &str = "whisper.decoder.self_kv";
 const CROSS_KV_STATE_ID: &str = "whisper.decoder.cross_kv";
+pub(super) const WHISPER_MAX_GENERATED_TOKENS: usize = 256;
 pub(crate) const WHISPER_DECODER_STATE_IDS: Seq2SeqStateIds = Seq2SeqStateIds {
     self_attention: SELF_KV_STATE_ID,
     cross_attention: CROSS_KV_STATE_ID,
 };
+pub(crate) const WHISPER_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        CROSS_KV_STATE_ID,
+        StateKind::CrossAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_whisper_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,
@@ -32,8 +45,48 @@ pub(crate) fn plan_whisper_decoder_state(
             reason: error.to_string(),
         },
     )?;
+    let tokenizer =
+        super::tokenizer::WhisperTokenizer::from_gguf_metadata(input.preflight.metadata.as_ref())
+            .map_err(
+            |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+                family,
+                reason: error.to_string(),
+            },
+        )?;
+    plan_whisper_decoder_state_with_components(input, metadata, &tokenizer)
+}
+
+pub(super) fn plan_whisper_decoder_state_with_prepared_runtime(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    prepared: &super::ggml_executor::WhisperPreparedRuntime,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    plan_whisper_decoder_state_with_components(
+        input,
+        prepared.execution.clone(),
+        &prepared.tokenizer,
+    )
+}
+
+fn plan_whisper_decoder_state_with_components(
+    input: &GgmlAsrDecoderStatePlanningInput<'_>,
+    metadata: WhisperGgmlExecutionMetadata,
+    tokenizer: &super::tokenizer::WhisperTokenizer,
+) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
+    let family = "whisper";
+    let prompt_bounds = super::prompt::whisper_prompt_position_bounds(
+        &metadata,
+        tokenizer,
+        input.request_options,
+        input.envelope.max_prompt_tokens(),
+    )
+    .map_err(
+        |error| GgmlAsrDecoderStatePlanningError::PromptTokenCountUnavailable {
+            family,
+            reason: error.to_string(),
+        },
+    )?;
     crate::capacity::topology::DecoderStatePlan::build(
-        &WhisperDecoderStateTopology::new(metadata),
+        &WhisperDecoderStateTopology::new(metadata, prompt_bounds.logical, prompt_bounds.stable),
         input.invocation,
         input.envelope,
     )
@@ -76,11 +129,42 @@ fn resident_kv_bytes(
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperDecoderStateTopology {
     metadata: WhisperGgmlExecutionMetadata,
+    logical_prompt_positions: usize,
+    stable_prompt_positions: usize,
 }
 
 impl WhisperDecoderStateTopology {
-    pub(crate) const fn new(metadata: WhisperGgmlExecutionMetadata) -> Self {
-        Self { metadata }
+    pub(crate) const fn new(
+        metadata: WhisperGgmlExecutionMetadata,
+        logical_prompt_positions: usize,
+        stable_prompt_positions: usize,
+    ) -> Self {
+        Self {
+            metadata,
+            logical_prompt_positions,
+            stable_prompt_positions,
+        }
+    }
+
+    fn self_kv_positions(&self, prompt_positions: usize) -> Result<usize, TopologyError> {
+        let generated_positions = self
+            .metadata
+            .max_target_positions
+            .checked_sub(prompt_positions)
+            .filter(|positions| *positions > 0)
+            .ok_or_else(|| TopologyError::Unavailable {
+                reason: format!(
+                    "whisper prompt {prompt_positions} exhausts decoder context {}",
+                    self.metadata.max_target_positions
+                ),
+            })?
+            .min(WHISPER_MAX_GENERATED_TOKENS);
+        causal_prefix_positions_with_context_cap(
+            SELF_KV_STATE_ID,
+            prompt_positions,
+            generated_positions,
+            self.metadata.max_target_positions,
+        )
     }
 }
 
@@ -89,11 +173,15 @@ impl DecoderStateTopology for WhisperDecoderStateTopology {
         &self,
         scope: DecoderStateDemandScope<InvocationShapeInput, InvocationEnvelope>,
     ) -> Result<Vec<StateDemand>, TopologyError> {
-        let (invocation, stable_envelope) = match scope {
-            DecoderStateDemandScope::ExactInvocation(invocation) => (invocation, None),
-            DecoderStateDemandScope::StableEnvelope(envelope) => {
-                (envelope.maximum_invocation(), Some(envelope))
+        let (invocation, prompt_positions, stable_envelope) = match scope {
+            DecoderStateDemandScope::ExactInvocation(invocation) => {
+                (invocation, self.logical_prompt_positions, None)
             }
+            DecoderStateDemandScope::StableEnvelope(envelope) => (
+                envelope.maximum_invocation(),
+                self.stable_prompt_positions,
+                Some(envelope),
+            ),
         };
         if invocation.sample_rate_hz().get() != WHISPER_SAMPLE_RATE_HZ {
             return Err(TopologyError::UnsupportedSampleRate {
@@ -118,27 +206,13 @@ impl DecoderStateTopology for WhisperDecoderStateTopology {
         let sequences = invocation.sequences().get() as usize;
         let cross_frames = self.metadata.encoder_context_length;
         let cross_position_cap = aligned_cross_frames(cross_frames)?;
-        // The resident arena is shared by every legal request in the session.
-        // Whisper's semantic context is P + G <= C (with G capped at 256),
-        // while the greedy implementation writes only P + G - 1 rows. The
-        // maximum over every legal prompt/carry shape is therefore C - 1.
-        let self_kv_positions = self
-            .metadata
-            .max_target_positions
-            .checked_sub(1)
-            .filter(|positions| *positions > 0)
-            .ok_or_else(|| TopologyError::Unavailable {
-                reason: format!(
-                    "whisper decoder context {} cannot hold a prompt and generated token",
-                    self.metadata.max_target_positions
-                ),
-            })?;
+        let self_kv_positions = self.self_kv_positions(prompt_positions)?;
         let mut demands = vec![
             StateDemand::new(
                 SELF_KV_STATE_ID,
                 StateKind::SelfAttentionKv,
                 self_kv_positions,
-                self_kv_positions,
+                self.metadata.max_target_positions,
                 resident_kv_bytes(&self.metadata, self_kv_positions, sequences)?,
                 PositionBoundProof::Exact,
             )?,
@@ -206,12 +280,18 @@ mod tests {
             NonZeroU32::new(30_000).unwrap(),
         )
         .unwrap();
-        let plan =
-            DecoderStatePlan::for_envelope(&WhisperDecoderStateTopology::new(metadata()), envelope)
-                .unwrap();
+        let plan = DecoderStatePlan::for_envelope(
+            &WhisperDecoderStateTopology::new(metadata(), 4, 36),
+            envelope,
+        )
+        .unwrap();
         assert_eq!(
             plan.reserve_positions(StateKind::SelfAttentionKv),
-            Some(447)
+            Some(291)
+        );
+        assert_eq!(
+            plan.logical_positions(StateKind::SelfAttentionKv),
+            Some(259)
         );
         assert_eq!(
             plan.logical_positions(StateKind::CrossAttentionKv),
@@ -226,9 +306,11 @@ mod tests {
     #[test]
     fn fixed_window_rejects_audio_the_frontend_would_silently_trim() {
         let envelope = InvocationEnvelope::new(NonZeroU32::new(16_000).unwrap(), 480_001).unwrap();
-        let error =
-            DecoderStatePlan::for_envelope(&WhisperDecoderStateTopology::new(metadata()), envelope)
-                .expect_err("more than the 30-second frontend window must fail closed");
+        let error = DecoderStatePlan::for_envelope(
+            &WhisperDecoderStateTopology::new(metadata(), 4, 4),
+            envelope,
+        )
+        .expect_err("more than the 30-second frontend window must fail closed");
         assert!(matches!(
             error,
             TopologyError::InvocationSampleLimitExceeded {
@@ -241,11 +323,11 @@ mod tests {
     #[test]
     fn one_and_thirty_seconds_share_the_fixed_window_arena_but_longer_calls_fail() {
         let rate = NonZeroU32::new(16_000).unwrap();
-        let topology = WhisperDecoderStateTopology::new(metadata());
+        let topology = WhisperDecoderStateTopology::new(metadata(), 4, 4);
         for seconds in [1, 30] {
             let envelope = InvocationEnvelope::new(rate, seconds * 16_000).unwrap();
             let plan = DecoderStatePlan::for_envelope(&topology, envelope).unwrap();
-            assert_eq!(plan.reserve_positions_by_id(SELF_KV_STATE_ID), Some(447));
+            assert_eq!(plan.reserve_positions_by_id(SELF_KV_STATE_ID), Some(259));
             assert_eq!(plan.reserve_positions_by_id(CROSS_KV_STATE_ID), Some(1_536));
         }
         for seconds in [60, 300] {
@@ -263,7 +345,7 @@ mod tests {
         tiny.max_target_positions = 1;
         let envelope = InvocationEnvelope::new(NonZeroU32::new(16_000).unwrap(), 16_000).unwrap();
         assert!(matches!(
-            DecoderStatePlan::for_envelope(&WhisperDecoderStateTopology::new(tiny), envelope),
+            DecoderStatePlan::for_envelope(&WhisperDecoderStateTopology::new(tiny, 1, 1), envelope,),
             Err(TopologyError::Unavailable { .. })
         ));
     }

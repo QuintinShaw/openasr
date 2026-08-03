@@ -1231,6 +1231,94 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
 }
 
 #[test]
+fn whisper_prompt_bounds_separate_current_prompt_from_future_carry() {
+    let (execution, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+    let exact_only = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &request_options,
+        0,
+    )
+    .expect("exact prompt bound");
+    assert_eq!(exact_only.logical, exact_only.stable);
+
+    let with_carry = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &request_options,
+        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+    )
+    .expect("stable carry bound");
+    assert_eq!(with_carry.logical, exact_only.logical);
+    assert!(with_carry.stable > with_carry.logical);
+}
+
+#[test]
+fn whisper_prompt_bounds_respect_mode_and_carry_as_independent_switches() {
+    let (execution, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let fixed_without_carry = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        longform: Some(crate::LongFormOptions {
+            mode: crate::LongFormMode::Fixed,
+            carry_prompt_across_slices: false,
+            ..crate::LongFormOptions::default()
+        }),
+        ..GgmlAsrExecutionOptions::default()
+    };
+    let fixed = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &fixed_without_carry,
+        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+    )
+    .expect("fixed prompt bound");
+    assert_eq!(fixed.stable, fixed.logical);
+
+    let disabled = GgmlAsrExecutionOptions {
+        longform: Some(crate::LongFormOptions {
+            mode: crate::LongFormMode::Off,
+            ..crate::LongFormOptions::default()
+        }),
+        ..fixed_without_carry
+    };
+    let off = super::super::prompt::whisper_prompt_position_bounds(
+        &execution,
+        &tokenizer,
+        &disabled,
+        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+    )
+    .expect("disabled prompt bound");
+    assert_eq!(off.stable, off.logical);
+    assert_eq!(
+        fixed.logical,
+        off.logical + 1,
+        "only active long-form adds <|startofprev|>"
+    );
+}
+
+#[test]
+fn whisper_carry_producer_honors_the_effective_carry_switch() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let request_options = GgmlAsrExecutionOptions {
+        longform: Some(crate::LongFormOptions {
+            carry_prompt_across_slices: false,
+            ..crate::LongFormOptions::default()
+        }),
+        ..GgmlAsrExecutionOptions::default()
+    };
+    assert_eq!(
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &[1, 2, 3])
+            .expect("disabled carry is valid"),
+        None
+    );
+}
+
+#[test]
 fn whisper_serve_batch_allows_longform_on_direct_gpu_lane() {
     let mut direct_gpu = GgmlCpuGraphConfig::conservative_default();
     direct_gpu.backend = GgmlCpuGraphBackend::Gpu;

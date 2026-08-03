@@ -25,6 +25,17 @@ pub(crate) const FIRERED_AED_DECODER_STATE_IDS: Seq2SeqStateIds = Seq2SeqStateId
     self_attention: SELF_KV_STATE_ID,
     cross_attention: CROSS_KV_STATE_ID,
 };
+pub(crate) const FIRERED_AED_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        CROSS_KV_STATE_ID,
+        StateKind::CrossAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_firered_aed_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,

@@ -1052,8 +1052,9 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
         .failure()
         .stderr(predicate::str::contains("Native ASR Core"))
         .stderr(predicate::str::contains("fail-closed"))
-        .stderr(predicate::str::contains("ggml-family-whisper-runtime-v1"))
-        .stderr(predicate::str::contains("tokenizer is missing"))
+        .stderr(predicate::str::contains(
+            "model family 'whisper' exact prompt token count is unavailable",
+        ))
         .stderr(predicate::str::contains(
             "Whisper GGUF tokenizer is missing required key 'tokenizer.ggml.model'",
         ))
@@ -1061,6 +1062,7 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
         .stderr(predicate::str::contains("missing required OASR v1 key").not())
         .stderr(predicate::str::contains("missing required GGUF metadata key").not())
         .stderr(predicate::str::contains("missing required GGUF tensor").not())
+        .stderr(predicate::str::contains("ggml-family-whisper-runtime-v1").not())
         .stderr(predicate::str::contains(".openasr").not())
         .stderr(predicate::str::contains("legacy pack").not());
 }

@@ -31,6 +31,13 @@ use super::runtime_contract::{
 };
 
 pub(crate) const MIMO_ASR_SELF_KV_STATE_ID: &str = "mimo-asr.decoder.self_kv";
+pub(crate) const MIMO_ASR_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        MIMO_ASR_SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_mimo_asr_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,

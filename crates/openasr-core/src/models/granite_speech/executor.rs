@@ -744,8 +744,9 @@ impl GgmlAsrViewExecutor for GraniteSpeechGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_granite_speech_decoder_state,
+                super::capacity::GRANITE_SPEECH_DECODER_STATE_STREAMS,
             ),
         )
     }
@@ -1089,9 +1090,9 @@ mod tests {
         let longform = LongFormOptions {
             mode: LongFormMode::Fixed,
             chunk_seconds: 30.0,
-            // Carry is allowed for granite's Default profile; leave it on so the
-            // test exercises the production-shaped path rather than a carry-off
-            // laboratory mode.
+            // Granite has no token-history producer. Deliberately request carry
+            // here so the architecture policy must normalize it off on the
+            // production path.
             carry_prompt_across_slices: true,
             ..LongFormOptions::default()
         };

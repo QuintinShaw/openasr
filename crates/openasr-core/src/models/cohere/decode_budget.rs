@@ -23,8 +23,8 @@ pub(crate) enum CohereDecodeBudgetError {
     },
     #[error("{COHERE_MAX_GENERATED_TOKENS_OVERRIDE_ENV} must be a positive integer, got '{value}'")]
     InvalidOverride { value: String },
-    #[error("cohere self-KV position count overflowed")]
-    PositionOverflow,
+    #[error("cohere causal decode schedule is invalid: {reason}")]
+    InvalidCausalSchedule { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,11 +66,15 @@ pub(crate) fn cohere_decode_budget(
             max_generated_tokens = max_generated_tokens.min(override_value);
         }
     }
-    let self_kv_positions = crate::capacity::decode_schedule::greedy_self_kv_positions(
+    let self_kv_positions = crate::capacity::topology::causal_prefix_positions_with_context_cap(
+        "cohere.decoder.self_kv",
         prompt_positions,
         max_generated_tokens,
+        decoder_position_cap,
     )
-    .map_err(|_| CohereDecodeBudgetError::PositionOverflow)?;
+    .map_err(|error| CohereDecodeBudgetError::InvalidCausalSchedule {
+        reason: error.to_string(),
+    })?;
     Ok(CohereDecodeBudget {
         prompt_positions,
         max_generated_tokens,

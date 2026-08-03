@@ -3701,11 +3701,14 @@ fn longform_prompt_carry_mode(
     options: &crate::LongFormOptions,
     model_architecture: &str,
 ) -> LongformPromptCarryMode {
-    if !options.carry_prompt_across_slices {
+    if matches!(options.mode, LongFormMode::Off) || !options.carry_prompt_across_slices {
         return LongformPromptCarryMode::Disabled;
     }
     resolve_builtin_decode_policy_for_architecture(model_architecture)
         .map(|policy| match policy.longform_prompt_carry_mode {
+            BuiltinDecodePolicyLongformPromptCarryMode::Disabled => {
+                LongformPromptCarryMode::Disabled
+            }
             BuiltinDecodePolicyLongformPromptCarryMode::Text => LongformPromptCarryMode::Text,
             BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory => {
                 LongformPromptCarryMode::TokenHistory
@@ -5984,7 +5987,15 @@ mod tests {
         );
         assert!(
             resolution.options.carry_prompt_across_slices,
-            "Default longform profile keeps prompt carry (unlike ConservativeSeq2SeqV1)"
+            "the generic window resolver preserves the requested carry switch"
+        );
+        assert_eq!(
+            longform_prompt_carry_mode(
+                &resolution.options,
+                crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            LongformPromptCarryMode::Disabled,
+            "granite has no carry producer, so its effective policy must remain disabled"
         );
         // LocalChunked encoder + Default profile: no encoder-memory or
         // conservative-seq2seq provenance tags on the auto path.
@@ -6397,6 +6408,16 @@ mod tests {
         );
         assert_eq!(
             longform_prompt_carry_mode(&options, crate::QWEN3_ASR_GGML_ARCHITECTURE_ID),
+            LongformPromptCarryMode::Disabled,
+        );
+
+        let disabled_mode = crate::LongFormOptions {
+            mode: LongFormMode::Off,
+            carry_prompt_across_slices: true,
+            ..crate::LongFormOptions::default()
+        };
+        assert_eq!(
+            longform_prompt_carry_mode(&disabled_mode, crate::WHISPER_GGML_ARCHITECTURE_ID,),
             LongformPromptCarryMode::Disabled,
         );
     }

@@ -1028,6 +1028,13 @@ impl MossTdGgmlExecutor {
             decode_prompt.token_ids.len(),
             kv_capacity,
         )?;
+        let semantic_required_positions = decode_prompt
+            .token_ids
+            .len()
+            .checked_add(max_generated_tokens)
+            .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
+                reason: "prompt plus generation position count overflowed".to_string(),
+            })?;
         let request_kv_cache_positions = moss_td_request_kv_cache_positions(
             decoder_metadata.max_positions,
             decode_prompt.token_ids.len(),
@@ -1036,10 +1043,7 @@ impl MossTdGgmlExecutor {
         .ok_or_else(|| MossTdExecutorError::AudioExceedsContext {
             prompt_tokens: decode_prompt.token_ids.len(),
             generation_budget: max_generated_tokens,
-            required_positions: decode_prompt
-                .token_ids
-                .len()
-                .saturating_add(max_generated_tokens.saturating_sub(1)),
+            required_positions: semantic_required_positions,
             kv_capacity,
             max_minutes: (kv_capacity.saturating_sub(max_generated_tokens) as f32
                 / AUDIO_TOKENS_PER_SECOND_FOR_LIMIT
@@ -1140,8 +1144,9 @@ impl GgmlAsrViewExecutor for MossTdGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_moss_td_decoder_state,
+                super::capacity::MOSS_TD_DECODER_STATE_STREAMS,
             ),
         )
     }

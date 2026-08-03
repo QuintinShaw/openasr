@@ -755,8 +755,9 @@ impl GgmlAsrViewExecutor for FunasrNanoGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_funasr_nano_decoder_state,
+                super::capacity::FUNASR_NANO_DECODER_STATE_STREAMS,
             ),
         )
     }

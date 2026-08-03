@@ -26,6 +26,7 @@ const RESERVED_OASR_MAGIC: &[u8; 4] = b"OASR";
 const GGUF_VERSION_V3: u32 = 3;
 const GGUF_TYPE_STRING: i32 = 8;
 const GGUF_TYPE_ARRAY: i32 = 9;
+const GGUF_TYPE_U32: i32 = 4;
 const GGML_TYPE_F32: i32 = 0;
 const GGML_TYPE_F16: i32 = 1;
 const GGML_TYPE_I32: i32 = 26;
@@ -158,6 +159,7 @@ pub enum WhisperExecutionFailureStage {
 pub struct TinyGgufFixtureSpec {
     pub metadata: BTreeMap<String, String>,
     pub metadata_string_arrays: BTreeMap<String, Vec<String>>,
+    pub metadata_u32_arrays: BTreeMap<String, Vec<u32>>,
     pub tensor_names: Vec<String>,
     tensor_dims: BTreeMap<String, Vec<u64>>,
     tensor_types: BTreeMap<String, i32>,
@@ -177,6 +179,7 @@ impl TinyGgufFixtureSpec {
         Self {
             metadata,
             metadata_string_arrays: BTreeMap::new(),
+            metadata_u32_arrays: BTreeMap::new(),
             tensor_names,
             tensor_dims,
             tensor_types,
@@ -221,9 +224,8 @@ impl TinyGgufFixtureSpec {
     }
 
     /// Production-window metadata and positional tensors, but still no
-    /// tokenizer. This is the end-to-end fixture for callers that must pass
-    /// semantic capacity planning and tensor binding before failing at the
-    /// tokenizer boundary.
+    /// tokenizer. This is the end-to-end fixture for callers that must fail in
+    /// exact prompt planning before any physical allocation or tensor binding.
     pub fn whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(
         model_id: impl Into<String>,
     ) -> Self {
@@ -251,6 +253,7 @@ impl TinyGgufFixtureSpec {
             .with_whisper_graph_metadata(1, 1, 8, 80)
             .with_metadata("whisper.encoder.context_length", "1500")
             .with_metadata("whisper.decoder.context_length", "448")
+            .with_whisper_minimal_tokenizer()
     }
 
     pub fn whisper_oasr_v1_encoder_graph_one_layer(model_id: impl Into<String>) -> Self {
@@ -522,6 +525,52 @@ impl TinyGgufFixtureSpec {
         self.metadata_string_arrays
             .insert(key.into(), values.into_iter().map(Into::into).collect());
         self
+    }
+
+    pub fn with_u32_array_metadata(
+        mut self,
+        key: impl Into<String>,
+        values: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        self.metadata_u32_arrays
+            .insert(key.into(), values.into_iter().collect());
+        self
+    }
+
+    /// Minimal, internally consistent Whisper tokenizer metadata for fixtures
+    /// whose intended failure boundary is after exact prompt planning.
+    pub fn with_whisper_minimal_tokenizer(self) -> Self {
+        let mut tokens = (0..WHISPER_DEFAULT_TOKEN_VOCAB)
+            .map(|index| format!("fixture{index}"))
+            .collect::<Vec<_>>();
+        const EOT: usize = 60;
+        const SOT: usize = 61;
+        const TRANSCRIBE: usize = 62;
+        const NO_TIMESTAMPS: usize = 63;
+        tokens[EOT] = "<|endoftext|>".to_string();
+        tokens[SOT] = "<|startoftranscript|>".to_string();
+        tokens[TRANSCRIBE] = "<|transcribe|>".to_string();
+        tokens[NO_TIMESTAMPS] = "<|notimestamps|>".to_string();
+
+        self.with_metadata("tokenizer.ggml.model", "gpt2")
+            .with_metadata("tokenizer.ggml.sot_token_id", SOT.to_string())
+            .with_metadata("tokenizer.ggml.eot_token_id", EOT.to_string())
+            .with_metadata("tokenizer.ggml.transcribe_token_id", TRANSCRIBE.to_string())
+            .with_metadata(
+                "tokenizer.ggml.no_timestamps_token_id",
+                NO_TIMESTAMPS.to_string(),
+            )
+            .with_string_array_metadata("tokenizer.ggml.tokens", tokens)
+            .with_string_array_metadata("tokenizer.ggml.merges", ["f i"])
+            .with_u32_array_metadata(
+                "tokenizer.ggml.special_token_ids",
+                [
+                    EOT as u32,
+                    SOT as u32,
+                    TRANSCRIBE as u32,
+                    NO_TIMESTAMPS as u32,
+                ],
+            )
     }
 
     pub fn with_whisper_graph_metadata(
@@ -1856,7 +1905,10 @@ pub fn write_tiny_gguf_runtime_source(
     bytes.extend_from_slice(&GGUF_VERSION_V3.to_le_bytes());
     bytes.extend_from_slice(&(tensor_entries.len() as u64).to_le_bytes());
     bytes.extend_from_slice(
-        &((spec.metadata.len() + spec.metadata_string_arrays.len()) as u64).to_le_bytes(),
+        &((spec.metadata.len()
+            + spec.metadata_string_arrays.len()
+            + spec.metadata_u32_arrays.len()) as u64)
+            .to_le_bytes(),
     );
     for (key, value) in &spec.metadata {
         push_gguf_string(&mut bytes, key);
@@ -1870,6 +1922,15 @@ pub fn write_tiny_gguf_runtime_source(
         bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
         for value in values {
             push_gguf_string(&mut bytes, value);
+        }
+    }
+    for (key, values) in &spec.metadata_u32_arrays {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+        bytes.extend_from_slice(&GGUF_TYPE_U32.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
 
@@ -2311,6 +2372,24 @@ mod tests {
             spec.metadata_string_arrays
                 .get("tokenizer.ggml.tokens")
                 .map(Vec::as_slice)
+        );
+    }
+
+    #[test]
+    fn tiny_gguf_writer_roundtrips_u32_array_metadata() {
+        let file = NamedTempFile::new().expect("temp file");
+        let spec =
+            TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-runtime-fixture")
+                .with_whisper_minimal_tokenizer();
+
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let metadata = read_gguf_metadata(file.path()).expect("read metadata");
+
+        assert_eq!(
+            metadata.get_u32_array("tokenizer.ggml.special_token_ids"),
+            spec.metadata_u32_arrays
+                .get("tokenizer.ggml.special_token_ids")
+                .map(Vec::as_slice),
         );
     }
 

@@ -31,6 +31,13 @@ use super::executor::FUNASR_NANO_MAX_GENERATED_TOKENS;
 use super::runtime_contract::FunasrNanoDecoderMetadata;
 
 pub(crate) const FUNASR_NANO_SELF_KV_STATE_ID: &str = "funasr-nano.decoder.self_kv";
+pub(crate) const FUNASR_NANO_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        FUNASR_NANO_SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_funasr_nano_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,

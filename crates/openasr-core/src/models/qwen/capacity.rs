@@ -31,6 +31,13 @@ use super::decode_budget::qwen3_desired_generated_tokens;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 
 pub(crate) const QWEN3_SELF_KV_STATE_ID: &str = "qwen3.decoder.self_kv";
+pub(crate) const QWEN3_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        QWEN3_SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_qwen3_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,

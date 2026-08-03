@@ -911,8 +911,9 @@ impl GgmlAsrViewExecutor for MimoAsrGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_mimo_asr_decoder_state,
+                super::capacity::MIMO_ASR_DECODER_STATE_STREAMS,
             ),
         )
     }

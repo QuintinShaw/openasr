@@ -4058,7 +4058,8 @@ mod tests {
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_missing_tensor(
             "whisper-runtime-fixture",
             "model.encoder.conv1.weight",
-        );
+        )
+        .with_whisper_minimal_tokenizer();
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
         let backend = native_backend_for_test();
@@ -4092,12 +4093,15 @@ mod tests {
             .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
-        assert!(error.contains("whisper-ggml-executor-v1"), "{error}");
         assert!(
-            error.contains("whisper ggml executor tokenizer is missing"),
+            error.contains("model family 'whisper' exact prompt token count is unavailable"),
             "{error}"
         );
-        assert!(error.contains("tokenizer.ggml.model"), "{error}");
+        assert!(
+            error.contains("Whisper GGUF tokenizer is missing required key 'tokenizer.ggml.model'"),
+            "{error}"
+        );
+        assert!(!error.contains("whisper-ggml-executor-v1"), "{error}");
         let stage = classify_whisper_execution_failure_stage(&error);
         assert!(
             matches!(stage, WhisperExecutionFailureStage::MetadataPreflight),
@@ -4131,8 +4135,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_whisper_executor_accepts_decoder_tensor_alias_and_reaches_tokenizer_boundary()
-    {
+    fn native_backend_whisper_executor_accepts_decoder_tensor_alias_and_executes() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-alias.gguf");
         let fixture_spec =
@@ -4140,7 +4143,8 @@ mod tests {
                 .with_whisper_required_tensor_alias(
                     "model.decoder.embed_tokens.weight",
                     "model.decoder.token_embedding.weight",
-                );
+                )
+                .with_whisper_minimal_tokenizer();
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
         let backend = native_backend_for_test();
@@ -4149,13 +4153,11 @@ mod tests {
             "whisper-runtime-fixture",
         )
         .with_model_pack_path(Some(runtime_path));
-        let error = backend.transcribe(request).unwrap_err().to_string();
-
-        assert!(
-            error.contains("whisper ggml executor tokenizer is missing"),
-            "{error}"
-        );
-        assert!(error.contains("tokenizer.ggml.model"), "{error}");
+        let transcription = backend
+            .transcribe(request)
+            .expect("the aliased decoder embedding must bind and execute");
+        assert!(!transcription.text.is_empty());
+        assert!(!transcription.segments.is_empty());
     }
 
     #[test]
@@ -4166,7 +4168,8 @@ mod tests {
             "whisper-runtime-fixture",
             2,
             2,
-        );
+        )
+        .with_whisper_minimal_tokenizer();
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
         let backend = native_backend_for_test();
@@ -4192,7 +4195,8 @@ mod tests {
             "whisper-runtime-fixture",
             "model.encoder.conv2.bias",
             [2_u64],
-        );
+        )
+        .with_whisper_minimal_tokenizer();
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
 
         let backend = native_backend_for_test();

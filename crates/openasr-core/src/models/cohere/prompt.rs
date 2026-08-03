@@ -69,7 +69,7 @@ pub(crate) fn build_cohere_initial_prompt_token_ids(
     prompt_token_ids = trim_prompt_token_tail(
         prompt_token_ids,
         max_prompt_tokens,
-        request_options.longform.is_some(),
+        request_options.longform_mode_enabled(),
         COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
     );
     initial_prompt_tokens.extend(prompt_token_ids);
@@ -79,13 +79,13 @@ pub(crate) fn build_cohere_initial_prompt_token_ids(
 pub(crate) fn cohere_stable_prompt_positions(
     logical_prompt_positions: usize,
     base_prompt_positions: usize,
-    request_options: &GgmlAsrExecutionOptions,
+    max_variable_prompt_tokens: usize,
     decoder_position_cap: usize,
 ) -> Result<usize, CohereTranscribeDecodePromptError> {
     if base_prompt_positions == 0 {
         return Err(CohereTranscribeDecodePromptError::EmptyBasePrompt);
     }
-    if request_options.longform.is_none() {
+    if max_variable_prompt_tokens == 0 {
         return Ok(logical_prompt_positions);
     }
     let available = decoder_position_cap
@@ -96,7 +96,12 @@ pub(crate) fn cohere_stable_prompt_positions(
             decoder_position_cap,
         })?;
     base_prompt_positions
-        .checked_add(available.min(COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT))
+        .checked_add(
+            available
+                .min(max_variable_prompt_tokens)
+                .min(COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT),
+        )
+        .map(|positions| positions.max(logical_prompt_positions))
         .ok_or(CohereTranscribeDecodePromptError::PromptExhaustsContext {
             prompt_positions: base_prompt_positions,
             decoder_position_cap,
@@ -241,5 +246,19 @@ mod tests {
         .expect_err("a language without a control token must fail closed")
         .to_string();
         assert!(error.contains("fr"), "{error}");
+    }
+
+    #[test]
+    fn stable_prompt_grows_only_for_an_admitted_carry_budget() {
+        assert_eq!(cohere_stable_prompt_positions(13, 9, 0, 1_024).unwrap(), 13);
+        assert_eq!(
+            cohere_stable_prompt_positions(13, 9, 32, 1_024).unwrap(),
+            41
+        );
+        assert_eq!(
+            cohere_stable_prompt_positions(80, 9, 4, 1_024).unwrap(),
+            80,
+            "the stable arena must still cover a larger explicit current prompt"
+        );
     }
 }

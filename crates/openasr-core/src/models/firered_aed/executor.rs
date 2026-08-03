@@ -553,8 +553,9 @@ impl GgmlAsrViewExecutor for FireRedAedGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_firered_aed_decoder_state,
+                super::capacity::FIRERED_AED_DECODER_STATE_STREAMS,
             ),
         )
     }

@@ -1769,8 +1769,9 @@ impl GgmlAsrViewExecutor for Qwen3AsrGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_qwen3_decoder_state,
+                super::capacity::QWEN3_DECODER_STATE_STREAMS,
             ),
         )
     }

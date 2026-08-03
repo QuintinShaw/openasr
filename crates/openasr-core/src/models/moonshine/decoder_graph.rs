@@ -2798,7 +2798,7 @@ mod tests {
             self_attention: Seq2SeqStateAxis {
                 logical_positions: self_positions,
                 resident_positions: self_positions,
-                hard_position_cap: self_positions,
+                hard_position_cap: metadata.decoder_max_context,
             },
             cross_attention: Seq2SeqStateAxis {
                 logical_positions: logical_cross_positions,

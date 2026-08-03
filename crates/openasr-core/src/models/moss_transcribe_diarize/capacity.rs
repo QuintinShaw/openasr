@@ -26,6 +26,13 @@ use super::runtime_contract::MossTdEncoderMetadata;
 use super::runtime_contract::{MossTdDecoderMetadata, moss_td_kv_cache_positions};
 
 pub(crate) const MOSS_TD_SELF_KV_STATE_ID: &str = "moss-td.decoder.self_kv";
+pub(crate) const MOSS_TD_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        MOSS_TD_SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_moss_td_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,

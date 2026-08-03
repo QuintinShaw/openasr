@@ -108,7 +108,7 @@ fn decoder_state_class(
         super::ggml_asr_executor::GgmlAsrDecoderStateContract::NoPersistentState => {
             crate::arch::OpenAsrDecoderStateClass::None
         }
-        super::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(_) => {
+        super::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned { .. } => {
             crate::arch::OpenAsrDecoderStateClass::TokenScaledPersistent
         }
     }
@@ -400,10 +400,15 @@ mod tests {
                 });
             let actual_class = match contract {
                 GgmlAsrDecoderStateContract::NoPersistentState => OpenAsrDecoderStateClass::None,
-                GgmlAsrDecoderStateContract::Planned(planner) => {
+                GgmlAsrDecoderStateContract::Planned { planner, streams } => {
                     assert_ne!(
                         planner as usize, 0,
                         "{} returned a null decoder-state planner",
+                        descriptor.model_architecture
+                    );
+                    assert!(
+                        !streams.is_empty(),
+                        "{} returned an empty decoder-state stream contract",
                         descriptor.model_architecture
                     );
                     OpenAsrDecoderStateClass::TokenScaledPersistent

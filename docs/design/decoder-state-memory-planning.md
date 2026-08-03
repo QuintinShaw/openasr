@@ -112,9 +112,11 @@ Families without token-scaled persistent state affirmatively return
 `NoPersistentState`; absence of a plan is never interpreted as that result.
 Every architecture descriptor also declares
 `OpenAsrDecoderStateClass::{None, TokenScaledPersistent}`. Runtime
-materialization and CI compare that declaration with the executor contract, so
-a newly added causal/seq2seq family cannot silently opt out by returning
-`NoPersistentState`.
+materialization and CI compare that declaration with the executor contract.
+Each planned contract additionally declares the complete stable ID +
+`StateKind` stream schema; dispatch rejects a plan with a missing, extra,
+renamed, or misclassified stream. A newly added causal/seq2seq family therefore
+cannot silently opt out or satisfy the check with an arbitrary non-empty plan.
 
 Sequence concurrency is an allocation-owner property, not a synonym for serve
 batch size. If one arena truly owns `N` simultaneous sequences, the invocation
@@ -133,9 +135,9 @@ topologies currently cover:
 | Family | Persistent streams | Bound source |
 |---|---|---|
 | Cohere | self + cross KV | request-aware prompt/decode budget + encoder frames |
-| Whisper | self + cross KV | fixed 448 decoder context + aligned encoder window |
+| Whisper | self + cross KV | prompt/carry wrapper (including post-encoder LID prefix outcomes) + 256-token decode cap + aligned encoder window |
 | Qwen | self KV | chunked audio encoder + prompt/carry + context clamp |
-| Moonshine | self + cross KV | fixed decoder budget + convolutional encoder length |
+| Moonshine | self + cross KV | BOS + full `C-1` runtime decode budget + convolutional encoder length |
 | FireRed-AED | self + cross KV | encoder-length decode budget + positional-table caps |
 | FireRed-LLM | self KV | fbank/conv/adapter shape + fixed decode budget |
 | FunASR Nano | self KV | fbank/LFR/adaptor shape + fixed decode budget |
@@ -160,6 +162,20 @@ allocator growth. Each quote reports:
 - incremental peak and retained commitment;
 - exact, upper-bound, or provisional confidence;
 - a quote token used by the matching native allocation transaction.
+
+The quote generation is an epoch only for provider state that can invalidate
+the quote's layout/cost derivation. It is not a hash of live used/free bytes.
+Capacity comes from the separately fetched fresh statistics; binding the epoch
+to unrelated process allocations creates false stale failures without closing
+the unavoidable race after any snapshot. CUDA and Metal v1 request-shape
+quotes are independent of live free bytes, so they use a stable provider epoch;
+allocation races remain covered by provisional reconciliation and typed OOM
+fallback. Vulkan uses the same rule. Its buffer quote enumerates every memory
+type the real retrying allocator may select and succeeds only when all of them
+map to one broker domain. A configured device-local-to-system-memory fallback
+therefore cannot silently move an allocation outside the domain that was
+admitted; an ambiguous quote fails closed so the execution policy can choose an
+explicit hybrid or CPU candidate.
 
 Context tensor allocation mirrors ggml's real tensor-order packing and buffer
 type maximum size. This matters for backends such as Vulkan, where a multi-GB
@@ -219,6 +235,13 @@ Exact and proven upper-bound quotes commit directly after successful native
 allocation. Provisional quotes require a fresh post-allocation observation and
 reconciliation. A partial backend-private failure that cannot prove release is
 quarantined rather than optimistically refunded.
+
+A provisional transaction holds its physical domain exclusively until that
+reconciliation completes. This is intentional, not a throughput heuristic:
+without a provider oracle that attributes backend-private deltas to individual
+concurrent transactions, admitting two such allocations would make either
+refund unsound. Exact and conservative-upper quotes remain concurrent; a future
+provider with attributable commitment may remove only its own provisional gate.
 
 Rust-owned persistent state uses the same transaction shape, with one important
 accounting distinction. Before construction, each family declares a provisional
@@ -330,9 +353,10 @@ GPU users remain part of physical admission and typed fallback.
   semantic span and model context prove it legal. A 30/60 product family fails
   before allocation; the memory planner never silently shortens it.
 - A small learned/RoPE ceiling (for example Whisper's 448-position semantic
-  context) remains the legality cap. The current greedy schedule may require
-  447 physical self-KV rows, while positional embeddings and generation retain
-  the full 448-position semantic coordinate.
+  context) remains the legality cap. Physical self-KV is still derived from
+  the actual prompt plus the family's generation budget; only a runtime that
+  genuinely permits generation through the full remaining context (Moonshine,
+  for example) requires `C-1` rows under the current greedy schedule.
 - Checked integer arithmetic makes zero rates/strides, overflow, an exhausted
   prompt context, or an empty generation budget fail closed.
 - Percentage margins are not added to a proven token bound. Architectural

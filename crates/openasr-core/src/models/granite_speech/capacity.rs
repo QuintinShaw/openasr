@@ -64,6 +64,13 @@ use super::qformer::GraniteSpeechProjectorConfig;
 /// it equal to this constant for the shipped 4.1-2b shape.
 pub(crate) const GRANITE_SPEECH_DECODER_MAX_POSITIONS: usize = 4096;
 pub(crate) const GRANITE_SPEECH_SELF_KV_STATE_ID: &str = "granite-speech.decoder.self_kv";
+pub(crate) const GRANITE_SPEECH_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        GRANITE_SPEECH_SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+];
 
 /// Front-end frame-stack factor: after the 80-mel STFT the extractor drops an
 /// odd trailing frame and concatenates pairs of 80-dim frames into 160-dim

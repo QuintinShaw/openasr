@@ -46,7 +46,7 @@ fn decoder_state(
         self_attention: Seq2SeqStateAxis {
             logical_positions: metadata.decoder_max_context - 1,
             resident_positions: metadata.decoder_max_context - 1,
-            hard_position_cap: metadata.decoder_max_context - 1,
+            hard_position_cap: metadata.decoder_max_context,
         },
         cross_attention: Seq2SeqStateAxis {
             logical_positions: cross_positions,

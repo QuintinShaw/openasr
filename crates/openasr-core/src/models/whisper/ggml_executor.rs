@@ -76,6 +76,8 @@ use super::batched_decode::{
     WhisperServeBatchJob, shutdown_whisper_serve_batch_engines, submit_whisper_serve_batch_job,
     whisper_serve_batch_decode_config,
 };
+#[cfg(test)]
+use super::capacity::WHISPER_MAX_GENERATED_TOKENS as WHISPER_DEFAULT_DECODE_MAX_GENERATED_TOKENS_CAP;
 use super::execution_policy::{
     whisper_decoder_cross_flash_attention_enabled, whisper_decoder_self_flash_attention_enabled,
     whisper_encoder_flash_attention_enabled, whisper_parallel_encoder_and_decoder_static_enabled,
@@ -129,18 +131,24 @@ use super::mel::{
     WHISPER_CHANNELS, WHISPER_SAMPLE_RATE_HZ, whisper_mel_features_from_prepared_audio_v0,
 };
 use super::runtime_contract::{WhisperGgmlExecutionMetadata, validate_whisper_execution_metadata};
+#[cfg(test)]
+use super::tokenizer::WhisperPrefixSpec;
 use super::{
     WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
     greedy_decode::{
         WhisperGreedyDecodeError, WhisperGreedyDecodeResult, run_whisper_greedy_decode_loop,
     },
-    tokenizer::{WhisperPrefixError, WhisperPrefixSpec, WhisperTokenizer},
+    prompt::{
+        WhisperPromptError,
+        build_whisper_initial_prompt_tokens as build_whisper_initial_prompt_tokens_shared,
+    },
+    tokenizer::WhisperTokenizer,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
 };
 use crate::models::decode_token_history::{
-    build_longform_token_history_carry, context_window_budget, trim_prompt_token_tail,
+    build_longform_token_history_carry, context_window_budget,
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -151,7 +159,6 @@ use crate::models::seq2seq_word_timestamps::{
     seq2seq_word_timestamps_from_token_times,
 };
 
-const WHISPER_DEFAULT_DECODE_MAX_GENERATED_TOKENS_CAP: usize = 256;
 const WHISPER_STREAMING_EXECUTOR_ID: &str = "whisper-ggml-snapshot-streaming-executor-v1";
 /// Largest vocab of an English-only (`.en`) Whisper checkpoint. The canonical
 /// Whisper rule (matching whisper.cpp `vocab.is_multilingual()`) is that any
@@ -298,14 +305,14 @@ pub(super) struct WhisperDecoderWeightSeam {
 }
 
 #[derive(Debug, Clone)]
-struct WhisperPreparedRuntime {
-    execution: WhisperGgmlExecutionMetadata,
+pub(super) struct WhisperPreparedRuntime {
+    pub(super) execution: WhisperGgmlExecutionMetadata,
     tensor_binding: WhisperGgmlTensorBinding,
     encoder_weights: WhisperEncoderWeightBundle,
     encoder_materialization: WhisperEncoderTensorMaterializationSeam,
     encoder_binding: WhisperEncoderTensorBindingSeam,
     decoder_weights: WhisperDecoderWeightSeam,
-    tokenizer: WhisperTokenizer,
+    pub(super) tokenizer: WhisperTokenizer,
 }
 
 impl SystemMemoryMaterialization for WhisperPreparedRuntime {
@@ -3523,10 +3530,36 @@ impl GgmlAsrViewExecutor for WhisperGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_whisper_decoder_state,
+                super::capacity::WHISPER_DECODER_STATE_STREAMS,
             ),
         )
+    }
+
+    fn replan_streaming_decoder_state(
+        &self,
+        selected_family: &GgmlFamilyAdapterDescriptor,
+        input: &crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput<'_>,
+    ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderState, GgmlAsrExecutionError> {
+        if let Some(prepared) = self
+            .runtime_cache_by_path
+            .ready(&input.preflight.runtime_source)
+        {
+            let plan = super::capacity::plan_whisper_decoder_state_with_prepared_runtime(
+                input,
+                prepared.as_ref(),
+            )?;
+            return Ok(
+                crate::models::ggml_asr_executor::GgmlAsrDecoderState::planned(
+                    plan,
+                    input.envelope,
+                ),
+            );
+        }
+        self.decoder_state_contract(selected_family)?
+            .plan(input)
+            .map_err(Into::into)
     }
 
     fn execute_view(
@@ -3576,7 +3609,7 @@ impl WhisperGgmlExecutor {
                 adapter_id: request.selected_family.adapter_id,
                 reason: error.to_string(),
             })?;
-        let reuse_runtime_state = request.request_options.longform.is_some();
+        let reuse_runtime_state = request.request_options.longform_mode_enabled();
         let prepared_runtime = self
             .prepared_runtime_for_preflight(preflight.as_ref(), request.resolved_runtime.backend())
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
@@ -3700,18 +3733,29 @@ fn build_whisper_prepared_runtime(
     })
 }
 
-fn whisper_prefix_error_to_executor_error(error: WhisperPrefixError) -> WhisperGgmlExecutorError {
+fn whisper_prompt_error_to_executor_error(error: WhisperPromptError) -> WhisperGgmlExecutorError {
     match error {
-        WhisperPrefixError::LanguageTokenMissing { language } => {
+        WhisperPromptError::LanguageTokenMissing { language } => {
             WhisperGgmlExecutorError::UnsupportedRequestOption {
                 option: "language",
                 reason: format!("this whisper pack has no <|{language}|> language token"),
             }
         }
-        WhisperPrefixError::TranslateTokenMissing => {
+        WhisperPromptError::TranslateTokenMissing => {
             WhisperGgmlExecutorError::UnsupportedRequestOption {
                 option: "task",
                 reason: "this whisper pack has no <|translate|> task token".to_string(),
+            }
+        }
+        WhisperPromptError::EmptyDecoderPrefix
+        | WhisperPromptError::PromptEncodingFailed { .. } => {
+            WhisperGgmlExecutorError::TokenizerMissing {
+                reason: error.to_string(),
+            }
+        }
+        WhisperPromptError::PromptExhaustsContext { .. } | WhisperPromptError::PositionOverflow => {
+            WhisperGgmlExecutorError::DecoderGraphUnsupported {
+                reason: error.to_string(),
             }
         }
     }
@@ -3721,84 +3765,15 @@ fn build_whisper_initial_prompt_tokens(
     execution: &WhisperGgmlExecutionMetadata,
     tokenizer: &WhisperTokenizer,
     request_options: &GgmlAsrExecutionOptions,
-    // When set (whisper LID detected a language for an `auto` request), it takes
-    // precedence over the request language for prefix construction. `Some("en")`
-    // is byte-identical to the unset path, so detecting English is a no-op.
     override_language: Option<&str>,
 ) -> Result<Vec<u32>, WhisperGgmlExecutorError> {
-    let decoder_start_token_id = tokenizer
-        .start_of_transcript_token_id()
-        .unwrap_or(execution.decoder_start_token_id);
-    let is_multilingual = execution.vocab_size > WHISPER_ENGLISH_ONLY_MAX_VOCAB_SIZE;
-    let prefix_spec = WhisperPrefixSpec {
-        language: override_language.or(request_options.language.as_deref()),
-        task: request_options.task,
-        is_multilingual,
-    };
-    let prompt_init_tokens = tokenizer
-        .decoder_prefix(decoder_start_token_id, &prefix_spec)
-        .map_err(whisper_prefix_error_to_executor_error)?;
-    if prompt_init_tokens.is_empty() {
-        return Err(WhisperGgmlExecutorError::TokenizerMissing {
-            reason: "whisper tokenizer returned empty initial prompt tokens".to_string(),
-        });
-    }
-
-    let mut prompt_tokens = if let Some(token_ids) = request_options.prompt_token_ids.as_ref() {
-        token_ids.clone()
-    } else {
-        let Some(prompt) = request_options.prompt.as_deref().map(str::trim) else {
-            return Ok(prompt_init_tokens);
-        };
-        if prompt.is_empty() {
-            return Ok(prompt_init_tokens);
-        }
-        tokenizer.encode_prompt_text(prompt).map_err(|error| {
-            WhisperGgmlExecutorError::TokenizerMissing {
-                reason: format!("could not encode whisper request prompt: {error}"),
-            }
-        })?
-    };
-    if prompt_tokens.is_empty() {
-        return Ok(prompt_init_tokens);
-    }
-    let prev_token = if request_options.longform.is_some() {
-        tokenizer.token_id_by_content("<|startofprev|>")
-    } else {
-        None
-    };
-    let max_prompt_tokens = execution
-        .max_target_positions
-        .saturating_sub(prompt_init_tokens.len())
-        .saturating_sub(usize::from(prev_token.is_some()))
-        .saturating_sub(1);
-    if max_prompt_tokens == 0 {
-        return Err(WhisperGgmlExecutorError::DecoderGraphUnsupported {
-            reason: format!(
-                "whisper initial prompt prefix len {} leaves no generation budget in max_target_positions {}",
-                prompt_init_tokens.len(),
-                execution.max_target_positions
-            ),
-        });
-    }
-    prompt_tokens = trim_prompt_token_tail(
-        prompt_tokens,
-        max_prompt_tokens,
-        request_options.longform.is_some(),
-        WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
-    );
-    let mut initial_prompt_tokens = Vec::with_capacity(
-        prompt_init_tokens.len() + prompt_tokens.len() + usize::from(prev_token.is_some()),
-    );
-    if let Some(prev_token) = prev_token {
-        initial_prompt_tokens.push(prev_token);
-        initial_prompt_tokens.extend(prompt_tokens);
-        initial_prompt_tokens.extend(prompt_init_tokens);
-    } else {
-        initial_prompt_tokens.extend(prompt_init_tokens);
-        initial_prompt_tokens.extend(prompt_tokens);
-    }
-    Ok(initial_prompt_tokens)
+    build_whisper_initial_prompt_tokens_shared(
+        execution,
+        tokenizer,
+        request_options,
+        override_language,
+    )
+    .map_err(whisper_prompt_error_to_executor_error)
 }
 
 fn build_whisper_carry_prompt_token_ids(
@@ -3823,7 +3798,7 @@ fn build_whisper_carry_prompt_seed_token_ids(
     tokenizer: &WhisperTokenizer,
     request_options: &GgmlAsrExecutionOptions,
 ) -> Result<Option<Vec<u32>>, WhisperGgmlExecutorError> {
-    if request_options.longform.is_none() {
+    if !request_options.longform_prompt_carry_enabled() {
         return Ok(None);
     }
 
@@ -4340,7 +4315,7 @@ fn whisper_decoder_state_for_execution(
         self_attention: Seq2SeqStateAxis {
             logical_positions: self_positions,
             resident_positions: self_positions,
-            hard_position_cap: self_positions,
+            hard_position_cap: execution.max_target_positions,
         },
         cross_attention: Seq2SeqStateAxis {
             logical_positions: execution.encoder_context_length,
@@ -5007,7 +4982,7 @@ fn decode_generated_token_step_cap(
                 "decoder initial prompt len {initial_prompt_len} exhausts max_target_positions {max_target_positions}"
             ),
         })
-        .map(|budget| budget.min(WHISPER_DEFAULT_DECODE_MAX_GENERATED_TOKENS_CAP))
+        .map(|budget| budget.min(super::capacity::WHISPER_MAX_GENERATED_TOKENS))
 }
 
 fn validate_whisper_self_kv_schedule(

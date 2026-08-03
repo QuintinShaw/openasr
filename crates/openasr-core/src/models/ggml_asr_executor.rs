@@ -442,14 +442,7 @@ impl<'a> GgmlAsrDecoderStatePlanningInput<'a> {
                 .map_err(|source| GgmlAsrDecoderStatePlanningError::InvalidShape { source })?;
         let configured_samples =
             offline_invocation_envelope_samples(request_options, sample_rate_hz, sample_count)?;
-        let max_prompt_tokens = request_options
-            .longform
-            .as_ref()
-            .filter(|options| {
-                !matches!(options.mode, crate::LongFormMode::Off)
-                    && options.carry_prompt_across_slices
-            })
-            .map_or(0, |options| options.max_context_tokens);
+        let max_prompt_tokens = request_options.max_longform_prompt_tokens();
         let envelope =
             crate::capacity::topology::InvocationEnvelope::new(sample_rate_hz, configured_samples)
                 .map_err(|source| GgmlAsrDecoderStatePlanningError::InvalidShape { source })?
@@ -472,11 +465,7 @@ impl<'a> GgmlAsrDecoderStatePlanningInput<'a> {
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlAsrDecoderStatePlanningError> {
         let sample_rate_hz = NonZeroU32::new(16_000).expect("16 kHz is non-zero");
-        let max_prompt_tokens = request_options
-            .longform
-            .as_ref()
-            .filter(|options| options.carry_prompt_across_slices)
-            .map_or(0, |options| options.max_context_tokens);
+        let max_prompt_tokens = request_options.max_longform_prompt_tokens();
         let envelope = crate::capacity::topology::InvocationEnvelope::from_milliseconds(
             sample_rate_hz,
             NonZeroU32::new(30_000).expect("30 seconds is non-zero"),
@@ -552,13 +541,16 @@ fn offline_invocation_envelope_samples(
     sample_rate_hz: NonZeroU32,
     actual_samples: usize,
 ) -> Result<usize, GgmlAsrDecoderStatePlanningError> {
-    let configured_samples = request_options
-        .longform
-        .as_ref()
-        .filter(|options| !matches!(options.mode, crate::LongFormMode::Off))
-        .map(|options| duration_samples_ceil(options.max_chunk_seconds, sample_rate_hz))
-        .transpose()?
-        .unwrap_or(actual_samples);
+    let configured_samples = if request_options.longform_mode_enabled() {
+        request_options
+            .longform
+            .as_ref()
+            .map(|options| duration_samples_ceil(options.max_chunk_seconds, sample_rate_hz))
+            .transpose()?
+            .unwrap_or(actual_samples)
+    } else {
+        actual_samples
+    };
     Ok(configured_samples)
 }
 
@@ -626,23 +618,48 @@ pub(crate) type GgmlAsrDecoderStatePlanner = for<'a> fn(
     GgmlAsrDecoderStatePlanningError,
 >;
 
+/// Stable identity and semantic kind of one persistent state stream promised
+/// by a family planner. Runtime dispatch validates the complete stream set,
+/// so a non-empty but semantically wrong plan cannot cross the executor seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GgmlAsrDecoderStateStreamContract {
+    pub(crate) id: &'static str,
+    pub(crate) kind: crate::capacity::topology::StateKind,
+}
+
+impl GgmlAsrDecoderStateStreamContract {
+    pub(crate) const fn new(id: &'static str, kind: crate::capacity::topology::StateKind) -> Self {
+        Self { id, kind }
+    }
+}
+
 /// Compile-time-required topology declaration returned by every executor.
 /// Planner function pointers keep the derivation family-owned while allowing
 /// model-agnostic dispatch to invoke it without an architecture switch.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum GgmlAsrDecoderStateContract {
     NoPersistentState,
-    Planned(GgmlAsrDecoderStatePlanner),
+    Planned {
+        planner: GgmlAsrDecoderStatePlanner,
+        streams: &'static [GgmlAsrDecoderStateStreamContract],
+    },
 }
 
 impl GgmlAsrDecoderStateContract {
+    pub(crate) const fn planned(
+        planner: GgmlAsrDecoderStatePlanner,
+        streams: &'static [GgmlAsrDecoderStateStreamContract],
+    ) -> Self {
+        Self::Planned { planner, streams }
+    }
+
     pub(crate) fn plan(
         self,
         input: &GgmlAsrDecoderStatePlanningInput<'_>,
     ) -> Result<GgmlAsrDecoderState, GgmlAsrDecoderStatePlanningError> {
         match self {
             Self::NoPersistentState => Ok(GgmlAsrDecoderState::NoPersistentState),
-            Self::Planned(planner) => {
+            Self::Planned { planner, .. } => {
                 planner(input).map(|plan| GgmlAsrDecoderState::planned(plan, input.envelope))
             }
         }
@@ -651,8 +668,20 @@ impl GgmlAsrDecoderStateContract {
     fn validates(self, state: &GgmlAsrDecoderState) -> bool {
         match (self, state) {
             (Self::NoPersistentState, GgmlAsrDecoderState::NoPersistentState) => true,
-            (Self::Planned(_), GgmlAsrDecoderState::Planned(plan)) => {
-                !plan.allocations().is_empty()
+            (Self::Planned { streams, .. }, GgmlAsrDecoderState::Planned(plan)) => {
+                !streams.is_empty()
+                    && streams.len() == plan.allocations().len()
+                    && streams.iter().enumerate().all(|(index, stream)| {
+                        !streams[..index]
+                            .iter()
+                            .any(|existing| existing.id == stream.id)
+                            && plan.allocations().iter().any(|allocation| {
+                                allocation.logical.id == stream.id
+                                    && allocation.logical.kind == stream.kind
+                                    && allocation.reserve.id == stream.id
+                                    && allocation.reserve.kind == stream.kind
+                            })
+                    })
             }
             _ => false,
         }
@@ -748,6 +777,27 @@ impl RuntimeBuildIdentitySource for GgmlAsrExecutionOptions {
 }
 
 impl GgmlAsrExecutionOptions {
+    pub(crate) fn longform_mode_enabled(&self) -> bool {
+        self.longform
+            .as_ref()
+            .is_some_and(|options| !matches!(options.mode, crate::LongFormMode::Off))
+    }
+
+    pub(crate) fn longform_prompt_carry_enabled(&self) -> bool {
+        self.longform_mode_enabled()
+            && self
+                .longform
+                .as_ref()
+                .is_some_and(|options| options.carry_prompt_across_slices)
+    }
+
+    pub(crate) fn max_longform_prompt_tokens(&self) -> usize {
+        self.longform
+            .as_ref()
+            .filter(|_| self.longform_prompt_carry_enabled())
+            .map_or(0, |options| options.max_context_tokens)
+    }
+
     pub fn from_transcription_request(
         language: Option<String>,
         prompt: Option<String>,
@@ -1885,7 +1935,63 @@ mod tests {
                 .validates(&GgmlAsrDecoderState::NoPersistentState)
         );
         assert!(!GgmlAsrDecoderStateContract::NoPersistentState.validates(&planned));
-        assert!(GgmlAsrDecoderStateContract::Planned(|_| unreachable!()).validates(&planned));
+        const MATCHING_STREAMS: &[GgmlAsrDecoderStateStreamContract] =
+            &[GgmlAsrDecoderStateStreamContract::new(
+                "test.self_kv",
+                crate::capacity::topology::StateKind::SelfAttentionKv,
+            )];
+        const WRONG_STREAMS: &[GgmlAsrDecoderStateStreamContract] =
+            &[GgmlAsrDecoderStateStreamContract::new(
+                "test.cross_kv",
+                crate::capacity::topology::StateKind::CrossAttentionKv,
+            )];
+        assert!(
+            GgmlAsrDecoderStateContract::planned(|_| unreachable!(), MATCHING_STREAMS)
+                .validates(&planned)
+        );
+        assert!(
+            !GgmlAsrDecoderStateContract::planned(|_| unreachable!(), WRONG_STREAMS)
+                .validates(&planned),
+            "a non-empty plan with the wrong stream identity/kind must fail closed"
+        );
+    }
+
+    #[test]
+    fn execution_options_distinguish_longform_mode_from_prompt_carry() {
+        let disabled = GgmlAsrExecutionOptions {
+            longform: Some(crate::LongFormOptions {
+                mode: crate::LongFormMode::Off,
+                ..crate::LongFormOptions::default()
+            }),
+            ..GgmlAsrExecutionOptions::default()
+        };
+        assert!(!disabled.longform_mode_enabled());
+        assert!(!disabled.longform_prompt_carry_enabled());
+        assert_eq!(disabled.max_longform_prompt_tokens(), 0);
+
+        let no_carry = GgmlAsrExecutionOptions {
+            longform: Some(crate::LongFormOptions {
+                mode: crate::LongFormMode::Fixed,
+                carry_prompt_across_slices: false,
+                ..crate::LongFormOptions::default()
+            }),
+            ..GgmlAsrExecutionOptions::default()
+        };
+        assert!(no_carry.longform_mode_enabled());
+        assert!(!no_carry.longform_prompt_carry_enabled());
+        assert_eq!(no_carry.max_longform_prompt_tokens(), 0);
+
+        let carry = GgmlAsrExecutionOptions {
+            longform: Some(crate::LongFormOptions {
+                mode: crate::LongFormMode::Fixed,
+                max_context_tokens: 37,
+                ..crate::LongFormOptions::default()
+            }),
+            ..GgmlAsrExecutionOptions::default()
+        };
+        assert!(carry.longform_mode_enabled());
+        assert!(carry.longform_prompt_carry_enabled());
+        assert_eq!(carry.max_longform_prompt_tokens(), 37);
     }
 
     #[test]

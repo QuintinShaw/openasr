@@ -757,8 +757,9 @@ impl GgmlAsrViewExecutor for CohereTranscribeGgmlExecutor {
     ) -> Result<crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract, GgmlAsrExecutionError>
     {
         Ok(
-            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::Planned(
+            crate::models::ggml_asr_executor::GgmlAsrDecoderStateContract::planned(
                 super::capacity::plan_cohere_decoder_state,
+                super::capacity::COHERE_DECODER_STATE_STREAMS,
             ),
         )
     }
@@ -1025,7 +1026,7 @@ fn build_cohere_carry_prompt_token_ids(
     generated_tokens: &[u32],
 ) -> Option<Vec<u32>> {
     build_longform_token_history_carry(
-        request_options.longform.is_some(),
+        request_options.longform_prompt_carry_enabled(),
         request_options.prompt_token_ids.clone().unwrap_or_default(),
         generated_tokens,
         COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
@@ -1457,37 +1458,49 @@ mod tests {
             longform: Some(LongFormOptions::default()),
             ..GgmlAsrExecutionOptions::default()
         };
-        let initial = build_cohere_initial_prompt_token_ids(
-            vec![100, 101, 102],
-            &request_options,
-            super::super::runtime_contract::CohereTranscribeExecutionMetadata {
-                vocab_size: 1024,
-                encoder_layers: 2,
-                encoder_d_model: 16,
-                encoder_heads: 2,
-                encoder_head_dim: 8,
-                encoder_ffn_dim: 32,
-                encoder_conv_kernel: 5,
-                decoder_layers: 2,
-                decoder_d_model: 16,
-                decoder_heads: 2,
-                decoder_head_dim: 8,
-                decoder_ffn_dim: 32,
-                decoder_max_context: 80,
-                decoder_start_token_id: 13764,
-                sample_rate_hz: 16_000,
-                n_mels: 8,
-                n_fft: 400,
-                hop_length: 160,
-                win_length: 400,
-            },
-        )
-        .expect("initial prompt should build");
+        let metadata = super::super::runtime_contract::CohereTranscribeExecutionMetadata {
+            vocab_size: 1024,
+            encoder_layers: 2,
+            encoder_d_model: 16,
+            encoder_heads: 2,
+            encoder_head_dim: 8,
+            encoder_ffn_dim: 32,
+            encoder_conv_kernel: 5,
+            decoder_layers: 2,
+            decoder_d_model: 16,
+            decoder_heads: 2,
+            decoder_head_dim: 8,
+            decoder_ffn_dim: 32,
+            decoder_max_context: 80,
+            decoder_start_token_id: 13764,
+            sample_rate_hz: 16_000,
+            n_mels: 8,
+            n_fft: 400,
+            hop_length: 160,
+            win_length: 400,
+        };
+        let initial =
+            build_cohere_initial_prompt_token_ids(vec![100, 101, 102], &request_options, metadata)
+                .expect("initial prompt should build");
 
         assert_eq!(initial[..3], [100, 101, 102]);
         assert_eq!(initial.len(), 67);
         assert_eq!(initial[3], 136);
         assert_eq!(initial.last().copied(), Some(199));
+
+        let disabled = GgmlAsrExecutionOptions {
+            longform: Some(LongFormOptions {
+                mode: crate::LongFormMode::Off,
+                ..LongFormOptions::default()
+            }),
+            ..request_options
+        };
+        let without_longform_tail =
+            build_cohere_initial_prompt_token_ids(vec![100, 101, 102], &disabled, metadata)
+                .expect("disabled long-form prompt should build");
+        assert_eq!(without_longform_tail.len(), 79);
+        assert_eq!(without_longform_tail[3], 124);
+        assert_eq!(without_longform_tail.last().copied(), Some(199));
     }
 
     #[test]
@@ -1506,6 +1519,21 @@ mod tests {
         assert_eq!(carry.len(), COHERE_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT);
         assert_eq!(carry.first().copied(), Some(46));
         assert_eq!(carry.last().copied(), Some(109));
+    }
+
+    #[test]
+    fn cohere_carry_producer_honors_the_effective_carry_switch() {
+        let request_options = GgmlAsrExecutionOptions {
+            longform: Some(LongFormOptions {
+                carry_prompt_across_slices: false,
+                ..LongFormOptions::default()
+            }),
+            ..GgmlAsrExecutionOptions::default()
+        };
+        assert_eq!(
+            build_cohere_carry_prompt_token_ids(&request_options, &[1, 2, 3]),
+            None
+        );
     }
 
     #[test]

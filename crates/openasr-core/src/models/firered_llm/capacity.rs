@@ -33,6 +33,13 @@ use super::executor::FIRERED_LLM_MAX_GENERATED_TOKENS;
 use super::runtime_contract::{FireRedLlmAdapterMetadata, FireRedLlmDecoderMetadata};
 
 pub(crate) const FIRERED_LLM_SELF_KV_STATE_ID: &str = "firered-llm.decoder.self_kv";
+pub(crate) const FIRERED_LLM_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        FIRERED_LLM_SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_firered_llm_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,

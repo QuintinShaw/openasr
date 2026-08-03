@@ -23,6 +23,17 @@ pub(crate) const COHERE_DECODER_STATE_IDS: Seq2SeqStateIds = Seq2SeqStateIds {
     self_attention: SELF_KV_STATE_ID,
     cross_attention: CROSS_KV_STATE_ID,
 };
+pub(crate) const COHERE_DECODER_STATE_STREAMS:
+    &[crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract] = &[
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        SELF_KV_STATE_ID,
+        StateKind::SelfAttentionKv,
+    ),
+    crate::models::ggml_asr_executor::GgmlAsrDecoderStateStreamContract::new(
+        CROSS_KV_STATE_ID,
+        StateKind::CrossAttentionKv,
+    ),
+];
 
 pub(crate) fn plan_cohere_decoder_state(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,
@@ -90,7 +101,7 @@ fn plan_cohere_decoder_state_with_components(
     let stable_prompt_positions = super::prompt::cohere_stable_prompt_positions(
         logical_prompt_positions,
         base_prompt_positions,
-        input.request_options,
+        input.envelope.max_prompt_tokens(),
         metadata.decoder_max_context,
     )
     .map_err(

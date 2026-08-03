@@ -15,6 +15,7 @@ use crate::models::seq2seq_greedy_decode::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinDecodePolicyLongformPromptCarryMode {
+    Disabled,
     Text,
     TokenHistory,
 }
@@ -181,11 +182,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
-        // Token-history carry mirrors cohere (the other conservative AED). The
-        // conservative longform profile caps chunk length and disables prompt
-        // carry, keeping moonshine's small-context decoder off the long-audio
-        // repetition failure mode.
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // The executor has no carry_context producer; the conservative profile
+        // also forces carry off. Declare the effective capability truthfully.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
     },
@@ -198,9 +197,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
-        // firered-aed is a plain `<sos>`-prompted AED; conservative slicing is the
-        // structural fix for its long-audio repetition (issue #60).
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // Plain `<sos>` AED with no carry_context producer; conservative
+        // slicing is the structural long-audio repetition fix (issue #60).
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
     },
@@ -217,11 +216,8 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // beyond eot.
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
-        // Mirrors firered-aed: the upstream 40s hard cap means every chunk is
-        // short and each chunk is a fresh ChatML turn -- the conservative
-        // longform profile is the structural fix for the #60 long-audio
-        // repetition failure mode, same reasoning as firered-aed.
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // Every chunk is a fresh ChatML turn and the executor emits no carry.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
     },
@@ -239,11 +235,8 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
-        // Upstream ~40s hard cap means every chunk is a short, fresh ChatML
-        // turn -- the conservative longform profile is the structural fix for
-        // the #60 long-audio repetition failure mode, same reasoning as
-        // firered-llm/mimo-asr.
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // Every chunk is a fresh ChatML turn and the executor emits no carry.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
     },
@@ -262,11 +255,8 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
-        // The executor's own 30s-per-chunk hard cap means every chunk is a
-        // fresh ChatML turn -- the conservative longform profile is the
-        // structural fix for the #60 long-audio repetition failure mode,
-        // same reasoning as firered-aed/firered-llm.
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // Every chunk is a fresh ChatML turn and the executor emits no carry.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
     },
@@ -293,8 +283,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // recording is cut for it is declared once on the architecture
         // descriptor (`OpenAsrLongformSliceShape::ScopedSlices`), which also
         // carries the per-slice speaker-scope consequence; the decode policy
-        // holds no separate opinion.
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // holds no separate opinion. Scoped slicing disables carry and the
+        // executor has no carry_context producer.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
     },
@@ -322,8 +313,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // small-context plain-prompted AED decoders `ConservativeSeq2SeqV1`
         // guards against repeating on long pause-free audio -- same
         // reasoning as `whisper`/`moss-transcribe-diarize` pairing
-        // `FixedWindow`/`Default` above.
-        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        // `FixedWindow`/`Default` above. The current executor emits no carry,
+        // so the capability remains explicitly disabled.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
     },
@@ -844,6 +836,27 @@ mod tests {
             qwen.seq2seq_text_postprocess_kind,
             BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0
         );
+    }
+
+    #[test]
+    fn families_without_a_carry_producer_declare_carry_disabled() {
+        for decode_policy_id in [
+            crate::MOONSHINE_DECODE_POLICY_ID,
+            crate::arch::FIRERED_AED_DECODE_POLICY_ID,
+            crate::arch::FIRERED_LLM_DECODE_POLICY_ID,
+            crate::arch::FUNASR_NANO_DECODE_POLICY_ID,
+            crate::arch::MIMO_ASR_DECODE_POLICY_ID,
+            crate::arch::MOSS_TD_DECODE_POLICY_ID,
+            crate::arch::GRANITE_SPEECH_DECODE_POLICY_ID,
+        ] {
+            let policy = resolve_builtin_decode_policy(decode_policy_id)
+                .unwrap_or_else(|error| panic!("{decode_policy_id}: {error}"));
+            assert_eq!(
+                policy.longform_prompt_carry_mode,
+                BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
+                "{decode_policy_id} has no carry_context producer"
+            );
+        }
     }
 
     #[test]

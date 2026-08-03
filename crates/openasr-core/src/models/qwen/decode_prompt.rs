@@ -57,6 +57,9 @@ fn encode_qwen3_suffix(
         })
     };
 
+    if !request_options.longform_mode_enabled() {
+        return tokenize(normalized_prompt);
+    }
     let Some(longform) = request_options.longform.as_ref() else {
         return tokenize(normalized_prompt);
     };
@@ -394,5 +397,38 @@ mod tests {
         assert!(bounded.token_ids.len() <= base.token_ids.len() + 1);
         assert_eq!(bounded.audio_pad_start_index, base.audio_pad_start_index);
         assert_eq!(bounded.audio_pad_count, base.audio_pad_count);
+    }
+
+    #[test]
+    fn disabled_longform_mode_does_not_apply_the_prompt_tail_budget() {
+        let tokenizer = tokenizer_fixture();
+        let prompt = "systemsystemsystemsystem";
+        let plain = build_qwen3_decode_prompt(
+            metadata(),
+            Some(&tokenizer),
+            2,
+            &GgmlAsrExecutionOptions {
+                prompt: Some(prompt.to_string()),
+                ..GgmlAsrExecutionOptions::default()
+            },
+        )
+        .expect("plain prompt");
+        let disabled = build_qwen3_decode_prompt(
+            metadata(),
+            Some(&tokenizer),
+            2,
+            &GgmlAsrExecutionOptions {
+                prompt: Some(prompt.to_string()),
+                longform: Some(crate::LongFormOptions {
+                    mode: crate::LongFormMode::Off,
+                    max_context_tokens: 1,
+                    max_context_chars: 1,
+                    ..crate::LongFormOptions::default()
+                }),
+                ..GgmlAsrExecutionOptions::default()
+            },
+        )
+        .expect("disabled long-form prompt");
+        assert_eq!(disabled, plain);
     }
 }

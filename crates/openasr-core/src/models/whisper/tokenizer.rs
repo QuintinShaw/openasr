@@ -16,7 +16,7 @@ use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyT
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
 };
-use crate::models::language::{language_control_token, normalize_language};
+use crate::models::language::{WHISPER_LANGUAGE_CODES, language_control_token, normalize_language};
 // Re-exported at this path (rather than imported privately) because
 // `whisper::package_import` and `whisper::batched_decode` reach these three
 // shared keys via `super::tokenizer::TOKENIZER_GGML_*`, matching how they
@@ -412,6 +412,17 @@ impl WhisperTokenizer {
         self.token_to_id.get(content).copied()
     }
 
+    /// One language outcome the LID path can actually emit for this pack.
+    /// Every Whisper language control token occupies exactly one prefix
+    /// position, so one present candidate is sufficient for prompt-capacity
+    /// planning to compare the unset and detected-language branches.
+    pub(super) fn first_present_language_code(&self) -> Option<&'static str> {
+        WHISPER_LANGUAGE_CODES.iter().copied().find(|code| {
+            self.token_id_by_content(&language_control_token(code))
+                .is_some()
+        })
+    }
+
     /// The `<|translate|>` task-token id, resolved by string content (its id
     /// shifts per checkpoint, so it has no dedicated metadata field unlike
     /// `transcribe_token_id`). `None` on a pack without the token.
@@ -452,7 +463,9 @@ impl WhisperTokenizer {
     }
 
     #[cfg(test)]
-    fn from_tokenizer_payload_bytes(tokenizer_bytes: &[u8]) -> Result<Self, NativeAsrError> {
+    pub(super) fn from_tokenizer_payload_bytes(
+        tokenizer_bytes: &[u8],
+    ) -> Result<Self, NativeAsrError> {
         let metadata = parse_tokenizer_json(tokenizer_bytes, SOURCE_TOKENIZER_JSON)?;
         let id_to_token = metadata.id_to_token_table()?;
         let token_to_id = metadata.token_to_id_map()?;

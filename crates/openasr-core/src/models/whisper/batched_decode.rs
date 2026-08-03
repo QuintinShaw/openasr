@@ -1142,7 +1142,7 @@ mod tests {
             self_attention: Seq2SeqStateAxis {
                 logical_positions: self_positions,
                 resident_positions: self_positions,
-                hard_position_cap: self_positions,
+                hard_position_cap: execution.max_target_positions,
             },
             cross_attention: Seq2SeqStateAxis {
                 logical_positions: encoder_frames,
