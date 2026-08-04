@@ -2359,6 +2359,17 @@ fn deterministic_f32_value(
         payload_profile,
         TinyGgufPayloadProfile::NumericallyStableDeepGraphV1
     ) {
+        if tensor_name == "dec.head.bias" {
+            if num_elements <= 1 {
+                return 0.0;
+            }
+            // Give the synthetic classifier a deterministic margin between
+            // adjacent classes. Without it, all-small deep-graph weights make
+            // several logits effectively tied, so harmless batched-vs-serial
+            // reduction noise can change argmax and stop testing the intended
+            // equivalence property.
+            return 0.25 * index as f32 / (num_elements - 1) as f32;
+        }
         if tensor_name.ends_with(".bias") || tensor_name.ends_with(".bn.mean") {
             return 0.0;
         }
@@ -2674,6 +2685,9 @@ mod tests {
             deterministic_f32_value("enc.pre.out.bias", 7, 0, 16, profile),
             0.0
         );
+        let penultimate_head_bias = deterministic_f32_value("dec.head.bias", 7, 30, 32, profile);
+        let final_head_bias = deterministic_f32_value("dec.head.bias", 7, 31, 32, profile);
+        assert!(final_head_bias - penultimate_head_bias > 0.005);
         assert_eq!(
             deterministic_f32_value("dec.emb_ln.weight", 7, 0, 16, profile),
             1.0
