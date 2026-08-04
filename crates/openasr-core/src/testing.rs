@@ -2456,6 +2456,11 @@ mod tests {
                 "qwen",
             ),
             (
+                "cohere.oasr",
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture"),
+                "cohere",
+            ),
+            (
                 "xasr.oasr",
                 TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
                     "xasr-fixture",
