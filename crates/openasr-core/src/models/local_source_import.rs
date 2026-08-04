@@ -642,11 +642,69 @@ fn decode_bf16_payload_as_f32(
 mod tests {
     use super::{
         LocalSourceImportError, SAFETENSORS_HEADER_MAX_BYTES, SafetensorsFile,
+        decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32,
         validate_output_pack_extension,
     };
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// Assert a payload-decode `Validate` error and return its message.
+    fn expect_decode_validate_error<T>(result: Result<T, LocalSourceImportError>) -> String {
+        match result {
+            Ok(_) => panic!("expected a Validate error, got Ok"),
+            Err(LocalSourceImportError::Validate(message)) => message,
+            Err(other) => panic!("expected LocalSourceImportError::Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_f32_payload_rejects_non_finite_values() {
+        // A NaN F32 weight is a corrupt source, not a value to quantize: the
+        // shared decoder fails closed instead of propagating it into a pack.
+        let payload = f32::NAN.to_le_bytes();
+        let message =
+            expect_decode_validate_error(decode_safetensors_payload_as_f32("t", "F32", &payload));
+        assert!(message.contains("non-finite"), "{message}");
+        // The f16 conversion path shares the same fail-closed decoder.
+        let message = expect_decode_validate_error(decode_safetensors_payload_as_f16_bits(
+            "t", "F32", &payload,
+        ));
+        assert!(message.contains("non-finite"), "{message}");
+    }
+
+    #[test]
+    fn decode_f16_payload_rejects_non_finite_values() {
+        // f16 +Inf (0x7C00) is non-finite and must be rejected on the way to f32.
+        let payload = 0x7C00_u16.to_le_bytes();
+        let message =
+            expect_decode_validate_error(decode_safetensors_payload_as_f32("t", "F16", &payload));
+        assert!(message.contains("non-finite"), "{message}");
+    }
+
+    #[test]
+    fn decode_bf16_payload_rejects_non_finite_values() {
+        // bf16 +Inf is the f32 upper half 0x7F80; widen and reject.
+        let payload = 0x7F80_u16.to_le_bytes();
+        let message =
+            expect_decode_validate_error(decode_safetensors_payload_as_f32("t", "BF16", &payload));
+        assert!(message.contains("non-finite"), "{message}");
+    }
+
+    #[test]
+    fn decode_payloads_accept_finite_values() {
+        // Control: finite payloads still decode through the shared track.
+        let f32_payload = 1.5_f32.to_le_bytes();
+        assert_eq!(
+            decode_safetensors_payload_as_f32("t", "F32", &f32_payload).expect("finite f32"),
+            vec![1.5]
+        );
+        assert_eq!(
+            decode_safetensors_payload_as_f16_bits("t", "F32", &f32_payload)
+                .expect("finite f32 -> f16"),
+            vec![0x3E00] // 1.5 in IEEE binary16
+        );
+    }
 
     #[test]
     fn output_pack_extension_accepts_oasr() {
