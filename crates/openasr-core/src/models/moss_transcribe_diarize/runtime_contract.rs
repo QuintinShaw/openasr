@@ -350,12 +350,9 @@ pub(crate) fn parse_moss_td_execution_metadata<M: ScalarMetadataView>(
         });
     }
 
-    let encoder =
-        parse_encoder_metadata(metadata).map_err(map_metadata_contract_error)?;
-    let adaptor =
-        parse_adaptor_metadata(metadata).map_err(map_metadata_contract_error)?;
-    let decoder =
-        parse_decoder_metadata(metadata).map_err(map_metadata_contract_error)?;
+    let encoder = parse_encoder_metadata(metadata).map_err(map_metadata_contract_error)?;
+    let adaptor = parse_adaptor_metadata(metadata).map_err(map_metadata_contract_error)?;
+    let decoder = parse_decoder_metadata(metadata).map_err(map_metadata_contract_error)?;
 
     // The adaptor's first linear consumes `merge_size` consecutive encoder
     // rows at once (`(B,T,E) -> (B,T/G,G*E)`), so its input width is exactly

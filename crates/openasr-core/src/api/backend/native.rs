@@ -2122,10 +2122,7 @@ mod tests {
         let adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("verified moss pack must resolve its native adapter");
 
-        assert_eq!(
-            adapter.adapter_id(),
-            crate::arch::MOSS_TD_GGML_ADAPTER_ID
-        );
+        assert_eq!(adapter.adapter_id(), crate::arch::MOSS_TD_GGML_ADAPTER_ID);
         assert_eq!(adapter.model_family(), crate::arch::MOSS_TD_MODEL_FAMILY);
         let capabilities = adapter.capabilities();
         assert!(

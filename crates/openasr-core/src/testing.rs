@@ -737,7 +737,10 @@ impl TinyGgufFixtureSpec {
             crate::arch::MOSS_TD_TOKENIZER_ID.to_string(),
         );
         for (key, value) in [
-            ("general.architecture", crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
+            (
+                "general.architecture",
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
             ("moss_td.encoder.n_layers", "1"),
             ("moss_td.encoder.d_model", "16"),
             ("moss_td.encoder.n_heads", "2"),
