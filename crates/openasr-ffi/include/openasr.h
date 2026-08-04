@@ -172,14 +172,14 @@ typedef enum OpenAsrPullPhase {
 typedef struct OpenAsrCatalog OpenAsrCatalog;
 
 /**
- * Opaque handle to a validated local `.oasr` model pack path. Obtained from
+ * Opaque handle to a fully verified local `.oasr` model pack. Obtained from
  * [`openasr_model_open`], released with [`openasr_model_close`].
  *
- * This does not keep decoded weights resident: the underlying engine loads
- * the pack fresh for each [`openasr_transcribe_pcm`] call (matching the CLI's
- * own per-request load path), so the handle's job is to validate the pack
- * once up front and fail closed before any transcription is attempted with a
- * bad path.
+ * The handle retains the exact `VerifiedPack` generation through its native
+ * adapter/model-pack binding. Decoded weights remain owned by the shared
+ * execution services and may be evicted independently, but transcription
+ * never downgrades this handle back to a bare path and re-verifies a possibly
+ * replaced file.
  */
 typedef struct OpenAsrEngine OpenAsrEngine;
 
