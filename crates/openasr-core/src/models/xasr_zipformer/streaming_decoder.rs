@@ -595,7 +595,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight: preflight.clone(),
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                preflight.clone(),
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: crate::arch::builtin_adapter_descriptor(
                 crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
             ),
@@ -678,7 +681,11 @@ mod tests {
             ),
         );
         let mut request = xasr_streaming_request();
-        request.runtime_source_preflight = preflight.clone();
+        request.verified_pack =
+            crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                preflight.clone(),
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            );
         request.resolved_runtime = resolved_runtime;
         let runtime_pool = super::super::runtime::new_runtime_actor_pool();
 
@@ -740,7 +747,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight,
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                runtime_source_preflight,
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: crate::arch::builtin_adapter_descriptor(
                 crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
             ),
@@ -771,7 +781,11 @@ mod tests {
         let preflight =
             load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
         let mut request = xasr_streaming_request();
-        request.runtime_source_preflight = preflight.clone();
+        request.verified_pack =
+            crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                preflight.clone(),
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            );
         let runtime_pool = super::super::runtime::new_runtime_actor_pool();
         let runtime = super::super::runtime::checkout_prepared_runtime(
             &runtime_pool,
@@ -862,7 +876,11 @@ mod tests {
         let preflight =
             load_runtime_source_metadata_and_tensor_index(&pack).expect("runtime preflight");
         let mut request = xasr_streaming_request();
-        request.runtime_source_preflight = preflight.clone();
+        request.verified_pack =
+            crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                preflight.clone(),
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            );
         let runtime_pool = super::super::runtime::new_runtime_actor_pool();
 
         let transcribe = |warm_up: bool| -> String {

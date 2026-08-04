@@ -3608,7 +3608,7 @@ impl WhisperGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason: error.to_string(),
         })?;
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let reuse_runtime_state = request.request_options.longform_mode_enabled();
         let prepared_runtime = self
             .prepared_runtime_for_preflight(preflight, request.resolved_runtime.backend())

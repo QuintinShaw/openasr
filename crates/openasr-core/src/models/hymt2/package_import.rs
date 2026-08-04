@@ -24,6 +24,7 @@ use thiserror::Error;
 use super::config::{
     HUNYUAN_DENSE_ARCHITECTURE_VALUE, HYMT2_EXPECTED_LAYERS, HYMT2_EXPECTED_VOCAB_SIZE,
 };
+use crate::VerifiedPack;
 use crate::ggml_runtime::GgufWriteValue;
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 
@@ -92,6 +93,8 @@ pub struct Hymt2ImportRequest {
 pub struct Hymt2ImportResult {
     /// Written `.oasr` pack path.
     pub output_path: PathBuf,
+    /// The exact proof produced by the transactional writer and verifier.
+    pub verified_pack: VerifiedPack,
     /// sha256 of the source GGUF.
     pub source_sha256: String,
     /// sha256 of the written pack.
@@ -317,6 +320,7 @@ pub fn import_hymt2_gguf_to_runtime_pack(
     let pack_size_bytes = verified.preflight().runtime_source().byte_len();
     Ok(Hymt2ImportResult {
         output_path: request.output_pack.clone(),
+        verified_pack: verified,
         source_sha256,
         pack_sha256,
         pack_size_bytes,

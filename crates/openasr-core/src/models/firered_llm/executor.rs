@@ -407,7 +407,7 @@ impl FireRedLlmGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
 
         let encoder_metadata =
             parse_firered_llm_encoder_metadata(&*preflight.metadata).map_err(|error| {
@@ -842,7 +842,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight,
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                runtime_source_preflight,
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
             ),

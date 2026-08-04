@@ -375,8 +375,8 @@ pub(crate) enum Command {
         #[arg(long)]
         model_pack: Option<PathBuf>,
         /// Local `.oadp` adapter pack (unsigned, base-bound). Fails closed when
-        /// it does not match the executing base pack exactly. Phase 0:
-        /// moonshine family only.
+        /// it does not match the executing base pack exactly or the selected
+        /// family has no concrete adapter binding strategy.
         #[arg(long)]
         adapter: Option<PathBuf>,
         /// Write output to a file (single input) or a directory (multiple

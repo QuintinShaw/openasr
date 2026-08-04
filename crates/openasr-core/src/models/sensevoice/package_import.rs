@@ -22,6 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::VerifiedPack;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
@@ -32,7 +33,7 @@ use crate::models::local_source_import::{
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 use crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID;
@@ -55,9 +56,10 @@ pub struct SenseVoiceImportRequest {
     pub quantization: SenseVoiceQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SenseVoiceImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -122,9 +124,11 @@ pub fn convert_local_sensevoice_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(SenseVoiceImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: vocab_tokens.len(),
     })
 }
@@ -587,18 +591,12 @@ fn quantized_tensor_type_for_sensevoice_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // The SAN-M encoder (`enc.blk.*`) and the two-pass encoder (`tp.blk.*`) are
-    // the acoustic front end; `ctc.head` / `embed.prompt` are downstream.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_sensevoice_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the SenseVoice SAN-M encoder (`enc.*`)
@@ -608,10 +606,25 @@ fn quantized_tensor_type_for_sensevoice_tensor(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "tp."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: SENSEVOICE_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_sensevoice_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_sensevoice_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn sensevoice_runtime_gguf_metadata(
     hparams: &SenseVoiceDerivedHparams,

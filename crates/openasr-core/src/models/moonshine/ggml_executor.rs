@@ -203,7 +203,7 @@ impl MoonshineGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         // OADP Phase 0: resolve the active adapter (request-level path, env
         // fallback — if any) against THIS base pack. Any mismatch fails the
         // whole transcription — adapters are never silently ignored.
@@ -521,6 +521,12 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
 }
 
 impl GgmlAsrViewExecutor for MoonshineGgmlExecutor {
+    fn adapter_binding_strategy(
+        &self,
+    ) -> crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy {
+        crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy::MoonshineLoraV1
+    }
+
     fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
         MoonshineGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
     }
@@ -594,6 +600,12 @@ fn moonshine_execute_error_to_ggml(
 }
 
 impl GgmlAsrStreamingExecutor for MoonshineGgmlExecutor {
+    fn adapter_binding_strategy(
+        &self,
+    ) -> crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy {
+        crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy::MoonshineLoraV1
+    }
+
     fn executor_id(&self) -> &'static str {
         MOONSHINE_STREAMING_EXECUTOR_ID
     }

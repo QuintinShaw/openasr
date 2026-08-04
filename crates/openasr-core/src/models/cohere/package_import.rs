@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -15,7 +16,7 @@ use crate::models::local_source_import::{
 };
 use crate::models::oasr_metadata::{OasrMetadataBuilder, OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 use super::tensor_names::{
@@ -49,9 +50,10 @@ pub struct CohereLocalSourceImportRequest {
     pub quantization: CohereRuntimeQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CohereLocalSourceImportRuntimeResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub model_id: String,
     pub tensor_count: usize,
 }
@@ -156,11 +158,12 @@ pub fn convert_local_cohere_source_to_runtime_pack(
         ))
     })?;
 
-    let preflight = verified.preflight();
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(CohereLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
+        verified_pack: verified,
         model_id,
-        tensor_count: preflight.tensor_index().tensors().len(),
+        tensor_count,
     })
 }
 
@@ -507,8 +510,12 @@ fn quantized_tensor_type_for_cohere_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization, cohere_quant_component(name))
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_cohere_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the cohere-transcribe audio front end
@@ -518,20 +525,23 @@ fn quantized_tensor_type_for_cohere_tensor(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_cohere_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
 
-/// The encoder carries the shared Q8_0 floor (see `classify_quant_tensor`).
-fn cohere_quant_component(name: &str) -> QuantComponent {
-    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+fn classify_cohere_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     {
-        QuantComponent::Encoder
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
     } else {
-        QuantComponent::Decoder
+        TensorRole::NonQuantizable
     }
 }
 

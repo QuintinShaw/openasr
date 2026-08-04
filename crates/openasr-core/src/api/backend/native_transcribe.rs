@@ -62,7 +62,7 @@ use crate::models::qwen::{
 };
 use crate::models::{
     aux_pack_registry::AuxPackKind,
-    pack_verifier::{PackCandidate, PackRoute, PackVerifier},
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
 };
 use crate::punctuation::should_apply_punctuation;
 
@@ -90,7 +90,7 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 /// (`apply_encoder_attention_span_longform_safety_policy`); a family carrying
 /// both gets whichever is tighter.
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
-const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
+const CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 
 fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
     let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
@@ -499,7 +499,7 @@ fn should_publish_token_step(step_index: usize) -> bool {
 fn run_dispatch_once_with_progress(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
-    runtime_preflight: &GgufRuntimeSourcePreflight,
+    verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
@@ -527,7 +527,7 @@ fn run_dispatch_once_with_progress(
     let result = run_dispatch_once(
         dispatch,
         execution_services,
-        runtime_preflight,
+        verified_pack,
         selected_family,
         chunk,
         request_options,
@@ -556,7 +556,7 @@ struct SliceExecutionFallback {
 fn run_dispatch_once_with_progress_and_policy(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
-    runtime_preflight: &GgufRuntimeSourcePreflight,
+    verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
@@ -583,7 +583,7 @@ fn run_dispatch_once_with_progress_and_policy(
                 run_dispatch_once_with_progress(
                     dispatch,
                     execution_services,
-                    runtime_preflight,
+                    verified_pack,
                     selected_family,
                     chunk.clone(),
                     request_options.clone(),
@@ -793,7 +793,7 @@ struct ConcurrentSlicePipeline<'a> {
     plan_audio: &'a PcmBuffer,
     dispatch: &'a GgmlAsrExecutionDispatch,
     execution_services: &'a Arc<NativeExecutionServices>,
-    runtime_preflight: &'a GgufRuntimeSourcePreflight,
+    verified_pack: &'a VerifiedPack,
     selected_family: &'a GgmlFamilyAdapterDescriptor,
     request_options: &'a GgmlAsrExecutionOptions,
     execution_plan: &'a ExecutionPlan,
@@ -843,7 +843,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         plan_audio,
         dispatch,
         execution_services,
-        runtime_preflight,
+        verified_pack,
         selected_family,
         request_options,
         execution_plan,
@@ -946,7 +946,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                         let outcome = run_dispatch_once_with_progress_and_policy(
                             dispatch,
                             execution_services,
-                            runtime_preflight,
+                            verified_pack,
                             selected_family,
                             chunk,
                             slice_options,
@@ -2182,7 +2182,7 @@ fn run_native_transcription_impl(
                     plan_audio: &plan_audio,
                     dispatch,
                     execution_services,
-                    runtime_preflight,
+                    verified_pack: verified_pack.as_ref(),
                     selected_family: &selected_family,
                     request_options: &request_options,
                     execution_plan: &execution_plan,
@@ -2254,7 +2254,7 @@ fn run_native_transcription_impl(
                         run_dispatch_once_with_progress_and_policy(
                             dispatch,
                             execution_services,
-                            runtime_preflight,
+                            verified_pack.as_ref(),
                             &selected_family,
                             chunk,
                             slice_options,
@@ -2397,7 +2397,7 @@ fn run_native_transcription_impl(
                 let (fallback, _) = run_dispatch_once_with_progress_and_policy(
                     dispatch,
                     execution_services,
-                    runtime_preflight,
+                    verified_pack.as_ref(),
                     &selected_family,
                     prepared_audio.full_slice(),
                     fallback_options,
@@ -2486,7 +2486,7 @@ fn run_native_transcription_impl(
     let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_policy(
         dispatch,
         execution_services,
-        runtime_preflight,
+        verified_pack.as_ref(),
         &selected_family,
         prepared_audio.full_slice(),
         request_options,
@@ -3143,22 +3143,26 @@ fn apply_conservative_seq2seq_longform_safety_policy(
         options.min_chunk_seconds = options.chunk_seconds;
         changed = true;
     }
-    if (options.overlap_seconds - COHERE_LONGFORM_OVERLAP_SECONDS).abs() > f32::EPSILON {
-        options.overlap_seconds = COHERE_LONGFORM_OVERLAP_SECONDS;
+    if (options.overlap_seconds - CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS).abs()
+        > f32::EPSILON
+    {
+        options.overlap_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS;
         changed = true;
         provenance.push(format!(
-            "core.native.longform.policy:cohere-overlap={}",
-            COHERE_LONGFORM_OVERLAP_SECONDS
+            "core.native.longform.policy:conservative-seq2seq-overlap={}",
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS
         ));
     }
     if options.carry_prompt_across_slices {
         options.carry_prompt_across_slices = false;
         changed = true;
-        provenance.push("core.native.longform.policy:cohere-disable-prompt-carry".to_string());
+        provenance.push(
+            "core.native.longform.policy:conservative-seq2seq-disable-prompt-carry".to_string(),
+        );
     }
     if changed {
         provenance.push(format!(
-            "core.native.longform.policy:cohere-chunk-cap={}",
+            "core.native.longform.policy:conservative-seq2seq-chunk-cap={}",
             CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         ));
     }
@@ -3474,7 +3478,7 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
 fn run_dispatch_once(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
-    runtime_preflight: &GgufRuntimeSourcePreflight,
+    verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
@@ -3483,6 +3487,7 @@ fn run_dispatch_once(
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
+    let runtime_preflight = verified_pack.preflight();
     let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
         resolved_preference,
         auto_gpu_policy,
@@ -3490,7 +3495,7 @@ fn run_dispatch_once(
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
         decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-        runtime_source_preflight: runtime_preflight.clone(),
+        verified_pack: verified_pack.clone(),
         selected_family: selected_family.clone(),
         prepared_audio: GgmlAsrPreparedAudioView::mono_16khz_shared(samples),
         request_options,
@@ -5288,7 +5293,7 @@ mod tests {
         // conservative-seq2seq provenance tags on the auto path.
         assert!(
             resolution.provenance.iter().all(|entry| {
-                !entry.contains("cohere-chunk-cap")
+                !entry.contains("conservative-seq2seq-chunk-cap")
                     && !entry.contains("encoder-attention-span")
                     && !entry.contains("scoped-slices")
             }),
@@ -5404,22 +5409,16 @@ mod tests {
         assert_eq!(resolution.options.min_chunk_seconds, 1.0);
         assert_eq!(
             resolution.options.overlap_seconds,
-            COHERE_LONGFORM_OVERLAP_SECONDS
-        );
-        assert!(
-            resolution
-                .provenance
-                .iter()
-                .any(|entry| entry.contains("core.native.longform.policy:cohere-chunk-cap="))
-        );
-        assert!(
-            resolution
-                .provenance
-                .iter()
-                .any(|entry| entry.contains("core.native.longform.policy:cohere-overlap="))
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS
         );
         assert!(resolution.provenance.iter().any(|entry| {
-            entry.contains("core.native.longform.policy:cohere-disable-prompt-carry")
+            entry.contains("core.native.longform.policy:conservative-seq2seq-chunk-cap=")
+        }));
+        assert!(resolution.provenance.iter().any(|entry| {
+            entry.contains("core.native.longform.policy:conservative-seq2seq-overlap=")
+        }));
+        assert!(resolution.provenance.iter().any(|entry| {
+            entry.contains("core.native.longform.policy:conservative-seq2seq-disable-prompt-carry")
         }));
     }
 
@@ -5453,7 +5452,7 @@ mod tests {
         );
         assert_eq!(
             resolution.options.overlap_seconds,
-            COHERE_LONGFORM_OVERLAP_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS
         );
         assert!(!resolution.options.carry_prompt_across_slices);
     }
@@ -6233,15 +6232,19 @@ mod tests {
         executor: std::sync::Arc<dyn GgmlAsrViewExecutor>,
     ) -> (
         GgmlAsrExecutionDispatch,
-        GgufRuntimeSourcePreflight,
+        VerifiedPack,
         GgmlFamilyAdapterDescriptor,
     ) {
         let preflight = tiny_whisper_preflight(dir);
+        let verified_pack = VerifiedPack::from_unverified_preflight_for_test(
+            preflight,
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+        );
         let dispatch = GgmlAsrExecutionDispatch::default()
             .with_view_executor_for_adapter(crate::WHISPER_GGML_ADAPTER_ID, executor);
         (
             dispatch,
-            preflight,
+            verified_pack,
             crate::arch::builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
         )
     }
@@ -6455,14 +6458,14 @@ mod tests {
     fn typed_candidate_failure_retries_without_parsing_error_text() {
         let dir = tempfile::tempdir().unwrap();
         let executor = Arc::new(TypedCandidateFailureStubExecutor::new(true));
-        let (dispatch, preflight, family) =
+        let (dispatch, verified_pack, family) =
             execution_policy_test_fixture(dir.path(), executor.clone());
         let services = native_execution_services_for_test();
         let progress = DecodeProgress::begin(None, 160, false);
         let (result, fallback) = run_dispatch_once_with_progress_and_policy(
             &dispatch,
             &services,
-            &preflight,
+            &verified_pack,
             &family,
             vec![0.0; 160].into(),
             GgmlAsrExecutionOptions::default(),
@@ -6489,14 +6492,14 @@ mod tests {
     fn identical_error_without_typed_failure_never_retries() {
         let dir = tempfile::tempdir().unwrap();
         let executor = Arc::new(TypedCandidateFailureStubExecutor::new(false));
-        let (dispatch, preflight, family) =
+        let (dispatch, verified_pack, family) =
             execution_policy_test_fixture(dir.path(), executor.clone());
         let services = native_execution_services_for_test();
         let progress = DecodeProgress::begin(None, 160, false);
         let error = run_dispatch_once_with_progress_and_policy(
             &dispatch,
             &services,
-            &preflight,
+            &verified_pack,
             &family,
             vec![0.0; 160].into(),
             GgmlAsrExecutionOptions::default(),
@@ -6785,7 +6788,7 @@ mod tests {
     ) -> Result<ConcurrentPipelineOutcome, BackendError> {
         let audio = PcmBuffer::from_vec(audio.to_vec());
         let dir = tempfile::tempdir().unwrap();
-        let (dispatch, preflight, family) = execution_policy_test_fixture(dir.path(), executor);
+        let (dispatch, verified_pack, family) = execution_policy_test_fixture(dir.path(), executor);
         let timeline = crate::longform::TimelineMap::identity();
         let mut assembler =
             TranscriptAssembler::new(timeline.clone(), SegmentMergePolicy::default());
@@ -6812,7 +6815,7 @@ mod tests {
             plan_audio: &audio,
             dispatch: &dispatch,
             execution_services: &execution_services,
-            runtime_preflight: &preflight,
+            verified_pack: &verified_pack,
             selected_family: &family,
             request_options: &request_options,
             execution_plan: &execution_plan,

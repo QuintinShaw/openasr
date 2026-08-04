@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
@@ -47,7 +48,7 @@ use crate::models::local_source_import::{
 use crate::models::oasr_metadata::{
     OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
 };
-use crate::models::pack_quant::{PackQuant, TensorQuantizationContract};
+use crate::models::pack_quant::{PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole};
 use crate::nn::half::f32_to_f16_bits;
 
 use crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID;
@@ -69,10 +70,25 @@ pub type GraniteSpeechQuantizationMode = PackQuant;
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder.", "projector."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_granite_speech_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_granite_speech_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GraniteSpeechImportRequest {
@@ -81,9 +97,10 @@ pub struct GraniteSpeechImportRequest {
     pub model_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraniteSpeechImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
 }
 
@@ -592,9 +609,11 @@ pub fn convert_local_granite_speech_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(GraniteSpeechImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
     })
 }
 

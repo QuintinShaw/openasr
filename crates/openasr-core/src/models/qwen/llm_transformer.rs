@@ -50,7 +50,7 @@ const QWEN3_LLM_CPU_SAFE_PREFILL_QUERY_TOKENS: usize = 8;
 /// Conservative single-query width kept for backends that have not been
 /// validated for multi-query host-cache prefill (legacy default). Discrete
 /// GPU (CUDA/HIP/Vulkan) no longer uses this once the non-flash wide path is
-/// selected — see `qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name`.
+/// selected — see `qwen_llm_safe_gpu_prefill_query_tokens_for_backend`.
 const QWEN3_LLM_GPU_SAFE_PREFILL_QUERY_TOKENS: usize = 1;
 /// Flash VEC kernel is trusted at `n_query <= 2` on every backend (see
 /// `fattn.cu` `Q->ne[1] <= 2`). Above this, discrete-GPU flash MMA/TILE must
@@ -2631,14 +2631,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.runner.release_cpu_step_buffer_pool();
     }
 
-    /// `"<kind>:<ggml backend name>"`, for perf diagnostics (e.g. the
-    /// `OPENASR_HYMT2_PROFILE` runtime-backend log line).
+    /// Human-readable provider identity for diagnostics only. Executable
+    /// policy in this family consumes the runner's typed backend kind or
+    /// capabilities; callers must not parse this label.
     pub(crate) fn backend_label(&self) -> String {
-        format!(
-            "{:?}:{}",
-            self.runner.backend_kind(),
-            self.runner.backend_name()
-        )
+        self.runner.backend_label()
     }
 
     /// Graph reuse is only correct on the single-backend GPU path (Metal or
@@ -2690,8 +2687,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             return None;
         }
         if self.runner.backend_kind().is_gpu_class() {
-            return Some(qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
-                self.runner.backend_name(),
+            return Some(qwen_llm_safe_gpu_prefill_query_tokens_for_backend(
+                self.runner.backend_capabilities(),
                 token_count,
             ));
         }
@@ -2732,8 +2729,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// (`even_prefill_chunk_len`); the final single token then rides the
     /// fast width-1 step.
     pub(crate) fn prefill_chunks_require_even_width(&self) -> bool {
-        self.runner.backend_kind().is_gpu_class()
-            && qwen_llm_backend_is_hip_like(self.runner.backend_name())
+        self.runner
+            .backend_capabilities()
+            .multi_query_prefill_width_multiple()
+            > 1
     }
 
     /// Run one decode token through ALL layers in a single graph. Returns the
@@ -6584,8 +6583,8 @@ fn qwen_llm_prefill_uses_flash_attention_for_backend(
     !matches!(backend, GgmlCpuGraphBackend::Gpu)
 }
 
-fn qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
-    backend_name: &str,
+fn qwen_llm_safe_gpu_prefill_query_tokens_for_backend(
+    backend_capabilities: crate::ggml_runtime::GgmlBackendCapabilities,
     token_count: usize,
 ) -> usize {
     // Discrete GPU backends share the non-flash-backed wide host-cache chunk
@@ -6595,37 +6594,13 @@ fn qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
     // same width-safe chunk without re-entering the historical serial path.
     // Metal keeps flash at every width and is selected by backend kind, not
     // by this name helper's discrete-GPU branch.
-    if qwen_llm_backend_is_discrete_gpu_like(backend_name) {
+    if backend_capabilities.is_known_discrete_gpu() {
         if token_count <= QWEN3_LLM_FLASH_SAFE_PREFILL_MAX_KV_TOKENS {
             return QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS;
         }
         return QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS;
     }
     QWEN3_LLM_GPU_SAFE_PREFILL_QUERY_TOKENS
-}
-
-fn qwen_llm_backend_is_hip_like(backend_name: &str) -> bool {
-    let backend_name = backend_name.to_ascii_lowercase();
-    backend_name.contains("hip") || backend_name.contains("rocm")
-}
-
-fn qwen_llm_backend_is_cuda_like(backend_name: &str) -> bool {
-    let backend_name = backend_name.to_ascii_lowercase();
-    backend_name.contains("cuda") || backend_name.contains("nvidia")
-}
-
-fn qwen_llm_backend_is_vulkan_like(backend_name: &str) -> bool {
-    backend_name.to_ascii_lowercase().contains("vulkan")
-}
-
-/// Name-level discrete-GPU detector used by the host-cache chunk policy when
-/// only the ggml backend display name is available (HIP0/CUDA0/Vulkan0/...).
-/// Metal is intentionally excluded: it is a separate backend kind with a
-/// trusted flash path and does not need the non-flash width ceiling.
-fn qwen_llm_backend_is_discrete_gpu_like(backend_name: &str) -> bool {
-    qwen_llm_backend_is_hip_like(backend_name)
-        || qwen_llm_backend_is_cuda_like(backend_name)
-        || qwen_llm_backend_is_vulkan_like(backend_name)
 }
 
 /// Next chunk width for a prefill loop whose backend reports
@@ -6845,23 +6820,27 @@ mod tests {
     #[test]
     fn qwen_llm_gpu_prefill_chunk_policy_widens_discrete_gpu_backends() {
         for backend_name in ["HIP0", "ROCm0", "CUDA0", "cuda:0", "Vulkan0", "NVIDIA"] {
+            let capabilities = crate::ggml_runtime::GgmlBackendCapabilities::from_backend_for_test(
+                GgmlCpuGraphBackend::Gpu,
+                backend_name,
+            );
             assert_eq!(
-                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 8),
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend(capabilities, 8),
                 QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS,
                 "backend_name={backend_name} short prompt"
             );
             assert_eq!(
-                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 32),
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend(capabilities, 32),
                 QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS,
                 "backend_name={backend_name} flash-tile boundary"
             );
             assert_eq!(
-                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 33),
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend(capabilities, 33),
                 QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS,
                 "backend_name={backend_name} non-flash window"
             );
             assert_eq!(
-                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 128),
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend(capabilities, 128),
                 QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS,
                 "backend_name={backend_name} long prompt"
             );
@@ -6869,12 +6848,13 @@ mod tests {
         // Metal / unknown names stay on the conservative single-query host
         // width; Metal bulk prefill goes through resident reuse instead.
         for backend_name in ["Metal", "GPU", ""] {
+            let capabilities = crate::ggml_runtime::GgmlBackendCapabilities::from_backend_for_test(
+                GgmlCpuGraphBackend::Gpu,
+                backend_name,
+            );
             for token_count in [8, 32, 128] {
                 assert_eq!(
-                    qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
-                        backend_name,
-                        token_count
-                    ),
+                    qwen_llm_safe_gpu_prefill_query_tokens_for_backend(capabilities, token_count),
                     QWEN3_LLM_GPU_SAFE_PREFILL_QUERY_TOKENS,
                     "backend_name={backend_name} token_count={token_count}"
                 );

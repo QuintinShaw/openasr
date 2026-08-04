@@ -347,7 +347,8 @@ pub struct TranscriptionRequest {
     pub model_pack_path: Option<std::path::PathBuf>,
     /// OADP Phase 0: optional `.oadp` adapter pack to activate for this
     /// request (CLI `--adapter`). The native executor validates it fail-closed
-    /// against the executing base pack; non-moonshine families hard-error.
+    /// against the executing base pack; families without a concrete adapter
+    /// binding strategy hard-error.
     /// `None` leaves the server-side `OPENASR_ADAPTER` env surface in charge.
     pub adapter_path: Option<std::path::PathBuf>,
     pub language: Option<String>,

@@ -108,7 +108,7 @@ _INVENTORY_EXECUTION_KEYS = {
     "phrase_bias_required_tensor",
     "supports_translation_task",
     "supports_source_language_hint",
-    "supports_lora_adapter",
+    "adapter_binding",
     "prepared_runtime",
     "word_timestamp_strategy",
     "invocation_span",
@@ -128,16 +128,19 @@ _INVENTORY_OPTIMIZATION_KEYS = {
     "auto_gpu_policy",
     "encoder_attention_span",
     "encoder_attention_max_safe_chunk_seconds",
-    "ownership",
-    "prepared_runtime_eviction",
-    "graph_reuse",
 }
 _INVENTORY_QUANTIZATION_KEYS = {"tensor_classification", "quantized_axis"}
 _INVENTORY_TENSOR_CLASSIFICATIONS = {
-    "acoustic-encoder-prefixes-v1",
     "semantic-roles-v1",
+    "entire-acoustic-pack",
+    "not-applicable",
 }
 _INVENTORY_QUANTIZED_AXES = {"first", "last"}
+_INVENTORY_ADAPTER_BINDINGS = {
+    "unsupported",
+    "qwen3-asr-lora-v1",
+    "moonshine-lora-v1",
+}
 _INVENTORY_CONFORMANCE_KEYS = {"profile_id", "reference_dumper_source"}
 _INVENTORY_PHRASE_BIAS_STRATEGIES = {"unsupported", "always", "requires-tensor"}
 _INVENTORY_WORD_TIMESTAMP_STRATEGIES = {"decode-invariant", "decode-sensitive"}
@@ -395,10 +398,16 @@ def _validate_model_family_inventory(payload: object) -> None:
             "supports_phrase_bias",
             "supports_translation_task",
             "supports_source_language_hint",
-            "supports_lora_adapter",
         ):
             if not isinstance(execution[field], bool):
                 raise _inventory_error(f"{path}.execution.{field}", "must be boolean")
+        adapter_binding = execution["adapter_binding"]
+        _inventory_string(adapter_binding, f"{path}.execution.adapter_binding")
+        if adapter_binding not in _INVENTORY_ADAPTER_BINDINGS:
+            raise _inventory_error(
+                f"{path}.execution.adapter_binding",
+                f"unsupported binding {adapter_binding!r}",
+            )
         phrase_bias_strategy = execution["phrase_bias_strategy"]
         _inventory_string(phrase_bias_strategy, f"{path}.execution.phrase_bias_strategy")
         if phrase_bias_strategy not in _INVENTORY_PHRASE_BIAS_STRATEGIES:
@@ -465,7 +474,7 @@ def _validate_model_family_inventory(payload: object) -> None:
         _inventory_exact_keys(optimization, _INVENTORY_OPTIMIZATION_KEYS, f"{path}.optimization")
         if not isinstance(optimization["prefer_cpu_decoder_for_multichunk_metal"], bool):
             raise _inventory_error(f"{path}.optimization.prefer_cpu_decoder_for_multichunk_metal", "must be boolean")
-        for field in ("auto_gpu_policy", "encoder_attention_span", "ownership", "prepared_runtime_eviction", "graph_reuse"):
+        for field in ("auto_gpu_policy", "encoder_attention_span"):
             _inventory_string(optimization[field], f"{path}.optimization.{field}")
         _inventory_nullable_number(
             optimization["encoder_attention_max_safe_chunk_seconds"],
@@ -495,10 +504,10 @@ def _validate_model_family_inventory(payload: object) -> None:
                 f"{path}.quantization.quantized_axis",
                 "semantic-roles-v1 requires 'first' or 'last'",
             )
-        if tensor_classification == "acoustic-encoder-prefixes-v1" and quantized_axis is not None:
+        if tensor_classification != "semantic-roles-v1" and quantized_axis is not None:
             raise _inventory_error(
                 f"{path}.quantization.quantized_axis",
-                "acoustic-encoder-prefixes-v1 requires null",
+                f"{tensor_classification} requires null",
             )
 
         conformance = _inventory_object(family["conformance"], f"{path}.conformance")

@@ -9,9 +9,13 @@ use crate::device::{
     execution_route::ExecutionProvider,
 };
 use crate::ggml_runtime::AutoGpuPolicy;
+use crate::models::decode_policy_component_registry::{
+    self as decode_policy, BuiltinDecodePolicyComponentDescriptor,
+};
 use crate::models::ggml_family_adapter::{
-    GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlFamilyAdapterSelectionError,
-    GgmlFamilyAdapterSelectionFields, GgmlFamilyAdapterSelectionSpec, LanguageFamilyHint,
+    GgmlAdapterBindingStrategy, GgmlExecutionCapability, GgmlFamilyAdapterDescriptor,
+    GgmlFamilyAdapterSelectionError, GgmlFamilyAdapterSelectionFields,
+    GgmlFamilyAdapterSelectionSpec, LanguageFamilyHint,
 };
 use crate::models::oasr_metadata::OASR_PACKAGE_VERSION_V1;
 use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
@@ -219,8 +223,7 @@ pub(crate) const FIRERED_AED_EXECUTOR_COMPONENT_ID: &str = "firered-aed.ggml-exe
 // Qwen2-7B-Instruct decoder, Apache-2.0). Like firered-aed, decode runs on a
 // hand-written dedicated executor (ArchitectureGraph) -- the Conformer
 // encoder + Qwen2 decoder shapes are family-specific, not composer block
-// kinds -- registered in `BUILTIN_COMPONENT_DESCRIPTORS` /
-// `BUILTIN_ARCHITECTURE_DESCRIPTORS` below.
+// kinds -- represented by the canonical architecture inventory below.
 pub(crate) const FIRERED_LLM_GGML_ARCHITECTURE_ID: &str = "firered-llm-conformer-adapter-qwen2";
 pub(crate) const FIRERED_LLM_GGML_ADAPTER_ID: &str = "ggml-family-firered-llm-runtime-v1";
 pub(crate) const FIRERED_LLM_MODEL_FAMILY: &str = "firered2-llm";
@@ -235,8 +238,8 @@ pub(crate) const FIRERED_LLM_EXECUTOR_COMPONENT_ID: &str = "firered-llm.ggml-exe
 // (512->2048->1024 MLP + 2 standard transformer blocks) + a stock Qwen3-0.6B
 // decoder (QK-norm, no attention bias, GQA, tied embeddings), Apache-2.0). The
 // release checkpoint carries no CTC decoder (a training-only branch), so decode
-// runs on a hand-written dedicated executor (ArchitectureGraph) -- registered in
-// `BUILTIN_COMPONENT_DESCRIPTORS` / `BUILTIN_ARCHITECTURE_DESCRIPTORS` below.
+// runs on a hand-written dedicated executor (ArchitectureGraph) -- represented
+// by the canonical architecture inventory below.
 pub(crate) const FUNASR_NANO_GGML_ARCHITECTURE_ID: &str = "funasr-nano-sanm-adapter-qwen3";
 pub(crate) const FUNASR_NANO_GGML_ADAPTER_ID: &str = "ggml-family-funasr-nano-runtime-v1";
 pub(crate) const FUNASR_NANO_MODEL_FAMILY: &str = "funasr-nano";
@@ -271,8 +274,8 @@ pub(crate) const MIMO_ASR_EXECUTOR_COMPONENT_ID: &str = "mimo-asr.ggml-executor.
 // `qwen`'s family-agnostic decoder machinery byte-for-byte (see
 // `models::moss_transcribe_diarize::llm_decoder`'s module doc). Like
 // firered-llm/mimo-asr, decode runs on a hand-written dedicated executor
-// (ArchitectureGraph) -- registered in `BUILTIN_COMPONENT_DESCRIPTORS` /
-// `BUILTIN_ARCHITECTURE_DESCRIPTORS` below.
+// (ArchitectureGraph) -- represented by the canonical architecture inventory
+// below.
 pub(crate) const MOSS_TD_GGML_ARCHITECTURE_ID: &str = "moss-transcribe-diarize-whisper-qwen3";
 pub(crate) const MOSS_TD_GGML_ADAPTER_ID: &str = "ggml-family-moss-transcribe-diarize-runtime-v1";
 pub(crate) const MOSS_TD_MODEL_FAMILY: &str = "moss-transcribe-diarize";
@@ -319,21 +322,6 @@ pub(crate) const GRANITE_SPEECH_EXECUTOR_COMPONENT_ID: &str = "granite-speech.gg
 // through `models::decode_policy_component_registry`, keeping its greedy loop
 // on the one shared decode driver.
 pub(crate) const HYMT2_DECODE_POLICY_ID: &str = "hymt2.greedy.seq2seq.v0";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrComponentKind {
-    AudioFrontend,
-    DecodePolicy,
-    Executor,
-    RuntimeTensorContract,
-    Tokenizer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OpenAsrComponentDescriptor {
-    pub kind: OpenAsrComponentKind,
-    pub id: &'static str,
-}
 
 /// Default chunk length long-form slicing aims for: how long a slice we
 /// *want*, as a transcription-quality choice.
@@ -565,9 +553,36 @@ pub enum StreamingPartialGranularity {
 /// conformance gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAsrDecodeDriverStrategy {
-    SharedSeq2SeqGreedy,
-    SharedCtcGreedy,
-    Dedicated { reason: &'static str },
+    SharedSeq2SeqGreedy {
+        policy: BuiltinDecodePolicyComponentDescriptor,
+    },
+    SharedCtcGreedy {
+        policy: BuiltinDecodePolicyComponentDescriptor,
+    },
+    Dedicated {
+        decode_policy_id: &'static str,
+        reason: &'static str,
+    },
+}
+
+impl OpenAsrDecodeDriverStrategy {
+    pub(crate) const fn decode_policy_id(self) -> &'static str {
+        match self {
+            Self::SharedSeq2SeqGreedy { policy } | Self::SharedCtcGreedy { policy } => {
+                policy.decode_policy_id
+            }
+            Self::Dedicated {
+                decode_policy_id, ..
+            } => decode_policy_id,
+        }
+    }
+
+    pub(crate) const fn shared_policy(self) -> Option<BuiltinDecodePolicyComponentDescriptor> {
+        match self {
+            Self::SharedSeq2SeqGreedy { policy } | Self::SharedCtcGreedy { policy } => Some(policy),
+            Self::Dedicated { .. } => None,
+        }
+    }
 }
 
 /// Whether graph construction is data-composed from shared blocks or remains
@@ -725,10 +740,10 @@ pub(crate) struct OpenAsrExecutionContract {
     pub phrase_bias: OpenAsrPhraseBiasStrategy,
     pub supports_translation_task: bool,
     pub supports_source_language_hint: bool,
-    /// Whether this family has a complete LoRA/OADP adapter binding contract.
-    /// The runtime adapter gate consumes this declaration instead of
-    /// maintaining a family-name allowlist.
-    pub supports_lora_adapter: bool,
+    /// Concrete LoRA/OADP binding the executor must implement. Dispatch
+    /// cross-checks this value against the materialized executor, so a family
+    /// cannot self-certify support by toggling a boolean.
+    pub adapter_binding: GgmlAdapterBindingStrategy,
     pub prepared_runtime: OpenAsrPreparedRuntimeStrategy,
     pub word_timestamps: OpenAsrWordTimestampStrategy,
     pub streaming_partial_granularity: StreamingPartialGranularity,
@@ -741,7 +756,6 @@ pub(crate) struct OpenAsrExecutionContract {
 /// Decoder topology and shared-driver selection for one native family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenAsrTopologyContract {
-    pub decode_policy_id: &'static str,
     pub decoder_state_topology: OpenAsrDecoderStateTopology,
     pub decode_driver: OpenAsrDecodeDriverStrategy,
     pub block_stack: OpenAsrBlockStackStrategy,
@@ -753,24 +767,6 @@ pub(crate) struct OpenAsrOptimizationContract {
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
     pub auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     pub encoder_attention_span: OpenAsrEncoderAttentionSpan,
-    pub ownership: OpenAsrExecutorOwnership,
-    pub prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction,
-    pub graph_reuse: OpenAsrGraphReuse,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrExecutorOwnership {
-    NativeExecutionServices,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrPreparedRuntimeEviction {
-    ContentId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrGraphReuse {
-    PreparedRuntimePool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -832,10 +828,10 @@ impl OpenAsrArchitectureDescriptor {
             model_architecture: self.identity.model_architecture,
             audio_frontend_id: self.pack_contract.audio_frontend_id,
             tokenizer_id: self.pack_contract.tokenizer_id,
-            decode_policy_id: self.topology_contract.decode_policy_id,
+            decode_policy_id: self.topology_contract.decode_driver.decode_policy_id(),
             execution_capability: self.execution_contract.execution_capability,
             execution_capabilities: self.execution_contract.execution_capabilities,
-            supports_lora_adapter: self.execution_contract.supports_lora_adapter,
+            adapter_binding: self.execution_contract.adapter_binding,
             speaker_segmentation: self.execution_contract.speaker_segmentation,
             phrase_bias: self.execution_contract.phrase_bias,
             word_timestamps: self.execution_contract.word_timestamps,
@@ -898,11 +894,6 @@ pub(crate) fn family_auto_gpu_policy_for_model_architecture(
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum OpenAsrArchitectureRegistryError {
-    MissingComponentReference {
-        model_architecture: &'static str,
-        kind: OpenAsrComponentKind,
-        component_id: &'static str,
-    },
     EmptyHparamSchema {
         model_architecture: &'static str,
     },
@@ -1028,40 +1019,14 @@ pub(crate) enum OpenAsrArchitectureRegistryError {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct OpenAsrComponentRegistry {
-    descriptors: &'static [OpenAsrComponentDescriptor],
-}
-
-impl OpenAsrComponentRegistry {
-    pub(crate) fn with_builtins() -> Self {
-        Self {
-            descriptors: BUILTIN_COMPONENT_DESCRIPTORS,
-        }
-    }
-
-    pub(crate) fn find(
-        self,
-        kind: OpenAsrComponentKind,
-        id: &str,
-    ) -> Option<OpenAsrComponentDescriptor> {
-        self.descriptors
-            .iter()
-            .copied()
-            .find(|descriptor| descriptor.kind == kind && descriptor.id == id)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenAsrArchitectureRegistry {
     architectures: &'static [OpenAsrArchitectureDescriptor],
-    components: OpenAsrComponentRegistry,
 }
 
 impl OpenAsrArchitectureRegistry {
     pub(crate) fn with_builtins() -> Self {
         Self {
             architectures: BUILTIN_ARCHITECTURE_DESCRIPTORS,
-            components: OpenAsrComponentRegistry::with_builtins(),
         }
     }
 
@@ -1180,31 +1145,6 @@ impl OpenAsrArchitectureRegistry {
     pub(crate) fn validate_references(self) -> Result<(), OpenAsrArchitectureRegistryError> {
         for descriptor in self.architectures {
             Self::validate_identity(*descriptor)?;
-            self.require_component(
-                *descriptor,
-                OpenAsrComponentKind::AudioFrontend,
-                descriptor.pack_contract.audio_frontend_id,
-            )?;
-            self.require_component(
-                *descriptor,
-                OpenAsrComponentKind::DecodePolicy,
-                descriptor.topology_contract.decode_policy_id,
-            )?;
-            self.require_component(
-                *descriptor,
-                OpenAsrComponentKind::RuntimeTensorContract,
-                descriptor.pack_contract.runtime_tensor_contract_id,
-            )?;
-            self.require_component(
-                *descriptor,
-                OpenAsrComponentKind::Tokenizer,
-                descriptor.pack_contract.tokenizer_id,
-            )?;
-            self.require_component(
-                *descriptor,
-                OpenAsrComponentKind::Executor,
-                descriptor.execution_contract.executor_component_id,
-            )?;
             Self::validate_hparam_schema(*descriptor)?;
             Self::validate_block_stack(*descriptor)?;
             Self::validate_invocation_span(*descriptor)?;
@@ -1363,21 +1303,6 @@ impl OpenAsrArchitectureRegistry {
             );
         }
         Ok(())
-    }
-
-    fn require_component(
-        self,
-        descriptor: OpenAsrArchitectureDescriptor,
-        kind: OpenAsrComponentKind,
-        id: &'static str,
-    ) -> Result<(), OpenAsrArchitectureRegistryError> {
-        self.components.find(kind, id).map(|_| ()).ok_or(
-            OpenAsrArchitectureRegistryError::MissingComponentReference {
-                model_architecture: descriptor.identity.model_architecture,
-                kind,
-                component_id: id,
-            },
-        )
     }
 
     fn validate_hparam_schema(
@@ -1567,329 +1492,6 @@ impl OpenAsrArchitectureRegistry {
     }
 }
 
-const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: WHISPER_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: QWEN3_ASR_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: WHISPER_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: QWEN3_ASR_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: WHISPER_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: WHISPER_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: COHERE_TRANSCRIBE_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: WHISPER_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: QWEN3_ASR_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: PARAKEET_CTC_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: PARAKEET_CTC_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: PARAKEET_CTC_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: PARAKEET_TDT_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: PARAKEET_TDT_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: PARAKEET_TDT_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: WAV2VEC2_CTC_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: WAV2VEC2_CTC_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: XASR_ZIPFORMER_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: XASR_ZIPFORMER_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: MOONSHINE_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: MOONSHINE_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: MOONSHINE_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: MOONSHINE_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: DOLPHIN_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: DOLPHIN_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: DOLPHIN_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: DOLPHIN_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: DOLPHIN_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: SENSEVOICE_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: SENSEVOICE_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: SENSEVOICE_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: FIRERED_AED_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: FIRERED_AED_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: FIRERED_AED_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: FIRERED_LLM_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: FIRERED_LLM_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: FIRERED_LLM_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: FUNASR_NANO_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: FUNASR_NANO_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: FUNASR_NANO_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: FUNASR_NANO_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: FUNASR_NANO_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: MIMO_ASR_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: MIMO_ASR_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: MIMO_ASR_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: MOSS_TD_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: MOSS_TD_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: MOSS_TD_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: MOSS_TD_EXECUTOR_COMPONENT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::AudioFrontend,
-        id: GRANITE_SPEECH_AUDIO_FRONTEND_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::DecodePolicy,
-        id: GRANITE_SPEECH_DECODE_POLICY_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::RuntimeTensorContract,
-        id: GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Tokenizer,
-        id: GRANITE_SPEECH_TOKENIZER_ID,
-    },
-    OpenAsrComponentDescriptor {
-        kind: OpenAsrComponentKind::Executor,
-        id: GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
-    },
-];
-
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
     OpenAsrArchitectureDescriptor {
         identity: OpenAsrIdentityContract {
@@ -1933,7 +1535,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: true,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -1943,10 +1545,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
             decoder_state_topology:
                 OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::COHERE_TRANSCRIBE_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                 orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
                 encoder_stage: Some(OpenAsrStageDescriptor {
@@ -1982,9 +1585,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::cohere::TENSOR_QUANTIZATION_CONTRACT,
@@ -2037,7 +1637,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: true,
             supports_source_language_hint: true,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeSensitive,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2047,10 +1647,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: WHISPER_DECODE_POLICY_ID,
             decoder_state_topology:
                 OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::WHISPER_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "Whisper's convolutional frontend and fixed-window encoder/decoder graph are not represented by the shared block composer.",
             },
@@ -2062,9 +1663,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             prefer_cpu_decoder_for_multichunk_metal: false,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
             encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::whisper::TENSOR_QUANTIZATION_CONTRACT,
@@ -2120,7 +1718,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: true,
+            adapter_binding: GgmlAdapterBindingStrategy::Qwen3AsrLoraV1,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2130,9 +1728,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: QWEN3_ASR_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::QWEN3_ASR_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                 orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
                 encoder_stage: Some(OpenAsrStageDescriptor {
@@ -2165,9 +1764,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::qwen::TENSOR_QUANTIZATION_CONTRACT,
@@ -2218,7 +1814,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2233,9 +1829,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: None,
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: PARAKEET_CTC_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy {
+                policy: decode_policy::PARAKEET_CTC_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                 orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                 encoder_stage: Some(OpenAsrStageDescriptor {
@@ -2254,9 +1851,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::parakeet_ctc::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2316,7 +1910,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2329,9 +1923,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
             decode_driver: OpenAsrDecodeDriverStrategy::Dedicated {
+                decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
                 reason: "TDT transducer decoding requires predictor and joint-network state that is neither CTC nor seq2seq greedy.",
             },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
@@ -2348,9 +1942,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::parakeet_tdt::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2402,7 +1993,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2413,9 +2004,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: None,
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: WAV2VEC2_CTC_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy {
+                policy: decode_policy::WAV2VEC2_CTC_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                 orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                 encoder_stage: Some(OpenAsrStageDescriptor {
@@ -2434,9 +2026,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::wav2vec2_ctc::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2491,7 +2080,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::FrameSync,
@@ -2501,9 +2090,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
             decode_driver: OpenAsrDecodeDriverStrategy::Dedicated {
+                decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
                 reason: "Zipformer transducer decoding requires architecture-specific predictor and joiner orchestration.",
             },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
@@ -2536,9 +2125,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // metal` request still gets Metal.
             auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
             encoder_attention_span: OpenAsrEncoderAttentionSpan::LocalChunked,
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::xasr_zipformer::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2591,7 +2177,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: true,
+            adapter_binding: GgmlAdapterBindingStrategy::MoonshineLoraV1,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2601,10 +2187,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: MOONSHINE_DECODE_POLICY_ID,
             decoder_state_topology:
                 OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::MOONSHINE_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "Moonshine's convolutional encoder and decoder graph are not represented by the shared block composer.",
             },
@@ -2621,9 +2208,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::moonshine::TENSOR_QUANTIZATION_CONTRACT,
@@ -2685,7 +2269,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             },
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2698,9 +2282,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(false),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
             decode_driver: OpenAsrDecodeDriverStrategy::Dedicated {
+                decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
                 reason: "Dolphin attention rescoring is a second-pass topology outside the shared CTC and seq2seq greedy drivers.",
             },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
@@ -2727,9 +2311,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::dolphin::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2784,7 +2365,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2794,9 +2375,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: SENSEVOICE_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy {
+                policy: decode_policy::SENSEVOICE_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                 orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                 encoder_stage: Some(OpenAsrStageDescriptor {
@@ -2815,9 +2397,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::sensevoice::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2874,7 +2453,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2887,10 +2466,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(false),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: FIRERED_AED_DECODE_POLICY_ID,
             decoder_state_topology:
                 OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::FIRERED_AED_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "FireRed AED's Conformer encoder and attention decoder are not yet represented by the shared block composer.",
             },
@@ -2911,9 +2491,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::firered_aed::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -2971,7 +2548,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -2986,9 +2563,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: None,
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: FIRERED_LLM_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::FIRERED_LLM_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "FireRed LLM composes a speech encoder and adapter with a Qwen language-model backbone.",
             },
@@ -3005,9 +2583,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::firered_llm::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -3065,7 +2640,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -3079,9 +2654,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: None,
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: FUNASR_NANO_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::FUNASR_NANO_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "FunASR Nano composes a SAN-M encoder and adaptor with a Qwen language-model decoder.",
             },
@@ -3095,9 +2671,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::funasr_nano::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -3151,7 +2724,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -3164,9 +2737,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: None,
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: MIMO_ASR_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::MIMO_ASR_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "MiMo composes a speech tokenizer and input-local adapter with its language-model decoder.",
             },
@@ -3181,9 +2755,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::mimo_asr::TENSOR_QUANTIZATION_CONTRACT,
@@ -3243,7 +2814,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
@@ -3278,9 +2849,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: None,
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: MOSS_TD_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::MOSS_TD_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "MOSS transcription/diarization uses an architecture-specific audio encoder and decoder graph.",
             },
@@ -3308,9 +2880,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // instruction), so this family diarizes itself -- there is no
             // separate diarization pass to compose.
             encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::moss_transcribe_diarize::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -3370,12 +2939,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
-            supports_lora_adapter: false,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
-            // Greedy decode rides the one shared seq2seq driver via the
-            // decode-policy registry (see AGENTS.md's single-driver invariant);
+            // Greedy decode rides the one shared seq2seq driver via the policy
+            // embedded in this row (see AGENTS.md's single-driver invariant);
             // this family provides a `Seq2SeqGreedyDecodeStepExecutor` and a
             // `GRANITE_SPEECH_DECODE_POLICY_ID` descriptor rather than a
             // hand-rolled argmax loop.
@@ -3396,9 +2965,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             emits_punctuation: Some(true),
         },
         topology_contract: OpenAsrTopologyContract {
-            decode_policy_id: GRANITE_SPEECH_DECODE_POLICY_ID,
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: decode_policy::GRANITE_SPEECH_DECODE_POLICY_COMPONENT,
+            },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "Granite Speech composes a Conformer encoder and Q-Former projector with its language-model decoder.",
             },
@@ -3423,9 +2993,6 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // markup, so speaker structure comes from the shared external
             // segmenter pass, same as every other non-diarizing family here.
             encoder_attention_span: OpenAsrEncoderAttentionSpan::LocalChunked,
-            ownership: OpenAsrExecutorOwnership::NativeExecutionServices,
-            prepared_runtime_eviction: OpenAsrPreparedRuntimeEviction::ContentId,
-            graph_reuse: OpenAsrGraphReuse::PreparedRuntimePool,
         },
         quantization_contract: OpenAsrQuantizationContract {
             tensor_classification: crate::models::granite_speech::package_import::TENSOR_QUANTIZATION_CONTRACT,
@@ -3474,10 +3041,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_architectures_validate_component_references() {
+    fn builtin_architectures_validate_inventory_invariants() {
         OpenAsrArchitectureRegistry::with_builtins()
             .validate_references()
-            .expect("builtins must reference known components");
+            .expect("builtins must satisfy inventory invariants");
     }
 
     #[test]
@@ -4538,7 +4105,6 @@ mod tests {
             .expect("qwen architecture");
         let descriptor = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
                     encoder_stage: None,
@@ -4572,7 +4138,6 @@ mod tests {
             .expect("qwen architecture");
         let descriptor = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
                     encoder_stage: None,
@@ -4606,7 +4171,6 @@ mod tests {
             .expect("qwen architecture");
         let descriptor = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
                     encoder_stage: None,
@@ -4642,7 +4206,6 @@ mod tests {
             .expect("cohere architecture");
         let descriptor = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
                     encoder_stage: Some(OpenAsrStageDescriptor {
@@ -4683,7 +4246,6 @@ mod tests {
             .expect("parakeet architecture");
         let descriptor = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                     encoder_stage: Some(OpenAsrStageDescriptor {
@@ -4706,7 +4268,6 @@ mod tests {
         // And a decoder stage under the Ctc shape must still fail closed.
         let with_decoder = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                     encoder_stage: Some(OpenAsrStageDescriptor {
@@ -4786,7 +4347,6 @@ mod tests {
                 ..base.identity
             },
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
                     encoder_stage: Some(OpenAsrStageDescriptor {
@@ -4904,7 +4464,9 @@ mod tests {
                 ..base.identity
             },
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
+                decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy {
+                    policy: decode_policy::PARAKEET_CTC_DECODE_POLICY_COMPONENT,
+                },
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                     encoder_stage: Some(OpenAsrStageDescriptor {
@@ -4965,7 +4527,9 @@ mod tests {
                 ..base.identity
             },
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
+                decode_driver: OpenAsrDecodeDriverStrategy::SharedCtcGreedy {
+                    policy: decode_policy::PARAKEET_CTC_DECODE_POLICY_COMPONENT,
+                },
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::Ctc,
                     encoder_stage: Some(OpenAsrStageDescriptor {
@@ -4995,7 +4559,6 @@ mod tests {
         // An autoregressive shape missing its required decoder stage is rejected.
         let llm_without_decoder = OpenAsrArchitectureDescriptor {
             topology_contract: OpenAsrTopologyContract {
-                decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                 block_stack: OpenAsrBlockStackStrategy::Shared(OpenAsrBlockStackDescriptor {
                     orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
                     encoder_stage: Some(OpenAsrStageDescriptor {

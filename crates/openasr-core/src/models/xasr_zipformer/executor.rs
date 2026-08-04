@@ -187,7 +187,7 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
                 reason,
             )
         };
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let output = transcribe_xasr_zipformer_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
@@ -259,7 +259,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             reject_xasr_phrase_bias(&request.selected_family)?;
         }
 
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         // The pool key and the prepared encoder graph bake the backend at
         // checkout, so the session's execution preference must be installed
         // before the runtime is selected.

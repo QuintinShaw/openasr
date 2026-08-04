@@ -32,6 +32,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -47,7 +48,7 @@ use crate::models::oasr_metadata::{
     TOKENIZER_GGML_TOKENS_KEY,
 };
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 use super::runtime_contract::{
@@ -56,10 +57,25 @@ use super::runtime_contract::{
 use super::tensor_names::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: FUNASR_NANO_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_funasr_nano_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_funasr_nano_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 const SOURCE_META_JSON: &str = "funasr_nano_meta.json";
@@ -79,9 +95,10 @@ pub struct FunasrNanoImportRequest {
     pub quantization: FunasrNanoQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunasrNanoImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -177,9 +194,11 @@ pub fn convert_local_funasr_nano_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(FunasrNanoImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: meta.llm.vocab_size,
     })
 }
@@ -611,16 +630,12 @@ fn funasr_nano_tensor_storage(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return FunasrNanoTensorStorage::F16;
     }
-    let ne0 = dims[0];
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    match classify_quant_tensor(ne0, quantization, component) {
+    match classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_funasr_nano_quant_tensor_role(name),
+        QuantizedAxis::First,
+    ) {
         Some(qtype) => FunasrNanoTensorStorage::Quantized(qtype),
         // Unaligned matmul widths keep the (higher-precision) fp16-mode
         // representation, same fallback every other importer uses.

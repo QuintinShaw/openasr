@@ -407,7 +407,7 @@ impl Qwen3AsrGgmlExecutor {
 
         let profile_started_at = qwen_decode_profile_start();
         let preflight_started_at = qwen_decode_profile_start();
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         qwen_decode_profile_log_opt("runtime_preflight", preflight_started_at);
         let prepared_runtime_started_at = qwen_decode_profile_start();
         let result = self
@@ -1749,6 +1749,12 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
 }
 
 impl GgmlAsrViewExecutor for Qwen3AsrGgmlExecutor {
+    fn adapter_binding_strategy(
+        &self,
+    ) -> crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy {
+        crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy::Qwen3AsrLoraV1
+    }
+
     fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
         Qwen3AsrGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
     }
@@ -1845,6 +1851,12 @@ fn qwen_execute_error_to_ggml(
 }
 
 impl GgmlAsrStreamingExecutor for Qwen3AsrGgmlExecutor {
+    fn adapter_binding_strategy(
+        &self,
+    ) -> crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy {
+        crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy::Qwen3AsrLoraV1
+    }
+
     fn executor_id(&self) -> &'static str {
         QWEN3_STREAMING_EXECUTOR_ID
     }
@@ -2040,7 +2052,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight,
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                runtime_source_preflight,
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             ),
@@ -2058,7 +2073,7 @@ mod tests {
     }
 
     fn plan_qwen_request_decoder_state(request: &mut GgmlAsrExecutionViewRequest<'_>) {
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         // The shared view intentionally borrows PCM, while the common offline
         // planning helper accepts the public owned DTO. This copy is test-only
         // and keeps the production execute_view path zero-copy.
@@ -2275,7 +2290,7 @@ mod tests {
             write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec)
                 .expect("write gguf fixture");
             let request = qwen_request(runtime_path);
-            let preflight = &request.runtime_source_preflight;
+            let preflight = request.runtime_source_preflight();
             executor
                 .build_prepared_runtime(request.selected_family.model_architecture, preflight)
                 .expect("prepared runtime should build");
@@ -2289,7 +2304,7 @@ mod tests {
         let fixture_spec = qwen_tensor_ready_fixture_spec();
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).expect("write gguf fixture");
         let request = qwen_request(runtime_path);
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let executor = Qwen3AsrGgmlExecutor::default();
         let prepared = executor
             .build_prepared_runtime(request.selected_family.model_architecture, preflight)
@@ -2374,11 +2389,13 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight:
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
                 crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
                     &pack_path,
                 )
                 .expect("qwen runtime pack must pass preflight"),
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             ),

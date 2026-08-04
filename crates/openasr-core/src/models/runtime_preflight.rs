@@ -35,3 +35,18 @@ pub(crate) fn leaked_tiny_runtime_source_preflight()
         })
         .clone()
 }
+
+/// Wraps a request-only test preflight in the same proof value required by
+/// production execution seams. Test fixtures still use a tiny synthetic GGUF,
+/// but they cannot silently regress to constructing an execution request from
+/// a bare preflight.
+#[cfg(test)]
+pub(crate) fn verified_pack_from_preflight_for_test(
+    preflight: crate::ggml_runtime::GgufRuntimeSourcePreflight,
+    model_architecture: &'static str,
+) -> crate::models::pack_verifier::VerifiedPack {
+    crate::models::pack_verifier::VerifiedPack::from_unverified_preflight_for_test(
+        preflight,
+        model_architecture,
+    )
+}

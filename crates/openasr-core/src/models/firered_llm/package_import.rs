@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -75,7 +76,7 @@ use crate::models::local_source_import::{
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 use super::tensor_names::{
@@ -153,9 +154,10 @@ pub struct FireRedLlmImportRequest {
     pub quantization: FireRedLlmQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FireRedLlmImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -305,9 +307,11 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(FireRedLlmImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: tokens.len(),
     })
 }
@@ -571,6 +575,7 @@ fn target_dims_for_class(
 }
 
 fn quantized_tensor_type_for_encoder_adapter_tensor(
+    name: &str,
     class: TensorClass,
     dims: &[u64],
     quantization: FireRedLlmQuantizationMode,
@@ -584,10 +589,12 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
     ) {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // This builder emits only the acoustic encoder + its adapter (the audio
-    // tower feeding the Qwen2 LLM), so every tensor here carries the floor.
-    classify_quant_tensor(ne0, quantization, QuantComponent::Encoder)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_firered_llm_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the two halves this importer combines
@@ -596,11 +603,10 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
 /// `map_adapter_tensor_name` targets `adapter.*`
 /// (`ADAPTER_LINEAR{1,2}_{WEIGHT,BIAS}` in `tensor_names`). Both halves come
 /// from `build_encoder_adapter_runtime_tensors` and always carry the Q8_0
-/// floor (`quantized_tensor_type_for_encoder_adapter_tensor` above always
-/// classifies `QuantComponent::Encoder`). The `llm.*` tensors from the
+/// floor. The `llm.*` tensors from the
 /// separate `build_llm_runtime_tensors` half (`remap_qwen2_tensor_name` /
 /// `qwen2_llm_layer_tensor_names`) are the Qwen2 text decoder, classified
-/// `QuantComponent::Decoder` and NOT covered by this list -- they keep the
+/// text-decoder role and NOT covered by this list -- they keep the
 /// full requested rung, so a pack's `.oasr` legitimately mixes Q8_0
 /// encoder/adapter tensors with e.g. Q4_K `llm.*` tensors. Shared with
 /// `models::pack_quant_audit`'s encoder-floor rule -- the single source of
@@ -610,10 +616,25 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "adapter."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: FIRERED_LLM_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_firered_llm_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_firered_llm_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.starts_with("llm.") && name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn build_encoder_adapter_runtime_tensors(
     safetensors: &SafetensorsFile,
@@ -646,6 +667,7 @@ fn build_encoder_adapter_runtime_tensors(
         let target_dims = target_dims_for_class(tensor.shape.as_slice(), class)?;
         let data = safetensors.tensor_data(tensor)?;
         let write_tensor = match quantized_tensor_type_for_encoder_adapter_tensor(
+            &target_name,
             class,
             &target_dims,
             quantization,
@@ -944,10 +966,14 @@ fn quantized_tensor_type_for_qwen2(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
     // This builder emits only the Qwen2 text decoder/LLM, which keeps the full
     // requested rung (the audio encoder floor does not apply here).
-    classify_quant_tensor(ne0, quantization, QuantComponent::Decoder)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_firered_llm_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 fn build_llm_runtime_tensors(
@@ -1525,7 +1551,7 @@ mod tests {
     /// declared prefix, and every Qwen2 LLM target name must NOT -- the
     /// invariant an earlier `EntirePack` audit rule got wrong (it floored
     /// `llm.*` tensors too, which this importer legitimately quantizes to the
-    /// full requested rung via `QuantComponent::Decoder`).
+    /// full requested rung as text-decoder matrices).
     #[test]
     fn audio_encoder_tensor_name_prefixes_match_the_encoder_adapter_half_only() {
         let is_encoder_name = |name: &str| {
@@ -1610,6 +1636,7 @@ mod tests {
         // just not sub-Q8).
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
+                "enc.blk.0.ffn1.weight",
                 TensorClass::Linear,
                 &[1280, 5120],
                 FireRedLlmQuantizationMode::Q4_K
@@ -1618,6 +1645,7 @@ mod tests {
         );
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
+                "enc.blk.0.conv.weight",
                 TensorClass::ConvKernel,
                 &[33, 1, 2560],
                 FireRedLlmQuantizationMode::Q4_K
@@ -1626,6 +1654,7 @@ mod tests {
         );
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
+                "enc.blk.0.ffn1.weight",
                 TensorClass::Linear,
                 &[2560, 3584],
                 FireRedLlmQuantizationMode::Fp16

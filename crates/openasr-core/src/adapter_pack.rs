@@ -39,15 +39,16 @@
 //! optional adapter path (`openasr transcribe --adapter` plumbs it through the
 //! native transcription request). The `OPENASR_ADAPTER` environment variable
 //! remains the SERVER-side process-level surface and acts as the fallback when
-//! the request does not name an adapter. Only the moonshine family supports
-//! dynamic adapters; every other family fails closed when an adapter is
-//! active.
+//! the request does not name an adapter. Only families with a concrete
+//! `GgmlAdapterBindingStrategy` (currently Moonshine and Qwen3-ASR) accept
+//! dynamic adapters; every other family fails closed when one is active.
 
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -78,8 +79,9 @@ pub fn active_adapter_path(request_adapter_path: Option<&Path>) -> Option<PathBu
     std::env::var_os(OPENASR_ADAPTER_ENV).map(PathBuf::from)
 }
 
-/// Conventional extension for adapter packs (advisory; the reader is
-/// magic-driven like `.oasr` and does not gate on the extension).
+/// Required user-facing extension for adapter packs. The extension is only the
+/// outer routing gate; the production reader still validates GGUF magic and the
+/// complete OADP metadata/tensor contract.
 pub const OPENASR_ADAPTER_PACK_EXTENSION: &str = "oadp";
 
 pub const OADP_KEY_PACKAGE_KIND: &str = "openasr.package.kind";
@@ -205,6 +207,8 @@ impl LoraAdapterPack {
 
 #[derive(Debug, Error)]
 pub enum AdapterPackError {
+    #[error("adapter pack '{path}' must use the .oadp extension")]
+    UnexpectedExtension { path: PathBuf },
     #[error("adapter pack '{path}' could not be read: {reason}")]
     Unreadable { path: PathBuf, reason: String },
     #[error(
@@ -291,6 +295,16 @@ pub enum AdapterPackError {
     MinVersionUnsatisfied { required: String, current: String },
     #[error("adapter pack write failed for '{path}': {reason}")]
     WriteFailed { path: PathBuf, reason: String },
+    #[error("adapter pack output path already exists: {path}")]
+    OutputExists { path: PathBuf },
+    #[error("could not construct adapter-pack staging path for '{path}'")]
+    InvalidOutputPath { path: PathBuf },
+    #[error("written adapter pack '{path}' failed its production reader: {reason}")]
+    WrittenPackInvalid { path: PathBuf, reason: String },
+    #[error("could not durably persist adapter pack '{path}': {reason}")]
+    Durability { path: PathBuf, reason: String },
+    #[error("could not expose verified adapter pack '{path}': {reason}")]
+    Expose { path: PathBuf, reason: String },
 }
 
 /// Read and structurally validate a `.oadp` adapter pack. This validates the
@@ -298,12 +312,28 @@ pub enum AdapterPackError {
 /// [`validate_lora_adapter_base_binding`].
 pub fn read_lora_adapter_pack(path: impl AsRef<Path>) -> Result<LoraAdapterPack, AdapterPackError> {
     let path = path.as_ref();
-    let runtime_source =
-        validate_ggml_runtime_source_path(path).map_err(|error| AdapterPackError::Unreadable {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
-        })?;
+    let runtime_source = validate_lora_adapter_runtime_source_path(path)?;
     read_lora_adapter_pack_from_runtime_source(&runtime_source)
+}
+
+pub(crate) fn validate_lora_adapter_runtime_source_path(
+    path: &Path,
+) -> Result<GgmlRuntimeSource, AdapterPackError> {
+    ensure_lora_adapter_extension(path)?;
+    validate_ggml_runtime_source_path(path).map_err(|error| AdapterPackError::Unreadable {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })
+}
+
+fn ensure_lora_adapter_extension(path: &Path) -> Result<(), AdapterPackError> {
+    if path.extension().and_then(|value| value.to_str()) == Some(OPENASR_ADAPTER_PACK_EXTENSION) {
+        Ok(())
+    } else {
+        Err(AdapterPackError::UnexpectedExtension {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 /// Read one adapter from the exact already-open file generation supplied by
@@ -587,10 +617,16 @@ pub struct LoraAdapterWriteRequest {
     pub targets: Vec<LoraAdapterWriteTarget>,
 }
 
-/// Write a `.oadp` adapter pack (GGUF-v0 payload). Used by the hand-made
-/// adapter tooling and the real-pack test suite.
-pub fn write_lora_adapter_pack(request: &LoraAdapterWriteRequest) -> Result<(), AdapterPackError> {
+/// Write, verify, and atomically expose a `.oadp` adapter pack.
+///
+/// The returned value was parsed from the exact staged bytes that were linked
+/// into `output_path`; callers do not need to reopen the path merely to prove
+/// that the writer emitted a pack accepted by the production reader.
+pub fn write_lora_adapter_pack(
+    request: &LoraAdapterWriteRequest,
+) -> Result<LoraAdapterPack, AdapterPackError> {
     let path = request.output_path.as_path();
+    ensure_lora_adapter_extension(path)?;
     let write_failed = |reason: String| AdapterPackError::WriteFailed {
         path: path.to_path_buf(),
         reason,
@@ -694,7 +730,89 @@ pub fn write_lora_adapter_pack(request: &LoraAdapterWriteRequest) -> Result<(), 
         ));
     }
 
-    write_gguf_file_v0(path, &metadata, &tensors).map_err(|error| write_failed(error.to_string()))
+    if path.exists() {
+        return Err(AdapterPackError::OutputExists {
+            path: path.to_path_buf(),
+        });
+    }
+    let staging_path = adapter_staging_path_for(path)?;
+    let mut staging = AdapterPackStaging::new(staging_path);
+    write_gguf_file_v0(staging.path(), &metadata, &tensors)
+        .map_err(|error| write_failed(error.to_string()))?;
+    File::open(staging.path())
+        .and_then(|file| file.sync_all())
+        .map_err(|error| AdapterPackError::Durability {
+            path: staging.path().to_path_buf(),
+            reason: error.to_string(),
+        })?;
+    let staging_source = validate_ggml_runtime_source_path(staging.path()).map_err(|error| {
+        AdapterPackError::WrittenPackInvalid {
+            path: staging.path().to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
+    let mut verified =
+        read_lora_adapter_pack_from_runtime_source(&staging_source).map_err(|error| {
+            AdapterPackError::WrittenPackInvalid {
+                path: staging.path().to_path_buf(),
+                reason: error.to_string(),
+            }
+        })?;
+    fs::hard_link(staging.path(), path).map_err(|error| AdapterPackError::Expose {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    staging.committed = true;
+    crate::atomic_file::sync_parent_dir_best_effort(path);
+    let _ = fs::remove_file(staging.path());
+    verified.source_path = path.to_path_buf();
+    Ok(verified)
+}
+
+struct AdapterPackStaging {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl AdapterPackStaging {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AdapterPackStaging {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn adapter_staging_path_for(output_path: &Path) -> Result<PathBuf, AdapterPackError> {
+    static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| AdapterPackError::InvalidOutputPath {
+            path: output_path.to_path_buf(),
+        })?;
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AdapterPackError::InvalidOutputPath {
+            path: output_path.to_path_buf(),
+        })?;
+    Ok(parent.join(format!(
+        ".{file_name}.openasr-adapter-write-{}-{}.tmp",
+        std::process::id(),
+        NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+    )))
 }
 
 /// The moonshine LoRA target contract: the 2-D linears that the dynamic
@@ -1228,9 +1346,11 @@ mod tests {
     fn adapter_pack_roundtrip_f32() {
         let dir = TempDir::new().expect("tempdir");
         let request = base_request(dir.path());
-        write_lora_adapter_pack(&request).expect("write adapter pack");
+        let written = write_lora_adapter_pack(&request).expect("write adapter pack");
+        assert_eq!(written.source_path, request.output_path);
 
         let pack = read_lora_adapter_pack(&request.output_path).expect("read adapter pack");
+        assert_eq!(written.file_sha256, pack.file_sha256);
         assert_eq!(pack.manifest.id, "test-adapter");
         assert_eq!(pack.manifest.version, 1);
         assert_eq!(pack.manifest.base_model_id, "moonshine-tiny");
@@ -1247,6 +1367,36 @@ mod tests {
         assert_eq!(target.b_values, vec![0.25; 10]);
         assert!(pack.fingerprint().contains("test-adapter"));
         assert!(pack.fingerprint().contains(&pack.file_sha256));
+    }
+
+    #[test]
+    fn adapter_writer_is_no_clobber_and_leaves_no_staging_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let request = base_request(dir.path());
+        let first = write_lora_adapter_pack(&request).expect("first write");
+        let first_bytes = fs::read(&request.output_path).expect("read first output");
+
+        let error = write_lora_adapter_pack(&request).expect_err("second write must not clobber");
+        assert!(matches!(error, AdapterPackError::OutputExists { .. }));
+        assert_eq!(
+            fs::read(&request.output_path).expect("read preserved output"),
+            first_bytes
+        );
+        assert_eq!(
+            read_lora_adapter_pack(&request.output_path)
+                .expect("preserved output remains valid")
+                .file_sha256,
+            first.file_sha256
+        );
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("read tempdir")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("openasr-adapter-write"))
+        );
     }
 
     #[test]
@@ -1298,7 +1448,7 @@ mod tests {
     #[test]
     fn non_adapter_pack_fails_closed_on_kind() {
         let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("not-adapter.gguf");
+        let path = dir.path().join("not-adapter.oadp");
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "openasr.model.id".to_string(),
@@ -1314,6 +1464,22 @@ mod tests {
 
         let error = read_lora_adapter_pack(&path).expect_err("must fail closed");
         assert!(matches!(error, AdapterPackError::NotAnAdapterPack { .. }));
+    }
+
+    #[test]
+    fn adapter_reader_and_writer_reject_non_oadp_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut request = base_request(dir.path());
+        request.output_path = dir.path().join("adapter.gguf");
+        assert!(matches!(
+            write_lora_adapter_pack(&request).expect_err("writer extension gate"),
+            AdapterPackError::UnexpectedExtension { .. }
+        ));
+        std::fs::write(&request.output_path, b"GGUF").expect("wrong-extension fixture");
+        assert!(matches!(
+            read_lora_adapter_pack(&request.output_path).expect_err("reader extension gate"),
+            AdapterPackError::UnexpectedExtension { .. }
+        ));
     }
 
     #[test]

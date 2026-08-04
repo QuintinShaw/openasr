@@ -520,7 +520,7 @@ impl FunasrNanoGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
 
         let encoder_metadata =
             parse_funasr_nano_encoder_metadata(&*preflight.metadata).map_err(|error| {

@@ -137,10 +137,12 @@ pub(crate) enum BuiltinDecodePolicyComponentRegistryError {
 /// logits head, surfacing tokens through `greedy_token_hint` with no host
 /// logit row (the driver's hint-only step shape).
 ///
-/// The `all_seq2seq_greedy_arch_decode_policies_resolve` regression test enforces
-/// that every `*.greedy.seq2seq.*` policy IS registered, so a new seq2seq family
-/// cannot half-connect (constant present, execution descriptor missing).
-const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor] = &[
+/// ASR ownership lives in each architecture inventory row: the row embeds one
+/// of these reusable policy components in its typed decode-driver strategy.
+/// There is deliberately no second family-to-policy table here. Hy-MT2 is the
+/// sole standalone component because it is an auxiliary route, not an ASR
+/// architecture descriptor.
+pub(crate) const COHERE_TRANSCRIBE_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::COHERE_TRANSCRIBE_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
@@ -151,7 +153,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const WHISPER_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::WHISPER_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
@@ -162,7 +166,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const QWEN3_ASR_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::QWEN3_ASR_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
@@ -174,7 +180,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Text,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const MOONSHINE_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::MOONSHINE_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
@@ -187,7 +195,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const FIRERED_AED_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch`; firered has no crate-root re-export
         // (it is not selected through the ASR architecture constant surface).
@@ -202,7 +212,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const FIRERED_LLM_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as firered-aed
         // above): firered-llm has no crate-root re-export.
@@ -220,7 +232,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const FUNASR_NANO_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as
         // firered-aed above): funasr-nano has no crate-root re-export. The eot
@@ -239,7 +253,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const MIMO_ASR_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as
         // firered-aed above): mimo-asr has no crate-root re-export.
@@ -259,7 +275,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const MOSS_TD_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as
         // firered-aed above): moss-transcribe-diarize has no crate-root
@@ -288,7 +306,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const GRANITE_SPEECH_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as
         // mimo-asr above): granite-speech has no crate-root re-export.
@@ -318,7 +338,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const HYMT2_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // hymt2 is an auxiliary translation family (no arch-registry entry, no
         // crate-root re-export); its runtime resolves this descriptor directly
@@ -335,7 +357,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Text,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
-    },
+    };
+
+pub(crate) const PARAKEET_CTC_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::PARAKEET_CTC_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::CtcGreedyV0,
@@ -349,7 +373,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // parakeet-ctc-0.6b: vocab_size 1025, pad_token_id 1024 = the CTC blank
         // (cross-checked against the pack metadata at decode time).
         ctc_blank_token_id: Some(1024),
-    },
+    };
+
+pub(crate) const WAV2VEC2_CTC_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::WAV2VEC2_CTC_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::CtcGreedyV0,
@@ -361,7 +387,9 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         // wav2vec2-base-960h: vocab_size 32, pad_token_id 0 = the CTC blank.
         ctc_blank_token_id: Some(0),
-    },
+    };
+
+pub(crate) const SENSEVOICE_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::SENSEVOICE_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::CtcGreedyV0,
@@ -374,8 +402,7 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // SenseVoiceSmall: vocab_size 25055, piece 0 (`<unk>`) = the CTC blank
         // (FunASR default blank_id 0).
         ctc_blank_token_id: Some(0),
-    },
-];
+    };
 
 pub(crate) trait BuiltinSeq2SeqDecodePolicyTokenSource: PhraseBiasTokenEncoder {
     fn audio_end_token_id(&self) -> Option<u32> {
@@ -423,15 +450,29 @@ pub(crate) fn resolve_builtin_decode_policy_for_architecture(
                 model_architecture: model_architecture.to_string(),
             },
         )?;
-    resolve_builtin_decode_policy(descriptor.topology_contract.decode_policy_id)
+    descriptor
+        .topology_contract
+        .decode_driver
+        .shared_policy()
+        .ok_or_else(
+            || BuiltinDecodePolicyComponentRegistryError::UnknownDecodePolicy {
+                decode_policy_id: descriptor
+                    .topology_contract
+                    .decode_driver
+                    .decode_policy_id()
+                    .to_string(),
+            },
+        )
 }
 
 pub(crate) fn resolve_builtin_decode_policy(
     decode_policy_id: &str,
 ) -> Result<BuiltinDecodePolicyComponentDescriptor, BuiltinDecodePolicyComponentRegistryError> {
-    BUILTIN_DECODE_POLICY_COMPONENTS
+    OpenAsrArchitectureRegistry::with_builtins()
+        .descriptors()
         .iter()
-        .copied()
+        .filter_map(|architecture| architecture.topology_contract.decode_driver.shared_policy())
+        .chain(std::iter::once(HYMT2_DECODE_POLICY_COMPONENT))
         .find(|descriptor| descriptor.decode_policy_id == decode_policy_id)
         .ok_or_else(
             || BuiltinDecodePolicyComponentRegistryError::UnknownDecodePolicy {
@@ -969,17 +1010,15 @@ mod tests {
         use crate::arch::OpenAsrDecodeDriverStrategy;
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
             match descriptor.topology_contract.decode_driver {
-                OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy => {
-                    let policy = resolve_builtin_decode_policy(
-                        descriptor.topology_contract.decode_policy_id,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "shared seq2seq family '{}' policy '{}' missing: {error}",
-                            descriptor.identity.model_family,
-                            descriptor.topology_contract.decode_policy_id
-                        )
-                    });
+                OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy { policy } => {
+                    let resolved = resolve_builtin_decode_policy(policy.decode_policy_id)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "shared seq2seq family '{}' policy '{}' missing: {error}",
+                                descriptor.identity.model_family, policy.decode_policy_id
+                            )
+                        });
+                    assert_eq!(resolved, policy);
                     assert_eq!(
                         policy.execution_kind,
                         BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
@@ -987,17 +1026,15 @@ mod tests {
                         descriptor.identity.model_family
                     );
                 }
-                OpenAsrDecodeDriverStrategy::SharedCtcGreedy => {
-                    let policy = resolve_builtin_decode_policy(
-                        descriptor.topology_contract.decode_policy_id,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "shared CTC family '{}' policy '{}' missing: {error}",
-                            descriptor.identity.model_family,
-                            descriptor.topology_contract.decode_policy_id
-                        )
-                    });
+                OpenAsrDecodeDriverStrategy::SharedCtcGreedy { policy } => {
+                    let resolved = resolve_builtin_decode_policy(policy.decode_policy_id)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "shared CTC family '{}' policy '{}' missing: {error}",
+                                descriptor.identity.model_family, policy.decode_policy_id
+                            )
+                        });
+                    assert_eq!(resolved, policy);
                     assert_eq!(
                         policy.execution_kind,
                         BuiltinDecodePolicyExecutionKind::CtcGreedyV0,
@@ -1010,12 +1047,11 @@ mod tests {
                         descriptor.identity.model_family
                     );
                 }
-                OpenAsrDecodeDriverStrategy::Dedicated { .. } => {
+                OpenAsrDecodeDriverStrategy::Dedicated {
+                    decode_policy_id, ..
+                } => {
                     assert!(
-                        resolve_builtin_decode_policy(
-                            descriptor.topology_contract.decode_policy_id,
-                        )
-                        .is_err(),
+                        resolve_builtin_decode_policy(decode_policy_id).is_err(),
                         "dedicated family '{}' must not register on the shared decode driver",
                         descriptor.identity.model_family
                     );

@@ -48,12 +48,14 @@ implementation details; the lifecycle and descriptor contracts are normative:
 
 - Top-level dispatch by `model_architecture` (`models/ggml_composed_executor.rs`).
 - Pack admission through `PackEnvelope` -> `PackVerifier` -> `VerifiedPack` ->
-  `AdmittedPack`; product paths carry the proof, while the public direct-path
-  ingress converts its candidate to the same proof exactly once at the seam.
+  `AdmittedPack`; public converters return the writer's proof beside a diagnostic
+  output path, execute requests carry the proof, and the direct-path ingress
+  converts an untrusted candidate exactly once at the seam.
 - The shared greedy decode loop, driven by your one step-executor impl
   (`models/seq2seq_greedy_decode.rs`).
-- The decode policy (stop tokens, suppression, text post-processing), keyed by
-  `decode_policy_id` (`models/decode_policy_component_registry.rs`).
+- The decode policy (stop tokens, suppression, text post-processing) embedded in
+  the row's typed decode-driver strategy. Reusable policy constants live in
+  `models/decode_policy_component_registry.rs`; there is no separate family map.
 - Layer-stack assembly over the shared `nn/` blocks plus the `compose_*` walkers
   and `validate_stage_against_descriptor`, which fails closed unless the stack
   matches the descriptor's shape / kind / scope / count (`arch/`).
@@ -66,7 +68,7 @@ implementation details; the lifecycle and descriptor contracts are normative:
   reusable component to its typed component registry once, then reference it
   from inventory rows.
 - Generated offline/streaming dispatch, executor force-linking, validator
-  dispatch, ownership/eviction coverage, and audit enumeration from the one
+  dispatch, shared ownership/eviction coverage, and audit enumeration from the one
   descriptor inventory. Do not add a central hand-written match.
 - One-open GGUF provenance through
   [`GgufRuntimeSourcePreflight`](design/runtime-source-preflight.md): contract
@@ -93,15 +95,18 @@ the one `OpenAsrArchitectureDescriptor` row in `arch/mod.rs`. Every required
 facet must be explicit: `identity`, `pack_contract`, `execution_contract`,
 `topology_contract`, `optimization_contract`, `quantization_contract`, and
 `conformance_contract`. The row supplies component ids, an hparam schema in
-`arch/hparams.rs`, the runtime validator, the streaming cadence, ownership and
-eviction policy, encoder attention span, semantic tensor classification, and a
-named decode/block strategy.
+`arch/hparams.rs`, the runtime validator, streaming cadence, encoder attention
+span, semantic tensor classification, and named decode/block strategies.
+Ownership, content-id eviction, graph reuse, cancellation, and admission are
+shared-module invariants and are deliberately not self-declared by each family.
 
 The execution facet also requires explicit typed capability choices:
 
 - `phrase_bias`: `Unsupported`, `Always`, or `RequiresTensor { tensor_name }`;
   the last case is valid only when pack preflight proves that tensor exists.
-- `supports_lora_adapter`: whether the shared LoRA binding seam is available.
+- `adapter_binding`: `Unsupported` or the concrete executable binding strategy
+  implemented by the family executor. Dispatch cross-checks both sides; a bool
+  cannot self-certify support.
 - `word_timestamps`: `DecodeInvariant` or `DecodeSensitive`.
 - `prepared_runtime`: `FamilyOwned` or an existing shared reusable component.
 
@@ -121,13 +126,14 @@ The migration reference order is FunASR-Nano (pack contract), Parakeet-CTC
 (dedicated-topology boundary). Follow that order when choosing examples for a
 new contributor guide or migration.
 
-## Step 2 — DATA: register the decode policy
+## Step 2 — DATA: select the decode policy
 
-Add a descriptor to the decode-policy registry keyed by your `decode_policy_id`:
-execution kind (greedy seq2seq or CTC), stop-token kind, suppression, and
-text-normalization rules. Set the matching `topology_contract.decode_driver` to
-the shared seq2seq/CTC driver or to a dedicated driver with a structural reason.
-This is policy data; the shared loop and cancellation fence remain shared.
+Set `topology_contract.decode_driver` to the shared seq2seq/CTC strategy carrying
+the exact `BuiltinDecodePolicyComponentDescriptor`, or to a dedicated driver
+with a structural reason. Reuse an existing policy constant when behavior is
+identical; add one reusable constant only for genuinely new policy behavior.
+Do not add a family-to-policy match table. The shared loop and cancellation fence
+remain shared.
 
 ## Step 3 — CODE: the per-architecture pieces (the irreducible part)
 
@@ -155,9 +161,11 @@ contract:
 - Expose one `runtime_factory` in the descriptor row. The inventory projects it
   into offline and streaming dispatch; do not edit a central match or registry.
 
-The adapter must not contain backend/platform branches, a second runtime cache,
-or a second cancellation callback. Reusable math belongs in `nn/`, ggml, or a
-shared backend-neutral layer; the family only consumes the resulting interface.
+The adapter must not parse backend/provider names, create a second runtime cache,
+or install a second cancellation callback. Reusable math belongs in `nn/`, ggml,
+or a shared backend-neutral layer; the family consumes typed backend kinds and
+capabilities. A typed backend-kind branch may express a real mathematical or
+correctness policy, but raw provider spelling and platform discovery stay shared.
 If a family can use an existing prepared-runtime or weight component, select it
 in the execution facet; do not add a family-id branch. Only a genuinely new
 reusable component may extend its typed component registry.
@@ -199,10 +207,13 @@ switch — there isn't one.
 Package import is part of onboarding, not a separate publishing concern. The
 family importer must write through `PackEnvelope`/`OasrPackWriter`; the writer
 runs `PackVerifier` on the exact staged bytes and returns `VerifiedPack` before
-the importer can expose its result. The install and runtime path creates and
-carries the corresponding proof into `AdmittedPack`; product execution cannot
-fall back to a bare path or a second family-local preflight. The public direct
-path ingress is the only candidate seam and verifies once before dispatch.
+the importer can expose its result. Every public converter result carries that
+same proof; its `output_path` is diagnostic, not an execution capability. The
+install and runtime path creates and carries the corresponding proof into
+`AdmittedPack`; the core execute request consumes `VerifiedPack` and cannot fall
+back to a bare path or a second family-local preflight. The public direct-path
+ingress is the only candidate seam and verifies once before dispatch. FFI open
+does the same full verification once and retains the proof for later calls.
 Catalog installs additionally bind the signed catalog family to the family
 projected from the verified route inside staging, before any content object is
 exposed. Auxiliary packs use the same verifier and content admission with an
@@ -226,6 +237,14 @@ profile or gate declaration is a compile-time/weight-free-CI failure. Real
 weights, backend smoke, and benchmark receipts remain release/manual gates
 unless a dedicated artifact-backed CI job runs them; passing ordinary
 weight-free CI is not evidence of measured performance or quality.
+
+Artifact-backed recipes are deliberately not runtime registries. When local
+weights exist, add the family-specific source path/import arguments to
+`tooling/native-streaming-smoke/streaming_smoke.py`; when a catalog family is
+published, add its documentation evidence keywords to
+`tooling/publish-model/scripts/check_catalog_drift.py`. These rosters own test
+assets and prose evidence, not dispatch facts, and must resolve their runtime
+identity through the generated inventory.
 
 After the pack gate, gate the execution result byte-identically:
 
@@ -371,9 +390,10 @@ did before it was caught.
   CI red**; there is no parallel classification table or exemption escape hatch.
 - `k2_registered_families_reference_a_resident_cache` then requires every
   descriptor-derived family to reference a resident-cache primitive in its own
-  module. The descriptor's required ownership/eviction facets and
-  `PreparedRuntimePool` graph-reuse contract are validated before this source
-  audit runs.
+  module. The audit parses production Rust syntax (excluding comments, imports,
+  and test-only code); shared `NativeExecutionServices` ownership, content-id
+  eviction, and prepared-runtime reuse are module invariants, not per-family
+  declaration fields.
 - Per-family byte-identity of a **cache hit vs a fresh build** is proved by that
   family's own dev-pack e2e test (`resident_*_cache_reuse_across_consecutive_calls_stays_byte_identical`),
   which the static K2 gate backstops.

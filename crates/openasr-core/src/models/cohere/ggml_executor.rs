@@ -237,7 +237,7 @@ impl CohereTranscribeGgmlExecutor {
             })?;
 
         let preflight_start = debug_timing_start();
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         emit_cohere_debug_timing_if_enabled("runtime_preflight", preflight_start, None);
         let prepared_runtime_start = debug_timing_start();
         let prepared_runtime_owner = self.runtime_cache_by_path.prepared_runtime_for_preflight(
@@ -1063,7 +1063,7 @@ mod tests {
     ) {
         use std::num::NonZeroU32;
 
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let sample_rate = NonZeroU32::new(request.prepared_audio.sample_rate_hz)
             .expect("test sample rate is non-zero");
         let invocation = crate::capacity::topology::InvocationShapeInput::new(
@@ -1101,7 +1101,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight,
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                runtime_source_preflight,
+                crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
             ),
@@ -1282,7 +1285,11 @@ mod tests {
             // the request an explicit preflight built from the held source,
             // instead of letting it re-resolve `path` itself.
             let mut request = runtime_ready_request(path.clone());
-            request.runtime_source_preflight = old_preflight.clone();
+            request.verified_pack =
+                crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                    old_preflight.clone(),
+                    crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                );
             executor
                 .execute_view(&request)
                 .expect("first execute against old pack via held preflight");
@@ -1306,7 +1313,11 @@ mod tests {
                  it was opened from was later replaced"
             );
             let mut old_request = runtime_ready_request(path.clone());
-            old_request.runtime_source_preflight = old_preflight;
+            old_request.verified_pack =
+                crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                    old_preflight,
+                    crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                );
             executor
                 .execute_view(&old_request)
                 .expect("second execute reusing the held old preflight after replacement");
@@ -1572,7 +1583,7 @@ mod tests {
         let executor = CohereTranscribeGgmlExecutor::default();
 
         let request = runtime_ready_request(runtime_path.clone());
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let runtime_a = executor
             .runtime_cache_by_path
             .prepared_runtime_for_preflight(
@@ -1622,7 +1633,7 @@ mod tests {
 
             let shared = CohereTranscribeGgmlExecutor::default();
             let request = runtime_ready_request(runtime_path);
-            let preflight = &request.runtime_source_preflight;
+            let preflight = request.runtime_source_preflight();
 
             // Cold fetch through the exact call `execute_inner` makes
             // internally for the offline path (`with_cohere_transcribe_runtime_for_preflight`
@@ -1787,7 +1798,11 @@ mod tests {
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_preflight,
+                verified_pack:
+                    crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                        runtime_source_preflight,
+                        crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                    ),
                 selected_family: builtin_adapter_descriptor(
                     crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                 ),

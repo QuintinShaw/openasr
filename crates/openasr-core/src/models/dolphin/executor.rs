@@ -888,7 +888,7 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         };
         // Gate-0 has already validated and admitted the source; use its
         // proof-carrying metadata and tensor index without reopening the path.
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         // Fail closed on an incomplete pack (missing runtime scalar keys).
         parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
@@ -1017,7 +1017,7 @@ impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
         // and aborts the whole process instead of returning a Rust error (the
         // idle_unload short-press crash), so the driver must skip that decode
         // call entirely rather than rely on catching an error afterward.
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let language_scheme = parse_dolphin_language_scheme(&preflight.metadata).map_err(fail)?;
         let min_frames = minimum_subsample_input_frames();
         let min_samples = match language_scheme {

@@ -51,13 +51,14 @@ Each facet owns one kind of fact:
   hint.
 - **Pack:** frontend, tokenizer, runtime tensor contract, importer surface, and
   the family runtime validator.
-- **Execution:** executor factory, offline/streaming cadence, ownership,
-  speaker source, invocation span, product capabilities, and typed runtime
-  policies.
+- **Execution:** executor factory, offline/streaming cadence, speaker source,
+  invocation span, product capabilities, and typed runtime policies.
 - **Topology:** decode policy, decoder-state topology, decode-driver strategy,
   and block-stack strategy.
-- **Optimization:** required ownership, prepared-runtime eviction, graph reuse,
-  encoder attention span, placement policy, and other typed policies.
+- **Optimization:** encoder attention span, placement policy, and other
+  family-varying typed policies. Universal ownership, content-id eviction, graph
+  reuse, cancellation, and admission live in shared modules and are not repeated
+  as self-certified family fields.
 - **Quantization:** semantic tensor-role classification and its quantization
   policy. Tensor spelling is an importer detail, not the final eligibility
   decision.
@@ -79,9 +80,9 @@ choice:
 - **Phrase bias:** `Unsupported`, `Always`, or `RequiresTensor { tensor_name }`.
   The `RequiresTensor` case is admitted only when the named tensor was found by
   pack preflight; runtime code must not rediscover it from a family id.
-- **LoRA binding:** a required boolean stating whether the adapter binding seam
-  is supported. The shared LoRA path owns the lifecycle; the row only states
-  whether the family exposes that seam.
+- **LoRA binding:** `Unsupported` or a concrete executable binding strategy. The
+  shared LoRA path owns the lifecycle and dispatch cross-checks the row against
+  the materialized executor, so a boolean cannot self-certify support.
 - **Word timestamps:** `DecodeInvariant` or `DecodeSensitive`, selecting the
   shared timestamp policy without a Whisper-style family branch.
 - **Prepared runtime:** `FamilyOwned` or a named shared reusable component.
@@ -114,8 +115,8 @@ layer, with all platform conformance completed before a family can use it.
 The only public lifecycle across the trust boundary is:
 
 ```text
-PackCandidate / GgufRuntimeSourcePreflight
-        -> PackVerifier -> VerifiedPack
+PackCandidate -> PackVerifier -> VerifiedPack
+                  (owns exact GgufRuntimeSourcePreflight)
         -> ContentStore -> AdmittedPack
         -> NativeExecutionServices
 ```
@@ -127,7 +128,9 @@ same verified fact together with content-store admission and the ownership
 lease. A filesystem or process boundary may begin with an untrusted path, but
 the first in-process ingress converts it to a proof value. Downstream install,
 writer, and runtime code consumes the proof and cannot fall back to reopening a
-bare path as an alternative.
+bare path as an alternative. Public converter results carry the writer-returned
+proof beside their diagnostic path; core execute requests carry `VerifiedPack`.
+FFI open performs the complete verification once and retains that proof.
 
 ### Writer rule
 
@@ -146,6 +149,12 @@ The same verifier and content identity apply to `PackRoute::Asr` and
 `PackRoute::Aux`; the route determines the family contract, not a second pack
 lifecycle. Raw GGUF writing is a crate-internal fixture/tooling primitive, not a
 production family import API.
+
+`.oadp` is a distinct, local unsigned adapter sidecar trust domain, not an ASR or
+Aux route. Its writer follows the same transactional discipline (private staging,
+production-reader verification, no-clobber exposure) and returns the parsed
+adapter pack; runtime additionally validates exact base model id and base-pack
+content hash before materialization.
 
 ### Publish staging and receipt
 
@@ -195,15 +204,14 @@ seams.
 
 ### B. Required family policies
 
-These are explicit typed fields in `optimization_contract` and
-`execution_contract`, including ownership, content-id eviction, prepared graph
-reuse, streaming granularity, decode-driver selection, encoder attention span,
-backend auto policy, phrase-bias policy, LoRA binding, word-timestamp policy,
-and prepared-runtime strategy. No `Default` or wildcard can hide a missing
-choice. Adding a policy adds a field and deliberately turns every family row
-red until it is classified. Reusing an existing prepared-runtime or other
-typed component requires no central family-id branch; only a genuinely new
-reusable component extends its typed component registry.
+These are explicit typed fields in `optimization_contract`,
+`execution_contract`, and `topology_contract`, including streaming granularity,
+decode-driver selection, encoder attention span, backend auto policy,
+phrase-bias policy, concrete LoRA binding, word-timestamp policy, and
+prepared-runtime strategy. Universal ownership, content-id eviction, and graph
+reuse stay in category A and do not appear as per-family declarations. No
+`Default` or wildcard can hide a missing choice. Adding a varying policy adds a
+field and deliberately turns every family row red until it is classified.
 
 ### C. Measured outcomes
 

@@ -44,9 +44,10 @@ use std::ptr;
 use std::sync::{Arc, OnceLock};
 
 use openasr_core::{
-    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrHardwareTarget, NativeBackend, NativeExecutionServices,
+    NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrModelPackRef, NativeAsrOfflineRequest,
+    NativeBackendExecutor, NativeExecutionServices, NativeRuntimeModelAdapter, RequestSource,
     StreamingConfig, StreamingEvent, StreamingEventKind, StreamingSession, Transcription,
-    TranscriptionBackend, TranscriptionRequest, validate_local_native_model_pack_path,
+    native_runtime_model_adapter_for_path,
 };
 
 /// Model-market C ABI: fetch/verify the signed catalog, pull (download +
@@ -148,21 +149,43 @@ pub enum OpenAsrPcmFormat {
     S16 = 1,
 }
 
-/// Opaque handle to a validated local `.oasr` model pack path. Obtained from
+/// Opaque handle to a fully verified local `.oasr` model pack. Obtained from
 /// [`openasr_model_open`], released with [`openasr_model_close`].
 ///
-/// This does not keep decoded weights resident: the underlying engine loads
-/// the pack fresh for each [`openasr_transcribe_pcm`] call (matching the CLI's
-/// own per-request load path), so the handle's job is to validate the pack
-/// once up front and fail closed before any transcription is attempted with a
-/// bad path.
+/// The handle retains the exact `VerifiedPack` generation through its native
+/// adapter/model-pack binding. Decoded weights remain owned by the shared
+/// execution services and may be evicted independently, but transcription
+/// never downgrades this handle back to a bare path and re-verifies a possibly
+/// replaced file.
 pub struct OpenAsrEngine {
     execution_services: Arc<NativeExecutionServices>,
 }
 
 pub struct OpenAsrModel {
-    pack_path: PathBuf,
+    proof: OpenAsrModelProof,
     execution_services: Arc<NativeExecutionServices>,
+}
+
+enum OpenAsrModelProof {
+    Verified {
+        adapter: NativeRuntimeModelAdapter,
+        model_pack: NativeAsrModelPackRef,
+    },
+    #[cfg(test)]
+    UnverifiedFixture,
+}
+
+impl OpenAsrModelProof {
+    fn verified(&self) -> Option<(&NativeRuntimeModelAdapter, &NativeAsrModelPackRef)> {
+        match self {
+            Self::Verified {
+                adapter,
+                model_pack,
+            } => Some((adapter, model_pack)),
+            #[cfg(test)]
+            Self::UnverifiedFixture => None,
+        }
+    }
 }
 
 struct OwnedSegment {
@@ -453,10 +476,28 @@ unsafe fn open_model_with_services(
         Ok(path) => path,
         Err(status) => return status,
     };
-    match validate_local_native_model_pack_path(&path) {
-        Ok(validated) => {
+    match (|| {
+        let adapter = native_runtime_model_adapter_for_path(&path).ok_or_else(|| {
+            openasr_core::BackendError::NativeModelPackPathRejected {
+                reason: format!(
+                    "the package at '{}' did not pass the full ASR package/runtime contract",
+                    path.display()
+                ),
+            }
+        })?;
+        let model_pack = adapter.model_pack_ref("native-ffi").map_err(|error| {
+            openasr_core::BackendError::NativeModelPackPathRejected {
+                reason: error.to_string(),
+            }
+        })?;
+        Ok::<_, openasr_core::BackendError>((adapter, model_pack))
+    })() {
+        Ok((adapter, model_pack)) => {
             let handle = Box::new(OpenAsrModel {
-                pack_path: validated,
+                proof: OpenAsrModelProof::Verified {
+                    adapter,
+                    model_pack,
+                },
                 execution_services,
             });
             // SAFETY: checked non-null above.
@@ -488,18 +529,10 @@ pub unsafe extern "C" fn openasr_model_close(model: *mut OpenAsrModel) {
     });
 }
 
-/// Builds the [`TranscriptionRequest`] for one `openasr_transcribe_pcm` call.
-/// Split out from that function so the `RequestSource` wiring is
-/// unit-testable without a real model pack (this never touches the
-/// filesystem or a backend).
-fn ffi_transcription_request(staging_path: PathBuf, pack_path: PathBuf) -> TranscriptionRequest {
-    TranscriptionRequest::new(staging_path, NATIVE_RUNTIME_MODEL_ID_AUTO)
-        // The C ABI carries no field distinguishing which host feature called
-        // in, so every embedder logs this one label -- see
-        // `RequestSource::Ffi`'s doc comment.
-        .with_source(openasr_core::RequestSource::Ffi)
-        .with_model_pack_path(Some(pack_path))
-        .with_word_timestamps(false)
+fn ffi_offline_request(staging_path: PathBuf, samples: Vec<f32>) -> NativeAsrOfflineRequest {
+    NativeAsrOfflineRequest::new(staging_path)
+        .with_source(RequestSource::Ffi)
+        .with_prepared_samples(Some(Arc::new(samples)))
 }
 
 /// Transcribes one whole in-memory 16 kHz mono PCM buffer and writes a result
@@ -596,9 +629,20 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
             return OpenAsrStatus::IoError;
         }
 
-        let request = ffi_transcription_request(staging_path, model_ref.pack_path.clone());
+        let request = ffi_offline_request(staging_path, samples_f32);
+        let Some((adapter, model_pack)) = model_ref.proof.verified() else {
+            set_last_error("openasr_transcribe_pcm: model handle has no verified package proof");
+            return OpenAsrStatus::ModelLoadFailed;
+        };
+        let executor = NativeBackendExecutor::new(Arc::clone(&model_ref.execution_services));
 
-        match NativeBackend::new(Arc::clone(&model_ref.execution_services)).transcribe(request) {
+        match NativeAsrExecutor::transcribe(
+            &executor,
+            adapter,
+            model_pack,
+            NativeAsrHardwareTarget::Auto,
+            request,
+        ) {
             Ok(transcription) => {
                 let result = Box::new(build_result(transcription, with_segments));
                 // SAFETY: checked non-null above.
@@ -1374,12 +1418,16 @@ mod tests {
     // still gets an intentional, non-default label despite carrying no
     // finer-grained caller context.
     #[test]
-    fn ffi_transcription_request_labels_source_as_ffi() {
-        let request = ffi_transcription_request(
+    fn ffi_offline_request_labels_source_and_retains_prepared_pcm() {
+        let request = ffi_offline_request(
             PathBuf::from("/tmp/openasr-ffi-staging.wav"),
-            PathBuf::from("/nonexistent/model.oasr"),
+            vec![0.25, -0.25],
         );
-        assert_eq!(request.source, openasr_core::RequestSource::Ffi);
+        assert_eq!(request.source, RequestSource::Ffi);
+        assert_eq!(
+            request.prepared_samples.as_deref().map(Vec::as_slice),
+            Some([0.25, -0.25].as_slice())
+        );
     }
 
     #[test]
@@ -1404,7 +1452,7 @@ mod tests {
         // SAFETY: the create call above returned a live engine handle.
         let engine_ref = unsafe { &*engine };
         let dependent = OpenAsrModel {
-            pack_path: PathBuf::from("/nonexistent/model.oasr"),
+            proof: OpenAsrModelProof::UnverifiedFixture,
             execution_services: Arc::clone(&engine_ref.execution_services),
         };
         assert!(Arc::ptr_eq(
@@ -1519,7 +1567,7 @@ mod tests {
         // model-null check runs before the sample-rate check, and this test
         // wants to isolate the latter.
         let fake_model = Box::into_raw(Box::new(OpenAsrModel {
-            pack_path: PathBuf::from("/nonexistent/model.oasr"),
+            proof: OpenAsrModelProof::UnverifiedFixture,
             execution_services: process_execution_services("ffi test")
                 .expect("builtin native execution services must construct for tests"),
         }));

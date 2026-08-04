@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -36,7 +37,7 @@ use crate::models::local_source_import::{
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
@@ -102,9 +103,10 @@ pub struct XasrZipformerImportRequest {
     pub quantization: XasrZipformerQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct XasrZipformerImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub blank_token_id: u32,
 }
@@ -161,9 +163,11 @@ pub fn convert_local_xasr_zipformer_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(XasrZipformerImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         blank_token_id,
     })
 }
@@ -367,18 +371,12 @@ fn quantized_tensor_type_for_xasr_tensor(
     if !name.ends_with(".weight") || dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    // The zipformer acoustic encoder is `encoder.*`; the chunk decoder
-    // (`decoder.embedding.weight`, `decoder.conv.weight`) is downstream.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_xasr_zipformer_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefix for the xasr-zipformer acoustic encoder
@@ -388,10 +386,25 @@ fn quantized_tensor_type_for_xasr_tensor(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_xasr_zipformer_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_xasr_zipformer_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn join_u32(values: &[u32]) -> String {
     values

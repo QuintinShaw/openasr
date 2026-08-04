@@ -48,6 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use crate::VerifiedPack;
 use crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -147,9 +148,10 @@ pub struct DolphinImportRequest {
     pub quantization: DolphinQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DolphinImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
     pub blank_token_id: u32,
@@ -221,9 +223,11 @@ pub fn convert_local_dolphin_wenet_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(DolphinImportResult {
         output_path: request.output_path.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size,
         blank_token_id: architecture.blank_token_id,
     })

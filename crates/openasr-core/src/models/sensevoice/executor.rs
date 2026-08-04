@@ -480,7 +480,7 @@ impl SenseVoiceGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         decode_sensevoice_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
@@ -536,7 +536,7 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let output = transcribe_sensevoice_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,

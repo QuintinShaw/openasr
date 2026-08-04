@@ -545,30 +545,24 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
         job.uses_scheduler
     }
 
-    fn effective_max_batch_for_backend_name(configured: usize, backend_name: &str) -> usize {
-        // Whisper caps Vulkan serve-batch to serial slots; delegate to the same
-        // helper `effective_max_batch_after_vram_cap` applies (AFTER the VRAM
-        // cap) so both paths agree.
-        whisper_serve_batch_effective_max_batch_for_backend_name(configured, backend_name)
-    }
-
     fn effective_max_batch_after_vram_cap(
         capped_max_batch: usize,
         job: &Self::Job,
     ) -> Result<usize, Self::Error> {
         // Applied AFTER the generic VRAM cap (order is load-bearing: it affects
-        // the engine key). Whisper resolves the concrete backend name and caps
-        // Vulkan serve-batch to serial slots. cohere / moonshine never resolve a
-        // backend name here (the default identity), preserving their behavior.
-        let backend_name =
-            GgmlCpuGraphConfig::resolve_backend_name_for(job.backend).map_err(|error| {
-                WhisperServeBatchError::DecodeFailed {
-                    reason: format!("could not resolve whisper serve-batch backend name: {error}"),
-                }
+        // the engine key). Shared runtime code resolves the concrete provider
+        // spelling into typed facts; family code never parses backend names.
+        // Cohere / moonshine keep the default identity hook and therefore do
+        // not initialize a backend guard here.
+        let capabilities = GgmlCpuGraphConfig::resolve_backend_capabilities_for(job.backend)
+            .map_err(|error| WhisperServeBatchError::DecodeFailed {
+                reason: format!(
+                    "could not resolve whisper serve-batch backend capabilities: {error}"
+                ),
             })?;
-        Ok(Self::effective_max_batch_for_backend_name(
+        Ok(whisper_serve_batch_effective_max_batch_for_capabilities(
             capped_max_batch,
-            &backend_name,
+            capabilities,
         ))
     }
 
@@ -767,11 +761,11 @@ fn whisper_serve_batch_decoder_graph_execution_config(
     }
 }
 
-fn whisper_serve_batch_effective_max_batch_for_backend_name(
+fn whisper_serve_batch_effective_max_batch_for_capabilities(
     configured_max_batch: usize,
-    backend_name: &str,
+    capabilities: crate::ggml_runtime::GgmlBackendCapabilities,
 ) -> usize {
-    if backend_name.to_ascii_lowercase().contains("vulkan") {
+    if capabilities.is_vulkan() {
         // Real server validation on Windows/RDNA showed whisper N=2 Vulkan
         // serve-batch can select empty text while serial Vulkan remains
         // correct. Keep the owner path but cap Vulkan to serial slots until
@@ -1425,11 +1419,23 @@ mod tests {
     #[test]
     fn whisper_serve_batch_effective_max_batch_caps_vulkan_to_serial() {
         assert_eq!(
-            whisper_serve_batch_effective_max_batch_for_backend_name(8, "Vulkan0"),
+            whisper_serve_batch_effective_max_batch_for_capabilities(
+                8,
+                crate::ggml_runtime::GgmlBackendCapabilities::from_backend_for_test(
+                    GgmlCpuGraphBackend::Gpu,
+                    "Vulkan0",
+                ),
+            ),
             1
         );
         assert_eq!(
-            whisper_serve_batch_effective_max_batch_for_backend_name(2, "ggml-vulkan"),
+            whisper_serve_batch_effective_max_batch_for_capabilities(
+                2,
+                crate::ggml_runtime::GgmlBackendCapabilities::from_backend_for_test(
+                    GgmlCpuGraphBackend::Gpu,
+                    "ggml-vulkan",
+                ),
+            ),
             1
         );
     }
@@ -1438,7 +1444,19 @@ mod tests {
     fn whisper_serve_batch_effective_max_batch_keeps_other_backends() {
         for backend_name in ["HIP0", "ROCm0", "CUDA0", "Metal", "CPU"] {
             assert_eq!(
-                whisper_serve_batch_effective_max_batch_for_backend_name(8, backend_name),
+                whisper_serve_batch_effective_max_batch_for_capabilities(
+                    8,
+                    crate::ggml_runtime::GgmlBackendCapabilities::from_backend_for_test(
+                        if matches!(backend_name, "Metal") {
+                            GgmlCpuGraphBackend::Metal
+                        } else if matches!(backend_name, "CPU") {
+                            GgmlCpuGraphBackend::Cpu
+                        } else {
+                            GgmlCpuGraphBackend::Gpu
+                        },
+                        backend_name,
+                    ),
+                ),
                 8,
                 "backend_name={backend_name}"
             );

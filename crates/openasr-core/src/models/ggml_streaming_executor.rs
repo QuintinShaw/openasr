@@ -97,13 +97,15 @@ mod tests {
     }
 
     fn request() -> GgmlAsrStreamingSessionRequest {
-        let runtime_source_preflight =
-            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
+        let verified_pack = crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+        );
         GgmlAsrStreamingSessionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight,
+            verified_pack,
             selected_family: crate::arch::builtin_adapter_descriptor(
                 crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             ),

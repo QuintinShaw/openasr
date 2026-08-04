@@ -3,14 +3,11 @@
 //! frontend from GGUF tensors via `build_builtin_runtime_component_bootstrap`,
 //! so they need a central place to map `architecture -> frontend plan`.
 //!
-//! The **dedicated-executor** families (Whisper, Moonshine, Parakeet-CTC,
-//! wav2vec2/data2vec-CTC) deliberately do *not* go through this registry: each
-//! owns its frontend + weight loading in its own family module and never calls
-//! `build_builtin_runtime_component_bootstrap`. To keep that boundary explicit
-//! rather than silent, every such frontend id is matched here to a fail-closed
-//! `UnsupportedMaterialization` arm (with a "dedicated executor" reason) and
-//! covered by a test — so routing one through the composer path fails loudly
-//! instead of falling into the generic unknown-frontend catch-all.
+//! Dedicated-executor families deliberately do *not* go through this registry:
+//! each owns its frontend + weight loading in its own family module and never
+//! calls `build_builtin_runtime_component_bootstrap`. The canonical architecture
+//! inventory distinguishes a known dedicated frontend from an unknown id, so
+//! this component registry does not maintain a second family/frontend list.
 
 use thiserror::Error;
 
@@ -112,36 +109,21 @@ pub(crate) fn materialize_builtin_audio_frontend(
                 found_kind: metadata_kind_label(metadata),
             },
         ),
-        (crate::WHISPER_AUDIO_FRONTEND_ID, _) => Err(
-            BuiltinAudioFrontendComponentRegistryError::UnsupportedMaterialization {
-                frontend_id: frontend_id.to_string(),
-                reason: "whisper frontend remains the hand-written reference gate".to_string(),
-            },
-        ),
-        // Dedicated-executor families: their frontend + weights load via the
-        // family's own module, not this tensor-backed composer registry. Matched
-        // explicitly (rather than via the catch-all below) so a misroute fails
-        // closed with a clear reason instead of a generic unknown-frontend error.
-        // wav2vec2's frontend id also covers data2vec (shared raw-waveform front).
-        (
-            crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID
-            | crate::arch::PARAKEET_TDT_AUDIO_FRONTEND_ID
-            | crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID
-            | crate::arch::MOONSHINE_AUDIO_FRONTEND_ID
-            | crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID
-            | crate::arch::FIRERED_AED_AUDIO_FRONTEND_ID,
-            _,
-        ) => Err(
-            BuiltinAudioFrontendComponentRegistryError::UnsupportedMaterialization {
-                frontend_id: frontend_id.to_string(),
-                reason: "frontend belongs to a dedicated executor; it loads via its family module, not the tensor-backed composer registry".to_string(),
-            },
-        ),
-        _ => Err(
-            BuiltinAudioFrontendComponentRegistryError::UnknownAudioFrontend {
-                frontend_id: frontend_id.to_string(),
-            },
-        ),
+        _ if OpenAsrArchitectureRegistry::with_builtins()
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.pack_contract.audio_frontend_id == frontend_id) =>
+        {
+            Err(
+                BuiltinAudioFrontendComponentRegistryError::UnsupportedMaterialization {
+                    frontend_id: frontend_id.to_string(),
+                    reason: "frontend belongs to a dedicated executor; it loads via its family module, not the tensor-backed composer registry".to_string(),
+                },
+            )
+        }
+        _ => Err(BuiltinAudioFrontendComponentRegistryError::UnknownAudioFrontend {
+            frontend_id: frontend_id.to_string(),
+        }),
     }
 }
 
@@ -302,30 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn whisper_frontend_stays_outside_tensor_backed_registry() {
-        let (_runtime_path, preflight) = write_cohere_preflight();
-        let metadata = RuntimeTensorContractMetadata::CohereTranscribe(
-            crate::models::cohere::runtime_contract::parse_cohere_transcribe_execution_metadata(
-                &preflight.metadata,
-            )
-            .expect("metadata"),
-        );
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
-
-        let error =
-            materialize_builtin_audio_frontend(crate::WHISPER_AUDIO_FRONTEND_ID, &reader, metadata)
-                .expect_err("whisper should remain hand-written");
-        assert!(matches!(
-            error,
-            BuiltinAudioFrontendComponentRegistryError::UnsupportedMaterialization { .. }
-        ));
-    }
-
-    #[test]
     fn dedicated_executor_frontends_fail_closed_outside_composer_registry() {
-        // Parakeet-CTC / wav2vec2-CTC / Moonshine load their frontend via their
-        // own family modules; routing them through the composer registry must
-        // fail closed (not silently hit the generic unknown-frontend arm).
+        // Derive the expected set from the inventory. A new dedicated family
+        // is covered without adding its frontend id to this test or registry.
         let (_runtime_path, preflight) = write_cohere_preflight();
         let base_metadata = RuntimeTensorContractMetadata::CohereTranscribe(
             crate::models::cohere::runtime_contract::parse_cohere_transcribe_execution_metadata(
@@ -335,14 +296,19 @@ mod tests {
         );
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
 
-        for frontend_id in [
-            crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID,
-            crate::arch::PARAKEET_TDT_AUDIO_FRONTEND_ID,
-            crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
-            crate::arch::MOONSHINE_AUDIO_FRONTEND_ID,
-            crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID,
-            crate::arch::FIRERED_AED_AUDIO_FRONTEND_ID,
-        ] {
+        let dedicated_frontend_ids = OpenAsrArchitectureRegistry::with_builtins()
+            .descriptors()
+            .iter()
+            .map(|descriptor| descriptor.pack_contract.audio_frontend_id)
+            .filter(|frontend_id| {
+                !matches!(
+                    *frontend_id,
+                    crate::COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID | crate::QWEN3_ASR_AUDIO_FRONTEND_ID
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!dedicated_frontend_ids.is_empty());
+        for frontend_id in dedicated_frontend_ids {
             let error = materialize_builtin_audio_frontend(frontend_id, &reader, base_metadata)
                 .expect_err("dedicated-executor frontend must not materialize here");
             assert!(

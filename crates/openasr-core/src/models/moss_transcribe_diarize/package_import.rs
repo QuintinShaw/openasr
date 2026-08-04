@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
@@ -75,7 +76,7 @@ use crate::models::oasr_metadata::{
     TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
 };
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 use super::runtime_contract::moss_td_kv_cache_positions;
@@ -164,9 +165,10 @@ pub struct MossTdImportRequest {
     pub quantization: MossTdQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MossTdImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -229,9 +231,11 @@ pub fn convert_local_moss_transcribe_diarize_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(MossTdImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: tokens.len(),
     })
 }
@@ -408,15 +412,19 @@ fn reversed_dims(shape: &[u64]) -> Vec<u64> {
 }
 
 fn quantized_linear_tensor_type(
+    name: &str,
     dims: &[u64],
     quantization: MossTdQuantizationMode,
-    component: QuantComponent,
 ) -> Option<GgufWriteTensorType> {
     if quantization == MossTdQuantizationMode::Fp16 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_moss_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefixes for the moss acoustic path: the whisper
@@ -428,19 +436,23 @@ fn quantized_linear_tensor_type(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["moss.enc.", "moss.adaptor."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: MOSS_TD_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_moss_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
 
-fn moss_quant_component(target_name: &str) -> QuantComponent {
-    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| target_name.starts_with(prefix))
+fn classify_moss_quant_tensor_role(target_name: &str) -> TensorRole {
+    if target_name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| target_name.starts_with(prefix))
     {
-        QuantComponent::Encoder
+        TensorRole::AcousticEncoderMatrix
+    } else if target_name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
     } else {
-        QuantComponent::Decoder
+        TensorRole::NonQuantizable
     }
 }
 
@@ -451,11 +463,7 @@ fn maybe_quantized_linear_tensor(
     target_dims: Vec<u64>,
     quantization: MossTdQuantizationMode,
 ) -> Result<GgufWriteTensor, LocalSourceImportError> {
-    match quantized_linear_tensor_type(
-        &target_dims,
-        quantization,
-        moss_quant_component(target_name),
-    ) {
+    match quantized_linear_tensor_type(target_name, &target_dims, quantization) {
         Some(tensor_type) => {
             let values = decode_safetensors_payload_as_f32(&tensor.name, &tensor.dtype, data)?;
             let expected = tensor_element_count(&tensor.name, &target_dims)?;

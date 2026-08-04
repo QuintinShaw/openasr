@@ -397,7 +397,7 @@ impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
         // Fail-closed: consume the already-admitted Gate-0 proof, then run the
         // cached prepared-runtime path against that same open source -- never
         // reopen or reparse a path inside the executor.
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let output = transcribe_parakeet_tdt_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,

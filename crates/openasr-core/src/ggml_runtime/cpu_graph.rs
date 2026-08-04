@@ -99,6 +99,63 @@ pub enum GgmlCpuGraphBackend {
     Gpu,
 }
 
+/// Backend-neutral kernel facts resolved once when a runner is created.
+///
+/// Family graph code consumes these facts instead of parsing implementation
+/// names such as `HIP0` or `Vulkan0`. Keeping provider-name recognition in the
+/// shared runtime prevents each family from growing its own incomplete
+/// platform table, while the conservative defaults preserve correctness for
+/// an unknown future backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GgmlBackendCapabilities {
+    known_discrete_gpu: bool,
+    vulkan: bool,
+    multi_query_prefill_width_multiple: usize,
+}
+
+impl GgmlBackendCapabilities {
+    fn resolve(backend: GgmlCpuGraphBackend, backend_name: &str) -> Self {
+        if !matches!(backend, GgmlCpuGraphBackend::Gpu) {
+            return Self {
+                known_discrete_gpu: false,
+                vulkan: false,
+                multi_query_prefill_width_multiple: 1,
+            };
+        }
+        let name = backend_name.to_ascii_lowercase();
+        let is_hip = name.contains("hip") || name.contains("rocm");
+        let vulkan = name.contains("vulkan");
+        let known_discrete_gpu =
+            is_hip || name.contains("cuda") || name.contains("nvidia") || vulkan;
+        Self {
+            known_discrete_gpu,
+            vulkan,
+            // Measured ggml HIP/ROCm kernels require even multi-token query
+            // widths; all other known providers accept unit alignment. An
+            // unknown provider remains conservative through
+            // `known_discrete_gpu == false` at the family policy layer.
+            multi_query_prefill_width_multiple: if is_hip { 2 } else { 1 },
+        }
+    }
+
+    pub(crate) const fn is_known_discrete_gpu(self) -> bool {
+        self.known_discrete_gpu
+    }
+
+    pub(crate) const fn is_vulkan(self) -> bool {
+        self.vulkan
+    }
+
+    pub(crate) const fn multi_query_prefill_width_multiple(self) -> usize {
+        self.multi_query_prefill_width_multiple
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_backend_for_test(backend: GgmlCpuGraphBackend, backend_name: &str) -> Self {
+        Self::resolve(backend, backend_name)
+    }
+}
+
 /// Per-family Auto-mode GPU policy: which GPU-class backend(s) Auto is
 /// allowed to pick automatically for this family. `backend == Metal` is
 /// exactly "Apple Silicon Metal" (see `default_gpu_backend_for_target`), so
@@ -493,6 +550,15 @@ impl GgmlCpuGraphConfig {
             GgmlCpuGraphBackend::Gpu => GgmlBackendGuard::gpu()?,
         };
         Ok(guard.name())
+    }
+
+    /// Resolve implementation-specific provider spelling once at the shared
+    /// runtime boundary and expose only typed facts to family policy code.
+    pub(crate) fn resolve_backend_capabilities_for(
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<GgmlBackendCapabilities, GgmlCpuGraphError> {
+        let name = Self::resolve_backend_name_for(backend)?;
+        Ok(GgmlBackendCapabilities::resolve(backend, &name))
     }
 }
 
@@ -1143,6 +1209,7 @@ pub struct GgmlCpuGraphRunner {
     backend: GgmlBackendGuard,
     backend_kind: GgmlCpuGraphBackend,
     backend_name: String,
+    backend_capabilities: GgmlBackendCapabilities,
     graph_size: usize,
     _scheduler_accel_backends: Vec<GgmlBackendGuard>,
     _scheduler_cpu_fallback: Option<GgmlBackendGuard>,
@@ -1425,11 +1492,13 @@ impl GgmlCpuGraphRunner {
         };
 
         let backend_name = backend.name();
+        let backend_capabilities = GgmlBackendCapabilities::resolve(config.backend, &backend_name);
         Ok(Self {
             context,
             backend,
             backend_kind: config.backend,
             backend_name,
+            backend_capabilities,
             graph_size: config.graph_size,
             _scheduler_accel_backends: scheduler_accel_backends,
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
@@ -1465,8 +1534,15 @@ impl GgmlCpuGraphRunner {
         self.backend_kind
     }
 
-    pub(crate) fn backend_name(&self) -> &str {
-        &self.backend_name
+    pub(crate) fn backend_capabilities(&self) -> GgmlBackendCapabilities {
+        self.backend_capabilities
+    }
+
+    /// Human-readable backend identity for diagnostics only. Family code gets
+    /// no raw provider-name accessor; executable decisions must use typed
+    /// capabilities so platform spelling cannot leak back into graph policy.
+    pub(crate) fn backend_label(&self) -> String {
+        format!("{:?}:{}", self.backend_kind, self.backend_name)
     }
 
     pub(crate) fn uses_scheduler(&self) -> bool {
@@ -7750,13 +7826,40 @@ mod tests {
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
-        AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlCpuBinaryOp, GgmlCpuGraphBackend,
-        GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError,
-        GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams, GpuProbeCache,
-        GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities, GgmlCpuBinaryOp,
+        GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
+        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
+        GpuProbeCache, GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
         flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
         gpu_probe_log_message, runtime_gpu_is_available, validate_graph_cancel_capability,
     };
+
+    #[test]
+    fn backend_capabilities_resolve_provider_names_once_and_fail_conservatively() {
+        for name in ["HIP0", "ROCm0"] {
+            let capabilities =
+                GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name);
+            assert!(capabilities.is_known_discrete_gpu());
+            assert_eq!(capabilities.multi_query_prefill_width_multiple(), 2);
+        }
+        for name in ["CUDA0", "NVIDIA", "Vulkan0"] {
+            let capabilities =
+                GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name);
+            assert!(capabilities.is_known_discrete_gpu());
+            assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
+        }
+        let unknown = GgmlBackendCapabilities::from_backend_for_test(
+            GgmlCpuGraphBackend::Gpu,
+            "future-provider",
+        );
+        assert!(!unknown.is_known_discrete_gpu());
+        assert_eq!(unknown.multi_query_prefill_width_multiple(), 1);
+        for backend in [GgmlCpuGraphBackend::Cpu, GgmlCpuGraphBackend::Metal] {
+            let capabilities = GgmlBackendCapabilities::from_backend_for_test(backend, "HIP0");
+            assert!(!capabilities.is_known_discrete_gpu());
+            assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
+        }
+    }
 
     fn softplus_reference(value: f32) -> f32 {
         value.max(0.0) + (-(value.abs())).exp().ln_1p()

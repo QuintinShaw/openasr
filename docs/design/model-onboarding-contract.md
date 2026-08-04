@@ -33,8 +33,9 @@ Register the family as one complete
 `crates/openasr-core/src/arch/mod.rs::BUILTIN_ARCHITECTURE_DESCRIPTORS`.
 Every facet is required: `identity`, `pack_contract`, `execution_contract`,
 `topology_contract`, `optimization_contract`, `quantization_contract`, and
-`conformance_contract`. Component ids still resolve through the matching
-`BUILTIN_COMPONENT_DESCRIPTORS` table.
+`conformance_contract`. Each component id resolves through its narrow typed
+component registry only when materialization is needed; there is no giant
+shadow component table mirroring every architecture row.
 
 The executor is materialized through the descriptor's typed runtime factory
 (`materialize_builtin_executor::<E>`) into the service-owned executor scope.
@@ -95,21 +96,29 @@ weight-placement gate. It intentionally does not run model weights, real
 backend smoke, or benchmarks; those C-class obligations require release/manual
 receipts and remain part of the reviewer checklist below.
 
+The real-weight streaming recipe list and catalog documentation-keyword map are
+artifact/prose evidence rosters, not runtime family registries. Add an entry
+only when providing that corresponding smoke asset or public catalog family;
+the entry must resolve its profile/family through the generated Rust inventory
+instead of restating runtime capabilities.
+
 ### 2. Pack proof and admission
 
 Every ASR and auxiliary importer uses `PackEnvelope` and the transactional
 `OasrPackWriter`, then verifies the exact staged bytes through `PackVerifier`:
 
 ```text
-PackCandidate / GgufRuntimeSourcePreflight
-        -> PackVerifier -> VerifiedPack
+PackCandidate -> PackVerifier -> VerifiedPack
+                  (owns exact GgufRuntimeSourcePreflight)
         -> ContentStore -> AdmittedPack
         -> NativeExecutionServices
 ```
 
 `VerifiedPack` and `AdmittedPack` are proof values with non-forgeable
-construction. Publish, install, and runtime entry points consume them rather
-than accepting a bare path. `PackRoute::Asr` and `PackRoute::Aux` share the
+construction. Publish, install, core execute, and runtime entry points consume
+them rather than accepting a bare path or preflight as package proof. Public
+converter results carry the writer-returned proof; FFI open verifies once and
+retains it. `PackRoute::Asr` and `PackRoute::Aux` share the
 verifier and content-identity lifecycle; only their route-specific contract
 differs. A family may add metadata but cannot override envelope keys or bypass
 the verifier. Once this path owns a behavior, remove any old writer, scanner,
@@ -157,11 +166,11 @@ other family.
 ### 4. Decode policy
 
 Stop tokens, suppression, and text post-processing (including longform carry)
-are data rows in
-`crates/openasr-core/src/models/decode_policy_component_registry.rs`
-(`BuiltinDecodePolicyComponentDescriptor`), keyed by the family's
-`decode_policy_id`. Add a descriptor there; do not write a new
-if/else post-processing branch elsewhere to get the same effect.
+are carried by the `BuiltinDecodePolicyComponentDescriptor` embedded in the
+row's typed decode-driver strategy. Reusable policy constants live in
+`crates/openasr-core/src/models/decode_policy_component_registry.rs`; there is
+no second family-to-policy registry. Reuse an existing constant when behavior
+matches; do not write a new if/else post-processing branch elsewhere.
 
 ### 5. Package import
 
@@ -171,8 +180,10 @@ module calls the shared helper and does not reimplement path/zip handling),
 `PackVerifier` for the exact staged bytes. The envelope owns the protected
 `openasr.*` keys documented in [`.oasr` Package Contract v1`](../format/OASR_PACKAGE_CONTRACT_V1.md);
 family metadata is additive only. The writer returns `VerifiedPack` before a
-successful importer may expose its result. Do not add a raw production writer,
-a family-local metadata validator, or a second preflight.
+successful importer may expose its result, and every public conversion result
+carries that exact proof beside its diagnostic path. Do not add a raw production
+writer, a family-local metadata validator, a proof-dropping result, or a second
+preflight.
 
 Quantization uses the shared semantic `TensorRole` classifier. Importers may
 map source names to roles once, but eligibility and axis/orientation policy are
@@ -185,12 +196,14 @@ Optimization obligations have three forms:
 
 - **Shared invariants (A):** the shared interfaces provide single-pass
   preflight, cancellation fences, content-identity admission, prepared-runtime
-  ownership, poisoned-state rebuild, and fail-closed dispatch. A family cannot
-  opt out by writing a parallel callback or cache.
-- **Typed family policy (B):** the descriptor must fill ownership, content-id
-  eviction, graph reuse, streaming granularity, decode-driver strategy,
-  encoder attention span, placement policy, and any other required policy. No
-  `Default`, wildcard, or runtime `Deferred` value is accepted.
+  ownership, content-id eviction, graph reuse, poisoned-state rebuild, and
+  fail-closed dispatch. These universal facts are not per-family fields; a
+  family cannot opt out by writing a parallel callback or cache.
+- **Typed family policy (B):** the descriptor must fill family-varying choices:
+  streaming granularity, decode-driver strategy, encoder attention span,
+  placement/auto-backend policy, phrase bias, concrete LoRA binding, word
+  timestamps, and prepared-runtime strategy. No `Default`, wildcard, or runtime
+  `Deferred` value is accepted.
 - **Measured result (C):** GPU placement, cold/warm latency, RSS, RTF, quant
   quality, and streaming cadence require conformance plus a real backend smoke
   or benchmark receipt. A descriptor bit or static code shape is not a result.
@@ -319,20 +332,24 @@ with a one-line structural justification for going another way):
       explicit: a `GlobalQuadratic` encoder uses
       `arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` unless a cited upstream source
       justifies another bound; the production attention-span tests cover it.
-- [ ] No hand-written decode step loop: `grep -rn 'for .*argmax\|while .*argmax'`
-      (or an equivalent manual scan of the new executor) turns up nothing; the
-      family implements `Seq2SeqGreedyDecodeStepExecutor` or calls
-      `ctc_greedy_decode`.
+- [ ] The AST-backed family source gate proves a shared seq2seq/CTC strategy
+      calls its declared driver in production code; the family implements
+      `Seq2SeqGreedyDecodeStepExecutor` or calls `ctc_greedy_decode`. Manual grep
+      may supplement this gate but is not the architectural proof.
 - [ ] Import uses `local_source_import` plus `PackEnvelope`/`OasrPackWriter`;
       exact staged bytes pass `PackVerifier` and yield `VerifiedPack` before
-      exposure. Untrusted paths are converted at the first ingress; no bare-path
-      fallback, raw production writer, duplicate preflight, metadata validator,
-      or zip parser is added downstream.
+      exposure, and the public result carries that proof. Untrusted paths are
+      converted at the first ingress; no bare-path fallback, raw production
+      writer, duplicate preflight, metadata validator, or zip parser is added
+      downstream.
 - [ ] ASR and auxiliary packs use the same verifier/content-admission lifecycle
       with their explicit route; auxiliary packs do not masquerade as ASR
       descriptor rows.
 - [ ] Quant handling maps source names once to shared semantic `TensorRole`s;
       no per-family quant enum or string-name eligibility table is added.
+- [ ] Family production code does not parse raw backend/provider names. It
+      consumes typed backend kind/capability values resolved by shared runtime
+      code; any typed backend branch has a documented correctness reason.
 - [ ] Tokenizer reuses `gpt2_bpe` (BPE) or the shared SPM path once it lands;
       no new hand-rolled `▁`/byte-fallback table duplicating an existing one.
 - [ ] Capabilities (`supports_phrase_bias`, `emits_punctuation`, streaming) are
@@ -343,9 +360,10 @@ with a one-line structural justification for going another way):
       `speaker_source`, and no family-local Voice ID/diarization pipeline or
       model-id allowlist was added.
 - [ ] Optimization A invariants use the shared admission, cancellation,
-      ownership, and poisoned-state seams; Optimization B policies are explicit
-      typed fields; Optimization C claims have conformance, real backend smoke,
-      or benchmark receipts. No static descriptor bit is presented as a result.
+      ownership/eviction/reuse, and poisoned-state seams rather than family
+      declaration fields; varying Optimization B policies are explicit typed
+      fields; Optimization C claims have conformance, real backend smoke, or
+      benchmark receipts. No static descriptor bit is presented as a result.
 - [ ] Generated offline/streaming dispatch, executor force-linking, validator
       routing, eviction, and audit enumeration cover the row. Any migration
       deletion gate removes the old hand-written projection and its obsolete

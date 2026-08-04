@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::arch::{
     OpenAsrArchitectureDescriptor, OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy,
     OpenAsrDecodeDriverStrategy, OpenAsrDecoderStateTopology, OpenAsrDialectCapability,
-    OpenAsrEncoderAttentionSpan, OpenAsrExecutorOwnership, OpenAsrGraphReuse,
-    OpenAsrPreparedRuntimeEviction, SpeakerSegmentationSource, StreamingPartialGranularity,
+    OpenAsrEncoderAttentionSpan, SpeakerSegmentationSource, StreamingPartialGranularity,
 };
 use crate::ggml_runtime::AutoGpuPolicy;
 use crate::models::ggml_family_adapter::{GgmlExecutionCapability, LanguageFamilyHint};
@@ -86,7 +85,7 @@ pub struct ExecutionInventoryV1 {
     pub phrase_bias_required_tensor: Option<String>,
     pub supports_translation_task: bool,
     pub supports_source_language_hint: bool,
-    pub supports_lora_adapter: bool,
+    pub adapter_binding: String,
     pub prepared_runtime: String,
     pub word_timestamp_strategy: String,
     pub invocation_span: InvocationSpanInventoryV1,
@@ -126,9 +125,6 @@ pub struct OptimizationInventoryV1 {
     pub auto_gpu_policy: String,
     pub encoder_attention_span: String,
     pub encoder_attention_max_safe_chunk_seconds: Option<f32>,
-    pub ownership: String,
-    pub prepared_runtime_eviction: String,
-    pub graph_reuse: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -194,11 +190,13 @@ fn project_descriptor(descriptor: OpenAsrArchitectureDescriptor) -> ModelFamilyI
     };
 
     let (decode_driver, decode_driver_reason) = match topology_contract.decode_driver {
-        OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy => {
+        OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy { .. } => {
             ("shared-seq2seq-greedy".to_string(), None)
         }
-        OpenAsrDecodeDriverStrategy::SharedCtcGreedy => ("shared-ctc-greedy".to_string(), None),
-        OpenAsrDecodeDriverStrategy::Dedicated { reason } => {
+        OpenAsrDecodeDriverStrategy::SharedCtcGreedy { .. } => {
+            ("shared-ctc-greedy".to_string(), None)
+        }
+        OpenAsrDecodeDriverStrategy::Dedicated { reason, .. } => {
             ("dedicated".to_string(), Some(reason.to_string()))
         }
     };
@@ -236,7 +234,10 @@ fn project_descriptor(descriptor: OpenAsrArchitectureDescriptor) -> ModelFamilyI
         ),
         pack: PackInventoryV1 {
             audio_frontend_id: pack_contract.audio_frontend_id.to_string(),
-            decode_policy_id: topology_contract.decode_policy_id.to_string(),
+            decode_policy_id: topology_contract
+                .decode_driver
+                .decode_policy_id()
+                .to_string(),
             runtime_tensor_contract_id: pack_contract.runtime_tensor_contract_id.to_string(),
             tokenizer_id: pack_contract.tokenizer_id.to_string(),
             hparam_schema: pack_contract
@@ -273,9 +274,7 @@ fn project_descriptor(descriptor: OpenAsrArchitectureDescriptor) -> ModelFamilyI
             phrase_bias_strategy: match execution_contract.phrase_bias {
                 crate::arch::OpenAsrPhraseBiasStrategy::Unsupported => "unsupported",
                 crate::arch::OpenAsrPhraseBiasStrategy::Always => "always",
-                crate::arch::OpenAsrPhraseBiasStrategy::RequiresTensor { .. } => {
-                    "requires-tensor"
-                }
+                crate::arch::OpenAsrPhraseBiasStrategy::RequiresTensor { .. } => "requires-tensor",
             }
             .to_string(),
             phrase_bias_required_tensor: match execution_contract.phrase_bias {
@@ -287,7 +286,7 @@ fn project_descriptor(descriptor: OpenAsrArchitectureDescriptor) -> ModelFamilyI
             },
             supports_translation_task: execution_contract.supports_translation_task,
             supports_source_language_hint: execution_contract.supports_source_language_hint,
-            supports_lora_adapter: execution_contract.supports_lora_adapter,
+            adapter_binding: execution_contract.adapter_binding.label().to_string(),
             prepared_runtime: match execution_contract.prepared_runtime {
                 crate::arch::OpenAsrPreparedRuntimeStrategy::FamilyOwned => "family-owned",
                 crate::arch::OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1 => {
@@ -342,46 +341,37 @@ fn project_descriptor(descriptor: OpenAsrArchitectureDescriptor) -> ModelFamilyI
             .to_string(),
             encoder_attention_span,
             encoder_attention_max_safe_chunk_seconds,
-            ownership: match optimization_contract.ownership {
-                OpenAsrExecutorOwnership::NativeExecutionServices => "native-execution-services",
-            }
-            .to_string(),
-            prepared_runtime_eviction: match optimization_contract.prepared_runtime_eviction {
-                OpenAsrPreparedRuntimeEviction::ContentId => "content-id",
-            }
-            .to_string(),
-            graph_reuse: match optimization_contract.graph_reuse {
-                OpenAsrGraphReuse::PreparedRuntimePool => "prepared-runtime-pool",
-            }
-            .to_string(),
         },
         quantization: QuantizationInventoryV1 {
             tensor_classification: match quantization_contract.tensor_classification {
-                crate::models::pack_quant::TensorQuantizationContract::AcousticEncoderPrefixesV1 { .. } => {
-                    "acoustic-encoder-prefixes-v1"
-                }
-                crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 { .. } => {
-                    "semantic-roles-v1"
-                }
-                crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack { .. } => {
-                    "entire-acoustic-pack"
-                }
+                crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
+                    ..
+                } => "semantic-roles-v1",
+                crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack {
+                    ..
+                } => "entire-acoustic-pack",
                 crate::models::pack_quant::TensorQuantizationContract::NotApplicable { .. } => {
                     "not-applicable"
                 }
             }
             .to_string(),
             quantized_axis: match quantization_contract.tensor_classification {
-                crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 { quantized_axis, .. } => Some(
+                crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
+                    quantized_axis,
+                    ..
+                } => Some(
                     match quantized_axis {
                         crate::models::pack_quant::QuantizedAxis::First => "first",
                         crate::models::pack_quant::QuantizedAxis::Last => "last",
                     }
                     .to_string(),
                 ),
-                crate::models::pack_quant::TensorQuantizationContract::AcousticEncoderPrefixesV1 { .. }
-                | crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack { .. }
-                | crate::models::pack_quant::TensorQuantizationContract::NotApplicable { .. } => None,
+                crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack {
+                    ..
+                }
+                | crate::models::pack_quant::TensorQuantizationContract::NotApplicable { .. } => {
+                    None
+                }
             },
         },
         conformance: ConformanceInventoryV1 {
@@ -567,9 +557,9 @@ mod tests {
                 family.adapter_id
             );
             assert_eq!(
-                family.execution.supports_lora_adapter,
-                descriptor.execution_contract.supports_lora_adapter,
-                "LoRA adapter capability drifted for {}",
+                family.execution.adapter_binding,
+                descriptor.execution_contract.adapter_binding.label(),
+                "adapter binding strategy drifted for {}",
                 family.adapter_id
             );
         }

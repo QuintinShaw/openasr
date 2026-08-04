@@ -78,7 +78,7 @@ fn terminal_final_text(events: &[RealtimeEventEnvelope]) -> Option<String> {
 
 fn build_request(pack: &Path) -> GgmlAsrStreamingSessionRequest {
     // Verify and open the source exactly once. The request retains this
-    // preflight (including its open source generation) through dispatch; the
+    // proof (including its open source generation) through dispatch; the
     // benchmark must not reconstruct a family from a path or re-run a second
     // metadata/tensor-index scan before starting the session.
     let verified_pack = PackVerifier
@@ -111,12 +111,11 @@ fn build_request(pack: &Path) -> GgmlAsrStreamingSessionRequest {
         architecture.identity.model_architecture, selected_family.model_architecture,
         "architecture registry and adapter projection disagree"
     );
-    let runtime_source_preflight = verified_pack.preflight().clone();
     GgmlAsrStreamingSessionRequest {
         execution_services:
             crate::models::native_execution_services::test_native_execution_services(),
         decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-        runtime_source_preflight,
+        verified_pack,
         selected_family,
         request_options: GgmlAsrExecutionOptions::default(),
         configured_diarize: false,

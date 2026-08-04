@@ -9,11 +9,11 @@ use std::{
 use thiserror::Error;
 
 use crate::api::backend::DecodeTruncation;
-use crate::arch::WHISPER_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
     GgufRuntimeSourcePreflight, RequestBackendPreference, install_request_backend_override,
     request_backend_override,
 };
+use crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy;
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, LongFormOptions,
     NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice, PhraseBiasConfig, RealtimeAudioFormat,
@@ -804,10 +804,10 @@ pub struct GgmlAsrExecutionRequest {
     /// Capacity-planner output for decoder-resident state. The topology
     /// integration fills this after request/session planning is wired.
     pub(crate) decoder_state: GgmlAsrDecoderState,
-    /// Proof-carrying preflight built at the untrusted-path ingress. It is
-    /// required even in tests so no request constructor can reopen a path and
-    /// silently create a second parse/admission universe.
-    pub runtime_source_preflight: GgufRuntimeSourcePreflight,
+    /// Package/runtime proof built at the untrusted-path ingress. Carrying the
+    /// full proof, rather than its structural preflight projection, prevents
+    /// callers from constructing an executable request from an arbitrary GGUF.
+    pub verified_pack: crate::models::pack_verifier::VerifiedPack,
     pub selected_family: GgmlFamilyAdapterDescriptor,
     pub prepared_audio: GgmlAsrPreparedAudio,
     pub request_options: GgmlAsrExecutionOptions,
@@ -846,7 +846,7 @@ pub(crate) struct GgmlAsrExecutionViewRequest<'a> {
     pub(crate) execution_services:
         Arc<crate::models::native_execution_services::NativeExecutionServices>,
     pub(crate) decoder_state: GgmlAsrDecoderState,
-    pub(crate) runtime_source_preflight: GgufRuntimeSourcePreflight,
+    pub(crate) verified_pack: crate::models::pack_verifier::VerifiedPack,
     pub(crate) selected_family: GgmlFamilyAdapterDescriptor,
     pub(crate) prepared_audio: GgmlAsrPreparedAudioView<'a>,
     pub(crate) request_options: GgmlAsrExecutionOptions,
@@ -961,8 +961,8 @@ pub struct GgmlAsrStreamingSessionRequest {
     pub execution_services: Arc<crate::models::native_execution_services::NativeExecutionServices>,
     pub(crate) decoder_state: GgmlAsrDecoderState,
     /// Required on every production session; see
-    /// [`GgmlAsrExecutionRequest::runtime_source_preflight`].
-    pub runtime_source_preflight: GgufRuntimeSourcePreflight,
+    /// [`GgmlAsrExecutionRequest::verified_pack`].
+    pub verified_pack: crate::models::pack_verifier::VerifiedPack,
     pub selected_family: GgmlFamilyAdapterDescriptor,
     pub request_options: GgmlAsrExecutionOptions,
     pub configured_diarize: bool,
@@ -981,11 +981,15 @@ pub struct GgmlAsrStreamingSessionRequest {
 }
 
 impl GgmlAsrExecutionRequest {
+    pub fn runtime_source_preflight(&self) -> &GgufRuntimeSourcePreflight {
+        self.verified_pack.preflight()
+    }
+
     pub(crate) fn as_view(&self) -> GgmlAsrExecutionViewRequest<'_> {
         GgmlAsrExecutionViewRequest {
             execution_services: Arc::clone(&self.execution_services),
             decoder_state: self.decoder_state.clone(),
-            runtime_source_preflight: self.runtime_source_preflight.clone(),
+            verified_pack: self.verified_pack.clone(),
             selected_family: self.selected_family.clone(),
             prepared_audio: self.prepared_audio.as_view(),
             request_options: self.request_options.clone(),
@@ -997,11 +1001,15 @@ impl GgmlAsrExecutionRequest {
 }
 
 impl GgmlAsrExecutionViewRequest<'_> {
+    pub(crate) fn runtime_source_preflight(&self) -> &GgufRuntimeSourcePreflight {
+        self.verified_pack.preflight()
+    }
+
     fn to_owned_request(&self) -> GgmlAsrExecutionRequest {
         GgmlAsrExecutionRequest {
             execution_services: Arc::clone(&self.execution_services),
             decoder_state: self.decoder_state.clone(),
-            runtime_source_preflight: self.runtime_source_preflight.clone(),
+            verified_pack: self.verified_pack.clone(),
             selected_family: self.selected_family.clone(),
             prepared_audio: GgmlAsrPreparedAudio {
                 sample_rate_hz: self.prepared_audio.sample_rate_hz,
@@ -1013,6 +1021,12 @@ impl GgmlAsrExecutionViewRequest<'_> {
             resolved_runtime: self.resolved_runtime,
             execution_context: Arc::clone(&self.execution_context),
         }
+    }
+}
+
+impl GgmlAsrStreamingSessionRequest {
+    pub fn runtime_source_preflight(&self) -> &GgufRuntimeSourcePreflight {
+        self.verified_pack.preflight()
     }
 }
 
@@ -1059,6 +1073,13 @@ pub enum GgmlAsrExecutionError {
         model_family: &'static str,
         capability: &'static str,
     },
+    #[error(
+        "verified pack route does not match selected family '{model_family}' (architecture '{model_architecture}')"
+    )]
+    VerifiedPackRouteMismatch {
+        model_family: &'static str,
+        model_architecture: &'static str,
+    },
     #[allow(private_interfaces)]
     #[error(transparent)]
     DecoderStatePlanning(#[from] GgmlAsrDecoderStatePlanningError),
@@ -1088,11 +1109,19 @@ pub enum GgmlAsrExecutionError {
     /// never silently ignored.
     #[error(
         "an adapter pack is active ('{adapter_path}') but model family '{model_family}' does not \
-         support adapter packs (the family execution contract does not declare LoRA support); fail-closed"
+         implement an adapter-binding strategy; fail-closed"
     )]
     AdapterUnsupportedForFamily {
         model_family: &'static str,
         adapter_path: String,
+    },
+    #[error(
+        "adapter binding contract mismatch for family '{model_family}': descriptor declares '{declared}', executor provides '{provided}'"
+    )]
+    AdapterBindingContractMismatch {
+        model_family: &'static str,
+        declared: &'static str,
+        provided: &'static str,
     },
     /// Typed Exact/preferred device failure from graph backend init. Kept as a
     /// first-class variant so `dispatch_error_to_backend` can surface
@@ -1142,6 +1171,9 @@ impl GgmlAsrExecutionError {
 #[allow(private_interfaces)]
 pub trait GgmlAsrExecutor: Send + Sync {
     fn executor_id(&self) -> &'static str;
+    fn adapter_binding_strategy(&self) -> GgmlAdapterBindingStrategy {
+        GgmlAdapterBindingStrategy::Unsupported
+    }
     fn supports_phrase_bias(&self) -> bool;
     /// Mandatory family-owned persistent-state declaration. There is no
     /// default: onboarding an executor cannot compile until it explicitly
@@ -1186,6 +1218,9 @@ pub trait GgmlAsrExecutor: Send + Sync {
 /// enter the native registry without implementing this view contract.
 pub(crate) trait GgmlAsrViewExecutor: Send + Sync {
     fn executor_id(&self) -> &'static str;
+    fn adapter_binding_strategy(&self) -> GgmlAdapterBindingStrategy {
+        GgmlAdapterBindingStrategy::Unsupported
+    }
     #[cfg_attr(not(test), allow(dead_code))]
     fn supports_phrase_bias(&self) -> bool;
     fn decoder_state_contract(
@@ -1225,6 +1260,13 @@ impl GgmlAsrExecutorSlot {
         match self {
             Self::OwnedCompatibility(executor) => executor.executor_id(),
             Self::SharedView(executor) => executor.executor_id(),
+        }
+    }
+
+    fn adapter_binding_strategy(&self) -> GgmlAdapterBindingStrategy {
+        match self {
+            Self::OwnedCompatibility(executor) => executor.adapter_binding_strategy(),
+            Self::SharedView(executor) => executor.adapter_binding_strategy(),
         }
     }
 
@@ -1294,6 +1336,9 @@ impl GgmlAsrExecutorSlot {
 
 pub trait GgmlAsrStreamingExecutor: Send + Sync {
     fn executor_id(&self) -> &'static str;
+    fn adapter_binding_strategy(&self) -> GgmlAdapterBindingStrategy {
+        GgmlAdapterBindingStrategy::Unsupported
+    }
     fn start_streaming_session(
         &self,
         request: &GgmlAsrStreamingSessionRequest,
@@ -1417,11 +1462,6 @@ impl GgmlAsrExecutionDispatch {
         self
     }
 
-    pub fn with_whisper_non_streaming_cpu(mut self, executor: Arc<dyn GgmlAsrExecutor>) -> Self {
-        self = self.with_executor_for_adapter(WHISPER_GGML_ADAPTER_ID, executor);
-        self
-    }
-
     pub fn with_native_graph_lowering_v1(mut self, executor: Arc<dyn GgmlAsrExecutor>) -> Self {
         self = self
             .with_executor_for_capability(GgmlExecutionCapability::NativeGraphLoweringV1, executor);
@@ -1436,10 +1476,7 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
-        ensure_adapter_supported_for_family(
-            &request.selected_family,
-            request.request_options.adapter_path.as_deref(),
-        )?;
+        ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         // Honor the request's execution preference for the few remaining
         // thread-local readers unrelated to backend resolution proper (the
         // longform multichunk-metal probe, a family's own post-hoc RAM-fit
@@ -1455,6 +1492,11 @@ impl GgmlAsrExecutionDispatch {
         );
 
         if let Some(executor) = self.executor_for(&request.selected_family) {
+            ensure_adapter_binding_for_executor(
+                &request.selected_family,
+                executor.adapter_binding_strategy(),
+                request.request_options.adapter_path.as_deref(),
+            )?;
             ensure_dispatch_not_canceled(
                 &request.execution_context,
                 executor.executor_id(),
@@ -1491,10 +1533,7 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
-        ensure_adapter_supported_for_family(
-            &request.selected_family,
-            request.request_options.adapter_path.as_deref(),
-        )?;
+        ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         let attempt_override =
             crate::models::native_execution_services::current_execution_placement()
                 .and_then(|_| request_backend_override());
@@ -1503,6 +1542,11 @@ impl GgmlAsrExecutionDispatch {
         );
 
         if let Some(executor) = self.executor_for(&request.selected_family) {
+            ensure_adapter_binding_for_executor(
+                &request.selected_family,
+                executor.adapter_binding_strategy(),
+                request.request_options.adapter_path.as_deref(),
+            )?;
             ensure_dispatch_not_canceled(
                 &request.execution_context,
                 executor.executor_id(),
@@ -1587,10 +1631,7 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
-        ensure_adapter_supported_for_family(
-            &request.selected_family,
-            request.request_options.adapter_path.as_deref(),
-        )?;
+        ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         // Same reasoning as `execute` above: the family's resolved backend
         // is `request.resolved_runtime`, filled in by whoever built this
         // session request. The shared streaming drivers copy that value
@@ -1601,12 +1642,22 @@ impl GgmlAsrExecutionDispatch {
             .streaming_executors_by_adapter_id
             .get(request.selected_family.adapter_id)
         {
+            ensure_adapter_binding_for_executor(
+                &request.selected_family,
+                executor.adapter_binding_strategy(),
+                request.request_options.adapter_path.as_deref(),
+            )?;
             return executor.start_streaming_session(request);
         }
 
         if let Some(executor) = self.streaming_executors_by_capability.get(capability_label(
             request.selected_family.execution_capability,
         )) {
+            ensure_adapter_binding_for_executor(
+                &request.selected_family,
+                executor.adapter_binding_strategy(),
+                request.request_options.adapter_path.as_deref(),
+            )?;
             return executor.start_streaming_session(request);
         }
 
@@ -1701,6 +1752,26 @@ impl GgmlAsrExecutionDispatch {
     }
 }
 
+/// The verifier proves a route from the package bytes; the selected adapter
+/// is a separate inventory projection. Bind both at the last shared execution
+/// seam so neither a direct library caller nor a future ingress can pair a
+/// valid pack with the wrong family implementation.
+fn ensure_verified_pack_matches_family(
+    verified_pack: &crate::models::pack_verifier::VerifiedPack,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+) -> Result<(), GgmlAsrExecutionError> {
+    if verified_pack.proves_asr_family(
+        selected_family.model_family,
+        selected_family.model_architecture,
+    ) {
+        return Ok(());
+    }
+    Err(GgmlAsrExecutionError::VerifiedPackRouteMismatch {
+        model_family: selected_family.model_family,
+        model_architecture: selected_family.model_architecture,
+    })
+}
+
 /// Universal cancellation fence around every built-in offline executor.
 ///
 /// Family/topology code may add finer checkpoints for latency, but it cannot
@@ -1727,14 +1798,22 @@ fn ensure_dispatch_not_canceled(
 /// only families with an implemented LoRA binding contract may execute; the
 /// adapter is then validated against the base pack inside that executor.
 /// Every other family hard-errors instead of silently ignoring the adapter.
-fn ensure_adapter_supported_for_family(
+fn ensure_adapter_binding_for_executor(
     selected_family: &GgmlFamilyAdapterDescriptor,
+    executor_binding: GgmlAdapterBindingStrategy,
     request_adapter_path: Option<&std::path::Path>,
 ) -> Result<(), GgmlAsrExecutionError> {
+    if selected_family.adapter_binding != executor_binding {
+        return Err(GgmlAsrExecutionError::AdapterBindingContractMismatch {
+            model_family: selected_family.model_family,
+            declared: selected_family.adapter_binding.label(),
+            provided: executor_binding.label(),
+        });
+    }
     let Some(adapter_path) = crate::adapter_pack::active_adapter_path(request_adapter_path) else {
         return Ok(());
     };
-    if selected_family.supports_lora_adapter {
+    if executor_binding.is_supported() {
         return Ok(());
     }
     Err(GgmlAsrExecutionError::AdapterUnsupportedForFamily {
@@ -1753,7 +1832,9 @@ const fn capability_label(capability: GgmlExecutionCapability) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::{QWEN3_ASR_GGML_ADAPTER_ID, builtin_adapter_descriptor};
+    use crate::arch::{
+        QWEN3_ASR_GGML_ADAPTER_ID, WHISPER_GGML_ADAPTER_ID, builtin_adapter_descriptor,
+    };
 
     #[test]
     fn duration_boundary_ceil_uses_exact_integer_binary_rational() {
@@ -2064,8 +2145,11 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight:
-                crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+            verified_pack:
+                crate::models::pack_verifier::VerifiedPack::from_unverified_preflight_for_test(
+                    crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+                    crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+                ),
             selected_family: builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
@@ -2093,6 +2177,43 @@ mod tests {
             carry_context: None,
             decode_truncation: None,
         }
+    }
+
+    #[test]
+    fn execute_rejects_a_verified_pack_paired_with_the_wrong_family() {
+        let mut request = whisper_request(GgmlAsrBackendPreference::CpuOnly);
+        request.selected_family =
+            builtin_adapter_descriptor(crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID);
+
+        let error = GgmlAsrExecutionDispatch::default()
+            .execute(&request)
+            .expect_err("route mismatch must fail before executor lookup");
+        assert!(matches!(
+            error,
+            GgmlAsrExecutionError::VerifiedPackRouteMismatch {
+                model_family: "qwen3-asr",
+                model_architecture: crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            }
+        ));
+    }
+
+    #[test]
+    fn supported_adapter_binding_cannot_be_self_certified_by_the_descriptor() {
+        let qwen = builtin_adapter_descriptor(crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID);
+        let error = ensure_adapter_binding_for_executor(
+            &qwen,
+            GgmlAdapterBindingStrategy::Unsupported,
+            None,
+        )
+        .expect_err("a supported descriptor requires a matching concrete executor binding");
+        assert!(matches!(
+            error,
+            GgmlAsrExecutionError::AdapterBindingContractMismatch {
+                declared: "qwen3-asr-lora-v1",
+                provided: "unsupported",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2292,8 +2413,11 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight:
-                crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+            verified_pack:
+                crate::models::pack_verifier::VerifiedPack::from_unverified_preflight_for_test(
+                    crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+                    crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+                ),
             selected_family: builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
@@ -2402,7 +2526,7 @@ mod tests {
 
         let request = whisper_request(GgmlAsrBackendPreference::Auto);
         let dispatch = GgmlAsrExecutionDispatch::default()
-            .with_whisper_non_streaming_cpu(Arc::new(StubExecutor));
+            .with_executor_for_adapter(WHISPER_GGML_ADAPTER_ID, Arc::new(StubExecutor));
         let result = dispatch.execute(&request).expect("auto should dispatch");
         assert_eq!(result.transcription.text, "ok");
     }
@@ -2452,7 +2576,7 @@ mod tests {
                 .expect("phrase bias fixture must validate"),
         );
         let dispatch = GgmlAsrExecutionDispatch::default()
-            .with_whisper_non_streaming_cpu(Arc::new(StubExecutor));
+            .with_executor_for_adapter(WHISPER_GGML_ADAPTER_ID, Arc::new(StubExecutor));
 
         let result = dispatch
             .execute(&request)
@@ -2976,7 +3100,8 @@ mod tests {
         let resolved_on_submitting_thread = request.resolved_runtime.backend();
 
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let dispatch = GgmlAsrExecutionDispatch::default().with_whisper_non_streaming_cpu(
+        let dispatch = GgmlAsrExecutionDispatch::default().with_executor_for_adapter(
+            WHISPER_GGML_ADAPTER_ID,
             Arc::new(RecordingExecutor {
                 observed: Arc::clone(&observed),
             }),
@@ -3086,8 +3211,11 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight:
-                crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+            verified_pack:
+                crate::models::pack_verifier::VerifiedPack::from_unverified_preflight_for_test(
+                    crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+                    crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+                ),
             selected_family: descriptor,
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),

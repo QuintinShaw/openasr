@@ -38,15 +38,19 @@ Hard rules for a new family:
   required facet. Do not add a parallel registry, `Default` escape, wildcard
   match, or runtime `Deferred` state.
 - Write through the shared `PackEnvelope` and verify once through `PackVerifier`.
-  Product paths carry `VerifiedPack`/`AdmittedPack`; the public direct-path
-  ingress must turn its candidate into the same proof exactly once before
-  dispatch. A bare path is not proof of a valid pack.
+  Product paths and the core execute request carry `VerifiedPack`/`AdmittedPack`;
+  public import results carry the writer's `VerifiedPack` beside a diagnostic
+  `output_path`. The public direct-path ingress must turn its candidate into the
+  same proof exactly once before dispatch. A bare path or preflight alone is not
+  proof of a valid package contract.
 - Use generated dispatch, validator, eviction, force-link, and audit projections.
   Once a projection owns a behavior, delete the old hand-written table and its
   tests/docs rather than keeping two sources of truth.
 - Keep family code limited to frontend/tensor binding/topology assembly. Reuse
   shared blocks, decode/cancel drivers, and backend-neutral placement; a
-  dedicated graph requires a structural reason and conformance coverage.
+  dedicated graph requires a structural reason and conformance coverage. Family
+  policy consumes typed backend capabilities; provider-name parsing belongs only
+  at the shared runtime boundary.
 
 ## Building from source (the part agents forget)
 
@@ -101,12 +105,15 @@ and the open-core trust boundary. Treat them as hard constraints:
   greedy decode through the single shared driver
   `run_seq2seq_greedy_decode_loop_v0` (via `run_builtin_seq2seq_decode_policy`). A
   new such family MUST provide a `Seq2SeqGreedyDecodeStepExecutor` and declare a
-  decode-policy descriptor in `models/decode_policy_component_registry.rs`; it MUST
-  NOT hand-write its own argmax step loop or build a decode config that bypasses the
-  registry. Hand-rolled loops miss the shared degenerate-loop guard and drift the
-  argmax / suppression / stop-token semantics the driver centralizes (a hand-rolled
-  firered loop is what caused the long-audio repetition, issue #60). The
-  `*.greedy.seq2seq.*` registry-resolution test fails closed on a half-connect.
+  shared decode strategy carrying its exact policy descriptor in the architecture
+  row; it MUST NOT hand-write its own argmax step loop or build a decode config
+  that bypasses strategy resolution. Reusable policy constants live in
+  `models/decode_policy_component_registry.rs`, but there is no second
+  family-to-policy table. Hand-rolled loops miss the shared degenerate-loop guard
+  and drift the argmax / suppression / stop-token semantics the driver centralizes
+  (a hand-rolled firered loop is what caused the long-audio repetition, issue #60).
+  The shared-driver source gate and registry-resolution tests fail closed on a
+  half-connect.
 
 ## Validation before you finish
 

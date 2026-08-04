@@ -127,11 +127,12 @@ pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
             ),
         });
     }
-    // moonshine routes through the shared decode-policy registry (same path as
-    // whisper/cohere/qwen) instead of hand-building a config: the descriptor
+    // moonshine routes through the shared inline decode-policy strategy (same
+    // path as whisper/cohere/qwen) instead of hand-building a config: the row
     // declares no suppression, no extra stop tokens and Identity postprocess, so
     // the resolved config is byte-identical to the previous inline one, and the
-    // registry owns phrase-bias tokenization against the tokenizer token source.
+    // shared policy resolver owns phrase-bias tokenization against the tokenizer
+    // token source.
     let config = BuiltinSeq2SeqDecodePolicyConfigInput {
         initial_prompt_tokens: prompt_tokens,
         eot_token_id: metadata.eos_token_id,

@@ -452,7 +452,7 @@ impl ParakeetCtcGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         decode_parakeet_ctc_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
@@ -510,7 +510,7 @@ impl GgmlAsrViewExecutor for ParakeetCtcGgmlExecutor {
         };
         // Fail-closed: consume the already-admitted Gate-0 proof, then run the
         // cached prepared-runtime path against that exact source generation.
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let output = transcribe_parakeet_ctc_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,

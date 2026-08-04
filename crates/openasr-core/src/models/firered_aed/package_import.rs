@@ -41,6 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::VerifiedPack;
 use crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -53,7 +54,7 @@ use crate::models::local_source_import::{
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope, TOKENIZER_GGML_TOKENS_KEY};
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
@@ -85,9 +86,10 @@ pub struct FireRedAedImportRequest {
     pub quantization: FireRedAedQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FireRedAedImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub vocab_size: usize,
 }
@@ -153,9 +155,11 @@ pub fn convert_local_firered_aed_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(FireRedAedImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         vocab_size: vocab_tokens.len(),
     })
 }
@@ -698,7 +702,7 @@ fn quantized_tensor_type_for_firered_tensor(
     class: TensorClass,
     dims: &[u64],
     quantization: FireRedAedQuantizationMode,
-    component: QuantComponent,
+    name: &str,
 ) -> Option<GgufWriteTensorType> {
     if quantization == FireRedAedQuantizationMode::Fp16 {
         return None;
@@ -709,8 +713,12 @@ fn quantized_tensor_type_for_firered_tensor(
     ) {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_firered_aed_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefix for the firered-aed conformer encoder (`enc.*`:
@@ -724,20 +732,23 @@ fn quantized_tensor_type_for_firered_tensor(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: FIRERED_AED_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_firered_aed_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
 
-/// The encoder carries the shared Q8_0 floor.
-fn firered_quant_component(target_name: &str) -> QuantComponent {
-    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| target_name.starts_with(prefix))
+fn classify_firered_aed_quant_tensor_role(target_name: &str) -> TensorRole {
+    if target_name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| target_name.starts_with(prefix))
     {
-        QuantComponent::Encoder
+        TensorRole::AcousticEncoderMatrix
+    } else if target_name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
     } else {
-        QuantComponent::Decoder
+        TensorRole::NonQuantizable
     }
 }
 
@@ -780,7 +791,7 @@ fn build_firered_runtime_tensors(
             class,
             &target_dims,
             quantization,
-            firered_quant_component(&target_name),
+            &target_name,
         ) {
             Some(qtype) => {
                 let values = decode_safetensors_payload_as_f32(&tensor.name, &tensor.dtype, data)?;
@@ -1019,7 +1030,7 @@ mod tests {
                 Linear,
                 &[1280, 5120],
                 FireRedAedQuantizationMode::Q4_K,
-                QuantComponent::Decoder
+                "dec.blk.0.ffn1.weight"
             ),
             Some(GgufWriteTensorType::Q4_K)
         );
@@ -1028,7 +1039,7 @@ mod tests {
                 PointwiseConvSqueeze,
                 &[1280, 5120],
                 FireRedAedQuantizationMode::Q8_0,
-                QuantComponent::Decoder
+                "dec.blk.0.ffn1.weight"
             ),
             Some(GgufWriteTensorType::Q8_0)
         );
@@ -1038,7 +1049,7 @@ mod tests {
                 Linear,
                 &[1280, 5120],
                 FireRedAedQuantizationMode::Fp16,
-                QuantComponent::Decoder
+                "dec.blk.0.ffn1.weight"
             ),
             None
         );
@@ -1047,7 +1058,7 @@ mod tests {
                 ConvKernel,
                 &[33, 1, 2560],
                 FireRedAedQuantizationMode::Q4_K,
-                QuantComponent::Decoder
+                "dec.blk.0.conv.weight"
             ),
             None
         );
@@ -1056,7 +1067,7 @@ mod tests {
                 F16Table,
                 &[1280, 7832, 1],
                 FireRedAedQuantizationMode::Q4_K,
-                QuantComponent::Decoder
+                "dec.blk.0.table.weight"
             ),
             None
         );
@@ -1066,7 +1077,7 @@ mod tests {
                 Linear,
                 &[100, 5120],
                 FireRedAedQuantizationMode::Q8_0,
-                QuantComponent::Decoder
+                "dec.blk.0.ffn1.weight"
             ),
             None
         );
@@ -1081,7 +1092,7 @@ mod tests {
                 Linear,
                 &[1280, 5120],
                 FireRedAedQuantizationMode::Q4_K,
-                QuantComponent::Encoder
+                "enc.blk.0.ffn1.weight"
             ),
             Some(GgufWriteTensorType::Q8_0)
         );

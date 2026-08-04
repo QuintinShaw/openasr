@@ -411,7 +411,6 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
                 ),
             });
         }
-        let runtime_preflight = verified_pack.preflight().clone();
         let request_intent = execution_intent_from_hardware_target(target)?;
         let execution_plan = resolve_native_execution_plan_for_hardware_target(
             execution_services.as_ref(),
@@ -431,7 +430,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         let factory: Arc<dyn NativeStreamingSessionCandidateBuilder> =
             Arc::new(NativeStreamingSessionCandidateFactory {
                 execution_services,
-                runtime_preflight,
+                verified_pack: Arc::clone(verified_pack),
                 selected_family: self.descriptor.clone(),
                 request_options,
                 configured_diarize: options.voice_id,
@@ -452,7 +451,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
 /// policy without teaching model-family executors about product fallback.
 struct NativeStreamingSessionCandidateFactory {
     execution_services: Arc<NativeExecutionServices>,
-    runtime_preflight: crate::GgufRuntimeSourcePreflight,
+    verified_pack: Arc<crate::models::pack_verifier::VerifiedPack>,
     selected_family: GgmlFamilyAdapterDescriptor,
     request_options: GgmlAsrExecutionOptions,
     configured_diarize: bool,
@@ -508,7 +507,7 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                 let resolved_runtime =
                     resolved_runtime_for_candidate(candidate, self.auto_gpu_policy);
                 let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_session(
-                    &self.runtime_preflight,
+                    self.verified_pack.preflight(),
                     &self.request_options,
                     resolved_runtime.backend(),
                 )
@@ -525,7 +524,7 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                 let request = GgmlAsrStreamingSessionRequest {
                     execution_services: Arc::clone(&self.execution_services),
                     decoder_state,
-                    runtime_source_preflight: self.runtime_preflight.clone(),
+                    verified_pack: self.verified_pack.as_ref().clone(),
                     selected_family: self.selected_family.clone(),
                     request_options: self.request_options.clone(),
                     configured_diarize: self.configured_diarize,
@@ -1477,6 +1476,9 @@ static NATIVE_RUNTIME_MODEL_ADAPTER_CACHE: OnceLock<
 /// projection borrows that exact proof; invalid packs are never cached as
 /// negative entries, so a later valid replacement can resolve normally.
 pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
+    if !crate::has_openasr_runtime_pack_extension(path) {
+        return None;
+    }
     let verified_pack = crate::models::pack_verifier::PackVerifier
         .verify_candidate(crate::models::pack_verifier::PackCandidate::new(path))
         .ok()?;
@@ -2020,7 +2022,7 @@ mod tests {
     #[test]
     fn native_runtime_model_adapter_selects_descriptor_and_capabilities_from_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
@@ -2364,7 +2366,7 @@ mod tests {
     #[test]
     fn native_backend_admits_and_dispatches_cohere_streaming_session() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-streaming-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-streaming-runtime.oasr");
         let spec = cohere_streaming_runtime_fixture_spec("cohere-streaming-runtime");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
@@ -2613,7 +2615,7 @@ mod tests {
     #[test]
     fn native_runtime_model_adapter_rejects_invalid_runtime_source() {
         let temp = tempfile::tempdir().unwrap();
-        let invalid_path = temp.path().join("not-a-runtime.gguf");
+        let invalid_path = temp.path().join("not-a-runtime.oasr");
         fs::write(&invalid_path, b"not gguf").unwrap();
 
         assert!(native_runtime_model_adapter_for_path(&invalid_path).is_none());
@@ -2624,12 +2626,30 @@ mod tests {
             crate::realtime::RealtimeBackendMode::Unsupported
         );
         assert!(!realtime.supports_realtime_sessions);
+
+        // A structurally valid GGUF payload is still not a product runtime
+        // package when it is exposed under the raw `.gguf` extension. The
+        // product adapter seam accepts only the published `.oasr` envelope.
+        let valid_gguf_path = temp.path().join("valid-runtime.gguf");
+        let valid_oasr_path = temp.path().join("valid-runtime.oasr");
+        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("valid-runtime");
+        write_tiny_gguf_runtime_source(&valid_gguf_path, &spec).unwrap();
+        assert!(
+            native_runtime_model_adapter_for_path(&valid_gguf_path).is_none(),
+            "a valid raw GGUF must not cross the product native adapter ingress"
+        );
+
+        write_tiny_gguf_runtime_source(&valid_oasr_path, &spec).unwrap();
+        assert!(
+            native_runtime_model_adapter_for_path(&valid_oasr_path).is_some(),
+            "the same valid payload is accepted once wrapped at the .oasr ingress"
+        );
     }
 
     #[test]
     fn native_runtime_model_adapter_does_not_cache_invalid_path_before_valid_replacement() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("replacement.gguf");
+        let runtime_path = temp.path().join("replacement.oasr");
         fs::write(&runtime_path, b"not gguf").unwrap();
 
         assert!(native_runtime_model_adapter_for_path(&runtime_path).is_none());
@@ -2668,7 +2688,7 @@ mod tests {
     #[test]
     fn native_runtime_model_adapter_cache_rekeys_same_path_content_replacement() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("dolphin-replacement.gguf");
+        let runtime_path = temp.path().join("dolphin-replacement.oasr");
 
         write_tiny_gguf_runtime_source(
             &runtime_path,
@@ -2699,7 +2719,7 @@ mod tests {
     #[test]
     fn native_backend_product_executor_reports_runtime_readiness() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let backend = native_executor_for_test();
@@ -2720,7 +2740,7 @@ mod tests {
         let missing_pack = NativeAsrModelPackRef::new(
             "cohere-runtime-fixture",
             "cohere",
-            temp.path().join("missing.gguf"),
+            temp.path().join("missing.oasr"),
         );
         assert!(matches!(
             NativeAsrExecutor::runtime_readiness(
@@ -3146,7 +3166,7 @@ mod tests {
     fn native_backend_product_executor_dispatches_offline_transcription() {
         with_forced_cpu_backend_for_test(|| {
             let temp = tempfile::tempdir().unwrap();
-            let runtime_path = temp.path().join("cohere-runtime.gguf");
+            let runtime_path = temp.path().join("cohere-runtime.oasr");
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
             let backend = native_executor_for_test();
@@ -3175,7 +3195,7 @@ mod tests {
     #[test]
     fn native_backend_product_executor_delegates_true_streaming_to_adapter() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let backend = native_executor_for_test();
@@ -3222,7 +3242,7 @@ mod tests {
     #[test]
     fn native_backend_product_executor_gates_adapter_streaming_options() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let backend = native_executor_for_test();
@@ -3257,7 +3277,7 @@ mod tests {
     #[test]
     fn native_backend_product_executor_keeps_streaming_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let backend = native_executor_for_test();
@@ -3288,7 +3308,7 @@ mod tests {
     #[test]
     fn native_runtime_model_adapter_routes_declared_true_streaming_to_ggml_dispatch() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         write_tiny_gguf_runtime_source(
             &runtime_path,
             &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture"),
@@ -3350,7 +3370,7 @@ mod tests {
     #[test]
     fn native_streaming_start_consumes_the_adapter_preflight_proof_without_reparse() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-single-preflight.gguf");
+        let runtime_path = temp.path().join("cohere-single-preflight.oasr");
         write_tiny_gguf_runtime_source(
             &runtime_path,
             &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-single-preflight"),
@@ -3388,7 +3408,7 @@ mod tests {
     #[test]
     fn verified_identity_and_model_pack_ref_project_without_reparse() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-identity-single-preflight.gguf");
+        let runtime_path = temp.path().join("cohere-identity-single-preflight.oasr");
         write_tiny_gguf_runtime_source(
             &runtime_path,
             &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-identity-single-preflight"),
@@ -3417,7 +3437,7 @@ mod tests {
     #[test]
     fn native_offline_start_consumes_the_model_pack_proof_without_reparse() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-offline-single-preflight.gguf");
+        let runtime_path = temp.path().join("cohere-offline-single-preflight.oasr");
         write_tiny_gguf_runtime_source(
             &runtime_path,
             &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-offline-single-preflight"),
@@ -3476,7 +3496,7 @@ mod tests {
                 // Every Voice ID route needs the shared acoustic identity
                 // space, so the runtime must stop before loading either the ASR
                 // model or the external segmenter when ReDim is absent.
-                let runtime_path = temp.path().join("whisper-runtime.gguf");
+                let runtime_path = temp.path().join("whisper-runtime.oasr");
                 let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
                     "whisper-runtime-fixture",
                 )
@@ -3708,11 +3728,15 @@ mod tests {
             );
             metadata.insert(
                 OASR_METADATA_KEY_DECODE_POLICY.to_string(),
-                descriptor.topology_contract.decode_policy_id.to_string(),
+                descriptor
+                    .topology_contract
+                    .decode_driver
+                    .decode_policy_id()
+                    .to_string(),
             );
             let spec = TinyGgufFixtureSpec::new(metadata);
             let temp = tempfile::tempdir().unwrap();
-            let pack_path = temp.path().join("fixture.gguf");
+            let pack_path = temp.path().join("fixture.oasr");
             write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
 
             let result = verify_native_runtime_model_pack_path(&pack_path);
@@ -3731,7 +3755,7 @@ mod tests {
     fn native_backend_rejects_speakers_hint_without_diarize() {
         with_forced_cpu_backend_for_test(|| {
             let temp = tempfile::tempdir().unwrap();
-            let runtime_path = temp.path().join("cohere-runtime.gguf");
+            let runtime_path = temp.path().join("cohere-runtime.oasr");
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
@@ -3756,7 +3780,7 @@ mod tests {
             ("OPENASR_REDIMNET_PACK", None),
             ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
         ]);
-        let runtime_path = temp.path().join("whisper-runtime.gguf");
+        let runtime_path = temp.path().join("whisper-runtime.oasr");
         let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
@@ -3775,7 +3799,7 @@ mod tests {
     #[test]
     fn native_runtime_capabilities_require_embedder_and_segmenter_for_external_voice_id() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-runtime.gguf");
+        let runtime_path = temp.path().join("whisper-runtime.oasr");
         let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
@@ -3805,7 +3829,7 @@ mod tests {
     #[test]
     fn native_runtime_realtime_capabilities_are_runtime_owned_and_conservative() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
+        let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
@@ -3907,7 +3931,7 @@ mod tests {
         // `native_runtime_descriptor_supports_phrase_bias` unit above).
         let temp = tempfile::tempdir().unwrap();
 
-        let base_path = temp.path().join("dolphin-base-e2e.gguf");
+        let base_path = temp.path().join("dolphin-base-e2e.oasr");
         write_tiny_gguf_runtime_source(
             &base_path,
             &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-base-e2e"),
@@ -3923,7 +3947,7 @@ mod tests {
             "a Dolphin pack without the context-module tensor must not advertise phrase bias"
         );
 
-        let hotword_path = temp.path().join("dolphin-hotword-e2e.gguf");
+        let hotword_path = temp.path().join("dolphin-hotword-e2e.oasr");
         let hotword_spec =
             TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-hotword-e2e")
                 .with_added_tensor(
@@ -4000,19 +4024,21 @@ mod tests {
     }
 
     #[test]
-    fn native_model_pack_path_preserves_input_file_path() {
+    fn native_model_pack_path_rejects_raw_gguf_file_path() {
         let temp = tempfile::tempdir().unwrap();
         let pack_file = temp.path().join("valid-pack.gguf");
         std::fs::write(&pack_file, b"GGUFpayload").unwrap();
 
-        let validated = validate_local_native_model_pack_path(&pack_file).unwrap();
-        assert_eq!(validated, pack_file);
+        let error = validate_local_native_model_pack_path(&pack_file)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected the .oasr extension"), "{error}");
     }
 
     #[test]
     fn native_backend_fails_closed_when_gguf_oasr_metadata_is_incomplete() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-incomplete.gguf");
+        let runtime_path = temp.path().join("whisper-incomplete.oasr");
         let fixture_spec = TinyGgufFixtureSpec::new(
             [
                 ("openasr.model.id", "whisper-runtime-fixture"),
@@ -4049,7 +4075,7 @@ mod tests {
     #[test]
     fn native_backend_fails_closed_when_gguf_metadata_has_no_registered_family_adapter() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("unknown-family.gguf");
+        let runtime_path = temp.path().join("unknown-family.oasr");
         let fixture_spec = TinyGgufFixtureSpec::new(
             [
                 ("openasr.model.id", "unknown-family-fixture"),
@@ -4085,7 +4111,7 @@ mod tests {
     #[test]
     fn native_backend_rejects_qwen_pack_missing_audio_stem_tensor_before_execution() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("qwen3-asr-0.6b-q4_k.gguf");
+        let runtime_path = temp.path().join("qwen3-asr-0.6b-q4_k.oasr");
         let fixture_spec =
             TinyGgufFixtureSpec::qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(
                 "qwen3-asr-0.6b-q4_k",
@@ -4144,7 +4170,7 @@ mod tests {
     fn native_backend_routes_a_complete_cohere_pack_to_its_executor() {
         with_forced_cpu_backend_for_test(|| {
             let temp = tempfile::tempdir().unwrap();
-            let runtime_path = temp.path().join("cohere-transcribe-q4_k.gguf");
+            let runtime_path = temp.path().join("cohere-transcribe-q4_k.oasr");
             let fixture_spec =
                 TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
@@ -4168,7 +4194,7 @@ mod tests {
     #[test]
     fn native_backend_rejects_whisper_pack_missing_tensor_anchor_before_execution() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-runtime.gguf");
+        let runtime_path = temp.path().join("whisper-runtime.oasr");
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_missing_tensor(
             "whisper-runtime-fixture",
             "model.encoder.conv1.weight",
@@ -4199,7 +4225,7 @@ mod tests {
     #[test]
     fn native_backend_rejects_whisper_pack_missing_tokenizer_before_execution() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-encoder-graph.gguf");
+        let runtime_path = temp.path().join("whisper-encoder-graph.oasr");
         let wav_path = temp.path().join("whisper-short.wav");
         write_mono_pcm16_wav(&wav_path, 16_000, 3_200);
         let fixture_spec =
@@ -4230,7 +4256,7 @@ mod tests {
     #[test]
     fn native_backend_rejects_whisper_pack_with_incomplete_runtime_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-metadata-incomplete.gguf");
+        let runtime_path = temp.path().join("whisper-metadata-incomplete.oasr");
         let mut fixture_spec =
             TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-runtime-fixture");
         fixture_spec.metadata.remove("n_audio_layer");
@@ -4259,7 +4285,7 @@ mod tests {
     #[test]
     fn native_backend_whisper_executor_accepts_decoder_tensor_alias_and_executes() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-alias.gguf");
+        let runtime_path = temp.path().join("whisper-alias.oasr");
         let fixture_spec =
             TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-runtime-fixture")
                 .with_whisper_required_tensor_alias(
@@ -4285,7 +4311,7 @@ mod tests {
     #[test]
     fn native_backend_rejects_whisper_pack_with_layer_tensor_mismatch() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-layer-mismatch.gguf");
+        let runtime_path = temp.path().join("whisper-layer-mismatch.oasr");
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_layer_count_mismatch(
             "whisper-runtime-fixture",
             2,
@@ -4316,7 +4342,7 @@ mod tests {
     #[test]
     fn native_backend_rejects_whisper_pack_with_required_tensor_shape_mismatch() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("whisper-shape-mismatch.gguf");
+        let runtime_path = temp.path().join("whisper-shape-mismatch.oasr");
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_shape_mismatch(
             "whisper-runtime-fixture",
             "model.encoder.conv2.bias",

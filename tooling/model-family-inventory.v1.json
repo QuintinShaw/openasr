@@ -101,7 +101,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": true,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "shared-cohere-transcribe-v1",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -120,14 +120,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": true,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "cohere",
@@ -235,7 +232,7 @@
         "phrase_bias_required_tensor": "context_module.context_extractor.word_embedding.weight",
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -254,10 +251,7 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
         "tensor_classification": "semantic-roles-v1",
@@ -355,7 +349,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -374,14 +368,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "firered-aed",
@@ -482,7 +473,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -501,14 +492,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "firered2-llm",
@@ -608,7 +596,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -627,14 +615,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "funasr-nano",
@@ -747,7 +732,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -766,14 +751,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "local-chunked",
-        "encoder_attention_max_safe_chunk_seconds": null,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": null
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "granite-speech",
@@ -897,7 +879,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -916,14 +898,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "mimo-asr",
@@ -1013,7 +992,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": true,
+        "adapter_binding": "moonshine-lora-v1",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1032,14 +1011,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "moonshine",
@@ -1147,7 +1123,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1166,14 +1142,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "fixed-window",
-        "encoder_attention_max_safe_chunk_seconds": null,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": null
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "moss-transcribe-diarize",
@@ -1260,7 +1233,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1279,14 +1252,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "parakeet",
@@ -1403,7 +1373,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1422,14 +1392,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "parakeet-tdt",
@@ -1552,7 +1519,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": true,
+        "adapter_binding": "qwen3-asr-lora-v1",
         "prepared_runtime": "shared-qwen3-asr-v1",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1571,10 +1538,7 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
         "tensor_classification": "semantic-roles-v1",
@@ -1667,7 +1631,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1686,14 +1650,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "sensevoice",
@@ -1778,7 +1739,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -1797,14 +1758,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 30.0,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": 30.0
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "wav2vec2",
@@ -1986,7 +1944,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": true,
         "supports_source_language_hint": true,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-sensitive",
         "invocation_span": {
@@ -2005,14 +1963,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "fixed-window",
-        "encoder_attention_max_safe_chunk_seconds": null,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": null
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "whisper",
@@ -2104,7 +2059,7 @@
         "phrase_bias_required_tensor": null,
         "supports_translation_task": false,
         "supports_source_language_hint": false,
-        "supports_lora_adapter": false,
+        "adapter_binding": "unsupported",
         "prepared_runtime": "family-owned",
         "word_timestamp_strategy": "decode-invariant",
         "invocation_span": {
@@ -2123,14 +2078,11 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "except-metal",
         "encoder_attention_span": "local-chunked",
-        "encoder_attention_max_safe_chunk_seconds": null,
-        "ownership": "native-execution-services",
-        "prepared_runtime_eviction": "content-id",
-        "graph_reuse": "prepared-runtime-pool"
+        "encoder_attention_max_safe_chunk_seconds": null
       },
       "quantization": {
-        "tensor_classification": "acoustic-encoder-prefixes-v1",
-        "quantized_axis": null
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
       },
       "conformance": {
         "profile_id": "xasr-zipformer",

@@ -55,8 +55,9 @@ pub use cpu_graph::{
     request_backend_override, resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
-    GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor,
+    GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32};

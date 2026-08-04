@@ -184,7 +184,7 @@ where
     let execution_services = std::sync::Arc::clone(&request.execution_services);
     let decode_execution_services = std::sync::Arc::clone(&request.execution_services);
     let resident_decoder_state = request.decoder_state.clone();
-    let runtime_source_preflight = request.runtime_source_preflight.clone();
+    let verified_pack = request.verified_pack.clone();
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
     let inference_threads = request_options.inference_threads;
@@ -209,7 +209,7 @@ where
         let decoder_state = match resident_decoder_state.invocation_envelope() {
             None => resident_decoder_state.clone(),
             Some(envelope) => {
-                let preflight = &runtime_source_preflight;
+                let preflight = verified_pack.preflight();
                 let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_decode_view(
                     preflight,
                     audio,
@@ -236,7 +236,7 @@ where
         Ok(GgmlAsrExecutionViewRequest {
             execution_services: std::sync::Arc::clone(&execution_services),
             decoder_state,
-            runtime_source_preflight: runtime_source_preflight.clone(),
+            verified_pack: verified_pack.clone(),
             selected_family: selected_family.clone(),
             prepared_audio: audio.clone(),
             request_options,
@@ -1693,7 +1693,11 @@ mod tests {
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_preflight,
+                verified_pack:
+                    crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                        runtime_source_preflight,
+                        crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                    ),
                 selected_family: crate::arch::builtin_adapter_descriptor(
                     crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
                 ),

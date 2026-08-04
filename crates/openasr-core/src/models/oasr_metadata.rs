@@ -116,7 +116,10 @@ impl PackEnvelope {
                 insert_metadata(
                     &mut metadata,
                     OASR_METADATA_KEY_DECODE_POLICY,
-                    descriptor.topology_contract.decode_policy_id,
+                    descriptor
+                        .topology_contract
+                        .decode_driver
+                        .decode_policy_id(),
                 );
                 insert_metadata(
                     &mut metadata,

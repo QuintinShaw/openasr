@@ -15,7 +15,7 @@
 //! The encoder/decoder split is keyed on the RUNTIME tensor names written
 //! into the pack and on the pack's `openasr.model.architecture` metadata, so
 //! the check needs no source checkout. Each family exports the exact same
-//! semantic-role or prefix classifier used by its writer through its required
+//! semantic-role classifier used by its writer through its required
 //! quantization contract. The tier-ceiling check
 //! (`declared_tier_allows`) is likewise derived by calling the shared policy
 //! function directly (see below) instead of re-deriving its per-tier rung
@@ -33,7 +33,7 @@ use thiserror::Error;
 use crate::ggml_runtime::GgufWriteTensorType;
 use crate::ggml_runtime::gguf_header::{GgufHeaderError, GgufHeaderView, parse_gguf_header};
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, TensorRole, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 // --- ggml type ids (stable ggml ABI wire values) ---------------------------
@@ -152,25 +152,27 @@ pub fn meets_encoder_q8_floor(ggml_type: u32) -> bool {
 }
 
 /// Representative `ne0` values covering both alignment classes
-/// `classify_quant_tensor` branches on: 32-aligned-but-not-256 (falls back to
+/// `classify_quant_tensor_role` branches on: 32-aligned-but-not-256 (falls back to
 /// the Q8_0 alignment rung) and 256-aligned (unlocks a tier's own K-quant
 /// rung, for `Decoder`).
 const REPRESENTATIVE_NE0_VALUES: [u64; 2] = [32, 256];
-const QUANT_COMPONENTS: [QuantComponent; 2] = [QuantComponent::Encoder, QuantComponent::Decoder];
+const QUANT_ROLES: [TensorRole; 2] = [
+    TensorRole::AcousticEncoderMatrix,
+    TensorRole::TextDecoderMatrix,
+];
 
 /// The block-quant rungs a declared pack tier may contain, DERIVED from
-/// [`crate::models::pack_quant::classify_quant_tensor`] -- the same policy
-/// function every importer's build-time quantization calls -- rather than a
-/// hand-copied per-tier table. `classify_quant_tensor` returns `None` for
-/// every `(ne0, component)` sample under `PackQuant::Fp16`, so the `Fp16`
+/// [`crate::models::pack_quant::classify_quant_tensor_role`] -- the same policy
+/// hand-copied per-tier table. `classify_quant_tensor_role` returns `None` for
+/// every `(ne0, role)` sample under `PackQuant::Fp16`, so the `Fp16`
 /// ceiling falls out of the same loop as an empty set (no block quants
 /// allowed) with no special-casing needed here.
 fn declared_tier_allows(declared: PackQuant, ggml_type: u32) -> bool {
     REPRESENTATIVE_NE0_VALUES.iter().any(|&ne0| {
-        QUANT_COMPONENTS.iter().any(|&component| {
-            classify_quant_tensor(ne0, declared, component).is_some_and(|tensor_type| {
-                wire_types_equivalent_to(tensor_type).contains(&ggml_type)
-            })
+        QUANT_ROLES.iter().any(|&role| {
+            classify_quant_tensor_role(&[ne0], declared, role, QuantizedAxis::First).is_some_and(
+                |tensor_type| wire_types_equivalent_to(tensor_type).contains(&ggml_type),
+            )
         })
     })
 }
@@ -274,9 +276,6 @@ fn is_encoder_tensor(rule: TensorQuantizationContract, name: &str) -> bool {
                 "NotApplicable quantization contracts require a reason"
             );
             false
-        }
-        TensorQuantizationContract::AcousticEncoderPrefixesV1 { prefixes, .. } => {
-            prefixes.iter().any(|prefix| name.starts_with(prefix))
         }
     }
 }

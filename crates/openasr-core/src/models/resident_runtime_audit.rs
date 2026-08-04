@@ -27,11 +27,12 @@
 //!
 //! - **K2 (resident reuse):** [`k2_every_ggml_executor_family_is_registered`]
 //!   and [`k2_registered_families_reference_a_resident_cache`] derive the
-//!   expected family set from required architecture facets. A dedicated
-//!   ggml-executor directory (`models/<module_slug>/executor.rs` or
-//!   `ggml_executor.rs`) must have a descriptor row whose graph reuse contract
-//!   is `PreparedRuntimePool`; there is no hand-maintained classification table
-//!   or exemption path. Every derived family must reference a resident
+//!   expected family set from required architecture facets. Prepared-runtime
+//!   ownership and reuse are universal execution-module invariants, not
+//!   family-selectable claims. A dedicated ggml-executor directory
+//!   (`models/<module_slug>/executor.rs` or `ggml_executor.rs`) must have a
+//!   descriptor row; there is no hand-maintained classification table or
+//!   exemption path. Every derived family must reference a resident
 //!   runtime-cache primitive in its own module (so a per-request `Runtime::new()`
 //!   rebuild has somewhere to be cached). The byte-identity of a cache HIT vs a
 //!   fresh build is proved per family by that family's own dev-pack e2e test,
@@ -54,7 +55,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrGraphReuse};
+use crate::arch::OpenAsrArchitectureRegistry;
+use crate::models::family_source_gates::ProductionSyntax;
 
 /// The committed K1 inventory (see the file's own header for the contract).
 const HOST_F32_LOADER_SITES_INVENTORY: &str = include_str!(concat!(
@@ -144,11 +146,10 @@ fn k1_host_f32_loader_sites_match_inventory() {
         if relative == "resident_runtime_audit.rs" {
             continue;
         }
-        let source = std::fs::read_to_string(file)
-            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+        let syntax = ProductionSyntax::collect(file);
         if HOST_F32_LOADER_CALLS
             .iter()
-            .any(|call| source.contains(call))
+            .any(|call| syntax.calls_or_invokes_method(call))
         {
             on_disk.insert(relative);
         }
@@ -204,7 +205,9 @@ fn on_disk_ggml_executor_families(models_dir: &Path) -> BTreeSet<String> {
 /// Derives the resident-executor family set from the canonical architecture
 /// inventory. The physical Rust directory is an explicit identity facet
 /// (`module_slug`); the conformance profile remains the public/audit name.
-/// Registry validation owns the required ownership and eviction contracts.
+/// Ownership, content-id eviction and graph reuse are supplied by the shared
+/// execution module and therefore are not repeated as self-certified family
+/// fields.
 fn registered_ggml_executor_families() -> BTreeSet<String> {
     let registry = OpenAsrArchitectureRegistry::with_builtins();
     registry
@@ -213,15 +216,7 @@ fn registered_ggml_executor_families() -> BTreeSet<String> {
     registry
         .descriptors()
         .iter()
-        .map(|descriptor| {
-            assert_eq!(
-                descriptor.optimization_contract.graph_reuse,
-                OpenAsrGraphReuse::PreparedRuntimePool,
-                "resident-runtime audit requires PreparedRuntimePool for '{}'",
-                descriptor.identity.model_architecture
-            );
-            descriptor.identity.module_slug.to_string()
-        })
+        .map(|descriptor| descriptor.identity.module_slug.to_string())
         .collect()
 }
 
@@ -260,10 +255,10 @@ fn k2_registered_families_reference_a_resident_cache() {
         let mut rs_files = Vec::new();
         collect_rs_files(&family_dir, &mut rs_files);
         let references_cache = rs_files.iter().any(|file| {
-            let source = std::fs::read_to_string(file).unwrap_or_default();
+            let syntax = ProductionSyntax::collect(file);
             RESIDENT_CACHE_PRIMITIVES
                 .iter()
-                .any(|primitive| source.contains(primitive))
+                .any(|primitive| syntax.references_identifier(primitive))
         });
         assert!(
             references_cache,
@@ -284,13 +279,14 @@ fn k3_registered_families_reference_physical_execution_lane_identity() {
         let family_dir = models_dir.join(&family);
         let mut rs_files = Vec::new();
         collect_rs_files(&family_dir, &mut rs_files);
-        let sources = rs_files
+        let references_lane_key = rs_files
             .iter()
-            .map(|file| std::fs::read_to_string(file).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .any(|file| ProductionSyntax::collect(file).references_identifier("ExecutionLaneKey"));
+        let derives_lane_key = rs_files.iter().any(|file| {
+            ProductionSyntax::collect(file).calls_or_invokes_method("current_execution_lane_key")
+        });
         assert!(
-            sources.contains("ExecutionLaneKey") && sources.contains("current_execution_lane_key"),
+            references_lane_key && derives_lane_key,
             "K3 execution-lane gate: resident family '{family}' does not derive its \
              backend-owner cache identity through ExecutionLaneKey/current_execution_lane_key. \
              A coarse GgmlCpuGraphBackend key aliases providers and physical cards."
@@ -303,7 +299,7 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
     let models_dir = models_dir();
     let mut rs_files = Vec::new();
     collect_rs_files(&models_dir, &mut rs_files);
-    let forbidden = [
+    let forbidden_symbols = [
         "checkout_thread_affine_admitted_object",
         "ThreadAffineAdmittedObjectCache",
         "take_generation_tagged",
@@ -311,8 +307,6 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
         "UnloadGenerationGated",
         "BoundedRuntimeCache",
         "DOLPHIN_WEIGHTS_POOL",
-        "unsafe impl Send for",
-        "unsafe impl Sync for",
     ];
     let mut violations = Vec::new();
     for file in rs_files {
@@ -323,10 +317,15 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
         ) {
             continue;
         }
-        let source = std::fs::read_to_string(&file).unwrap_or_default();
-        for token in forbidden {
-            if source.contains(token) {
-                violations.push(format!("{relative}: {token}"));
+        let syntax = ProductionSyntax::collect(&file);
+        for symbol in forbidden_symbols {
+            if syntax.references_identifier(symbol) || syntax.calls_or_invokes_method(symbol) {
+                violations.push(format!("{relative}: {symbol}"));
+            }
+        }
+        for trait_name in ["Send", "Sync"] {
+            if syntax.has_unsafe_impl_for(trait_name) {
+                violations.push(format!("{relative}: unsafe impl {trait_name}"));
             }
         }
     }
@@ -354,10 +353,9 @@ fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
             "PinnedRuntimeActor",
         ),
     ] {
-        let source = std::fs::read_to_string(root.join(relative))
-            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        let syntax = ProductionSyntax::collect(&root.join(relative));
         assert!(
-            source.contains(required),
+            syntax.references_identifier(required),
             "K4 auxiliary ownership gate: {relative} does not reference declared owner primitive {required}"
         );
     }

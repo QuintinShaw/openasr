@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::ggml_runtime::GgufWriteValue;
-use crate::models::diarize_pack_import::convert_diarize_safetensors_to_oasr;
+use crate::models::diarize_pack_import::convert_diarize_safetensors_to_verified_oasr;
 use crate::models::local_source_import::LocalSourceImportError;
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_FEATURE_DIARIZATION, OASR_METADATA_KEY_MODEL_ARCHITECTURE,
@@ -37,9 +37,10 @@ pub struct PyannoteImportRequest {
     pub model_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PyannoteImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: crate::VerifiedPack,
     pub tensor_count: usize,
 }
 
@@ -47,14 +48,16 @@ pub struct PyannoteImportResult {
 pub fn convert_local_pyannote_source_to_runtime_pack(
     request: &PyannoteImportRequest,
 ) -> Result<PyannoteImportResult, LocalSourceImportError> {
-    let tensor_count = convert_diarize_safetensors_to_oasr(
+    let verified_pack = convert_diarize_safetensors_to_verified_oasr(
         &request.source_safetensors,
         &request.output_root,
         PYANNOTE_GGML_ARCHITECTURE_ID,
         &runtime_metadata(request),
     )?;
+    let tensor_count = verified_pack.preflight().tensor_index().tensors().len();
     Ok(PyannoteImportResult {
         output_path: request.output_root.clone(),
+        verified_pack,
         tensor_count,
     })
 }

@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::VerifiedPack;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
@@ -76,9 +77,10 @@ pub struct FireRedPuncImportRequest {
     pub quantization: FireRedPuncQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FireRedPuncImportResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub tensor_count: usize,
     pub token_count: usize,
 }
@@ -405,9 +407,11 @@ pub fn convert_local_firered_punc_source_to_runtime_pack(
             request.output_pack.display()
         ))
     })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(FireRedPuncImportResult {
         output_path: request.output_pack.clone(),
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        verified_pack: verified,
+        tensor_count,
         token_count: tokens.len(),
     })
 }

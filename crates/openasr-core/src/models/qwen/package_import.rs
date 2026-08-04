@@ -19,6 +19,7 @@ use crate::models::oasr_metadata::{
 };
 // Re-exported at `pub(super)` (not just imported) because `forced_aligner_import.rs`
 // pulls these in via `use super::package_import::{insert_metadata, ...}`.
+use crate::VerifiedPack;
 pub(super) use crate::models::oasr_metadata::{
     insert_metadata, insert_metadata_string_array, insert_metadata_u32,
 };
@@ -57,9 +58,10 @@ pub struct Qwen3AsrLocalSourceImportRequest {
     pub quantization: Qwen3AsrRuntimeQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Qwen3AsrLocalSourceImportRuntimeResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub model_id: String,
     pub tensor_count: usize,
 }
@@ -169,10 +171,12 @@ pub fn convert_local_qwen_source_to_runtime_pack(
             request.output_root.display()
         ))
     })?;
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(Qwen3AsrLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
+        verified_pack: verified,
         model_id,
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        tensor_count,
     })
 }
 

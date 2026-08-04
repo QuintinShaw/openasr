@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
@@ -17,7 +18,7 @@ use crate::models::oasr_metadata::{
     insert_metadata_string_array as insert_string_array, insert_metadata_u32 as insert_u32,
 };
 use crate::models::pack_quant::{
-    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
@@ -43,9 +44,10 @@ pub struct MoonshineLocalSourceImportRequest {
     pub quantization: MoonshineRuntimeQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MoonshineLocalSourceImportRuntimeResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub model_id: String,
     pub tensor_count: usize,
 }
@@ -115,11 +117,12 @@ pub fn convert_local_moonshine_source_to_runtime_pack(
         ))
     })?;
 
-    let preflight = verified.preflight();
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(MoonshineLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
+        verified_pack: verified,
         model_id,
-        tensor_count: preflight.tensor_index().tensors().len(),
+        tensor_count,
     })
 }
 
@@ -374,15 +377,12 @@ fn quantized_tensor_type_for_moonshine_tensor(
     }
     // The acoustic encoder is `enc.*`; `dec.*` (incl. the encoder cross-attention
     // mapped to `dec.blk.{i}.cross_*`) is the decoder side.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        dims,
+        quantization,
+        classify_moonshine_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 /// Runtime tensor name prefix for the moonshine acoustic encoder (`enc.*`).
@@ -391,10 +391,25 @@ fn quantized_tensor_type_for_moonshine_tensor(
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: MOONSHINE_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_moonshine_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_moonshine_quant_tensor_role(name: &str) -> TensorRole {
+    if name.ends_with(".weight")
+        && AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 #[derive(Debug, Clone)]
 struct MoonshineMetadataFields {

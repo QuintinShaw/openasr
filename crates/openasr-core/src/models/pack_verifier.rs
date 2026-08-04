@@ -60,13 +60,13 @@ pub(crate) enum PackRoute {
 /// Proof that one exact source generation passed every package/runtime gate.
 /// Its fields are private; only [`PackVerifier`] can construct it.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct VerifiedPack {
+pub struct VerifiedPack {
     preflight: GgufRuntimeSourcePreflight,
     route: PackRoute,
 }
 
 impl VerifiedPack {
-    pub(crate) fn preflight(&self) -> &GgufRuntimeSourcePreflight {
+    pub fn preflight(&self) -> &GgufRuntimeSourcePreflight {
         &self.preflight
     }
 
@@ -74,8 +74,57 @@ impl VerifiedPack {
         &self.route
     }
 
-    pub(crate) fn content_id(&self) -> &str {
+    pub fn content_id(&self) -> &str {
         self.preflight.runtime_source().content_id()
+    }
+
+    /// Diagnostic path for the exact open generation represented by this
+    /// proof. The path is not an execution capability; consumers retain this
+    /// `VerifiedPack` and pass the proof across the next seam.
+    pub fn path(&self) -> &Path {
+        self.preflight.runtime_source().path()
+    }
+
+    pub(crate) fn proves_asr_family(&self, model_family: &str, model_architecture: &str) -> bool {
+        matches!(
+            &self.route,
+            PackRoute::Asr {
+                model_family: proven_family,
+                model_architecture: proven_architecture,
+            } if *proven_family == model_family && *proven_architecture == model_architecture
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_unverified_preflight_for_test(
+        preflight: GgufRuntimeSourcePreflight,
+        model_architecture: &'static str,
+    ) -> Self {
+        let descriptor = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(model_architecture)
+            .expect("test runtime architecture must be registered");
+        Self {
+            preflight,
+            route: PackRoute::Asr {
+                model_family: descriptor.identity.model_family,
+                model_architecture: descriptor.identity.model_architecture,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_unverified_preflight_and_route_for_test(
+        preflight: GgufRuntimeSourcePreflight,
+        model_family: &'static str,
+        model_architecture: &'static str,
+    ) -> Self {
+        Self {
+            preflight,
+            route: PackRoute::Asr {
+                model_family,
+                model_architecture,
+            },
+        }
     }
 
     /// Canonical catalog family projected from the route proven from these
@@ -181,7 +230,7 @@ impl AdmittedPack {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum PackVerificationError {
+pub enum PackVerificationError {
     #[error("runtime source path '{path}' is invalid: {source}")]
     RuntimeSource {
         path: PathBuf,
@@ -202,10 +251,10 @@ pub(crate) enum PackVerificationError {
 
 /// The sole constructor for verified package capability values.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct PackVerifier;
+pub struct PackVerifier;
 
 impl PackVerifier {
-    pub(crate) fn verify_candidate(
+    pub fn verify_candidate(
         self,
         candidate: PackCandidate,
     ) -> Result<VerifiedPack, PackVerificationError> {

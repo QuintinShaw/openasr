@@ -392,7 +392,7 @@ impl FireRedAedGgmlExecutor {
             .map_err(|error| FireRedAedExecutorError::DecoderFailed {
                 reason: error.to_string(),
             })?;
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let metadata =
             parse_firered_aed_execution_metadata(&preflight.metadata).map_err(|error| {
                 FireRedAedExecutorError::RuntimeContractViolation {
@@ -881,7 +881,7 @@ mod tests {
     ) -> Result<(), String> {
         use std::num::NonZeroU32;
 
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let sample_rate = NonZeroU32::new(request.prepared_audio.sample_rate_hz)
             .ok_or_else(|| "test sample rate is zero".to_string())?;
         let invocation = crate::capacity::topology::InvocationShapeInput::new(
@@ -927,7 +927,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                test_runtime_preflight(&pack_path),
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
             ),
@@ -996,7 +999,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                test_runtime_preflight(&pack_path),
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
             ),
@@ -1012,7 +1018,7 @@ mod tests {
             )),
         };
         plan_request_decoder_state(&mut request, None).expect("plan firered-aed decoder state");
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let metadata = parse_firered_aed_execution_metadata(&preflight.metadata)
             .expect("parse execution metadata");
 
@@ -1173,7 +1179,11 @@ mod tests {
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_preflight: test_runtime_preflight(&pack_path),
+                verified_pack:
+                    crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                        test_runtime_preflight(&pack_path),
+                        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+                    ),
                 selected_family: builtin_adapter_descriptor(
                     crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
                 ),
@@ -1241,7 +1251,11 @@ mod tests {
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_preflight: test_runtime_preflight(&pack_path),
+                verified_pack:
+                    crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                        test_runtime_preflight(&pack_path),
+                        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+                    ),
                 selected_family: builtin_adapter_descriptor(
                     crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
                 ),
@@ -1317,7 +1331,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                test_runtime_preflight(&pack_path),
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
             ),
@@ -1372,7 +1389,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                test_runtime_preflight(&pack_path),
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             selected_family: builtin_adapter_descriptor(
                 crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
             ),

@@ -1,13 +1,13 @@
 //! Generic seq2seq serve-batch owner.
 //!
 //! This module hosts the family-agnostic continuous-batching owner loop that
-//! the three seq2seq serve-batch owners (whisper / cohere / moonshine) will
-//! share. The control flow is ported VERBATIM from the cohere owner
+//! the seq2seq serve-batch owners (whisper / cohere / moonshine / qwen) share.
+//! The control flow is ported VERBATIM from the cohere owner
 //! (`models/cohere/batched_decode.rs`, the cleanest no-special-casing
 //! baseline), with concrete types replaced by the `Seq2SeqServeBatchFamily`
 //! associated types and concrete method calls replaced by trait hooks.
 //!
-//! All three families (cohere / moonshine / whisper) are now wired onto this
+//! All four families (cohere / moonshine / whisper / qwen) are wired onto this
 //! generic owner.
 
 use std::collections::{HashMap, VecDeque};
@@ -95,7 +95,7 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     // `Display` lets the generic owner reproduce cohere's `error.to_string()`
     // re-wrapping (`fail_all_active_slots` / refill seed failure) where one
     // error is stringified and cloned into per-slot `DecodeFailed` replies.
-    // All three family error enums derive thiserror `Error` (hence `Display`).
+    // All family error enums derive thiserror `Error` (hence `Display`).
     type Error: std::fmt::Display;
     type EngineKey: Clone + Eq + std::hash::Hash;
 
@@ -112,15 +112,12 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     fn vram_slot_bytes(job: &Self::Job) -> usize;
     fn backend(job: &Self::Job) -> GgmlCpuGraphBackend;
     fn uses_scheduler(job: &Self::Job) -> bool;
-    fn effective_max_batch_for_backend_name(configured: usize, _backend_name: &str) -> usize {
-        configured
-    } // whisper Vulkan->1
     /// Applied AFTER the VRAM cap in `validate_for_job`. The default is the
     /// identity (cohere / moonshine never resolve a backend name); whisper
-    /// overrides this to resolve the backend name and apply the Vulkan->serial
-    /// cap via `effective_max_batch_for_backend_name`. Keeping name resolution
-    /// behind this hook preserves cohere/moonshine behavior exactly (they never
-    /// initialized a backend guard inside validation).
+    /// overrides this to resolve typed backend capabilities at the shared
+    /// runtime boundary and apply its Vulkan->serial cap. Keeping capability
+    /// resolution behind this hook preserves cohere/moonshine behavior exactly
+    /// (they never initialize a backend guard inside validation).
     fn effective_max_batch_after_vram_cap(
         capped_max_batch: usize,
         _job: &Self::Job,
@@ -1193,7 +1190,7 @@ fn format_error<F: Seq2SeqServeBatchFamily>(error: F::Error) -> String {
 // ===========================================================================
 // Generic serve-batch engine layer (Wave B).
 //
-// The three families' `*ServeBatchConfig` structs were field-identical, and
+// The original three families' `*ServeBatchConfig` structs were field-identical, and
 // their engine/spawn/submit/owner-loop/registry-lookup bodies were near-clones
 // differing only in error-variant constructors and the per-family thread-name
 // prefix. They are collapsed here into a generic `ServeBatchConfig` +
@@ -1205,7 +1202,7 @@ fn format_error<F: Seq2SeqServeBatchFamily>(error: F::Error) -> String {
 const SERVE_BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVE_BATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The serve-batch owner-thread tuning shared by all three families. Field
+/// The serve-batch owner-thread tuning shared by all participating families. Field
 /// names match the previous per-family `*ServeBatchConfig` structs so the
 /// per-family type aliases and their struct-literal construction in tests keep
 /// compiling unchanged.
@@ -1481,11 +1478,11 @@ where
 
 /// Shared-layer slot isolation tests.
 ///
-/// `cohere` / `moonshine` / `whisper` are all wired onto the exact
+/// `cohere` / `moonshine` / `whisper` / `qwen` are wired onto the exact
 /// `OwnerThreadState::run_batch` / `decode_continuous_batch` code in this
 /// module (see the module doc comment), so a fake, ggml-free family here
-/// exercises the real per-slot cancellation logic those three families share
-/// -- one test proves it for all of them instead of three near-identical
+/// exercises the real per-slot cancellation logic those families share -- one
+/// test proves it for all of them instead of near-identical
 /// copies each needing a real model pack.
 #[cfg(test)]
 mod slot_isolation_tests {

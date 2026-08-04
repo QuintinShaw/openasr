@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::Deserialize;
 
+use crate::VerifiedPack;
 use crate::arch::WHISPER_GGML_ARCHITECTURE_ID;
 use crate::arch::hparams::{
     WHISPER_DECODER_BLOCK_COUNT_KEY, WHISPER_DECODER_CONTEXT_LENGTH_KEY,
@@ -18,7 +19,10 @@ use crate::models::{
         OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
         insert_metadata_u32, insert_metadata_u32_array,
     },
-    pack_quant::{PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor},
+    pack_quant::{
+        PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole,
+        classify_quant_tensor_role,
+    },
 };
 use crate::nn::half::{f16_bits_slice_to_f32, f32_to_f16_bits};
 
@@ -56,9 +60,10 @@ pub struct WhisperLocalSourceImportRequest {
     pub quantization: WhisperRuntimeQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WhisperLocalSourceImportRuntimeResult {
     pub output_path: PathBuf,
+    pub verified_pack: VerifiedPack,
     pub model_id: String,
     pub tensor_count: usize,
 }
@@ -115,12 +120,12 @@ pub fn convert_local_whisper_hf_source_to_runtime_pack(
     )
     .map_err(|error| validate_error(format!("Whisper local-source GGUF writer failed: {error}")))?;
 
-    let preflight = verified.preflight();
-    let index = preflight.tensor_index();
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(WhisperLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
+        verified_pack: verified,
         model_id,
-        tensor_count: index.tensors().len(),
+        tensor_count,
     })
 }
 
@@ -178,18 +183,13 @@ fn quantization_tensor_type_for_whisper_tensor(
         return None;
     }
     let name = tensor.name.as_str();
-    let is_encoder = is_whisper_encoder_linear_weight(name);
-    if !is_encoder && !is_whisper_decoder_linear_weight(name) {
-        return None;
-    }
-    let component = if is_encoder {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
     let dims = gguf_runtime_tensor_dims_from_source_tensor(tensor);
-    let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        &dims,
+        quantization,
+        classify_whisper_quant_tensor_role(name),
+        QuantizedAxis::First,
+    )
 }
 
 fn gguf_quantized_tensor_from_safetensors(
@@ -239,24 +239,22 @@ fn gguf_runtime_tensor_dims_from_source_tensor(tensor: &SafetensorsTensorHeader)
     tensor.shape.clone()
 }
 
-/// Runtime tensor namespace prefix for the whisper audio encoder. Broader
-/// than [`is_whisper_encoder_linear_weight`] on purpose: that function also
-/// gates *quantization eligibility* (rank-2 `.weight`, specific projections),
-/// but the audit's question is "is this tensor part of the audio encoder at
-/// all" -- e.g. `model.encoder.conv1.weight` is encoder but not
-/// linear-eligible today. Keeping the audit rule at the namespace level means
-/// it stays correct even if a future change block-quantizes a
-/// currently-untouched encoder tensor; `whisper_encoder_linear_weights_stay_within_the_audit_namespace`
-/// below pins the containment the other way (every linear-eligible name is
-/// also inside this namespace). Shared with `models::pack_quant_audit`'s
-/// encoder-floor rule.
-pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["model.encoder."];
-
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
-    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+    TensorQuantizationContract::SemanticRolesV1 {
         model_architecture: WHISPER_GGML_ARCHITECTURE_ID,
-        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        classify: classify_whisper_quant_tensor_role,
+        quantized_axis: QuantizedAxis::First,
     };
+
+fn classify_whisper_quant_tensor_role(name: &str) -> TensorRole {
+    if is_whisper_encoder_linear_weight(name) {
+        TensorRole::AcousticEncoderMatrix
+    } else if is_whisper_decoder_linear_weight(name) {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 fn is_whisper_encoder_linear_weight(name: &str) -> bool {
     name.starts_with("model.encoder.layers.")
@@ -1096,19 +1094,8 @@ mod tests {
         );
     }
 
-    /// `AUDIO_ENCODER_TENSOR_NAME_PREFIXES` (consumed by
-    /// `models::pack_quant_audit`) is deliberately broader than
-    /// `is_whisper_encoder_linear_weight` (see that constant's doc comment):
-    /// every name the eligibility check accepts must fall inside the audit
-    /// namespace, so the two can never silently diverge on the direction that
-    /// matters (a linear-quantizable encoder tensor escaping the floor).
     #[test]
-    fn whisper_encoder_linear_weights_stay_within_the_audit_namespace() {
-        let is_audit_encoder_name = |name: &str| {
-            AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-        };
+    fn whisper_quantization_classifier_matches_current_eligibility() {
         for name in [
             "model.encoder.layers.0.self_attn.q_proj.weight",
             "model.encoder.layers.0.self_attn.k_proj.weight",
@@ -1116,34 +1103,30 @@ mod tests {
             "model.encoder.layers.0.self_attn.out_proj.weight",
             "model.encoder.layers.5.fc1.weight",
             "model.encoder.layers.5.fc2.weight",
-            // Non-linear encoder tensors the eligibility check never touches
-            // today must still be caught by the broader namespace rule.
+        ] {
+            assert!(
+                classify_whisper_quant_tensor_role(name) == TensorRole::AcousticEncoderMatrix,
+                "'{name}' must be classified as an acoustic encoder matrix"
+            );
+        }
+        for name in [
             "model.encoder.conv1.weight",
             "model.encoder.conv2.weight",
             "model.encoder.embed_positions.weight",
         ] {
-            assert!(
-                is_audit_encoder_name(name),
-                "'{name}' must be inside the audit's audio-encoder namespace"
+            assert_eq!(
+                classify_whisper_quant_tensor_role(name),
+                TensorRole::NonQuantizable
             );
         }
-        assert!(is_whisper_encoder_linear_weight(
-            "model.encoder.layers.0.self_attn.q_proj.weight"
-        ));
-        assert!(is_audit_encoder_name(
-            "model.encoder.layers.0.self_attn.q_proj.weight"
-        ));
-        // Decoder names (incl. the cross-attention "encoder_attn" tensors,
-        // which read FROM the encoder but live in the decoder stack) must
-        // stay outside the namespace.
         for name in [
             "model.decoder.layers.0.self_attn.q_proj.weight",
             "model.decoder.layers.0.encoder_attn.q_proj.weight",
             "model.decoder.output_projection.weight",
         ] {
-            assert!(
-                !is_audit_encoder_name(name),
-                "'{name}' must NOT be inside the audio-encoder namespace"
+            assert_eq!(
+                classify_whisper_quant_tensor_role(name),
+                TensorRole::TextDecoderMatrix
             );
         }
     }

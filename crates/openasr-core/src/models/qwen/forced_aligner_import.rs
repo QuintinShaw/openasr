@@ -72,9 +72,12 @@ pub struct Qwen3ForcedAlignerLocalSourceImportRequest {
     pub quantization: Qwen3AsrRuntimeQuantizationMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Qwen3ForcedAlignerLocalSourceImportRuntimeResult {
     pub output_path: PathBuf,
+    /// Capability proof for the exact bytes written. `output_path` is only a
+    /// diagnostic location and must never be reopened as an execution proof.
+    pub verified_pack: crate::VerifiedPack,
     pub model_id: String,
     pub tensor_count: usize,
 }
@@ -207,10 +210,12 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
         ))
     })?;
 
+    let tensor_count = verified.preflight().tensor_index().tensors().len();
     Ok(Qwen3ForcedAlignerLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
+        verified_pack: verified,
         model_id,
-        tensor_count: verified.preflight().tensor_index().tensors().len(),
+        tensor_count,
     })
 }
 

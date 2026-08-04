@@ -84,6 +84,32 @@ pub enum LanguageFamilyHint {
     FixedMultilingual { languages: &'static [&'static str] },
 }
 
+/// Executable adapter-pack binding shape supplied by a family executor.
+///
+/// This replaces the retired self-certified LoRA capability boolean. A
+/// descriptor may select a supported strategy only when the concrete offline
+/// and streaming executors report the same binding at dispatch time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgmlAdapterBindingStrategy {
+    Unsupported,
+    Qwen3AsrLoraV1,
+    MoonshineLoraV1,
+}
+
+impl GgmlAdapterBindingStrategy {
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Qwen3AsrLoraV1 => "qwen3-asr-lora-v1",
+            Self::MoonshineLoraV1 => "moonshine-lora-v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgmlFamilyAdapterDescriptor {
     pub adapter_id: &'static str,
@@ -94,10 +120,8 @@ pub struct GgmlFamilyAdapterDescriptor {
     pub decode_policy_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub execution_capabilities: crate::device::execution_policy::ExecutionCapabilities,
-    /// Whether the selected family exposes a complete LoRA/OADP adapter
-    /// binding. This is projected from the canonical architecture execution
-    /// contract; runtime gates must not maintain a family-name allowlist.
-    pub supports_lora_adapter: bool,
+    /// Concrete adapter binding required from the selected executor.
+    pub adapter_binding: GgmlAdapterBindingStrategy,
     pub phrase_bias: crate::arch::OpenAsrPhraseBiasStrategy,
     pub word_timestamps: crate::arch::OpenAsrWordTimestampStrategy,
     pub language_family_hint: LanguageFamilyHint,

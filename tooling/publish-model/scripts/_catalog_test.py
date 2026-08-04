@@ -131,7 +131,10 @@ class ModelFamilyInventoryTest(unittest.TestCase):
 
         for family in inventory.values():
             execution = family["execution"]
-            self.assertIsInstance(execution["supports_lora_adapter"], bool)
+            self.assertIn(
+                execution["adapter_binding"],
+                {"unsupported", "qwen3-asr-lora-v1", "moonshine-lora-v1"},
+            )
             self.assertEqual(
                 execution["supports_phrase_bias"],
                 execution["phrase_bias_strategy"] != "unsupported",
@@ -158,12 +161,12 @@ class ModelFamilyInventoryTest(unittest.TestCase):
         payload["families"][0]["execution"]["prepared_runtime"] = "shared-future-component-v17"
         load_model_family_inventory(self._write_payload(payload))
 
-    def test_rejects_non_boolean_lora_binding(self) -> None:
+    def test_rejects_unknown_adapter_binding(self) -> None:
         payload = self._committed_payload()
-        payload["families"][0]["execution"]["supports_lora_adapter"] = "yes"
+        payload["families"][0]["execution"]["adapter_binding"] = "future-lora-v1"
         with self.assertRaisesRegex(
             ValueError,
-            r"families\[0\]\.execution\.supports_lora_adapter.*boolean",
+            r"families\[0\]\.execution\.adapter_binding.*unsupported binding",
         ):
             load_model_family_inventory(self._write_payload(payload))
 
@@ -231,9 +234,9 @@ class ModelFamilyInventoryTest(unittest.TestCase):
             if quantization["tensor_classification"] == "semantic-roles-v1":
                 self.assertIn(quantization["quantized_axis"], {"first", "last"})
             else:
-                self.assertEqual(
+                self.assertIn(
                     quantization["tensor_classification"],
-                    "acoustic-encoder-prefixes-v1",
+                    {"entire-acoustic-pack", "not-applicable"},
                 )
                 self.assertIsNone(quantization["quantized_axis"])
 
@@ -348,18 +351,26 @@ class ModelFamilyInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "semantic-roles-v1 requires 'first' or 'last'"):
             load_model_family_inventory(self._write_payload(payload))
 
-    def test_rejects_acoustic_encoder_prefixes_with_quantized_axis(self) -> None:
+    def test_accepts_nonsemantic_quantization_contracts_without_axis(self) -> None:
         payload = self._committed_payload()
-        family = next(
-            family
-            for family in payload["families"]
-            if family["quantization"]["tensor_classification"]
-            == "acoustic-encoder-prefixes-v1"
-        )
-        family["quantization"]["quantized_axis"] = "first"
+        for classification in ("entire-acoustic-pack", "not-applicable"):
+            candidate = json.loads(json.dumps(payload))
+            candidate["families"][0]["quantization"] = {
+                "tensor_classification": classification,
+                "quantized_axis": None,
+            }
+            with self.subTest(classification=classification):
+                load_model_family_inventory(self._write_payload(candidate))
+
+    def test_rejects_nonsemantic_quantization_with_quantized_axis(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["quantization"] = {
+            "tensor_classification": "entire-acoustic-pack",
+            "quantized_axis": "first",
+        }
         with self.assertRaisesRegex(
             ValueError,
-            "acoustic-encoder-prefixes-v1 requires null",
+            "entire-acoustic-pack requires null",
         ):
             load_model_family_inventory(self._write_payload(payload))
 

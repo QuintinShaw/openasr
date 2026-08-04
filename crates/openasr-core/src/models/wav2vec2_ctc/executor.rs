@@ -437,7 +437,7 @@ impl Wav2Vec2CtcGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         decode_wav2vec2_ctc_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
@@ -495,7 +495,7 @@ impl GgmlAsrViewExecutor for Wav2Vec2CtcGgmlExecutor {
         };
         // Fail-closed: consume the already-admitted Gate-0 proof, then run the
         // cached prepared-runtime path against that exact source generation.
-        let preflight = &request.runtime_source_preflight;
+        let preflight = request.runtime_source_preflight();
         let output = transcribe_wav2vec2_ctc_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
