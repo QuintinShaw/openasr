@@ -17,10 +17,10 @@ use crate::arch::{
 };
 use crate::device::{
     execution_policy::{
-        ExecutionCandidate, ExecutionCandidateFailure, ExecutionIntent, ExecutionPlacement,
-        ExecutionPlan, ExecutionPolicyError,
+        AcceleratedDeviceConstraint, ExecutionCandidate, ExecutionCandidateFailure,
+        ExecutionIntent, ExecutionPlacement, ExecutionPlan, ExecutionPolicyError,
     },
-    execution_route::enumerate_compute_devices_from_ggml,
+    execution_route::{ExecutionProvider, enumerate_compute_devices_from_ggml},
 };
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference};
 #[cfg(test)]
@@ -86,6 +86,57 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 /// both gets whichever is tighter.
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
+
+fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
+    let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
+    if value.eq_ignore_ascii_case("cpu") {
+        return Some(ExecutionIntent::CpuOnly);
+    }
+    if value.eq_ignore_ascii_case("gpu") {
+        return Some(ExecutionIntent::AcceleratedOnly);
+    }
+    let provider = if value.eq_ignore_ascii_case("metal") {
+        ExecutionProvider::Metal
+    } else if value.eq_ignore_ascii_case("cuda") {
+        ExecutionProvider::Cuda
+    } else if value.eq_ignore_ascii_case("hip") || value.eq_ignore_ascii_case("rocm") {
+        ExecutionProvider::Hip
+    } else if value.eq_ignore_ascii_case("vulkan") {
+        ExecutionProvider::Vulkan
+    } else {
+        return None;
+    };
+    Some(ExecutionIntent::ConstrainedAcceleratedOnly(
+        AcceleratedDeviceConstraint::Provider(provider),
+    ))
+}
+
+/// Resolve the process-wide developer/backend override into the same typed
+/// request intent consumed by the unified execution policy. The environment
+/// is read exactly once at the native boundary; every main and auxiliary
+/// stage then receives a clone of this immutable value.
+fn request_execution_intent(target: Option<crate::ExecutionTarget>) -> ExecutionIntent {
+    let backend_env = std::env::var(GgmlCpuGraphConfig::BACKEND_ENV).ok();
+    request_execution_intent_with_backend_env(target, backend_env.as_deref())
+}
+
+fn request_execution_intent_with_backend_env(
+    target: Option<crate::ExecutionTarget>,
+    backend_env: Option<&str>,
+) -> ExecutionIntent {
+    match target.unwrap_or_default() {
+        crate::ExecutionTarget::Cpu => ExecutionIntent::CpuOnly,
+        crate::ExecutionTarget::Accelerated => {
+            match execution_intent_from_backend_env(backend_env) {
+                Some(intent @ ExecutionIntent::ConstrainedAcceleratedOnly(_)) => intent,
+                _ => ExecutionIntent::AcceleratedOnly,
+            }
+        }
+        crate::ExecutionTarget::Auto => {
+            execution_intent_from_backend_env(backend_env).unwrap_or(ExecutionIntent::Auto)
+        }
+    }
+}
 // Phase-aware progress for the in-flight native file transcription, keyed by
 // transcription id in a bounded per-request registry. The server's native
 // path has no concurrency gate (each request's native transcription runs on
@@ -1185,7 +1236,7 @@ fn run_native_transcription_fallible(
     // re-reads process defaults after the main ASR dispatch completes.
     let request_execution_intent = execution_intent
         .clone()
-        .unwrap_or_else(|| ExecutionIntent::from(request.execution_target.unwrap_or_default()));
+        .unwrap_or_else(|| request_execution_intent(request.execution_target));
     // Coarse per-request stage timing: "inference" spans model resolution +
     // audio prep (see the `audio_prep` stage logged inside `_impl` around the
     // WAV load) + decode/longform-assembly, i.e. the whole
@@ -1610,8 +1661,8 @@ fn run_native_transcription_impl(
     )?;
     let emits_punctuation =
         emits_punctuation_for_model_architecture(selected_family.model_architecture);
-    let request_execution_intent = execution_intent
-        .unwrap_or_else(|| ExecutionIntent::from(request.execution_target.unwrap_or_default()));
+    let request_execution_intent =
+        execution_intent.unwrap_or_else(|| request_execution_intent(request.execution_target));
     let execution_plan = resolve_native_execution_plan(
         execution_services.as_ref(),
         &selected_family,
@@ -3816,6 +3867,76 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_request_auto_honors_backend_environment_as_typed_intent() {
+        assert_eq!(
+            request_execution_intent_with_backend_env(None, Some("cpu")),
+            ExecutionIntent::CpuOnly
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(
+                Some(crate::ExecutionTarget::Auto),
+                Some("metal")
+            ),
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Metal
+            ))
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(None, Some("rocm")),
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Hip
+            ))
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(None, Some("gpu")),
+            ExecutionIntent::AcceleratedOnly
+        );
+    }
+
+    #[test]
+    fn native_request_explicit_target_preserves_product_constraint() {
+        assert_eq!(
+            request_execution_intent_with_backend_env(
+                Some(crate::ExecutionTarget::Cpu),
+                Some("cuda")
+            ),
+            ExecutionIntent::CpuOnly
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(
+                Some(crate::ExecutionTarget::Accelerated),
+                Some("cpu")
+            ),
+            ExecutionIntent::AcceleratedOnly
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(
+                Some(crate::ExecutionTarget::Accelerated),
+                Some("vulkan")
+            ),
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Vulkan
+            ))
+        );
+    }
+
+    #[test]
+    fn native_request_unknown_or_missing_backend_environment_keeps_auto() {
+        assert_eq!(
+            request_execution_intent_with_backend_env(None, None),
+            ExecutionIntent::Auto
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(None, Some("")),
+            ExecutionIntent::Auto
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(None, Some("not-a-backend")),
+            ExecutionIntent::Auto
+        );
+    }
 
     #[test]
     fn canceled_longform_planning_maps_to_typed_backend_cancel() {

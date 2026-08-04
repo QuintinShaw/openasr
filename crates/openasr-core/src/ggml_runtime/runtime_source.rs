@@ -10,7 +10,12 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -53,12 +58,31 @@ impl StrongFileIdentity {
     /// `None` when any needed metadata field cannot be read (including a
     /// pre-1970 mtime, which cannot be represented here) -- callers must fail
     /// closed rather than trust a partial identity.
-    pub(crate) fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+    pub(crate) fn of_file(file: &File, metadata: &std::fs::Metadata) -> Option<Self> {
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = metadata;
+            let _ = (file, metadata);
             return None;
         }
+        #[cfg(unix)]
+        let _ = file;
+        #[cfg(windows)]
+        let handle_identity = {
+            let mut information = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: `file` owns a live Windows file handle for the duration
+            // of this call, and `information` points to writable storage of
+            // the exact structure required by GetFileInformationByHandle.
+            let succeeded =
+                unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+            if succeeded == 0 {
+                return None;
+            }
+            (
+                information.dwVolumeSerialNumber,
+                (u64::from(information.nFileIndexHigh) << 32)
+                    | u64::from(information.nFileIndexLow),
+            )
+        };
         let modified = metadata.modified().ok()?;
         let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
         Some(Self {
@@ -67,9 +91,9 @@ impl StrongFileIdentity {
             #[cfg(unix)]
             ino: metadata.ino(),
             #[cfg(windows)]
-            volume_serial_number: metadata.volume_serial_number()?,
+            volume_serial_number: handle_identity.0,
             #[cfg(windows)]
-            file_index: metadata.file_index()?,
+            file_index: handle_identity.1,
             len: metadata.len(),
             mtime_secs: since_epoch.as_secs(),
             mtime_nanos: since_epoch.subsec_nanos(),
@@ -341,7 +365,7 @@ impl GgmlRuntimeSource {
     fn trusted_object_content_id(&self, models_root: &Path) -> Option<String> {
         let canonical_path = fs::canonicalize(&self.path).ok()?;
         let canonical_models_root = fs::canonicalize(models_root).ok()?;
-        let current_identity = StrongFileIdentity::of(&fs::metadata(&canonical_path).ok()?)?;
+        let current_identity = self.current_strong_file_identity()?;
         if current_identity != self.stat_identity {
             return None;
         }
@@ -395,7 +419,7 @@ impl GgmlRuntimeSource {
         let file = file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        StrongFileIdentity::of(&file.metadata().ok()?)
+        StrongFileIdentity::of_file(&file, &file.metadata().ok()?)
     }
 
     /// Return the exact engine-requested host-memory peak for making an
@@ -676,7 +700,7 @@ pub fn validate_ggml_runtime_source_path(
             path: path.to_path_buf(),
         });
     }
-    let stat_identity = StrongFileIdentity::of(&fd_metadata).ok_or_else(|| {
+    let stat_identity = StrongFileIdentity::of_file(&file, &fd_metadata).ok_or_else(|| {
         GgmlRuntimeSourcePathError::UnsupportedFileIdentity {
             path: path.to_path_buf(),
         }

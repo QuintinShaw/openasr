@@ -71,7 +71,10 @@ pub fn is_cacheable_pack_content_id(pack_content_id: &str) -> bool {
 /// already exists costs no read of its bytes.
 pub(crate) fn pack_content_id_for_path_before_replace(path: &Path, models_root: &Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let Ok(metadata) = std::fs::metadata(&canonical) else {
+    let Ok(mut file) = std::fs::File::open(&canonical) else {
+        return unreadable_content_id(&canonical);
+    };
+    let Ok(metadata) = file.metadata() else {
         return unreadable_content_id(&canonical);
     };
     // `models_root` is canonicalized the same way `path` just was: on
@@ -83,14 +86,10 @@ pub(crate) fn pack_content_id_for_path_before_replace(path: &Path, models_root: 
     // without weakening it.
     let canonical_root =
         std::fs::canonicalize(models_root).unwrap_or_else(|_| models_root.to_path_buf());
-    // The seal here comes from a path stat, not an open descriptor --
-    // `trusted_object_digest`'s contract prefers fd-derived metadata. This
-    // call site may keep the weaker form because its verdict only ever
-    // decides a cache eviction: a stat/open race can at worst evict too
-    // little or too much, never key a runtime build by the wrong content.
-    // A new caller that feeds a runtime build must not copy this shape --
-    // open the file first and take the seal from its fd, as
-    // `GgmlRuntimeSource` does.
+    // Read the seal and identity from the same open file that the cold path
+    // hashes. Besides being required for stable Windows file identity, this
+    // prevents a path replacement between stat and open from warming the
+    // shared identity memo with a digest for a different generation.
     if let Some(digest) = crate::content_store::trusted_object_digest(
         &canonical,
         metadata.permissions().readonly(),
@@ -98,10 +97,10 @@ pub(crate) fn pack_content_id_for_path_before_replace(path: &Path, models_root: 
     ) {
         return content_id_from_sha256_hex(digest);
     }
-    let Some(identity) = StrongFileIdentity::of(&metadata) else {
+    let Some(identity) = StrongFileIdentity::of_file(&file, &metadata) else {
         return unreadable_content_id(&canonical);
     };
-    resolve_content_id(&canonical, identity, || sha256_hex_file(&canonical).ok())
+    resolve_content_id(&canonical, identity, || sha256_hex_reader(&mut file).ok())
 }
 
 /// Content-addressed prepared/process-pool cache key: pack content id alone.
@@ -145,15 +144,19 @@ impl PackContentKey {
 /// the seal gate declines (sealed objects answer from their path digest and
 /// never get here). `GgmlRuntimeSource::content_id` never calls this: it
 /// hashes the mapping it already holds open instead.
+#[cfg(test)]
 fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
     let mut file = std::fs::File::open(path)?;
+    sha256_hex_reader(&mut file)
+}
+
+fn sha256_hex_reader(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
