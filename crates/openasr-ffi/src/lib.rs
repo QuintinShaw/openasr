@@ -167,21 +167,20 @@ pub struct OpenAsrModel {
 }
 
 enum OpenAsrModelProof {
-    Verified {
-        adapter: NativeRuntimeModelAdapter,
-        model_pack: NativeAsrModelPackRef,
-    },
+    Verified(Box<VerifiedOpenAsrModelProof>),
     #[cfg(test)]
     UnverifiedFixture,
+}
+
+struct VerifiedOpenAsrModelProof {
+    adapter: NativeRuntimeModelAdapter,
+    model_pack: NativeAsrModelPackRef,
 }
 
 impl OpenAsrModelProof {
     fn verified(&self) -> Option<(&NativeRuntimeModelAdapter, &NativeAsrModelPackRef)> {
         match self {
-            Self::Verified {
-                adapter,
-                model_pack,
-            } => Some((adapter, model_pack)),
+            Self::Verified(proof) => Some((&proof.adapter, &proof.model_pack)),
             #[cfg(test)]
             Self::UnverifiedFixture => None,
         }
@@ -494,10 +493,10 @@ unsafe fn open_model_with_services(
     })() {
         Ok((adapter, model_pack)) => {
             let handle = Box::new(OpenAsrModel {
-                proof: OpenAsrModelProof::Verified {
+                proof: OpenAsrModelProof::Verified(Box::new(VerifiedOpenAsrModelProof {
                     adapter,
                     model_pack,
-                },
+                })),
                 execution_services,
             });
             // SAFETY: checked non-null above.
