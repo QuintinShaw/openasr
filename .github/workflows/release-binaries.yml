@@ -30,6 +30,10 @@ on:
         description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
         required: false
         default: ""
+      cuda_gpu_targets:
+        description: "Optional CUDA arch list for a diagnostic workflow_dispatch build (empty = release defaults)"
+        required: false
+        default: ""
   workflow_call:
     inputs:
       ref:
@@ -71,6 +75,10 @@ jobs:
     # users tune locally via --features native or OPENASR_GGML_NATIVE=1.
     env:
       OPENASR_GGML_NATIVE: "0"
+      # A maintainer may narrow a manual diagnostic build to the exact GPU
+      # under test. Tag/workflow_call releases leave this empty and retain the
+      # portable build.rs defaults.
+      OPENASR_CUDA_GPU_TARGETS: ${{ inputs.cuda_gpu_targets || '' }}
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
