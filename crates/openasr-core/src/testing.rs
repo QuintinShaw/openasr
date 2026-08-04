@@ -578,7 +578,15 @@ impl TinyGgufFixtureSpec {
         ] {
             spec = spec.with_tensor_shape(name, dims);
         }
-        spec
+        // The admission contract proves tokenizer construction and full
+        // `moonshine.vocab_size` coverage from the pack metadata, so the
+        // verifier-ready skeleton carries the same llama-model vocab the
+        // importer writes (exactly vocab_size entries).
+        spec.with_metadata("tokenizer.ggml.model", "llama")
+            .with_string_array_metadata(
+                "tokenizer.ggml.tokens",
+                ["<pad>", "<s>", "</s>", "fixture"],
+            )
     }
 
     /// Metadata-complete Qwen3-ASR routing fixture. As with the Moonshine
