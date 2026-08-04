@@ -758,6 +758,77 @@ impl TinyGgufFixtureSpec {
         Self::new(metadata)
     }
 
+    /// Metadata-complete wav2vec2-ctc routing fixture with the same tiny
+    /// internally-consistent geometry the runtime tensor-contract tests use
+    /// (one transformer layer, hidden 16, vocab 4, blank 0, group-norm
+    /// feature extractor, single folded pos-conv).
+    pub fn wav2vec2_ctc_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "wav2vec2-ctc".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::WAV2VEC2_CTC_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::WAV2VEC2_CTC_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::WAV2VEC2_CTC_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "wav2vec2-ctc"),
+            ("wav2vec2.n_layers", "1"),
+            ("wav2vec2.hidden_size", "16"),
+            ("wav2vec2.n_heads", "2"),
+            ("wav2vec2.head_dim", "8"),
+            ("wav2vec2.ffn_dim", "32"),
+            ("wav2vec2.vocab_size", "4"),
+            ("wav2vec2.num_conv_pos_embeddings", "4"),
+            ("wav2vec2.num_conv_pos_embedding_groups", "2"),
+            ("ctc.blank_token_id", "0"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Contract-complete wav2vec2-ctc fixture: the fail-closed metadata plus
+    /// the full runtime tensor set, so the pack passes the production
+    /// `PackVerifier` (which enforces the family runtime metadata AND tensor
+    /// contract). The tensor set comes from the same enumeration the
+    /// admission validator checks, so fixture and validator agree through one
+    /// contract. Mirrors `xasr_zipformer_oasr_v1_runtime_ready`.
+    pub fn wav2vec2_ctc_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut spec = Self::wav2vec2_ctc_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::wav2vec2_ctc::runtime_contract::parse_wav2vec2_ctc_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("wav2vec2 fixture metadata must parse");
+        for (name, dims) in
+            crate::models::wav2vec2_ctc::runtime_contract::wav2vec2_ctc_runtime_tensors(&metadata)
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
@@ -2461,6 +2532,11 @@ mod tests {
                     "xasr-fixture",
                 ),
                 "xasr-zipformer",
+            ),
+            (
+                "wav2vec2.oasr",
+                TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready("wav2vec2-fixture"),
+                "wav2vec2",
             ),
         ];
         for (name, spec, expected_catalog_family) in cases {
