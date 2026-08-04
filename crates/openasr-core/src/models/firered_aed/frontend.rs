@@ -21,20 +21,36 @@ use crate::models::kaldi_fbank::{
 
 pub(crate) const SAMPLE_RATE_HZ: u32 = 16_000;
 pub(crate) const NUM_MEL_BINS: usize = 80;
+/// 25 ms analysis window (upstream `kaldi_native_fbank` default with
+/// `frame_length=25`); also baked into the pack metadata as
+/// `firered.audio.frame_length_ms` so the admission contract can pin it.
+pub(crate) const FRAME_LENGTH_MS: u32 = 25;
+/// 10 ms frame hop (upstream `frame_shift=10`); baked into the pack metadata
+/// as `firered.audio.frame_shift_ms`.
+pub(crate) const FRAME_SHIFT_MS: u32 = 10;
+const SAMPLES_PER_MS: usize = (SAMPLE_RATE_HZ as usize) / 1_000;
 /// 25 ms @ 16 kHz. Exposed (not just baked into [`FRONTEND_CONFIG`]) so
 /// [`super::decoder_graph`]'s cross-KV capacity sizing can predict the mel
 /// frame count for a given audio duration without duplicating this constant.
-pub(crate) const FRAME_LENGTH_SAMPLES: usize = 400;
+pub(crate) const FRAME_LENGTH_SAMPLES: usize = FRAME_LENGTH_MS as usize * SAMPLES_PER_MS;
 /// 10 ms @ 16 kHz (`snip_edges=true`: frame count is `1 + (len - FRAME_LENGTH_SAMPLES) / FRAME_SHIFT_SAMPLES`).
-pub(crate) const FRAME_SHIFT_SAMPLES: usize = 160;
+pub(crate) const FRAME_SHIFT_SAMPLES: usize = FRAME_SHIFT_MS as usize * SAMPLES_PER_MS;
+/// 512-point FFT: next pow2 >= the 400-sample window (kaldi rounds the window
+/// up). Baked into the pack metadata as `firered.audio.n_fft`; the packed
+/// provenance filterbank ([`super::package_import`]) derives its bin count
+/// from the same constant.
+pub(crate) const FFT_SIZE: usize = 512;
+/// Kaldi/HTK mel-scale low edge shared by the runtime frontend and the packed
+/// provenance filterbank (both are the same 80-mel construction).
+pub(crate) const MEL_LOW_HZ: f32 = 20.0;
 
 const FRONTEND_CONFIG: KaldiFbankConfig = KaldiFbankConfig {
     sample_rate_hz: SAMPLE_RATE_HZ,
     frame_length: FRAME_LENGTH_SAMPLES,
     frame_shift: FRAME_SHIFT_SAMPLES,
-    fft_size: 512, // next pow2 >= 400 (kaldi rounds the window up)
+    fft_size: FFT_SIZE,
     num_mel_bins: NUM_MEL_BINS,
-    mel_low_hz: 20.0,
+    mel_low_hz: MEL_LOW_HZ,
     mel_high_hz: 8_000.0, // high_freq <= 0 in kaldi => Nyquist
     preemph_coeff: 0.97,
     input_scale: 32_768.0, // float [-1, 1] -> int16 magnitude
