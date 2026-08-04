@@ -700,7 +700,7 @@ fn require_tensor<'a>(
     let name = compact_xasr_name(upstream_name);
     index
         .get(&name)
-        .ok_or_else(|| XasrTensorContractError::MissingRequiredTensor { name })
+        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })
 }
 
 fn require_vector(
@@ -711,7 +711,7 @@ fn require_vector(
     let name = compact_xasr_name(upstream_name);
     let tensor = index
         .get(&name)
-        .ok_or_else(|| XasrTensorContractError::MissingRequiredTensor { name })?;
+        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })?;
     if tensor.dims.len() == 1 && tensor.dims[0] == len as u64 {
         return Ok(());
     }
@@ -730,7 +730,7 @@ fn require_exact(
     let name = compact_xasr_name(upstream_name);
     let tensor = index
         .get(&name)
-        .ok_or_else(|| XasrTensorContractError::MissingRequiredTensor { name })?;
+        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })?;
     if tensor.dims.as_slice() == expected {
         return Ok(());
     }
