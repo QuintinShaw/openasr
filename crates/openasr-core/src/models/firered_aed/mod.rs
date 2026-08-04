@@ -5,16 +5,33 @@
 //! a LayerNorm mid-block) over a Conv2d 4x subsampling stem, plus a 16-layer
 //! pre-norm Transformer decoder (causal self-attention + cross-attention +
 //! GELU FFN, absolute sinusoidal positions). No CTC branch: decoding is pure
-//! autoregressive attention. Char + SentencePiece hybrid vocab (`dict.txt`),
-//! Mandarin/Chinese-dialect + English. Apache-2.0.
+//! autoregressive attention from the `<sos>` prompt. Char + SentencePiece
+//! hybrid vocab (`dict.txt`), Mandarin/Chinese-dialect + English. Apache-2.0.
 //!
-//! Stage status:
-//! - The checkpoint-to-GGUF importer lives in [`package_import`].
-//! - The fbank+CMVN frontend ([`frontend`]), the detokenizer ([`tokenizer`]),
-//!   and the pack-metadata contract ([`runtime_contract`]) are implemented and
-//!   unit-tested here.
-//! - The Conformer encoder graph ([`encoder_graph`]), the KV-cached decoder
-//!   ([`decoder_graph`]), and the dedicated [`executor`] complete the stage.
+//! The family's complete lifecycle row -- identity, pack, execution,
+//! topology, optimization, quantization, and conformance facets -- is declared
+//! in the canonical architecture inventory (`arch/mod.rs`); offline/streaming
+//! dispatch, executor materialization, runtime-validator routing, and
+//! content-id eviction are generated projections of that row, not
+//! family-specific central wiring. The checkpoint-to-`.oasr` importer
+//! ([`package_import`]) is the row's pack-import surface: it reads the
+//! safetensors source through the shared `local_source_import` track, writes
+//! through the shared `PackEnvelope`/`OasrPackWriter` seam, and returns the
+//! `VerifiedPack` proof every install/runtime path consumes -- the exposed
+//! `output_path` is diagnostic, not an execution capability.
+//!
+//! Family-varying semantics stay in typed descriptor facets plus narrow
+//! adapters: greedy decode rides the shared seq2seq driver
+//! (`run_builtin_seq2seq_decode_policy` in [`decoder_graph`]) under the row's
+//! `SharedSeq2SeqGreedy` strategy -- the structural fix for issue #60's
+//! long-audio repetition, never a hand-written argmax loop -- with the
+//! `ConservativeSeq2SeqV1` longform profile carried by the family decode
+//! policy component; the Conformer encoder and attention decoder are an
+//! `ArchitectureGraph` (the three-independent-LayerNorm / bias-free topology
+//! is not a composer block kind, see [`encoder_graph`]); and the runtime
+//! pack contract ([`runtime_contract`]) is depth-complete -- metadata,
+//! frontend-audio, tensor binding, and tokenizer admission all fail closed at
+//! pack verification.
 
 pub(crate) mod capacity;
 mod decode_budget;

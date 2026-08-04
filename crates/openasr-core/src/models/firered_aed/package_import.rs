@@ -57,19 +57,11 @@ use crate::models::pack_quant::{
     PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
 
+use super::frontend::{FFT_SIZE, FRAME_LENGTH_MS, FRAME_SHIFT_MS, MEL_LOW_HZ, SAMPLE_RATE_HZ};
+
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 const SOURCE_DICT_TXT: &str = "dict.txt";
 const SOURCE_CMVN_TXT: &str = "cmvn.txt";
-
-// fbank frontend contract (upstream `kaldi_native_fbank` defaults with
-// `num_mel_bins=80, frame_length=25, frame_shift=10, dither=0`): 16 kHz mono,
-// 400-sample window rounded up to a 512-point FFT, kaldi/HTK mel scale from
-// 20 Hz to Nyquist.
-const SAMPLE_RATE_HZ: u32 = 16_000;
-const FRAME_LENGTH_MS: u32 = 25;
-const FRAME_SHIFT_MS: u32 = 10;
-const FFT_SIZE: usize = 512;
-const MEL_LOW_HZ: f32 = 20.0;
 
 /// Kaldi CMVN variance floor (upstream `fireredasr/data/asr_feat.py`).
 const CMVN_VARIANCE_FLOOR: f64 = 1e-20;

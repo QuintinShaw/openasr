@@ -209,6 +209,11 @@ pub(crate) static FIRERED_AED_HPARAM_SCHEMA: &[&str] = &[
     "firered.sos_token_id",
     "firered.eos_token_id",
     "firered.pad_token_id",
+    "firered.audio.sample_rate",
+    "firered.audio.n_fft",
+    "firered.audio.frame_length_ms",
+    "firered.audio.frame_shift_ms",
+    "firered.audio.n_mels",
 ];
 
 // ── firered-llm (FireRedTeam/FireRedASR2-LLM, Conformer+Adapter+Qwen2) ───────

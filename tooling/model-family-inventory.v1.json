@@ -305,7 +305,12 @@
           "firered.vocab_size",
           "firered.sos_token_id",
           "firered.eos_token_id",
-          "firered.pad_token_id"
+          "firered.pad_token_id",
+          "firered.audio.sample_rate",
+          "firered.audio.n_fft",
+          "firered.audio.frame_length_ms",
+          "firered.audio.frame_shift_ms",
+          "firered.audio.n_mels"
         ],
         "importer": {
           "kind": "core-convert",
