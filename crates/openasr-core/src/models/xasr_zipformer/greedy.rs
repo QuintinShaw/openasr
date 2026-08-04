@@ -69,6 +69,7 @@ pub(crate) fn greedy_decode_frames_with_limit(
         &mut emit_frames,
         &mut emit_probabilities,
         0,
+        &|| false,
     )?;
     let text = tokenizer.decode(&emitted)?;
     Ok(XasrGreedyDecodeResult {
@@ -107,6 +108,7 @@ pub(crate) fn greedy_decode_frames_incremental(
     emit_frames: &mut Vec<usize>,
     emit_probabilities: &mut Vec<f32>,
     frame_offset: usize,
+    is_canceled: &dyn Fn() -> bool,
 ) -> Result<usize, String> {
     let expected = frame_count
         .checked_mul(encoder_dim)
@@ -121,6 +123,15 @@ pub(crate) fn greedy_decode_frames_incremental(
     let mut scratch = joiner.scratch();
     let mut decoder_projection_valid = false;
     for frame_idx in 0..frame_count {
+        // Cooperative cancellation fence: the dedicated transducer loop is
+        // CPU-side (not a ggml graph), so it polls the shared request control
+        // at each encoder-frame boundary rather than relying on a graph-abort
+        // callback (the parakeet-tdt transducer precedent).
+        if is_canceled() {
+            return Err(format!(
+                "xasr-zipformer decode canceled at encoder frame {frame_idx}"
+            ));
+        }
         let frame = &encoder_frames[frame_idx * encoder_dim..(frame_idx + 1) * encoder_dim];
         joiner.project_encoder_frame(frame, &mut scratch)?;
         for _ in 0..max_symbols_per_frame {
@@ -231,11 +242,46 @@ mod tests {
             &mut emit_frames,
             &mut emit_probabilities,
             7,
+            &|| false,
         )
         .unwrap();
         assert_eq!(emitted.len(), emit_frames.len());
         assert_eq!(emitted.len(), emit_probabilities.len());
         assert_eq!(emit_frames, vec![7, 8]);
+    }
+
+    #[test]
+    fn greedy_decode_polls_cancellation_at_frame_boundaries() {
+        let decoder = XasrDecoder::new(decoder_weights(), 2, 0);
+        let joiner = XasrJoiner::new(joiner_weights());
+        let mut context = decoder.initial_context();
+        let mut emitted = Vec::new();
+        let mut emit_frames = Vec::new();
+        let mut emit_probabilities = Vec::new();
+        // Already canceled before the first frame: the dedicated transducer
+        // loop must fail closed without emitting anything, mirroring the
+        // shared cooperative cancellation contract (the parakeet-tdt precedent).
+        let error = greedy_decode_frames_incremental(
+            &[1.0, 0.0, 0.0, 1.0],
+            2,
+            2,
+            &decoder,
+            &joiner,
+            0,
+            1,
+            &mut context,
+            &mut emitted,
+            &mut emit_frames,
+            &mut emit_probabilities,
+            0,
+            &|| true,
+        )
+        .expect_err("a canceled decode must fail closed");
+        assert!(error.contains("canceled"), "{error}");
+        assert!(
+            emitted.is_empty(),
+            "cancel polling must remain frame-local and emit nothing"
+        );
     }
 
     fn decoder_weights() -> XasrDecoderWeights {

@@ -79,7 +79,7 @@ pub(crate) fn transcribe_xasr_zipformer_pcm(
     }
     let mut runtime =
         XasrZipformerPreparedRuntime::from_reader_metadata(reader, gguf_metadata, backend)?;
-    let result = runtime.transcribe(samples)?;
+    let result = runtime.transcribe(samples, &|| false)?;
     transcription_from_decode(
         &runtime,
         result,
@@ -95,6 +95,7 @@ fn transcribe_xasr_zipformer_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
+    control: std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<XasrZipformerTranscription, String> {
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());
@@ -103,7 +104,7 @@ fn transcribe_xasr_zipformer_pcm_cached(
     let samples = samples.to_vec();
     actor
         .call_mut(move |runtime| {
-            let result = runtime.transcribe(&samples)?;
+            let result = runtime.transcribe(&samples, &|| control.is_canceled())?;
             transcription_from_decode(
                 runtime,
                 result,
@@ -195,6 +196,7 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
+            std::sync::Arc::clone(&request.execution_context.control),
         )
         .map_err(fail)?;
         let duration = pcm_duration_seconds(&request.prepared_audio.samples_f32);
