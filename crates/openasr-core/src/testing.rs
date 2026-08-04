@@ -3017,6 +3017,11 @@ mod tests {
                 TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready("wav2vec2-fixture"),
                 "wav2vec2",
             ),
+            (
+                "sensevoice.oasr",
+                TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready("sensevoice-fixture"),
+                "sensevoice",
+            ),
         ];
         for (name, spec, expected_catalog_family) in cases {
             let path = temp.path().join(name);
