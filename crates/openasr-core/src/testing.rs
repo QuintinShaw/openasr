@@ -870,6 +870,25 @@ impl TinyGgufFixtureSpec {
         Self::new(metadata)
     }
 
+    /// Contract-complete X-ASR Zipformer fixture: the fail-closed metadata plus
+    /// the full runtime tensor set, so the pack passes the production
+    /// `PackVerifier` (which enforces the family runtime metadata AND tensor
+    /// contract). Mirrors `moonshine_oasr_v1_runtime_ready`.
+    pub fn xasr_zipformer_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut spec =
+            Self::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata = crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata(&spec.metadata)
+            .expect("xasr fixture metadata must parse");
+        for (name, dims) in
+            crate::models::xasr_zipformer::runtime_contract::xasr_zipformer_minimal_runtime_tensors(
+                &metadata,
+            )
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
@@ -2574,9 +2593,7 @@ mod tests {
             ),
             (
                 "xasr.oasr",
-                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
-                    "xasr-fixture",
-                ),
+                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture"),
                 "xasr-zipformer",
             ),
         ];

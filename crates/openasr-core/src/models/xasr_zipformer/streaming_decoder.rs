@@ -135,8 +135,11 @@ impl XasrIncrementalDecoder {
         &mut self,
         final_flush: bool,
     ) -> Result<usize, GgmlAsrExecutionError> {
+        // Streaming cancellation is owned by the session driver (which stops
+        // driving this decoder); each hop is a single short chunk, so the
+        // decode loop itself never cancels mid-hop.
         self.call_decode(move |runtime, state, features| {
-            runtime.decode_available_chunks(state, features, final_flush)
+            runtime.decode_available_chunks(state, features, final_flush, &|| false)
         })
     }
 
@@ -145,7 +148,7 @@ impl XasrIncrementalDecoder {
         final_flush: bool,
     ) -> Result<HopDecodeOutcome, GgmlAsrExecutionError> {
         self.call_decode(move |runtime, state, features| {
-            runtime.decode_next_chunk(state, features, final_flush)
+            runtime.decode_next_chunk(state, features, final_flush, &|| false)
         })
     }
 

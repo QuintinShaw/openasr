@@ -1735,10 +1735,7 @@ mod tests {
     fn phrase_bias_cli_rejects_xasr_model_pack_early() {
         let temp = tempfile::tempdir().unwrap();
         let pack_path = temp.path().join("xasr-cli.oasr");
-        let spec =
-            TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
-                "xasr-cli",
-            );
+        let spec = TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-cli");
         openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
         let config = openasr_core::PhraseBiasConfig::from_phrases([("OpenASR", 2.0)])
             .expect("phrase bias fixture");

@@ -458,7 +458,11 @@ impl XasrZipformerPreparedRuntime {
         })
     }
 
-    pub(super) fn transcribe(&mut self, samples: &[f32]) -> Result<XasrGreedyDecodeResult, String> {
+    pub(super) fn transcribe(
+        &mut self,
+        samples: &[f32],
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<XasrGreedyDecodeResult, String> {
         let total_profile = xasr_profile_start();
         let fbank_profile = xasr_profile_start();
         let frontend = XasrFbankFrontend::new();
@@ -485,7 +489,7 @@ impl XasrZipformerPreparedRuntime {
         );
 
         let mut state = self.new_decode_state();
-        self.decode_available_chunks(&mut state, &features, true)?;
+        self.decode_available_chunks(&mut state, &features, true, is_canceled)?;
         let text = self.decode_text(state.emitted_token_ids())?;
         xasr_profile_log(
             "decode_total",
@@ -537,13 +541,14 @@ impl XasrZipformerPreparedRuntime {
         state: &mut XasrChunkedDecodeState,
         features: &XasrFbankFeatures,
         final_flush: bool,
+        is_canceled: &dyn Fn() -> bool,
     ) -> Result<usize, String> {
         let mut new_tokens = 0usize;
         let mut greedy_elapsed = Duration::ZERO;
         let mut processed_chunks = 0usize;
 
         loop {
-            let outcome = self.decode_next_chunk(state, features, final_flush)?;
+            let outcome = self.decode_next_chunk(state, features, final_flush, is_canceled)?;
             if !outcome.processed {
                 break;
             }
@@ -582,6 +587,7 @@ impl XasrZipformerPreparedRuntime {
         state: &mut XasrChunkedDecodeState,
         features: &XasrFbankFeatures,
         final_flush: bool,
+        is_canceled: &dyn Fn() -> bool,
     ) -> Result<HopDecodeOutcome, String> {
         let chunk_hop = self.metadata.decode_chunk_len;
         let chunk_input_frames = chunk_hop
@@ -660,6 +666,7 @@ impl XasrZipformerPreparedRuntime {
             &mut state.emitted_frames,
             &mut state.emitted_probabilities,
             chunk_frame_offset,
+            is_canceled,
         )?;
         let greedy_elapsed =
             greedy_profile.map_or(Duration::ZERO, |started_at| started_at.elapsed());
@@ -823,7 +830,7 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
             .collect::<Vec<_>>();
         let result = rebuilt
-            .call_mut(move |runtime| runtime.transcribe(&samples))
+            .call_mut(move |runtime| runtime.transcribe(&samples, &|| false))
             .expect("rebuilt actor must remain live")
             .expect("rebuilt runtime must decode");
         assert!(result.text.is_char_boundary(result.text.len()));

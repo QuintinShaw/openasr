@@ -174,8 +174,8 @@ fn required_env_path(name: &str) -> PathBuf {
 }
 
 fn write_xasr_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
-    let spec = openasr_core::testing::TinyGgufFixtureSpec::
-        xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+    let spec =
+        openasr_core::testing::TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready(model_id);
     openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
         .expect("write xasr native streaming fixture pack");
 }
