@@ -304,6 +304,78 @@ impl SafetensorsFile {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SafetensorsShardIndexJson {
+    weight_map: BTreeMap<String, String>,
+}
+
+/// A sharded HF safetensors source resolved through its
+/// `*.safetensors.index.json` weight map. Large checkpoints ship several
+/// `model-NNNNN-of-NNNNN.safetensors` shards; this shared reader opens every
+/// referenced shard once through [`SafetensorsFile`] and resolves each tensor
+/// name to the shard that actually holds it, so family converters stay on the
+/// single shared safetensors track instead of growing private shard resolvers.
+pub(crate) struct ShardedSafetensorsSource {
+    shards: Vec<SafetensorsFile>,
+    shard_of: BTreeMap<String, usize>,
+}
+
+impl ShardedSafetensorsSource {
+    pub(crate) fn open(
+        source_root: &Path,
+        index_file: &'static str,
+        family: &str,
+    ) -> Result<Self, LocalSourceImportError> {
+        let index: SafetensorsShardIndexJson = read_source_json_file(source_root, index_file)?;
+        let mut shard_paths: Vec<String> = index.weight_map.values().cloned().collect();
+        shard_paths.sort();
+        shard_paths.dedup();
+
+        let mut shards = Vec::with_capacity(shard_paths.len());
+        let mut path_to_index = BTreeMap::new();
+        for (index, path) in shard_paths.iter().enumerate() {
+            shards.push(SafetensorsFile::open(source_root.join(path))?);
+            path_to_index.insert(path.clone(), index);
+        }
+        let mut shard_of = BTreeMap::new();
+        for (tensor_name, path) in &index.weight_map {
+            let &shard_index = path_to_index.get(path).ok_or_else(|| {
+                validate_error(format!(
+                    "{family} {index_file} references unknown shard '{path}' for tensor '{tensor_name}'"
+                ))
+            })?;
+            shard_of.insert(tensor_name.clone(), shard_index);
+        }
+        Ok(Self { shards, shard_of })
+    }
+
+    pub(crate) fn tensor_names(&self) -> impl Iterator<Item = &String> {
+        self.shard_of.keys()
+    }
+
+    /// Read one tensor as `(shape, f32 values)` from whichever shard holds
+    /// it, through the shared payload decoders.
+    pub(crate) fn read_f32(
+        &self,
+        name: &str,
+        family: &str,
+    ) -> Result<(Vec<u64>, Vec<f32>), LocalSourceImportError> {
+        let &shard_index = self
+            .shard_of
+            .get(name)
+            .ok_or_else(|| validate_error(format!("{family} source is missing tensor '{name}'")))?;
+        let shard = &self.shards[shard_index];
+        let header = shard.tensor(name).ok_or_else(|| {
+            validate_error(format!(
+                "{family} shard is missing tensor header for '{name}'"
+            ))
+        })?;
+        let data = shard.tensor_data(header)?;
+        let values = decode_safetensors_payload_as_f32(name, &header.dtype, data)?;
+        Ok((header.shape.clone(), values))
+    }
+}
+
 /// Parse and validate one safetensors header from an already-pinned byte
 /// generation. The caller owns the mapping; this helper never reopens a path
 /// and never allocates from the untrusted length prefix before enforcing the

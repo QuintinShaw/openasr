@@ -1,7 +1,8 @@
 //! Convert a local `ibm-granite/granite-speech-4.1-2b` HF source (sharded
 //! safetensors + `config.json`) into an OpenASR `.oasr` (GGUF-v0) runtime pack.
 //!
-//! fp16-only this pass (q8_0/q4_k rungs are a follow-up); every tensor keeps its original HF name verbatim (`encoder.layers.0.attn.
+//! fp16-only this pass (q8_0/q4_k rungs are a follow-up). Every tensor keeps
+//! its original HF name verbatim (`encoder.layers.0.attn.
 //! to_q.weight`, `projector.query`, `language_model.model.layers.0....`)
 //! rather than remapping to a family-local convention: the encoder/projector
 //! ggml graphs (`encoder_graph.rs`/`qformer.rs`) already load by these exact
@@ -41,8 +42,8 @@ use serde::Deserialize;
 use crate::VerifiedPack;
 use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 use crate::models::local_source_import::{
-    LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
-    load_gpt2_bpe_merges, read_source_json_file, validate_error, validate_output_pack_extension,
+    LocalSourceImportError, ShardedSafetensorsSource, encode_f16_bits_le, load_gpt2_bpe_merges,
+    read_source_json_file, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
     OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
@@ -154,66 +155,6 @@ struct GraniteSpeechConfigJson {
     text_config: GraniteTextConfigJson,
 }
 
-/// Opens every safetensors shard listed in `model.safetensors.index.json` and
-/// resolves a tensor name to whichever shard actually holds it. Granite Speech
-/// 4.1 2B ships 3 shards (~4.6 GB total, bf16); no existing family converter
-/// needed multi-shard support before this one (every prior HF source was a
-/// single `model.safetensors`).
-struct ShardedSafetensors {
-    shards: Vec<SafetensorsFile>,
-    shard_of: BTreeMap<String, usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SafetensorsIndexJson {
-    weight_map: BTreeMap<String, String>,
-}
-
-impl ShardedSafetensors {
-    fn open(source_root: &Path) -> Result<Self, LocalSourceImportError> {
-        let index: SafetensorsIndexJson = read_source_json_file(source_root, SOURCE_INDEX_JSON)?;
-        let mut shard_paths: Vec<String> = index.weight_map.values().cloned().collect();
-        shard_paths.sort();
-        shard_paths.dedup();
-
-        let mut shards = Vec::with_capacity(shard_paths.len());
-        let mut path_to_index = BTreeMap::new();
-        for (index, path) in shard_paths.iter().enumerate() {
-            shards.push(SafetensorsFile::open(source_root.join(path))?);
-            path_to_index.insert(path.clone(), index);
-        }
-        let mut shard_of = BTreeMap::new();
-        for (tensor_name, path) in &index.weight_map {
-            let &shard_index = path_to_index.get(path).ok_or_else(|| {
-                validate_error(format!(
-                    "granite-speech index.json references unknown shard '{path}' for tensor '{tensor_name}'"
-                ))
-            })?;
-            shard_of.insert(tensor_name.clone(), shard_index);
-        }
-        Ok(Self { shards, shard_of })
-    }
-
-    fn tensor_names(&self) -> impl Iterator<Item = &String> {
-        self.shard_of.keys()
-    }
-
-    fn read_f32(&self, name: &str) -> Result<(Vec<u64>, Vec<f32>), LocalSourceImportError> {
-        let &shard_index = self.shard_of.get(name).ok_or_else(|| {
-            validate_error(format!("granite-speech source is missing tensor '{name}'"))
-        })?;
-        let shard = &self.shards[shard_index];
-        let header = shard.tensor(name).ok_or_else(|| {
-            validate_error(format!(
-                "granite-speech shard is missing tensor header for '{name}'"
-            ))
-        })?;
-        let data = shard.tensor_data(header)?;
-        let values = decode_safetensors_payload_as_f32(name, &header.dtype, data)?;
-        Ok((header.shape.clone(), values))
-    }
-}
-
 /// `Conv1d`/`Linear` weight ranks (>=2) go F16; everything else (1-D norms,
 /// biases, BatchNorm running stats, the `projector.query` [1,3,1024] parameter
 /// treated as rank>=2 too since it is a genuine matmul-adjacent operand, not a
@@ -305,7 +246,7 @@ fn should_carry_tensor(name: &str) -> bool {
 }
 
 fn build_runtime_tensors(
-    source: &ShardedSafetensors,
+    source: &ShardedSafetensorsSource,
 ) -> Result<Vec<GgufWriteTensor>, LocalSourceImportError> {
     let mut names: Vec<&String> = source
         .tensor_names()
@@ -314,7 +255,10 @@ fn build_runtime_tensors(
     names.sort();
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        let (shape, values) = source.read_f32(name)?;
+        let (shape, values) = source.read_f32(
+            name,
+            crate::models::granite_speech::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+        )?;
         out.push(make_write_tensor(remap_tensor_name(name), shape, values));
     }
     Ok(out)
@@ -587,7 +531,11 @@ pub fn convert_local_granite_speech_source_to_runtime_pack(
     validate_output_pack_extension(&request.output_root)?;
     let config: GraniteSpeechConfigJson =
         read_source_json_file(&request.source_root, SOURCE_CONFIG_JSON)?;
-    let source = ShardedSafetensors::open(&request.source_root)?;
+    let source = ShardedSafetensorsSource::open(
+        &request.source_root,
+        SOURCE_INDEX_JSON,
+        super::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+    )?;
 
     let tensors = build_runtime_tensors(&source)?;
     let vocab_tokens =
@@ -699,7 +647,12 @@ mod tests {
             result.tensor_count
         );
 
-        let source = ShardedSafetensors::open(&source_root).expect("open source");
+        let source = ShardedSafetensorsSource::open(
+            &source_root,
+            SOURCE_INDEX_JSON,
+            crate::models::granite_speech::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+        )
+        .expect("open source");
         let reader = GgufTensorDataReader::from_path(&output_root).expect("reader");
 
         let sample_names = [
@@ -713,7 +666,12 @@ mod tests {
             "language_model.model.embed_tokens.weight",
         ];
         for name in sample_names {
-            let (shape, expected) = source.read_f32(name).unwrap_or_else(|e| {
+            let (shape, expected) = source
+                .read_f32(
+                    name,
+                    crate::models::granite_speech::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+                )
+                .unwrap_or_else(|e| {
                 panic!("source tensor '{name}' missing (a `lm_head.weight` may be tied to the embedding on this checkpoint -- adjust sample list if so): {e}")
             });
             // Pack stores ggml dims (`[in, out]` for rank-2); the flat f32
