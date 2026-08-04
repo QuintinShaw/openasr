@@ -790,9 +790,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, tensors) = fixture_pack(dir.path());
         let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert("family.rope.freq_base".to_string(), GgufWriteValue::F32(640000.0));
-        metadata.insert("family.attention.qkv_bias".to_string(), GgufWriteValue::Bool(true));
-        metadata.insert("family.attention.qk_norm".to_string(), GgufWriteValue::Bool(false));
+        metadata.insert(
+            "family.rope.freq_base".to_string(),
+            GgufWriteValue::F32(640000.0),
+        );
+        metadata.insert(
+            "family.attention.qkv_bias".to_string(),
+            GgufWriteValue::Bool(true),
+        );
+        metadata.insert(
+            "family.attention.qk_norm".to_string(),
+            GgufWriteValue::Bool(false),
+        );
 
         with_test_process_env([(BUILD_COMMIT_ENV, None)], || {
             write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
