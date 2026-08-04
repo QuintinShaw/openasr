@@ -46,6 +46,11 @@ pub(crate) enum DolphinJointDecodeError {
     Decoder(#[from] DolphinDecoderError),
     #[error("dolphin joint decode produced no hypotheses")]
     NoHypotheses,
+    /// Cooperative cancellation fence: the dedicated CTC/attention decode is
+    /// CPU-side (the prefix-beam and rescore loops are not ggml graphs), so it
+    /// polls the shared request control and fails closed once canceled.
+    #[error("dolphin joint decode canceled at {stage}")]
+    Canceled { stage: &'static str },
 }
 
 /// Decode-time knobs (not baked in the pack; fixed to the WeNet reference decode).
@@ -102,6 +107,7 @@ pub(crate) fn joint_decode(
     rescoring_encoder_out: &[f32],
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
+    is_canceled: &dyn Fn() -> bool,
 ) -> Result<DolphinJointDecodeResult, DolphinJointDecodeError> {
     let decoder_config = *rescore.config();
     let vocab = decoder_config.vocab_size;
@@ -136,7 +142,8 @@ pub(crate) fn joint_decode(
         vocab,
         blank,
         decode_config.beam_size.max(1),
-    );
+        is_canceled,
+    )?;
     if nbest.is_empty() {
         return Err(DolphinJointDecodeError::NoHypotheses);
     }
@@ -147,6 +154,7 @@ pub(crate) fn joint_decode(
         frames,
         decode_config,
         &nbest,
+        is_canceled,
     )?;
     let best_token_ids = scored_nbest
         .first()
@@ -423,11 +431,20 @@ fn ctc_prefix_beam_search(
     vocab: usize,
     blank: usize,
     beam_size: usize,
-) -> Vec<(Vec<u32>, f32)> {
+    is_canceled: &dyn Fn() -> bool,
+) -> Result<Vec<(Vec<u32>, f32)>, DolphinJointDecodeError> {
     // (prefix, (log_pb, log_pnb)). Seed: empty prefix reachable only via blank.
     let mut cur: Vec<(Vec<u32>, (f64, f64))> = vec![(Vec::new(), (0.0, NEG_INF))];
 
     for t in 0..frames {
+        // Cooperative cancellation fence: the prefix-beam loop is CPU-side (not a
+        // ggml graph), so it polls the shared request control at each frame
+        // boundary and fails closed once a request is canceled.
+        if is_canceled() {
+            return Err(DolphinJointDecodeError::Canceled {
+                stage: "ctc prefix-beam search",
+            });
+        }
         let row = &log_probs[t * vocab..(t + 1) * vocab];
         let top = top_k_indices(row, beam_size);
         let mut next: HashMap<Vec<u32>, (f64, f64)> = HashMap::new();
@@ -471,9 +488,10 @@ fn ctc_prefix_beam_search(
         cur = items;
     }
 
-    cur.into_iter()
+    Ok(cur
+        .into_iter()
         .map(|(prefix, (pb, pnb))| (prefix, log_add(pb, pnb) as f32))
-        .collect()
+        .collect())
 }
 
 /// Indices of the `k` largest values in `row` (unordered), `k` clamped to the row.
@@ -507,12 +525,18 @@ fn attention_rescore(
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
     nbest: &[(Vec<u32>, f32)],
+    is_canceled: &dyn Fn() -> bool,
 ) -> Result<Vec<DolphinScoredHypothesis>, DolphinJointDecodeError> {
     let prompt = &decode_config.prompt_prefix;
     let prompt_len = prompt.len();
     if prompt_len == 0 {
         return Err(DolphinJointDecodeError::Shape {
             reason: "prompt prefix must be non-empty".to_string(),
+        });
+    }
+    if is_canceled() {
+        return Err(DolphinJointDecodeError::Canceled {
+            stage: "attention rescoring",
         });
     }
     let vocab = runtime.config().vocab_size;
@@ -538,6 +562,11 @@ fn attention_rescore(
 
     let mut scored = Vec::with_capacity(nbest.len());
     for ((tokens, ctc_score), logits) in nbest.iter().zip(&nbest_logits) {
+        if is_canceled() {
+            return Err(DolphinJointDecodeError::Canceled {
+                stage: "attention rescoring",
+            });
+        }
         let attention_score = if tokens.is_empty() {
             // Empty hypothesis: score is just log P(eos | prompt).
             let mut row = logits.last_token_logits().to_vec();
@@ -635,8 +664,26 @@ mod tests {
             -10.0, -0.001, -10.0, //
             -10.0, -0.001, -10.0, //
         ];
-        let nbest = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4);
+        let nbest = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4, &|| false).expect("decode");
         assert_eq!(nbest[0].0, vec![1]);
+    }
+
+    /// Cooperative cancellation: an already-canceled request must fail closed at
+    /// the first prefix-beam frame boundary without producing hypotheses, mirroring
+    /// the shared compute-scoped cancellation contract (the xasr/parakeet-tdt
+    /// precedent).
+    #[test]
+    fn prefix_beam_polls_cancellation_at_frame_boundaries() {
+        let log_probs = vec![
+            -10.0, -0.001, -10.0, //
+            -10.0, -0.001, -10.0, //
+        ];
+        let error = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4, &|| true)
+            .expect_err("a canceled prefix-beam search must fail closed");
+        assert!(
+            matches!(error, DolphinJointDecodeError::Canceled { .. }),
+            "expected a cancel error, got {error}"
+        );
     }
 
     #[test]

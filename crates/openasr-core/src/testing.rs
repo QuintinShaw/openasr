@@ -200,14 +200,17 @@ impl TinyGgufFixtureSpec {
         }
     }
 
-    /// Metadata-complete Dolphin fixture used by capability probes that must
-    /// pass the shared package/runtime verifier before reading the tensor
-    /// index. The one placeholder tensor is intentional: these tests exercise
-    /// adapter selection and Dolphin's optional context-module probe, not a
-    /// decode. Keep the scalar values internally consistent with the
-    /// architecture contract (head_dim * n_heads == d_model, even cgMLP
-    /// units, odd convolution kernels, and in-range token ids).
-    pub fn dolphin_oasr_v1_runtime_metadata_ready(model_id: impl Into<String>) -> Self {
+    /// Metadata-complete Dolphin fixture with deliberately tiny geometry, used as
+    /// the base for the runtime-ready skeleton and by fail-closed probes that must
+    /// pass the shared package/runtime verifier before reading the tensor index.
+    /// The one placeholder tensor is intentional here: the `_runtime_ready`
+    /// variant below replaces it with the full runtime tensor set. Keep the scalar
+    /// values internally consistent with the architecture contract
+    /// (head_dim * n_heads == d_model, even cgMLP units, odd convolution kernels,
+    /// and in-range token ids).
+    pub fn dolphin_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
         let mut metadata = BTreeMap::new();
         metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
         metadata.insert(
@@ -239,21 +242,21 @@ impl TinyGgufFixtureSpec {
             DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
         );
         for (key, value) in [
-            ("dolphin.encoder.n_layers", "12"),
-            ("dolphin.encoder.d_model", "768"),
-            ("dolphin.encoder.n_heads", "12"),
-            ("dolphin.encoder.head_dim", "64"),
-            ("dolphin.encoder.ffn_dim", "3072"),
-            ("dolphin.encoder.cgmlp_units", "3072"),
-            ("dolphin.encoder.cgmlp_kernel", "31"),
-            ("dolphin.encoder.merge_kernel", "31"),
-            ("dolphin.encoder.feature_dim", "80"),
-            ("dolphin.encoder.max_ctx", "5000"),
-            ("dolphin.decoder.n_layers", "12"),
-            ("dolphin.decoder.n_heads", "12"),
-            ("dolphin.decoder.ffn_dim", "3072"),
-            ("dolphin.decoder.max_ctx", "5000"),
-            ("dolphin.vocab_size", "18173"),
+            ("dolphin.encoder.n_layers", "1"),
+            ("dolphin.encoder.d_model", "8"),
+            ("dolphin.encoder.n_heads", "2"),
+            ("dolphin.encoder.head_dim", "4"),
+            ("dolphin.encoder.ffn_dim", "16"),
+            ("dolphin.encoder.cgmlp_units", "16"),
+            ("dolphin.encoder.cgmlp_kernel", "3"),
+            ("dolphin.encoder.merge_kernel", "3"),
+            ("dolphin.encoder.feature_dim", "16"),
+            ("dolphin.encoder.max_ctx", "8"),
+            ("dolphin.decoder.n_layers", "1"),
+            ("dolphin.decoder.n_heads", "2"),
+            ("dolphin.decoder.ffn_dim", "16"),
+            ("dolphin.decoder.max_ctx", "8"),
+            ("dolphin.vocab_size", "12"),
             ("dolphin.sos_token_id", "2"),
             ("dolphin.eos_token_id", "3"),
             ("ctc.blank_token_id", "0"),
@@ -261,6 +264,37 @@ impl TinyGgufFixtureSpec {
             metadata.insert(key.to_string(), value.to_string());
         }
         Self::new(metadata)
+    }
+
+    /// Fully verifier-ready Dolphin skeleton: the fail-closed metadata plus the
+    /// complete runtime tensor set and a vocab-length tokenizer, so the pack passes
+    /// the production `PackVerifier` (which enforces the family runtime metadata AND
+    /// tensor contract). The required-tensor enumeration is shared with the
+    /// admission validator through `dolphin_runtime_tensor_element_counts`, so the
+    /// fixture and the gate agree on the tensor set through one contract. The
+    /// optional hotword `context_module.*` tensors are intentionally absent (a pack
+    /// without a trained context module is valid and reports no phrase bias).
+    pub fn dolphin_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::dolphin::package_import::DolphinLanguageScheme;
+        use crate::models::dolphin::runtime_contract::{
+            dolphin_runtime_tensor_element_counts, parse_dolphin_execution_metadata,
+        };
+
+        let mut spec = Self::dolphin_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let execution_metadata =
+            parse_dolphin_execution_metadata(&spec.metadata, &()).expect("parse");
+        let language_scheme = DolphinLanguageScheme::CnDialect;
+        for (name, dims) in
+            dolphin_runtime_tensor_element_counts(&execution_metadata, language_scheme)
+        {
+            spec = spec.with_tensor_shape(name, vec![dims]);
+        }
+        let vocab_size = execution_metadata.vocab_size;
+        spec = spec.with_string_array_metadata(
+            "tokenizer.ggml.tokens",
+            (0..vocab_size).map(|index| format!("tok{index}")),
+        );
+        spec
     }
 
     /// Runtime-ready SenseVoice fixture: the complete `.oasr` v1 envelope plus
@@ -2925,6 +2959,11 @@ mod tests {
                 "xasr.oasr",
                 TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture"),
                 "xasr-zipformer",
+            ),
+            (
+                "dolphin.oasr",
+                TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-fixture"),
+                "dolphin",
             ),
             (
                 "wav2vec2.oasr",

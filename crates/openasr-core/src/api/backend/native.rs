@@ -2738,21 +2738,18 @@ mod tests {
 
         write_tiny_gguf_runtime_source(
             &runtime_path,
-            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready(
-                "dolphin-replacement-base",
-            ),
+            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-replacement-base"),
         )
         .unwrap();
         let base_adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("base Dolphin fixture must resolve");
         assert!(!base_adapter.capabilities().supports_phrase_bias);
 
-        let hotword_spec = TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready(
-            "dolphin-replacement-hotword",
-        )
-        .with_added_tensor(
-            crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
-        );
+        let hotword_spec =
+            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-replacement-hotword")
+                .with_added_tensor(
+                crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+            );
         write_tiny_gguf_runtime_source(&runtime_path, &hotword_spec).unwrap();
         let hotword_adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("same-path Dolphin replacement must resolve");
@@ -3980,7 +3977,7 @@ mod tests {
         let base_path = temp.path().join("dolphin-base-e2e.oasr");
         write_tiny_gguf_runtime_source(
             &base_path,
-            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-base-e2e"),
+            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-base-e2e"),
         )
         .unwrap();
         let base_adapter = native_runtime_model_adapter_for_path(&base_path).unwrap();
@@ -3995,7 +3992,7 @@ mod tests {
 
         let hotword_path = temp.path().join("dolphin-hotword-e2e.oasr");
         let hotword_spec =
-            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-hotword-e2e")
+            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-hotword-e2e")
                 .with_added_tensor(
                 crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
             );

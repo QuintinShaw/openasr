@@ -65,14 +65,6 @@ use super::runtime_contract::parse_dolphin_execution_metadata;
 
 /// Encoder weight namespace baked into the pack under exact WeNet names.
 const ENCODER_TENSOR_PREFIX: &str = "encoder.";
-/// Sentinels proving the pack baked the encoder + CTC head namespaces (cheap
-/// index probe, no dequantization), common to both language schemes.
-const ENCODER_SENTINEL_TENSORS: [&str; 2] = ["encoder.after_norm.weight", "ctc.ctc_lo.weight"];
-/// CnDialect-only sentinel: the multilingual scheme's encoder attention never
-/// bakes this table (its `rel_pos_v1` table is computed fresh per request
-/// instead -- see `encoder_graph::dolphin_relative_positional_table`), so
-/// requiring it there would fail closed on every valid multilingual pack.
-const ENCODER_CN_DIALECT_SENTINEL_TENSOR: &str = "encoder.embed.pos_enc.pe";
 
 /// Global CMVN vectors baked in the pack (checkpoint's own `encoder.global_cmvn`).
 const CMVN_MEAN_TENSOR: &str = "encoder.global_cmvn.mean";
@@ -84,8 +76,9 @@ const CMVN_ISTD_TENSOR: &str = "encoder.global_cmvn.istd";
 /// single pack can honor any advertised dialect region rather than one baked one.
 const EOS_TOKEN_ID_KEY: &str = "dolphin.eos_token_id";
 /// Selects the decode-prefix builder (see `run_dolphin_pipeline`); absent on
-/// a pre-existing pack, which defaults to the cn-dialect scheme.
-const LANGUAGE_SCHEME_KEY: &str = "dolphin.language.scheme";
+/// a pre-existing pack, which defaults to the cn-dialect scheme. Alias of the
+/// runtime-contract key so the admission gate and the runtime read one literal.
+const LANGUAGE_SCHEME_KEY: &str = super::runtime_contract::DOLPHIN_LANGUAGE_SCHEME_KEY;
 const BLANK_TOKEN_ID_KEY: &str = "ctc.blank_token_id";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
@@ -486,6 +479,7 @@ pub(crate) fn transcribe_dolphin_pcm(
     let weights = load_dolphin_runtime_weights_from_pack(reader)
         .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
     let mut prepared = build_dolphin_prepared_runtime(&weights, metadata, backend)?;
+    // Uncached parity/test path: no request control, never canceled.
     run_dolphin_pipeline(
         &mut prepared,
         &weights,
@@ -494,45 +488,30 @@ pub(crate) fn transcribe_dolphin_pcm(
         ctc_weight,
         language,
         phrase_bias,
+        &|| false,
     )
 }
 
-/// Parse the pack's `dolphin.language.scheme` metadata (see [`LANGUAGE_SCHEME_KEY`])
-/// into the typed [`DolphinLanguageScheme`] that dispatches the decode-prefix
-/// builder, audio frontend, and encoder rel-pos-attention scheme. A **missing**
-/// key is an intentional backward-compat default to `CnDialect` -- every pack
-/// baked before this key existed (both originally published dolphin packs) is
-/// cn-dialect. A key that IS **present** but holds anything other than the two
-/// recognized values fails closed with a typed error instead of silently
-/// falling back: a corrupt or future-versioned pack must never be silently
-/// misdispatched to the wrong frontend/attention scheme.
+/// Parse the pack's `dolphin.language.scheme` metadata into the typed
+/// [`DolphinLanguageScheme`] that dispatches the decode-prefix builder, audio
+/// frontend, and encoder rel-pos-attention scheme. The string-level parse lives
+/// in the runtime contract ([`super::runtime_contract::parse_dolphin_language_scheme_value`])
+/// so the admission gate and this runtime path share one fail-closed parser; the
+/// contract rejects an unrecognized value at install/admission time, and this
+/// re-parse keeps the runtime self-contained for its other callers.
 fn parse_dolphin_language_scheme(metadata: &GgufMetadata) -> Result<DolphinLanguageScheme, String> {
-    parse_dolphin_language_scheme_value(metadata.get_string(LANGUAGE_SCHEME_KEY))
-}
-
-/// The string-level half of [`parse_dolphin_language_scheme`], split out so a
-/// test can pin it against [`DolphinLanguageScheme::label`] (the importer's
-/// writer) without needing to construct a [`GgufMetadata`] -- the two literal
-/// sets (writer labels here, reader match arms in `package_import.rs`) must
-/// never drift out of sync.
-fn parse_dolphin_language_scheme_value(
-    value: Option<&str>,
-) -> Result<DolphinLanguageScheme, String> {
-    match value {
-        None => Ok(DolphinLanguageScheme::CnDialect),
-        Some("cn_dialect") => Ok(DolphinLanguageScheme::CnDialect),
-        Some("multilingual") => Ok(DolphinLanguageScheme::Multilingual),
-        Some(other) => Err(format!(
-            "dolphin pack has unrecognized '{LANGUAGE_SCHEME_KEY}' value {other:?} \
-             (expected 'cn_dialect' or 'multilingual')"
-        )),
-    }
+    super::runtime_contract::parse_dolphin_language_scheme_value(
+        metadata.get_string(LANGUAGE_SCHEME_KEY),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Run the fbank+CMVN -> encoder -> joint-decode -> detokenize pipeline over
 /// already-loaded `weights` and already-`prepared` graph runtimes. Split out
 /// from [`transcribe_dolphin_pcm`] so the executor can reuse both across
-/// requests without re-dequantizing or re-uploading.
+/// requests without re-dequantizing or re-uploading. `is_canceled` is the shared
+/// request-control fence the CPU-side joint-decode loops poll (the ggml graphs
+/// cancel through the shared runner).
 pub(crate) fn run_dolphin_pipeline(
     prepared: &mut DolphinPreparedRuntime,
     weights: &DolphinRuntimeWeights,
@@ -541,6 +520,7 @@ pub(crate) fn run_dolphin_pipeline(
     ctc_weight: f32,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
+    is_canceled: &dyn Fn() -> bool,
 ) -> Result<DolphinPipelineOutput, String> {
     let backend = prepared.backend;
     let tokens = metadata
@@ -676,6 +656,7 @@ pub(crate) fn run_dolphin_pipeline(
         &rescoring_encoder_out,
         encoder.frames,
         &decode_config,
+        is_canceled,
     )
     .map_err(|error| format!("dolphin joint decode failed: {error}"))?;
 
@@ -888,27 +869,11 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         };
         // Gate-0 has already validated and admitted the source; use its
         // proof-carrying metadata and tensor index without reopening the path.
+        // The runtime metadata contract, the language scheme, and the full
+        // runtime tensor set were all fail-closed-checked by the family runtime
+        // validator at admission (`runtime_contract::validate_runtime_pack_contract`),
+        // so this path consumes the proof instead of re-validating it.
         let preflight = request.runtime_source_preflight();
-        // Fail closed on an incomplete pack (missing runtime scalar keys).
-        parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
-            .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
-        // Resolve the language scheme once here (fail closed on an unrecognized
-        // value at Gate-0, before any decode work); `run_dolphin_pipeline` below
-        // re-derives the same result from the same metadata key rather than
-        // threading it through, per its own doc comment.
-        let language_scheme = parse_dolphin_language_scheme(&preflight.metadata).map_err(fail)?;
-        // Confirm the encoder + CTC namespaces are actually baked before decoding.
-        let mut sentinels = ENCODER_SENTINEL_TENSORS.to_vec();
-        if language_scheme == DolphinLanguageScheme::CnDialect {
-            sentinels.push(ENCODER_CN_DIALECT_SENTINEL_TENSOR);
-        }
-        for sentinel in sentinels {
-            if preflight.tensor_index.get(sentinel).is_none() {
-                return Err(fail(format!(
-                    "dolphin pack is missing required tensor '{sentinel}'"
-                )));
-            }
-        }
 
         // Resolved once by whoever built this request (this architecture's
         // `auto_gpu_policy = AllBackends`), carried as an explicit field --
@@ -934,6 +899,9 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         let samples = request.prepared_audio.samples_f32.to_owned_pcm_slice();
         let language = request.request_options.language.clone();
         let phrase_bias = request.request_options.phrase_bias.clone();
+        // Cooperative cancellation fence for the CPU-side joint-decode loops; the
+        // ggml graphs cancel through the shared runner on the same control.
+        let control = std::sync::Arc::clone(&request.execution_context.control);
         // Thread the request language into the decode prefix builder; an
         // unsupported code / missing region token fails closed here (typed).
         let output = actor
@@ -946,6 +914,7 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
                     DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
                     language.as_deref(),
                     phrase_bias.as_ref(),
+                    &|| control.is_canceled(),
                 )
             })
             .map_err(|error| fail(error.to_string()))?
@@ -1175,7 +1144,8 @@ mod tests {
     }
 
     #[test]
-    fn language_scheme_label_round_trips_through_the_executor_parser() {
+    fn language_scheme_label_round_trips_through_the_contract_parser() {
+        use crate::models::dolphin::runtime_contract::parse_dolphin_language_scheme_value;
         for scheme in [
             DolphinLanguageScheme::CnDialect,
             DolphinLanguageScheme::Multilingual,
@@ -1195,6 +1165,7 @@ mod tests {
         assert!(
             parse_dolphin_language_scheme_value(Some("bogus"))
                 .unwrap_err()
+                .to_string()
                 .contains("bogus"),
             "an unrecognized scheme value must fail closed rather than silently default"
         );
@@ -1572,6 +1543,7 @@ mod tests {
                     ctc_weight,
                     Some("zh-sichuan"),
                     None,
+                    &|| false,
                 )
             } else {
                 let weights =
@@ -1586,6 +1558,7 @@ mod tests {
                     ctc_weight,
                     Some("zh-sichuan"),
                     None,
+                    &|| false,
                 )
             }
             .expect("dolphin pipeline");

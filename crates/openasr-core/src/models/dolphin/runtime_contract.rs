@@ -1,4 +1,7 @@
-//! Dolphin `small.cn` execution metadata parsed from the `.oasr` GGUF header.
+//! Dolphin `small.cn` execution metadata parsed from the `.oasr` GGUF header,
+//! plus the admission-time runtime tensor contract that proves the pack carries
+//! every tensor the runtime will load (metadata-derived element counts checked
+//! against the tensor index) before the pack is admitted.
 //!
 //! This is the required-metadata contract the install gate (`native.rs`)
 //! dispatches to for the Dolphin architecture, so a pack missing a runtime
@@ -9,13 +12,26 @@
 //! table tensor, when present, is authoritative over the scalar (this is what
 //! lets the originally published `dolphin-cn-dialect-small` pack, which
 //! predates the `max_ctx` metadata key, keep loading).
+//!
+//! Tensor-contract note: Dolphin stores rank-2 `.weight` matrices with reversed
+//! dims when block-quantized (the contiguous `in` axis lands on ne0; see
+//! `package_import`), and the runtime re-declares every graph tensor and consumes
+//! each weight only by element count. The admission contract therefore checks
+//! element counts -- not stored dims -- which is invariant to the
+//! quantized-orientation reversal and matches exactly what the loader enforces.
 
 #![allow(dead_code)]
+
+use thiserror::Error;
 
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, optional_u64_scalar, required_u64_scalar,
     u64_to_u32, u64_to_usize, validate_positive_usize,
 };
+use crate::{GgufTensorIndex, GgufTensorMetadata};
+
+use super::encoder_graph::subsample_width;
+use super::package_import::DolphinLanguageScheme;
 
 pub(crate) const DOLPHIN_ENCODER_N_LAYERS_KEY: &str = "dolphin.encoder.n_layers";
 pub(crate) const DOLPHIN_ENCODER_D_MODEL_KEY: &str = "dolphin.encoder.d_model";
@@ -35,6 +51,17 @@ pub(crate) const DOLPHIN_VOCAB_SIZE_KEY: &str = "dolphin.vocab_size";
 pub(crate) const DOLPHIN_SOS_TOKEN_ID_KEY: &str = "dolphin.sos_token_id";
 pub(crate) const DOLPHIN_EOS_TOKEN_ID_KEY: &str = "dolphin.eos_token_id";
 pub(crate) const DOLPHIN_CTC_BLANK_TOKEN_ID_KEY: &str = "ctc.blank_token_id";
+
+/// Selects the decode-prefix builder, audio frontend, and encoder rel-pos
+/// attention scheme (see `executor::parse_dolphin_language_scheme`). Absent on
+/// packs predating the key, which default to the cn-dialect scheme; a present
+/// but unrecognized value fails closed. Validated here at admission so a corrupt
+/// or future-versioned pack is rejected before any decode work.
+pub(crate) const DOLPHIN_LANGUAGE_SCHEME_KEY: &str = "dolphin.language.scheme";
+/// The char/SentencePiece vocab, stamped by the importer as a string array. Its
+/// length must agree with `dolphin.vocab_size`; the runtime detokenizes through
+/// it and fails on a missing entry.
+pub(crate) const DOLPHIN_TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// Baked sinusoidal position-table tensor names (see
 /// `package_import::sinusoidal_pos_table_max_ctx`). When a pack bakes one of
@@ -296,14 +323,251 @@ where
     }
 }
 
+/// Parse the pack's `dolphin.language.scheme` metadata into the typed
+/// [`DolphinLanguageScheme`]. A **missing** key is an intentional
+/// backward-compat default to `CnDialect` (every pack baked before the key
+/// existed is cn-dialect); a **present** but unrecognized value fails closed so
+/// a corrupt or future-versioned pack is never silently misdispatched to the
+/// wrong frontend/attention scheme. This is the single language-scheme parser
+/// shared by the admission validator and the executor.
+pub(crate) fn parse_dolphin_language_scheme_value(
+    value: Option<&str>,
+) -> Result<DolphinLanguageScheme, DolphinTensorContractError> {
+    match value {
+        None => Ok(DolphinLanguageScheme::CnDialect),
+        Some("cn_dialect") => Ok(DolphinLanguageScheme::CnDialect),
+        Some("multilingual") => Ok(DolphinLanguageScheme::Multilingual),
+        Some(other) => Err(DolphinTensorContractError::LanguageScheme {
+            reason: format!(
+                "unrecognized '{DOLPHIN_LANGUAGE_SCHEME_KEY}' value {other:?} \
+                 (expected 'cn_dialect' or 'multilingual')"
+            ),
+        }),
+    }
+}
+
+/// Admission-time tensor-contract errors for the Dolphin runtime set.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub(crate) enum DolphinTensorContractError {
+    #[error("dolphin missing required runtime tensor '{name}'")]
+    MissingTensor { name: String },
+    #[error("dolphin runtime tensor '{name}' has {actual} elements, expected {expected}")]
+    TensorElementCount {
+        name: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("dolphin language scheme metadata is invalid: {reason}")]
+    LanguageScheme { reason: String },
+    #[error("dolphin pack is missing the '{DOLPHIN_TOKENIZER_TOKENS_KEY}' vocab")]
+    MissingTokenizer,
+    #[error(
+        "dolphin '{DOLPHIN_TOKENIZER_TOKENS_KEY}' has {actual} tokens, expected {expected} (vocab_size)"
+    )]
+    TokenizerVocabSize { expected: usize, actual: usize },
+}
+
+/// The required Dolphin runtime tensor set as `(name, expected_element_count)`,
+/// derived entirely from the parsed execution metadata and the language scheme.
+/// Element counts (not stored dims) are the contract: Dolphin reverses rank-2
+/// weight dims when block-quantizing and the runtime consumes every weight by
+/// element count, so this enumeration is invariant to the stored orientation and
+/// is the single source of truth shared by the admission validator and the
+/// runtime-ready test fixture. The optional hotword `context_module.*` tensors
+/// are deliberately absent -- packs without a trained context module are valid
+/// and simply do not advertise phrase bias.
+pub(crate) fn dolphin_runtime_tensor_element_counts(
+    metadata: &DolphinExecutionMetadata,
+    language_scheme: DolphinLanguageScheme,
+) -> Vec<(String, u64)> {
+    let d = metadata.encoder_d_model as u64;
+    let enc_ffn = metadata.encoder_ffn_dim as u64;
+    let cg = metadata.encoder_cgmlp_units as u64;
+    let cg_half = cg / 2;
+    let ck = metadata.encoder_cgmlp_kernel as u64;
+    let mk = metadata.encoder_merge_kernel as u64;
+    let feature_dim = metadata.feature_dim as u64;
+    let vocab = metadata.vocab_size as u64;
+    let dec_ffn = metadata.decoder_ffn_dim as u64;
+    // The decoder reuses the encoder width (the importer fails closed on a
+    // disagreement), so the decoder model dim is `d` as well.
+    let flat = d * subsample_width(metadata.feature_dim) as u64;
+
+    let mut out: Vec<(String, u64)> = Vec::new();
+    let mut push = |name: &str, elements: u64| out.push((name.to_string(), elements));
+
+    // Encoder subsampling embed (Conv2d x2 + linear reshape).
+    push("encoder.embed.conv.0.weight", 3 * 3 * d);
+    push("encoder.embed.conv.0.bias", d);
+    push("encoder.embed.conv.2.weight", 3 * 3 * d * d);
+    push("encoder.embed.conv.2.bias", d);
+    push("encoder.embed.out.0.weight", flat * d);
+    push("encoder.embed.out.0.bias", d);
+
+    // E-Branchformer encoder blocks.
+    for index in 0..metadata.encoder_n_layers {
+        let p = |suffix: &str| format!("encoder.encoders.{index}.{suffix}");
+        push(&p("norm_ff_macaron.weight"), d);
+        push(&p("norm_ff_macaron.bias"), d);
+        push(&p("feed_forward_macaron.w_1.weight"), d * enc_ffn);
+        push(&p("feed_forward_macaron.w_1.bias"), enc_ffn);
+        push(&p("feed_forward_macaron.w_2.weight"), enc_ffn * d);
+        push(&p("feed_forward_macaron.w_2.bias"), d);
+        push(&p("norm_mha.weight"), d);
+        push(&p("norm_mha.bias"), d);
+        for proj in ["linear_q", "linear_k", "linear_v", "linear_out"] {
+            push(&p(&format!("attn.{proj}.weight")), d * d);
+            push(&p(&format!("attn.{proj}.bias")), d);
+        }
+        push(&p("attn.linear_pos.weight"), d * d);
+        push(&p("attn.pos_bias_u"), d);
+        push(&p("attn.pos_bias_v"), d);
+        push(&p("norm_mlp.weight"), d);
+        push(&p("norm_mlp.bias"), d);
+        push(&p("cgmlp.channel_proj1.0.weight"), d * cg);
+        push(&p("cgmlp.channel_proj1.0.bias"), cg);
+        push(&p("cgmlp.csgu.norm.weight"), cg_half);
+        push(&p("cgmlp.csgu.norm.bias"), cg_half);
+        push(&p("cgmlp.csgu.conv.weight"), ck * cg_half);
+        push(&p("cgmlp.csgu.conv.bias"), cg_half);
+        push(&p("cgmlp.channel_proj2.weight"), cg_half * d);
+        push(&p("cgmlp.channel_proj2.bias"), d);
+        push(&p("depthwise_conv_fusion.weight"), mk * 2 * d);
+        push(&p("depthwise_conv_fusion.bias"), 2 * d);
+        push(&p("merge_proj.weight"), 2 * d * d);
+        push(&p("merge_proj.bias"), d);
+        push(&p("norm_ff.weight"), d);
+        push(&p("norm_ff.bias"), d);
+        push(&p("feed_forward.w_1.weight"), d * enc_ffn);
+        push(&p("feed_forward.w_1.bias"), enc_ffn);
+        push(&p("feed_forward.w_2.weight"), enc_ffn * d);
+        push(&p("feed_forward.w_2.bias"), d);
+        push(&p("norm_final.weight"), d);
+        push(&p("norm_final.bias"), d);
+    }
+
+    // Encoder tail + global CMVN.
+    push("encoder.after_norm.weight", d);
+    push("encoder.after_norm.bias", d);
+    push("encoder.global_cmvn.mean", feature_dim);
+    push("encoder.global_cmvn.istd", feature_dim);
+
+    // The cn-dialect encoder attention consumes the baked sinusoidal table; the
+    // multilingual scheme computes a centered table per request instead, so its
+    // packs legitimately omit this tensor (mirrors the executor's sentinel set).
+    if language_scheme == DolphinLanguageScheme::CnDialect {
+        push(
+            "encoder.embed.pos_enc.pe",
+            d * metadata.encoder_max_ctx as u64,
+        );
+    }
+
+    // CTC head.
+    push("ctc.ctc_lo.weight", vocab * d);
+    push("ctc.ctc_lo.bias", vocab);
+
+    // Transformer rescore decoder.
+    push("decoder.embed.0.weight", d * vocab);
+    push("decoder.embed.1.pe", d * metadata.decoder_max_ctx as u64);
+    for index in 0..metadata.decoder_n_layers {
+        let p = |suffix: &str| format!("decoder.decoders.{index}.{suffix}");
+        for norm in ["norm1", "norm2", "norm3"] {
+            push(&p(&format!("{norm}.weight")), d);
+            push(&p(&format!("{norm}.bias")), d);
+        }
+        for attn in ["self_attn", "src_attn"] {
+            for proj in ["linear_q", "linear_k", "linear_v", "linear_out"] {
+                push(&p(&format!("{attn}.{proj}.weight")), d * d);
+                push(&p(&format!("{attn}.{proj}.bias")), d);
+            }
+        }
+        push(&p("feed_forward.w_1.weight"), d * dec_ffn);
+        push(&p("feed_forward.w_1.bias"), dec_ffn);
+        push(&p("feed_forward.w_2.weight"), dec_ffn * d);
+        push(&p("feed_forward.w_2.bias"), d);
+    }
+    push("decoder.after_norm.weight", d);
+    push("decoder.after_norm.bias", d);
+    push("decoder.output_layer.weight", d * vocab);
+    push("decoder.output_layer.bias", vocab);
+
+    out
+}
+
+/// Validate the pack's runtime tensor set against the tensor index: every tensor
+/// the runtime loads must be present with a metadata-consistent element count.
+/// A truncated, reshaped, or mis-converted pack fails closed at admission with
+/// the offending tensor named, instead of passing a metadata-only check and
+/// failing later inside the executor.
+pub(crate) fn validate_dolphin_runtime_tensors_with_index(
+    index: &GgufTensorIndex,
+    metadata: &DolphinExecutionMetadata,
+    language_scheme: DolphinLanguageScheme,
+) -> Result<(), DolphinTensorContractError> {
+    for (name, expected) in dolphin_runtime_tensor_element_counts(metadata, language_scheme) {
+        let tensor: &GgufTensorMetadata = index
+            .get(&name)
+            .ok_or_else(|| DolphinTensorContractError::MissingTensor { name: name.clone() })?;
+        let actual = tensor.num_elements().ok_or_else(|| {
+            DolphinTensorContractError::TensorElementCount {
+                name: name.clone(),
+                expected,
+                actual: 0,
+            }
+        })?;
+        if actual != expected {
+            return Err(DolphinTensorContractError::TensorElementCount {
+                name,
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_runtime_pack_contract(
     preflight: &crate::GgufRuntimeSourcePreflight,
 ) -> Result<(), String> {
-    parse_dolphin_execution_metadata(preflight.metadata(), preflight.tensor_index())
-        .map(|_| ())
+    let metadata = parse_dolphin_execution_metadata(preflight.metadata(), preflight.tensor_index())
         .map_err(|error| {
             crate::models::runtime_pack_contract::metadata_validation_error("dolphin", error)
-        })
+        })?;
+    // The language scheme selects the frontend, attention scheme, and the
+    // required tensor set; fail closed on an unrecognized value before any
+    // tensor or decode work.
+    let language_scheme = parse_dolphin_language_scheme_value(
+        preflight.metadata().get_string(DOLPHIN_LANGUAGE_SCHEME_KEY),
+    )
+    .map_err(|error| {
+        crate::models::runtime_pack_contract::metadata_validation_error("dolphin", error)
+    })?;
+    // The runtime detokenizes through the stamped vocab; its length must agree
+    // with the metadata vocab_size.
+    let tokens = preflight
+        .metadata()
+        .get_string_array(DOLPHIN_TOKENIZER_TOKENS_KEY)
+        .ok_or_else(|| {
+            crate::models::runtime_pack_contract::tensor_validation_error(
+                DolphinTensorContractError::MissingTokenizer,
+            )
+        })?;
+    if tokens.len() != metadata.vocab_size {
+        return Err(
+            crate::models::runtime_pack_contract::tensor_validation_error(
+                DolphinTensorContractError::TokenizerVocabSize {
+                    expected: metadata.vocab_size,
+                    actual: tokens.len(),
+                },
+            ),
+        );
+    }
+    validate_dolphin_runtime_tensors_with_index(
+        preflight.tensor_index(),
+        &metadata,
+        language_scheme,
+    )
+    .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
 }
 
 #[cfg(test)]
@@ -311,6 +575,7 @@ mod tests {
     use super::*;
     use crate::arch::hparams::DOLPHIN_HPARAM_SCHEMA;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn dolphin_metadata() -> BTreeMap<String, String> {
         [
@@ -481,5 +746,186 @@ mod tests {
         let mut schema_keys = DOLPHIN_HPARAM_SCHEMA.to_vec();
         schema_keys.sort_unstable();
         assert_eq!(contract_keys, schema_keys);
+    }
+
+    /// Small internally-consistent metadata for the tensor-contract tests (the
+    /// same geometry the runtime-ready fixture stamps).
+    fn small_dolphin_metadata() -> BTreeMap<String, String> {
+        [
+            (DOLPHIN_ENCODER_N_LAYERS_KEY, "1"),
+            (DOLPHIN_ENCODER_D_MODEL_KEY, "8"),
+            (DOLPHIN_ENCODER_N_HEADS_KEY, "2"),
+            (DOLPHIN_ENCODER_HEAD_DIM_KEY, "4"),
+            (DOLPHIN_ENCODER_FFN_DIM_KEY, "16"),
+            (DOLPHIN_ENCODER_CGMLP_UNITS_KEY, "16"),
+            (DOLPHIN_ENCODER_CGMLP_KERNEL_KEY, "3"),
+            (DOLPHIN_ENCODER_MERGE_KERNEL_KEY, "3"),
+            (DOLPHIN_ENCODER_FEATURE_DIM_KEY, "16"),
+            (DOLPHIN_ENCODER_MAX_CTX_KEY, "8"),
+            (DOLPHIN_DECODER_N_LAYERS_KEY, "1"),
+            (DOLPHIN_DECODER_N_HEADS_KEY, "2"),
+            (DOLPHIN_DECODER_FFN_DIM_KEY, "16"),
+            (DOLPHIN_DECODER_MAX_CTX_KEY, "8"),
+            (DOLPHIN_VOCAB_SIZE_KEY, "12"),
+            (DOLPHIN_SOS_TOKEN_ID_KEY, "2"),
+            (DOLPHIN_EOS_TOKEN_ID_KEY, "3"),
+            (DOLPHIN_CTC_BLANK_TOKEN_ID_KEY, "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    fn small_execution_metadata() -> DolphinExecutionMetadata {
+        parse_dolphin_execution_metadata(&small_dolphin_metadata(), &()).expect("small parse")
+    }
+
+    /// Build a tensor index whose entries are 1-D tensors of the given element
+    /// counts (the validator checks element counts, not stored orientation).
+    fn tensor_index_from_counts(entries: &[(String, u64)]) -> crate::GgufTensorIndex {
+        let tensors: Vec<crate::GgufTensorMetadata> = entries
+            .iter()
+            .map(|(name, elements)| crate::GgufTensorMetadata {
+                name: name.clone(),
+                dims: vec![*elements],
+                ggml_type: 0,
+                type_name: "f32".to_string(),
+                size_bytes: 0,
+                offset_bytes: 0,
+            })
+            .collect();
+        crate::GgufTensorIndex::from_snapshot(crate::ggml_runtime::GgufTensorIndexSnapshot {
+            path: PathBuf::from("/tmp/dolphin-contract.oasr"),
+            data_section_offset_bytes: 0,
+            tensors,
+        })
+        .expect("unique tensor names")
+    }
+
+    fn full_runtime_index(scheme: DolphinLanguageScheme) -> crate::GgufTensorIndex {
+        let metadata = small_execution_metadata();
+        let entries = dolphin_runtime_tensor_element_counts(&metadata, scheme);
+        tensor_index_from_counts(&entries)
+    }
+
+    #[test]
+    fn full_runtime_tensor_set_passes_the_contract() {
+        let metadata = small_execution_metadata();
+        for scheme in [
+            DolphinLanguageScheme::CnDialect,
+            DolphinLanguageScheme::Multilingual,
+        ] {
+            let index = full_runtime_index(scheme);
+            validate_dolphin_runtime_tensors_with_index(&index, &metadata, scheme)
+                .expect("complete tensor set must pass");
+        }
+    }
+
+    #[test]
+    fn missing_required_tensor_fails_closed() {
+        let metadata = small_execution_metadata();
+        let mut entries =
+            dolphin_runtime_tensor_element_counts(&metadata, DolphinLanguageScheme::CnDialect);
+        // Drop a tensor every scheme requires.
+        entries.retain(|(name, _)| name != "ctc.ctc_lo.weight");
+        let index = tensor_index_from_counts(&entries);
+        let error = validate_dolphin_runtime_tensors_with_index(
+            &index,
+            &metadata,
+            DolphinLanguageScheme::CnDialect,
+        )
+        .expect_err("a missing required tensor must fail closed");
+        assert!(matches!(
+            error,
+            DolphinTensorContractError::MissingTensor { ref name } if name == "ctc.ctc_lo.weight"
+        ));
+    }
+
+    #[test]
+    fn wrong_element_count_fails_closed() {
+        let metadata = small_execution_metadata();
+        let mut entries =
+            dolphin_runtime_tensor_element_counts(&metadata, DolphinLanguageScheme::CnDialect);
+        for (name, elements) in entries.iter_mut() {
+            if name == "ctc.ctc_lo.bias" {
+                *elements += 1;
+            }
+        }
+        let index = tensor_index_from_counts(&entries);
+        let error = validate_dolphin_runtime_tensors_with_index(
+            &index,
+            &metadata,
+            DolphinLanguageScheme::CnDialect,
+        )
+        .expect_err("a mis-shaped tensor must fail closed");
+        assert!(matches!(
+            error,
+            DolphinTensorContractError::TensorElementCount { ref name, .. }
+                if name == "ctc.ctc_lo.bias"
+        ));
+    }
+
+    /// The cn-dialect encoder consumes the baked sinusoidal position table; the
+    /// multilingual scheme computes it per request, so its packs legitimately omit
+    /// the tensor and the contract must not require it there.
+    #[test]
+    fn encoder_position_table_is_required_only_for_cn_dialect() {
+        let metadata = small_execution_metadata();
+        let cn_entries =
+            dolphin_runtime_tensor_element_counts(&metadata, DolphinLanguageScheme::CnDialect);
+        assert!(
+            cn_entries
+                .iter()
+                .any(|(name, _)| name == "encoder.embed.pos_enc.pe"),
+            "cn-dialect contract must require the baked encoder position table"
+        );
+        let multilingual_entries =
+            dolphin_runtime_tensor_element_counts(&metadata, DolphinLanguageScheme::Multilingual);
+        assert!(
+            !multilingual_entries
+                .iter()
+                .any(|(name, _)| name == "encoder.embed.pos_enc.pe"),
+            "multilingual contract must not require the baked encoder position table"
+        );
+
+        // A multilingual pack without the table passes the multilingual contract
+        // but fails the cn-dialect contract.
+        let index_without = tensor_index_from_counts(&multilingual_entries);
+        validate_dolphin_runtime_tensors_with_index(
+            &index_without,
+            &metadata,
+            DolphinLanguageScheme::Multilingual,
+        )
+        .expect("multilingual pack without the baked table is valid");
+        assert!(
+            validate_dolphin_runtime_tensors_with_index(
+                &index_without,
+                &metadata,
+                DolphinLanguageScheme::CnDialect,
+            )
+            .is_err()
+        );
+    }
+
+    /// The required-tensor enumeration is a pure function of the metadata and the
+    /// language scheme; pin a couple of counts so accidental formula drift is loud.
+    #[test]
+    fn tensor_element_counts_follow_the_metadata_geometry() {
+        let metadata = small_execution_metadata();
+        let entries =
+            dolphin_runtime_tensor_element_counts(&metadata, DolphinLanguageScheme::CnDialect);
+        let lookup: std::collections::BTreeMap<&str, u64> = entries
+            .iter()
+            .map(|(name, elements)| (name.as_str(), *elements))
+            .collect();
+        let d = metadata.encoder_d_model as u64; // 8
+        let vocab = metadata.vocab_size as u64; // 12
+        assert_eq!(lookup["encoder.encoders.0.attn.linear_q.weight"], d * d);
+        assert_eq!(lookup["ctc.ctc_lo.weight"], vocab * d);
+        assert_eq!(lookup["decoder.embed.0.weight"], d * vocab);
+        assert_eq!(
+            lookup["encoder.embed.pos_enc.pe"],
+            d * metadata.encoder_max_ctx as u64
+        );
     }
 }
