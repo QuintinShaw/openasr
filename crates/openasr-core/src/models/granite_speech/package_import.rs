@@ -1,8 +1,8 @@
 //! Convert a local `ibm-granite/granite-speech-4.1-2b` HF source (sharded
 //! safetensors + `config.json`) into an OpenASR `.oasr` (GGUF-v0) runtime pack.
 //!
-//! fp16-only this pass (`PackQuant::Fp16`; q8_0/q4_k rungs are a follow-up).
-//! Every tensor keeps its original HF name verbatim (`encoder.layers.0.attn.
+//! fp16-only this pass (q8_0/q4_k rungs are a follow-up). Every tensor keeps
+//! its original HF name verbatim (`encoder.layers.0.attn.
 //! to_q.weight`, `projector.query`, `language_model.model.layers.0....`)
 //! rather than remapping to a family-local convention: the encoder/projector
 //! ggml graphs (`encoder_graph.rs`/`qformer.rs`) already load by these exact
@@ -27,12 +27,12 @@
 //! variant; `insert_metadata` accepts any `ToString`, so this is the
 //! established convention other families already use for non-integer hparams).
 //!
-//! The decoder ggml graph, greedy-decode-policy registration, and end-to-end
-//! golden are a separate follow-up pass (see `mod.rs`); this converter still
-//! carries the decoder's tensors + hparams now so that pass does not need a
-//! second converter revision.
-
-#![allow(dead_code)]
+//! The converter writes through the shared `PackEnvelope`/`OasrPackWriter`
+//! seam and returns the writer's `VerifiedPack`; the runtime contract in
+//! `runtime_contract.rs` re-proves the exact same metadata keys and the full
+//! three-stage tensor set at pack admission, so a pack this writer produced
+//! and a pack an attacker trimmed cannot reach the executor through the same
+//! door.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,13 +42,13 @@ use serde::Deserialize;
 use crate::VerifiedPack;
 use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 use crate::models::local_source_import::{
-    LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
+    LocalSourceImportError, ShardedSafetensorsSource, encode_f16_bits_le, load_gpt2_bpe_merges,
     read_source_json_file, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
     OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
 };
-use crate::models::pack_quant::{PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole};
+use crate::models::pack_quant::{QuantizedAxis, TensorQuantizationContract, TensorRole};
 use crate::nn::half::f32_to_f16_bits;
 
 use crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID;
@@ -66,7 +66,6 @@ pub(crate) const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 pub(crate) const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
-pub type GraniteSpeechQuantizationMode = PackQuant;
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder.", "projector."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
@@ -154,66 +153,6 @@ struct GraniteSpeechConfigJson {
     encoder_config: GraniteSpeechEncoderConfigJson,
     projector_config: GraniteSpeechProjectorConfigJson,
     text_config: GraniteTextConfigJson,
-}
-
-/// Opens every safetensors shard listed in `model.safetensors.index.json` and
-/// resolves a tensor name to whichever shard actually holds it. Granite Speech
-/// 4.1 2B ships 3 shards (~4.6 GB total, bf16); no existing family converter
-/// needed multi-shard support before this one (every prior HF source was a
-/// single `model.safetensors`).
-struct ShardedSafetensors {
-    shards: Vec<SafetensorsFile>,
-    shard_of: BTreeMap<String, usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SafetensorsIndexJson {
-    weight_map: BTreeMap<String, String>,
-}
-
-impl ShardedSafetensors {
-    fn open(source_root: &Path) -> Result<Self, LocalSourceImportError> {
-        let index: SafetensorsIndexJson = read_source_json_file(source_root, SOURCE_INDEX_JSON)?;
-        let mut shard_paths: Vec<String> = index.weight_map.values().cloned().collect();
-        shard_paths.sort();
-        shard_paths.dedup();
-
-        let mut shards = Vec::with_capacity(shard_paths.len());
-        let mut path_to_index = BTreeMap::new();
-        for (index, path) in shard_paths.iter().enumerate() {
-            shards.push(SafetensorsFile::open(source_root.join(path))?);
-            path_to_index.insert(path.clone(), index);
-        }
-        let mut shard_of = BTreeMap::new();
-        for (tensor_name, path) in &index.weight_map {
-            let &shard_index = path_to_index.get(path).ok_or_else(|| {
-                validate_error(format!(
-                    "granite-speech index.json references unknown shard '{path}' for tensor '{tensor_name}'"
-                ))
-            })?;
-            shard_of.insert(tensor_name.clone(), shard_index);
-        }
-        Ok(Self { shards, shard_of })
-    }
-
-    fn tensor_names(&self) -> impl Iterator<Item = &String> {
-        self.shard_of.keys()
-    }
-
-    fn read_f32(&self, name: &str) -> Result<(Vec<u64>, Vec<f32>), LocalSourceImportError> {
-        let &shard_index = self.shard_of.get(name).ok_or_else(|| {
-            validate_error(format!("granite-speech source is missing tensor '{name}'"))
-        })?;
-        let shard = &self.shards[shard_index];
-        let header = shard.tensor(name).ok_or_else(|| {
-            validate_error(format!(
-                "granite-speech shard is missing tensor header for '{name}'"
-            ))
-        })?;
-        let data = shard.tensor_data(header)?;
-        let values = decode_safetensors_payload_as_f32(name, &header.dtype, data)?;
-        Ok((header.shape.clone(), values))
-    }
 }
 
 /// `Conv1d`/`Linear` weight ranks (>=2) go F16; everything else (1-D norms,
@@ -307,7 +246,7 @@ fn should_carry_tensor(name: &str) -> bool {
 }
 
 fn build_runtime_tensors(
-    source: &ShardedSafetensors,
+    source: &ShardedSafetensorsSource,
 ) -> Result<Vec<GgufWriteTensor>, LocalSourceImportError> {
     let mut names: Vec<&String> = source
         .tensor_names()
@@ -316,7 +255,10 @@ fn build_runtime_tensors(
     names.sort();
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        let (shape, values) = source.read_f32(name)?;
+        let (shape, values) = source.read_f32(
+            name,
+            crate::models::granite_speech::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+        )?;
         out.push(make_write_tensor(remap_tensor_name(name), shape, values));
     }
     Ok(out)
@@ -364,21 +306,22 @@ fn load_granite_speech_vocab_tokens(
         .collect()
 }
 
+/// Loads the GPT-2 BPE merge list through the shared local-source loader,
+/// then fails closed when the source carries no merges: the shared helper
+/// tolerates an absent file (some families ship without one), but granite's
+/// prompt encode/decode cannot build a tokenizer without its merge table, so
+/// an empty result rejects the source instead of writing a broken pack.
 fn load_granite_speech_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
-    let path = source_root.join(SOURCE_MERGES_TXT);
-    let bytes =
-        crate::models::local_source_import::read_source_file_bytes(source_root, SOURCE_MERGES_TXT)?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| {
-        validate_error(format!(
-            "granite-speech merges.txt is not valid UTF-8 ({}): {error}",
-            path.display()
-        ))
-    })?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    let merges = load_gpt2_bpe_merges(
+        source_root,
+        super::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+    )?;
+    if merges.is_empty() {
+        return Err(validate_error(format!(
+            "granite-speech source must carry a non-empty {SOURCE_MERGES_TXT}; the pack tokenizer cannot encode prompts without its BPE merge table"
+        )));
+    }
+    Ok(merges)
 }
 
 fn granite_speech_runtime_gguf_metadata(
@@ -588,7 +531,11 @@ pub fn convert_local_granite_speech_source_to_runtime_pack(
     validate_output_pack_extension(&request.output_root)?;
     let config: GraniteSpeechConfigJson =
         read_source_json_file(&request.source_root, SOURCE_CONFIG_JSON)?;
-    let source = ShardedSafetensors::open(&request.source_root)?;
+    let source = ShardedSafetensorsSource::open(
+        &request.source_root,
+        SOURCE_INDEX_JSON,
+        super::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+    )?;
 
     let tensors = build_runtime_tensors(&source)?;
     let vocab_tokens =
@@ -642,6 +589,36 @@ mod tests {
         assert_eq!(ggml_dims_for_pack(&[1, 3, 1024]), vec![1, 3, 1024]);
     }
 
+    #[test]
+    fn merges_loader_rides_the_shared_track_and_fails_closed_on_empty() {
+        let source_root = tempfile::tempdir().expect("tempdir");
+        // Absent merges.txt: the shared loader tolerates it, granite must not.
+        let error = load_granite_speech_merges(source_root.path())
+            .expect_err("absent merges.txt must fail closed");
+        assert!(
+            error.to_string().contains("merges.txt"),
+            "unexpected error: {error}"
+        );
+        // Comment + blank lines drop; real merge lines survive trimmed.
+        std::fs::write(
+            source_root.path().join(SOURCE_MERGES_TXT),
+            "#version: 0.2\n\nĠ t\nĠa b\n",
+        )
+        .expect("write merges.txt");
+        let merges = load_granite_speech_merges(source_root.path()).expect("load merges");
+        assert_eq!(merges, vec!["Ġ t".to_string(), "Ġa b".to_string()]);
+        // A header-only file is still an empty merge table: fail closed.
+        std::fs::write(
+            source_root.path().join(SOURCE_MERGES_TXT),
+            "#version: 0.2\n",
+        )
+        .expect("write header-only merges.txt");
+        assert!(
+            load_granite_speech_merges(source_root.path()).is_err(),
+            "a merge table with no merges must fail closed"
+        );
+    }
+
     /// End-to-end converter smoke test + sampled tensor parity: converts the
     /// real checkpoint to a scratch `.oasr`, then re-reads a handful of
     /// tensors from every carried segment (encoder / projector / decoder) and
@@ -670,7 +647,12 @@ mod tests {
             result.tensor_count
         );
 
-        let source = ShardedSafetensors::open(&source_root).expect("open source");
+        let source = ShardedSafetensorsSource::open(
+            &source_root,
+            SOURCE_INDEX_JSON,
+            crate::models::granite_speech::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+        )
+        .expect("open source");
         let reader = GgufTensorDataReader::from_path(&output_root).expect("reader");
 
         let sample_names = [
@@ -684,7 +666,12 @@ mod tests {
             "language_model.model.embed_tokens.weight",
         ];
         for name in sample_names {
-            let (shape, expected) = source.read_f32(name).unwrap_or_else(|e| {
+            let (shape, expected) = source
+                .read_f32(
+                    name,
+                    crate::models::granite_speech::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+                )
+                .unwrap_or_else(|e| {
                 panic!("source tensor '{name}' missing (a `lm_head.weight` may be tied to the embedding on this checkpoint -- adjust sample list if so): {e}")
             });
             // Pack stores ggml dims (`[in, out]` for rank-2); the flat f32

@@ -371,7 +371,10 @@ type GraniteSpeechPreparedRuntimeActor = PinnedRuntimeActorCheckout<
 >;
 
 const GRANITE_SPEECH_EXECUTOR_ID: &str = crate::arch::GRANITE_SPEECH_EXECUTOR_COMPONENT_ID;
-const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
+/// Greedy decode stop token (`<|end_of_text|>` in the packed GPT-2 BPE
+/// table). Shared with the runtime contract validator, which fails closed on
+/// a pack whose vocab or token table cannot represent it.
+pub(crate) const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
 /// Fail-closed backstop against a non-terminating decode -- greedy decode stops
 /// at `<|end_of_text|>` well before this in practice. Also a first-class input
 /// to `capacity::derive_max_input_whole_seconds` (must stay in lockstep with that
@@ -781,11 +784,14 @@ fn granite_speech_execute_error_to_ggml(
 impl GraniteSpeechGgmlExecutor {
     /// Streaming decode: re-runs the SAME offline pipeline (`execute_inner`)
     /// against the growing/windowed audio buffer the shared streaming driver
-    /// hands it -- there is no incremental KV-cache session to plug in yet
-    /// (see `decode_executor.rs`'s O(n^2) recompute-per-step note), so every
-    /// partial re-does frontend + encoder + Q-Former + a full prefill-style
-    /// decode from scratch. This is registered to satisfy the codebase's
-    /// fail-closed streaming-completeness gate
+    /// hands it. The resident session's incremental-KV decode is scoped to one
+    /// request's own generated tokens; a streaming partial cannot reuse a prior
+    /// partial's KV, because each partial re-splices a LONGER audio prompt
+    /// (different projected rows, different prompt embeddings), which
+    /// invalidates every cached position. So every partial re-does frontend +
+    /// encoder + Q-Former + a full prefill-style decode from scratch. This is
+    /// registered to satisfy the codebase's fail-closed streaming-completeness
+    /// gate
     /// (`builtin_execution_dispatch::build_builtin_ggml_streaming_execution_dispatch`
     /// rejects the WHOLE dispatch, for every family, if any registered
     /// architecture has no streaming executor at all) -- it is correctness-

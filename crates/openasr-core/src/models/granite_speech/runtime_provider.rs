@@ -17,8 +17,6 @@
 //! (b) the decoder's **token-embedding table alone** (used on the host by
 //! `embed_token_row` for the prompt + per-step embedding lookup).
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use crate::ggml_runtime::GgufTensorDataReadError;
