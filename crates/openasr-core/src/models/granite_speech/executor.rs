@@ -371,7 +371,10 @@ type GraniteSpeechPreparedRuntimeActor = PinnedRuntimeActorCheckout<
 >;
 
 const GRANITE_SPEECH_EXECUTOR_ID: &str = crate::arch::GRANITE_SPEECH_EXECUTOR_COMPONENT_ID;
-const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
+/// Greedy decode stop token (`<|end_of_text|>` in the packed GPT-2 BPE
+/// table). Shared with the runtime contract validator, which fails closed on
+/// a pack whose vocab or token table cannot represent it.
+pub(crate) const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
 /// Fail-closed backstop against a non-terminating decode -- greedy decode stops
 /// at `<|end_of_text|>` well before this in practice. Also a first-class input
 /// to `capacity::derive_max_input_whole_seconds` (must stay in lockstep with that
