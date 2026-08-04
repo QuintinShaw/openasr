@@ -955,9 +955,12 @@ impl TinyGgufFixtureSpec {
             "cohere_transcribe.decoder.max_ctx".to_string(),
             "32".to_string(),
         );
+        // The runtime contract proves the decoder start token id is inside the
+        // declared vocab, so the scaled fixture keeps the id in range of its
+        // own tiny vocab instead of the real checkpoint's 13764.
         self.metadata.insert(
             "cohere_transcribe.decoder.start_token_id".to_string(),
-            "13764".to_string(),
+            vocab_size.saturating_sub(1).to_string(),
         );
         self.metadata.insert(
             "cohere_transcribe.audio.sample_rate".to_string(),

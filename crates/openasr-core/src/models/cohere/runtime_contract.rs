@@ -172,6 +172,19 @@ pub(crate) fn parse_cohere_transcribe_execution_metadata<M: ScalarMetadataView>(
             ),
         });
     }
+    // The decoder start token indexes the same vocab the decode loop argmax-es
+    // over; a start id at or beyond vocab_size can never be fed to the
+    // embedding rows the pack ships. Fail closed here, the same "token ids
+    // must stay inside the declared vocab" rule the moss-transcribe-diarize
+    // contract applies to its audio control tokens.
+    if (decoder_start_token_id as usize) >= vocab_size {
+        return Err(CohereTranscribeRuntimeContractError::InvalidMetadataValue {
+            key: COHERE_TRANSCRIBE_DECODER_START_TOKEN_ID_KEY,
+            reason: format!(
+                "token id {decoder_start_token_id} out of range for vocab_size {vocab_size}"
+            ),
+        });
+    }
     if hop_length > win_length || win_length > n_fft {
         return Err(CohereTranscribeRuntimeContractError::InvalidMetadataValue {
             key: COHERE_TRANSCRIBE_AUDIO_WIN_LENGTH_KEY,
@@ -904,6 +917,23 @@ mod tests {
             error,
             CohereTranscribeRuntimeContractError::InvalidMetadataValue {
                 key: COHERE_TRANSCRIBE_ENCODER_D_MODEL_KEY,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_decoder_start_token_id_out_of_vocab() {
+        let mut metadata = base_metadata();
+        metadata.insert(
+            COHERE_TRANSCRIBE_DECODER_START_TOKEN_ID_KEY.to_string(),
+            "16384".to_string(),
+        );
+        let error = parse_cohere_transcribe_execution_metadata(&metadata).expect_err("must fail");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidMetadataValue {
+                key: COHERE_TRANSCRIBE_DECODER_START_TOKEN_ID_KEY,
                 ..
             }
         ));
