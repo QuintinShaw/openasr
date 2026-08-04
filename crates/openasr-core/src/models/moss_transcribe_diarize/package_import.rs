@@ -49,11 +49,14 @@
 //!
 //! **Current status**: this importer produces a well-formed, self-describing
 //! GGUF with every tensor this family needs and full tokenizer metadata. It is
-//! wired into the canonical architecture descriptor and builtin dedicated
-//! executor/decode-policy/runtime-contract registries, and the `moss` variant
-//! of `openasr model-pack import` invokes it. Packs produced here are consumed
-//! by the builtin runtime and the public `moss-transcribe-diarize` packs are
-//! listed in `model-registry/catalog.public.json`.
+//! declared as the family's pack-import surface on the canonical architecture
+//! descriptor row (force-linked through the generated import dispatch), writes
+//! through the shared `PackEnvelope`/`OasrPackWriter` seam, and returns the
+//! `VerifiedPack` proof every install/runtime path consumes -- the exposed
+//! `output_path` is diagnostic, not an execution capability. The `moss`
+//! variant of `openasr model-pack import` invokes it. Packs produced here are
+//! consumed by the builtin runtime and the public `moss-transcribe-diarize`
+//! packs are listed in `model-registry/catalog.public.json`.
 //!
 //! Runtime semantics still follow the family contract: MOSS has no true
 //! realtime/incremental path (its registered streaming surface is buffered),

@@ -16,11 +16,15 @@
 //! Current status: the checkpoint-to-GGUF importer ([`package_import`]) and
 //! the full ggml execution graph (Whisper encoder reuse via [`encoder_graph`],
 //! the [`adaptor_graph`] bridge, Qwen3 decoder reuse via [`llm_decoder`], and
-//! decode-policy/executor/tensor-contract registration in [`executor`] and
-//! `arch/mod.rs`) are implemented and registered as a builtin architecture.
-//! A pack produced by this importer runs through `openasr transcribe
-//! --model-pack <pack>`, and `openasr model-pack import moss` dispatches the
-//! importer. Public catalog coverage is live in
+//! the dedicated executor in [`executor`]) are implemented. The family's
+//! complete lifecycle row -- identity, pack, execution, topology,
+//! optimization, quantization, and conformance facets -- is declared in the
+//! canonical architecture inventory (`arch/mod.rs`); offline/streaming
+//! dispatch, executor materialization, runtime-validator routing, and
+//! content-id eviction are generated projections of that row, not
+//! family-specific central wiring. A pack produced by this importer runs
+//! through `openasr transcribe --model-pack <pack>`, and `openasr model-pack
+//! import moss` dispatches the importer. Public catalog coverage is live in
 //! `model-registry/catalog.public.json` with the three published quantization
 //! tiers: `fp16`, `q8_0`, and `q4_k`.
 //!
