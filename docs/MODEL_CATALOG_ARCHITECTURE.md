@@ -75,6 +75,15 @@ entries omit the field. The catalog generator owns the denormalization and
 generated catalog from drifting from the Rust registry. Clients use the field
 to preflight Voice ID dependencies without a model-id allowlist.
 
+ASR entries also carry `word_timestamp_source = "native" | "forced_aligner"`,
+the signed mirror of `OpenAsrArchitectureDescriptor::word_timestamp_source`.
+It states whether the executor can provide usable word anchors itself or needs
+the shared Qwen3 forced-aligner pack. Clients combine this with
+`speaker_source`: an external ASR with `forced_aligner` must install the
+embedder, segmenter, and aligner before file Voice ID starts. Missing or future
+values are treated as `forced_aligner`, so clients never skip a correctness
+dependency by guessing.
+
 `public` means published/downloadable/importable. It is not the model-market
 predicate. The Rust market-list helper is `CatalogModel::is_market_listed()`,
 defined as `public && kind in {asr-model, translation-model}`; capability packs
@@ -159,7 +168,9 @@ relative basename-only `.oasr` targets.
 
 For the local file Voice ID pipeline, ReDimNet2-B6 is required for both
 `speaker_source` values. An `external` ASR additionally needs the default
-segmentation-3.0 pack; a `native` model such as MOSS does not. A future
+segmentation-3.0 pack and, when its `word_timestamp_source` is
+`forced_aligner`, Qwen3-ForcedAligner-0.6B; a `native` model such as MOSS does
+not need either attribution dependency. A future
 consent-installed DiariZen pack may replace segmentation-3.0 behind the same
 segmenter interface, but its staged source row does not authorize any current
 CLI/server auto-install behavior.

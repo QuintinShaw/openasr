@@ -427,7 +427,7 @@ pub enum SpeakerSegmentationSource {
     /// from a separate segmenter over the same audio: today the model-agnostic
     /// neural VAD + ReDimNet2-B6 speaker-embedder clustering path, and (next)
     /// the pyannote segmenter, which plugs in at the same
-    /// `crate::diarize::pipeline::Diarization` boundary without any family
+    /// `crate::diarize::contract::SpeakerTimeline` boundary without any family
     /// needing to change.
     External,
 }
@@ -436,6 +436,17 @@ impl SpeakerSegmentationSource {
     pub fn is_in_decoder(self) -> bool {
         matches!(self, Self::InDecoder)
     }
+}
+
+/// Where this architecture obtains the word anchors needed to project a
+/// transcript onto an external speaker timeline without losing speaker
+/// changes. This is an architecture capability, not a request preference:
+/// executors declaring `Native` must populate `Segment.words` when requested;
+/// `ForcedAligner` families require the shared alignment capability pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordTimestampSource {
+    Native,
+    ForcedAligner,
 }
 
 /// How one recording is cut up for this architecture before decode -- the
@@ -748,6 +759,8 @@ pub(crate) struct OpenAsrExecutionContract {
     pub word_timestamps: OpenAsrWordTimestampStrategy,
     pub streaming_partial_granularity: StreamingPartialGranularity,
     pub speaker_segmentation: SpeakerSegmentationSource,
+    /// Source of usable word anchors for transcript/speaker attribution.
+    pub word_timestamp_source: WordTimestampSource,
     pub longform_slice_shape: OpenAsrLongformSliceShape,
     pub(crate) invocation_span: OpenAsrInvocationSpan,
     pub emits_punctuation: Option<bool>,
@@ -870,6 +883,7 @@ impl OpenAsrArchitectureDescriptor {
             speaker_segmentation: self.execution_contract.speaker_segmentation,
             phrase_bias: self.execution_contract.phrase_bias,
             word_timestamps: self.execution_contract.word_timestamps,
+            word_timestamp_source: self.execution_contract.word_timestamp_source,
         }
     }
 }
@@ -1575,6 +1589,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -1679,6 +1694,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeSensitive,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 30.0 },
             emits_punctuation: Some(true),
@@ -1762,6 +1778,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -1860,6 +1877,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             // Character/BPE CTC: whether an imported checkpoint's vocab includes
@@ -1958,6 +1976,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             // Verified on the imported pack: trained on transcripts that preserve
@@ -2043,6 +2062,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
@@ -2132,6 +2152,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::FrameSync,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -2231,6 +2252,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -2325,6 +2347,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             // DataoceanAI's cn-dialect-small training corpus is transcribed
@@ -2423,6 +2446,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -2513,6 +2537,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             // The reference tokenizer's dict.txt has no punctuation/<space>
@@ -2610,6 +2635,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 40.0 },
             // Qwen2's ChatML decode is a plain transcription completion -- no
@@ -2704,6 +2730,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 40.0 },
             // The stock Qwen3 ChatML decode emits ordinary punctuation, but no
@@ -2790,6 +2817,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 30.0 },
             // No characterized punctuation behavior for this family yet (unlike
@@ -2882,6 +2910,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::Buffered,
             speaker_segmentation: SpeakerSegmentationSource::InDecoder,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             // Product invocation envelope: ordinary VAD slicing aims at 30s and
             // may stretch to 60s to reach a clean cut. Recordings at or below 60s
             // decode whole. This bound is machine-independent, so a recording has
@@ -3014,6 +3043,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // `GRANITE_SPEECH_DECODE_POLICY_ID` descriptor rather than a
             // hand-rolled argmax loop.
             speaker_segmentation: SpeakerSegmentationSource::External,
+            word_timestamp_source: WordTimestampSource::ForcedAligner,
             // External families ride the shared generic longform window (slices
             // are never their own speaker scope). This is not the whole-recording
             // single-prompt `ScopedSlices` case (only moss-transcribe-diarize is),
@@ -3265,8 +3295,8 @@ mod tests {
             .expect("builtin native families must satisfy the integration audit");
     }
 
-    /// Pins `speaker_segmentation` and `emits_punctuation` per builtin
-    /// architecture -- the single Rust-side declaration of both
+    /// Pins transcript-attribution capabilities per builtin architecture --
+    /// the single Rust-side declaration of these
     /// capability-single-source facts this test protects against silent drift.
     /// moss-transcribe-diarize is the only builtin family that segments
     /// speakers in-decoder today (cohere's decoder has the mode but no
@@ -3275,7 +3305,7 @@ mod tests {
     /// cross-checks the shipped result against
     /// [`emits_punctuation_for_model_architecture`].
     #[test]
-    fn builtin_architectures_declare_speaker_segmentation_and_emits_punctuation() {
+    fn builtin_architectures_declare_transcript_capabilities() {
         let expected: &[(&str, SpeakerSegmentationSource, Option<bool>)] = &[
             (
                 COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
@@ -3358,6 +3388,16 @@ mod tests {
                 Some(true),
             ),
         ];
+        let forced_aligner_word_timestamps = std::collections::BTreeSet::from([
+            DOLPHIN_GGML_ARCHITECTURE_ID,
+            SENSEVOICE_GGML_ARCHITECTURE_ID,
+            FIRERED_AED_GGML_ARCHITECTURE_ID,
+            FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            FUNASR_NANO_GGML_ARCHITECTURE_ID,
+            MIMO_ASR_GGML_ARCHITECTURE_ID,
+            MOSS_TD_GGML_ARCHITECTURE_ID,
+            GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+        ]);
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
 
@@ -3379,6 +3419,16 @@ mod tests {
                 emits_punctuation_for_model_architecture(model_architecture),
                 emits_punctuation,
                 "'{model_architecture}' accessor must match the descriptor field"
+            );
+            let expected_word_source =
+                if forced_aligner_word_timestamps.contains(model_architecture) {
+                    WordTimestampSource::ForcedAligner
+                } else {
+                    WordTimestampSource::Native
+                };
+            assert_eq!(
+                descriptor.execution_contract.word_timestamp_source, expected_word_source,
+                "'{model_architecture}' word_timestamp_source mismatch"
             );
             seen.insert(model_architecture);
         }

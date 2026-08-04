@@ -185,6 +185,7 @@ fn alias_contract_model(
         recommended: false,
         upstream_release_date: None,
         speaker_source: None,
+        word_timestamp_source: None,
         emits_punctuation: None,
         prose: None,
         prose_locales: None,
@@ -1725,7 +1726,7 @@ fn embedded_catalog_emits_punctuation_matches_family() {
 }
 
 #[test]
-fn embedded_catalog_speaker_source_matches_architecture_registry() {
+fn embedded_catalog_speaker_capabilities_match_architecture_registry() {
     let home = tempfile::tempdir().unwrap();
     let catalog = super::load_embedded_signed_catalog(home.path())
         .expect("embedded catalog should verify and parse offline");
@@ -1736,6 +1737,11 @@ fn embedded_catalog_speaker_source_matches_architecture_registry() {
             assert_eq!(
                 model.speaker_source, None,
                 "non-ASR model '{}' must omit speaker_source",
+                model.id
+            );
+            assert_eq!(
+                model.word_timestamp_source, None,
+                "non-ASR model '{}' must omit word_timestamp_source",
                 model.id
             );
             continue;
@@ -1764,6 +1770,19 @@ fn embedded_catalog_speaker_source_matches_architecture_registry() {
             model.speaker_source,
             Some(expected),
             "catalog model '{}' speaker_source drifted from architecture '{}'",
+            model.id,
+            architecture
+        );
+        let expected_word_source = match descriptor.execution_contract.word_timestamp_source {
+            crate::arch::WordTimestampSource::Native => CatalogWordTimestampSource::Native,
+            crate::arch::WordTimestampSource::ForcedAligner => {
+                CatalogWordTimestampSource::ForcedAligner
+            }
+        };
+        assert_eq!(
+            model.word_timestamp_source,
+            Some(expected_word_source),
+            "catalog model '{}' word_timestamp_source drifted from architecture '{}'",
             model.id,
             architecture
         );

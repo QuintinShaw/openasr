@@ -68,7 +68,10 @@ use thiserror::Error;
 use super::evidence::{self, JudgedWindows, MIN_PURITY_VERDICT_WINDOWS, WINDOW_SECONDS};
 use super::naming::{SpeakerNamingRefusal, UnnamedSpeaker};
 use crate::Segment;
-use crate::diarize::contract::{SpeakerEmbedding, TimeRange};
+#[cfg(test)]
+use crate::diarize::contract::SpeakerTurn;
+use crate::diarize::contract::{SpeakerEmbedding, SpeakerId, SpeakerTimeline, TimeRange};
+use crate::diarize::enrollment::SpeakerDisplayAssignment;
 
 /// Fail-closed failures of the identity evidence machinery. Evidence-quality
 /// refusals remain anonymous results; model/runtime failures and cancellation
@@ -292,76 +295,13 @@ fn name_speakers_across_scopes_with_library_state(
     // into one centroid unless a caller genuinely produced one scope.
     let mut evidence: BTreeMap<String, LabelEvidence> = BTreeMap::new();
     for (scope_index, scope) in scopes.iter().enumerate() {
-        for (label, windows) in evidence::plan_label_windows(scope.segments) {
-            let planned_windows = windows.len();
-            let mut clips = Vec::with_capacity(windows.len());
-            let mut valid_windows = Vec::with_capacity(windows.len());
-            for window in windows {
-                let Some(clip) = window_clip(&window, scope.samples) else {
-                    continue;
-                };
-                clips.push(clip);
-                valid_windows.push(window);
-            }
-            let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
-            if results.len() != valid_windows.len() {
-                return Err(SpeakerIdentityError::EmbeddingFailed {
-                    reason: format!(
-                        "embedder returned {} results for {} evidence windows",
-                        results.len(),
-                        valid_windows.len()
-                    ),
-                });
-            }
-            let mut embeddings = Vec::with_capacity(valid_windows.len());
-            let mut spans = Vec::with_capacity(valid_windows.len());
-            for (window, result) in valid_windows.into_iter().zip(results) {
-                match result {
-                    Ok(embedding) => {
-                        embeddings.push(embedding);
-                        spans.push(window);
-                    }
-                    Err(crate::diarize::embed::EmbedError::TooShort) => {}
-                    Err(crate::diarize::embed::EmbedError::Canceled) => {
-                        return Err(SpeakerIdentityError::Canceled);
-                    }
-                    Err(error) => {
-                        return Err(SpeakerIdentityError::EmbeddingFailed {
-                            reason: error.to_string(),
-                        });
-                    }
-                }
-            }
-            if embeddings.is_empty() {
-                log_naming_debug(format_args!(
-                    "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows=0 decision=no-usable-window"
-                ));
-                // Same user-facing answer as failing the window/second gates
-                // below, reached one step earlier: the label produced windows
-                // the audio could not back. Reported rather than skipped so a
-                // label with no evidence at all is not the one case that
-                // silently vanishes from the report.
-                refusals.insert(label, not_enough_speech(0, 0.0));
-                continue;
-            }
-            let entry = LabelEvidence::from_windows(
-                evidence::judge_windows(&embeddings, &spans),
-                scope_index,
-            );
-            log_naming_debug(format_args!(
-                "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows={} kept_windows={} kept_seconds={:.2} single_voice={} min_windows={MIN_PURITY_VERDICT_WINDOWS} min_seconds={MIN_NAMING_EVIDENCE_SECONDS:.2} naming_evidence={}",
-                embeddings.len(),
-                entry.kept.len(),
-                entry.kept_seconds,
-                entry.single_voice,
-                if entry.centroid_for_naming().is_some() {
-                    "accepted"
-                } else {
-                    "refused"
-                },
-            ));
-            evidence.insert(label, entry);
-        }
+        evidence.extend(collect_label_evidence(
+            embedder,
+            evidence::plan_label_windows(scope.segments),
+            scope.samples,
+            scope_index,
+            &mut refusals,
+        )?);
     }
 
     // Put the scopes back together: labels from different scopes whose voices
@@ -396,7 +336,176 @@ fn name_speakers_across_scopes_with_library_state(
         .identity()
         .ok_or(super::VoiceIdLibraryError::EmbedderIdentityUnavailable)?;
     let matcher = super::load_person_matcher_for_embedder(&identity, embedder)?;
-    let mut matches: BTreeMap<String, super::PersonMatch> = BTreeMap::new();
+    let matches = match_label_evidence(&matcher, evidence, &mut refusals);
+
+    for scope in scopes.iter_mut() {
+        for segment in scope.segments.iter_mut() {
+            let Some(label) = segment.speaker_label.as_deref() else {
+                continue;
+            };
+            let Some(person) = matches.get(label) else {
+                continue;
+            };
+            segment.speaker = Some(person.display_name.clone());
+            segment.speaker_person_id = Some(person.person_id.as_str().to_string());
+            segment.speaker_snapshot_label = Some(person.display_name.clone());
+        }
+    }
+    Ok(unnamed_speakers(scopes, &refusals, |_| {
+        // A label the evidence pass never saw: it carries segments but
+        // produced no turn long enough to plan a window over, which is the
+        // shortest-speech end of the same gate.
+        not_enough_speech(0, 0.0)
+    }))
+}
+
+/// Identity result for a recording-local speaker timeline. Every timeline
+/// speaker receives an assignment; anonymous speakers additionally carry the
+/// refusal that explains why no enrolled person was attached.
+pub(crate) struct TimelineIdentityResolution {
+    pub assignments: BTreeMap<SpeakerId, SpeakerDisplayAssignment>,
+    pub unnamed_speakers: Vec<UnnamedSpeaker>,
+}
+
+/// Resolve identities directly from the segmenter's canonical timeline.
+///
+/// This is intentionally independent of ASR segments. A coarse or unaligned
+/// transcript can therefore delay text attribution without contaminating the
+/// audio evidence used to recognize people.
+pub(crate) fn resolve_timeline_identities_with_embedder(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    timeline: &SpeakerTimeline,
+    samples: &[f32],
+) -> Result<TimelineIdentityResolution, SpeakerIdentityError> {
+    let identity = embedder
+        .identity()
+        .ok_or(super::VoiceIdLibraryError::EmbedderIdentityUnavailable)?;
+    let matcher = super::load_person_matcher_for_embedder(&identity, embedder)?;
+    resolve_timeline_identities_with_matcher(embedder, timeline, samples, &matcher)
+}
+
+fn resolve_timeline_identities_with_matcher(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    timeline: &SpeakerTimeline,
+    samples: &[f32],
+    matcher: &super::PersonMatcher,
+) -> Result<TimelineIdentityResolution, SpeakerIdentityError> {
+    let speakers: BTreeSet<SpeakerId> = timeline.turns.iter().map(|turn| turn.speaker).collect();
+    let planned = evidence::plan_timeline_windows(&timeline.turns)
+        .into_iter()
+        .map(|(speaker, windows)| (speaker.label(), windows))
+        .collect();
+    let mut refusals = BTreeMap::new();
+    let evidence = collect_label_evidence(embedder, planned, samples, 0, &mut refusals)?;
+    let matches = match_label_evidence(matcher, evidence, &mut refusals);
+
+    let mut assignments = BTreeMap::new();
+    let mut unnamed_speakers = Vec::new();
+    for speaker in speakers {
+        let label = speaker.label();
+        if let Some(person) = matches.get(&label) {
+            assignments.insert(
+                speaker,
+                SpeakerDisplayAssignment::from_voice_id_assignment(
+                    super::VoiceIdAssignment::from_person_match(speaker, person),
+                ),
+            );
+            continue;
+        }
+        assignments.insert(speaker, SpeakerDisplayAssignment::anonymous(speaker));
+        unnamed_speakers.push(UnnamedSpeaker {
+            label: label.clone(),
+            reason: refusals
+                .remove(&label)
+                .unwrap_or_else(|| not_enough_speech(0, 0.0)),
+        });
+    }
+    Ok(TimelineIdentityResolution {
+        assignments,
+        unnamed_speakers,
+    })
+}
+
+fn collect_label_evidence(
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    planned: BTreeMap<String, Vec<TimeRange>>,
+    samples: &[f32],
+    scope_index: usize,
+    refusals: &mut BTreeMap<String, SpeakerNamingRefusal>,
+) -> Result<BTreeMap<String, LabelEvidence>, SpeakerIdentityError> {
+    let mut evidence = BTreeMap::new();
+    for (label, windows) in planned {
+        let planned_windows = windows.len();
+        let mut clips = Vec::with_capacity(windows.len());
+        let mut valid_windows = Vec::with_capacity(windows.len());
+        for window in windows {
+            let Some(clip) = window_clip(&window, samples) else {
+                continue;
+            };
+            clips.push(clip);
+            valid_windows.push(window);
+        }
+        let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
+        if results.len() != valid_windows.len() {
+            return Err(SpeakerIdentityError::EmbeddingFailed {
+                reason: format!(
+                    "embedder returned {} results for {} evidence windows",
+                    results.len(),
+                    valid_windows.len()
+                ),
+            });
+        }
+        let mut embeddings = Vec::with_capacity(valid_windows.len());
+        let mut spans = Vec::with_capacity(valid_windows.len());
+        for (window, result) in valid_windows.into_iter().zip(results) {
+            match result {
+                Ok(embedding) => {
+                    embeddings.push(embedding);
+                    spans.push(window);
+                }
+                Err(crate::diarize::embed::EmbedError::TooShort) => {}
+                Err(crate::diarize::embed::EmbedError::Canceled) => {
+                    return Err(SpeakerIdentityError::Canceled);
+                }
+                Err(error) => {
+                    return Err(SpeakerIdentityError::EmbeddingFailed {
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        if embeddings.is_empty() {
+            log_naming_debug(format_args!(
+                "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows=0 decision=no-usable-window"
+            ));
+            refusals.insert(label, not_enough_speech(0, 0.0));
+            continue;
+        }
+        let entry =
+            LabelEvidence::from_windows(evidence::judge_windows(&embeddings, &spans), scope_index);
+        log_naming_debug(format_args!(
+            "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows={} kept_windows={} kept_seconds={:.2} single_voice={} min_windows={MIN_PURITY_VERDICT_WINDOWS} min_seconds={MIN_NAMING_EVIDENCE_SECONDS:.2} naming_evidence={}",
+            embeddings.len(),
+            entry.kept.len(),
+            entry.kept_seconds,
+            entry.single_voice,
+            if entry.centroid_for_naming().is_some() {
+                "accepted"
+            } else {
+                "refused"
+            },
+        ));
+        evidence.insert(label, entry);
+    }
+    Ok(evidence)
+}
+
+fn match_label_evidence(
+    matcher: &super::PersonMatcher,
+    evidence: BTreeMap<String, LabelEvidence>,
+    refusals: &mut BTreeMap<String, SpeakerNamingRefusal>,
+) -> BTreeMap<String, super::PersonMatch> {
+    let mut matches = BTreeMap::new();
     for (label, evidence) in evidence {
         let Some(centroid) = evidence.centroid_for_naming() else {
             refusals.insert(label, evidence.refusal());
@@ -433,26 +542,7 @@ fn name_speakers_across_scopes_with_library_state(
             }
         }
     }
-
-    for scope in scopes.iter_mut() {
-        for segment in scope.segments.iter_mut() {
-            let Some(label) = segment.speaker_label.as_deref() else {
-                continue;
-            };
-            let Some(person) = matches.get(label) else {
-                continue;
-            };
-            segment.speaker = Some(person.display_name.clone());
-            segment.speaker_person_id = Some(person.person_id.as_str().to_string());
-            segment.speaker_snapshot_label = Some(person.display_name.clone());
-        }
-    }
-    Ok(unnamed_speakers(scopes, &refusals, |_| {
-        // A label the evidence pass never saw: it carries segments but
-        // produced no turn long enough to plan a window over, which is the
-        // shortest-speech end of the same gate.
-        not_enough_speech(0, 0.0)
-    }))
+    matches
 }
 
 /// The labels a finished transcript still spells anonymously, in label order,
@@ -574,14 +664,6 @@ pub fn name_speakers_from_labeled_segments(
     samples: &[f32],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     name_speakers_across_scopes(embedder, &mut [SpeakerScope { segments, samples }])
-}
-
-pub(crate) fn name_speakers_from_labeled_segments_with_embedder(
-    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
-    segments: &mut [Segment],
-    samples: &[f32],
-) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
-    name_speakers_across_scopes_with_embedder(embedder, &mut [SpeakerScope { segments, samples }])
 }
 
 /// What a label's voice amounts to: the windows that survived main-cluster
@@ -863,6 +945,7 @@ fn window_clip<'a>(window: &TimeRange, samples: &'a [f32]) -> Option<&'a [f32]> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diarize::embed::SpeakerEmbedder;
 
     fn labeled(start: f32, end: f32, speaker: Option<&str>) -> Segment {
         Segment {
@@ -1296,6 +1379,87 @@ mod tests {
 
     fn one_voice_embedder() -> &'static dyn crate::diarize::embed::SpeakerEmbedder {
         &OneVoiceEmbedder
+    }
+
+    struct SignedVoiceEmbedder;
+
+    impl crate::diarize::embed::SpeakerEmbedder for SignedVoiceEmbedder {
+        fn embed(
+            &self,
+            samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<SpeakerEmbedding, crate::diarize::embed::EmbedError> {
+            let mean = samples.iter().copied().sum::<f32>() / samples.len().max(1) as f32;
+            Ok(if mean >= 0.0 {
+                SpeakerEmbedding::l2_normalized(vec![1.0, 0.0])
+            } else {
+                SpeakerEmbedding::l2_normalized(vec![0.0, 1.0])
+            })
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(deterministic_test_embedder_identity())
+        }
+    }
+
+    #[test]
+    fn timeline_identity_uses_clean_turns_instead_of_coarse_transcript_segments() {
+        let timeline = SpeakerTimeline {
+            turns: vec![
+                SpeakerTurn {
+                    range: TimeRange::new(0.0, 8.0),
+                    speaker: SpeakerId(0),
+                    overlap: false,
+                },
+                SpeakerTurn {
+                    range: TimeRange::new(8.0, 12.0),
+                    speaker: SpeakerId(0),
+                    overlap: true,
+                },
+                SpeakerTurn {
+                    range: TimeRange::new(8.0, 12.0),
+                    speaker: SpeakerId(1),
+                    overlap: true,
+                },
+                SpeakerTurn {
+                    range: TimeRange::new(12.0, 20.0),
+                    speaker: SpeakerId(1),
+                    overlap: false,
+                },
+            ],
+            centroids: Vec::new(),
+        };
+        let mut samples = vec![1.0_f32; 20 * EMBEDDER_SAMPLE_RATE_HZ];
+        samples[10 * EMBEDDER_SAMPLE_RATE_HZ..].fill(-1.0);
+        let embedder = SignedVoiceEmbedder;
+        let identity = embedder.identity().expect("test embedder identity");
+        let matcher = super::super::PersonMatcher::new(
+            super::super::EmbeddingSpace::for_active_embedder(
+                &identity,
+                embedder.calibration_profile(),
+            ),
+            Vec::new(),
+            0.5,
+            0.15,
+        );
+
+        let resolution =
+            resolve_timeline_identities_with_matcher(&embedder, &timeline, &samples, &matcher)
+                .expect("timeline identity resolution");
+
+        assert_eq!(resolution.assignments.len(), 2);
+        assert_eq!(resolution.unnamed_speakers.len(), 2);
+        assert!(resolution.unnamed_speakers.iter().all(|speaker| matches!(
+            speaker.reason,
+            SpeakerNamingRefusal::NoMatchInLibrary {
+                library_empty: true,
+                ..
+            }
+        )));
     }
 
     fn one_voice_or_marked_too_short(

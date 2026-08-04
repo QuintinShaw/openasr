@@ -64,6 +64,22 @@ pub struct SpeakerTurn {
     pub overlap: bool,
 }
 
+/// The recording-local source of truth for speaker structure.
+///
+/// A segmenter adapter owns producing this timeline. Transcript attribution and
+/// Voice ID consume it independently: attribution projects text onto `turns`,
+/// while identity gathers clean audio evidence from those same turns. Neither
+/// consumer is allowed to reconstruct speaker structure from the other's
+/// output.
+#[derive(Debug, Clone, Default)]
+pub struct SpeakerTimeline {
+    pub turns: Vec<SpeakerTurn>,
+    /// Clustering centroids retained for diagnostics and downstream adapters.
+    /// Enrolled-person matching deliberately gathers its own fixed-window
+    /// evidence from `turns`; these centroids are not naming evidence.
+    pub centroids: Vec<(SpeakerId, SpeakerEmbedding)>,
+}
+
 /// An L2-normalized speaker embedding. The dimension is model-dependent and read
 /// at runtime from the pack (ReDimNet2-B6 = 192).
 #[derive(Debug, Clone, PartialEq)]

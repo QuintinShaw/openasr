@@ -57,9 +57,7 @@ use crate::models::firered_punc::policy_runtime::{FireRedPuncActor, load_actor, 
 #[cfg(test)]
 use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
-use crate::models::qwen::{
-    ForcedAlignItem, forced_aligner_pack, refine_word_timestamps_with_forced_aligner,
-};
+use crate::models::qwen::{ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_pack};
 use crate::models::{
     aux_pack_registry::AuxPackKind,
     pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
@@ -672,7 +670,11 @@ fn slice_pipeline_explicit_width() -> Option<usize> {
 /// Requested concurrent slice-pipeline width for one run, gated on that run's
 /// normalized effective prompt-carry state ([`longform_prompt_carry_mode`],
 /// which already folds the request option and the family's decode policy
-/// together -- deliberately not a per-family list).
+/// together -- deliberately not a per-family list). The provider gate in
+/// [`effective_slice_pipeline_width`] then keeps the automatic concurrent path
+/// on independently addressable discrete-GPU lanes; CPU and unified-memory
+/// Metal already saturate their shared compute/memory domain inside one decode
+/// and default to serial slices.
 ///
 /// - Carry `Disabled`: the serial loop threads no cross-slice prompt anyway,
 ///   so the carry-light concurrent path is transcript-equivalent (proven
@@ -740,6 +742,29 @@ fn slice_pipeline_per_worker_bytes(runtime_preflight: &GgufRuntimeSourcePrefligh
     pack_bytes.max(SLICE_PIPELINE_PER_WORKER_BYTES_FLOOR)
 }
 
+/// Automatic slice concurrency is only enabled for independently addressable
+/// discrete-GPU providers. CPU workers compete for the same cores, while ggml
+/// Metal already uses command-buffer concurrency and every extra slice creates
+/// another large runtime in the same unified-memory domain. On both routes the
+/// observed result is higher RSS without a latency win, and cold candidates can
+/// also make each other fall back. CUDA/HIP/Vulkan retain the bubble-filling
+/// path. An explicit `OPENASR_SLICE_PIPELINE_WIDTH` remains an operator escape
+/// hatch and bypasses this default provider cap.
+fn slice_pipeline_default_provider_width(
+    requested_width: usize,
+    provider: crate::ExecutionProvider,
+) -> usize {
+    match provider {
+        crate::ExecutionProvider::Cuda
+        | crate::ExecutionProvider::Hip
+        | crate::ExecutionProvider::Vulkan => requested_width,
+        crate::ExecutionProvider::Cpu
+        | crate::ExecutionProvider::Metal
+        | crate::ExecutionProvider::Accelerator
+        | crate::ExecutionProvider::Unknown => 1,
+    }
+}
+
 /// Concurrent-width decision wired to the live host: caps `requested_width` by
 /// swap-aware available memory ([`crate::host::host_available_memory_bytes`], the
 /// capacity source) against the conservative per-worker estimate, and by the
@@ -751,7 +776,22 @@ fn effective_slice_pipeline_width(
     requested_width: usize,
     slices: &[crate::longform::AudioSlice],
     runtime_preflight: &GgufRuntimeSourcePreflight,
+    execution_plan: &ExecutionPlan,
 ) -> usize {
+    let requested_width = if slice_pipeline_explicit_width().is_some() {
+        requested_width
+    } else {
+        execution_plan
+            .candidates()
+            .first()
+            .map(|candidate| {
+                slice_pipeline_default_provider_width(
+                    requested_width,
+                    candidate.device.route.provider,
+                )
+            })
+            .unwrap_or(1)
+    };
     if requested_width <= 1 || slices.len() <= 1 {
         return 1;
     }
@@ -1112,15 +1152,35 @@ struct NativeTranscriptionOutcome {
     transcription: Transcription,
     prepared_audio: PcmBuffer,
     emits_punctuation: Option<bool>,
+    speaker_finalization: SpeakerFinalizationContext,
 }
 
-/// Entry point for the native backend: runs the ordinary decode/longform/
-/// diarization pipeline unchanged (`run_native_transcription_impl`), then --
+struct SpeakerFinalizationContext {
+    attribution: SpeakerAttribution,
+    embedder: Option<Arc<dyn crate::diarize::embed::SpeakerEmbedder>>,
+    plan: SpeakerPlan,
+    scope_by_segment: Vec<Option<usize>>,
+    strip_forced_word_timestamps: bool,
+}
+
+impl SpeakerFinalizationContext {
+    fn requires_word_alignment(&self, transcription: &Transcription) -> bool {
+        self.plan == SpeakerPlan::External
+            && crate::diarize::attribution::requires_word_alignment(
+                &self.attribution.timeline.turns,
+                &transcription.segments,
+            )
+    }
+}
+
+/// Entry point for the native backend: prepares the ordinary decode/longform
+/// result (`run_native_transcription_impl`), then --
 /// gated on the resolved model's `emits_punctuation` capability and the
 /// request's `punctuate` opt-out -- restores punctuation with the installed
 /// FireRedPunc capability pack, then -- only when the request opted into
-/// `--word-timestamps=aligned` (`word_timestamps_refine`) -- refines the
-/// finished transcript's per-word timestamps with the installed
+/// `--word-timestamps=aligned` (`word_timestamps_refine`), or when external
+/// speaker attribution discovers a coarse multi-speaker segment -- refines
+/// the finished transcript's per-word timestamps with the installed
 /// Qwen3-ForcedAligner-0.6B capability pack. Kept as a thin wrapper rather
 /// than threading either post-process into the (already long) decode/longform
 /// function: both re-read only the finished transcript (the aligner also
@@ -1275,6 +1335,7 @@ fn run_native_transcription_fallible_with_input(
     let _progress = ProgressRegistryHandle::new(execution_context.request_id.clone());
     let language_hint = request.language.clone();
     let punctuate = request.punctuate;
+    let explicit_refine = request.word_timestamps_refine;
     // Every independent native model stage resolves from this same immutable
     // product intent. Each stage still owns its own capability matrix and
     // candidate transaction; no auxiliary model inherits a coarse backend or
@@ -1286,7 +1347,8 @@ fn run_native_transcription_fallible_with_input(
     // audio prep (see the `audio_prep` stage logged inside `_impl` around the
     // WAV load) + decode/longform-assembly, i.e. the whole
     // `run_native_transcription_impl` call; "postprocess" covers the
-    // optional punctuation-restoration and forced-align refine stages below.
+    // punctuation-restoration and explicit-or-speaker-required forced-align
+    // stages below.
     // Grain matches what the task asked for (per-request, not per-frame); the
     // finer `audio_prep` sub-stage nests inside `inference`'s span rather than
     // being disjoint from it, which is called out in both log lines' names.
@@ -1295,6 +1357,7 @@ fn run_native_transcription_fallible_with_input(
         transcription,
         prepared_audio,
         emits_punctuation,
+        speaker_finalization,
     } = run_native_transcription_impl(
         request,
         execution_services,
@@ -1317,7 +1380,17 @@ fn run_native_transcription_fallible_with_input(
         execution_services,
         &request_execution_intent,
     )?;
-    let result = if refine {
+    let refine = explicit_refine || speaker_finalization.requires_word_alignment(&transcription);
+    let transcription = if refine {
+        // Forced alignment is a separate heavyweight model phase. The
+        // finished transcript and normalized PCM are the complete boundary
+        // contract, so primary-ASR and earlier auxiliary runtimes are idle and
+        // must not retain their admitted host/device commitments while the
+        // aligner quotes its graph. This is especially important on unified
+        // memory machines, where otherwise two independently valid models can
+        // never coexist inside the physical headroom even though their phases
+        // are strictly sequential.
+        execution_services.unload_idle_native_model_runtime_caches();
         publish_align_progress(execution_context.request_id.as_deref());
         refine_transcription_word_timestamps_with_forced_aligner_policy(
             transcription,
@@ -1326,10 +1399,15 @@ fn run_native_transcription_fallible_with_input(
             language_hint.as_deref(),
             execution_services,
             &request_execution_intent,
-        )
+        )?
     } else {
-        Ok(transcription)
+        transcription
     };
+    let result = finalize_native_transcription(
+        transcription,
+        &speaker_finalization,
+        prepared_audio.as_slice(),
+    );
     crate::stage_timing::log_stage(
         "native_transcribe",
         "postprocess",
@@ -1545,12 +1623,11 @@ fn resolve_prepared_audio_samples(
 }
 
 /// Reuses the exact normalized PCM backing decoded by the main request and
-/// calls the installed Qwen3-ForcedAligner pack once over the whole finished
-/// transcript, then reassigns each segment's `words`
-/// from the aligner's own per-word spans (dropping the family's approximate
-/// per-word confidence -- the aligner does not produce one; never inventing a
-/// value is preferred to fabricating one). Segments/text/speaker attribution
-/// from the ordinary decode path are left untouched; only `words` changes.
+/// loads the installed Qwen3-ForcedAligner pack once. Each already-bounded ASR
+/// segment is aligned independently, then its local spans are mapped back to
+/// the recording clock. This keeps graph memory bounded by the largest decode
+/// segment instead of growing with the whole meeting. Segment text and speaker
+/// attribution are left untouched; only `words` changes.
 fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     transcription: Transcription,
     prepared_audio: PcmSlice,
@@ -1580,22 +1657,73 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             )
             .backend();
-            let items = refine_word_timestamps_with_forced_aligner(
-                &pack_path,
-                prepared_audio.clone(),
-                &transcription.text,
-                &language,
-                backend,
-            )
-            .map_err(|error| BackendError::WordTimestampAlignmentFailed {
-                reason: error.to_string(),
+            let session = Qwen3ForcedAlignerSession::load(&pack_path, backend).map_err(|error| {
+                BackendError::WordTimestampAlignmentFailed {
+                    reason: error.to_string(),
+                }
             })?;
             let mut refined = transcription.clone();
-            assign_aligned_words_to_segments(&mut refined.segments, &items);
+            let audio_samples = prepared_audio.as_slice().len();
+            for (index, segment) in refined.segments.iter_mut().enumerate() {
+                if segment.text.trim().is_empty() {
+                    continue;
+                }
+                let range = forced_alignment_segment_sample_range(segment, audio_samples)
+                    .ok_or_else(|| BackendError::WordTimestampAlignmentFailed {
+                        reason: format!(
+                            "segment {index} has no valid audio span for non-empty text: start={} end={}",
+                            segment.start, segment.end
+                        ),
+                    })?;
+                let items = session
+                    .align(
+                        prepared_audio.slice(range),
+                        &segment.text,
+                        &language,
+                    )
+                    .map_err(|error| BackendError::WordTimestampAlignmentFailed {
+                        reason: format!("segment {index}: {error}"),
+                    })?;
+                assign_local_aligned_words(segment, &items);
+            }
             Ok(refined)
         },
     )
     .map_err(required_auxiliary_stage_error)
+}
+
+fn forced_alignment_segment_sample_range(
+    segment: &Segment,
+    audio_samples: usize,
+) -> Option<std::ops::Range<usize>> {
+    let start_s = f64::from(segment.start).max(0.0);
+    let end_s = f64::from(segment.end).max(start_s);
+    let start = ((start_s * 16_000.0).floor() as usize).min(audio_samples);
+    let end = ((end_s * 16_000.0).ceil() as usize).min(audio_samples);
+    (start < end).then_some(start..end)
+}
+
+fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) {
+    if items.is_empty() {
+        return;
+    }
+    let offset = f64::from(segment.start);
+    let segment_end = f64::from(segment.end);
+    segment.words = items
+        .iter()
+        .map(|item| {
+            let start = (offset + item.start_time_s).clamp(offset, segment_end);
+            let end = (offset + item.end_time_s)
+                .clamp(start, segment_end)
+                .max(start);
+            WordTimestamp {
+                word: item.text.clone(),
+                start: start as f32,
+                end: end as f32,
+                confidence: None,
+            }
+        })
+        .collect();
 }
 
 /// Distributes forced-aligner word spans onto the (time-ordered,
@@ -1605,6 +1733,7 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
 /// well-formed decode). A segment with no aligned words keeps its prior
 /// (family-approximate) word list rather than being emptied -- most often
 /// because there is exactly one segment and the whole item list lands in it.
+#[cfg(test)]
 fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAlignItem]) {
     if segments.is_empty() || items.is_empty() {
         return;
@@ -1877,7 +2006,9 @@ fn run_native_transcription_impl(
     } else {
         None
     };
-    let voice_id_embedder = speaker_runtime.as_ref().map(|runtime| runtime.embedder());
+    let voice_id_embedder = speaker_runtime
+        .as_ref()
+        .map(|runtime| runtime.shared_embedder());
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
     let voice_id_audio = voice_id_audio_view(&prepared_audio, speaker_plan);
@@ -1901,12 +2032,25 @@ fn run_native_transcription_impl(
                 .as_ref()
                 .expect("external speaker plan retains a Voice ID PCM view")
                 .clone(),
+            voice_id_embedder
+                .as_deref()
+                .expect("external speaker plan has a resolved embedder"),
             hint,
             &execution_context,
         )?
     } else {
         SpeakerAttribution::default()
     };
+    // External attribution is pure data at this point: both the timeline and
+    // enrolled-person assignments have been copied out of the auxiliary
+    // runtimes. Do not retain the segmenter/ReDimNet candidate leases while
+    // the primary ASR candidate is admitted. In-decoder identity still needs
+    // the shared embedder after decode, so only that plan carries it forward.
+    let voice_id_embedder = (speaker_plan == SpeakerPlan::InDecoder)
+        .then_some(voice_id_embedder)
+        .flatten();
+    drop(external_diarizer);
+    drop(speaker_runtime);
     let dispatch = execution_services.offline_dispatch();
     let longform_resolution = resolve_native_longform_policy(
         request.longform.as_ref(),
@@ -2091,6 +2235,13 @@ fn run_native_transcription_impl(
                 },
                 prepared_audio,
                 emits_punctuation,
+                speaker_finalization: SpeakerFinalizationContext {
+                    attribution: speaker_turns,
+                    embedder: voice_id_embedder,
+                    plan: speaker_plan,
+                    scope_by_segment: Vec::new(),
+                    strip_forced_word_timestamps,
+                },
             });
         }
         if has_processed_audio || plan.slices.len() > 1 {
@@ -2117,7 +2268,10 @@ fn run_native_transcription_impl(
             // bar from the outer wrapper; the run-scoped handle removes this
             // request's registry entry on any exit. `word_timestamps_refine`
             // reserves headroom for that phase.
-            let with_align = request.word_timestamps_refine;
+            let with_align = request.word_timestamps_refine
+                || (external_speakers
+                    && selected_family.word_timestamp_source
+                        == crate::arch::WordTimestampSource::ForcedAligner);
             let total_decode_samples: u64 = plan
                 .slices
                 .iter()
@@ -2162,6 +2316,7 @@ fn run_native_transcription_impl(
                 slice_pipeline_requested_width(carry_prompt_mode),
                 &plan.slices,
                 runtime_preflight,
+                &execution_plan,
             );
             if pipeline_width > 1 {
                 let carry_note = if carry_prompt_mode == LongformPromptCarryMode::Disabled {
@@ -2419,42 +2574,44 @@ fn run_native_transcription_impl(
                     })
                     .into_iter()
                     .collect();
-                let transcription = finalize_native_transcription(
+                let transcription = prepare_native_transcription(
                     fallback.into_transcription(),
                     audio_duration_seconds,
                     Some(run_metadata),
-                    &speaker_turns,
-                    voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
-                    voice_id_embedder,
-                    speaker_plan,
-                    &[],
-                    strip_forced_word_timestamps,
                     reported_language.clone(),
                     fallback_truncated_decodes,
-                )?;
+                );
                 return Ok(NativeTranscriptionOutcome {
                     transcription,
                     prepared_audio,
                     emits_punctuation,
+                    speaker_finalization: SpeakerFinalizationContext {
+                        attribution: speaker_turns,
+                        embedder: voice_id_embedder,
+                        plan: speaker_plan,
+                        scope_by_segment: Vec::new(),
+                        strip_forced_word_timestamps,
+                    },
                 });
             }
-            let transcription = finalize_native_transcription(
+            let transcription = prepare_native_transcription(
                 assembled,
                 audio_duration_seconds,
                 Some(run_metadata),
-                &speaker_turns,
-                voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
-                voice_id_embedder,
-                speaker_plan,
-                &speaker_scope_by_segment,
-                strip_forced_word_timestamps,
                 reported_language.clone(),
                 truncated_decodes,
-            )?;
+            );
             return Ok(NativeTranscriptionOutcome {
                 transcription,
                 prepared_audio,
                 emits_punctuation,
+                speaker_finalization: SpeakerFinalizationContext {
+                    attribution: speaker_turns,
+                    embedder: voice_id_embedder,
+                    plan: speaker_plan,
+                    scope_by_segment: speaker_scope_by_segment,
+                    strip_forced_word_timestamps,
+                },
             });
         }
         longform_metadata = Some(build_longform_metadata(
@@ -2481,7 +2638,10 @@ fn run_native_transcription_impl(
     let single_pass_decode_progress = DecodeProgress::begin(
         execution_context.request_id.clone(),
         single_pass_total_samples,
-        request.word_timestamps_refine,
+        request.word_timestamps_refine
+            || (external_speakers
+                && selected_family.word_timestamp_source
+                    == crate::arch::WordTimestampSource::ForcedAligner),
     );
     let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_policy(
         dispatch,
@@ -2522,23 +2682,24 @@ fn run_native_transcription_impl(
             truncation,
         });
     }
-    let transcription = finalize_native_transcription(
+    let transcription = prepare_native_transcription(
         transcription.into_transcription(),
         audio_duration_seconds,
         longform_metadata,
-        &speaker_turns,
-        voice_id_audio.as_ref().map_or(&[], PcmSlice::as_slice),
-        voice_id_embedder,
-        speaker_plan,
-        &[],
-        strip_forced_word_timestamps,
         reported_language,
         truncated_decodes,
-    )?;
+    );
     Ok(NativeTranscriptionOutcome {
         transcription,
         prepared_audio,
         emits_punctuation,
+        speaker_finalization: SpeakerFinalizationContext {
+            attribution: speaker_turns,
+            embedder: voice_id_embedder,
+            plan: speaker_plan,
+            scope_by_segment: Vec::new(),
+            strip_forced_word_timestamps,
+        },
     })
 }
 
@@ -2585,40 +2746,41 @@ fn format_truncation_anchor(truncation: &DecodeTruncation) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// Finalize a decoded transcription for return from
-/// `run_native_transcription_impl`: normalize segment timing/text (dropping
-/// empty segments, filling a fallback span from the request-level audio
-/// duration), stamp the longform metadata, attribute recording-level turns,
-/// resolve identity while exact decode-scope provenance is still aligned,
-/// re-segment presentation cues, and stamp the reported source language -- in
-/// that fixed order. Every exit path of `run_native_transcription_impl` (the longform
-/// all-silent fallback, the longform assembled result, and the short-form /
-/// single-slice result) funnels through this single function so the order and
-/// parameters of the chain cannot drift between paths; only the decoded
-/// `Transcription` body and its longform metadata differ per call site. See
-/// the `C1` pipeline-split roadmap: this collapses what were three
-/// byte-for-byte-identical call chains into one.
-fn finalize_native_transcription(
+/// Normalize decode output before transcript-aware post-processing. Punctuation
+/// and forced alignment need stable segment clocks and the reported language,
+/// but speaker attribution must wait until both have finished.
+fn prepare_native_transcription(
     transcription: Transcription,
     audio_duration_seconds: f32,
     longform_metadata: Option<TranscriptionLongFormMetadata>,
-    speaker_turns: &SpeakerAttribution,
-    prepared_audio: &[f32],
-    voice_id_embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
-    speaker_plan: SpeakerPlan,
-    speaker_scope_by_segment: &[Option<usize>],
-    strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
     truncated_decodes: Vec<TruncatedDecode>,
-) -> Result<Transcription, BackendError> {
+) -> Transcription {
     let mut transcription = with_longform_metadata(
         normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
         longform_metadata,
     );
-    if speaker_plan == SpeakerPlan::External {
-        transcription = apply_speaker_attribution(transcription, speaker_turns);
+    debug_assert!(
+        transcription.truncated_decodes.is_empty(),
+        "prepare_native_transcription overwrites truncated_decodes; the incoming transcription must not already carry any"
+    );
+    transcription.truncated_decodes = truncated_decodes;
+    with_reported_language(transcription, reported_language)
+}
+
+/// Complete speaker attribution and identity only after punctuation and any
+/// required word alignment have run. This ordering is the contract: external
+/// timelines may require word anchors to project a coarse ASR segment without
+/// losing speaker turns.
+fn finalize_native_transcription(
+    mut transcription: Transcription,
+    speaker: &SpeakerFinalizationContext,
+    prepared_audio: &[f32],
+) -> Result<Transcription, BackendError> {
+    if speaker.plan == SpeakerPlan::External {
+        transcription = apply_speaker_attribution(transcription, &speaker.attribution)?;
     }
-    match speaker_plan {
+    match speaker.plan {
         SpeakerPlan::InDecoder => {
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
@@ -2626,12 +2788,16 @@ fn finalize_native_transcription(
             // people.
             let mut scopes = speaker_scopes_by_provenance(
                 &mut transcription.segments,
-                speaker_scope_by_segment,
+                &speaker.scope_by_segment,
                 prepared_audio,
             )?;
-            let embedder = voice_id_embedder.ok_or(BackendError::VoiceIdIdentityFailed(
-                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
-            ))?;
+            let embedder =
+                speaker
+                    .embedder
+                    .as_deref()
+                    .ok_or(BackendError::VoiceIdIdentityFailed(
+                        crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
+                    ))?;
             transcription.unnamed_speakers =
                 crate::diarize::voice_id::name_speakers_across_scopes_with_embedder(
                     embedder,
@@ -2640,20 +2806,11 @@ fn finalize_native_transcription(
                 .map_err(speaker_identity_error_to_backend)?;
         }
         SpeakerPlan::External => {
-            // External segmentation has already been normalized to the same
-            // recording-local labels. Naming deliberately runs through the
-            // identical evidence/purity/matcher policy as in-decoder models;
-            // clustering centroids are not trusted as identity evidence.
-            let embedder = voice_id_embedder.ok_or(BackendError::VoiceIdIdentityFailed(
-                crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
-            ))?;
-            transcription.unnamed_speakers =
-                crate::diarize::voice_id::name_speakers_from_labeled_segments_with_embedder(
-                    embedder,
-                    &mut transcription.segments,
-                    prepared_audio,
-                )
-                .map_err(speaker_identity_error_to_backend)?;
+            // External identity was resolved directly from the canonical
+            // speaker timeline before ASR attribution. Never rebuild its audio
+            // evidence from transcript segments: coarse ASR segments can span
+            // several speakers even when the timeline is correct.
+            transcription.unnamed_speakers = speaker.attribution.unnamed_speakers.clone();
         }
         SpeakerPlan::Off => {
             transcription.unnamed_speakers.clear();
@@ -2665,29 +2822,12 @@ fn finalize_native_transcription(
     // their decode-scope provenance. Cue splitting copies the resolved speaker
     // identity fields onto every child afterwards.
     transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
-    if strip_forced_word_timestamps {
+    if speaker.strip_forced_word_timestamps {
         for segment in &mut transcription.segments {
             segment.words.clear();
         }
     }
-    // Stamped after the body is assembled and before the transcript leaves the
-    // engine, on every exit path: the per-decode results this run consumed are
-    // gone by now, so this is the last point at which "the transcript is short"
-    // is still knowable.
-    //
-    // This is an overwrite, not a merge, so it silently clobbers anything a
-    // caller already set on `transcription.truncated_decodes` before handing
-    // it here. Every call site is expected to pass that field in empty and
-    // supply the real list via the `truncated_decodes` parameter instead --
-    // catch a caller that drifts from that contract before it loses truncation
-    // visibility outright.
-    debug_assert!(
-        transcription.truncated_decodes.is_empty(),
-        "finalize_native_transcription overwrites truncated_decodes; \
-         the incoming transcription must not already carry any"
-    );
-    transcription.truncated_decodes = truncated_decodes;
-    Ok(with_reported_language(transcription, reported_language))
+    Ok(transcription)
 }
 
 /// Cut time-ordered segments into the exact decode scopes that produced them.
@@ -2779,20 +2919,25 @@ fn with_reported_language(
 }
 
 /// Recording-local speaker turns normalized from the selected segmentation
-/// source. Enrolled-person matching happens later in the one shared Voice ID
-/// evidence stage, after these turns have been reconciled with ASR segments.
+/// source plus identities resolved directly from clean timeline windows.
 #[derive(Default)]
 struct SpeakerAttribution {
-    turns: Vec<crate::diarize::contract::SpeakerTurn>,
+    timeline: crate::diarize::contract::SpeakerTimeline,
+    identities: BTreeMap<
+        crate::diarize::contract::SpeakerId,
+        crate::diarize::enrollment::SpeakerDisplayAssignment,
+    >,
+    unnamed_speakers: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
 }
 
 /// Diarize the prepared audio into recording-local speaker turns, then match
-/// the optional enrolled primary user. All external protocol details stay
+/// enrolled people from those turns. All external protocol details stay
 /// behind `ExternalDiarizer`; this layer only consumes normalized turns and
 /// centroids.
 fn compute_speaker_attribution(
     diarizer: &crate::diarize::external::ExternalDiarizer,
     samples: PcmSlice,
+    embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     hint: crate::diarize::contract::DiarizeHint,
     execution_context: &crate::RequestExecutionContext,
 ) -> Result<SpeakerAttribution, BackendError> {
@@ -2800,8 +2945,10 @@ fn compute_speaker_attribution(
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
-    let diarization = diarizer
-        .diarize(samples, 16_000, hint, &|| execution_context.is_canceled())
+    let timeline = diarizer
+        .diarize(samples.clone(), 16_000, hint, &|| {
+            execution_context.is_canceled()
+        })
         .map_err(external_diarization_error_to_backend)?;
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
@@ -2809,10 +2956,10 @@ fn compute_speaker_attribution(
     if diarize_debug {
         eprintln!(
             "openasr_diarize_debug stage=batch turns={} speakers={}",
-            diarization.turns.len(),
-            diarization.centroids.len()
+            timeline.turns.len(),
+            timeline.centroids.len()
         );
-        for turn in &diarization.turns {
+        for turn in &timeline.turns {
             eprintln!(
                 "openasr_diarize_debug stage=batch turn start={:.2} end={:.2} speaker={} overlap={}",
                 turn.range.start_s,
@@ -2822,8 +2969,16 @@ fn compute_speaker_attribution(
             );
         }
     }
+    let identity = crate::diarize::voice_id::resolve_timeline_identities_with_embedder(
+        embedder,
+        &timeline,
+        samples.as_slice(),
+    )
+    .map_err(speaker_identity_error_to_backend)?;
     Ok(SpeakerAttribution {
-        turns: diarization.turns,
+        timeline,
+        identities: identity.assignments,
+        unnamed_speakers: identity.unnamed_speakers,
     })
 }
 
@@ -2866,16 +3021,18 @@ fn speaker_identity_error_to_backend(
 fn apply_speaker_attribution(
     mut transcription: Transcription,
     attribution: &SpeakerAttribution,
-) -> Transcription {
-    if !attribution.turns.is_empty() {
-        let identities = BTreeMap::new();
+) -> Result<Transcription, BackendError> {
+    if !attribution.timeline.turns.is_empty() {
         transcription.segments = crate::diarize::attribution::assign_speakers(
-            &attribution.turns,
+            &attribution.timeline.turns,
             std::mem::take(&mut transcription.segments),
-            &identities,
-        );
+            &attribution.identities,
+        )
+        .map_err(|error| BackendError::WordTimestampAlignmentFailed {
+            reason: error.to_string(),
+        })?;
     }
-    transcription
+    Ok(transcription)
 }
 
 /// Resolve the long-form VAD provider for this request, returning the
@@ -6179,6 +6336,36 @@ mod tests {
     }
 
     #[test]
+    fn forced_alignment_uses_each_decode_segments_bounded_pcm_view() {
+        let first = segment(0.0, 30.0, "first");
+        let second = segment(30.0, 59.71, "second");
+        let audio_samples = 955_360;
+
+        assert_eq!(
+            forced_alignment_segment_sample_range(&first, audio_samples),
+            Some(0..480_000)
+        );
+        assert_eq!(
+            forced_alignment_segment_sample_range(&second, audio_samples),
+            Some(480_000..955_360)
+        );
+    }
+
+    #[test]
+    fn local_forced_alignment_is_mapped_back_to_the_recording_clock() {
+        let mut target = segment(30.0, 32.0, "hello world");
+        let items = vec![item("hello", 0.1, 0.4), item("world", 0.5, 2.4)];
+
+        assign_local_aligned_words(&mut target, &items);
+
+        assert_eq!(target.words.len(), 2);
+        assert_eq!(target.words[0].start, 30.1);
+        assert_eq!(target.words[0].end, 30.4);
+        assert_eq!(target.words[1].start, 30.5);
+        assert_eq!(target.words[1].end, 32.0);
+    }
+
+    #[test]
     fn should_run_punctuation_stage_requires_both_opt_in_and_unpunctuated_capability() {
         // The stage only runs when the request has not opted out AND the
         // model's capability is honestly `Some(false)` -- an unknown or
@@ -6590,6 +6777,25 @@ mod tests {
             slice_pipeline_capped_width(1, 8, Some(64 << 30), 1 << 20, 0),
             1
         );
+    }
+
+    #[test]
+    fn automatic_slice_concurrency_is_limited_to_discrete_gpu_providers() {
+        for provider in [
+            crate::ExecutionProvider::Cuda,
+            crate::ExecutionProvider::Hip,
+            crate::ExecutionProvider::Vulkan,
+        ] {
+            assert_eq!(slice_pipeline_default_provider_width(4, provider), 4);
+        }
+        for provider in [
+            crate::ExecutionProvider::Cpu,
+            crate::ExecutionProvider::Metal,
+            crate::ExecutionProvider::Accelerator,
+            crate::ExecutionProvider::Unknown,
+        ] {
+            assert_eq!(slice_pipeline_default_provider_width(4, provider), 1);
+        }
     }
 
     #[test]

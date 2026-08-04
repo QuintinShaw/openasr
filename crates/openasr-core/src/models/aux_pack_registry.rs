@@ -312,7 +312,13 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         kind: AuxPackKind::ForcedAlignment,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
             capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
-            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+            // The NAR prefill graph is both large and short-lived. On the
+            // measured Apple M1 path Metal repeatedly constructs contexts and
+            // is terminated by system memory pressure even with the Q4_K pack;
+            // CPU completes the same segmented alignment deterministically.
+            // Keep explicit device requests truthful and retain acceleration
+            // on discrete-GPU backends, but make Auto safe on Apple Silicon.
+            auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         quantization_classification:
@@ -436,6 +442,20 @@ mod tests {
                 descriptor.architecture_id
             );
         }
+    }
+
+    #[test]
+    fn forced_aligner_auto_avoids_metal_without_disabling_other_accelerators() {
+        let policy = auxiliary_execution_policy(
+            crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        );
+        assert!(matches!(
+            policy,
+            Some(AuxiliaryExecutionPolicy::RequestScoped {
+                auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
+                ..
+            })
+        ));
     }
 
     #[test]

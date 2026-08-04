@@ -118,7 +118,7 @@
 use std::collections::BTreeMap;
 
 use crate::Segment;
-use crate::diarize::contract::{DiarizeHint, SpeakerEmbedding, TimeRange};
+use crate::diarize::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
 
 /// Length of one embedding window.
 ///
@@ -249,24 +249,55 @@ pub(super) struct JudgedWindows {
 /// as handed in, so how finely the transcript happens to be cut cannot change
 /// how much evidence a voice is credited with.
 pub(super) fn plan_label_windows(segments: &[Segment]) -> BTreeMap<String, Vec<TimeRange>> {
-    let mut ordered: Vec<(&str, TimeRange)> = segments
+    let spans = segments
         .iter()
         .filter_map(|segment| {
-            let label = segment.speaker_label.as_deref()?;
+            let label = segment.speaker_label.clone()?;
             let range = TimeRange::new(
                 f64::from(segment.start).max(0.0),
                 f64::from(segment.end)
                     .max(f64::from(segment.start))
                     .max(0.0),
             );
-            Some((label, range))
+            Some(LabeledSpan {
+                label,
+                range,
+                evidence_eligible: true,
+            })
         })
         .collect();
-    ordered.sort_by(|a, b| a.1.start_s.total_cmp(&b.1.start_s));
+    plan_windows(spans)
+}
 
-    let mut planned: BTreeMap<String, Vec<TimeRange>> = BTreeMap::new();
+/// Fixed-window Voice ID evidence planned directly from the canonical speaker
+/// timeline. Overlap-marked turns remain in the contamination mask but never
+/// seed windows of their own.
+pub(super) fn plan_timeline_windows(turns: &[SpeakerTurn]) -> BTreeMap<SpeakerId, Vec<TimeRange>> {
+    plan_windows(
+        turns
+            .iter()
+            .map(|turn| LabeledSpan {
+                label: turn.speaker,
+                range: turn.range,
+                evidence_eligible: !turn.overlap,
+            })
+            .collect(),
+    )
+}
+
+#[derive(Clone)]
+struct LabeledSpan<K> {
+    label: K,
+    range: TimeRange,
+    evidence_eligible: bool,
+}
+
+fn plan_windows<K: Clone + Ord>(mut ordered: Vec<LabeledSpan<K>>) -> BTreeMap<K, Vec<TimeRange>> {
+    ordered.sort_by(|a, b| a.range.start_s.total_cmp(&b.range.start_s));
+
+    let mut planned: BTreeMap<K, Vec<TimeRange>> = BTreeMap::new();
     for (label, range) in label_turn_runs(&ordered) {
-        let windows = planned.entry(label.to_string()).or_default();
+        let windows = planned.entry(label.clone()).or_default();
         if windows.len() >= MAX_WINDOWS_PER_LABEL {
             continue;
         }
@@ -275,7 +306,7 @@ pub(super) fn plan_label_windows(segments: &[Segment]) -> BTreeMap<String, Vec<T
         let mut start = first;
         while start + WINDOW_SECONDS <= last + f64::EPSILON {
             let window = TimeRange::new(start, start + WINDOW_SECONDS);
-            if !overlaps_another_label(&window, label, &ordered) {
+            if !overlaps_another_label(&window, &label, &ordered) {
                 windows.push(window);
                 if windows.len() >= MAX_WINDOWS_PER_LABEL {
                     break;
@@ -325,28 +356,34 @@ pub(super) fn plan_label_windows(segments: &[Segment]) -> BTreeMap<String, Vec<T
 /// Bridging a gap cannot pull in another speaker: a window that reaches across
 /// a segment where a different label is active is still rejected by
 /// [`overlaps_another_label`] below, exactly as before.
-fn label_turn_runs<'a>(ordered: &[(&'a str, TimeRange)]) -> Vec<(&'a str, TimeRange)> {
-    let mut open: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut runs: Vec<(&'a str, TimeRange)> = Vec::new();
-    for (label, range) in ordered {
-        match open.get(label).copied() {
-            Some(index) if range.start_s - runs[index].1.end_s <= SEGMENT_EDGE_TRIM_SECONDS => {
-                let end = runs[index].1.end_s.max(range.end_s);
+fn label_turn_runs<K: Clone + Ord>(ordered: &[LabeledSpan<K>]) -> Vec<(K, TimeRange)> {
+    let mut open: BTreeMap<K, usize> = BTreeMap::new();
+    let mut runs: Vec<(K, TimeRange)> = Vec::new();
+    for span in ordered.iter().filter(|span| span.evidence_eligible) {
+        match open.get(&span.label).copied() {
+            Some(index)
+                if span.range.start_s - runs[index].1.end_s <= SEGMENT_EDGE_TRIM_SECONDS =>
+            {
+                let end = runs[index].1.end_s.max(span.range.end_s);
                 runs[index].1 = TimeRange::new(runs[index].1.start_s, end);
             }
             _ => {
-                open.insert(*label, runs.len());
-                runs.push((*label, *range));
+                open.insert(span.label.clone(), runs.len());
+                runs.push((span.label.clone(), span.range));
             }
         }
     }
     runs
 }
 
-fn overlaps_another_label(window: &TimeRange, label: &str, ordered: &[(&str, TimeRange)]) -> bool {
+fn overlaps_another_label<K: Eq>(
+    window: &TimeRange,
+    label: &K,
+    ordered: &[LabeledSpan<K>],
+) -> bool {
     ordered
         .iter()
-        .any(|(other, range)| *other != label && range.overlaps(window))
+        .any(|span| span.label != *label && span.range.overlaps(window))
 }
 
 /// Split a label's window embeddings into the majority voice and a verdict on

@@ -35,8 +35,7 @@ pub use forced_aligner_import::{
     convert_local_qwen_forced_aligner_source_to_runtime_pack,
 };
 pub(crate) use forced_aligner_runtime::{
-    ForcedAlignItem, refine_word_timestamps_with_forced_aligner,
-    validate_forced_aligner_runtime_pack_contract,
+    ForcedAlignItem, Qwen3ForcedAlignerSession, validate_forced_aligner_runtime_pack_contract,
 };
 pub(crate) use frontend::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;

@@ -13,6 +13,8 @@ use std::{
     mem::size_of,
     ops::{Deref, DerefMut},
     sync::Arc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -274,25 +276,53 @@ impl<T> SystemMemoryOwner<T> {
         })?;
         let quoted_peak_bytes = quote.peak_bytes;
         let quoted_retained_bytes = quote.retained_bytes;
-        let mut reservation = broker
-            .try_reserve_batch(vec![DomainReservationRequest {
+        let reservation_cohort = current_memory_reservation_cohort_id();
+        let resource_id = quote.resource_id;
+        let wait_deadline = Instant::now() + Duration::from_secs(30);
+        let mut retry_delay = Duration::from_millis(1);
+        let mut snapshot_before = snapshot_before;
+        let mut reservation = loop {
+            match broker.try_reserve_batch(vec![DomainReservationRequest {
                 domain: MemoryDomainKey::SystemMemory,
                 snapshot: snapshot_before,
-                peak_bytes: quote.peak_bytes,
-                retained_bytes: quote.retained_bytes,
+                peak_bytes: quoted_peak_bytes,
+                retained_bytes: quoted_retained_bytes,
                 // Rust allocator capacity is measured only after construction;
                 // the provisional/exclusive path is what makes reconciliation
                 // safe even when `reserve_exact` rounds upward.
                 requires_reconciliation: true,
-                resource_id: quote.resource_id,
-                cohort_id: current_memory_reservation_cohort_id(),
-            }])
-            .map_err(|error| {
-                let reason = error.to_string();
-                SystemMemoryAllocationTransactionError::Capacity(
-                    SystemMemoryOwnerError::capacity_failure("host_state_admission", reason),
-                )
-            })?;
+                resource_id: resource_id.clone(),
+                cohort_id: reservation_cohort,
+            }]) {
+                Ok(reservation) => break reservation,
+                Err(crate::device::execution_memory::MemoryPlanningError::DeviceDomainBusy {
+                    ..
+                }) if Instant::now() < wait_deadline => {
+                    // A concurrent cold runtime is still measuring its actual
+                    // allocation in this physical domain. That is transient
+                    // serialization imposed by the broker, not evidence that
+                    // this candidate is over capacity. Wait briefly, refresh
+                    // the live snapshot, and retry the same candidate instead
+                    // of spuriously falling back to a different backend.
+                    thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(Duration::from_millis(32));
+                    snapshot_before = observe().map_err(|reason| {
+                        SystemMemoryAllocationTransactionError::Capacity(
+                            SystemMemoryOwnerError::capacity_failure(
+                                "host_state_observe_before",
+                                reason,
+                            ),
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    return Err(SystemMemoryAllocationTransactionError::Capacity(
+                        SystemMemoryOwnerError::capacity_failure("host_state_admission", reason),
+                    ));
+                }
+            }
+        };
 
         let outcome = allocate().map_err(SystemMemoryAllocationTransactionError::Allocation)?;
         validate_outcome(&outcome).map_err(SystemMemoryAllocationTransactionError::Capacity)?;
@@ -532,6 +562,61 @@ mod tests {
         ));
         release_tx.send(()).unwrap();
         allocating.join().unwrap();
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory),
+            DeviceMemoryUsage::default()
+        );
+    }
+
+    #[test]
+    fn concurrent_owner_waits_for_provisional_gate_then_reobserves_and_succeeds() {
+        let broker = test_broker();
+        let allocating_broker = Arc::clone(&broker);
+        let waiting_broker = Arc::clone(&broker);
+        let (pending_tx, pending_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (allocated_tx, allocated_rx) = mpsc::channel();
+
+        let allocating = thread::spawn(move || {
+            let owner = SystemMemoryOwner::try_allocate_with(
+                SystemMemoryAllocationQuote::new("test.wait-first", 64, 64).unwrap(),
+                Some(allocating_broker),
+                true,
+                || Ok(snapshot(256)),
+                move || {
+                    pending_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 64], 64, 64))
+                },
+            )
+            .unwrap();
+            drop(owner);
+        });
+
+        pending_rx.recv().unwrap();
+        let waiting = thread::spawn(move || {
+            let owner = SystemMemoryOwner::try_allocate_with(
+                SystemMemoryAllocationQuote::new("test.wait-second", 64, 64).unwrap(),
+                Some(waiting_broker),
+                true,
+                || Ok(snapshot(256)),
+                || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 64], 64, 64)),
+            )
+            .unwrap();
+            allocated_tx.send(()).unwrap();
+            drop(owner);
+        });
+
+        assert!(matches!(
+            allocated_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        allocated_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the waiting owner should retry after the provisional gate clears");
+        allocating.join().unwrap();
+        waiting.join().unwrap();
         assert_eq!(
             broker.usage(&MemoryDomainKey::SystemMemory),
             DeviceMemoryUsage::default()

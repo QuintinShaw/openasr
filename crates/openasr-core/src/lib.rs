@@ -92,6 +92,12 @@ mod test_process_env;
 pub mod testing;
 pub(crate) mod translation;
 
+/// Whether the optional forced-aligner pack resolves from the explicit
+/// environment override or the installed content-addressed model store.
+pub fn word_timestamp_forced_aligner_available() -> bool {
+    models::qwen::forced_aligner_pack::resolve_forced_aligner_pack_path().is_some()
+}
+
 pub use api::backend::{
     BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
     FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
@@ -363,16 +369,16 @@ pub use registry::{
     CatalogBackend, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
     CatalogCapability, CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror,
     CatalogModel, CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant,
-    CatalogQuantPerf, CatalogQuantRecommendationProfile, CatalogSpeakerSource, LicenseClass,
-    LocalCatalogEnvOverride, ModelAvailability, ModelCard, ModelCatalog,
-    ModelInstallLicenseDecision, ModelRef, ModelResolutionError, ModelVariantMetadata,
-    OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR, RegistryError,
-    ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef,
-    RuntimeModelRefSource, RuntimeModelResolutionError, RuntimeRegistryError, canonical_quant_tag,
-    current_cli_version, default_catalog_cache_path, default_catalog_url, default_registry_dir,
-    embedded_catalog_fingerprint, load_embedded_signed_catalog,
-    load_local_catalog_file_with_identity, load_model_catalog, load_registry,
-    model_cards_from_catalog, model_install_license_decision,
+    CatalogQuantPerf, CatalogQuantRecommendationProfile, CatalogSpeakerSource,
+    CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride, ModelAvailability,
+    ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef, ModelResolutionError,
+    ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR,
+    RegistryError, ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel,
+    ResolvedRuntimeModelRef, RuntimeModelRefSource, RuntimeModelResolutionError,
+    RuntimeRegistryError, canonical_quant_tag, current_cli_version, default_catalog_cache_path,
+    default_catalog_url, default_registry_dir, embedded_catalog_fingerprint,
+    load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
+    load_registry, model_cards_from_catalog, model_install_license_decision,
     model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
     parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
     recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_pull,

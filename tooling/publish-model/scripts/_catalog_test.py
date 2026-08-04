@@ -16,6 +16,7 @@ from _catalog import (
     _check_no_halfwidth_punct_between_cjk,
     apply_catalog_series_defaults,
     apply_speaker_sources_to_catalog,
+    apply_word_timestamp_sources_to_catalog,
     language_labels_wire,
     language_mode_for_model,
     languages_for_model,
@@ -31,6 +32,7 @@ from _catalog import (
     validate_min_core_version,
     validate_recognition_languages,
     validate_upstream_release_date,
+    word_timestamp_source_for_model,
 )
 
 
@@ -748,6 +750,63 @@ class SpeakerSourceForModelTest(unittest.TestCase):
     def test_catalog_wide_refresh_rejects_unknown_id(self) -> None:
         with self.assertRaisesRegex(KeyError, "no models-core.toml source"):
             apply_speaker_sources_to_catalog({"models": [{"id": "unknown"}]}, {})
+
+
+class WordTimestampSourceForModelTest(unittest.TestCase):
+    def test_native_anchor_families_are_declared(self) -> None:
+        for family in ("qwen", "cohere", "whisper", "parakeet-tdt", "xasr-zipformer", "moonshine"):
+            with self.subTest(family=family):
+                self.assertEqual(
+                    word_timestamp_source_for_model({"kind": "asr-model", "family": family}),
+                    {"word_timestamp_source": "native"},
+                )
+
+    def test_forced_aligner_families_are_declared(self) -> None:
+        for family in ("dolphin", "sensevoice", "firered-aed", "firered2-llm", "funasr-nano", "mimo-asr", "moss-transcribe-diarize", "granite-speech"):
+            with self.subTest(family=family):
+                self.assertEqual(
+                    word_timestamp_source_for_model({"kind": "asr-model", "family": family}),
+                    {"word_timestamp_source": "forced_aligner"},
+                )
+
+    def test_non_asr_kinds_omit_word_timestamp_source(self) -> None:
+        self.assertEqual(
+            word_timestamp_source_for_model(
+                {"kind": "capability-pack", "family": "qwen3-forced-aligner"}
+            ),
+            {},
+        )
+
+    def test_catalog_wide_refresh_is_fail_closed(self) -> None:
+        catalog = {
+            "models": [
+                {"id": "qwen"},
+                {"id": "funasr"},
+                {"id": "aligner", "word_timestamp_source": "native"},
+            ]
+        }
+        entries = {
+            "qwen-src": {"registry_id": "qwen", "kind": "asr-model", "family": "qwen"},
+            "funasr-src": {
+                "registry_id": "funasr",
+                "kind": "asr-model",
+                "family": "funasr-nano",
+            },
+            "aligner-src": {
+                "registry_id": "aligner",
+                "kind": "capability-pack",
+                "family": "qwen3-forced-aligner",
+            },
+        }
+        self.assertEqual(apply_word_timestamp_sources_to_catalog(catalog, entries), 3)
+        self.assertEqual(catalog["models"][0]["word_timestamp_source"], "native")
+        self.assertEqual(
+            catalog["models"][1]["word_timestamp_source"], "forced_aligner"
+        )
+        self.assertNotIn("word_timestamp_source", catalog["models"][2])
+
+        with self.assertRaisesRegex(KeyError, "no models-core.toml source"):
+            apply_word_timestamp_sources_to_catalog({"models": [{"id": "unknown"}]}, {})
 
 
 class RecognitionLanguageValidatorTest(unittest.TestCase):

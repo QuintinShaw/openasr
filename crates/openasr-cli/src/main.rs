@@ -307,30 +307,34 @@ async fn run() -> Result<()> {
             longform,
             phrase_bias,
             language_task,
-        } => transcribe(
-            &native_execution_services,
-            TranscribeCommandOptions {
-                inputs: &inputs,
-                formats: &formats,
-                model: model.as_deref(),
-                backend_kind: backend,
-                runtime_paths: RuntimePathOverrides { ffmpeg_bin },
-                diarize,
-                speakers,
-                punctuate: !no_punctuate,
-                word_timestamps_mode: word_timestamps,
-                model_pack: model_pack.as_deref(),
-                adapter: adapter.as_deref(),
-                output: output.as_deref(),
-                continue_on_error,
-                benchmark,
-                longform,
-                phrase_bias,
-                language: normalize_language_hint(language_task.language),
-                task: language_task.task,
-                consent: consent::PullConsent::resolve(yes, offline),
-            },
-        ),
+        } => tokio::task::spawn_blocking(move || {
+            transcribe(
+                &native_execution_services,
+                TranscribeCommandOptions {
+                    inputs: &inputs,
+                    formats: &formats,
+                    model: model.as_deref(),
+                    backend_kind: backend,
+                    runtime_paths: RuntimePathOverrides { ffmpeg_bin },
+                    diarize,
+                    speakers,
+                    punctuate: !no_punctuate,
+                    word_timestamps_mode: word_timestamps,
+                    model_pack: model_pack.as_deref(),
+                    adapter: adapter.as_deref(),
+                    output: output.as_deref(),
+                    continue_on_error,
+                    benchmark,
+                    longform,
+                    phrase_bias,
+                    language: normalize_language_hint(language_task.language),
+                    task: language_task.task,
+                    consent: consent::PullConsent::resolve(yes, offline),
+                },
+            )
+        })
+        .await
+        .context("openasr transcribe worker task failed")?,
         Command::Apikey { command } => apikey_command(command),
         Command::BenchSuite {
             config,
@@ -1169,6 +1173,7 @@ fn transcribe(
         prepared_run.backend_kind,
         prepared_run.model_source.model_pack_path.as_deref(),
         options.diarize,
+        &options.consent,
     )?;
     ensure_diarization_supported(
         prepared_run.backend_kind,
@@ -1181,7 +1186,10 @@ fn transcribe(
     ensure_cli_word_timestamps_pack_installed(
         native_execution_services,
         prepared_run.backend_kind,
+        prepared_run.model_source.model_pack_path.as_deref(),
+        options.diarize,
         options.word_timestamps_mode,
+        &options.consent,
     )?;
     ensure_word_timestamps_alignment_supported(
         prepared_run.backend_kind,

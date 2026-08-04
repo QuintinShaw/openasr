@@ -215,6 +215,11 @@ fn choose_cut(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> 
 /// Merge a trailing 1-2 word cue back into its predecessor when they belong to
 /// the same sentence (the predecessor did not end one) and the union still fits
 /// the hard caps -- avoids leaving a dangling orphan word on its own line.
+///
+/// The forced aligner's reference timestamp repair can legitimately collapse a
+/// trailing anomaly to the preceding timestamp. Such a zero-duration range is
+/// never useful as a standalone subtitle cue, so merge it even when the prior
+/// token ended a sentence. The original word timestamp remains untouched.
 fn merge_orphan_tails(
     chars: &[char],
     tokens: &[CueToken],
@@ -226,8 +231,9 @@ fn merge_orphan_tails(
         if let Some(&(prev_first, prev_last)) = merged.last() {
             let word_count = last - first + 1;
             let prev_ends_sentence = ends_sentence(chars, &tokens[prev_last]);
+            let zero_duration = tokens[last].end <= tokens[first].start;
             if word_count <= ORPHAN_MAX_WORDS
-                && !prev_ends_sentence
+                && (zero_duration || !prev_ends_sentence)
                 && fits(tokens, prev_first, last, budget, MAX_CUE_SECONDS)
             {
                 *merged.last_mut().unwrap() = (prev_first, last);
@@ -358,8 +364,13 @@ fn char_has_content(c: char) -> bool {
 }
 
 /// Map each word token to its `[start, end)` char span in the segment `chars`
-/// by greedy forward matching (words are whitespace-separated tokens of the
-/// text). Returns `None` if a token does not align, so the caller falls back to
+/// by greedy forward matching. Native word timestamps may retain punctuation,
+/// while forced aligners commonly strip it (`hello, world` -> `hello`,
+/// `world`; `你好，今天` -> one timestamp per ideograph). Try the exact form
+/// first, then allow only punctuation/whitespace to be skipped while matching
+/// an alphanumeric/apostrophe-only token. Separator text is attached to the
+/// preceding span so cue slicing preserves the original transcript verbatim.
+/// Returns `None` if content characters disagree, so the caller falls back to
 /// synthesised tokens rather than mis-slicing text.
 fn word_char_spans(chars: &[char], words: &[WordTimestamp]) -> Option<Vec<(usize, usize)>> {
     let mut spans = Vec::with_capacity(words.len());
@@ -373,16 +384,47 @@ fn word_char_spans(chars: &[char], words: &[WordTimestamp]) -> Option<Vec<(usize
             spans.push((idx, idx));
             continue;
         }
-        if idx + token.len() > chars.len() {
-            return None;
-        }
-        if chars[idx..idx + token.len()] != token[..] {
-            return None;
-        }
-        spans.push((idx, idx + token.len()));
-        idx += token.len();
+        let (start, end) = match_word_span(chars, idx, &token)?;
+        spans.push((start, end));
+        idx = end;
+    }
+    if let Some(first) = spans.first_mut() {
+        first.0 = 0;
+    }
+    for index in 0..spans.len().saturating_sub(1) {
+        spans[index].1 = spans[index + 1].0;
+    }
+    if let Some(last) = spans.last_mut() {
+        last.1 = chars.len();
     }
     Some(spans)
+}
+
+fn match_word_span(chars: &[char], start: usize, token: &[char]) -> Option<(usize, usize)> {
+    if start + token.len() <= chars.len() && chars[start..start + token.len()] == token[..] {
+        return Some((start, start + token.len()));
+    }
+    if !token.iter().copied().all(is_forced_alignment_char) {
+        return None;
+    }
+
+    let mut cursor = start;
+    let mut first = None;
+    for &expected in token {
+        while cursor < chars.len() && !is_forced_alignment_char(chars[cursor]) {
+            cursor += 1;
+        }
+        if chars.get(cursor).copied() != Some(expected) {
+            return None;
+        }
+        first.get_or_insert(cursor);
+        cursor += 1;
+    }
+    Some((first?, cursor))
+}
+
+fn is_forced_alignment_char(ch: char) -> bool {
+    ch == '\'' || ch.is_alphanumeric()
 }
 
 #[cfg(test)]
@@ -518,6 +560,82 @@ mod tests {
             cues[1].text,
             "\u{4eca}\u{5929}\u{5929}\u{6c14}\u{5f88}\u{597d}"
         );
+    }
+
+    #[test]
+    fn preserves_forced_aligner_words_across_latin_punctuation() {
+        let text = "hello, world; this is a deliberately long sentence. another clause follows";
+        let tokens = [
+            "hello",
+            "world",
+            "this",
+            "is",
+            "a",
+            "deliberately",
+            "long",
+            "sentence",
+            "another",
+            "clause",
+            "follows",
+        ];
+        let words = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| word(token, index as f32, index as f32 + 0.5))
+            .collect::<Vec<_>>();
+
+        let cues = segment_into_cues(segment(text, words));
+
+        assert!(
+            cues.len() >= 2,
+            "sentence punctuation should remain visible: {cues:?}"
+        );
+        let preserved = cues
+            .iter()
+            .flat_map(|cue| cue.words.iter().map(|word| word.word.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(preserved, tokens);
+        assert!(cues.iter().any(|cue| cue.text.ends_with("sentence.")));
+    }
+
+    #[test]
+    fn preserves_forced_aligner_words_across_cjk_punctuation() {
+        let text = "你好世界。今天天气很好";
+        let tokens = ["你", "好", "世", "界", "今", "天", "天", "气", "很", "好"];
+        let words = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| word(token, index as f32 * 0.3, index as f32 * 0.3 + 0.2))
+            .collect::<Vec<_>>();
+
+        let cues = segment_into_cues(segment(text, words));
+
+        assert_eq!(
+            cues.len(),
+            2,
+            "ideographic period should remain visible: {cues:?}"
+        );
+        let preserved = cues
+            .iter()
+            .flat_map(|cue| cue.words.iter().map(|word| word.word.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(preserved, tokens);
+        assert_eq!(cues[0].text, "你好世界。");
+        assert_eq!(cues[1].text, "今天天气很好");
+    }
+
+    #[test]
+    fn merges_zero_duration_forced_aligner_tail_across_sentence_boundary() {
+        let text = "嗯。嗯。";
+        let words = vec![word("嗯", 55.60, 55.92), word("嗯", 55.92, 55.92)];
+
+        let cues = segment_into_cues(segment(text, words));
+
+        assert_eq!(cues.len(), 1, "zero-duration tail must not stand alone");
+        assert_eq!(cues[0].text, text);
+        assert_eq!(cues[0].words.len(), 2);
+        assert_eq!(cues[0].start, 55.60);
+        assert_eq!(cues[0].end, 55.92);
     }
 
     #[test]

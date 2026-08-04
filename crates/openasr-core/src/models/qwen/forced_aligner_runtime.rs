@@ -3,9 +3,9 @@
 //! end-to-end "mel -> audio encoder -> LLM prefill -> classify head at
 //! `<timestamp>` positions -> fix_timestamp -> per-word spans" path.
 //!
-//! Stage 6 adds the real caller: [`refine_word_timestamps_with_forced_aligner`]
-//! is invoked from `api::backend::native_transcribe` when a request opts into
-//! `--word-timestamps=aligned` and the capability pack
+//! Stage 6 adds the request-scoped [`Qwen3ForcedAlignerSession`], invoked from
+//! `api::backend::native_transcribe` when attribution needs real word anchors
+//! or a request opts into `--word-timestamps=aligned` and the capability pack
 //! (`models::qwen::forced_aligner_pack`) is installed. `align_forced` and
 //! `load_forced_aligner_prepared_assets` stay `pub(crate)` (not `pub`): the
 //! one in-crate caller does not need a wider surface, and every
@@ -23,7 +23,7 @@ use crate::ggml_runtime::{
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 use crate::models::{
     aux_pack_registry::AuxPackKind,
-    pack_verifier::{PackCandidate, PackRoute, PackVerifier},
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
 };
 
 use super::audio_encoder::{
@@ -532,58 +532,65 @@ fn round_to_millis(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
 }
 
-/// One-shot entry point for the `--word-timestamps=aligned` opt-in refinement
-/// tier: loads the pack fresh (no process-wide cache -- this runs at most once
-/// per `transcribe` call, the same cost profile as loading the primary ASR
-/// pack) and runs the full NAR pipeline. `language` accepts either an ISO
-/// 639-1 code or a full name; unsupported languages (Japanese, Korean --
-/// see `forced_aligner_align_text`) fail closed with
-/// [`Qwen3ForcedAlignerRuntimeError::TextFailed`] rather than mis-tokenizing.
-pub(crate) fn refine_word_timestamps_with_forced_aligner(
-    pack_path: &std::path::Path,
-    audio_samples_16khz_mono: crate::PcmSlice,
-    text: &str,
-    language: &str,
+/// One request-scoped forced-aligner session. Pack metadata and immutable
+/// weights are loaded once, while each bounded audio/text item owns and drops
+/// its graph runtime before the next item starts. That keeps peak graph memory
+/// proportional to the largest ASR segment rather than the whole recording.
+pub(crate) struct Qwen3ForcedAlignerSession {
+    verified: VerifiedPack,
+    assets: Qwen3ForcedAlignerPreparedAssets,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
-    // This tier is an independent auxiliary stage. Its caller resolves a
-    // stage-level execution candidate and passes the backend explicitly; do
-    // not re-derive from process defaults here or a vendor-constrained request
-    // could silently run the aligner on another GPU.
-    // The capability stage receives the same proof-carrying package gate as
-    // primary ASR. The verifier opens and parses one immutable generation;
-    // both asset preparation and execution borrow that exact preflight.
-    let verified = PackVerifier
-        .verify_candidate(PackCandidate::new(pack_path))
-        .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-            key: "<pack verifier>",
-            reason: error.to_string(),
-        })?;
-    if !matches!(
-        verified.route(),
-        PackRoute::Aux {
-            kind: AuxPackKind::ForcedAlignment,
-            ..
+}
+
+impl Qwen3ForcedAlignerSession {
+    pub(crate) fn load(
+        pack_path: &std::path::Path,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
+        let verified = PackVerifier
+            .verify_candidate(PackCandidate::new(pack_path))
+            .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+                key: "<pack verifier>",
+                reason: error.to_string(),
+            })?;
+        if !matches!(
+            verified.route(),
+            PackRoute::Aux {
+                kind: AuxPackKind::ForcedAlignment,
+                ..
+            }
+        ) {
+            return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+                key: "<pack route>",
+                reason: format!(
+                    "expected auxiliary forced-alignment pack, got {:?}",
+                    verified.route()
+                ),
+            });
         }
-    ) {
-        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-            key: "<pack route>",
-            reason: format!(
-                "expected auxiliary forced-alignment pack, got {:?}",
-                verified.route()
-            ),
-        });
+        let assets = load_forced_aligner_prepared_assets(verified.preflight(), backend)?;
+        Ok(Self {
+            verified,
+            assets,
+            backend,
+        })
     }
-    let preflight = verified.preflight();
-    let assets = load_forced_aligner_prepared_assets(preflight, backend)?;
-    align_forced(
-        preflight,
-        &assets,
-        audio_samples_16khz_mono,
-        text,
-        language,
-        backend,
-    )
+
+    pub(crate) fn align(
+        &self,
+        audio_samples_16khz_mono: crate::PcmSlice,
+        text: &str,
+        language: &str,
+    ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
+        align_forced(
+            self.verified.preflight(),
+            &self.assets,
+            audio_samples_16khz_mono,
+            text,
+            language,
+            self.backend,
+        )
+    }
 }
 
 #[cfg(test)]

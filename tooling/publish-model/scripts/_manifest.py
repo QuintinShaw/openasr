@@ -29,6 +29,7 @@ from _catalog import (
     punctuation_for_model,
     speaker_source_for_model,
     validate_card_prose_locales,
+    word_timestamp_source_for_model,
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
 from _pathlib_helpers import repo_root
@@ -288,6 +289,7 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     # the shared external diarizer. Desktop consumes this signed field to plan
     # ReDim-only vs ReDim+segmenter dependencies without a model-id allowlist.
     model_entry.update(speaker_source_for_model(entry))
+    model_entry.update(word_timestamp_source_for_model(entry))
     if entry.get("experimental") is True:
         model_entry["experimental"] = True
     # Explicit, author-set display hints (models-core.toml `sort_weight`/

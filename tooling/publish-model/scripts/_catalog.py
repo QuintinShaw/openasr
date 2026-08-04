@@ -768,6 +768,74 @@ def speaker_source_for_model(entry: dict) -> dict:
     return {"speaker_source": "native" if source == "in-decoder" else "external"}
 
 
+# Source of the word anchors needed to project transcript text onto an
+# external speaker timeline. This mirrors
+# `OpenAsrArchitectureDescriptor::word_timestamp_source`; keeping it in the
+# signed catalog lets clients pre-install the forced aligner without a
+# model-id allowlist or a late transcription failure.
+WORD_TIMESTAMP_SOURCE_BY_FAMILY = {
+    "qwen": "native",
+    "parakeet-tdt": "native",
+    "cohere": "native",
+    "whisper": "native",
+    "xasr-zipformer": "native",
+    "moonshine": "native",
+    "dolphin": "forced_aligner",
+    "sensevoice": "forced_aligner",
+    "firered-aed": "forced_aligner",
+    "firered2-llm": "forced_aligner",
+    "mimo-asr": "forced_aligner",
+    "moss-transcribe-diarize": "forced_aligner",
+    "funasr-nano": "forced_aligner",
+    "granite-speech": "forced_aligner",
+}
+
+
+def word_timestamp_source_for_model(entry: dict) -> dict:
+    """Return the architecture's usable word-anchor source for ASR models."""
+    if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
+        return {}
+    family = entry["family"]
+    source = WORD_TIMESTAMP_SOURCE_BY_FAMILY.get(family)
+    if source is None:
+        known = ", ".join(sorted(WORD_TIMESTAMP_SOURCE_BY_FAMILY))
+        raise KeyError(
+            f"model '{entry.get('id', '?')}' family '{family}' has no "
+            f"word_timestamp_source mapping. Known families: {known}"
+        )
+    return {"word_timestamp_source": source}
+
+
+def apply_word_timestamp_sources_to_catalog(
+    catalog: dict, catalog_entries: dict | None = None
+) -> int:
+    """Refresh architecture-derived word timestamp sources in-place."""
+    entries = catalog_entries if catalog_entries is not None else load()
+    by_registry_id = {entry["registry_id"]: entry for entry in entries.values()}
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        raise KeyError("catalog models must be a list")
+
+    updated = 0
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            raise KeyError("catalog models must contain object entries with string ids")
+        source = by_registry_id.get(model["id"])
+        if source is None:
+            raise KeyError(
+                f"catalog model '{model['id']}' has no models-core.toml source entry"
+            )
+        expected = word_timestamp_source_for_model(source).get("word_timestamp_source")
+        previous = model.get("word_timestamp_source")
+        if expected is None:
+            model.pop("word_timestamp_source", None)
+        else:
+            model["word_timestamp_source"] = expected
+        if previous != expected:
+            updated += 1
+    return updated
+
+
 def apply_speaker_sources_to_catalog(
     catalog: dict, catalog_entries: dict | None = None
 ) -> int:
@@ -1303,6 +1371,16 @@ def main(argv: list[str]) -> int:
         updated = apply_speaker_sources_to_catalog(data)
         atomic_write_json(path, data)
         print(f"wrote speaker_source for {updated} changed catalog model(s) to {path}")
+    elif cmd == "write-word-timestamp-sources":
+        from _file_loaders import atomic_write_json
+
+        path = Path(argv[1])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        updated = apply_word_timestamp_sources_to_catalog(data)
+        atomic_write_json(path, data)
+        print(
+            f"wrote word_timestamp_source for {updated} changed catalog model(s) to {path}"
+        )
     else:
         sys.exit(f"unknown command '{cmd}'")
     return 0

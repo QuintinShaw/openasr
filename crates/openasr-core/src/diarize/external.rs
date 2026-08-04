@@ -14,10 +14,10 @@ use super::clustering::{AutomaticClusterer, AutomaticClusteringError};
 #[cfg(test)]
 use super::clustering::{AutomaticClusteringDiagnostics, AutomaticClusteringStrategy};
 use super::contract::{
-    DiarizeHint, MAX_DIARIZATION_SPEAKERS, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange,
+    DiarizeHint, MAX_DIARIZATION_SPEAKERS, SpeakerEmbedding, SpeakerId, SpeakerTimeline,
+    SpeakerTurn, TimeRange,
 };
 use super::embed::{EmbedError, SpeakerEmbedder};
-use super::pipeline::Diarization;
 #[cfg(test)]
 use super::segment::SegmenterProvider;
 use super::segment::{
@@ -529,7 +529,7 @@ impl ExternalDiarizer {
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
-    ) -> Result<Diarization, ExternalDiarizationError> {
+    ) -> Result<SpeakerTimeline, ExternalDiarizationError> {
         self.diarize_with_clustering(
             samples,
             sample_rate_hz,
@@ -551,7 +551,7 @@ impl ExternalDiarizer {
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
-    ) -> Result<(Diarization, NativeDiarizationDiagnostics), ExternalDiarizationError> {
+    ) -> Result<(SpeakerTimeline, NativeDiarizationDiagnostics), ExternalDiarizationError> {
         self.diarize_with_clustering(
             samples,
             sample_rate_hz,
@@ -581,7 +581,7 @@ impl ExternalDiarizer {
             DiarizeHint,
             &dyn Fn() -> bool,
         ) -> Result<(Vec<SpeakerId>, T), AutomaticClusteringError>,
-    ) -> Result<(Diarization, T), ExternalDiarizationError> {
+    ) -> Result<(SpeakerTimeline, T), ExternalDiarizationError> {
         if sample_rate_hz != SAMPLE_RATE_HZ {
             return Err(ExternalDiarizationError::UnsupportedSampleRate(
                 sample_rate_hz,
@@ -690,7 +690,10 @@ fn external_clustering_error(error: AutomaticClusteringError) -> ExternalDiariza
     }
 }
 
-fn assemble_recording(prepared: &PreparedExternalRecording, labels: &[SpeakerId]) -> Diarization {
+fn assemble_recording(
+    prepared: &PreparedExternalRecording,
+    labels: &[SpeakerId],
+) -> SpeakerTimeline {
     let cluster_segments = compress_cluster_segments(&prepared.embedded_chunks, labels);
     let speaker_count = labels
         .iter()
@@ -704,7 +707,7 @@ fn assemble_recording(prepared: &PreparedExternalRecording, labels: &[SpeakerId]
         prepared.audio_duration_s,
     );
     let centroids = speaker_centroids(labels, &prepared.embeddings);
-    Diarization { turns, centroids }
+    SpeakerTimeline { turns, centroids }
 }
 
 fn cancel_checkpoint(canceled: &dyn Fn() -> bool) -> Result<(), ExternalDiarizationError> {
@@ -962,31 +965,39 @@ fn binary_to_turns(
     let frames = binary.len() / speaker_count;
     let mut turns = Vec::new();
     for speaker in 0..speaker_count {
-        let mut start = None;
+        let mut active_run: Option<(usize, bool)> = None;
         for frame in 0..frames {
             let active = binary[frame * speaker_count + speaker];
-            if active && start.is_none() {
-                start = Some(frame);
-            }
-            if !active && let Some(begin) = start.take() {
-                turns.push(SpeakerTurn {
-                    range: TimeRange::new(
-                        clock.midpoint_s(begin),
-                        clock.midpoint_s(frame).min(audio_duration_s),
-                    ),
-                    speaker: SpeakerId(speaker as u32),
-                    overlap: false,
-                });
+            let overlap = active
+                && (0..speaker_count)
+                    .filter(|&candidate| binary[frame * speaker_count + candidate])
+                    .take(2)
+                    .count()
+                    > 1;
+            match active_run {
+                None if active => active_run = Some((frame, overlap)),
+                Some((begin, run_overlap)) if !active || overlap != run_overlap => {
+                    turns.push(SpeakerTurn {
+                        range: TimeRange::new(
+                            clock.midpoint_s(begin),
+                            clock.midpoint_s(frame).min(audio_duration_s),
+                        ),
+                        speaker: SpeakerId(speaker as u32),
+                        overlap: run_overlap,
+                    });
+                    active_run = active.then_some((frame, overlap));
+                }
+                _ => {}
             }
         }
-        if let Some(begin) = start {
+        if let Some((begin, overlap)) = active_run {
             turns.push(SpeakerTurn {
                 range: TimeRange::new(
                     clock.midpoint_s(begin),
                     clock.midpoint_s(frames).min(audio_duration_s),
                 ),
                 speaker: SpeakerId(speaker as u32),
-                overlap: false,
+                overlap,
             });
         }
     }
@@ -996,13 +1007,6 @@ fn binary_to_turns(
             .total_cmp(&right.range.start_s)
             .then_with(|| left.speaker.cmp(&right.speaker))
     });
-    for index in 0..turns.len() {
-        turns[index].overlap = turns.iter().enumerate().any(|(other_index, other)| {
-            index != other_index
-                && turns[index].speaker != other.speaker
-                && turns[index].range.overlaps(&other.range)
-        });
-    }
     turns
 }
 
@@ -1414,15 +1418,31 @@ mod tests {
             },
         ];
         let turns = reconstruct_global_turns(&activity, &clusters, 2, 0.4);
-        assert!(
-            turns
-                .iter()
-                .any(|turn| turn.speaker == SpeakerId(0) && turn.overlap)
-        );
-        assert!(
-            turns
-                .iter()
-                .any(|turn| turn.speaker == SpeakerId(1) && turn.overlap)
+        assert_eq!(
+            turns,
+            vec![
+                SpeakerTurn {
+                    range: TimeRange::new(0.1, 0.2),
+                    speaker: SpeakerId(0),
+                    overlap: false,
+                },
+                SpeakerTurn {
+                    range: TimeRange::new(0.2, 0.3),
+                    speaker: SpeakerId(0),
+                    overlap: true,
+                },
+                SpeakerTurn {
+                    range: TimeRange::new(0.2, 0.3),
+                    speaker: SpeakerId(1),
+                    overlap: true,
+                },
+                SpeakerTurn {
+                    range: TimeRange::new(0.3, 0.4),
+                    speaker: SpeakerId(1),
+                    overlap: false,
+                },
+            ],
+            "overlap state changes must split turns instead of tainting each speaker's whole continuous run",
         );
     }
 

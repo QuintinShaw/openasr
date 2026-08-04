@@ -131,6 +131,9 @@ pub struct GgmlFamilyAdapterDescriptor {
     /// dispatch reads it here instead of re-deriving family capabilities from
     /// an `adapter_id` string match.
     pub speaker_segmentation: crate::arch::SpeakerSegmentationSource,
+    /// Whether this family emits usable word anchors itself or needs the
+    /// shared forced-aligner capability pack.
+    pub word_timestamp_source: crate::arch::WordTimestampSource,
 }
 
 impl GgmlFamilyAdapterDescriptor {

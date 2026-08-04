@@ -7,18 +7,37 @@
 //! split at speaker-turn boundaries snapped to word boundaries: each word goes
 //! to the turn covering its midpoint, runs of same-speaker words become
 //! separate segments, and the segment text is carved at the corresponding word
-//! positions (no text is invented or lost). Without word anchors the text
+//! positions (no text is invented or lost). A single-stream ASR cannot emit
+//! two simultaneous transcripts, so a word inside an overlap is linearized
+//! from the nearest clean speaker context on both sides: a transition switches
+//! at the overlap midpoint, while the same clean speaker on both sides keeps
+//! ownership throughout. Without word anchors the text
 //! cannot be split faithfully, so the segment keeps the dominant-overlap
-//! speaker unchanged — the batch path force-enables word timestamps when
-//! diarization is active precisely so this fallback stays rare.
+//! speaker attribution fails closed. The native pipeline first requests the
+//! family's own word anchors and automatically invokes the shared forced
+//! aligner when a coarse ASR segment still crosses speaker turns.
 
 use std::collections::BTreeMap;
+
+use thiserror::Error;
 
 use super::contract::{SpeakerId, SpeakerTurn, TimeRange};
 use super::debug::diarize_debug_enabled;
 use super::enrollment::SpeakerDisplayAssignment;
 use crate::Segment;
 use crate::api::backend::WordTimestamp;
+
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum SpeakerAttributionError {
+    #[error(
+        "speaker attribution requires word alignment for a multi-speaker transcript segment at {start_s:.2}-{end_s:.2}s"
+    )]
+    WordAlignmentRequired { start_s: f32, end_s: f32 },
+    #[error(
+        "speaker attribution could not reconcile aligned words with transcript text at {start_s:.2}-{end_s:.2}s"
+    )]
+    AlignedWordTextMismatch { start_s: f32, end_s: f32 },
+}
 
 /// Assign `Segment.speaker` from speaker turns, splitting multi-speaker
 /// segments at word-snapped turn boundaries. Returns the (possibly longer)
@@ -28,16 +47,25 @@ use crate::api::backend::WordTimestamp;
 /// Ties break toward the lower `SpeakerId` (deterministic). `identities`
 /// optionally relabel compatible voice-match profiles with display names while
 /// preserving the stable anonymous session label in `speaker_label`.
-pub fn assign_speakers(
+pub(crate) fn assign_speakers(
     turns: &[SpeakerTurn],
     segments: Vec<Segment>,
     identities: &BTreeMap<SpeakerId, SpeakerDisplayAssignment>,
-) -> Vec<Segment> {
+) -> Result<Vec<Segment>, SpeakerAttributionError> {
     let mut output = Vec::with_capacity(segments.len());
     for segment in segments {
-        attribute_segment(segment, turns, identities, &mut output);
+        attribute_segment(segment, turns, identities, &mut output)?;
     }
-    output
+    Ok(output)
+}
+
+/// Whether projecting this transcript onto the timeline requires an independent
+/// word aligner. A coarse segment that intersects several speakers cannot be
+/// split faithfully from segment timestamps alone.
+pub(crate) fn requires_word_alignment(turns: &[SpeakerTurn], segments: &[Segment]) -> bool {
+    segments
+        .iter()
+        .any(|segment| segment.words.is_empty() && overlap_by_speaker(segment, turns).len() > 1)
 }
 
 fn attribute_segment(
@@ -45,26 +73,25 @@ fn attribute_segment(
     turns: &[SpeakerTurn],
     identities: &BTreeMap<SpeakerId, SpeakerDisplayAssignment>,
     output: &mut Vec<Segment>,
-) {
+) -> Result<(), SpeakerAttributionError> {
     let overlap = overlap_by_speaker(&segment, turns);
     let Some(dominant) = dominant_speaker(&overlap) else {
         log_attribution(&segment, &overlap, "unattributed", 1);
         output.push(segment);
-        return;
+        return Ok(());
     };
     if overlap.len() == 1 {
         log_attribution(&segment, &overlap, "single-speaker", 1);
         apply_speaker(&mut segment, dominant, identities);
         output.push(segment);
-        return;
+        return Ok(());
     }
     if segment.words.is_empty() {
-        // No word anchors: the text cannot be split faithfully, keep the
-        // dominant-overlap assignment (legacy behavior).
-        log_attribution(&segment, &overlap, "multi-speaker-no-words", 1);
-        apply_speaker(&mut segment, dominant, identities);
-        output.push(segment);
-        return;
+        log_attribution(&segment, &overlap, "multi-speaker-needs-alignment", 0);
+        return Err(SpeakerAttributionError::WordAlignmentRequired {
+            start_s: segment.start,
+            end_s: segment.end,
+        });
     }
     match split_segment_at_turn_boundaries(&segment, turns) {
         Some(pieces) => {
@@ -84,13 +111,14 @@ fn attribute_segment(
                 }
                 output.push(piece_segment);
             }
+            Ok(())
         }
         None => {
-            // Word/text mismatch — fall back to the unsplit dominant speaker
-            // rather than emit text that no longer matches the transcript.
-            log_attribution(&segment, &overlap, "split-fallback-dominant", 1);
-            apply_speaker(&mut segment, dominant, identities);
-            output.push(segment);
+            log_attribution(&segment, &overlap, "aligned-word-text-mismatch", 0);
+            Err(SpeakerAttributionError::AlignedWordTextMismatch {
+                start_s: segment.start,
+                end_s: segment.end,
+            })
         }
     }
 }
@@ -153,8 +181,8 @@ struct SplitPiece {
 /// concatenation of all piece texts reproduces the original text exactly
 /// (modulo the trimmed inter-piece whitespace).
 ///
-/// Returns `None` when a word cannot be located in the segment text in order
-/// (the caller falls back to unsplit dominant-speaker attribution).
+/// Returns `None` when a word cannot be located in the segment text in order;
+/// the caller fails closed rather than fabricating a dominant-speaker result.
 fn split_segment_at_turn_boundaries(
     segment: &Segment,
     turns: &[SpeakerTurn],
@@ -371,14 +399,34 @@ pub struct TranscriptTailSplit {
 
 /// The speaker of the turn covering the word's midpoint, falling back to the
 /// turn whose range is nearest to the midpoint (inter-turn gaps and turn-edge
-/// drift). `None` only when `turns` is empty.
+/// drift).
+///
+/// Several speakers can cover the midpoint in an overlap. Returning whichever
+/// turn happens to sort first makes the transcript depend on an anonymous id,
+/// not the audio timeline. Since this API projects a *single-stream* ASR result
+/// (there is only one word to assign), it linearizes that overlap using clean
+/// context: when the clean speaker before and after differ, ownership changes
+/// at the overlap midpoint; when they agree, a transient overlapping track
+/// does not steal the word. `None` only when `turns` is empty.
 fn word_speaker(word: &WordTimestamp, turns: &[SpeakerTurn]) -> Option<SpeakerId> {
     let midpoint = f64::from(word.start + word.end) / 2.0;
+    let covering: Vec<&SpeakerTurn> = turns
+        .iter()
+        .filter(|turn| midpoint >= turn.range.start_s && midpoint < turn.range.end_s)
+        .collect();
+    let mut covering_speakers: Vec<SpeakerId> = covering.iter().map(|turn| turn.speaker).collect();
+    covering_speakers.sort_unstable();
+    covering_speakers.dedup();
+    if covering_speakers.len() == 1 {
+        return covering_speakers.first().copied();
+    }
+    if covering_speakers.len() > 1 {
+        return linearized_overlap_speaker(midpoint, &covering, turns)
+            .or_else(|| covering_speakers.first().copied());
+    }
+
     let mut nearest: Option<(f64, SpeakerId)> = None;
     for turn in turns {
-        if midpoint >= turn.range.start_s && midpoint < turn.range.end_s {
-            return Some(turn.speaker);
-        }
         let distance = if midpoint < turn.range.start_s {
             turn.range.start_s - midpoint
         } else {
@@ -393,6 +441,58 @@ fn word_speaker(word: &WordTimestamp, turns: &[SpeakerTurn]) -> Option<SpeakerId
         }
     }
     nearest.map(|(_, speaker)| speaker)
+}
+
+fn linearized_overlap_speaker(
+    midpoint: f64,
+    covering: &[&SpeakerTurn],
+    turns: &[SpeakerTurn],
+) -> Option<SpeakerId> {
+    let overlap = TimeRange::new(
+        covering
+            .iter()
+            .map(|turn| turn.range.start_s)
+            .fold(f64::NEG_INFINITY, f64::max),
+        covering
+            .iter()
+            .map(|turn| turn.range.end_s)
+            .fold(f64::INFINITY, f64::min),
+    );
+    if overlap.duration_s() <= 0.0 {
+        return None;
+    }
+    let candidates = |speaker: SpeakerId| covering.iter().any(|turn| turn.speaker == speaker);
+    let before = turns
+        .iter()
+        .filter(|turn| {
+            !turn.overlap
+                && turn.range.end_s <= overlap.start_s + f64::EPSILON
+                && candidates(turn.speaker)
+        })
+        .max_by(|left, right| left.range.end_s.total_cmp(&right.range.end_s))
+        .map(|turn| turn.speaker);
+    let after = turns
+        .iter()
+        .filter(|turn| {
+            !turn.overlap
+                && turn.range.start_s + f64::EPSILON >= overlap.end_s
+                && candidates(turn.speaker)
+        })
+        .min_by(|left, right| left.range.start_s.total_cmp(&right.range.start_s))
+        .map(|turn| turn.speaker);
+
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(before),
+        (Some(before), Some(after)) => {
+            if midpoint < (overlap.start_s + overlap.end_s) * 0.5 {
+                Some(before)
+            } else {
+                Some(after)
+            }
+        }
+        (Some(speaker), None) | (None, Some(speaker)) => Some(speaker),
+        (None, None) => None,
+    }
 }
 
 fn log_attribution(
@@ -432,6 +532,13 @@ mod tests {
         }
     }
 
+    fn overlap_turn(start: f64, end: f64, spk: u32) -> SpeakerTurn {
+        SpeakerTurn {
+            overlap: true,
+            ..turn(start, end, spk)
+        }
+    }
+
     fn seg(start: f32, end: f32) -> Segment {
         Segment {
             start,
@@ -467,31 +574,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn assigns_dominant_overlap_speaker() {
-        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 5.0, 1)];
-        let segs = assign_speakers(
-            &turns,
-            vec![seg(0.0, 1.5), seg(2.5, 4.0), seg(1.8, 2.4)],
-            &BTreeMap::new(),
-        );
-        assert_eq!(segs.len(), 3);
-        assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
-        // straddling segment without words: 0.2s in spk0, 0.4s in spk1 ->
-        // spk1 dominates, no split possible.
-        assert_eq!(segs[2].speaker.as_deref(), Some("SPEAKER_01"));
+    fn assign(
+        turns: &[SpeakerTurn],
+        segments: Vec<Segment>,
+        identities: &BTreeMap<SpeakerId, SpeakerDisplayAssignment>,
+    ) -> Vec<Segment> {
+        assign_speakers(turns, segments, identities).expect("speaker attribution must succeed")
     }
 
     #[test]
-    fn exact_overlap_tie_breaks_to_lower_speaker() {
-        // segment 1.0-3.0 overlaps spk0 (1.0-2.0) and spk1 (2.0-3.0) by 1.0s each.
-        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 3.0, 1)];
-        let segs = assign_speakers(&turns, vec![seg(1.0, 3.0)], &BTreeMap::new());
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
+    fn multi_speaker_segment_without_words_requires_alignment() {
+        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 5.0, 1)];
+        let error = assign_speakers(&turns, vec![seg(1.8, 2.4)], &BTreeMap::new())
+            .expect_err("coarse multi-speaker text must not be silently attributed");
+        assert_eq!(
+            error,
+            SpeakerAttributionError::WordAlignmentRequired {
+                start_s: 1.8,
+                end_s: 2.4,
+            }
+        );
+        assert!(requires_word_alignment(&turns, &[seg(1.8, 2.4)]));
+    }
+
+    #[test]
+    fn single_speaker_segments_do_not_require_alignment() {
+        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 4.0, 1)];
+        let segments = vec![seg(0.0, 1.5), seg(2.5, 4.0)];
+        assert!(!requires_word_alignment(&turns, &segments));
+        let assigned = assign(&turns, segments, &BTreeMap::new());
+        assert_eq!(assigned[0].speaker.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(assigned[1].speaker.as_deref(), Some("SPEAKER_01"));
     }
 
     #[test]
@@ -508,7 +621,7 @@ mod tests {
                 speaker_snapshot_label: None,
             },
         );
-        let segs = assign_speakers(&turns, vec![seg(0.0, 1.5), seg(2.5, 4.0)], &identities);
+        let segs = assign(&turns, vec![seg(0.0, 1.5), seg(2.5, 4.0)], &identities);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[1].speaker.as_deref(), Some("Alice"));
@@ -518,13 +631,13 @@ mod tests {
     #[test]
     fn no_overlap_leaves_speaker_unassigned() {
         let turns = vec![turn(0.0, 1.0, 0)];
-        let segs = assign_speakers(&turns, vec![seg(2.0, 3.0)], &BTreeMap::new());
+        let segs = assign(&turns, vec![seg(2.0, 3.0)], &BTreeMap::new());
         assert_eq!(segs[0].speaker, None);
     }
 
     #[test]
     fn empty_turns_is_noop() {
-        let segs = assign_speakers(&[], vec![seg(0.0, 1.0)], &BTreeMap::new());
+        let segs = assign(&[], vec![seg(0.0, 1.0)], &BTreeMap::new());
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].speaker, None);
     }
@@ -549,7 +662,7 @@ mod tests {
                 word("bold", 5.0, 5.6),
             ],
         );
-        let segs = assign_speakers(&turns, vec![segment], &BTreeMap::new());
+        let segs = assign(&turns, vec![segment], &BTreeMap::new());
         assert_eq!(segs.len(), 3, "A/B/A turns must yield three segments");
 
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
@@ -599,7 +712,7 @@ mod tests {
                 word("天", 2.8, 3.2),
             ],
         );
-        let segs = assign_speakers(&turns, vec![segment], &BTreeMap::new());
+        let segs = assign(&turns, vec![segment], &BTreeMap::new());
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[0].text, "你好，");
@@ -622,12 +735,46 @@ mod tests {
                 word("okay", 3.4, 4.0),
             ],
         );
-        let segs = assign_speakers(&turns, vec![segment], &BTreeMap::new());
+        let segs = assign(&turns, vec![segment], &BTreeMap::new());
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[0].text, "yes uh");
         assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segs[1].text, "okay");
+    }
+
+    #[test]
+    fn overlap_transition_switches_at_its_midpoint_not_by_speaker_id() {
+        let turns = vec![
+            turn(0.0, 2.0, 7),
+            overlap_turn(2.0, 4.0, 3),
+            overlap_turn(2.0, 4.0, 7),
+            turn(4.0, 6.0, 3),
+        ];
+        assert_eq!(
+            word_speaker(&word("early", 2.2, 2.6), &turns),
+            Some(SpeakerId(7)),
+            "the outgoing speaker owns the first half even though its id is larger",
+        );
+        assert_eq!(
+            word_speaker(&word("late", 3.4, 3.8), &turns),
+            Some(SpeakerId(3)),
+            "the incoming speaker owns the second half",
+        );
+    }
+
+    #[test]
+    fn transient_overlap_does_not_steal_words_from_same_surrounding_speaker() {
+        let turns = vec![
+            turn(0.0, 2.0, 9),
+            overlap_turn(2.0, 3.0, 1),
+            overlap_turn(2.0, 3.0, 9),
+            turn(3.0, 5.0, 9),
+        ];
+        assert_eq!(
+            word_speaker(&word("stable", 2.2, 2.6), &turns),
+            Some(SpeakerId(9)),
+        );
     }
 
     #[test]
@@ -654,7 +801,7 @@ mod tests {
                 word("旦", 6.1, 6.2),
             ],
         );
-        let segs = assign_speakers(&turns, vec![segment], &BTreeMap::new());
+        let segs = assign(&turns, vec![segment], &BTreeMap::new());
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[0].text, "可以听见吗？");
@@ -692,7 +839,7 @@ mod tests {
                 word("speaker", 1.6, 2.4),
             ],
         );
-        let segs = assign_speakers(&turns, vec![original.clone()], &BTreeMap::new());
+        let segs = assign(&turns, vec![original.clone()], &BTreeMap::new());
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[0].text, original.text);
@@ -716,14 +863,14 @@ mod tests {
                 word("zero", 2.0, 2.6),
             ],
         );
-        let segs = assign_speakers(&turns, vec![segment], &BTreeMap::new());
+        let segs = assign(&turns, vec![segment], &BTreeMap::new());
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[0].text, "only speaker zero");
     }
 
     #[test]
-    fn word_text_mismatch_falls_back_to_dominant_without_split() {
+    fn word_text_mismatch_fails_closed() {
         let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 4.0, 1)];
         let segment = worded_seg(
             0.0,
@@ -731,10 +878,15 @@ mod tests {
             "actual transcript text",
             vec![word("unrelated", 0.5, 1.0), word("words", 2.5, 3.0)],
         );
-        let segs = assign_speakers(&turns, vec![segment], &BTreeMap::new());
-        assert_eq!(segs.len(), 1, "mismatched words must not split the text");
-        assert_eq!(segs[0].text, "actual transcript text");
-        assert!(segs[0].speaker.is_some());
+        let error = assign_speakers(&turns, vec![segment], &BTreeMap::new())
+            .expect_err("mismatched aligned words must not fabricate attribution");
+        assert_eq!(
+            error,
+            SpeakerAttributionError::AlignedWordTextMismatch {
+                start_s: 0.0,
+                end_s: 4.0,
+            }
+        );
     }
 
     #[test]
@@ -762,7 +914,7 @@ mod tests {
                 word("audio", 3.0, 3.6),
             ],
         );
-        let segs = assign_speakers(&turns, vec![segment], &identities);
+        let segs = assign(&turns, vec![segment], &identities);
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].speaker.as_deref(), Some("Alice"));
         assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));

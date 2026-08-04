@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 
 use super::clustering::{ClusterContext, SpeakerClusterer};
-use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTurn, TimeRange};
+use super::contract::{
+    DiarizeHint, SpeakerEmbedding, SpeakerId, SpeakerTimeline, SpeakerTurn, TimeRange,
+};
 use super::embed::SpeakerEmbedder;
 
 /// Resolve speech regions for the compatibility/enrollment path.
@@ -74,26 +76,6 @@ pub fn resolve_diarization_regions(samples: &[f32]) -> Option<Vec<DiarizationReg
 const MIN_SEGMENT_S: f64 = 0.5;
 const MAX_EMBED_CHUNK_S: f64 = 5.0;
 
-/// What an **external speaker segmentation source** produces: recording-local
-/// speaker turns plus each speaker's mean (L2-normalized) embedding centroid.
-///
-/// This is the seam a new external source plugs into. The VAD + speaker-embedder
-/// pass below produces one today; the pyannote segmenter will produce one too,
-/// and nothing downstream changes -- `native_transcribe` matches the centroids
-/// against Voice ID and `diarize::attribution` projects the turns onto
-/// transcript segments as `Segment::speaker_label`, which is the one
-/// recording-local speaker representation the rest of the engine consumes (a
-/// family that segments in its own decode writes the same field directly, see
-/// `arch::SpeakerSegmentationSource`).
-///
-/// `SpeakerId` is an arrival-order counter with no identity in it and no
-/// stability across recordings; the centroids are the only thing that may ever
-/// turn a turn into a named person.
-pub struct Diarization {
-    pub turns: Vec<SpeakerTurn>,
-    pub centroids: Vec<(SpeakerId, SpeakerEmbedding)>,
-}
-
 struct EmbeddedRegion {
     source_index: usize,
     range: TimeRange,
@@ -133,7 +115,7 @@ impl<'a> BatchDiarizer<'a> {
         sample_rate_hz: u32,
         speech: &[TimeRange],
         hint: DiarizeHint,
-    ) -> Diarization {
+    ) -> SpeakerTimeline {
         let regions: Vec<DiarizationRegion> = speech
             .iter()
             .map(|range| DiarizationRegion {
@@ -151,7 +133,7 @@ impl<'a> BatchDiarizer<'a> {
         sample_rate_hz: u32,
         speech: &[DiarizationRegion],
         hint: DiarizeHint,
-    ) -> Diarization {
+    ) -> SpeakerTimeline {
         let mut pending_regions = Vec::new();
         let mut clips = Vec::new();
         for (source_index, region) in speech.iter().enumerate() {
@@ -190,7 +172,7 @@ impl<'a> BatchDiarizer<'a> {
             .map(|region| region.embedding.clone())
             .collect();
         if embeddings.is_empty() {
-            return Diarization {
+            return SpeakerTimeline {
                 turns: Vec::new(),
                 centroids: Vec::new(),
             };
@@ -217,7 +199,7 @@ impl<'a> BatchDiarizer<'a> {
         let centroids = speaker_centroids(&labels, &embeddings);
         let turn_regions = labeled_turn_regions(speech, &embedded_regions, &labels);
         let turns = build_speaker_turns(&turn_regions, centroids.len());
-        Diarization { turns, centroids }
+        SpeakerTimeline { turns, centroids }
     }
 }
 

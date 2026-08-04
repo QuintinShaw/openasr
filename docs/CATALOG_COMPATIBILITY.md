@@ -71,6 +71,11 @@ the signing keys, and the epoch/signature verification math are untouched.
   `CatalogSignatureManifest` / `CatalogSignature` -- deliberately keeps
   `deny_unknown_fields`: that is trust-boundary data, not catalog business
   data, and stays strict.)
+- **Unknown speaker/timestamp source values.** `CatalogSpeakerSource` and
+  `CatalogWordTimestampSource` also carry `Unknown`, but these descriptive
+  dependency-planning fields degrade conservatively instead of hiding the ASR
+  model: clients plan the external segmenter and forced aligner unless the
+  signed value is an explicitly recognized `native`.
 
 ### Epoch floor at boot (new in this PR, narrowly scoped)
 

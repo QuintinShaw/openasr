@@ -180,23 +180,25 @@ fn decode_segments(activity: &[u8], frames: usize) -> Vec<SpeakerTurn> {
     let time = |frame: usize| frame as f64 * FRAME_STRIDE_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
     let mut turns = Vec::new();
     for speaker in 0..LOCAL_SPEAKERS {
-        let mut start = None;
-        let mut overlap = false;
+        let mut active_run: Option<(usize, bool)> = None;
         for frame in 0..frames {
             let row = &activity[frame * LOCAL_SPEAKERS..(frame + 1) * LOCAL_SPEAKERS];
-            if row[speaker] != 0 {
-                start.get_or_insert(frame);
-                overlap |= row.iter().filter(|&&value| value != 0).count() > 1;
-            } else if let Some(begin) = start.take() {
-                turns.push(SpeakerTurn {
-                    range: TimeRange::new(time(begin), time(frame)),
-                    speaker: SpeakerId(speaker as u32),
-                    overlap,
-                });
-                overlap = false;
+            let speaker_active = row[speaker] != 0;
+            let overlap = speaker_active && row.iter().filter(|&&value| value != 0).count() > 1;
+            match active_run {
+                None if speaker_active => active_run = Some((frame, overlap)),
+                Some((begin, run_overlap)) if !speaker_active || overlap != run_overlap => {
+                    turns.push(SpeakerTurn {
+                        range: TimeRange::new(time(begin), time(frame)),
+                        speaker: SpeakerId(speaker as u32),
+                        overlap: run_overlap,
+                    });
+                    active_run = speaker_active.then_some((frame, overlap));
+                }
+                _ => {}
             }
         }
-        if let Some(begin) = start {
+        if let Some((begin, overlap)) = active_run {
             turns.push(SpeakerTurn {
                 range: TimeRange::new(time(begin), time(frames)),
                 speaker: SpeakerId(speaker as u32),

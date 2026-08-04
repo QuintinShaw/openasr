@@ -676,27 +676,29 @@ fn decode_segments(logp: &[f32], frames: usize) -> Vec<SpeakerTurn> {
     let time = |frame: usize| frame as f64 * FRAME_STEP_SAMPLES / SAMPLE_RATE_HZ as f64;
     let mut turns = Vec::new();
     for speaker in 0..MAX_LOCAL_SPEAKERS {
-        let bit = 1u8 << speaker;
-        let mut start = None;
-        let mut overlapped = false;
+        let bit = 1_u8 << speaker;
+        let mut active_run: Option<(usize, bool)> = None;
         for (frame, &slots) in active.iter().enumerate() {
-            if slots & bit != 0 {
-                start.get_or_insert(frame);
-                overlapped |= slots.count_ones() > 1;
-            } else if let Some(begin) = start.take() {
-                turns.push(SpeakerTurn {
-                    range: TimeRange::new(time(begin), time(frame)),
-                    speaker: SpeakerId(speaker as u32),
-                    overlap: overlapped,
-                });
-                overlapped = false;
+            let speaker_active = slots & bit != 0;
+            let overlap = speaker_active && slots.count_ones() > 1;
+            match active_run {
+                None if speaker_active => active_run = Some((frame, overlap)),
+                Some((begin, run_overlap)) if !speaker_active || overlap != run_overlap => {
+                    turns.push(SpeakerTurn {
+                        range: TimeRange::new(time(begin), time(frame)),
+                        speaker: SpeakerId(speaker as u32),
+                        overlap: run_overlap,
+                    });
+                    active_run = speaker_active.then_some((frame, overlap));
+                }
+                _ => {}
             }
         }
-        if let Some(begin) = start {
+        if let Some((begin, overlap)) = active_run {
             turns.push(SpeakerTurn {
                 range: TimeRange::new(time(begin), time(frames)),
                 speaker: SpeakerId(speaker as u32),
-                overlap: overlapped,
+                overlap,
             });
         }
     }
@@ -725,10 +727,12 @@ mod decode_tests {
             .iter()
             .filter(|turn| turn.speaker == SpeakerId(1))
             .collect();
-        assert_eq!(s0.len(), 1);
-        assert_eq!(s1.len(), 1);
-        assert!(s0[0].overlap);
+        assert_eq!(s0.len(), 2);
+        assert_eq!(s1.len(), 2);
+        assert!(!s0[0].overlap);
+        assert!(s0[1].overlap);
         assert!(s1[0].overlap);
+        assert!(!s1[1].overlap);
     }
 
     #[test]

@@ -105,3 +105,4 @@ python3 "$CATALOG_PY" write-language-labels "$REPO_ROOT/model-registry/catalog.j
 # for packs that are otherwise unchanged.
 log "refreshing catalog speaker-source map"
 python3 "$CATALOG_PY" write-speaker-sources "$REPO_ROOT/model-registry/catalog.json"
+python3 "$CATALOG_PY" write-word-timestamp-sources "$REPO_ROOT/model-registry/catalog.json"

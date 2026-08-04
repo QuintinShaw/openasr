@@ -74,6 +74,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             recommended: false,
             upstream_release_date: None,
             speaker_source: None,
+            word_timestamp_source: None,
             emits_punctuation: None,
             prose: None,
             prose_locales: None,

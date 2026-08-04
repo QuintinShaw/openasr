@@ -926,10 +926,19 @@ pub(super) fn ensure_cli_diarization_packs_installed(
     backend: BackendKind,
     model_pack_path: Option<&Path>,
     diarize: bool,
+    consent: &crate::consent::PullConsent,
 ) -> Result<()> {
     if !diarize || backend != BackendKind::Native || diarization_supported(backend, model_pack_path)
     {
         return Ok(());
+    }
+
+    if consent.offline {
+        return Err(crate::consent::CliExit::new(
+            crate::consent::ExitCode::ModelNotInstalled,
+            "Speaker diarization capability packs are not installed and OpenASR is offline.\nRun: openasr pull redimnet2-b6 && openasr pull pyannote-segmentation-3.0",
+        )
+        .into());
     }
 
     let home = openasr_home()?;
@@ -1000,12 +1009,29 @@ pub(super) fn ensure_word_timestamps_alignment_supported(
 pub(super) fn ensure_cli_word_timestamps_pack_installed(
     native_execution_services: &Arc<NativeExecutionServices>,
     backend: BackendKind,
+    model_pack_path: Option<&Path>,
+    diarize: bool,
     word_timestamps_mode: Option<WordTimestampsMode>,
+    consent: &crate::consent::PullConsent,
 ) -> Result<()> {
-    if !matches!(word_timestamps_mode, Some(WordTimestampsMode::Aligned))
-        || backend != BackendKind::Native
-    {
+    let explicit_alignment = matches!(word_timestamps_mode, Some(WordTimestampsMode::Aligned));
+    let voice_id_alignment = diarize
+        && model_pack_path
+            .and_then(openasr_core::native_runtime_model_adapter_for_path)
+            .is_some_and(|adapter| adapter.requires_forced_aligner_for_voice_id());
+    if (!explicit_alignment && !voice_id_alignment) || backend != BackendKind::Native {
         return Ok(());
+    }
+    if openasr_core::word_timestamp_forced_aligner_available() {
+        return Ok(());
+    }
+
+    if consent.offline {
+        return Err(crate::consent::CliExit::new(
+            crate::consent::ExitCode::ModelNotInstalled,
+            "The Qwen3 forced-alignment capability pack is not installed and OpenASR is offline.\nRun: openasr pull qwen3-forced-aligner-0.6b:q4_k",
+        )
+        .into());
     }
 
     let home = openasr_home()?;
@@ -1837,20 +1863,95 @@ mod tests {
 
         // Neither absent nor approximate ever touches the catalog/network.
         let execution_services = test_native_execution_services();
-        ensure_cli_word_timestamps_pack_installed(&execution_services, BackendKind::Native, None)
-            .expect("no word-timestamps request never installs a pack");
         ensure_cli_word_timestamps_pack_installed(
             &execution_services,
             BackendKind::Native,
+            None,
+            false,
+            None,
+            &crate::consent::PullConsent::default(),
+        )
+        .expect("no word-timestamps request never installs a pack");
+        ensure_cli_word_timestamps_pack_installed(
+            &execution_services,
+            BackendKind::Native,
+            None,
+            false,
             Some(WordTimestampsMode::Approximate),
+            &crate::consent::PullConsent::default(),
         )
         .expect("approximate word timestamps never install the forced-aligner pack");
         ensure_cli_word_timestamps_pack_installed(
             &execution_services,
             BackendKind::Mock,
+            None,
+            false,
             Some(WordTimestampsMode::Aligned),
+            &crate::consent::PullConsent::default(),
         )
         .expect("the mock backend never needs the native-only forced-aligner pack");
+    }
+
+    #[test]
+    fn offline_diarization_never_attempts_capability_pack_install() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _models_dir = EnvVarRestore::remove("OPENASR_MODELS_DIR");
+        let _redimnet_pack = EnvVarRestore::remove("OPENASR_REDIMNET_PACK");
+        let _pyannote_pack = EnvVarRestore::remove("OPENASR_PYANNOTE_PACK");
+        let _diarizen_pack = EnvVarRestore::remove("OPENASR_DIARIZEN_PACK");
+        let consent = crate::consent::PullConsent {
+            offline: true,
+            ..Default::default()
+        };
+
+        let error = ensure_cli_diarization_packs_installed(
+            &test_native_execution_services(),
+            BackendKind::Native,
+            None,
+            true,
+            &consent,
+        )
+        .expect_err("offline diarization must fail before constructing a downloader");
+
+        let exit = error
+            .downcast_ref::<crate::consent::CliExit>()
+            .expect("offline capability failure must preserve the stable CLI exit contract");
+        assert_eq!(exit.code, crate::consent::ExitCode::ModelNotInstalled);
+        assert!(exit.message.contains("OpenASR is offline"));
+        assert!(exit.message.contains("redimnet2-b6"));
+        assert!(exit.message.contains("pyannote-segmentation-3.0"));
+    }
+
+    #[test]
+    fn offline_aligned_timestamps_never_attempt_capability_pack_install() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _models_dir = EnvVarRestore::remove("OPENASR_MODELS_DIR");
+        let _aligner_pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let consent = crate::consent::PullConsent {
+            offline: true,
+            ..Default::default()
+        };
+
+        let error = ensure_cli_word_timestamps_pack_installed(
+            &test_native_execution_services(),
+            BackendKind::Native,
+            None,
+            false,
+            Some(WordTimestampsMode::Aligned),
+            &consent,
+        )
+        .expect_err("offline aligned timestamps must fail before constructing a downloader");
+
+        let exit = error
+            .downcast_ref::<crate::consent::CliExit>()
+            .expect("offline capability failure must preserve the stable CLI exit contract");
+        assert_eq!(exit.code, crate::consent::ExitCode::ModelNotInstalled);
+        assert!(exit.message.contains("OpenASR is offline"));
+        assert!(exit.message.contains("qwen3-forced-aligner-0.6b:q4_k"));
     }
 
     #[test]

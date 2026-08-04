@@ -75,26 +75,32 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   requests against a Dolphin pack yield an empty word list rather than an error.
   SenseVoice likewise returns an empty word list: its CTC frames sit on a 60 ms
   low-frame-rate grid behind 4 prompt frames, so per-word times would be
-  fabricated precision rather than acoustic timestamps. FireRedASR-AED also
-  returns an empty word list -- its attention-based encoder-decoder has no
-  alignment head exposed yet, so `--word-timestamps` requests yield a
-  segment-level span rather than fabricated per-word times.
+  fabricated precision rather than acoustic timestamps. FireRedASR-AED,
+  FireRed2-LLM, FunASR-Nano, MiMo-ASR, Granite Speech, and MOSS likewise return
+  empty word lists: those executors expose no usable word-alignment head. The
+  signed catalog records this as `word_timestamp_source = "forced_aligner"`;
+  families that populate word anchors declare `native`.
 - Word-timestamp refinement (`--word-timestamps=aligned` / API
   `timestamp_granularities=word_aligned`) is an opt-in tier on top of the
   approximate timestamps above: it re-runs the finished transcript and the full
   source audio through the Qwen3-ForcedAligner-0.6B capability pack and
   replaces each segment's word spans with the aligner's own output. Passing
-  `=aligned` is the consent to install the pack (mirroring `--diarize`'s
-  ReDimNet2-B6 auto-install); the native backend never installs it silently
-  otherwise, and the server never auto-installs it at all (operator-gated pull
-  only). It is native-backend-only, requires `--word-timestamps` semantics
-  implicitly (word timestamps are always emitted for `aligned`), and does not
+  `=aligned` is explicit consent to install the pack. File Voice ID also
+  requires this pack automatically for an external ASR whose catalog
+  `word_timestamp_source` is `forced_aligner`: Desktop/CLI preflight the
+  dependency, while the server remains operator-gated and never downloads.
+  At runtime the aligner only executes when the decoded transcript actually
+  contains a coarse segment crossing multiple speaker turns. It runs before
+  speaker attribution, so its anchors are used to split text exactly; the
+  internally requested word list is stripped again unless the caller asked
+  for word timestamps. It is native-backend-only and does not
   yet support Japanese or Korean transcripts -- the reference routes those
   through external morphological segmenters (`nagisa`/`soynlp`) that have not
   been ported, so an `aligned` request against ja/ko text fails closed with a
-  typed error rather than mis-tokenizing. Every other family keeps its
-  approximate timestamps unchanged; `aligned` only affects the words replaced
-  by the aligner's output, never segment text or speaker attribution.
+  typed error rather than mis-tokenizing. Other families keep their approximate
+  timestamps unchanged. Explicit `aligned` only refines words; the automatic
+  Voice ID path additionally consumes those words to assign each text run to
+  the canonical speaker timeline.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no public per-provider/per-device pinning surface such as

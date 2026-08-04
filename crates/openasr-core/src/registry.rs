@@ -290,6 +290,11 @@ pub struct CatalogModel {
     /// dependencies without maintaining model-id allowlists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_source: Option<CatalogSpeakerSource>,
+    /// Where this ASR family obtains usable word anchors. This mirrors the
+    /// architecture descriptor so clients can install a forced-aligner pack
+    /// before starting external speaker attribution instead of failing late.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub word_timestamp_source: Option<CatalogWordTimestampSource>,
     // Whether the model's transcripts include punctuation -- an architecture/
     // training-corpus property, not a per-release editorial choice. This field
     // is a read-only wire mirror, not an independent declaration: the single
@@ -339,6 +344,17 @@ pub enum CatalogSpeakerSource {
     External,
     /// Future source values remain parseable; clients conservatively plan the
     /// external dependency set unless they explicitly recognize `Native`.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogWordTimestampSource {
+    Native,
+    ForcedAligner,
+    /// Future values remain parseable. Clients must conservatively require
+    /// the aligner unless they explicitly recognize `Native`.
     #[serde(other)]
     Unknown,
 }
