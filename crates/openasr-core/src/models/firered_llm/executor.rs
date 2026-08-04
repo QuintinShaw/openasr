@@ -68,6 +68,7 @@ use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
 use super::decode_prompt::build_firered_llm_decode_prompt;
 use super::llm_transformer::FireRedLlmDecoderRuntime;
 use super::runtime_contract::{
+    FIRERED_LLM_CMVN_INV_STDDEV_TENSOR, FIRERED_LLM_CMVN_NEG_MEAN_TENSOR,
     parse_firered_llm_adapter_metadata, parse_firered_llm_decoder_metadata,
     parse_firered_llm_encoder_metadata,
 };
@@ -113,8 +114,8 @@ type FireRedLlmDecoderRuntimeActor =
 
 const FIRERED_LLM_EXECUTOR_ID: &str = crate::arch::FIRERED_LLM_EXECUTOR_COMPONENT_ID;
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
-const CMVN_NEG_MEAN_TENSOR: &str = "frontend.cmvn.neg_mean";
-const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
+const CMVN_NEG_MEAN_TENSOR: &str = FIRERED_LLM_CMVN_NEG_MEAN_TENSOR;
+const CMVN_INV_STDDEV_TENSOR: &str = FIRERED_LLM_CMVN_INV_STDDEV_TENSOR;
 /// Upstream single-utterance hard cap (`fireredasr2` README: "single 40s max
 /// input"). The executor fails closed rather than silently truncating or
 /// running an out-of-distribution multi-minute prefill; longer audio is the

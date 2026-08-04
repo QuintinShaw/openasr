@@ -71,8 +71,9 @@ use crate::ggml_runtime::{
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
-    decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_file_bytes,
-    read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
+    decode_safetensors_payload_as_f32, encode_f16_bits_le, load_gpt2_bpe_merges,
+    load_gpt2_bpe_vocab_tokens, pad_gpt2_bpe_vocab_tokens, read_source_json_file,
+    tensor_element_count, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
@@ -87,9 +88,6 @@ use super::tensor_names::{
 const SOURCE_ENCODER_ADAPTER_SAFETENSORS: &str = "model.safetensors";
 const SOURCE_CMVN_TXT: &str = "cmvn.txt";
 const SOURCE_QWEN2_CONFIG_JSON: &str = "config.json";
-const SOURCE_QWEN2_VOCAB_JSON: &str = "vocab.json";
-const SOURCE_QWEN2_MERGES_TXT: &str = "merges.txt";
-const SOURCE_QWEN2_TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 
 const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
@@ -212,17 +210,6 @@ struct Qwen2ConfigJson {
     max_position_embeddings: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenizerConfigJson {
-    #[serde(default)]
-    added_tokens_decoder: BTreeMap<String, AddedTokenEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AddedTokenEntry {
-    content: String,
-}
-
 pub fn convert_local_firered_llm_source_to_runtime_pack(
     request: &FireRedLlmImportRequest,
 ) -> Result<FireRedLlmImportResult, LocalSourceImportError> {
@@ -265,9 +252,9 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
     let llm_tensors = build_llm_runtime_tensors(&qwen2_safetensors, request.quantization)?;
     tensors.extend(llm_tensors);
 
-    let mut tokens = load_vocab_tokens(&request.qwen2_metadata_source_root)?;
-    let merges = load_merges(&request.qwen2_metadata_source_root)?;
-    patch_added_tokens(&request.qwen2_metadata_source_root, &mut tokens)?;
+    let mut tokens =
+        load_gpt2_bpe_vocab_tokens(&request.qwen2_metadata_source_root, "firered-llm")?;
+    let merges = load_gpt2_bpe_merges(&request.qwen2_metadata_source_root, "firered-llm")?;
     if tokens.len() != SPEECH_TOKEN_ID as usize {
         return Err(validate_error(format!(
             "firered-llm expected the official Qwen2 tokenizer to have exactly {} \
@@ -277,14 +264,7 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
         )));
     }
     tokens.push(SPEECH_TOKEN_TEXT.to_string());
-    if tokens.len() < decoder_hparams.vocab_size {
-        tokens.resize_with(decoder_hparams.vocab_size, String::new);
-    }
-    for (index, token) in tokens.iter_mut().enumerate() {
-        if token.is_empty() {
-            *token = format!("<unused_{index}>");
-        }
-    }
+    pad_gpt2_bpe_vocab_tokens(&mut tokens, decoder_hparams.vocab_size, "firered-llm")?;
 
     let metadata = firered_llm_runtime_gguf_metadata(
         &encoder_hparams,
@@ -1200,74 +1180,6 @@ fn derive_and_validate_decoder_hparams(
         vocab_size: embed_vocab,
         max_positions,
     })
-}
-
-// --- Qwen2 tokenizer (vocab.json + merges.txt + added tokens) -------------
-
-fn load_vocab_tokens(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
-    let vocab: BTreeMap<String, usize> =
-        read_source_json_file(source_root, SOURCE_QWEN2_VOCAB_JSON)?;
-    if vocab.is_empty() {
-        return Err(validate_error(
-            "firered-llm qwen2 vocab.json cannot be empty",
-        ));
-    }
-    let mut pairs = vocab.into_iter().collect::<Vec<_>>();
-    pairs.sort_by_key(|(_, token_id)| *token_id);
-    let max_id = pairs.last().map(|(_, token_id)| *token_id).ok_or_else(|| {
-        validate_error("firered-llm qwen2 vocab.json cannot determine max token id")
-    })?;
-    let mut tokens = vec![String::new(); max_id + 1];
-    for (token, token_id) in pairs {
-        tokens[token_id] = token;
-    }
-    Ok(tokens)
-}
-
-fn load_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
-    let path = source_root.join(SOURCE_QWEN2_MERGES_TXT);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let bytes = read_source_file_bytes(source_root, SOURCE_QWEN2_MERGES_TXT)?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| {
-        validate_error(format!(
-            "firered-llm qwen2 merges.txt is not valid UTF-8 ({}): {error}",
-            path.display()
-        ))
-    })?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-fn patch_added_tokens(
-    source_root: &Path,
-    tokens: &mut Vec<String>,
-) -> Result<(), LocalSourceImportError> {
-    let path = source_root.join(SOURCE_QWEN2_TOKENIZER_CONFIG_JSON);
-    if !path.exists() {
-        return Ok(());
-    }
-    let cfg: TokenizerConfigJson =
-        read_source_json_file(source_root, SOURCE_QWEN2_TOKENIZER_CONFIG_JSON)?;
-    for (token_id_str, entry) in cfg.added_tokens_decoder {
-        let token_id = token_id_str.parse::<usize>().map_err(|error| {
-            validate_error(format!(
-                "invalid firered-llm qwen2 tokenizer added token id '{}' in {}: {error}",
-                token_id_str,
-                path.display()
-            ))
-        })?;
-        if token_id >= tokens.len() {
-            tokens.resize_with(token_id + 1, String::new);
-        }
-        tokens[token_id] = entry.content;
-    }
-    Ok(())
 }
 
 // --- metadata ---------------------------------------------------------

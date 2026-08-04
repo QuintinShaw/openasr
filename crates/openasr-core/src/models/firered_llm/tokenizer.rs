@@ -1,7 +1,8 @@
 //! firered-llm tokenizer: the official Qwen2-7B-Instruct byte-level BPE
 //! vocabulary (`tokenizer.ggml.{model,tokens,merges}`, baked in verbatim by
-//! `package_import`, including the literal ChatML special-token strings --
-//! see `package_import`'s `patch_added_tokens`), reusing the same shared
+//! `package_import`, including the literal ChatML special-token strings that
+//! the shared `local_source_import` GPT-2 BPE loader overlays from
+//! `tokenizer_config.json`), reusing the same shared
 //! `models::gpt2_bpe` engine `qwen::tokenizer` uses (there is nothing
 //! Qwen2/Qwen3-specific about byte-level BPE encode/decode).
 
