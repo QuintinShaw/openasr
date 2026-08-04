@@ -703,6 +703,115 @@ impl TinyGgufFixtureSpec {
         spec
     }
 
+    /// Metadata-complete moss-transcribe-diarize routing fixture. As with the
+    /// Moonshine/Qwen counterparts, its placeholder tensor deliberately proves
+    /// that failure happens inside the selected family executor rather than in
+    /// topology discovery.
+    pub fn moss_td_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::arch::MOSS_TD_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::MOSS_TD_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::MOSS_TD_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::MOSS_TD_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
+            ("moss_td.encoder.n_layers", "1"),
+            ("moss_td.encoder.d_model", "16"),
+            ("moss_td.encoder.n_heads", "2"),
+            ("moss_td.encoder.ffn_dim", "32"),
+            ("moss_td.encoder.n_mels", "8"),
+            ("moss_td.encoder.max_source_positions", "20"),
+            ("moss_td.adaptor.merge_size", "2"),
+            ("moss_td.adaptor.input_dim", "32"),
+            ("moss_td.llm.n_layers", "1"),
+            ("moss_td.llm.d_model", "16"),
+            ("moss_td.llm.ffn_dim", "32"),
+            ("moss_td.llm.n_heads", "2"),
+            ("moss_td.llm.n_kv_heads", "1"),
+            ("moss_td.llm.head_dim", "8"),
+            ("moss_td.llm.vocab_size", "64"),
+            ("moss_td.llm.max_positions", "128"),
+            ("moss_td.llm.audio_start_token_id", "5"),
+            ("moss_td.llm.audio_end_token_id", "6"),
+            ("moss_td.llm.audio_pad_token_id", "7"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Fully verifier-ready one-layer moss-transcribe-diarize skeleton. The
+    /// deterministic payloads are not quality fixtures; their shapes exist so
+    /// install, adapter-selection, and capability tests cross the same
+    /// tensor-contract seam as a production pack without borrowing another
+    /// family's route. Every tensor shape is projected from the family's own
+    /// metadata-derived runtime tensor descriptors, so the fixture follows
+    /// contract additions automatically.
+    pub fn moss_td_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::tensor_binding::TensorBindingDescriptorRequirement;
+
+        let mut spec = Self::moss_td_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::moss_transcribe_diarize::runtime_contract::parse_moss_td_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("shared moss-transcribe-diarize fixture metadata must parse");
+        for descriptor in
+            crate::models::moss_transcribe_diarize::runtime_contract::moss_td_runtime_tensor_descriptors(
+                metadata,
+            )
+            .expect("shared moss-transcribe-diarize fixture geometry must expand")
+        {
+            let dims = match descriptor.requirement {
+                TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
+                TensorBindingDescriptorRequirement::VectorLen(len) => vec![len],
+                TensorBindingDescriptorRequirement::NonEmptyVector => vec![2],
+                TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![dim, dim],
+                TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs)
+                | TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(lhs, rhs) => {
+                    vec![lhs, rhs]
+                }
+                TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+                    min_rank,
+                    axis,
+                    dim,
+                } => {
+                    let mut dims = vec![2; min_rank.max(axis.saturating_add(1))];
+                    dims[axis] = dim;
+                    dims
+                }
+            };
+            spec = spec.with_tensor_shape(
+                descriptor.tensor_name,
+                dims.into_iter().map(|dim| dim as u64),
+            );
+        }
+        spec
+    }
+
     /// Metadata-complete X-ASR Zipformer routing fixture. Its placeholder
     /// tensor is deliberately non-runnable: capability and request-gating
     /// tests use it to prove adapter selection before graph construction.
@@ -2454,6 +2563,11 @@ mod tests {
                 "qwen.oasr",
                 TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture"),
                 "qwen",
+            ),
+            (
+                "moss.oasr",
+                TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-fixture"),
+                "moss-transcribe-diarize",
             ),
             (
                 "xasr.oasr",
