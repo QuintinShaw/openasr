@@ -123,9 +123,7 @@ pub(crate) fn cohere_conditioned_default_language() -> &'static str {
         .language_family_hint
     {
         LanguageFamilyHint::SelectsViaPrompt { default_language } => default_language,
-        other => unreachable!(
-            "cohere language hint must remain SelectsViaPrompt, found {other:?}"
-        ),
+        other => unreachable!("cohere language hint must remain SelectsViaPrompt, found {other:?}"),
     }
 }
 
