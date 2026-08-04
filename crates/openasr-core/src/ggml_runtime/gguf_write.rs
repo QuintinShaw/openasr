@@ -64,10 +64,21 @@ pub(crate) fn build_provenance_from_env() -> Result<Option<(String, GgufWriteVal
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `F32` carries an IEEE float. Callers compare values with `==`
+// (PartialEq) when inheriting metadata from an existing pack; they never hash
+// or order them.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GgufWriteValue {
     String(String),
     U32(u32),
+    // The reader parses native f32/bool KV entries (external pack tooling
+    // bakes hparams that way), so the write choke point can spell them too.
+    // No Rust importer selects them yet -- available until one does (same
+    // precedent as the reserved Q5_K/Q6_K tensor types below).
+    #[allow(dead_code)]
+    F32(f32),
+    #[allow(dead_code)]
+    Bool(bool),
     StringArray(Vec<String>),
     U32Array(Vec<u32>),
 }
@@ -126,6 +137,8 @@ pub(crate) enum GgufWriteError {
     PathContainsNul { path: String },
     #[error("gguf string field '{field}' cannot contain NUL bytes")]
     StringContainsNul { field: &'static str },
+    #[error("gguf metadata key '{key}' has a non-finite f32 value")]
+    NonFiniteMetadataValue { key: String },
     #[error("gguf metadata key cannot be empty")]
     EmptyMetadataKey,
     #[error("gguf metadata key '{key}' is duplicated")]
@@ -471,6 +484,19 @@ fn set_metadata_value(
         GgufWriteValue::U32(value) => unsafe {
             ffi::gguf_set_val_u32(ctx, key_cstring.as_ptr(), *value);
         },
+        GgufWriteValue::F32(value) => {
+            if !value.is_finite() {
+                return Err(GgufWriteError::NonFiniteMetadataValue {
+                    key: key.to_string(),
+                });
+            }
+            unsafe {
+                ffi::gguf_set_val_f32(ctx, key_cstring.as_ptr(), *value);
+            }
+        }
+        GgufWriteValue::Bool(value) => unsafe {
+            ffi::gguf_set_val_bool(ctx, key_cstring.as_ptr(), *value);
+        },
         GgufWriteValue::StringArray(values) => {
             let value_cstrings = values
                 .iter()
@@ -753,5 +779,56 @@ mod tests {
             Some(TEST_COMMIT)
         );
         assert_eq!(metadata.len(), 1, "caller metadata map must not be mutated");
+    }
+
+    /// The reader parses native GGUF f32/bool KV types (external pack tooling
+    /// bakes hparams that way), so the single write choke point must be able
+    /// to emit them too -- a fixture/pack writer that can only spell strings
+    /// and u32 cannot reproduce a real pack's metadata faithfully.
+    #[test]
+    fn f32_and_bool_metadata_round_trip_as_native_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "family.rope.freq_base".to_string(),
+            GgufWriteValue::F32(640000.0),
+        );
+        metadata.insert(
+            "family.attention.qkv_bias".to_string(),
+            GgufWriteValue::Bool(true),
+        );
+        metadata.insert(
+            "family.attention.qk_norm".to_string(),
+            GgufWriteValue::Bool(false),
+        );
+
+        with_test_process_env([(BUILD_COMMIT_ENV, None)], || {
+            write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
+        });
+
+        let read = read_gguf_metadata(&path).expect("read pack metadata");
+        assert_eq!(read.get_f32("family.rope.freq_base"), Some(640000.0));
+        assert_eq!(read.get_bool("family.attention.qkv_bias"), Some(true));
+        assert_eq!(read.get_bool("family.attention.qk_norm"), Some(false));
+        // Native typing must not leak into the scalar-string view.
+        assert_eq!(read.get_string("family.rope.freq_base"), None);
+    }
+
+    #[test]
+    fn non_finite_f32_metadata_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("family.bad".to_string(), GgufWriteValue::F32(f32::NAN));
+
+        let error = with_test_process_env([(BUILD_COMMIT_ENV, None)], || {
+            write_gguf_file_v0(&path, &metadata, &tensors).expect_err("must fail closed")
+        });
+        assert!(
+            matches!(error, GgufWriteError::NonFiniteMetadataValue { ref key } if key == "family.bad"),
+            "unexpected error: {error}"
+        );
+        assert!(!path.exists(), "a rejected write must not expose an output");
     }
 }

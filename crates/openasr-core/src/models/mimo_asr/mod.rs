@@ -6,11 +6,15 @@
 //! backbone (qkv-bias, no QK-norm, reusing `qwen::llm_transformer`'s
 //! shared machinery) driven through the ONE shared greedy decode loop. MIT.
 //!
-//! Conversion (`.oasr` packing) is Python-only tooling
-//! (`tooling/mimo-asr/convert_mimo_asr.py`), not a Rust importer -- unlike
-//! `firered_llm`, which has its own `package_import.rs`. This module is the
-//! P2.2 runtime only: mel/encoder/RVQ/input-local/LLM graphs, tokenizer,
-//! decode-policy registration, and the dedicated executor.
+//! Pack import surface: this family is the inventory's
+//! `OpenAsrPackImportSurface::ExternalTooling` case -- `.oasr` packing is
+//! Python-only tooling (`tooling/mimo-asr/convert_mimo_asr.py`), not a Rust
+//! `CoreConvert` importer. The split stops at tensor production: the external
+//! script writes the full public envelope (routing keys, tokenizer id, build
+//! provenance), and every pack it emits still passes the SAME production
+//! `PackVerifier` + this module's `runtime_contract` validator (metadata +
+//! tensor + tokenizer) at publish staging, install-time admission, and the
+//! direct run ingress -- there is no bypass and no second, weaker gate.
 
 mod audio_tokenizer_graph;
 pub(crate) mod capacity;

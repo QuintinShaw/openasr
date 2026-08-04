@@ -390,7 +390,7 @@ source_revision = "main"
 needs_license_flags = false
 extra_sources = ["XiaomiMiMo/MiMo-Audio-Tokenizer@main:tokenizer-src"]
 required_download_files = ["config.json", "model.safetensors.index.json", "model*.safetensors", "tokenizer-src/model.safetensors"]
-external_converter = "python3 tooling/mimo-asr/convert_mimo_asr.py --main-dir {src} --tokenizer {src}/tokenizer-src/model.safetensors --out-dir {packs_dir} --package-id {registry_id} --quant {quant}"
+external_converter = "python3 tooling/mimo-asr/convert_mimo_asr.py --main-dir {src} --tokenizer {src}/tokenizer-src/model.safetensors --out {out} --package-id {registry_id} --quant {quant}"
 
 # Qwen3-ForcedAligner-0.6B: shares its thinker (audio encoder + LM) tensor
 # layout byte-for-byte with qwen3-asr (see

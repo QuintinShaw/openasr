@@ -29,6 +29,8 @@ const GGUF_VERSION_V3: u32 = 3;
 const GGUF_TYPE_STRING: i32 = 8;
 const GGUF_TYPE_ARRAY: i32 = 9;
 const GGUF_TYPE_U32: i32 = 4;
+const GGUF_TYPE_F32: i32 = 6;
+const GGUF_TYPE_BOOL: i32 = 7;
 const GGML_TYPE_F32: i32 = 0;
 const GGML_TYPE_F16: i32 = 1;
 const GGML_TYPE_I32: i32 = 26;
@@ -167,9 +169,13 @@ enum TinyGgufPayloadProfile {
     NumericallyStableDeepGraphV1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// No `Eq`: `metadata_f32s` carries IEEE floats. Fixtures compare with `==`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TinyGgufFixtureSpec {
     pub metadata: BTreeMap<String, String>,
+    pub metadata_u32s: BTreeMap<String, u32>,
+    pub metadata_f32s: BTreeMap<String, f32>,
+    pub metadata_bools: BTreeMap<String, bool>,
     pub metadata_string_arrays: BTreeMap<String, Vec<String>>,
     pub metadata_u32_arrays: BTreeMap<String, Vec<u32>>,
     pub tensor_names: Vec<String>,
@@ -191,6 +197,9 @@ impl TinyGgufFixtureSpec {
             .collect::<BTreeMap<_, _>>();
         Self {
             metadata,
+            metadata_u32s: BTreeMap::new(),
+            metadata_f32s: BTreeMap::new(),
+            metadata_bools: BTreeMap::new(),
             metadata_string_arrays: BTreeMap::new(),
             metadata_u32_arrays: BTreeMap::new(),
             tensor_names,
@@ -1242,6 +1251,26 @@ impl TinyGgufFixtureSpec {
 
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Native GGUF u32 scalar metadata (families whose packs bake integers as
+    /// native u32 -- e.g. the mimo-asr external converter -- need faithful
+    /// fixtures; string-encoded integers are a distinct encoding).
+    pub fn with_u32_metadata(mut self, key: impl Into<String>, value: u32) -> Self {
+        self.metadata_u32s.insert(key.into(), value);
+        self
+    }
+
+    /// Native GGUF f32 scalar metadata.
+    pub fn with_f32_metadata(mut self, key: impl Into<String>, value: f32) -> Self {
+        self.metadata_f32s.insert(key.into(), value);
+        self
+    }
+
+    /// Native GGUF bool scalar metadata.
+    pub fn with_bool_metadata(mut self, key: impl Into<String>, value: bool) -> Self {
+        self.metadata_bools.insert(key.into(), value);
         self
     }
 
@@ -2637,6 +2666,9 @@ pub fn write_tiny_gguf_runtime_source(
     bytes.extend_from_slice(&(tensor_entries.len() as u64).to_le_bytes());
     bytes.extend_from_slice(
         &((spec.metadata.len()
+            + spec.metadata_u32s.len()
+            + spec.metadata_f32s.len()
+            + spec.metadata_bools.len()
             + spec.metadata_string_arrays.len()
             + spec.metadata_u32_arrays.len()) as u64)
             .to_le_bytes(),
@@ -2645,6 +2677,21 @@ pub fn write_tiny_gguf_runtime_source(
         push_gguf_string(&mut bytes, key);
         bytes.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
         push_gguf_string(&mut bytes, value);
+    }
+    for (key, value) in &spec.metadata_u32s {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_U32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for (key, value) in &spec.metadata_f32s {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_F32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for (key, value) in &spec.metadata_bools {
+        push_gguf_string(&mut bytes, key);
+        bytes.extend_from_slice(&GGUF_TYPE_BOOL.to_le_bytes());
+        bytes.extend_from_slice(&[u8::from(*value)]);
     }
     for (key, values) in &spec.metadata_string_arrays {
         push_gguf_string(&mut bytes, key);

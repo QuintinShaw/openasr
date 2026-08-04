@@ -1,18 +1,23 @@
 # MiMo-V2.5-ASR .oasr GGUF manifest (for P2.2 runtime)
-# generated from mimo-v2.5-asr-q8_0.oasr by tooling/mimo-asr/convert_mimo_asr.py
+# key/value contract of the packs emitted by tooling/mimo-asr/convert_mimo_asr.py
+# (the q8_0 tier; the fp16 tier differs only in openasr.pack.quant and tensor types)
 
 ## Metadata keys (key = value)
 GGUF.version = 3
 GGUF.tensor_count = 1016
-GGUF.kv_count = 72
+GGUF.kv_count = 73
 general.architecture = mimo-asr
 openasr.package.version = 1
 openasr.model.family = mimo-asr
 openasr.model.architecture = mimo-asr
-openasr.model.id = mimo-v2.5-asr-q8_0
+openasr.model.id = mimo-v2.5-asr:q8_0
 openasr.audio.frontend = mimo-tokenizer-rvq-v0
 openasr.decode.policy = mimo-asr.greedy.seq2seq.v0
+openasr.tokenizer.id = mimo-asr.gpt2-bpe.v0
 openasr.pack.quant = q8_0
+# openasr.build.commit = <40-hex git sha> -- present only when the build
+# pipeline exported OPENASR_BUILD_COMMIT (fail-closed on a malformed value);
+# absent for an unclaimed-provenance pack.
 tokenizer.ggml.model = gpt2
 tokenizer.ggml.tokens = [151680 strings, official Qwen2 BPE vocab + MiMo's added special tokens]
 tokenizer.ggml.merges = [151291 "a b" byte-pair merge rules]

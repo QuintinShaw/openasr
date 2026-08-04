@@ -902,9 +902,7 @@ unsafe extern "C" {
     pub(crate) fn gguf_set_val_u32(ctx: GgufContextRaw, key: *const c_char, val: u32);
     #[cfg(test)]
     pub(crate) fn gguf_set_val_u64(ctx: GgufContextRaw, key: *const c_char, val: u64);
-    #[cfg(test)]
     pub(crate) fn gguf_set_val_f32(ctx: GgufContextRaw, key: *const c_char, val: f32);
-    #[cfg(test)]
     pub(crate) fn gguf_set_val_bool(ctx: GgufContextRaw, key: *const c_char, val: bool);
     pub(crate) fn gguf_set_val_str(ctx: GgufContextRaw, key: *const c_char, val: *const c_char);
     pub(crate) fn gguf_set_arr_data(

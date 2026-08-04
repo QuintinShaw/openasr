@@ -2,10 +2,19 @@
 """Convert MiMo-V2.5-ASR (main model + MiMo-Audio-Tokenizer encoder) into a single
 OpenASR ``.oasr`` GGUF pack.
 
-This is the stage-2 P2.1 conversion pipeline. It produces a *usable local pack*
-only; runtime family registration, the decode-policy descriptor, and the ggml
-executor land later in P2.2. Nothing here touches the catalog or the model
-registry.
+This is the mimo-asr family's ExternalTooling pack-import surface (the
+architecture inventory's ``OpenAsrPackImportSurface::ExternalTooling`` row
+points at this file). It produces the pack bytes; everything downstream --
+publish staging (``openasr model-pack preflight --stage``), install-time
+content admission, and the direct run ingress -- verifies those bytes through
+the same production ``PackVerifier`` + mimo-asr runtime validator, so a pack
+this script emits is held to the exact same contract as a Rust-imported pack.
+To keep that true the converter must write the full public envelope (the
+``openasr.*`` routing keys, the tokenizer id, and -- when the publish
+pipeline claims provenance -- ``openasr.build.commit``), bake the mel
+filterbank/window and the gpt2 tokenizer (both are runtime-contract tensors/
+metadata, not optional extras), and fail closed instead of emitting a pack
+the runtime contract would reject.
 
 Layout follows the design's "single .oasr = single GGUF, tensor-prefix
 namespaces" decision (mirrors qwen3-asr's ``package_import.rs``):
@@ -41,6 +50,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +70,35 @@ PACKAGE_VERSION = "1"
 MODEL_FAMILY = "mimo-asr"
 AUDIO_FRONTEND = "mimo-tokenizer-rvq-v0"
 DECODE_POLICY = "mimo-asr.greedy.seq2seq.v0"
+# Must equal the inventory row's tokenizer_id
+# (crate::arch::MIMO_ASR_TOKENIZER_ID). PackVerifier adapter selection
+# fail-closes on a present-but-wrong value, so a drift surfaces at the first
+# verification instead of at runtime.
+TOKENIZER_ID = "mimo-asr.gpt2-bpe.v0"
+
+# Build provenance: the same env/semantics as the Rust write choke point
+# (ggml_runtime::gguf_write's build_provenance_from_env). Unset/empty means
+# "no provenance claimed"; a set value must be a 40-hex commit or the write
+# fails closed. The publish pipeline (convert.sh) always exports it.
+BUILD_COMMIT_ENV = "OPENASR_BUILD_COMMIT"
+BUILD_COMMIT_KEY = "openasr.build.commit"
+_BUILD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# The publish lane passes CLI canonical quant tokens (models-publish.toml's
+# ``--quant {quant}`` expands ``quant_token``: fp16 / q8-0 / q4-k). Map them
+# to the canonical pack-quant labels baked into ``openasr.pack.quant``.
+#
+# q4_k is declared but NOT producible here: the gguf Python library only
+# implements legacy-quant (Q4_0..Q8_0) block quantization, and K-quant math
+# belongs to ggml's single source of truth -- it must come from a Rust-side
+# repack/requant seam, not a second Python implementation. Until that seam
+# exists this converter fails closed on q4-k instead of emitting a mislabeled
+# pack.
+QUANT_TOKEN_TO_LABEL = {
+    "fp16": "fp16",
+    "q8-0": "q8_0",
+    "q4-k": "q4_k",
+}
 
 # Special-token ids (from HF added_tokens / special_tokens_map, pinned in P2.0).
 SPECIAL_TOKENS = {
@@ -226,6 +266,27 @@ _TOK_SUB = {
 
 class ConversionError(RuntimeError):
     pass
+
+
+def build_provenance_from_env() -> Optional[str]:
+    """The build-provenance value to bake, read from ``OPENASR_BUILD_COMMIT``.
+
+    Mirrors the Rust write choke point (``ggml_runtime::gguf_write``):
+    unset/empty claims no provenance (returns ``None``); a SET value must be a
+    40-hex git commit sha or the conversion fails closed -- a builder that
+    claims provenance must claim it correctly.
+    """
+    raw = os.environ.get(BUILD_COMMIT_ENV)
+    if raw is None:
+        return None
+    commit = raw.strip().lower()
+    if not commit:
+        return None
+    if not _BUILD_COMMIT_RE.match(commit):
+        raise ConversionError(
+            f"{BUILD_COMMIT_ENV} must be a 40-hex git commit sha, got {raw!r}"
+        )
+    return commit
 
 
 def _split_layer(rest: str, prefix: str) -> tuple[int, str]:
@@ -405,8 +466,9 @@ def build_metadata(
     tok: TokHParams,
     model_id: str,
     quant_label: str,
-    tokens: Optional[list[str]] = None,
-    merges: Optional[list[str]] = None,
+    tokens: list[str],
+    merges: list[str],
+    build_commit: Optional[str] = None,
 ) -> list[MetaItem]:
     m: list[MetaItem] = []
 
@@ -417,24 +479,28 @@ def build_metadata(
     def ua(k, v): m.append(MetaItem(k, "u32_array", [int(x) for x in v]))
     def sa(k, v): m.append(MetaItem(k, "str_array", list(v)))
 
-    # openasr envelope
+    # openasr envelope -- the public routing/identity keys the production
+    # PackVerifier and adapter selection resolve. These must stay byte-equal
+    # to the mimo-asr architecture inventory row; a drift fails closed at the
+    # first verification (adapter selection finds no matching descriptor).
     s("openasr.package.version", PACKAGE_VERSION)
     s("openasr.model.family", MODEL_FAMILY)
     s("openasr.model.architecture", ARCH)
     s("openasr.model.id", model_id)
     s("openasr.audio.frontend", AUDIO_FRONTEND)
     s("openasr.decode.policy", DECODE_POLICY)
+    s("openasr.tokenizer.id", TOKENIZER_ID)
     s("openasr.pack.quant", quant_label)
+    if build_commit is not None:
+        s(BUILD_COMMIT_KEY, build_commit)
 
     # tokenizer (gpt2-style byte-level BPE, the official Qwen2 vocab this
-    # checkpoint fine-tunes on top of -- P2.1 originally shipped this pack
-    # without a baked tokenizer; the P2.2 runtime needs it to build the
-    # ChatML/<|sosp|>/<|eosp|> prompt and decode generated tokens back to
-    # text). Mirrors firered-llm's package_import tokenizer-baking keys.
-    if tokens is not None and merges is not None:
-        s("tokenizer.ggml.model", "gpt2")
-        sa("tokenizer.ggml.tokens", tokens)
-        sa("tokenizer.ggml.merges", merges)
+    # checkpoint fine-tunes on top of). Baking is MANDATORY: the runtime
+    # pack contract rejects a pack without it, so the converter fails closed
+    # up front instead of emitting an uninstallable artifact.
+    s("tokenizer.ggml.model", "gpt2")
+    sa("tokenizer.ggml.tokens", tokens)
+    sa("tokenizer.ggml.merges", merges)
 
     # backbone (36L Qwen2, GQA, qkv-bias, no qk-norm)
     u("mimo.llm.block_count", main.num_hidden_layers)
@@ -670,7 +736,6 @@ def write_pack(
     quant_label: str,
     model_id: str,
     *,
-    bake_mel: bool = True,
     verbose: bool = True,
 ) -> dict:
     import gguf
@@ -680,21 +745,25 @@ def write_pack(
     main = MainHParams.from_config(main_cfg)
     tok = TokHParams.from_config(tok_cfg)
 
-    tokens: Optional[list[str]] = None
-    merges: Optional[list[str]] = None
-    if (main_dir / "vocab.json").exists():
-        tokens, merges = load_tokenizer(main_dir, main.vocab_size)
-        if verbose:
-            print(f"[tokenizer] {len(tokens)} tokens, {len(merges)} merges", flush=True)
-    elif verbose:
-        print(
-            f"[tokenizer] no vocab.json under {main_dir}, skipping tokenizer.ggml.* bake "
-            "(pack will not be runnable by the P2.2 executor)",
-            flush=True,
+    # The runtime pack contract requires the baked tokenizer; a source without
+    # it can only produce an uninstallable pack, so fail closed here.
+    if not (main_dir / "vocab.json").exists():
+        raise ConversionError(
+            f"no vocab.json under {main_dir}: the mimo-asr runtime contract "
+            "requires the baked gpt2 tokenizer, refusing to emit an "
+            "uninstallable pack"
         )
+    tokens, merges = load_tokenizer(main_dir, main.vocab_size)
+    if verbose:
+        print(f"[tokenizer] {len(tokens)} tokens, {len(merges)} merges", flush=True)
+
+    build_commit = build_provenance_from_env()
 
     writer = gguf.GGUFWriter(str(out_path), ARCH, use_temp_file=True)
-    apply_metadata(writer, build_metadata(main, tok, model_id, quant_label, tokens, merges))
+    apply_metadata(
+        writer,
+        build_metadata(main, tok, model_id, quant_label, tokens, merges, build_commit),
+    )
 
     type_counts = {"q8_0": 0, "f16": 0, "f32": 0}
     seen: set[str] = set()
@@ -734,12 +803,14 @@ def write_pack(
         del src
         gc.collect()
 
-    if bake_mel:
-        fb, window = mel_filters_and_window(tok)
-        writer.add_tensor("audiotok.mel_filters", fb, raw_dtype=gguf.GGMLQuantizationType.F32)
-        writer.add_tensor("audiotok.mel_window", window, raw_dtype=gguf.GGMLQuantizationType.F32)
-        type_counts["f32"] += 2
-        n += 2
+    # The baked mel filterbank/window are runtime-contract tensors (the
+    # executor reads them from the pack; there is no synthesis fallback), so
+    # every pack carries them.
+    fb, window = mel_filters_and_window(tok)
+    writer.add_tensor("audiotok.mel_filters", fb, raw_dtype=gguf.GGMLQuantizationType.F32)
+    writer.add_tensor("audiotok.mel_window", window, raw_dtype=gguf.GGMLQuantizationType.F32)
+    type_counts["f32"] += 2
+    n += 2
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -758,33 +829,42 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Convert MiMo-V2.5-ASR to a .oasr GGUF pack")
     ap.add_argument("--main-dir", required=True, type=Path, help="MiMo-V2.5-ASR dir (config.json + shards)")
     ap.add_argument("--tokenizer", required=True, type=Path, help="MiMo-Audio-Tokenizer model.safetensors (config.json alongside)")
-    ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--out", required=True, type=Path, help="output .oasr pack path (the publish lane owns the naming)")
     ap.add_argument("--package-id", default="mimo-v2.5-asr")
-    ap.add_argument("--quant", action="append", choices=["q8_0", "fp16"], help="repeatable; default q8_0 + fp16")
-    ap.add_argument("--no-mel", action="store_true", help="skip baking mel filters/window")
+    ap.add_argument(
+        "--quant",
+        required=True,
+        choices=sorted(QUANT_TOKEN_TO_LABEL),
+        help="CLI canonical quant token (publish lane spelling)",
+    )
     args = ap.parse_args(argv)
 
-    quants = args.quant or ["q8_0", "fp16"]
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    results = []
-    for q in quants:
-        # canonical quant label for tensor policy is q8_0/f16 style; pack name uses q8_0/fp16
-        policy_label = "q8_0" if q == "q8_0" else "fp16"
-        out_path = args.out_dir / f"{args.package_id}-{q}.oasr"
-        # Catalog convention is colon-joined `family:quant` (see model-registry
-        # pull ids and tooling/publish-model's f"{registry_id}:{suffix}"); a
-        # hyphen-joined id here used to make openasr.model.id unparseable as
-        # `family:quant`, so the server's native runtime matcher fell back to
-        # treating the whole hyphenated string as an unrecognized bare family
-        # id and rejected every valid `mimo-v2.5-asr:<quant-alias>` request.
-        model_id = f"{args.package_id}:{q}"
-        print(f"[convert] {q} -> {out_path}", flush=True)
-        res = write_pack(args.main_dir, args.tokenizer, out_path, policy_label, model_id)
-        print(f"[done] {q}: {res['tensor_count']} tensors, "
-              f"{res['size_bytes']/1e9:.2f} GB, types={res['type_counts']}", flush=True)
-        results.append(res)
+    quant_label = QUANT_TOKEN_TO_LABEL[args.quant]
+    if quant_label == "q4_k":
+        raise ConversionError(
+            "q4_k conversion requires ggml's K-quant math, which the gguf "
+            "Python library does not implement; produce the fp16 pack here "
+            "and requantize through the Rust pack tooling once that seam "
+            "exists (a second Python quantizer would fork the quantization "
+            "contract)"
+        )
+    # Catalog convention is colon-joined `family:quant` (see model-registry
+    # pull ids and tooling/publish-model's f"{registry_id}:{suffix}"); a
+    # hyphen-joined id here used to make openasr.model.id unparseable as
+    # `family:quant`, so the server's native runtime matcher fell back to
+    # treating the whole hyphenated string as an unrecognized bare family
+    # id and rejected every valid `mimo-v2.5-asr:<quant-alias>` request.
+    model_id = f"{args.package_id}:{quant_label}"
+    print(f"[convert] {args.quant} -> {args.out}", flush=True)
+    res = write_pack(args.main_dir, args.tokenizer, args.out, quant_label, model_id)
+    print(f"[done] {args.quant}: {res['tensor_count']} tensors, "
+          f"{res['size_bytes']/1e9:.2f} GB, types={res['type_counts']}", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ConversionError as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)
