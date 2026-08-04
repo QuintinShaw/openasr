@@ -239,20 +239,18 @@ pub(crate) fn validate_firered_aed_frontend_contract<M: ScalarMetadataView>(
     let frame_shift_ms = usize_key(FIRERED_AUDIO_FRAME_SHIFT_MS_KEY)?;
     let n_mels = usize_key(FIRERED_AUDIO_N_MELS_KEY)?;
 
-    let expect = |key: &'static str,
-                  actual: usize,
-                  expected: usize|
-     -> Result<(), MetadataContractError> {
-        if actual == expected {
-            return Ok(());
-        }
-        Err(MetadataContractError::InvalidValue {
-            key,
-            reason: format!(
-                "pack declares {actual} but the firered-aed frontend is fixed at {expected}"
-            ),
-        })
-    };
+    let expect =
+        |key: &'static str, actual: usize, expected: usize| -> Result<(), MetadataContractError> {
+            if actual == expected {
+                return Ok(());
+            }
+            Err(MetadataContractError::InvalidValue {
+                key,
+                reason: format!(
+                    "pack declares {actual} but the firered-aed frontend is fixed at {expected}"
+                ),
+            })
+        };
     expect(
         FIRERED_AUDIO_SAMPLE_RATE_KEY,
         sample_rate_hz,
@@ -796,7 +794,10 @@ mod tests {
     #[test]
     fn rejects_even_conv_kernel_and_pe_len() {
         let mut metadata = aed_l_metadata();
-        metadata.insert(FIRERED_ENCODER_CONV_KERNEL_KEY.to_string(), "32".to_string());
+        metadata.insert(
+            FIRERED_ENCODER_CONV_KERNEL_KEY.to_string(),
+            "32".to_string(),
+        );
         assert!(parse_firered_aed_execution_metadata(&metadata).is_err());
 
         let mut metadata = aed_l_metadata();
@@ -837,7 +838,10 @@ mod tests {
     #[test]
     fn frontend_contract_rejects_a_drifted_sample_rate() {
         let mut metadata = aed_l_frontend_metadata();
-        metadata.insert(FIRERED_AUDIO_SAMPLE_RATE_KEY.to_string(), "8000".to_string());
+        metadata.insert(
+            FIRERED_AUDIO_SAMPLE_RATE_KEY.to_string(),
+            "8000".to_string(),
+        );
         let error = validate_firered_aed_frontend_contract(&metadata, 80)
             .expect_err("a drifted sample rate must fail closed");
         assert!(matches!(
