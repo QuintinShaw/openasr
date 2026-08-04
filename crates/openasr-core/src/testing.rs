@@ -8,8 +8,9 @@ use crate::arch::{
     COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
     COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, COHERE_TRANSCRIBE_TOKENIZER_ID,
     DOLPHIN_AUDIO_FRONTEND_ID, DOLPHIN_DECODE_POLICY_ID, DOLPHIN_GGML_ARCHITECTURE_ID,
-    DOLPHIN_TOKENIZER_ID, WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID,
-    WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID,
+    DOLPHIN_TOKENIZER_ID, SENSEVOICE_AUDIO_FRONTEND_ID, SENSEVOICE_DECODE_POLICY_ID,
+    SENSEVOICE_GGML_ARCHITECTURE_ID, SENSEVOICE_TOKENIZER_ID, WHISPER_AUDIO_FRONTEND_ID,
+    WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID,
 };
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 use crate::models::oasr_metadata::{
@@ -45,6 +46,9 @@ const WHISPER_EXPECTED_SAMPLE_RATE_HZ: u32 = 16_000;
 const WHISPER_EXPECTED_CHANNELS: u16 = 1;
 const WHISPER_REAL_MEL_SOURCE_LABEL: &str = "whisper-log-mel-frontend-v0";
 const COHERE_GRAPH_ARCHITECTURE: &str = "cohere-transcribe";
+/// Vocab size of the tiny SenseVoice runtime fixture (kept in sync with
+/// `sensevoice_oasr_v1_runtime_ready`'s metadata and tensor shapes).
+const SENSEVOICE_FIXTURE_VOCAB_SIZE: u64 = 12;
 const TINY_WHISPER_SYNTHETIC_EOS_TOKEN_ID: u32 = 101;
 const TINY_WHISPER_REAL_SMOKE_MODEL_PACK_RELATIVE_PATH: &str = "tmp/whisper-tiny.en-hf-gguf.oasr";
 const TINY_WHISPER_REAL_SMOKE_AUDIO_RELATIVE_PATH: &str =
@@ -257,6 +261,118 @@ impl TinyGgufFixtureSpec {
             metadata.insert(key.to_string(), value.to_string());
         }
         Self::new(metadata)
+    }
+
+    /// Runtime-ready SenseVoice fixture: the complete `.oasr` v1 envelope plus
+    /// every tensor the SAN-M/CTC runtime contract binds, at a tiny geometry
+    /// (2 `enc.blk` layers + 1 `tp.blk` layer, d_model 16). Used to prove the
+    /// family's depth-complete validator (metadata + tensors + tokenizer) on
+    /// both the positive path and fail-closed mutations.
+    pub fn sensevoice_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "sensevoice".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            SENSEVOICE_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            SENSEVOICE_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            SENSEVOICE_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            SENSEVOICE_TOKENIZER_ID.to_string(),
+        );
+        metadata.insert(
+            "general.architecture".to_string(),
+            SENSEVOICE_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        for (key, value) in [
+            ("sensevoice.n_layers", "2"),
+            ("sensevoice.tp_layers", "1"),
+            ("sensevoice.d_model", "16"),
+            ("sensevoice.n_heads", "2"),
+            ("sensevoice.ffn_dim", "32"),
+            ("sensevoice.fsmn_kernel", "5"),
+            ("sensevoice.feature_dim", "28"),
+            ("sensevoice.vocab_size", "12"),
+            ("ctc.blank_token_id", "0"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+            .with_string_array_metadata(
+                "tokenizer.ggml.tokens",
+                (0..SENSEVOICE_FIXTURE_VOCAB_SIZE).map(|index| format!("<fixture{index}>")),
+            )
+            .with_sensevoice_runtime_tensors_with_layers(2, 1)
+    }
+
+    /// Declare the full SenseVoice runtime tensor set for `n_layers` `enc.blk`
+    /// blocks and `tp_layers` `tp.blk` blocks, shaped consistently with the
+    /// tiny geometry of [`Self::sensevoice_oasr_v1_runtime_ready`] (input width
+    /// 28 for `enc.blk.0`, d_model 16 everywhere else).
+    pub fn with_sensevoice_runtime_tensors_with_layers(
+        self,
+        n_layers: usize,
+        tp_layers: usize,
+    ) -> Self {
+        const D_MODEL: u64 = 16;
+        const FEATURE_DIM: u64 = 28;
+        let mut spec = self;
+        for layer in 0..n_layers {
+            let input_dim = if layer == 0 { FEATURE_DIM } else { D_MODEL };
+            spec = spec.with_sensevoice_block_tensors("enc.blk", layer, input_dim);
+        }
+        for layer in 0..tp_layers {
+            spec = spec.with_sensevoice_block_tensors("tp.blk", layer, D_MODEL);
+        }
+        spec.with_tensor_shape("enc.after_norm.weight", [D_MODEL])
+            .with_tensor_shape("enc.after_norm.bias", [D_MODEL])
+            .with_tensor_shape("tp.norm.weight", [D_MODEL])
+            .with_tensor_shape("tp.norm.bias", [D_MODEL])
+            .with_tensor_shape("ctc.head.weight", [D_MODEL, SENSEVOICE_FIXTURE_VOCAB_SIZE])
+            .with_tensor_shape("ctc.head.bias", [SENSEVOICE_FIXTURE_VOCAB_SIZE])
+            .with_tensor_shape("embed.prompt.weight", [FEATURE_DIM, 16])
+            .with_tensor_shape("frontend.cmvn.neg_mean", [FEATURE_DIM])
+            .with_tensor_shape("frontend.cmvn.inv_stddev", [FEATURE_DIM])
+    }
+
+    /// The 13 runtime tensors of one SenseVoice SAN-M block at `input_dim`.
+    fn with_sensevoice_block_tensors(self, scope: &str, layer: usize, input_dim: u64) -> Self {
+        const D_MODEL: u64 = 16;
+        const QKV_DIM: u64 = 3 * D_MODEL;
+        const FFN_DIM: u64 = 32;
+        const FSMN_KERNEL: u64 = 5;
+        let prefix = format!("{scope}.{layer}");
+        self.with_tensor_shape(format!("{prefix}.attn.norm.weight"), [input_dim])
+            .with_tensor_shape(format!("{prefix}.attn.norm.bias"), [input_dim])
+            .with_tensor_shape(format!("{prefix}.attn.qkv.weight"), [input_dim, QKV_DIM])
+            .with_tensor_shape(format!("{prefix}.attn.qkv.bias"), [QKV_DIM])
+            .with_tensor_shape(format!("{prefix}.attn.out.weight"), [D_MODEL, D_MODEL])
+            .with_tensor_shape(format!("{prefix}.attn.out.bias"), [D_MODEL])
+            .with_tensor_shape(
+                format!("{prefix}.attn.fsmn.weight"),
+                [FSMN_KERNEL, 1, D_MODEL],
+            )
+            .with_tensor_shape(format!("{prefix}.ffn.norm.weight"), [D_MODEL])
+            .with_tensor_shape(format!("{prefix}.ffn.norm.bias"), [D_MODEL])
+            .with_tensor_shape(format!("{prefix}.ffn.up.weight"), [D_MODEL, FFN_DIM])
+            .with_tensor_shape(format!("{prefix}.ffn.up.bias"), [FFN_DIM])
+            .with_tensor_shape(format!("{prefix}.ffn.down.weight"), [FFN_DIM, D_MODEL])
+            .with_tensor_shape(format!("{prefix}.ffn.down.bias"), [D_MODEL])
     }
 
     pub fn whisper_oasr_v1_non_streaming_cpu(model_id: impl Into<String>) -> Self {
