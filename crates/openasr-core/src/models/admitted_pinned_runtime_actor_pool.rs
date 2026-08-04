@@ -14,6 +14,15 @@
 //! content/lane key, which is the deliberately finite per-key concurrency
 //! bound. An evicted actor remains alive while an in-flight handle exists and
 //! shuts down synchronously as soon as its last handle drops.
+//!
+//! Cancellation crosses the owner-thread boundary with the job: each build
+//! and each enqueued operation captures the caller's compute-scoped cancel
+//! flag (published at the shared native-core boundary by
+//! `TranscriptionControl::arm_for_native_decode`) and republishes it on the
+//! owner thread for exactly that job's duration, then restores the worker's
+//! previous publication. Graph compute on the owner thread therefore observes
+//! the request's flag under the shared L2 cancellation contract -- and a
+//! cached runtime never retains a job's callback data across jobs.
 
 use std::any::Any;
 use std::fmt;
@@ -179,11 +188,20 @@ impl<R: 'static> PinnedRuntimeActor<R> {
         let alive = Arc::new(AtomicBool::new(true));
         let worker_alive = Arc::clone(&alive);
         let build_context = current_native_execution_context();
+        // The request's compute-scoped cancel flag is thread-local; capture it
+        // on the admitting caller and republish it on the owner thread for the
+        // build's duration, so a canceled request also aborts the runtime
+        // construction it triggered (graph-cancellation contract: arm once per
+        // worker a decode fans out to, never retain it in the runtime).
+        let build_job_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let worker = thread::Builder::new()
             .name(worker_name.to_string())
             .spawn(move || {
                 let built = panic::catch_unwind(AssertUnwindSafe(|| {
                     let _context = build_context.map(install_native_execution_context);
+                    let _job_cancel = build_job_cancel
+                        .as_ref()
+                        .map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
                     build()
                 }));
                 let mut owner = match built {
@@ -311,11 +329,15 @@ impl<R: 'static> PinnedRuntimeActor<R> {
             return Err(PinnedRuntimeActorError::WorkerTerminated);
         }
         let context = current_native_execution_context();
+        let job_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let alive = Arc::clone(&self.inner.alive);
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         let job = Box::new(move |runtime: &mut R| {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                 let _context = context.map(install_native_execution_context);
+                let _job_cancel = job_cancel
+                    .as_ref()
+                    .map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
                 operation(runtime)
             }));
             match outcome {
@@ -368,11 +390,15 @@ impl<R: 'static> PinnedRuntimeActor<R> {
             return Err(PinnedRuntimeActorError::WorkerTerminated);
         }
         let context = current_native_execution_context();
+        let job_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let alive = Arc::clone(&self.inner.alive);
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         let job = Box::new(move |runtime: &mut R| {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                 let _context = context.map(install_native_execution_context);
+                let _job_cancel = job_cancel
+                    .as_ref()
+                    .map(crate::ggml_runtime::InheritedJobCancelGuard::arm);
                 operation(runtime)
             }));
             match outcome {
@@ -725,7 +751,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct ThreadPinnedRuntime {
@@ -1201,5 +1227,106 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// The owner thread runs graph compute for whichever request currently
+    /// owns the actor call, but TLS does not cross the actor boundary. The
+    /// pool must republish the caller's compute-scoped cancel flag on the
+    /// owner thread for exactly one job -- the exact atomic, cleared again
+    /// before the next job -- or mid-graph cancellation silently disappears
+    /// at the thread boundary (graph-cancellation contract).
+    #[test]
+    fn actor_operations_republish_the_callers_job_cancel_flag_on_the_owner_thread() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let actor = PinnedRuntimeActor::spawn("pinned-cancel-flag-test", {
+            let drops = Arc::clone(&drops);
+            move || Ok::<_, String>(owner(1, 16, drops))
+        })
+        .expect("actor builds");
+
+        // No armed flag on the caller: the owner thread stays callback-free.
+        // Raw pointers are not `Send`, so the observation crosses the actor
+        // boundary as a plain address.
+        let observed_unarmed = actor
+            .call_mut(|_| crate::ggml_runtime::thread_job_cancel_flag_data() as usize)
+            .expect("unarmed call");
+        assert_eq!(
+            observed_unarmed, 0,
+            "owner thread must not inherit a cancel flag no caller armed"
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        let (observed_data, observed_flag) = actor
+            .call_mut(|_| {
+                (
+                    crate::ggml_runtime::thread_job_cancel_flag_data() as usize,
+                    crate::ggml_runtime::thread_job_cancel_flag(),
+                )
+            })
+            .expect("armed call");
+        assert_eq!(
+            observed_data,
+            Arc::as_ptr(&flag) as usize,
+            "owner thread must publish the caller's exact cancel atomic"
+        );
+        assert!(
+            observed_flag.is_some_and(|published| Arc::ptr_eq(&published, &flag)),
+            "owner thread must see the caller's flag, not a copy"
+        );
+
+        // A canceled request flips the shared atomic; the owner thread's next
+        // observation of the same job sees it without any extra wiring.
+        flag.store(true, Ordering::SeqCst);
+        let observed_canceled = actor
+            .call_mut(|_| crate::ggml_runtime::thread_job_cancel_requested())
+            .expect("canceled call");
+        assert!(
+            observed_canceled,
+            "owner thread must observe a cancel flipped after the job started"
+        );
+        let _ = crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous);
+
+        // The next job, armed by no caller, must not see the previous job's
+        // publication: a cached runtime never retains a job's callback data.
+        let observed_after = actor
+            .call_mut(|_| crate::ggml_runtime::thread_job_cancel_flag_data() as usize)
+            .expect("post-cancel call");
+        assert_eq!(
+            observed_after, 0,
+            "the previous job's cancel flag must not leak into the next job"
+        );
+    }
+
+    #[test]
+    fn actor_build_inherits_the_callers_job_cancel_flag() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::new(AtomicBool::new(false));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        let observed_in_build = Arc::new(AtomicBool::new(false));
+        let build_observed = Arc::clone(&observed_in_build);
+        let build_flag = Arc::clone(&flag);
+        let actor = PinnedRuntimeActor::spawn("pinned-cancel-flag-build-test", move || {
+            build_observed.store(
+                crate::ggml_runtime::thread_job_cancel_flag()
+                    .is_some_and(|published| Arc::ptr_eq(&published, &build_flag)),
+                Ordering::SeqCst,
+            );
+            Ok::<_, String>(owner(1, 16, drops))
+        })
+        .expect("actor builds");
+        let _ = crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous);
+        assert!(
+            observed_in_build.load(Ordering::SeqCst),
+            "the owner thread must arm the caller's cancel flag for the build itself"
+        );
+        // The build's publication must not outlive the build into later jobs.
+        let observed_in_operation = actor
+            .call_mut(|_| crate::ggml_runtime::thread_job_cancel_flag_data() as usize)
+            .expect("post-build call");
+        assert_eq!(
+            observed_in_operation, 0,
+            "the build's cancel publication must not leak into subsequent jobs"
+        );
     }
 }
