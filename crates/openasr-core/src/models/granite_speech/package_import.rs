@@ -43,7 +43,7 @@ use crate::VerifiedPack;
 use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
-    read_source_json_file, validate_error, validate_output_pack_extension,
+    load_gpt2_bpe_merges, read_source_json_file, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
     OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
@@ -364,21 +364,22 @@ fn load_granite_speech_vocab_tokens(
         .collect()
 }
 
+/// Loads the GPT-2 BPE merge list through the shared local-source loader,
+/// then fails closed when the source carries no merges: the shared helper
+/// tolerates an absent file (some families ship without one), but granite's
+/// prompt encode/decode cannot build a tokenizer without its merge table, so
+/// an empty result rejects the source instead of writing a broken pack.
 fn load_granite_speech_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
-    let path = source_root.join(SOURCE_MERGES_TXT);
-    let bytes =
-        crate::models::local_source_import::read_source_file_bytes(source_root, SOURCE_MERGES_TXT)?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| {
-        validate_error(format!(
-            "granite-speech merges.txt is not valid UTF-8 ({}): {error}",
-            path.display()
-        ))
-    })?;
-    Ok(text
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    let merges = load_gpt2_bpe_merges(
+        source_root,
+        super::runtime_contract::GRANITE_SPEECH_CONTRACT_FAMILY,
+    )?;
+    if merges.is_empty() {
+        return Err(validate_error(format!(
+            "granite-speech source must carry a non-empty {SOURCE_MERGES_TXT}; the pack tokenizer cannot encode prompts without its BPE merge table"
+        )));
+    }
+    Ok(merges)
 }
 
 fn granite_speech_runtime_gguf_metadata(
@@ -640,6 +641,36 @@ mod tests {
         assert_eq!(ggml_dims_for_pack(&[1024]), vec![1024]);
         assert_eq!(ggml_dims_for_pack(&[1024, 1, 31]), vec![1024, 1, 31]);
         assert_eq!(ggml_dims_for_pack(&[1, 3, 1024]), vec![1, 3, 1024]);
+    }
+
+    #[test]
+    fn merges_loader_rides_the_shared_track_and_fails_closed_on_empty() {
+        let source_root = tempfile::tempdir().expect("tempdir");
+        // Absent merges.txt: the shared loader tolerates it, granite must not.
+        let error = load_granite_speech_merges(source_root.path())
+            .expect_err("absent merges.txt must fail closed");
+        assert!(
+            error.to_string().contains("merges.txt"),
+            "unexpected error: {error}"
+        );
+        // Comment + blank lines drop; real merge lines survive trimmed.
+        std::fs::write(
+            source_root.path().join(SOURCE_MERGES_TXT),
+            "#version: 0.2\n\nĠ t\nĠa b\n",
+        )
+        .expect("write merges.txt");
+        let merges = load_granite_speech_merges(source_root.path()).expect("load merges");
+        assert_eq!(merges, vec!["Ġ t".to_string(), "Ġa b".to_string()]);
+        // A header-only file is still an empty merge table: fail closed.
+        std::fs::write(
+            source_root.path().join(SOURCE_MERGES_TXT),
+            "#version: 0.2\n",
+        )
+        .expect("write header-only merges.txt");
+        assert!(
+            load_granite_speech_merges(source_root.path()).is_err(),
+            "a merge table with no merges must fail closed"
+        );
     }
 
     /// End-to-end converter smoke test + sampled tensor parity: converts the
