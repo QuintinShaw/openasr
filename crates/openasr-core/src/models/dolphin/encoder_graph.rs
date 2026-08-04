@@ -242,7 +242,9 @@ pub(crate) fn minimum_subsample_input_frames() -> usize {
 /// `feature_dim` config (e.g. 80 mel bins), never a runtime-variable audio
 /// length, so it stays infallible (saturating is safe: `feature_dim` is always
 /// far above the two-layer receptive field for every published Dolphin pack).
-fn subsample_width(features: usize) -> usize {
+/// Shared with the admission-time runtime tensor contract so the embed output
+/// width is derived from the same formula the encoder graph uses.
+pub(crate) fn subsample_width(features: usize) -> usize {
     let after_first = (features.saturating_sub(3)) / 2 + 1;
     (after_first.saturating_sub(3)) / 2 + 1
 }
