@@ -15,7 +15,7 @@
 //! `timestamp_segment_time`, and `thinker_config.classify_num`) and in the
 //! GGUF metadata it emits.
 //!
-//! Deliberately NOT wired into `ggml_family_registry`: this produces a valid
+//! Deliberately NOT wired into the ASR architecture registry: this produces a valid
 //! GGUF/.oasr pack for numeric-parity verification and Stage 2 ggml
 //! execution, but the forced-aligner's NAR (single forward pass, argmax at
 //! `<timestamp>` positions) decode policy is not the qwen3-asr autoregressive
@@ -28,15 +28,12 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::ggml_runtime::{
-    GgufWriteValue, read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
-    read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
-    write_gguf_file_v0,
-};
+use crate::ggml_runtime::GgufWriteValue;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, read_source_json_file, validate_error,
     validate_output_pack_extension,
 };
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 
 use super::package_import::{
     Qwen3AsrRuntimeQuantizationMode, build_qwen_runtime_tensors, compose_model_id, insert_metadata,
@@ -50,7 +47,6 @@ const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 
 /// GGUF `general.architecture` / `openasr.model.family` value for this
 /// converter's output. Deliberately distinct from `qwen3-asr` so a bundled
@@ -186,7 +182,7 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
     }
 
     let safetensor_files = discover_safetensor_files(&request.source_root)?;
-    let mut tensors = build_qwen_runtime_tensors(
+    let tensors = build_qwen_runtime_tensors(
         &safetensor_files,
         request.quantization,
         fields.n_mels,
@@ -198,47 +194,23 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
     let model_id = compose_model_id(&request.package_id, request.package_variant.as_deref());
     let metadata = forced_aligner_gguf_metadata(request, &fields, &model_id, &tokens, &merges);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::aux(QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "Qwen3-ForcedAligner local-source GGUF writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    // Mechanical round-trip check only (tensor count / readability). This
-    // converter is not registered with `ggml_family_registry`, so there is no
-    // builtin runtime tensor contract to validate against yet -- that lands
-    // with family registration in a later stage.
-    let runtime_source =
-        validate_ggml_runtime_source_path(&request.output_root).map_err(|error| {
-            validate_error(format!(
-                "Qwen3-ForcedAligner local-source import produced invalid runtime path '{}': {error}",
-                request.output_root.display()
-            ))
-        })?;
-    let _metadata_read =
-        read_gguf_metadata_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Qwen3-ForcedAligner import produced unreadable GGUF metadata: {error}"
-            ))
-        })?;
-    let _tensor_index_read =
-        read_gguf_tensor_index_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Qwen3-ForcedAligner import produced unreadable GGUF tensor index: {error}"
-            ))
-        })?;
-
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "Qwen3-ForcedAligner local-source GGUF writer produced unreadable tensor index: {error}"
-        ))
-    })?;
-    tensors.clear();
     Ok(Qwen3ForcedAlignerLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
         model_id,
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
     })
 }
 
@@ -288,11 +260,6 @@ fn forced_aligner_gguf_metadata(
     let mut metadata = BTreeMap::new();
     insert_metadata(
         &mut metadata,
-        crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
-        crate::models::oasr_metadata::OASR_PACKAGE_VERSION_V1,
-    );
-    insert_metadata(
-        &mut metadata,
         crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
         QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
     );
@@ -302,11 +269,6 @@ fn forced_aligner_gguf_metadata(
         QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
     );
     insert_metadata(&mut metadata, OPENASR_MODEL_ID_KEY, model_id);
-    insert_metadata(
-        &mut metadata,
-        GENERAL_ARCHITECTURE_KEY,
-        QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
-    );
 
     insert_metadata_u32(
         &mut metadata,
@@ -571,7 +533,8 @@ mod tests {
             "expected every source tensor to map 1:1 to a destination tensor, plus 2 synthesized frontend tensors"
         );
 
-        let index = read_gguf_tensor_index(&output_root).expect("tensor index");
+        let index =
+            crate::ggml_runtime::read_gguf_tensor_index(&output_root).expect("tensor index");
         // Spot-check the classify head landed with its real (non-tied) shape:
         // [1024 (hidden), 5000 (classify_num)] after the qwen dim-reversal
         // convention (source safetensors shape is [5000, 1024]).

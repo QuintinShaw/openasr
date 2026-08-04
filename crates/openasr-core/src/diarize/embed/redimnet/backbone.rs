@@ -3,17 +3,22 @@
 //!
 //! Mirrors `models::dolphin::encoder_graph`'s pattern (arena weight upload,
 //! `start_graph`/`set_input`/`compute_output(s)_f32`), fed from the f32 `.oasr`
-//! pack via `diarize::embed::weights::Weights::from_oasr`. See
+//! pack through the proof-carrying preflight path. See
 //! `docs/design/redimnet2-b6-embedder.md` and `HANDOFF.md` for the staged
 //! bring-up plan and golden anchors this module's tests pin against.
 
 use std::sync::Arc;
 
+use crate::ggml_runtime::GgmlCpuGraphRunner;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuTensor,
     GgmlPersistentGraphSession, GgmlStaticTensor, GgmlStaticTensorArena,
 };
-use crate::ggml_runtime::{GgmlCpuGraphRunner, GgmlRuntimeSource};
+#[cfg(test)]
+use crate::models::{
+    aux_pack_registry::AuxPackKind,
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
+};
 
 use super::super::weights::{Weights, WeightsError};
 use super::config::{self, StageConfig};
@@ -1146,19 +1151,13 @@ pub(crate) struct RedimNet2Model {
 }
 
 impl RedimNet2Model {
+    #[cfg(test)]
     pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, RedimNetBackboneError> {
-        let source = crate::ggml_runtime::validate_ggml_runtime_source_path(path)
+        let verified_pack = PackVerifier
+            .verify_candidate(PackCandidate::new(path))
             .map_err(|error| WeightsError::Gguf(error.to_string()))?;
-        Self::from_runtime_source(&source)
-    }
-
-    pub(crate) fn from_runtime_source(
-        source: &GgmlRuntimeSource,
-    ) -> Result<Self, RedimNetBackboneError> {
-        Ok(Self {
-            weights: Arc::new(Weights::from_runtime_source(source)?),
-            pack_content_id: source.content_id().to_string(),
-        })
+        ensure_diarization_pack_route(&verified_pack)?;
+        Self::from_preflight(verified_pack.preflight())
     }
 
     pub(crate) fn from_preflight(
@@ -1194,6 +1193,26 @@ impl RedimNet2Model {
     pub(crate) fn shared_weights(&self) -> Arc<Weights> {
         Arc::clone(&self.weights)
     }
+}
+
+#[cfg(test)]
+fn ensure_diarization_pack_route(
+    verified_pack: &VerifiedPack,
+) -> Result<(), RedimNetBackboneError> {
+    if matches!(
+        verified_pack.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::Diarization,
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    Err(WeightsError::Gguf(format!(
+        "ReDimNet pack route is not auxiliary diarization: {:?}",
+        verified_pack.route()
+    ))
+    .into())
 }
 
 #[cfg(test)]

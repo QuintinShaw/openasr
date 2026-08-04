@@ -3,6 +3,7 @@ use std::{fmt, str::FromStr, sync::Arc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::arch::OpenAsrArchitectureRegistry;
 use crate::models::language::LanguageMode;
 
 mod mock;
@@ -20,7 +21,7 @@ pub use native::{
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     native_transcription_progress_for_id, resolve_local_native_runtime_model_identity,
-    validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
+    validate_local_native_model_pack_path, verify_native_runtime_model_pack_path,
 };
 pub use request_context::{
     FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,
@@ -843,19 +844,6 @@ pub(crate) fn reject_unsupported_phrase_bias_for_model(
     })
 }
 
-/// Only multilingual Whisper performs X->English speech translation.
-fn family_supports_translation(adapter_id: &str) -> bool {
-    adapter_id == crate::models::ggml_family_registry::WHISPER_GGML_ADAPTER_ID
-}
-
-/// A non-English source-language hint is honored only by Whisper (multilingual
-/// packs) and the Cohere transcribe family; every other family — and any future
-/// family until explicitly wired — fails closed.
-fn family_supports_source_language(adapter_id: &str) -> bool {
-    adapter_id == crate::models::ggml_family_registry::WHISPER_GGML_ADAPTER_ID
-        || adapter_id == crate::models::ggml_family_registry::COHERE_TRANSCRIBE_GGML_ADAPTER_ID
-}
-
 /// True when this native family honors a non-English source-language decode
 /// hint (multilingual Whisper, Cohere transcribe). The realtime server uses
 /// this to decide whether the session-level translation source declaration
@@ -863,7 +851,9 @@ fn family_supports_source_language(adapter_id: &str) -> bool {
 /// decode hint; families that fail closed on hints they ignore must not
 /// receive it.
 pub fn native_adapter_supports_source_language_hint(adapter_id: &str) -> bool {
-    family_supports_source_language(adapter_id)
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_adapter_id(adapter_id)
+        .is_some_and(|descriptor| descriptor.execution_contract.supports_source_language_hint)
 }
 
 /// Post-family-selection fail-closed gate: reject `task=translate` on a family
@@ -877,7 +867,10 @@ pub(crate) fn reject_unsupported_task_or_language(
     task: TranscriptionTask,
     language: Option<&str>,
 ) -> Result<(), BackendError> {
-    if task == TranscriptionTask::Translate && !family_supports_translation(adapter_id) {
+    let supports_translation_task = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_adapter_id(adapter_id)
+        .is_some_and(|descriptor| descriptor.execution_contract.supports_translation_task);
+    if task == TranscriptionTask::Translate && !supports_translation_task {
         return Err(BackendError::RequestOptionUnsupportedByModel {
             adapter: adapter_id,
             option: "task=translate",
@@ -1136,7 +1129,7 @@ mod tests {
 
     #[test]
     fn auto_language_never_trips_gate_for_any_mode() {
-        use crate::models::ggml_family_registry::WHISPER_GGML_ADAPTER_ID;
+        use crate::arch::WHISPER_GGML_ADAPTER_ID;
         let modes = [
             LanguageMode::DetectAndSpecify,
             LanguageMode::DetectImplicit { reject_reason: "x" },
@@ -1168,7 +1161,7 @@ mod tests {
 
     #[test]
     fn source_language_hint_capability_matches_language_gate() {
-        use crate::models::ggml_family_registry::{
+        use crate::arch::{
             COHERE_TRANSCRIBE_GGML_ADAPTER_ID, QWEN3_ASR_GGML_ADAPTER_ID, WHISPER_GGML_ADAPTER_ID,
             XASR_ZIPFORMER_GGML_ADAPTER_ID,
         };
@@ -1186,11 +1179,14 @@ mod tests {
         assert!(!native_adapter_supports_source_language_hint(
             QWEN3_ASR_GGML_ADAPTER_ID
         ));
+        assert!(!native_adapter_supports_source_language_hint(
+            "unknown-adapter"
+        ));
     }
 
     #[test]
     fn language_gate_matrix_matches_decision_table() {
-        use crate::models::ggml_family_registry::{
+        use crate::arch::{
             COHERE_TRANSCRIBE_GGML_ADAPTER_ID, MOONSHINE_GGML_ADAPTER_ID, WHISPER_GGML_ADAPTER_ID,
             XASR_ZIPFORMER_GGML_ADAPTER_ID,
         };
@@ -1264,9 +1260,7 @@ mod tests {
 
     #[test]
     fn translate_gate_is_whisper_only() {
-        use crate::models::ggml_family_registry::{
-            COHERE_TRANSCRIBE_GGML_ADAPTER_ID, WHISPER_GGML_ADAPTER_ID,
-        };
+        use crate::arch::{COHERE_TRANSCRIBE_GGML_ADAPTER_ID, WHISPER_GGML_ADAPTER_ID};
         // Whisper honors translate.
         assert!(
             reject_unsupported_task_or_language(
@@ -1284,6 +1278,20 @@ mod tests {
                 LanguageMode::SpecifyOnly {
                     default_language: "en"
                 },
+                TranscriptionTask::Translate,
+                None,
+            ),
+            Err(BackendError::RequestOptionUnsupportedByModel {
+                option: "task=translate",
+                ..
+            })
+        ));
+        // Unknown adapters fail closed because capability lookup has no
+        // descriptor to authorize the task.
+        assert!(matches!(
+            reject_unsupported_task_or_language(
+                "unknown-adapter",
+                LanguageMode::DetectAndSpecify,
                 TranscriptionTask::Translate,
                 None,
             ),

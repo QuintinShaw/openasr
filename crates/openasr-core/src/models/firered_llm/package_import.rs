@@ -63,27 +63,20 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::arch::{
-    FIRERED_LLM_AUDIO_FRONTEND_ID, FIRERED_LLM_DECODE_POLICY_ID, FIRERED_LLM_GGML_ARCHITECTURE_ID,
-    FIRERED_LLM_MODEL_FAMILY, FIRERED_LLM_TOKENIZER_ID,
-};
+use crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_file_bytes,
     read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use super::tensor_names::{
     ADAPTER_LINEAR1_BIAS, ADAPTER_LINEAR1_WEIGHT, ADAPTER_LINEAR2_BIAS, ADAPTER_LINEAR2_WEIGHT,
@@ -102,7 +95,6 @@ const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 
 /// The `<speech>` placeholder token (`DEFAULT_SPEECH_TOKEN` upstream) is not
 /// baked into any Qwen2 tokenizer file -- `fireredasr2/data/llm_tokenizer.py`
@@ -300,21 +292,22 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
         &tokens,
         &merges,
     );
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(FIRERED_LLM_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "firered-llm GGUF writer failed for '{}': {error}",
+            "firered-llm OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "firered-llm import produced an unreadable tensor index: {error}"
-        ))
-    })?;
     Ok(FireRedLlmImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
         vocab_size: tokens.len(),
     })
 }
@@ -615,6 +608,12 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
 /// earlier `EntirePack` audit rule that incorrectly floored every `llm.*`
 /// tensor too; see `firered_llm_prefixes_exclude_the_llm_decoder_half` below).
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "adapter."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: FIRERED_LLM_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };
 
 fn build_encoder_adapter_runtime_tensors(
     safetensors: &SafetensorsFile,
@@ -1259,41 +1258,6 @@ fn firered_llm_runtime_gguf_metadata(
     let put_str = |metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str(
-        &mut metadata,
-        GENERAL_ARCHITECTURE_KEY,
-        FIRERED_LLM_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_PACKAGE_VERSION,
-        OASR_PACKAGE_VERSION_V1,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_FAMILY,
-        FIRERED_LLM_MODEL_FAMILY,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        FIRERED_LLM_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        FIRERED_LLM_AUDIO_FRONTEND_ID,
-    );
-    put_str(
-        &mut metadata,
-        OASR_METADATA_KEY_DECODE_POLICY,
-        FIRERED_LLM_DECODE_POLICY_ID,
-    );
-    put_str(
-        &mut metadata,
-        GGML_TOKENIZER_ID_KEY,
-        FIRERED_LLM_TOKENIZER_ID,
-    );
     put_str(&mut metadata, OPENASR_MODEL_ID_KEY, &request.model_id);
 
     let put_u32 = |metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: u32| {
@@ -1715,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_declares_family_and_speech_token_contract() {
+    fn metadata_leaves_envelope_keys_to_shared_writer() {
         let encoder = FireRedLlmEncoderHparams {
             n_layers: 16,
             d_model: 1280,
@@ -1753,10 +1717,20 @@ mod tests {
         let tokens: Vec<String> = (0..152064).map(|i| format!("t{i}")).collect();
         let metadata =
             firered_llm_runtime_gguf_metadata(&encoder, &adapter, &decoder, &request, &tokens, &[]);
-        assert!(matches!(
-            metadata.get(OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(GgufWriteValue::String(family)) if family == FIRERED_LLM_MODEL_FAMILY
-        ));
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert!(matches!(
             metadata.get("firered_llm.llm.speech_token_id"),
             Some(GgufWriteValue::U32(151_646))

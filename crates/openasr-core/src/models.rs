@@ -14,6 +14,8 @@ pub(crate) mod diarize_pack_import;
 pub(crate) mod dolphin;
 pub(crate) mod executor_component_registry;
 pub(crate) mod family_integration_audit;
+#[cfg(test)]
+mod family_source_gates;
 pub(crate) mod fastconformer;
 pub(crate) mod firered_aed;
 pub(crate) mod firered_llm;
@@ -24,7 +26,6 @@ pub(crate) mod funasr_nano;
 pub mod ggml_asr_executor;
 pub(crate) mod ggml_composed_executor;
 pub mod ggml_family_adapter;
-pub mod ggml_family_registry;
 pub(crate) mod ggml_graph_config;
 pub(crate) mod ggml_streaming_audio;
 pub(crate) mod ggml_streaming_executor;
@@ -46,6 +47,7 @@ pub mod oasr_metadata;
 pub(crate) mod pack_import_surface;
 pub mod pack_quant;
 pub mod pack_quant_audit;
+pub(crate) mod pack_verifier;
 pub(crate) mod parakeet_ctc;
 pub(crate) mod parakeet_runtime_memory;
 pub mod parakeet_tdt;
@@ -61,6 +63,7 @@ pub(crate) mod runtime_cache_coordinator;
 pub(crate) mod runtime_component_bootstrap;
 pub(crate) mod runtime_contract;
 pub(crate) mod runtime_memory;
+pub(crate) mod runtime_pack_contract;
 pub(crate) mod runtime_preflight;
 pub(crate) mod runtime_prepared_registry;
 pub(crate) mod runtime_selection_metadata;
@@ -86,3 +89,6 @@ pub(crate) mod tokenizer_component_registry;
 pub(crate) mod wav2vec2_ctc;
 pub mod whisper;
 pub(crate) mod xasr_zipformer;
+
+// xtask generated model-family modules begin
+// xtask generated model-family modules end

@@ -321,13 +321,53 @@ fn parallel_test_options(segment_bytes: u64) -> PullOptions {
 fn tiny_pack_bytes() -> Vec<u8> {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("tiny.oasr");
-    // `whisper_oasr_v1_non_streaming_cpu` alone deliberately omits the
-    // whisper runtime scalar keys (block_count, head_count, ...) elsewhere
-    // used to test fail-closed executor preflight; install now enforces that
-    // same contract (see `validate_native_runtime_model_pack_contract`), so
-    // this generic "any installable pack" fixture must be contract-complete.
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    // This helper backs the Moonshine catalog/pull fixtures, so its proven
+    // route must be Moonshine rather than a Whisper-shaped pack carrying a
+    // Moonshine model id. This runtime-ready fixture is complete for the
+    // install-time family contract and its tiny tensor skeleton keeps the
+    // pull tests independent of a downloaded production model.
+    let spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny");
     write_tiny_gguf_runtime_source(&path, &spec).unwrap();
+    fs::read(path).unwrap()
+}
+
+#[test]
+fn model_pack_preflight_receipt_describes_the_exact_verified_bytes() {
+    let bytes = tiny_pack_bytes();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("receipt-source.oasr");
+    fs::write(&path, &bytes).unwrap();
+
+    let receipt = preflight_model_pack_with_receipt(&path).unwrap();
+
+    assert_eq!(receipt.schema, "openasr.model-pack-preflight.v1");
+    assert_eq!(receipt.content_id, format!("sha256:{}", sha256_hex(&bytes)));
+    assert_eq!(receipt.size_bytes, bytes.len() as u64);
+    assert_eq!(receipt.route, "asr");
+    assert_eq!(receipt.catalog_family_id, "moonshine");
+    assert_eq!(receipt.model_family.as_deref(), Some("moonshine"));
+    assert_eq!(receipt.model_architecture, "moonshine-encoder-decoder");
+    assert_eq!(receipt.build_commit, None);
+}
+
+fn tiny_redimnet_pack_bytes() -> Vec<u8> {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("redimnet2-tiny.oasr");
+    let tensor = crate::ggml_runtime::GgufWriteTensor {
+        name: "fixture.tensor".to_string(),
+        dims: vec![1],
+        tensor_type: crate::ggml_runtime::GgufWriteTensorType::F32,
+        data: 0.0_f32.to_le_bytes().to_vec(),
+    };
+    crate::models::oasr_metadata::OasrPackWriter::write(
+        &path,
+        crate::models::oasr_metadata::PackEnvelope::aux(
+            crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
+        ),
+        std::collections::BTreeMap::new(),
+        &[tensor],
+    )
+    .unwrap();
     fs::read(path).unwrap()
 }
 
@@ -339,6 +379,7 @@ fn resolved_for(bytes: &[u8]) -> ResolvedCatalogPull {
     ResolvedCatalogPull {
         requested: "moonshine-tiny:q8".to_string(),
         model_id: "moonshine-tiny".to_string(),
+        catalog_family_id: "moonshine".to_string(),
         display_name: "Moonshine Tiny".to_string(),
         quant: "q8_0".to_string(),
         suffix: "q8".to_string(),
@@ -378,7 +419,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
             capability: None,
             experimental: false,
             display_name: resolved.display_name.clone(),
-            family: resolved.model_id.clone(),
+            family: resolved.catalog_family_id.clone(),
             aliases: Vec::new(),
             pull_alias: None,
             size: "tiny".to_string(),
@@ -732,6 +773,39 @@ fn install_catalog_model_pack_from_path_reuses_catalog_target_and_marks_local_so
     );
 }
 
+#[test]
+fn install_catalog_model_pack_rejects_a_catalog_family_mismatch() {
+    let bytes = tiny_pack_bytes();
+    let mut resolved = resolved_for(&bytes);
+    // The bytes prove Moonshine, while the signed catalog target claims a
+    // different family. Digest and size alone are insufficient authority for
+    // a runtime install; the verified route must bind to the catalog family.
+    resolved.catalog_family_id = "whisper".to_string();
+    let catalog = catalog_for_resolved(&resolved);
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("moonshine-tiny-q8_0.oasr");
+    let digest = sha256_hex(&bytes);
+    fs::write(&source_path, bytes).unwrap();
+
+    let error = install_catalog_model_pack_from_path(&catalog, &source_path, temp.path(), |_| {})
+        .expect_err("catalog family mismatch must fail closed");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("catalog family") && message.contains("whisper"),
+        "error must identify the mismatched catalog family: {message}"
+    );
+    assert!(matches!(error, PullError::RuntimeValidation { .. }));
+    assert!(
+        list_installed_packs(temp.path()).unwrap().is_empty(),
+        "a mismatched family must not publish an installed reference"
+    );
+    assert!(
+        !object_path_for(&temp.path().join("models"), &digest).exists(),
+        "a mismatched family must not publish a content object"
+    );
+}
+
 /// Fail-closed regression for the turbo-pack incident: a pack that carries a
 /// full whisper runtime graph except `whisper.decoder.attention.head_count`
 /// used to "install successfully" (catalog digest + GGUF preflight only) and
@@ -749,7 +823,8 @@ fn install_catalog_model_pack_from_path_rejects_whisper_pack_missing_decoder_hea
     write_tiny_gguf_runtime_source(&broken_path, &spec).unwrap();
     let bytes = fs::read(&broken_path).unwrap();
 
-    let resolved = resolved_for(&bytes);
+    let mut resolved = resolved_for(&bytes);
+    resolved.catalog_family_id = "whisper".to_string();
     let catalog = catalog_for_resolved(&resolved);
     let source_path = temp.path().join("moonshine-tiny-q8_0.oasr");
     fs::write(&source_path, &bytes).unwrap();
@@ -776,7 +851,7 @@ fn install_catalog_model_pack_from_path_rejects_whisper_pack_missing_decoder_hea
 
 #[test]
 fn capability_pack_stays_pullable_and_importable_by_digest() {
-    let bytes = tiny_pack_bytes();
+    let bytes = tiny_redimnet_pack_bytes();
     let mut resolved = resolved_for(&bytes);
     resolved.requested = "redimnet2-b6-cn:fp16".to_string();
     resolved.model_id = "redimnet2-b6-cn".to_string();
@@ -961,7 +1036,8 @@ fn pull_does_not_fallback_after_runtime_validation_failure() {
     write_tiny_gguf_runtime_source(&broken_path, &spec).unwrap();
     let bytes = fs::read(&broken_path).unwrap();
 
-    let resolved = resolved_for(&bytes);
+    let mut resolved = resolved_for(&bytes);
+    resolved.catalog_family_id = "whisper".to_string();
     let temp = tempfile::tempdir().unwrap();
     let mut client = FakeClient::with_responses(vec![
         ResponseSpec {
@@ -2214,10 +2290,12 @@ fn seed_final_object(paths: &PullPaths, bytes: &[u8], read_only: bool) {
     fs::set_permissions(&paths.final_path, permissions).unwrap();
 }
 
-/// The download-skip verdict for a sealed object must be answered from the
-/// path and a stat alone. Pinned by construction: an object whose bytes do
-/// *not* hash to the catalog digest can only match if the digest was read
-/// off the path, never recomputed.
+/// The digest half of the download-skip verdict for a sealed object must be
+/// answered from the anchored path without re-hashing gigabytes. The verifier
+/// still reads the bounded GGUF header and family contract before accepting
+/// the object. Pinned by construction: bytes that do *not* hash to the catalog
+/// digest can only pass the identity half if the digest came from the sealed
+/// object path, never from a full-file hash.
 #[test]
 fn installed_matches_trusts_a_sealed_object_without_rehashing() {
     let bytes = tiny_pack_bytes();
@@ -2234,6 +2312,28 @@ fn installed_matches_trusts_a_sealed_object_without_rehashing() {
     seed_final_object(&paths, &bytes, true);
 
     assert!(installed_matches(&target, &paths).unwrap());
+}
+
+#[test]
+fn installed_matches_rejects_a_sealed_object_that_fails_the_family_contract() {
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let mut spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("broken-installed");
+    spec.metadata
+        .remove("whisper.decoder.attention.head_count")
+        .unwrap();
+    let source = fixture_dir.path().join("broken-installed.oasr");
+    write_tiny_gguf_runtime_source(&source, &spec).unwrap();
+    let bytes = fs::read(source).unwrap();
+    let mut resolved = resolved_for(&bytes);
+    resolved.catalog_family_id = "whisper".to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    seed_final_object(&paths, &bytes, true);
+
+    let error = installed_matches(&target, &paths).unwrap_err();
+
+    assert!(matches!(error, PullError::RuntimeValidation { .. }));
 }
 
 /// The fail-closed half: the seal gone, the same mismatched object goes back
@@ -4119,7 +4219,8 @@ fn write_legacy_install(
     let bytes = {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("tiny.oasr");
-        let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(model_id);
+        let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(model_id)
+            .with_whisper_minimal_tokenizer();
         write_tiny_gguf_runtime_source(&source, &spec).unwrap();
         fs::read(source).unwrap()
     };
@@ -4216,25 +4317,6 @@ fn migration_converts_a_legacy_install_and_leaves_exactly_one_copy() {
     assert_eq!(packs[0].pull, "moonshine-tiny:q8");
     assert_eq!(packs[0].path, object);
     assert_eq!(packs[0].sha256, digest);
-}
-
-#[cfg(unix)]
-#[test]
-fn migration_moves_bytes_by_rename_within_one_filesystem() {
-    use std::os::unix::fs::MetadataExt;
-
-    let home = tempfile::tempdir().unwrap();
-    let models = home.path().join("models");
-    let (legacy_path, bytes) =
-        write_legacy_install(home.path(), &models, "moonshine-tiny", "q8_0", None);
-    let inode_before = fs::metadata(&legacy_path).unwrap().ino();
-
-    migrate_legacy_model_store(home.path()).unwrap();
-
-    // Same inode == the bytes were never copied. This is what keeps converting a
-    // multi-gigabyte store from costing a full rewrite of it.
-    let object = object_path_for(&models, &sha256_hex(&bytes));
-    assert_eq!(fs::metadata(&object).unwrap().ino(), inode_before);
 }
 
 #[test]

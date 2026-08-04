@@ -11,7 +11,7 @@
 //! + one `add` — no extra scale node.
 
 use crate::adapter_pack::is_qwen3_asr_lora_target_tensor_name;
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::lora_adapter::{
     LoraResolveError, ResolvedLoraAdapter, ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle,
     adapter_cache_fingerprint, resolve_lora_adapter,
@@ -55,7 +55,7 @@ pub(crate) fn qwen_adapter_cache_fingerprint(adapter: Option<&QwenLoraAdapter>) 
 pub(crate) fn resolve_qwen_lora_adapter(
     cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<Option<ResolvedLoraAdapterHandle>, QwenLoraError> {
     resolve_lora_adapter(
         cache,
@@ -87,11 +87,11 @@ mod tests {
         LoraAdapterDtype, LoraAdapterWriteRequest, LoraAdapterWriteTarget, base_pack_model_id,
         file_sha256_hex, qwen3_asr_lora_targetable_tensors, write_lora_adapter_pack,
     };
+    use crate::arch::builtin_adapter_descriptor;
     use crate::testing::with_forced_cpu_backend_for_test;
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionOptions,
         GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
-        qwen3_asr_runtime_descriptor_v1,
     };
 
     /// LCG for deterministic non-zero floats (no rand crate).
@@ -145,13 +145,19 @@ mod tests {
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(audio_path, "test", "clip")
             .map_err(|e| e.to_string())?;
         let executor = crate::models::qwen::ggml_executor::Qwen3AsrGgmlExecutor::default();
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                runtime_path,
+            )
+            .map_err(|error| error.to_string())?;
         let request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: runtime_path.to_path_buf(),
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions {
                 adapter_path,
@@ -321,13 +327,19 @@ mod tests {
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(audio_path, "test", "clip")
             .map_err(|e| e.to_string())?;
         let executor = crate::models::qwen::ggml_executor::Qwen3AsrGgmlExecutor::default();
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                runtime_path,
+            )
+            .map_err(|error| error.to_string())?;
         let request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: runtime_path.to_path_buf(),
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions {
                 adapter_path,

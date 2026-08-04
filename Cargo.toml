@@ -6,6 +6,7 @@ members = [
     "crates/openasr-ffi",
     "crates/openasr-server",
     "crates/openasr-system-audio",
+    "crates/xtask",
 ]
 resolver = "2"
 

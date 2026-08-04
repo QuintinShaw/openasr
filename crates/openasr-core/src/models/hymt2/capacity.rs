@@ -110,10 +110,8 @@ impl Hymt2DecoderCapacityContract {
         )
     }
 
-    /// Backward-compatible envelope for the public low-level runtime API,
-    /// which historically accepted any prompt that fit the pack context.
-    /// Product paths should use [`Self::from_tokenizer`] with their clause
-    /// segmentation bound instead.
+    /// Test-only full-context envelope used to exercise the low-level runtime.
+    #[cfg(test)]
     pub(crate) fn full_context(
         metadata: Hymt2ExecutionMetadata,
         kv_spec: LlmKvCacheSpec,

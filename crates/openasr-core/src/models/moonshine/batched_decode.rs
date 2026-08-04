@@ -12,8 +12,8 @@ use super::runtime_contract::MoonshineExecutionMetadata;
 use super::tokenizer::MoonshineTokenizer;
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqTextPostprocessKind;
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::phrase_bias_decode::build_token_phrase_biases;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
@@ -77,7 +77,7 @@ pub(crate) struct MoonshineServeBatchJob {
     /// instead of a fresh `File::open`/`load_gguf_weight_context` by path,
     /// so identity and weight bytes come from one open even across this
     /// thread boundary.
-    pub runtime_preflight: GgmlAsrRuntimeSourcePreflight,
+    pub runtime_preflight: GgufRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -212,7 +212,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
                 backend: job.backend,
             },
             false,
-            Some(&job.runtime_preflight),
+            &job.runtime_preflight,
             None,
         )
         .map_err(map_decoder_error)
@@ -225,7 +225,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             job.decoder_state,
             job.backend,
             false,
-            Some(&job.runtime_preflight),
+            &job.runtime_preflight,
             n_seq,
             None,
         )
@@ -647,7 +647,7 @@ mod tests {
     use crate::ggml_runtime::GgmlCpuGraphBackend;
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::{
-        GgmlAsrRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
+        GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
         read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
     };
     use std::ffi::OsString;
@@ -845,14 +845,14 @@ mod tests {
         )
     }
 
-    fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
+    fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
         let runtime_source =
             validate_ggml_runtime_source_path(runtime_path).expect("valid runtime source path");
         let metadata =
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        GgmlAsrRuntimeSourcePreflight {
+        GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),

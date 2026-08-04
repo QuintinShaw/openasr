@@ -114,7 +114,11 @@ pub(crate) fn tdt_greedy_decode(
     metadata: &ParakeetTdtExecutionMetadata,
     predictor: &ParakeetTdtPredictor,
     joint: &ParakeetTdtJoint,
+    is_canceled: &dyn Fn() -> bool,
 ) -> Result<Vec<ParakeetTdtEmittedToken>, String> {
+    if is_canceled() {
+        return Err("parakeet-tdt decode canceled before predictor prefill".to_string());
+    }
     let joint_hidden = metadata.joint_hidden;
     let expected = frame_count
         .checked_mul(joint_hidden)
@@ -148,11 +152,19 @@ pub(crate) fn tdt_greedy_decode(
 
     let mut t = 0usize;
     while t < frame_count {
+        if is_canceled() {
+            return Err(format!("parakeet-tdt decode canceled at encoder frame {t}"));
+        }
         let enc_frame = &enc_features[t * joint_hidden..(t + 1) * joint_hidden];
         let mut symbols_this_frame = 0usize;
         // Inner loop: symbols decoded without leaving frame `t`. Exits when a
         // duration > 0 advances `t`, or the budget forces `t += 1`.
         loop {
+            if is_canceled() {
+                return Err(format!(
+                    "parakeet-tdt decode canceled at encoder frame {t}, symbol {symbols_this_frame}"
+                ));
+            }
             let logits = joint.logits(enc_frame, &mut scratch);
             let token_id = argmax(&logits[..vocab])
                 .ok_or_else(|| "parakeet-tdt joint produced no token logits".to_string())?;
@@ -296,8 +308,8 @@ mod tests {
         // forced advance.
         // Frame 2: m=[2, 0] -> tok0 again.
         let enc = vec![2.0, 0.0, 0.0, 2.0, 2.0, 0.0];
-        let emitted =
-            tdt_greedy_decode(&enc, 3, &metadata(3, 2, 4), &predictor, &joint).expect("decode");
+        let emitted = tdt_greedy_decode(&enc, 3, &metadata(3, 2, 4), &predictor, &joint, &|| false)
+            .expect("decode");
         assert_eq!(emitted.len(), 2);
         assert_eq!(emitted[0].token_id, 0);
         assert_eq!(emitted[0].start_frame, 0);
@@ -332,8 +344,8 @@ mod tests {
             hidden,
         );
         let enc = vec![1.0, 1.0, 1.0, 1.0];
-        let emitted =
-            tdt_greedy_decode(&enc, 2, &metadata(3, 2, 3), &predictor, &joint).expect("decode");
+        let emitted = tdt_greedy_decode(&enc, 2, &metadata(3, 2, 3), &predictor, &joint, &|| false)
+            .expect("decode");
         // 2 frames x budget 3 duration-0 symbols each.
         assert_eq!(emitted.len(), 6);
     }
@@ -364,7 +376,8 @@ mod tests {
         );
         let enc = vec![1.0, 1.0, 1.0, 1.0];
         let emitted =
-            tdt_greedy_decode(&enc, 2, &metadata(3, 2, 10), &predictor, &joint).expect("decode");
+            tdt_greedy_decode(&enc, 2, &metadata(3, 2, 10), &predictor, &joint, &|| false)
+                .expect("decode");
         assert!(emitted.is_empty());
     }
 
@@ -372,8 +385,42 @@ mod tests {
     fn rejects_mismatched_joint_head_rows() {
         let (predictor, joint) = fixture();
         // metadata claims 3 durations but the fixture head has vocab 3 + 2.
-        let err = tdt_greedy_decode(&[1.0, 1.0], 1, &metadata(3, 3, 4), &predictor, &joint)
-            .expect_err("row mismatch must fail closed");
+        let err = tdt_greedy_decode(
+            &[1.0, 1.0],
+            1,
+            &metadata(3, 3, 4),
+            &predictor,
+            &joint,
+            &|| false,
+        )
+        .expect_err("row mismatch must fail closed");
         assert!(err.contains("joint head"));
+    }
+
+    #[test]
+    fn dedicated_tdt_polls_cancellation_inside_the_symbol_loop() {
+        use std::cell::Cell;
+
+        let (predictor, joint) = fixture();
+        let polls = Cell::new(0usize);
+        let cancel_after_two_boundaries = || {
+            let current = polls.get();
+            polls.set(current + 1);
+            current >= 2
+        };
+        let error = tdt_greedy_decode(
+            &[2.0, 0.0, 2.0, 0.0],
+            2,
+            &metadata(3, 2, 10),
+            &predictor,
+            &joint,
+            &cancel_after_two_boundaries,
+        )
+        .expect_err("dedicated TDT loop must stop at its next symbol boundary");
+        assert!(error.contains("canceled"));
+        assert!(
+            polls.get() <= 4,
+            "cancel polling must remain frame/symbol local"
+        );
     }
 }

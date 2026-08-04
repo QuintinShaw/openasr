@@ -1239,10 +1239,10 @@ impl ServerRuntime {
     /// and thread-local ggml backend handles instead.
     pub(crate) fn acquire_native_execution(
         &self,
+        verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
     ) -> Result<ModelSessionPermit, ApiError> {
-        let model_identity = native_model_session_key(self)?;
-        let identity = openasr_core::admission_identity_for_route(&model_identity, route);
+        let identity = openasr_core::admission_identity_for_route(verified_model_identity, route);
         self.native_execution
             .try_acquire(identity)
             .map_err(ApiError::ModelSessionCapacity)
@@ -1263,9 +1263,7 @@ impl ServerRuntime {
                 let Some(model_pack_path) = self.model_pack_path.as_deref() else {
                     return Ok(());
                 };
-                let pack_root =
-                    openasr_core::validate_local_native_model_pack_path(model_pack_path)?;
-                let _ = validate_native_runtime_pack(&pack_root)?;
+                let _ = validate_native_runtime_pack(model_pack_path)?;
                 Ok(())
             }
         }
@@ -2003,11 +2001,10 @@ async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsRespo
             match runtime.model_pack_path.as_deref() {
                 None => Vec::new(),
                 Some(model_pack_path) => {
-                    let pack_root =
-                        openasr_core::validate_local_native_model_pack_path(model_pack_path)
-                            .map_err(ApiError::Backend)?;
-                    let identity =
-                        validate_native_runtime_pack(&pack_root).map_err(ApiError::Backend)?;
+                    let adapter =
+                        validate_native_runtime_pack(model_pack_path).map_err(ApiError::Backend)?;
+                    let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
+                        .map_err(ApiError::Backend)?;
                     vec![identity.model_id]
                 }
             }

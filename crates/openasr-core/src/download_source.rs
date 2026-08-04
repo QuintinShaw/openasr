@@ -206,6 +206,7 @@ mod tests {
         ResolvedCatalogPull {
             requested: "moonshine-tiny:q8".to_string(),
             model_id: "moonshine-tiny".to_string(),
+            catalog_family_id: "moonshine".to_string(),
             display_name: "Moonshine Tiny".to_string(),
             quant: "q8_0".to_string(),
             suffix: "q8".to_string(),

@@ -20,7 +20,9 @@ use crate::{
     ExecutionTarget, NativeExecutionServices, TranslationRequest, TranslationWorkerOutput,
     device::execution_policy::{ExecutionCandidate, ExecutionIntent},
     models::{
+        aux_pack_registry::AuxPackKind,
         native_execution_services::current_execution_candidate_failure,
+        pack_verifier::{PackCandidate, PackRoute, PackVerificationError, PackVerifier},
         policy_resolved_aux_runtime::{
             AuxiliaryPinnedRuntimeCacheKey, PolicyResolvedAuxRuntime,
             PolicyResolvedAuxRuntimeError, PolicyResolvedStatefulAuxRuntime,
@@ -82,15 +84,28 @@ impl PolicyResolvedHymt2TranslationRuntime {
         execution_target: ExecutionTarget,
         max_source_clause_chars: usize,
     ) -> Result<Self, PolicyResolvedHymt2Error> {
-        let quoted_source = crate::validate_ggml_runtime_source_path(&pack_path)
-            .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        let preflight =
-            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-                &quoted_source,
-            )
-            .map_err(|source| Hymt2RuntimeError::Preflight {
-                reason: source.to_string(),
+        let verified_pack = PackVerifier
+            .verify_candidate(PackCandidate::new(&pack_path))
+            .map_err(|error| {
+                PolicyResolvedHymt2Error::Runtime(map_pack_verification_error(error))
             })?;
+        if !matches!(
+            verified_pack.route(),
+            PackRoute::Aux {
+                kind: AuxPackKind::Translation,
+                ..
+            }
+        ) {
+            return Err(PolicyResolvedHymt2Error::Runtime(
+                Hymt2RuntimeError::Preflight {
+                    reason: format!(
+                        "Hy-MT2 pack route is not auxiliary translation: {:?}",
+                        verified_pack.route()
+                    ),
+                },
+            ));
+        }
+        let preflight = verified_pack.preflight().clone();
         let content_id = preflight.runtime_source.content_id().to_string();
 
         let intent = ExecutionIntent::from(execution_target);
@@ -158,6 +173,17 @@ impl Drop for PolicyResolvedHymt2TranslationRuntime {
         self.execution_services
             .hymt2_translation_actors()
             .evict_where(|key| key.has_instance_id(self.actor_instance_id));
+    }
+}
+
+fn map_pack_verification_error(error: PackVerificationError) -> Hymt2RuntimeError {
+    match error {
+        PackVerificationError::RuntimeSource { source, .. } => {
+            Hymt2RuntimeError::RuntimeSourcePath { source }
+        }
+        other => Hymt2RuntimeError::Preflight {
+            reason: other.to_string(),
+        },
     }
 }
 

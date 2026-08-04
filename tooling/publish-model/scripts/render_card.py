@@ -18,7 +18,11 @@ import re
 import sys
 from pathlib import Path
 
-from _catalog import QUANT_METADATA, load as load_publish_catalog
+from _catalog import (
+    QUANT_METADATA,
+    SUPPORTED_CAPABILITY_ROLES,
+    load as load_publish_catalog,
+)
 from _file_loaders import load_json, load_toml
 from _pathlib_helpers import repo_root
 
@@ -29,23 +33,19 @@ TEMPLATE = TOOLING_ROOT / "template" / "MODEL_CARD.md.tmpl"
 DIARIZE_TEMPLATE = TOOLING_ROOT / "template" / "DIARIZE_CARD.md.tmpl"
 TRANSLATION_TEMPLATE = TOOLING_ROOT / "template" / "TRANSLATION_CARD.md.tmpl"
 CAPABILITY_TEMPLATE = TOOLING_ROOT / "template" / "CAPABILITY_CARD.md.tmpl"
-# Diarization support packs render the diarize card: no ASR pipeline tags,
-# no transcribe quickstart.
-DIARIZE_FAMILIES = {"pyannote-segmentation", "redimnet2"}
-# Translation models render the translation card: translation pipeline tag,
-# realtime-translation quickstart, no ASR bench columns.
-TRANSLATION_FAMILIES = {"hymt2"}
-# Other (non-diarization) capability packs render the generic capability card:
-# no ASR pipeline tags/transcribe quickstart, no diarize-specific wording --
-# just quant/file/size and a note that this model augments another model's
-# decode path.
-CAPABILITY_FAMILIES = {"qwen3-forced-aligner", "firered-punc"}
-# HF YAML pipeline tag per diarize/capability family (the prose card may override).
-DIARIZE_PIPELINE_TAG_BY_FAMILY = {
-    "redimnet2": "feature-extraction",
-    "pyannote-segmentation": "voice-activity-detection",
-    "qwen3-forced-aligner": "automatic-speech-recognition",
-    "firered-punc": "automatic-speech-recognition",
+# Capability semantics are part of the catalog contract. Keep the small
+# presentation mapping keyed by role rather than duplicating family ids here.
+_CAPABILITY_FEATURE_BY_ROLE = {
+    "speaker-embedder": "speaker-diarization",
+    "speaker-segmenter": "speaker-diarization",
+    "forced-aligner": "word-timestamps",
+    "punctuation-restorer": "punctuation",
+}
+_CAPABILITY_PIPELINE_TAG_BY_ROLE = {
+    "speaker-embedder": "feature-extraction",
+    "speaker-segmenter": "voice-activity-detection",
+    "forced-aligner": "automatic-speech-recognition",
+    "punctuation-restorer": "automatic-speech-recognition",
 }
 # SPDX ids (lowercased) that HF's YAML `license:` field accepts directly. A
 # license outside this set (e.g. the FunASR Model License) must use the HF
@@ -108,6 +108,85 @@ def pct(v) -> str:
     return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
 
 
+def _catalog_kind(catalog: dict) -> str:
+    """Return a validated semantic catalog kind; never infer it from family."""
+    kind = catalog.get("kind")
+    if kind not in {"asr-model", "translation-model", "capability-pack"}:
+        raise ValueError(
+            "render_card requires a supported catalog kind; "
+            f"got {kind!r}"
+        )
+    return kind
+
+
+def _capability_semantics(catalog: dict) -> tuple[str, str]:
+    """Validate and return ``(feature, role)`` for a capability pack."""
+    if _catalog_kind(catalog) != "capability-pack":
+        raise ValueError("render_card capability semantics requested for a non-capability model")
+    capability = catalog.get("capability")
+    if not isinstance(capability, dict):
+        raise ValueError("render_card capability-pack entry is missing capability metadata")
+    feature = capability.get("feature")
+    role = capability.get("role")
+    if not isinstance(feature, str) or not feature.strip():
+        raise ValueError("render_card capability.feature must be a non-empty string")
+    if role not in SUPPORTED_CAPABILITY_ROLES:
+        raise ValueError(f"render_card capability.role is unsupported: {role!r}")
+    expected_feature = _CAPABILITY_FEATURE_BY_ROLE.get(role)
+    if expected_feature is None:
+        raise ValueError(f"render_card has no semantics for capability role: {role!r}")
+    if feature != expected_feature:
+        raise ValueError(
+            f"render_card capability role {role!r} requires feature {expected_feature!r}, "
+            f"got {feature!r}"
+        )
+    return feature, role
+
+
+def card_type_for_catalog(catalog: dict) -> str:
+    """Select the card template from catalog semantics, not a family allowlist."""
+    kind = _catalog_kind(catalog)
+    if kind == "asr-model":
+        if catalog.get("capability") is not None:
+            raise ValueError("render_card asr-model entry must not carry capability metadata")
+        return "asr"
+    if kind == "translation-model":
+        if catalog.get("capability") is not None:
+            raise ValueError("render_card translation-model entry must not carry capability metadata")
+        return "translation"
+
+    feature, role = _capability_semantics(catalog)
+    if feature == "speaker-diarization" and role in {"speaker-embedder", "speaker-segmenter"}:
+        return "diarize"
+    return "capability"
+
+
+def pipeline_tag_for_catalog(catalog: dict, prose: dict) -> str:
+    """Resolve the HF pipeline tag from prose or catalog kind/capability role."""
+    kind = _catalog_kind(catalog)
+    if kind == "capability-pack":
+        _feature, role = _capability_semantics(catalog)
+    else:
+        role = None
+        if catalog.get("capability") is not None:
+            raise ValueError(f"render_card {kind} entry must not carry capability metadata")
+
+    explicit = prose.get("pipeline_tag")
+    if explicit:
+        return explicit
+
+    if kind == "asr-model":
+        return "automatic-speech-recognition"
+    if kind == "translation-model":
+        return "translation"
+
+    try:
+        assert role is not None
+        return _CAPABILITY_PIPELINE_TAG_BY_ROLE[role]
+    except KeyError as exc:  # pragma: no cover - guarded by _capability_semantics
+        raise ValueError(f"render_card has no pipeline tag for capability role: {role!r}") from exc
+
+
 def main(argv: list[str]) -> int:
     model = argv[0]
     catalog = load_publish_catalog()[model]
@@ -120,9 +199,10 @@ def main(argv: list[str]) -> int:
     upstream_link = f"https://huggingface.co/{upstream}"
     registry_id = catalog["registry_id"]
 
-    diarize = catalog["family"] in DIARIZE_FAMILIES
-    translation = catalog["family"] in TRANSLATION_FAMILIES
-    capability = catalog["family"] in CAPABILITY_FAMILIES
+    card_type = card_type_for_catalog(catalog)
+    diarize = card_type == "diarize"
+    translation = card_type == "translation"
+    capability = card_type == "capability"
 
     # Perf table rows + pull lines, one per built quant (catalog order). The
     # diarize/capability card's table carries only quant/file/size — ASR bench
@@ -153,19 +233,17 @@ def main(argv: list[str]) -> int:
         prose.get("highlights") or generic_highlights(catalog, qm)
     )
 
-    if diarize:
+    if card_type == "diarize":
         template = DIARIZE_TEMPLATE
-    elif translation:
+    elif card_type == "translation":
         template = TRANSLATION_TEMPLATE
-    elif capability:
+    elif card_type == "capability":
         template = CAPABILITY_TEMPLATE
     else:
         template = TEMPLATE
     text = template.read_text()
     repl = {
-        "pipeline_tag": prose.get("pipeline_tag")
-        or ("translation" if translation else None)
-        or DIARIZE_PIPELINE_TAG_BY_FAMILY.get(catalog["family"], "automatic-speech-recognition"),
+        "pipeline_tag": pipeline_tag_for_catalog(catalog, prose),
         "upstream_license_id": catalog["license_name"],
         # HF requires the YAML `license:` to be a lowercase SPDX id from its
         # allowed list; the body keeps the display-cased form. Non-SPDX

@@ -99,6 +99,12 @@ impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
         executor.execute_view(request)
     }
 
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        for executor in self.executors_by_model_architecture.values() {
+            executor.evict_prepared_runtime_content_id(pack_content_id);
+        }
+    }
+
     fn unload_idle_state(&self) {
         // The composed executor is itself registered in the dispatch maps
         // (see `builtin_execution_dispatch.rs`), so the reaper only ever
@@ -114,11 +120,10 @@ impl GgmlAsrViewExecutor for ComposedGgmlAsrExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::sync::Arc;
 
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudioView, Transcription,
-        qwen3_asr_runtime_descriptor_v1, whisper_runtime_descriptor_v1,
     };
 
     use super::*;
@@ -160,16 +165,21 @@ mod tests {
                 decode_truncation: None,
             })
         }
+
+        fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
     }
 
     fn qwen_request() -> GgmlAsrExecutionViewRequest<'static> {
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
         GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: crate::arch::builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -199,7 +209,8 @@ mod tests {
     #[test]
     fn composed_executor_fails_closed_when_architecture_is_not_registered() {
         let mut request = qwen_request();
-        request.selected_family = whisper_runtime_descriptor_v1();
+        request.selected_family =
+            crate::arch::builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
         let executor = ComposedGgmlAsrExecutor::default().with_architecture_executor(
             crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             Arc::new(StubExecutor { text: "qwen" }),
@@ -247,6 +258,7 @@ mod tests {
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 unreachable!("this test never executes a request")
             }
+            fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {}
             fn unload_idle_state(&self) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }

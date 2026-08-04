@@ -18,7 +18,7 @@ REPO_ROOT = SCRIPT_DIR.parents[2]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _catalog import (  # noqa: E402
-    LANG_BY_FAMILY,
+    MODEL_FAMILY_CAPABILITIES,
     QUANT_METADATA,
     language_labels_wire,
     language_mode_for_model,
@@ -87,7 +87,7 @@ FAMILY_COUNT_RE = re.compile(
 )
 
 # Docs checked for a stale "N families" literal against the actual family
-# count (len(LANG_BY_FAMILY), the catalog's own family/language SSOT).
+# count (len(MODEL_FAMILY_CAPABILITIES), the generated Rust inventory SSOT).
 FAMILY_COUNT_DOCS = ("README.md", "ARCHITECTURE.md", "docs/FAQ.md")
 
 
@@ -254,10 +254,10 @@ def extract_section(text: str, start: str, end_markers: tuple[str, ...]) -> str:
 
 def check_family_count_strings(errors: list[str]) -> None:
     """A doc claiming e.g. "eight families" must agree with the catalog's own
-    family/language SSOT (LANG_BY_FAMILY). Prevents the prose count silently
+    generated Rust inventory SSOT (MODEL_FAMILY_CAPABILITIES). Prevents the prose count silently
     going stale when a family is added or removed.
     """
-    expected = len(LANG_BY_FAMILY)
+    expected = len(MODEL_FAMILY_CAPABILITIES)
     for relative in FAMILY_COUNT_DOCS:
         path = REPO_ROOT / relative
         if not path.exists():
@@ -271,7 +271,7 @@ def check_family_count_strings(errors: list[str]) -> None:
             if found != expected:
                 errors.append(
                     f"{relative}: family count phrase {match.group(0)!r} says {found}, "
-                    f"but LANG_BY_FAMILY has {expected} families"
+                    f"but the model-family inventory has {expected} families"
                 )
 
 

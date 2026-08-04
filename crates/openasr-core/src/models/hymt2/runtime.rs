@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -10,8 +10,9 @@ use crate::capacity::topology::{DecoderStatePlan, StateKind};
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgufMetadataReadError, GgufRuntimeSourcePreflight,
     GgufTensorDataReadError, GgufTensorIndexReadError, build_runtime_tensor_reader_from_preflight,
-    load_runtime_source_metadata_and_tensor_index_from_source,
 };
+#[cfg(test)]
+use crate::models::aux_pack_registry::AuxPackKind;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
@@ -19,6 +20,10 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::hymt2::prompt::{
     build_hymt2_subtitle_prompt_token_parts, build_hymt2_user_chat_prompt_tokens,
     build_subtitle_translation_prompt, max_output_tokens_for_source_tokens,
+};
+#[cfg(test)]
+use crate::models::pack_verifier::{
+    PackCandidate, PackRoute, PackVerificationError, PackVerifier, VerifiedPack,
 };
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
@@ -34,7 +39,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
-use crate::{GgmlRuntimeSourcePathError, NativeAsrError, validate_ggml_runtime_source_path};
+use crate::{GgmlRuntimeSourcePathError, NativeAsrError};
 
 use super::capacity::{
     HYMT2_DECODE_SCRATCH_STATE_ID, HYMT2_PREFIX_CACHE_STATE_ID, Hymt2DecoderCapacityContract,
@@ -58,6 +63,7 @@ const HYMT2_PRODUCT_CLAUSE_ID_MAX_BYTES: usize = 2 + 20;
 
 #[derive(Debug, Clone, Copy)]
 enum Hymt2CapacityMode {
+    #[cfg(test)]
     FullContext,
     ClauseChars(usize),
 }
@@ -390,6 +396,37 @@ impl Hymt2RuntimeSession {
     }
 }
 
+#[cfg(test)]
+fn map_pack_verification_error(error: PackVerificationError) -> Hymt2RuntimeError {
+    match error {
+        PackVerificationError::RuntimeSource { source, .. } => {
+            Hymt2RuntimeError::RuntimeSourcePath { source }
+        }
+        other => Hymt2RuntimeError::Preflight {
+            reason: other.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+fn ensure_translation_pack_route(verified_pack: &VerifiedPack) -> Result<(), Hymt2RuntimeError> {
+    if matches!(
+        verified_pack.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::Translation,
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    Err(Hymt2RuntimeError::Preflight {
+        reason: format!(
+            "Hy-MT2 pack route is not auxiliary translation: {:?}",
+            verified_pack.route()
+        ),
+    })
+}
+
 impl Hymt2Runtime {
     /// Conservative, topology-derived quote for the complete product
     /// candidate: tokenizer + mmap-view metadata + resident decoder host
@@ -585,19 +622,19 @@ impl Hymt2Runtime {
         Ok(bytes.finish())
     }
 
+    #[cfg(test)]
     pub fn from_path(
         path: impl AsRef<Path>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, Hymt2RuntimeError> {
-        let runtime_source = validate_ggml_runtime_source_path(path.as_ref())
-            .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
-            .map_err(|source| Hymt2RuntimeError::Preflight {
-                reason: source.to_string(),
-            })?;
-        Self::from_preflight(&preflight, backend)
+        let verified_pack = PackVerifier
+            .verify_candidate(PackCandidate::new(path.as_ref()))
+            .map_err(map_pack_verification_error)?;
+        ensure_translation_pack_route(&verified_pack)?;
+        Self::from_preflight(verified_pack.preflight(), backend)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_preflight(
         preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
@@ -704,6 +741,7 @@ impl Hymt2Runtime {
         )?;
         let kv_spec = session.whole_decoder.kv_cache_spec();
         let capacity = match capacity_mode {
+            #[cfg(test)]
             Hymt2CapacityMode::FullContext => {
                 Hymt2DecoderCapacityContract::full_context(hymt2_metadata, kv_spec)
             }
@@ -742,19 +780,6 @@ impl Hymt2Runtime {
         })
     }
 
-    pub fn probe_path(path: impl AsRef<Path>) -> Result<Hymt2ExecutionMetadata, Hymt2RuntimeError> {
-        let runtime_source = validate_ggml_runtime_source_path(path.as_ref())
-            .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
-        let preflight =
-            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-                &runtime_source,
-            )
-            .map_err(|source| Hymt2RuntimeError::Preflight {
-                reason: source.to_string(),
-            })?;
-        Self::probe_preflight_parts(&preflight.metadata, &preflight.tensor_index)
-    }
-
     pub(crate) fn probe_preflight_parts(
         metadata: &crate::GgufMetadata,
         tensor_index: &crate::GgufTensorIndex,
@@ -764,51 +789,6 @@ impl Hymt2Runtime {
         validate_hymt2_runtime_tensors_with_index(tensor_index, hymt2_metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
         Ok(hymt2_metadata)
-    }
-
-    /// Process-lifetime-cached wrapper over [`Hymt2Runtime::probe_path`],
-    /// keyed on the canonicalized path -- same discipline as
-    /// `native_runtime_model_adapter_for_path` in
-    /// `api::backend::native`: an installed pack's bytes are immutable for
-    /// the life of the daemon process (a re-pull that actually changes
-    /// content lands under its own path per `pull_paths`'s
-    /// `model_id/quant/filename` layout, not by mutating an already-bound
-    /// path in place), so a fixed path deterministically reprobes to the
-    /// same metadata/error for the rest of the process's life.
-    ///
-    /// This exists because `translation_capability_for_distribution`
-    /// (`/v1/capabilities`) re-validated the full Hy-MT2 pack -- GGUF
-    /// metadata read, tensor-index read, and tensor-contract check -- on
-    /// every single call with no cross-call memoization, even though the
-    /// *discovery* of which pack path to probe
-    /// (`find_installed_hymt2_translation_pack`) is already a cheap,
-    /// uncached directory scan performed fresh on every call. Caching only
-    /// the expensive probe below means a pack installed or removed while
-    /// the daemon is running is still picked up immediately (discovery
-    /// reruns every call and hands this a different/absent path), while a
-    /// repeat probe of the same already-known pack no longer re-parses a
-    /// model many times larger than the ASR packs the sibling cache
-    /// targets.
-    ///
-    /// Errors are cached as their rendered message (`Hymt2RuntimeError`
-    /// itself is not `Clone`): callers here only ever display the error, and
-    /// a fixed input path fails the same way every time.
-    pub fn probe_path_cached(path: impl AsRef<Path>) -> Result<Hymt2ExecutionMetadata, String> {
-        static CACHE: OnceLock<Mutex<HashMap<PathBuf, Result<Hymt2ExecutionMetadata, String>>>> =
-            OnceLock::new();
-        let path = path.as_ref();
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let cache_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if let Ok(cache) = cache.lock()
-            && let Some(cached) = cache.get(&cache_key)
-        {
-            return cached.clone();
-        }
-        let result = Self::probe_path(path).map_err(|error| error.to_string());
-        if let Ok(mut cache) = cache.lock() {
-            cache.insert(cache_key, result.clone());
-        }
-        result
     }
 
     pub fn metadata(&self) -> Hymt2ExecutionMetadata {
@@ -2742,36 +2722,6 @@ mod tests {
         assert_eq!(active.source_prefix_tokens, [1, 2, 3, 4, 5]);
         assert_eq!(cache.layer_kv_caches.as_ptr(), arena_ptr);
         assert_eq!(cache.layer_kv_caches[0].written_positions(), 5);
-    }
-
-    /// `probe_path_cached` must serve a repeat call for the same path from
-    /// the process-lifetime cache rather than re-reading the file: writes a
-    /// too-short file (fails as `FileTooShort`), probes it, then overwrites
-    /// the same path with a longer file carrying unrecognized magic bytes
-    /// (which would fail as a *different* `UnknownMagic` error if actually
-    /// re-probed). The second call must still report the first, cached
-    /// error string, proving it never touched the file the second time.
-    #[test]
-    fn probe_path_cached_does_not_reread_an_already_probed_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("probe-cache-test.oasr");
-
-        std::fs::write(&path, b"ab").expect("write too-short file");
-        let first = Hymt2Runtime::probe_path_cached(&path);
-        assert!(
-            first.is_err(),
-            "a 2-byte file must fail runtime source validation"
-        );
-
-        std::fs::write(&path, b"ZZZZ-not-a-real-gguf-package").expect("overwrite with new bytes");
-        let second = Hymt2Runtime::probe_path_cached(&path);
-
-        assert_eq!(
-            first, second,
-            "a cached probe must return the exact same error on a repeat call for the \
-             same path, even though the file's content (and therefore its uncached \
-             error) changed in between"
-        );
     }
 
     #[test]

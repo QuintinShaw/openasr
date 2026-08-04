@@ -7,7 +7,7 @@
 //! torch-pickle `model.pt` into a `model.safetensors` keyed by the openasr
 //! tensor-name convention plus a `funasr_nano_meta.json` architecture sidecar,
 //! and this importer then validates, quantizes, and packs through the shared
-//! `write_gguf_file_v0` writer -- the same path every other family uses, so the
+//! shared GGUF writer -- the same path every other family uses, so the
 //! `.oasr` v1 required-metadata contract (`openasr.package.version = "1"` and
 //! the descriptor keys) is stamped by construction rather than by a one-off
 //! pack script remembering every key.
@@ -32,15 +32,10 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::arch::{
-    FUNASR_NANO_AUDIO_FRONTEND_ID, FUNASR_NANO_DECODE_POLICY_ID, FUNASR_NANO_GGML_ARCHITECTURE_ID,
-    FUNASR_NANO_MODEL_FAMILY, FUNASR_NANO_TOKENIZER_ID,
-};
+use crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, load_gpt2_bpe_merges,
@@ -48,17 +43,23 @@ use crate::models::local_source_import::{
     validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, TOKENIZER_GGML_MERGES_KEY,
-    TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
+    OasrPackWriter, PackEnvelope, TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY,
+    TOKENIZER_GGML_TOKENS_KEY,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
+use crate::models::pack_quant::{
+    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+};
 
 use super::runtime_contract::{
     FUNASR_NANO_ENCODER_LAYER_NORM_EPSILON, FUNASR_NANO_RMS_NORM_EPSILON, FUNASR_NANO_ROPE_THETA,
 };
 use super::tensor_names::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: FUNASR_NANO_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };
 
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 const SOURCE_META_JSON: &str = "funasr_nano_meta.json";
@@ -66,7 +67,6 @@ const SOURCE_META_JSON: &str = "funasr_nano_meta.json";
 /// outputs (vocab.json + merges.txt + tokenizer_config.json).
 const SOURCE_QWEN3_DIR: &str = "Qwen3-0.6B";
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
 
 pub type FunasrNanoQuantizationMode = PackQuant;
@@ -164,21 +164,22 @@ pub fn convert_local_funasr_nano_source_to_runtime_pack(
     let tensors = build_funasr_nano_runtime_tensors(&safetensors, request.quantization)?;
     let metadata = funasr_nano_runtime_gguf_metadata(&meta, request, &tokens, &merges);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(FUNASR_NANO_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "funasr-nano GGUF writer failed for '{}': {error}",
+            "funasr-nano OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "funasr-nano import produced an unreadable tensor index: {error}"
-        ))
-    })?;
     Ok(FunasrNanoImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
         vocab_size: meta.llm.vocab_size,
     })
 }
@@ -641,22 +642,6 @@ fn funasr_nano_runtime_gguf_metadata(
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
 
-    put_str(GENERAL_ARCHITECTURE_KEY, FUNASR_NANO_GGML_ARCHITECTURE_ID);
-    put_str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
-    put_str(OASR_METADATA_KEY_MODEL_FAMILY, FUNASR_NANO_MODEL_FAMILY);
-    put_str(
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        FUNASR_NANO_GGML_ARCHITECTURE_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        FUNASR_NANO_AUDIO_FRONTEND_ID,
-    );
-    put_str(
-        OASR_METADATA_KEY_DECODE_POLICY,
-        FUNASR_NANO_DECODE_POLICY_ID,
-    );
-    put_str(GGML_TOKENIZER_ID_KEY, FUNASR_NANO_TOKENIZER_ID);
     put_str(OPENASR_MODEL_ID_KEY, &request.model_id);
     put_str(TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_MODEL_VALUE_GPT2);
 
@@ -763,12 +748,11 @@ mod tests {
         }
     }
 
-    /// The `.oasr` v1 required-metadata contract: the install-time preflight
-    /// (`preflight_model_pack_for_install`) fails closed on a pack missing any
-    /// of these keys, so the importer must stamp them by construction. This is
-    /// the regression the python-only pack path shipped without.
+    /// Family metadata contains only family-owned keys. The shared writer owns
+    /// every package/routing key, so this importer cannot recreate the FunASR
+    /// missing-version failure by omission or override.
     #[test]
-    fn metadata_stamps_the_oasr_v1_required_contract_keys() {
+    fn metadata_does_not_redeclare_envelope_owned_keys() {
         let metadata = funasr_nano_runtime_gguf_metadata(
             &fixture_meta(),
             &fixture_request(),
@@ -776,35 +760,17 @@ mod tests {
             &["a b".to_string()],
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_PACKAGE_VERSION),
-            Some(OASR_PACKAGE_VERSION_V1.to_string()),
-            "packs without openasr.package.version are rejected by the install preflight"
-        );
-        assert_eq!(
-            string_metadata(&metadata, GENERAL_ARCHITECTURE_KEY),
-            Some(FUNASR_NANO_GGML_ARCHITECTURE_ID.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(FUNASR_NANO_MODEL_FAMILY.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_ARCHITECTURE),
-            Some(FUNASR_NANO_GGML_ARCHITECTURE_ID.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_AUDIO_FRONTEND),
-            Some(FUNASR_NANO_AUDIO_FRONTEND_ID.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_DECODE_POLICY),
-            Some(FUNASR_NANO_DECODE_POLICY_ID.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, GGML_TOKENIZER_ID_KEY),
-            Some(FUNASR_NANO_TOKENIZER_ID.to_string())
-        );
+        for key in [
+            "general.architecture",
+            "openasr.package.version",
+            "openasr.model.family",
+            "openasr.model.architecture",
+            "openasr.audio.frontend",
+            "openasr.decode.policy",
+            "ggml.tokenizer.id",
+        ] {
+            assert!(!metadata.contains_key(key), "envelope owns {key}");
+        }
         assert_eq!(
             string_metadata(&metadata, OPENASR_MODEL_ID_KEY),
             Some("funasr-nano".to_string())

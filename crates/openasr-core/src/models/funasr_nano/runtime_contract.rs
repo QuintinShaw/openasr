@@ -235,6 +235,18 @@ pub(crate) fn parse_funasr_nano_decoder_metadata<M: ScalarMetadataView>(
     })
 }
 
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_funasr_nano_encoder_metadata(preflight.metadata())
+        .map(|_| ())
+        .and_then(|()| parse_funasr_nano_adapter_metadata(preflight.metadata()).map(|_| ()))
+        .and_then(|()| parse_funasr_nano_decoder_metadata(preflight.metadata()).map(|_| ()))
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

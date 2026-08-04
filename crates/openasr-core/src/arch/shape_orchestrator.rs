@@ -14,8 +14,9 @@
 //! Those — and the cohere deferred-`uploads` side-channel — live inside the
 //! family's build closure / call site, never in the descriptor or the gate.
 //!
-//! Whisper has `block_stack == None` and its executor never calls the gate, so it
-//! remains the hand-written bit-level reference gate, structurally untouched.
+//! Whisper uses an architecture-specific graph and its executor never calls
+//! the shared block gate, so it remains the hand-written bit-level reference
+//! gate, structurally untouched.
 //!
 //! INTERFACE NOTE: the S5b sketch had a `ShapeOrchestrator` trait whose
 //! `StageCtx<'a>` GAT carried the `&mut GgmlCpuGraphBuilder`. Wiring revealed that
@@ -46,8 +47,9 @@ pub(crate) enum OpenAsrStageRole {
 /// an error, never a warning. The family lifts them into its own error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeOrchestratorError {
-    /// `block_stack` was `None` for an architecture whose executor asked to
-    /// orchestrate (whisper, the only `None`, must never reach the driver).
+    /// No shared block stack was supplied for an architecture whose executor
+    /// asked to orchestrate (architecture-specific graphs must not reach the
+    /// shared driver).
     MissingBlockStack { model_architecture: &'static str },
     /// The shape the executor handles (`O::SHAPE`) != the shape the descriptor
     /// declares.

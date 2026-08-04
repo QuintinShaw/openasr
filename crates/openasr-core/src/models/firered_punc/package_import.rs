@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    write_gguf_file_v0,
 };
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, SafetensorsTensorHeader,
@@ -27,8 +26,8 @@ use crate::models::local_source_import::{
     validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY, OasrPackWriter,
+    PackEnvelope,
 };
 use crate::nn::half::f32_to_f16_bits;
 
@@ -315,8 +314,6 @@ fn runtime_metadata(
     let mut put = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put("general.architecture", FIRERED_PUNC_ARCHITECTURE_VALUE);
-    put(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
     put(OASR_METADATA_KEY_MODEL_FAMILY, FIRERED_PUNC_MODEL_FAMILY);
     put(
         OASR_METADATA_KEY_MODEL_ARCHITECTURE,
@@ -396,7 +393,13 @@ pub fn convert_local_firered_punc_source_to_runtime_pack(
     }
 
     let metadata = runtime_metadata(request, &tokens);
-    write_gguf_file_v0(&request.output_pack, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_pack,
+        PackEnvelope::aux(FIRERED_PUNC_ARCHITECTURE_VALUE),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "FireRedPunc GGUF writer failed for '{}': {error}",
             request.output_pack.display()
@@ -404,7 +407,7 @@ pub fn convert_local_firered_punc_source_to_runtime_pack(
     })?;
     Ok(FireRedPuncImportResult {
         output_path: request.output_pack.clone(),
-        tensor_count: tensors.len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
         token_count: tokens.len(),
     })
 }

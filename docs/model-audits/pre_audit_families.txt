@@ -4,7 +4,6 @@
 # when its docs/model-audits/<family>.md form lands. Never add new families.
 cohere
 dolphin
-firered-aed
 firered-punc
 hymt2
 mimo-asr

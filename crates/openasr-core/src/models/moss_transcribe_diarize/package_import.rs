@@ -63,9 +63,7 @@ use serde::Deserialize;
 
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, SafetensorsTensorHeader,
     decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32, encode_f16_bits_le,
@@ -73,12 +71,12 @@ use crate::models::local_source_import::{
     validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, OasrMetadataBuilder,
-    TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
+    OasrMetadataBuilder, OasrPackWriter, PackEnvelope, TOKENIZER_GGML_MERGES_KEY,
+    TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
+use crate::models::pack_quant::{
+    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+};
 
 use super::runtime_contract::moss_td_kv_cache_positions;
 use super::tensor_names::{
@@ -89,10 +87,7 @@ use super::tensor_names::{
     moss_llm_layer_tensor_names,
 };
 
-use crate::arch::{
-    MOSS_TD_AUDIO_FRONTEND_ID, MOSS_TD_DECODE_POLICY_ID, MOSS_TD_GGML_ARCHITECTURE_ID,
-    MOSS_TD_MODEL_FAMILY, MOSS_TD_TOKENIZER_ID,
-};
+use crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_VOCAB_JSON: &str = "vocab.json";
@@ -101,8 +96,6 @@ const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
 
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
-
 const WHISPER_ENCODER_PREFIX: &str = "model.whisper_encoder.";
 const VQ_ADAPTOR_PREFIX: &str = "model.vq_adaptor.";
 const LANGUAGE_MODEL_PREFIX: &str = "model.language_model.";
@@ -223,21 +216,22 @@ pub fn convert_local_moss_transcribe_diarize_source_to_runtime_pack(
 
     let metadata =
         moss_td_runtime_gguf_metadata(&config, request, &tokens, &merges, audio_token_ids);
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(MOSS_TD_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "moss-transcribe-diarize GGUF writer failed for '{}': {error}",
+            "moss-transcribe-diarize OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "moss-transcribe-diarize import produced an unreadable tensor index: {error}"
-        ))
-    })?;
     Ok(MossTdImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
         vocab_size: tokens.len(),
     })
 }
@@ -432,6 +426,12 @@ fn quantized_linear_tensor_type(
 /// `models::pack_quant_audit`'s encoder-floor rule -- the single source of
 /// truth for "which moss tensors are audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["moss.enc.", "moss.adaptor."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: MOSS_TD_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };
 
 fn moss_quant_component(target_name: &str) -> QuantComponent {
     if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
@@ -1020,16 +1020,6 @@ fn moss_td_runtime_gguf_metadata(
     let text = &config.text_config;
     let audio = &config.audio_config;
     OasrMetadataBuilder::new()
-        .str(GENERAL_ARCHITECTURE_KEY, MOSS_TD_GGML_ARCHITECTURE_ID)
-        .str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1)
-        .str(OASR_METADATA_KEY_MODEL_FAMILY, MOSS_TD_MODEL_FAMILY)
-        .str(
-            OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-            MOSS_TD_GGML_ARCHITECTURE_ID,
-        )
-        .str(OASR_METADATA_KEY_AUDIO_FRONTEND, MOSS_TD_AUDIO_FRONTEND_ID)
-        .str(OASR_METADATA_KEY_DECODE_POLICY, MOSS_TD_DECODE_POLICY_ID)
-        .str(GGML_TOKENIZER_ID_KEY, MOSS_TD_TOKENIZER_ID)
         .str(OPENASR_MODEL_ID_KEY, &request.model_id)
         .str(TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_MODEL_VALUE_GPT2)
         .string_array(TOKENIZER_GGML_TOKENS_KEY, tokens)
@@ -1071,7 +1061,7 @@ fn moss_td_runtime_gguf_metadata(
         .u32("moss_td.llm.audio_pad_token_id", audio_token_ids.pad)
         .str("moss_td.llm.rms_norm_eps", text.rms_norm_eps)
         .str("moss_td.llm.rope_theta", text.rope_theta)
-        .build()
+        .build_family_metadata()
 }
 
 #[cfg(test)]
@@ -1137,6 +1127,20 @@ mod tests {
                 pad: 151_671,
             },
         );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert_eq!(
             metadata.get("moss_td.llm.max_positions"),
             Some(&GgufWriteValue::U32(8_192))

@@ -218,6 +218,16 @@ fn required_usize_list<M: ScalarMetadataView>(
     Ok(values)
 }
 
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_xasr_zipformer_execution_metadata(preflight.metadata())
+        .map(|_| ())
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("xasr-zipformer", error)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

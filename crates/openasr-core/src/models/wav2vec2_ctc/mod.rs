@@ -20,7 +20,3 @@ pub(crate) mod frontend;
 pub(crate) mod graph_config;
 pub(crate) mod runtime_contract;
 pub(crate) mod tokenizer;
-
-/// Crate-internal model-family + architecture ids for wav2vec2-ctc.
-pub(crate) const WAV2VEC2_CTC_MODEL_FAMILY: &str = "wav2vec2-ctc";
-pub(crate) const WAV2VEC2_CTC_GGML_ARCHITECTURE_ID: &str = "wav2vec2-ctc";

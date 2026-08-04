@@ -46,6 +46,8 @@ jobs:
         with:
           shared-key: lint
       - run: cargo fmt --check
+      - name: Model-family inventory drift gate
+        run: cargo xtask family export-inventory --check
       - name: Catalog drift gate
         run: tooling/publish-model/scripts/regenerate_all.sh --check
       - name: Catalog consistency gate

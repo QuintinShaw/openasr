@@ -13,7 +13,6 @@ use openasr_core::{ResponseFormat, TranscriptionRequest, render_transcription};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     io::Write,
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -81,7 +80,7 @@ fn with_server_instance_token_env<T>(value: Option<&str>, run: impl FnOnce() -> 
 fn write_content_addressed_moonshine_ref(home: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(home).unwrap();
     let staging = home.join("fixture-source.oasr");
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    let spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny");
     write_tiny_gguf_runtime_source(&staging, &spec).expect("write content-addressed fixture");
     let bytes = std::fs::read(&staging).unwrap();
     std::fs::remove_file(&staging).unwrap();
@@ -117,42 +116,15 @@ fn write_content_addressed_moonshine_ref(home: &std::path::Path) -> std::path::P
 fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Option<&str>) {
     let spec = metadata_model_id.map_or_else(
         || TinyGgufFixtureSpec::new(Default::default()),
-        TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu,
+        TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed,
     );
     write_tiny_gguf_runtime_source(path, &spec).expect("write mock gguf runtime source");
 }
 
 fn write_xasr_gguf_runtime_source(path: &std::path::Path, metadata_model_id: &str) {
-    let mut metadata = BTreeMap::new();
-    metadata.insert(
-        "openasr.model.id".to_string(),
-        metadata_model_id.to_string(),
+    let spec = TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        metadata_model_id,
     );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
-        openasr_core::models::oasr_metadata::OASR_PACKAGE_VERSION_V1.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
-        "xasr-zipformer".to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
-        openasr_core::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
-        openasr_core::XASR_ZIPFORMER_AUDIO_FRONTEND_ID.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY.to_string(),
-        openasr_core::XASR_ZIPFORMER_DECODE_POLICY_ID.to_string(),
-    );
-    metadata.insert(
-        openasr_core::GGML_TOKENIZER_ID_KEY.to_string(),
-        openasr_core::XASR_ZIPFORMER_TOKENIZER_ID.to_string(),
-    );
-    let spec = TinyGgufFixtureSpec::new(metadata);
     write_tiny_gguf_runtime_source(path, &spec).expect("write xasr gguf runtime source");
 }
 
@@ -165,11 +137,10 @@ fn write_moonshine_pull_fixture(
     root: &std::path::Path,
 ) -> (std::path::PathBuf, openasr_server::DistributionRuntime) {
     let pack_path = root.join("moonshine-tiny-q8_0.oasr");
-    // `whisper_oasr_v1_non_streaming_cpu` alone omits the whisper runtime
-    // scalar contract keys; install-time validation now enforces them (see
-    // `validate_native_runtime_model_pack_contract`), so this pull/import
-    // stand-in pack must be contract-complete to keep installing.
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    // A pull/import stand-in must be a real Moonshine-route fixture and
+    // contract-complete; a Whisper pack carrying a Moonshine model id would
+    // be rejected by the unified verifier before the job can install it.
+    let spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny");
     write_tiny_gguf_runtime_source(&pack_path, &spec).expect("write pull fixture");
     let bytes = std::fs::read(&pack_path).unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -470,6 +441,7 @@ fn write_persisted_pull_job_with_resolved_and_source(
             "resolved": {
                 "requested": "moonshine-tiny:q8",
                 "model_id": "moonshine-tiny",
+                "catalog_family_id": "moonshine",
                 "display_name": "Moonshine Tiny",
                 "quant": "q8_0",
                 "suffix": "q8",
@@ -2591,7 +2563,10 @@ fn native_server_runtime_rejects_reserved_oasr_container_magic() {
     .unwrap_err()
     .to_string();
 
-    assert!(error.contains("reserved OASR container magic"));
+    // Server startup exposes the deliberately generic fail-closed adapter
+    // selection error; the core runtime-source seam owns the detailed magic
+    // diagnostic without leaking it through this API boundary.
+    assert!(error.contains("could not verify and select a native model adapter"));
 }
 
 fn multipart_request_with_diarize(

@@ -2,7 +2,7 @@
 //! `granite_speech.{encoder,projector,decoder}.*` keys `package_import.rs`
 //! writes back into the same config structs
 //! `encoder_graph`/`qformer`/`decoder_graph` already accept, so an install-
-//! time pack check (`api::backend::native::validate_native_runtime_model_pack_contract`)
+//! time pack check (`api::backend::native::verify_native_runtime_model_pack_path`)
 //! and the executor read the exact same parsed values -- no second copy of
 //! the hparam list to drift. Mirrors `arch::hparams::GRANITE_SPEECH_HPARAM_SCHEMA`'s
 //! key list exactly.
@@ -140,4 +140,16 @@ pub(crate) fn parse_decoder_metadata(
         )?,
         logits_scaling: required_metadata_f32(metadata, "granite_speech.decoder.logits_scaling")?,
     })
+}
+
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_encoder_metadata(preflight.metadata())
+        .map(|_| ())
+        .and_then(|()| parse_projector_metadata(preflight.metadata()).map(|_| ()))
+        .and_then(|()| parse_decoder_metadata(preflight.metadata()).map(|_| ()))
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("granite-speech", error)
+        })
 }

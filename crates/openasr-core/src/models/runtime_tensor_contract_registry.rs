@@ -3,22 +3,22 @@
 //! two whose runtime tensors are validated/expanded centrally before graph
 //! assembly. Reached only from those families' import + prepared-runtime paths.
 //!
-//! Dedicated-executor families validate their own tensor sets in their family
-//! modules (e.g. `validate_stage_against_descriptor`) and never route a
-//! contract id through here. Known dedicated-executor contract ids are matched
-//! explicitly so generic tooling sees a first-class fail-closed marker instead
-//! of a generic unknown-contract error.
+//! Families that select `FamilyOwned` prepared runtimes validate their tensor
+//! sets in their own modules (e.g. `validate_stage_against_descriptor`) and
+//! never route a contract id through here. The canonical architecture
+//! inventory identifies those contracts so generic tooling sees a first-class
+//! fail-closed marker instead of a generic unknown-contract error. This is
+//! intentionally independent from the outer executor capability: Cohere uses a
+//! dedicated executor facade while still sharing the composer runtime.
 
 use thiserror::Error;
 
 use crate::GgufTensorIndex;
 use crate::arch::{
-    COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID, MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID,
-    OpenAsrArchitectureRegistry, PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID,
-    QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID, WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID,
-    XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID,
+    COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID, OpenAsrArchitectureRegistry,
+    OpenAsrPreparedRuntimeStrategy, QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
 };
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
 use crate::models::runtime_contract::ScalarMetadataView;
 
@@ -62,47 +62,6 @@ impl RuntimeTensorContractMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DedicatedRuntimeTensorContractFamily {
-    ParakeetCtc,
-    ParakeetTdt,
-    Wav2Vec2Ctc,
-    XasrZipformer,
-    Moonshine,
-    SenseVoice,
-    FireRedAed,
-    FireRedLlm,
-    FunasrNano,
-    MimoAsr,
-    MossTd,
-    GraniteSpeech,
-}
-
-impl DedicatedRuntimeTensorContractFamily {
-    fn label(self) -> &'static str {
-        match self {
-            Self::ParakeetCtc => "parakeet-ctc",
-            Self::ParakeetTdt => "parakeet-tdt",
-            Self::Wav2Vec2Ctc => "wav2vec2-ctc",
-            Self::XasrZipformer => "xasr-zipformer",
-            Self::Moonshine => "moonshine",
-            Self::SenseVoice => "sensevoice",
-            Self::FireRedAed => "firered-aed",
-            Self::FireRedLlm => "firered-llm",
-            Self::FunasrNano => "funasr-nano",
-            Self::MimoAsr => "mimo-asr",
-            Self::MossTd => "moss-transcribe-diarize",
-            Self::GraniteSpeech => "granite-speech",
-        }
-    }
-}
-
-impl std::fmt::Display for DedicatedRuntimeTensorContractFamily {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.label())
-    }
-}
-
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeTensorContractRegistryError {
     #[error("unknown builtin model architecture '{model_architecture}'")]
@@ -110,11 +69,11 @@ pub(crate) enum RuntimeTensorContractRegistryError {
     #[error("unknown runtime tensor contract '{contract_id}'")]
     UnknownContract { contract_id: String },
     #[error(
-        "runtime tensor contract '{contract_id}' belongs to dedicated executor family '{family}' and is not materialized by the composer registry"
+        "runtime tensor contract '{contract_id}' belongs to family-owned runtime '{family}' and is not materialized by the shared composer registry"
     )]
-    DedicatedExecutorContract {
+    FamilyOwnedRuntimeContract {
         contract_id: String,
-        family: DedicatedRuntimeTensorContractFamily,
+        family: &'static str,
     },
     #[error(
         "runtime tensor contract '{contract_id}' expected metadata for '{expected_kind}', got '{found_kind}'"
@@ -157,7 +116,7 @@ pub(crate) fn resolve_builtin_runtime_tensor_contract_descriptors(
                 found_kind: metadata.kind_label(),
             })
         }
-        (contract_id, _) => dedicated_executor_contract_error(contract_id).map_or_else(
+        (contract_id, _) => family_owned_runtime_contract_error(contract_id).map_or_else(
             || {
                 Err(RuntimeTensorContractRegistryError::UnknownContract {
                     contract_id: contract_id.to_string(),
@@ -178,17 +137,23 @@ pub(crate) fn validate_builtin_runtime_tensor_contract_for_architecture<M: Scala
         .ok_or_else(|| RuntimeTensorContractRegistryError::UnknownArchitecture {
             model_architecture: model_architecture.to_string(),
         })?;
-    match descriptor.runtime_tensor_contract_id {
+    match descriptor.pack_contract.runtime_tensor_contract_id {
         QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID => {
             let metadata = parse_qwen3_execution_metadata(metadata).map_err(|error| {
                 RuntimeTensorContractRegistryError::MetadataParseFailed {
-                    contract_id: descriptor.runtime_tensor_contract_id.to_string(),
+                    contract_id: descriptor
+                        .pack_contract
+                        .runtime_tensor_contract_id
+                        .to_string(),
                     reason: error.to_string(),
                 }
             })?;
             validate_qwen3_runtime_tensors_with_index(tensor_index, metadata).map_err(|error| {
                 RuntimeTensorContractRegistryError::ValidationFailed {
-                    contract_id: descriptor.runtime_tensor_contract_id.to_string(),
+                    contract_id: descriptor
+                        .pack_contract
+                        .runtime_tensor_contract_id
+                        .to_string(),
                     reason: error.to_string(),
                 }
             })?;
@@ -198,19 +163,25 @@ pub(crate) fn validate_builtin_runtime_tensor_contract_for_architecture<M: Scala
             let metadata =
                 parse_cohere_transcribe_execution_metadata(metadata).map_err(|error| {
                     RuntimeTensorContractRegistryError::MetadataParseFailed {
-                        contract_id: descriptor.runtime_tensor_contract_id.to_string(),
+                        contract_id: descriptor
+                            .pack_contract
+                            .runtime_tensor_contract_id
+                            .to_string(),
                         reason: error.to_string(),
                     }
                 })?;
             validate_cohere_transcribe_runtime_tensors_with_index(tensor_index, metadata).map_err(
                 |error| RuntimeTensorContractRegistryError::ValidationFailed {
-                    contract_id: descriptor.runtime_tensor_contract_id.to_string(),
+                    contract_id: descriptor
+                        .pack_contract
+                        .runtime_tensor_contract_id
+                        .to_string(),
                     reason: error.to_string(),
                 },
             )?;
             Ok(RuntimeTensorContractMetadata::CohereTranscribe(metadata))
         }
-        contract_id => dedicated_executor_contract_error(contract_id).map_or_else(
+        contract_id => family_owned_runtime_contract_error(contract_id).map_or_else(
             || {
                 Err(RuntimeTensorContractRegistryError::UnknownContract {
                     contract_id: contract_id.to_string(),
@@ -223,7 +194,7 @@ pub(crate) fn validate_builtin_runtime_tensor_contract_for_architecture<M: Scala
 
 pub(crate) fn validate_builtin_runtime_tensor_contract_preflight(
     model_architecture: &str,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<RuntimeTensorContractMetadata, RuntimeTensorContractRegistryError> {
     validate_builtin_runtime_tensor_contract_for_architecture(
         model_architecture,
@@ -232,55 +203,23 @@ pub(crate) fn validate_builtin_runtime_tensor_contract_preflight(
     )
 }
 
-fn dedicated_runtime_tensor_contract_family(
-    contract_id: &str,
-) -> Option<DedicatedRuntimeTensorContractFamily> {
-    match contract_id {
-        PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::ParakeetCtc)
-        }
-        crate::arch::PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::ParakeetTdt)
-        }
-        WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::Wav2Vec2Ctc)
-        }
-        XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::XasrZipformer)
-        }
-        MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::Moonshine)
-        }
-        crate::arch::SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::SenseVoice)
-        }
-        crate::arch::FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::FireRedAed)
-        }
-        crate::arch::FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::FireRedLlm)
-        }
-        crate::arch::FUNASR_NANO_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::FunasrNano)
-        }
-        crate::arch::MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::MimoAsr)
-        }
-        crate::arch::MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::MossTd)
-        }
-        crate::arch::GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID => {
-            Some(DedicatedRuntimeTensorContractFamily::GraniteSpeech)
-        }
-        _ => None,
-    }
+fn family_owned_runtime_tensor_contract_family(contract_id: &str) -> Option<&'static str> {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .descriptors()
+        .iter()
+        .find(|descriptor| {
+            descriptor.pack_contract.runtime_tensor_contract_id == contract_id
+                && descriptor.execution_contract.prepared_runtime
+                    == OpenAsrPreparedRuntimeStrategy::FamilyOwned
+        })
+        .map(|descriptor| descriptor.identity.model_family)
 }
 
-fn dedicated_executor_contract_error(
+fn family_owned_runtime_contract_error(
     contract_id: &str,
 ) -> Option<RuntimeTensorContractRegistryError> {
-    dedicated_runtime_tensor_contract_family(contract_id).map(|family| {
-        RuntimeTensorContractRegistryError::DedicatedExecutorContract {
+    family_owned_runtime_tensor_contract_family(contract_id).map(|family| {
+        RuntimeTensorContractRegistryError::FamilyOwnedRuntimeContract {
             contract_id: contract_id.to_string(),
             family,
         }
@@ -385,56 +324,53 @@ mod tests {
     }
 
     #[test]
-    fn identifies_dedicated_executor_contract_markers() {
+    fn identifies_every_family_owned_runtime_contract_from_architecture_inventory() {
+        let family_owned_descriptors = OpenAsrArchitectureRegistry::with_builtins()
+            .descriptors()
+            .iter()
+            .filter(|descriptor| {
+                descriptor.execution_contract.prepared_runtime
+                    == OpenAsrPreparedRuntimeStrategy::FamilyOwned
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!family_owned_descriptors.is_empty());
+        for descriptor in family_owned_descriptors {
+            assert_eq!(
+                family_owned_runtime_tensor_contract_family(
+                    descriptor.pack_contract.runtime_tensor_contract_id
+                ),
+                Some(descriptor.identity.model_family)
+            );
+        }
         assert_eq!(
-            dedicated_runtime_tensor_contract_family(PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID),
-            Some(DedicatedRuntimeTensorContractFamily::ParakeetCtc)
-        );
-        assert_eq!(
-            dedicated_runtime_tensor_contract_family(WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID),
-            Some(DedicatedRuntimeTensorContractFamily::Wav2Vec2Ctc)
-        );
-        assert_eq!(
-            dedicated_runtime_tensor_contract_family(MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID),
-            Some(DedicatedRuntimeTensorContractFamily::Moonshine)
-        );
-        assert_eq!(
-            dedicated_runtime_tensor_contract_family(XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID),
-            Some(DedicatedRuntimeTensorContractFamily::XasrZipformer)
+            family_owned_runtime_tensor_contract_family("unknown-contract"),
+            None
         );
     }
 
     #[test]
-    fn dedicated_executor_contracts_fail_closed_without_unknown_contract() {
-        for (contract_id, family) in [
-            (
-                PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID,
-                DedicatedRuntimeTensorContractFamily::ParakeetCtc,
-            ),
-            (
-                WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID,
-                DedicatedRuntimeTensorContractFamily::Wav2Vec2Ctc,
-            ),
-            (
-                MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID,
-                DedicatedRuntimeTensorContractFamily::Moonshine,
-            ),
-            (
-                XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID,
-                DedicatedRuntimeTensorContractFamily::XasrZipformer,
-            ),
-        ] {
+    fn family_owned_runtime_contracts_fail_closed_without_unknown_contract() {
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins()
+            .descriptors()
+            .iter()
+            .filter(|descriptor| {
+                descriptor.execution_contract.prepared_runtime
+                    == OpenAsrPreparedRuntimeStrategy::FamilyOwned
+            })
+        {
+            let contract_id = descriptor.pack_contract.runtime_tensor_contract_id;
             let error = resolve_builtin_runtime_tensor_contract_descriptors(
                 contract_id,
                 RuntimeTensorContractMetadata::Qwen3Asr(qwen_metadata()),
             )
-            .expect_err("dedicated contract should not materialize composer descriptors");
+            .expect_err("family-owned contract should not materialize shared composer descriptors");
 
             assert_eq!(
                 error,
-                RuntimeTensorContractRegistryError::DedicatedExecutorContract {
+                RuntimeTensorContractRegistryError::FamilyOwnedRuntimeContract {
                     contract_id: contract_id.to_string(),
-                    family,
+                    family: descriptor.identity.model_family,
                 }
             );
         }

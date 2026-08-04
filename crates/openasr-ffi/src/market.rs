@@ -872,6 +872,7 @@ mod tests {
         ResolvedCatalogPull {
             requested: "test-model:q8".to_string(),
             model_id: "test-model".to_string(),
+            catalog_family_id: "test-family".to_string(),
             display_name: "Test Model".to_string(),
             quant: "q8_0".to_string(),
             suffix: "q8".to_string(),

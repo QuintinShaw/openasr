@@ -176,7 +176,7 @@ pub(crate) fn build_dolphin_decode_prefix(
 /// `languages.md` "Language Code" + "Language Region Code" tables. Dolphin's
 /// own language code matches this crate's normalized ISO code for every entry
 /// except Cantonese (Dolphin: `ct`, this table's key: `yue`, matching
-/// `LANG_BY_FAMILY`/`LANGUAGE_DISPLAY_LABELS`'s existing `yue` convention).
+/// generated family inventory / `LANGUAGE_DISPLAY_LABELS`'s existing `yue` convention).
 /// The default region is the card's unqualified/most-common region where it
 /// lists several (e.g. Arabic's `ar-GLA` is the only entry labeled plain
 /// "Arabic", the rest carry a country qualifier), or `NULL` where the card
@@ -305,8 +305,8 @@ pub(crate) fn build_dolphin_multilingual_decode_prefix(
 /// `crate::models::language`, which is now a cross-family typo-guard union:
 /// FireRedASR2 (`firered-aed`) and Qwen3-ASR (`qwen`) also advertise
 /// registered dialect codes for their own benchmark-verified recognition
-/// coverage (see `DIALECT_CAPABLE_FAMILIES` in `_catalog.py`), not a
-/// selectable prompt, so the global registry has grown codes this family's
+/// coverage (see the generated family descriptor/inventory), not a selectable
+/// prompt, so the global registry has grown codes this family's
 /// vocab has no `<REGION>` token for. This module's producer-side import
 /// guard and tests pin against THIS list, not the global one, so a future
 /// cross-family dialect addition can never make Dolphin's own picker

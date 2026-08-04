@@ -38,6 +38,12 @@ const SUBSAMPLING_KERNEL: usize = 3;
 const SUBSAMPLING_STRIDE: usize = 2;
 const SUBSAMPLING_PADDING: usize = 1;
 
+enum RuntimeWeightSource<'a> {
+    Verified(&'a GgufRuntimeSourcePreflight),
+    #[cfg(test)]
+    Synthetic,
+}
+
 pub(crate) fn conv_out_dim(input: usize) -> usize {
     (input + 2 * SUBSAMPLING_PADDING - SUBSAMPLING_KERNEL) / SUBSAMPLING_STRIDE + 1
 }
@@ -351,9 +357,64 @@ impl FastConformerEncoderCore {
     /// then upload everything" pass (the first upload call freezes further
     /// tensor allocation).
     pub(crate) fn build<E, T>(
+        graph_config: GgmlCpuGraphConfig,
+        context_bytes: usize,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        subsampling: &[NamedTensor],
+        layers: &[FastConformerLayerWeights],
+        declare_tail: impl FnOnce(
+            &GgmlStaticTensorArena,
+            Option<&GgmlLoadedWeightContext>,
+        ) -> Result<T, E>,
+        upload_tail: impl FnOnce(&mut GgmlStaticTensorArena, &T) -> Result<(), E>,
+    ) -> Result<(Self, T), E>
+    where
+        E: FastConformerGraphError,
+    {
+        Self::build_impl(
+            graph_config,
+            context_bytes,
+            RuntimeWeightSource::Verified(runtime_preflight),
+            subsampling,
+            layers,
+            declare_tail,
+            upload_tail,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_synthetic<E, T>(
+        graph_config: GgmlCpuGraphConfig,
+        context_bytes: usize,
+        subsampling: &[NamedTensor],
+        layers: &[FastConformerLayerWeights],
+        declare_tail: impl FnOnce(
+            &GgmlStaticTensorArena,
+            Option<&GgmlLoadedWeightContext>,
+        ) -> Result<T, E>,
+        upload_tail: impl FnOnce(&mut GgmlStaticTensorArena, &T) -> Result<(), E>,
+    ) -> Result<(Self, T), E>
+    where
+        E: FastConformerGraphError,
+    {
+        Self::build_impl(
+            graph_config,
+            context_bytes,
+            RuntimeWeightSource::Synthetic,
+            subsampling,
+            layers,
+            declare_tail,
+            upload_tail,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_impl<E, T>(
         mut graph_config: GgmlCpuGraphConfig,
         context_bytes: usize,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_source: RuntimeWeightSource<'_>,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
         declare_tail: impl FnOnce(
@@ -378,11 +439,15 @@ impl FastConformerEncoderCore {
         // Bind the 2-D linears zero-copy from the mmap'd pack (no f32
         // dequantize-to-host, no arena upload). Fails closed below if the
         // load failed but a bindable weight's host payload was dropped.
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
-            runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+        let loaded_weights = match runtime_source {
+            RuntimeWeightSource::Verified(preflight) => Some(
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(|source| E::graph_build_failed("load_gguf_weight_context", source))?,
+            ),
+            #[cfg(test)]
+            RuntimeWeightSource::Synthetic => None,
+        };
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(context_bytes)

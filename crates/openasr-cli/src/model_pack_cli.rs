@@ -5,7 +5,9 @@ pub(super) fn model_pack_command(command: ModelPackCommand) -> Result<()> {
     match command {
         ModelPackCommand::Import { command } => import_command(*command),
         ModelPackCommand::Verify => verify_model_store_command(),
-        ModelPackCommand::Preflight { path } => preflight_model_pack_command(&path),
+        ModelPackCommand::Preflight { path, stage, json } => {
+            preflight_model_pack_command(&path, stage.as_deref(), json)
+        }
         ModelPackCommand::AuditQuant { target, quant } => audit_pack_quant_command(&target, quant),
         ModelPackCommand::Usage => model_store_usage_command(),
         ModelPackCommand::Gc { dry_run } => model_store_gc_command(dry_run),
@@ -384,13 +386,63 @@ fn import_command(command: ImportCommand) -> Result<()> {
 /// pack (`openasr_core::preflight_model_pack_for_install`). The publish
 /// pipeline invokes this on every final `.oasr` before upload so a pack a
 /// client would reject can never ship.
-fn preflight_model_pack_command(path: &Path) -> Result<()> {
+fn preflight_model_pack_command(path: &Path, stage: Option<&Path>, json: bool) -> Result<()> {
     let package_path = validate_local_ggml_package_cli_path(path)?;
-    openasr_core::preflight_model_pack_for_install(&package_path).map_err(anyhow::Error::new)?;
-    println!(
-        "Preflight passed: {} is installable by the client pull path.",
-        package_path.display()
-    );
+    let verified_path = if let Some(destination) = stage {
+        if destination.extension().and_then(|value| value.to_str()) != Some("oasr") {
+            anyhow::bail!("staged model pack destination must end in .oasr");
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            anyhow::anyhow!("staged model pack destination has no parent directory")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut source = std::fs::File::open(&package_path)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        if let Err(error) = std::io::copy(&mut source, &mut output).and_then(|_| output.sync_all())
+        {
+            drop(output);
+            let _ = std::fs::remove_file(destination);
+            return Err(error.into());
+        }
+        destination.to_path_buf()
+    } else {
+        package_path
+    };
+    let receipt = match openasr_core::preflight_model_pack_with_receipt(&verified_path) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            if stage.is_some() {
+                let _ = std::fs::remove_file(&verified_path);
+            }
+            return Err(anyhow::Error::new(error));
+        }
+    };
+    if stage.is_some() {
+        let mut permissions = match std::fs::metadata(&verified_path) {
+            Ok(metadata) => metadata.permissions(),
+            Err(error) => {
+                let _ = std::fs::remove_file(&verified_path);
+                return Err(error.into());
+            }
+        };
+        permissions.set_readonly(true);
+        if let Err(error) = std::fs::set_permissions(&verified_path, permissions) {
+            let _ = std::fs::remove_file(&verified_path);
+            return Err(error.into());
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string(&receipt)?);
+    } else {
+        println!(
+            "Preflight passed: {} is installable by the client pull path ({}).",
+            verified_path.display(),
+            receipt.content_id
+        );
+    }
     Ok(())
 }
 
@@ -751,11 +803,8 @@ fn import_hymt2_gguf_local_command(
 
     let result =
         openasr_core::import_hymt2_gguf_to_runtime_pack(&request).map_err(anyhow::Error::new)?;
-    // Fail-closed: the written pack must load through the Hy-MT2 runtime probe.
-    let metadata =
-        openasr_core::Hymt2Runtime::probe_path(&result.output_path).map_err(anyhow::Error::new)?;
     println!(
-        "Imported pinned Hy-MT2 GGUF into translation runtime pack:\n- source: {}\n- source_sha256: {}\n- output: {}\n- pack_sha256: {}\n- size_bytes: {}\n- tensor_count: {}\n- spliced_metadata_entries: {}\n- layers: {}\n- vocab_size: {}",
+        "Imported pinned Hy-MT2 GGUF into translation runtime pack:\n- source: {}\n- source_sha256: {}\n- output: {}\n- pack_sha256: {}\n- size_bytes: {}\n- tensor_count: {}\n- spliced_metadata_entries: {}",
         source_gguf.display(),
         result.source_sha256,
         result.output_path.display(),
@@ -763,8 +812,6 @@ fn import_hymt2_gguf_local_command(
         result.pack_size_bytes,
         result.tensor_count,
         result.appended_metadata_entries,
-        metadata.layers,
-        metadata.vocab_size,
     );
     Ok(())
 }
@@ -1606,5 +1653,44 @@ mod tests {
         let rendered = render_native_transcription_capability_summary(&runtime_path);
 
         assert!(rendered.contains("- diarization: supported=false, behavior=reject_request"));
+    }
+
+    #[test]
+    fn preflight_stage_verifies_exact_copy_and_seals_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        let destination = temp.path().join("stage").join("pack.oasr");
+        let spec =
+            openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+                "staged-whisper",
+            )
+            .with_whisper_minimal_tokenizer();
+        openasr_core::testing::write_tiny_gguf_runtime_source(&source, &spec).unwrap();
+
+        preflight_model_pack_command(&source, Some(&destination), true).unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        assert!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[test]
+    fn preflight_stage_removes_the_new_destination_when_verification_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("broken.oasr");
+        let destination = temp.path().join("stage").join("pack.oasr");
+        std::fs::write(&source, b"not a GGUF pack").unwrap();
+
+        let error = preflight_model_pack_command(&source, Some(&destination), true).unwrap_err();
+
+        assert!(error.to_string().contains("preflight"));
+        assert!(!destination.exists());
     }
 }

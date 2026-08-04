@@ -63,6 +63,99 @@ pub(crate) enum QuantComponent {
     Decoder,
 }
 
+/// Mathematical use of a runtime tensor. Source-name parsing ends at this
+/// boundary; quantization policy consumes the role and shape, never a family
+/// prefix or suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TensorRole {
+    AcousticEncoderMatrix,
+    TextDecoderMatrix,
+    EmbeddingTable,
+    OutputProjection,
+    NonQuantizable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuantizedAxis {
+    First,
+    Last,
+}
+
+/// Executable classification contract used by both pack writers and the
+/// post-build quant-floor audit. Registry descriptors must choose one variant;
+/// there is no architecture-name fallback table.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TensorQuantizationContract {
+    /// Legacy name-based importers expose their authoritative acoustic prefix
+    /// slice directly from the family module until they migrate to roles.
+    AcousticEncoderPrefixesV1 {
+        model_architecture: &'static str,
+        prefixes: &'static [&'static str],
+    },
+    /// Writer and audit share the same mathematical-role classifier.
+    SemanticRolesV1 {
+        model_architecture: &'static str,
+        classify: fn(&str) -> TensorRole,
+        quantized_axis: QuantizedAxis,
+    },
+    /// Every quantizable tensor belongs to one acoustic model.
+    EntireAcousticPack { model_architecture: &'static str },
+    /// The pack has no acoustic encoder to which the ASR Q8 floor applies.
+    /// A reason is mandatory so `NotApplicable` cannot become a disguised
+    /// backlog state in a multi-agent registry.
+    NotApplicable {
+        model_architecture: &'static str,
+        reason: &'static str,
+    },
+}
+
+impl TensorQuantizationContract {
+    pub(crate) const fn model_architecture(self) -> &'static str {
+        match self {
+            Self::AcousticEncoderPrefixesV1 {
+                model_architecture, ..
+            }
+            | Self::SemanticRolesV1 {
+                model_architecture, ..
+            }
+            | Self::EntireAcousticPack { model_architecture }
+            | Self::NotApplicable {
+                model_architecture, ..
+            } => model_architecture,
+        }
+    }
+}
+
+impl TensorRole {
+    fn quant_component(self) -> Option<QuantComponent> {
+        match self {
+            Self::AcousticEncoderMatrix => Some(QuantComponent::Encoder),
+            Self::TextDecoderMatrix | Self::EmbeddingTable | Self::OutputProjection => {
+                Some(QuantComponent::Decoder)
+            }
+            Self::NonQuantizable => None,
+        }
+    }
+}
+
+/// Semantic quantization entry point. The family maps a source tensor to a
+/// [`TensorRole`] and storage orientation once; this shared policy applies the
+/// alignment and acoustic Q8 floor without inspecting a tensor name.
+pub(crate) fn classify_quant_tensor_role(
+    dims: &[u64],
+    quantization: PackQuant,
+    role: TensorRole,
+    axis: QuantizedAxis,
+) -> Option<GgufWriteTensorType> {
+    let component = role.quant_component()?;
+    let ne0 = match axis {
+        QuantizedAxis::First => dims.first(),
+        QuantizedAxis::Last => dims.last(),
+    }
+    .copied()?;
+    classify_quant_tensor(ne0, quantization, component)
+}
+
 /// Shared 32/256-alignment + K-quant-rung selection tail.
 ///
 /// Callers first resolve their own family-specific tensor eligibility
@@ -195,6 +288,37 @@ mod tests {
         assert_eq!(
             classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Decoder),
             Some(GgufWriteTensorType::Q3_K)
+        );
+    }
+
+    #[test]
+    fn semantic_roles_apply_policy_without_tensor_names() {
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[256, 896],
+                PackQuant::Q4_K,
+                TensorRole::AcousticEncoderMatrix,
+                QuantizedAxis::First,
+            ),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[896, 256],
+                PackQuant::Q4_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::Last,
+            ),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[256, 896],
+                PackQuant::Q4_K,
+                TensorRole::NonQuantizable,
+                QuantizedAxis::First,
+            ),
+            None
         );
     }
 

@@ -58,6 +58,10 @@ pub(crate) struct GgufTensorIndexSnapshot {
 }
 
 impl GgufTensorIndex {
+    pub(crate) fn set_display_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     #[cfg(test)]
     pub(crate) fn empty_for_test(path: PathBuf) -> Self {
         Self {

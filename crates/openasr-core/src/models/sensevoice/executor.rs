@@ -26,7 +26,9 @@ use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
-use crate::arch::{OpenAsrArchitectureRegistry, SENSEVOICE_GGML_ARCHITECTURE_ID};
+use crate::arch::{
+    OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy, SENSEVOICE_GGML_ARCHITECTURE_ID,
+};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -134,7 +136,7 @@ pub(crate) struct SenseVoiceTranscription {
 }
 
 fn materialize_sensevoice_prepared_runtime(
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     gguf_metadata: &crate::ggml_runtime::GgufMetadata,
     metadata: SenseVoiceExecutionMetadata,
@@ -146,7 +148,7 @@ fn materialize_sensevoice_prepared_runtime(
     let prompt_embed = weights.prompt_embed.values.clone();
     let cmvn_neg_mean = weights.cmvn_neg_mean.values.clone();
     let cmvn_inv_stddev = weights.cmvn_inv_stddev.values.clone();
-    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, Some(preflight), backend)
+    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, preflight, backend)
         .map_err(|e| e.to_string())?;
     Ok(SenseVoicePreparedRuntime {
         metadata,
@@ -164,7 +166,12 @@ fn validate_sensevoice_block_stack(
 ) -> Result<(), String> {
     let block_stack = OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(SENSEVOICE_GGML_ARCHITECTURE_ID)
-        .and_then(|descriptor| descriptor.block_stack);
+        .and_then(
+            |descriptor| match descriptor.topology_contract.block_stack {
+                OpenAsrBlockStackStrategy::Shared(stack) => Some(stack),
+                OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => None,
+            },
+        );
     validate_stage_against_descriptor(
         SENSEVOICE_GGML_ARCHITECTURE_ID,
         block_stack.as_ref(),
@@ -285,7 +292,7 @@ fn strip_tags_in_result(mut result: CtcGreedyDecodeResult) -> CtcGreedyDecodeRes
 fn decode_sensevoice_pcm_cached(
     runtime_pool: &SenseVoiceRuntimePool,
     samples: &[f32],
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
@@ -304,7 +311,7 @@ fn decode_sensevoice_pcm_cached(
 fn transcribe_sensevoice_pcm_cached(
     runtime_pool: &SenseVoiceRuntimePool,
     samples: &[f32],
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
@@ -333,7 +340,7 @@ fn new_sensevoice_runtime_pool() -> Arc<SenseVoiceRuntimePool> {
 
 fn checkout_sensevoice_prepared_runtime(
     runtime_pool: &SenseVoiceRuntimePool,
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<SenseVoiceRuntimeActor, String> {
     let backend = sensevoice_encoder_graph_config(resolved_backend).backend;
@@ -473,13 +480,11 @@ impl SenseVoiceGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        let preflight = &request.runtime_source_preflight;
         decode_sensevoice_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight,
+            preflight,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
@@ -489,7 +494,18 @@ impl SenseVoiceGgmlExecutor {
     }
 }
 
+impl SenseVoiceGgmlExecutor {
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_pool
+            .evict_where(|(key, _lane)| key.pack_content_id == pack_content_id);
+    }
+}
+
 impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        SenseVoiceGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         crate::arch::SENSEVOICE_EXECUTOR_COMPONENT_ID
     }
@@ -520,13 +536,11 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        let preflight = &request.runtime_source_preflight;
         let output = transcribe_sensevoice_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight,
+            preflight,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),

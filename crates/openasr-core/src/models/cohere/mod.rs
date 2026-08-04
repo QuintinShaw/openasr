@@ -29,7 +29,7 @@ pub(crate) use frontend::{
     CohereTranscribeFrontendPlan, load_cohere_transcribe_frontend_plan_from_reader,
 };
 pub(crate) use ggml_executor::CohereTranscribeGgmlExecutor;
-pub(crate) use package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
+pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{
     CohereLocalSourceError, CohereLocalSourceImportRequest, CohereLocalSourceImportRuntimeResult,
     CohereRuntimeQuantizationMode, convert_local_cohere_source_to_runtime_pack,

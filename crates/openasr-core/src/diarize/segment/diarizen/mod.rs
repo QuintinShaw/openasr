@@ -16,9 +16,10 @@ use thiserror::Error;
 
 #[cfg(test)]
 use crate::diarize::contract::{SpeakerId, SpeakerTurn, TimeRange};
-use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgufMetadata, GgufTensorIndex,
-    load_runtime_source_metadata_and_tensor_index_from_source, validate_ggml_runtime_source_path,
+use crate::ggml_runtime::{GgmlCpuGraphError, GgufMetadata, GgufTensorIndex};
+use crate::models::{
+    aux_pack_registry::AuxPackKind,
+    pack_verifier::{PackCandidate, PackRoute, PackVerificationError, PackVerifier, VerifiedPack},
 };
 
 pub use config::ARCHITECTURE_ID as DIARIZEN_GGML_ARCHITECTURE_ID;
@@ -131,17 +132,10 @@ impl DiariZenSegmenter {
     /// Cheap install-time contract probe. This parses metadata and the tensor
     /// index only; it does not materialize weights or construct a compute graph.
     pub fn probe_oasr(path: &Path) -> Result<(), DiariZenSegmenterError> {
-        let source = validate_ggml_runtime_source_path(path)
-            .map_err(|error| DiariZenSegmenterError::PackSource(error.to_string()))?;
-        Self::probe_runtime_source(&source)
-    }
-
-    pub(super) fn probe_runtime_source(
-        source: &crate::ggml_runtime::GgmlRuntimeSource,
-    ) -> Result<(), DiariZenSegmenterError> {
-        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(source)
-            .map_err(|error| DiariZenSegmenterError::PackRead(error.to_string()))?;
-        Self::probe_preflight_parts(&preflight.metadata, &preflight.tensor_index)
+        let verified_pack = PackVerifier
+            .verify_candidate(PackCandidate::new(path))
+            .map_err(map_pack_verification_error)?;
+        ensure_diarization_pack_route(&verified_pack)
     }
 
     pub(crate) fn probe_preflight_parts(
@@ -151,6 +145,33 @@ impl DiariZenSegmenter {
         config::validate_metadata(metadata)?;
         validate_tensor_contract(tensor_index)
     }
+}
+
+fn map_pack_verification_error(error: PackVerificationError) -> DiariZenSegmenterError {
+    match error {
+        PackVerificationError::RuntimeSource { source, .. } => {
+            DiariZenSegmenterError::PackSource(source.to_string())
+        }
+        other => DiariZenSegmenterError::PackRead(other.to_string()),
+    }
+}
+
+fn ensure_diarization_pack_route(
+    verified_pack: &VerifiedPack,
+) -> Result<(), DiariZenSegmenterError> {
+    if matches!(
+        verified_pack.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::Diarization,
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    Err(DiariZenSegmenterError::PackRead(format!(
+        "pack route is not auxiliary diarization: {:?}",
+        verified_pack.route()
+    )))
 }
 
 #[cfg(test)]

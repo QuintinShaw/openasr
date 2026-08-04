@@ -23,3 +23,18 @@ pub(crate) mod runtime_contract;
 mod rvq;
 mod tensor_names;
 mod tokenizer;
+use crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID;
+use crate::models::pack_quant::TensorQuantizationContract;
+
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &[
+    "audiotok.",
+    "inlocal.",
+    "speech_embd.",
+    "speech_group_proj.",
+];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: MIMO_ASR_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };

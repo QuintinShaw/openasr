@@ -72,7 +72,7 @@ use super::runtime_contract::{
 use super::rvq::{MimoRvqCodebooks, encode_rvq_codes, load_mimo_rvq_codebooks_from_reader};
 use super::tokenizer::MimoAsrTokenizer;
 
-const MIMO_ASR_EXECUTOR_ID: &str = "mimo-asr-ggml-executor-v1";
+const MIMO_ASR_EXECUTOR_ID: &str = crate::arch::MIMO_ASR_EXECUTOR_COMPONENT_ID;
 const MIMO_ASR_STREAMING_EXECUTOR_ID: &str = "mimo-asr-ggml-snapshot-streaming-executor-v1";
 /// The reference `preprocess_input` re-chunks internally at 30s (`chunk_samples
 /// = 30 * sampling_rate`); this executor instead fails closed above that same
@@ -88,8 +88,6 @@ enum MimoAsrExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("mimo-asr executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("mimo-asr runtime metadata contract failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("mimo-asr tokenizer materialization failed: {reason}")]
@@ -296,7 +294,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
 
 impl MimoAsrPreparedRuntime {
     fn quoted_system_memory_bytes(
-        preflight: &crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<(u64, u64), MimoAsrExecutorError> {
         let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata)
@@ -393,7 +391,7 @@ impl MimoAsrPreparedRuntime {
     /// This is the whole cost the resident cache exists to pay exactly once per
     /// (pack, backend).
     fn build(
-        preflight: &crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, MimoAsrExecutorError> {
         let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata).map_err(|error| {
@@ -567,7 +565,7 @@ impl MimoAsrGgmlExecutor {
 
     fn checkout_prepared_runtime(
         &self,
-        preflight: &crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         kv_capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<MimoAsrPreparedRuntimeActor, MimoAsrExecutorError> {
@@ -634,11 +632,7 @@ impl MimoAsrGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| MimoAsrExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
 
         let samples = &request.prepared_audio.samples_f32;
         let audio_duration_seconds =
@@ -656,7 +650,7 @@ impl MimoAsrGgmlExecutor {
             super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
         )
         .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(&preflight, backend, kv_capacity)?;
+        let actor = self.checkout_prepared_runtime(preflight, backend, kv_capacity)?;
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);
@@ -898,6 +892,10 @@ fn strip_mimo_language_tags(text: &str) -> String {
 }
 
 impl GgmlAsrViewExecutor for MimoAsrGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        MimoAsrGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         MIMO_ASR_EXECUTOR_ID
     }
@@ -966,8 +964,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use crate::arch::builtin_adapter_descriptor;
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
-    use crate::models::ggml_family_registry::mimo_asr_runtime_descriptor_v1;
 
     use super::*;
 
@@ -1072,14 +1070,18 @@ mod tests {
         )
         .expect("load wav fixture");
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &pack_path,
+            )
+            .expect("mimo runtime must pass preflight");
 
         let request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: mimo_asr_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,

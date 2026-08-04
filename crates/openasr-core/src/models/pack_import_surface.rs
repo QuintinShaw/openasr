@@ -1,127 +1,71 @@
 //! Force-linked pack-import surfaces for native families.
 //!
-//! Architecture integration descriptors name a convert symbol or external
-//! tooling path. This module is the compiled registration table that proves
-//! each `CoreConvert` symbol still exists and is linked into the crate:
-//! naming a deleted or private convert entry fails to compile here. File-on-disk
-//! checks alone are intentionally insufficient.
+//! Architecture descriptors carry the importer symbol and a compile-time
+//! force-link callback. This module projects the builtin descriptor inventory
+//! into the set consumed by runtime wiring, so a deleted or private convert
+//! entry fails to compile at its descriptor and no independent symbol table can
+//! drift from the architecture inventory.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-#[cfg(test)]
 use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrPackImportSurface};
 
-fn link_symbol<F>(symbol: &'static str, function: F) -> (&'static str, usize) {
-    // Keep the convert entry reachable so deleting or privatizing it fails this
-    // module's compile, not only a stringly path check.
-    (symbol, std::ptr::from_ref(&function) as usize)
-}
-
-/// Returns the set of core convert symbols that are force-linked into this
-/// crate, keyed by symbol name. Presence in this map is what makes a
-/// `OpenAsrPackImportSurface::CoreConvert` declaration real.
-pub(crate) fn linked_core_pack_import_symbols() -> BTreeMap<&'static str, usize> {
-    [
-        link_symbol(
-            "convert_local_cohere_source_to_runtime_pack",
-            crate::models::cohere::convert_local_cohere_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_whisper_hf_source_to_runtime_pack",
-            crate::models::whisper::convert_local_whisper_hf_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_qwen_source_to_runtime_pack",
-            crate::models::qwen::convert_local_qwen_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_parakeet_ctc_source_to_runtime_pack",
-            crate::models::parakeet_ctc::convert_local_parakeet_ctc_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_parakeet_tdt_source_to_runtime_pack",
-            crate::models::parakeet_tdt::convert_local_parakeet_tdt_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_wav2vec2_ctc_source_to_runtime_pack",
-            crate::models::wav2vec2_ctc::convert_local_wav2vec2_ctc_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_xasr_zipformer_source_to_runtime_pack",
-            crate::models::xasr_zipformer::convert_local_xasr_zipformer_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_moonshine_source_to_runtime_pack",
-            crate::models::moonshine::convert_local_moonshine_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_dolphin_wenet_source_to_runtime_pack",
-            crate::models::dolphin::convert_local_dolphin_wenet_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_sensevoice_source_to_runtime_pack",
-            crate::models::sensevoice::convert_local_sensevoice_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_firered_aed_source_to_runtime_pack",
-            crate::models::firered_aed::convert_local_firered_aed_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_firered_llm_source_to_runtime_pack",
-            crate::models::firered_llm::convert_local_firered_llm_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_funasr_nano_source_to_runtime_pack",
-            crate::models::funasr_nano::convert_local_funasr_nano_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_moss_transcribe_diarize_source_to_runtime_pack",
-            crate::models::moss_transcribe_diarize::convert_local_moss_transcribe_diarize_source_to_runtime_pack,
-        ),
-        link_symbol(
-            "convert_local_granite_speech_source_to_runtime_pack",
-            crate::models::granite_speech::convert_local_granite_speech_source_to_runtime_pack,
-        ),
-    ]
-    .into_iter()
-    .collect()
-}
-
-/// Ensures every architecture-declared core convert surface is present in the
-/// force-linked table above.
-#[cfg(test)]
-pub(crate) fn assert_architecture_pack_imports_are_linked() {
-    let linked = linked_core_pack_import_symbols();
+/// Returns the core convert symbols force-linked by the builtin architecture
+/// inventory, keyed by symbol name.
+pub(crate) fn linked_core_pack_import_symbols() -> BTreeSet<&'static str> {
+    let mut linked = BTreeSet::new();
     for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
-        match descriptor.integration.pack_import {
-            OpenAsrPackImportSurface::CoreConvert { symbol } => {
-                assert!(
-                    linked.contains_key(symbol),
-                    "native family '{}' declares core pack-import symbol '{}' but it is not force-linked in pack_import_surface",
-                    descriptor.model_family,
-                    symbol
-                );
-            }
-            OpenAsrPackImportSurface::ExternalTooling { .. } => {}
+        if let OpenAsrPackImportSurface::CoreConvert { symbol, force_link } =
+            descriptor.pack_contract.pack_import
+        {
+            force_link();
+            assert!(
+                linked.insert(symbol),
+                "duplicate core pack-import symbol '{symbol}' in builtin architecture inventory"
+            );
         }
     }
+    linked
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
-    fn every_architecture_core_pack_import_is_force_linked() {
-        assert_architecture_pack_imports_are_linked();
-    }
-
-    #[test]
-    fn half_wired_core_pack_import_symbol_is_rejected() {
+    fn inventory_projection_covers_every_core_convert_surface() {
+        let descriptors = OpenAsrArchitectureRegistry::with_builtins().descriptors();
         let linked = linked_core_pack_import_symbols();
-        assert!(
-            !linked.contains_key("convert_local_does_not_exist"),
-            "unknown symbols must not appear in the linked table"
+        let mut inventory_symbols = BTreeSet::new();
+        let mut core_convert_count = 0;
+
+        for descriptor in descriptors {
+            if let OpenAsrPackImportSurface::CoreConvert { symbol, force_link } =
+                descriptor.pack_contract.pack_import
+            {
+                core_convert_count += 1;
+                assert!(
+                    inventory_symbols.insert(symbol),
+                    "builtin architecture inventory must not repeat core pack-import symbol '{symbol}'"
+                );
+                force_link();
+                assert!(
+                    linked.contains(symbol),
+                    "linked set must project '{}' from the descriptor inventory",
+                    descriptor.identity.model_family
+                );
+            }
+        }
+
+        assert_eq!(
+            linked.len(),
+            core_convert_count,
+            "linked set must contain one entry for every CoreConvert descriptor"
+        );
+        assert_eq!(
+            linked, inventory_symbols,
+            "linked set must contain only symbols declared by the descriptor inventory"
         );
     }
 }

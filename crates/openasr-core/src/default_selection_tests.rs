@@ -13,7 +13,7 @@ use sha2::Digest;
 /// object exists, is a regular file, and matches the recorded size), so a ref
 /// with no backing object is silently dropped rather than "installed". The
 /// backing bytes use the graph-complete whisper fixture because installs enforce
-/// `validate_native_runtime_model_pack_contract`, which the bare non-graph spec
+/// `verify_native_runtime_model_pack_path`, which the bare non-graph spec
 /// fails.
 fn write_installed_pack(home: &Path, model_id: &str, quant: &str, suffix: &str) -> InstalledPack {
     let filename = format!("{model_id}-{quant}.oasr");

@@ -12,7 +12,9 @@ use super::prompt::{
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 use super::tokenizer::CohereTranscribeTokenizer;
 use crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID;
-use crate::models::ggml_asr_executor::{GgmlAsrExecutionOptions, GgmlAsrRuntimeSourcePreflight};
+use crate::arch::OpenAsrPreparedRuntimeStrategy;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
+use crate::models::ggml_asr_executor::GgmlAsrExecutionOptions;
 use crate::models::runtime_component_bootstrap::{
     BuiltinRuntimeComponentBootstrap, BuiltinRuntimeComponentBootstrapError,
     BuiltinTokenizerMaterializationMode, build_builtin_runtime_component_bootstrap,
@@ -176,7 +178,7 @@ pub(crate) enum CoherePreparedRuntimeError {
 }
 
 pub(crate) fn build_cohere_prepared_runtime(
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CoherePreparedRuntime, CoherePreparedRuntimeError> {
     let components = build_builtin_runtime_component_bootstrap(
@@ -224,7 +226,7 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
     }
     let weights_start = Instant::now();
     let (encoder_weights, decoder_weights) = materialize_builtin_runtime_weight_components(
-        COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
         &tensor_reader,
         runtime_source,
         runtime_metadata,
@@ -306,7 +308,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempPath};
 
-    fn write_runtime_ready_preflight() -> (TempPath, GgmlAsrRuntimeSourcePreflight) {
+    fn write_runtime_ready_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
         let file = NamedTempFile::new().expect("temp file");
         let persisted = file.into_temp_path();
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -320,7 +322,7 @@ mod tests {
             .expect("read gguf tensor index");
         (
             persisted,
-            GgmlAsrRuntimeSourcePreflight {
+            GgufRuntimeSourcePreflight {
                 runtime_source,
                 metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
@@ -379,7 +381,7 @@ mod tests {
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        let preflight = GgmlAsrRuntimeSourcePreflight {
+        let preflight = GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),

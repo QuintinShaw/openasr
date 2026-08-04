@@ -394,6 +394,69 @@ impl GgmlRuntimeSource {
         Arc::clone(&self.mmap)
     }
 
+    /// Bytes of the exact open generation held by this source. Package
+    /// admission uses this view for the Rust-only envelope scan before the C
+    /// parser is allowed to inspect the same mapping.
+    pub(crate) fn backing_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    /// Rebinds only the diagnostic/display path while retaining the exact
+    /// descriptor, mapping, stat identity, package probe, and content proof.
+    /// Content admission and transactional writers use this after exposing the
+    /// already-verified inode under its durable name; no bytes are reopened.
+    pub(crate) fn with_display_path(mut self, path: PathBuf) -> Self {
+        self.path = path;
+        self
+    }
+
+    /// Builds a runtime source from the descriptor/mapping already owned by a
+    /// content-store admission lease. This never reopens the display path.
+    /// The lease digest was computed from these exact bytes, so it can seed the
+    /// otherwise-lazy content identity without another full-file hash.
+    pub(crate) fn from_admission_lease(
+        lease: &crate::content_store::ContentLease,
+    ) -> Result<Self, GgmlRuntimeSourcePathError> {
+        let path = lease.path().to_path_buf();
+        let mut file =
+            lease
+                .file()
+                .try_clone()
+                .map_err(|source| GgmlRuntimeSourcePathError::OpenFile {
+                    path: path.clone(),
+                    source,
+                })?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| GgmlRuntimeSourcePathError::Metadata {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(GgmlRuntimeSourcePathError::NotARegularFile {
+                path: path.display().to_string(),
+            });
+        }
+        let package_probe = probe_ggml_package_file(&path, &mut file)?;
+        if package_probe.format == GgmlPackageFormat::UnsupportedOpenAsrContainerReserved {
+            return Err(GgmlRuntimeSourcePathError::ReservedOpenAsrContainer { path });
+        }
+        let stat_identity = StrongFileIdentity::of_file(&file, &metadata).ok_or_else(|| {
+            GgmlRuntimeSourcePathError::UnsupportedFileIdentity { path: path.clone() }
+        })?;
+        let content_id = OnceLock::new();
+        let _ = content_id.set(format!("sha256:{}", lease.digest()));
+        Ok(Self {
+            path,
+            package_probe,
+            file: Some(Arc::new(Mutex::new(file))),
+            mmap: lease.mmap(),
+            stat_identity,
+            opened_read_only: metadata.permissions().readonly(),
+            content_id,
+        })
+    }
+
     /// Process-local identity of the already-open mapping. Clones of this
     /// runtime source retain the same `Arc<Mmap>` and therefore the same value;
     /// a separately admitted file gets a distinct value even at the same path.

@@ -19,9 +19,31 @@ use crate::models::tensor_binding::{
 };
 
 use super::tensor_names::{
-    AUDIO_CONV_OUT_WEIGHT, AUDIO_MEL_FILTERS, AUDIO_MEL_WINDOW, OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT,
+    AUDIO_CONV_OUT_BIAS, AUDIO_CONV_OUT_WEIGHT, AUDIO_CONV1_BIAS, AUDIO_CONV1_WEIGHT,
+    AUDIO_CONV2_BIAS, AUDIO_CONV2_WEIGHT, AUDIO_CONV3_BIAS, AUDIO_CONV3_WEIGHT, AUDIO_LN_POST_BIAS,
+    AUDIO_LN_POST_WEIGHT, AUDIO_MEL_FILTERS, AUDIO_MEL_WINDOW, AUDIO_PROJ1_BIAS,
+    AUDIO_PROJ1_WEIGHT, AUDIO_PROJ2_BIAS, AUDIO_PROJ2_WEIGHT, OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT,
     TOKEN_EMBD_WEIGHT, audio_layer_tensor_names, llm_layer_tensor_names,
 };
+
+pub(crate) const QWEN3_AUDIO_CONV_KERNEL: usize = 3;
+pub(crate) const QWEN3_AUDIO_CONV_STRIDE: usize = 2;
+pub(crate) const QWEN3_AUDIO_CONV_PADDING: usize = 1;
+pub(crate) const QWEN3_AUDIO_CONV_DILATION: usize = 1;
+
+pub(crate) fn qwen3_audio_conv_output_len(input: usize) -> Option<usize> {
+    // floor((input + 2p - d(k - 1) - 1) / s + 1). Keep this tied to the
+    // actual graph constants so a future dilation/kernel change cannot make
+    // admission accept a projection shape the graph will not construct.
+    let effective_kernel = QWEN3_AUDIO_CONV_DILATION
+        .checked_mul(QWEN3_AUDIO_CONV_KERNEL.checked_sub(1)?)?
+        .checked_add(1)?;
+    input
+        .checked_add(QWEN3_AUDIO_CONV_PADDING.checked_mul(2)?)?
+        .checked_sub(effective_kernel)?
+        .checked_div(QWEN3_AUDIO_CONV_STRIDE)?
+        .checked_add(1)
+}
 
 pub(crate) use crate::arch::hparams::{
     QWEN3_ARCHITECTURE_VALUE, QWEN3_AUDIO_D_MODEL_KEY, QWEN3_AUDIO_END_TOKEN_ID_KEY,
@@ -323,6 +345,8 @@ pub(crate) fn validate_qwen3_runtime_tensors_with_index(
         ));
     }
 
+    validate_qwen3_audio_stem_tensor_shapes(index, metadata)?;
+
     let descriptors = resolve_builtin_runtime_tensor_contract_descriptors(
         qwen3_runtime_tensor_contract_id(),
         RuntimeTensorContractMetadata::Qwen3Asr(metadata),
@@ -342,21 +366,6 @@ pub(crate) fn qwen3_runtime_tensor_descriptors(
     metadata: Qwen3AsrExecutionMetadata,
 ) -> Vec<TensorBindingDescriptor> {
     let mut descriptors = vec![
-        TensorBindingDescriptor {
-            tensor_name: AUDIO_MEL_WINDOW.to_string(),
-            requirement: TensorBindingDescriptorRequirement::VectorLen(metadata.win_length),
-            reason: "expected mel window vector".to_string(),
-        },
-        TensorBindingDescriptor {
-            tensor_name: AUDIO_CONV_OUT_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
-                min_rank: 2,
-                axis: 1,
-                dim: metadata.audio_d_model,
-            },
-            reason: "expected rank>=2 audio projection tensor with dims[1]=audio d_model"
-                .to_string(),
-        },
         TensorBindingDescriptor {
             tensor_name: TOKEN_EMBD_WEIGHT.to_string(),
             requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
@@ -558,10 +567,104 @@ pub(crate) fn qwen3_runtime_tensor_descriptors(
     descriptors
 }
 
+fn validate_qwen3_audio_stem_tensor_shapes(
+    index: &GgufTensorIndex,
+    metadata: Qwen3AsrExecutionMetadata,
+) -> Result<(), Qwen3AsrRuntimeContractError> {
+    require_exact_dims(index, AUDIO_MEL_WINDOW, &[metadata.win_length as u64])?;
+
+    let conv1_channels = require_conv2d_kernel(index, AUDIO_CONV1_WEIGHT, 1)?;
+    require_exact_dims(index, AUDIO_CONV1_BIAS, &[conv1_channels])?;
+    let conv2_channels = require_conv2d_kernel(index, AUDIO_CONV2_WEIGHT, conv1_channels)?;
+    require_exact_dims(index, AUDIO_CONV2_BIAS, &[conv2_channels])?;
+    let conv3_channels = require_conv2d_kernel(index, AUDIO_CONV3_WEIGHT, conv2_channels)?;
+    require_exact_dims(index, AUDIO_CONV3_BIAS, &[conv3_channels])?;
+
+    let conv_frequency_bins = qwen3_audio_conv_output_len(metadata.n_mels)
+        .and_then(qwen3_audio_conv_output_len)
+        .and_then(qwen3_audio_conv_output_len)
+        .ok_or_else(|| Qwen3AsrRuntimeContractError::InvalidMetadataValue {
+            key: QWEN3_MELS_COUNT_KEY,
+            reason: format!(
+                "{QWEN3_MELS_COUNT_KEY}={} cannot pass three kernel-{QWEN3_AUDIO_CONV_KERNEL} stride-{QWEN3_AUDIO_CONV_STRIDE} convolution stages",
+                metadata.n_mels
+            ),
+        })?;
+    let conv_projection_rows = u64::try_from(conv_frequency_bins)
+        .ok()
+        .and_then(|frequency| frequency.checked_mul(conv3_channels))
+        .ok_or_else(|| Qwen3AsrRuntimeContractError::InvalidMetadataValue {
+            key: QWEN3_MELS_COUNT_KEY,
+            reason: "audio convolution projection width overflow".to_string(),
+        })?;
+    require_exact_dims(
+        index,
+        AUDIO_CONV_OUT_WEIGHT,
+        &[conv_projection_rows, metadata.audio_d_model as u64],
+    )?;
+    if index.get(AUDIO_CONV_OUT_BIAS).is_some() {
+        require_exact_dims(index, AUDIO_CONV_OUT_BIAS, &[metadata.audio_d_model as u64])?;
+    }
+    for name in [AUDIO_LN_POST_WEIGHT, AUDIO_LN_POST_BIAS, AUDIO_PROJ1_BIAS] {
+        require_exact_dims(index, name, &[metadata.audio_d_model as u64])?;
+    }
+    require_exact_dims(
+        index,
+        AUDIO_PROJ1_WEIGHT,
+        &[metadata.audio_d_model as u64, metadata.audio_d_model as u64],
+    )?;
+    require_exact_dims(
+        index,
+        AUDIO_PROJ2_WEIGHT,
+        &[metadata.audio_d_model as u64, metadata.llm_d_model as u64],
+    )?;
+    require_exact_dims(index, AUDIO_PROJ2_BIAS, &[metadata.llm_d_model as u64])?;
+    Ok(())
+}
+
+fn require_conv2d_kernel(
+    index: &GgufTensorIndex,
+    name: &str,
+    expected_input_channels: u64,
+) -> Result<u64, Qwen3AsrRuntimeContractError> {
+    let tensor = require_tensor(index, name)?;
+    let kernel = QWEN3_AUDIO_CONV_KERNEL as u64;
+    let valid = tensor.dims.len() == 4
+        && tensor.dims[0] == kernel
+        && tensor.dims[1] == kernel
+        && tensor.dims[2] == expected_input_channels
+        && tensor.dims[3] > 0;
+    if !valid {
+        return Err(invalid_tensor_shape(
+            name,
+            &tensor.dims,
+            format!("expected [{kernel}, {kernel}, {expected_input_channels}, output_channels>0]"),
+        ));
+    }
+    Ok(tensor.dims[3])
+}
+
+fn require_exact_dims<'a>(
+    index: &'a GgufTensorIndex,
+    name: &str,
+    expected: &[u64],
+) -> Result<&'a crate::GgufTensorMetadata, Qwen3AsrRuntimeContractError> {
+    let tensor = require_tensor(index, name)?;
+    if tensor.dims == expected {
+        return Ok(tensor);
+    }
+    Err(invalid_tensor_shape(
+        name,
+        &tensor.dims,
+        format!("expected {}", render_shape(expected)),
+    ))
+}
+
 fn qwen3_runtime_tensor_contract_id() -> &'static str {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
         .expect("qwen architecture must be registered")
+        .pack_contract
         .runtime_tensor_contract_id
 }
 
@@ -595,6 +698,18 @@ fn map_metadata_contract_error(error: MetadataContractError) -> Qwen3AsrRuntimeC
             Qwen3AsrRuntimeContractError::InvalidMetadataValue { key, reason }
         }
     }
+}
+
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture(
+        crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+        preflight.metadata(),
+        preflight.tensor_index(),
+    )
+    .map(|_| ())
+    .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
 }
 
 #[cfg(test)]
@@ -641,6 +756,16 @@ mod tests {
         assert_eq!(parsed.llm_kv_heads, 8);
         assert_eq!(parsed.llm_head_dim, 128);
         assert_eq!(parsed.llm_d_model, 2048);
+    }
+
+    #[test]
+    fn qwen3_audio_convolution_geometry_matches_three_stride_two_stages() {
+        let once = qwen3_audio_conv_output_len(80).expect("first convolution");
+        let twice = qwen3_audio_conv_output_len(once).expect("second convolution");
+        let thrice = qwen3_audio_conv_output_len(twice).expect("third convolution");
+        assert_eq!((once, twice, thrice), (40, 20, 10));
+        assert_eq!(qwen3_audio_conv_output_len(1), Some(1));
+        assert_eq!(qwen3_audio_conv_output_len(0), None);
     }
 
     /// Capacity regression anchor: the shared KV byte derivation on this

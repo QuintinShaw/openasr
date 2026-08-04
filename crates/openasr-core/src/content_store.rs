@@ -28,8 +28,8 @@
 //!    same-shaped path outside that root falls back to full verification
 //!    instead of silently trusting.
 //! 3. **Full verification stays available and is used where it decides
-//!    something.** [`open_verified_lease`] re-hashes, and every caller that
-//!    would otherwise destroy or skip another copy of the content uses it;
+//!    something.** [`open_verified_lease`] re-hashes when an existing object's
+//!    digest claim must be re-established;
 //!    `openasr model-pack verify` re-hashes the whole store on demand, and
 //!    re-seals each intact object afterwards so a store whose seals were lost
 //!    (a backup restore without permissions, say) earns the fast path back.
@@ -54,14 +54,13 @@
 //! file -- a user-supplied pack directory, a dev fixture, a zip extracted by a
 //! converter tool. [`trusted_object_digest`] therefore never trusts the shape
 //! alone; it additionally requires the path to fall under the caller's own
-//! `models_root`, the one directory whose `objects/sha256/` this module's two
-//! writers actually populate. Exactly two functions create objects there, and
-//! both uphold the verified-before-reachable half of the invariant:
-//! [`admit_file`] hashes its private staging copy, re-checks the hash against
-//! the mapped bytes, runs the caller's preflight, and only then links/renames
-//! the bytes into place and seals them; [`link_file_as_object`] moves a legacy
-//! file in by rename and seals it, under a caller contract to have hashed the
-//! bytes itself (the one caller, the legacy migration in `pull`, does).
+//! `models_root`, the one directory whose `objects/sha256/` this module's sole
+//! writer actually populates. [`admit_file`] upholds the
+//! verified-before-reachable half of the invariant: it hashes every byte while
+//! writing its private staging copy, maps that same held descriptor, runs the
+//! caller's preflight, and only then links/renames
+//! the bytes into place and seals them. Legacy migration deliberately uses
+//! this same seam instead of owning a path-based zero-copy exception.
 //! In-flight writes live in `staging/` beside `objects/`, never inside the
 //! content namespace, so an object path can never observe a torn or
 //! unverified write -- at worst a crash leaves a verified-but-unsealed object,
@@ -180,16 +179,38 @@ impl ContentLease {
 }
 
 #[derive(Debug)]
-pub(crate) struct AdmittedContent {
+pub(crate) struct AdmittedContent<P = ()> {
     pub digest: String,
     pub size_bytes: u64,
     pub object_path: PathBuf,
     lease: ContentLease,
+    proof: P,
 }
 
-impl AdmittedContent {
+impl<P> AdmittedContent<P> {
     /// Consume the validation lease for the object just admitted. It remains
     /// valid even after the private staging name has been unlinked.
+    pub(crate) fn into_parts(self) -> (ContentLease, P) {
+        (self.lease, self.proof)
+    }
+
+    pub(crate) fn proof(&self) -> &P {
+        &self.proof
+    }
+
+    pub(crate) fn map_proof<Q>(self, map: impl FnOnce(P) -> Q) -> AdmittedContent<Q> {
+        AdmittedContent {
+            digest: self.digest,
+            size_bytes: self.size_bytes,
+            object_path: self.object_path,
+            lease: self.lease,
+            proof: map(self.proof),
+        }
+    }
+}
+
+impl AdmittedContent<()> {
+    #[cfg(test)]
     pub(crate) fn into_lease(self) -> ContentLease {
         self.lease
     }
@@ -340,8 +361,8 @@ pub(crate) fn object_digest_from_path(path: &Path) -> Option<&str> {
 /// `<anything>/objects/sha256/<64 lowercase hex>/content` -- the layout is a
 /// public shape, not a proof of provenance, and admission never ran against
 /// bytes outside `models_root`. The `models_root` check is what ties the
-/// shape back to a store this module's two writers ([`admit_file`],
-/// [`link_file_as_object`]) actually populated; see the module docs' "What
+/// shape back to a store this module's sole writer ([`admit_file`]) actually
+/// populated; see the module docs' "What
 /// may write into the object namespace" section. While all three hold,
 /// handing the digest out without a multi-gigabyte re-read is not skipping
 /// verification -- the verification already happened at admission and its
@@ -366,8 +387,8 @@ pub(crate) fn object_digest_from_path(path: &Path) -> Option<&str> {
 /// back to the hashing path it had before this gate existed; or everything
 /// reads as sealed and the trust is still sound, because an object's
 /// correctness never came from the permission bit -- admission hashed the
-/// bytes before the object existed at all, and only two writers can create
-/// one *within the given models root* (see the module docs). Exploiting a
+/// bytes before the object existed at all, and only the admission writer can
+/// create one *within the given models root* (see the module docs). Exploiting a
 /// mount that lies about *writability* still takes local write access, which
 /// the threat model already excludes; bit rot under such a mount is exactly
 /// what `verify` re-hashes for.
@@ -377,7 +398,7 @@ pub(crate) fn object_digest_from_path(path: &Path) -> Option<&str> {
 /// between stat and open cannot change which file the seal verdict applies to.
 ///
 /// `models_root` must be the caller's own resolved model-store root (the same
-/// value `admit_file`/`link_file_as_object` were called with), never a value
+/// value `admit_file` was called with), never a value
 /// derived from `path` itself -- deriving it from `path` would make the
 /// anchor check trivially satisfiable by construction and defeat the point.
 pub(crate) fn trusted_object_digest<'a>(
@@ -395,7 +416,7 @@ pub(crate) fn trusted_object_digest<'a>(
 /// more specific root is already in scope: `OPENASR_HOME` (or the user-home
 /// default) plus any `config.json`/`OPENASR_MODELS_DIR` override -- the exact
 /// resolution every install path in this crate uses to decide where
-/// [`admit_file`] and [`link_file_as_object`] are allowed to write (see
+/// [`admit_file`] is allowed to write (see
 /// `pull.rs`'s own `models_root(home)` and `config::models_dir`'s doc
 /// comment). This product commits to exactly one home per process (the
 /// `OPENASR_HOME=...` convention documented in `AGENTS.md`), so this is not a
@@ -498,11 +519,11 @@ fn open_object(
 /// Copy one opened source descriptor into a private staging file, fsync it,
 /// validate its mapped bytes, then create an immutable object. `preflight` is
 /// deliberately lease-based: it cannot accidentally reopen a mutable pathname.
-pub(crate) fn admit_file(
+pub(crate) fn admit_file<P>(
     source_path: &Path,
     models_root: &Path,
-    preflight: impl Fn(&ContentLease) -> Result<(), crate::PullError>,
-) -> Result<AdmittedContent, ContentStoreError> {
+    preflight: impl Fn(&ContentLease) -> Result<P, crate::PullError>,
+) -> Result<AdmittedContent<P>, ContentStoreError> {
     let source_metadata =
         fs::symlink_metadata(source_path).map_err(|source| ContentStoreError::Io {
             path: source_path.to_path_buf(),
@@ -600,12 +621,18 @@ pub(crate) fn admit_file(
             })?;
         let digest = format!("{:x}", hash.finalize());
         let lease = ContentLease::from_file(digest.clone(), staging.clone(), output)?;
-        if lease.bytes().len() as u64 != size || lease.sha256() != digest {
+        // `digest` was updated from the exact slices successfully written to
+        // this private, still-held descriptor. Re-hashing the mmap here would
+        // add a second O(n) SHA-256 pass over multi-gigabyte packs without a
+        // distinct trust boundary; length plus the held descriptor is the
+        // needed write/map consistency check.
+        if lease.bytes().len() as u64 != size {
             return Err(ContentStoreError::SourceChanged {
                 path: source_path.to_path_buf(),
             });
         }
-        preflight(&lease).map_err(|error| ContentStoreError::Preflight(Box::new(error)))?;
+        let proof =
+            preflight(&lease).map_err(|error| ContentStoreError::Preflight(Box::new(error)))?;
 
         let object = object_path(models_root, &digest)?;
         let parent = object.parent().expect("object path has parent");
@@ -613,7 +640,7 @@ pub(crate) fn admit_file(
             path: parent.to_path_buf(),
             source,
         })?;
-        let lease = match fs::hard_link(&staging, &object) {
+        let (lease, proof) = match fs::hard_link(&staging, &object) {
             Ok(()) => {
                 atomic_file::sync_parent_dir_best_effort(&object);
                 // Drop the staging name before sealing: it shares the inode with
@@ -624,41 +651,41 @@ pub(crate) fn admit_file(
                     source,
                 })?;
                 seal_object(&object)?;
-                lease.with_path(object.clone())
+                (lease.with_path(object.clone()), proof)
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 // A digest name is not evidence. Revalidate the existing object's
                 // descriptor and contract before reusing it; never replace it.
                 let existing = open_verified_lease(models_root, &digest)?;
-                if existing.bytes().len() as u64 != size || existing.sha256() != digest {
+                if existing.bytes().len() as u64 != size {
                     return Err(ContentStoreError::ObjectCollision { path: object });
                 }
-                preflight(&existing)
+                let proof = preflight(&existing)
                     .map_err(|error| ContentStoreError::Preflight(Box::new(error)))?;
                 fs::remove_file(&staging).map_err(|source| ContentStoreError::Io {
                     path: staging.clone(),
                     source,
                 })?;
-                existing
+                (existing, proof)
             }
             Err(_) => match fs::rename(&staging, &object) {
                 Ok(()) => {
                     atomic_file::sync_parent_dir_best_effort(&object);
                     seal_object(&object)?;
-                    lease.with_path(object.clone())
+                    (lease.with_path(object.clone()), proof)
                 }
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                     let existing = open_verified_lease(models_root, &digest)?;
-                    if existing.bytes().len() as u64 != size || existing.sha256() != digest {
+                    if existing.bytes().len() as u64 != size {
                         return Err(ContentStoreError::ObjectCollision { path: object });
                     }
-                    preflight(&existing)
+                    let proof = preflight(&existing)
                         .map_err(|error| ContentStoreError::Preflight(Box::new(error)))?;
                     fs::remove_file(&staging).map_err(|source| ContentStoreError::Io {
                         path: staging.clone(),
                         source,
                     })?;
-                    existing
+                    (existing, proof)
                 }
                 Err(source) => {
                     return Err(ContentStoreError::Io {
@@ -673,6 +700,7 @@ pub(crate) fn admit_file(
             size_bytes: size,
             object_path: object,
             lease,
+            proof,
         })
     })();
     if result.is_err() {
@@ -764,48 +792,6 @@ pub(crate) fn stored_objects(models_root: &Path) -> Result<Vec<StoredObject>, Co
     Ok(objects)
 }
 
-/// Land an already-durable file as an object by renaming it into place.
-///
-/// This is the migration path: within one filesystem a rename moves no bytes, so
-/// converting a legacy pack costs a verification pass and nothing else. It is
-/// one of only two writers into the object namespace (the other is
-/// [`admit_file`]), and unlike admission it cannot hash the bytes itself
-/// without defeating the point of a rename -- so the caller contract is load
-/// bearing: it has already hashed `source_path` and is responsible for it
-/// being a regular file it owns. An object landed here without that hash
-/// would be reachable by the seal-gated hot paths as "verified" when it was
-/// never checked. Returns `false` when the object already existed, in which
-/// case `source_path` is left for the caller to drop.
-pub(crate) fn link_file_as_object(
-    source_path: &Path,
-    models_root: &Path,
-    digest: &str,
-) -> Result<bool, ContentStoreError> {
-    let object = object_path(models_root, digest)?;
-    let parent = object.parent().expect("object path has parent");
-    fs::create_dir_all(parent).map_err(|source| ContentStoreError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    if fs::symlink_metadata(&object).is_ok() {
-        return Ok(false);
-    }
-    match fs::rename(source_path, &object) {
-        Ok(()) => {
-            atomic_file::sync_parent_dir_best_effort(&object);
-            seal_object(&object)?;
-            Ok(true)
-        }
-        // A models root spanning devices (or a legacy tree the user moved onto
-        // another volume) cannot be renamed across; the caller falls back to a
-        // copying admission.
-        Err(source) => Err(ContentStoreError::Io {
-            path: object,
-            source,
-        }),
-    }
-}
-
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -862,6 +848,21 @@ mod tests {
         assert_eq!(admitted.digest, expected);
         assert_eq!(admitted.into_lease().bytes(), b"GGUF-original-pack");
         assert_eq!(fs::read(&source).unwrap(), b"GGUF-replacement-pack");
+    }
+
+    #[test]
+    fn admission_returns_the_proof_for_the_exact_landed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-proof-bearing-pack").unwrap();
+
+        let admitted = admit_file(&source, &temp.path().join("models"), |lease| {
+            Ok(lease.sha256())
+        })
+        .unwrap();
+        assert_eq!(admitted.proof(), &admitted.digest);
+        let (lease, proof) = admitted.into_parts();
+        assert_eq!(proof, lease.sha256());
     }
 
     /// Overwrite a sealed object the way a bug or a stray tool would have to:
@@ -995,27 +996,6 @@ mod tests {
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].digest, admitted.digest);
         assert_eq!(objects[0].size_bytes, b"GGUF-listed-pack".len() as u64);
-    }
-
-    #[test]
-    fn link_file_as_object_moves_bytes_and_seals_them() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("models");
-        let legacy = temp.path().join("legacy.oasr");
-        fs::write(&legacy, b"GGUF-renamed-pack").unwrap();
-        let digest = sha256_bytes(b"GGUF-renamed-pack");
-
-        assert!(link_file_as_object(&legacy, &root, &digest).unwrap());
-        assert!(!legacy.exists(), "rename must not leave the source behind");
-        let object = object_path(&root, &digest).unwrap();
-        assert_eq!(fs::read(&object).unwrap(), b"GGUF-renamed-pack");
-        assert!(fs::metadata(&object).unwrap().permissions().readonly());
-
-        // A second landing of the same digest is a no-op that keeps the source.
-        let again = temp.path().join("again.oasr");
-        fs::write(&again, b"GGUF-renamed-pack").unwrap();
-        assert!(!link_file_as_object(&again, &root, &digest).unwrap());
-        assert!(again.exists());
     }
 
     /// The load path must not re-derive what admission already established.

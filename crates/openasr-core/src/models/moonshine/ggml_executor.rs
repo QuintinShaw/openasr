@@ -23,14 +23,15 @@ use super::prepared_runtime::{
 use crate::MOONSHINE_GGML_ADAPTER_ID;
 use crate::NativeAsrSession;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
-    GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor,
-    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
+    GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT, build_seq2seq_streaming_session,
@@ -46,7 +47,7 @@ use crate::models::prepared_runtime_cache::{
 use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
 use crate::models::system_memory_owner::SystemMemoryOwner;
 
-const MOONSHINE_EXECUTOR_ID: &str = "moonshine-ggml-executor-v1";
+const MOONSHINE_EXECUTOR_ID: &str = crate::arch::MOONSHINE_EXECUTOR_COMPONENT_ID;
 const MOONSHINE_STREAMING_EXECUTOR_ID: &str = "moonshine-ggml-snapshot-streaming-executor-v1";
 
 const MOONSHINE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
@@ -96,8 +97,6 @@ enum MoonshineGgmlExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("moonshine ggml executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("moonshine adapter pack rejected (fail-closed): {source}")]
     AdapterRejected {
         #[source]
@@ -204,22 +203,18 @@ impl MoonshineGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| MoonshineGgmlExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
         // OADP Phase 0: resolve the active adapter (request-level path, env
         // fallback — if any) against THIS base pack. Any mismatch fails the
         // whole transcription — adapters are never silently ignored.
         let adapter = resolve_moonshine_lora_adapter(
             &self.lora_adapters,
             request.request_options.adapter_path.as_deref(),
-            preflight.as_ref(),
+            preflight,
         )
         .map_err(|source| MoonshineGgmlExecutorError::AdapterRejected { source })?;
         let backend = request.resolved_runtime.backend();
-        let prepared_runtime = self.prepared_runtime_for_preflight(preflight.as_ref(), backend)?;
+        let prepared_runtime = self.prepared_runtime_for_preflight(preflight, backend)?;
         let features = moonshine_waveform_from_prepared_audio(
             &request.prepared_audio,
             prepared_runtime.metadata.sample_rate_hz,
@@ -227,7 +222,7 @@ impl MoonshineGgmlExecutor {
         .map_err(map_frontend_error)?;
 
         let encoder_output = self.encode_with_owned_runtime(
-            preflight.as_ref(),
+            preflight,
             Arc::clone(&prepared_runtime),
             features,
             adapter.clone(),
@@ -262,7 +257,7 @@ impl MoonshineGgmlExecutor {
                     runtime_cache_path: canonical_runtime_cache_path(
                         preflight.runtime_source.path(),
                     ),
-                    runtime_preflight: preflight.as_ref().clone(),
+                    runtime_preflight: preflight.clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
@@ -295,7 +290,7 @@ impl MoonshineGgmlExecutor {
             })?
             } else {
                 self.decode_with_owned_runtime(
-                    preflight.as_ref(),
+                    preflight,
                     Arc::clone(&prepared_runtime),
                     encoder_output,
                     request.request_options.phrase_bias.clone(),
@@ -320,7 +315,7 @@ impl MoonshineGgmlExecutor {
 
     fn prepared_runtime_for_preflight(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<PreparedRuntimeHandle<MoonshinePreparedRuntime>, MoonshineGgmlExecutorError> {
         self.runtime_cache_by_path.get_or_try_insert_with(
@@ -372,7 +367,7 @@ impl MoonshineGgmlExecutor {
 
     fn checkout_encoder_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
@@ -391,7 +386,7 @@ impl MoonshineGgmlExecutor {
                 let runtime = MoonshineEncoderGraphRuntime::new(
                     &prepared.encoder_weights,
                     prepared.metadata,
-                    Some(&preflight),
+                    &preflight,
                     adapter.as_ref().map(resolved_lora_adapter),
                     backend,
                 )
@@ -411,7 +406,7 @@ impl MoonshineGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
@@ -437,7 +432,7 @@ impl MoonshineGgmlExecutor {
                         backend,
                     },
                     false,
-                    Some(&preflight),
+                    &preflight,
                     adapter.as_ref().map(resolved_lora_adapter),
                 )
                 .map_err(|error| MoonshineGgmlExecutorError::DecoderFailed {
@@ -456,7 +451,7 @@ impl MoonshineGgmlExecutor {
 
     fn encode_with_owned_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         features: super::frontend::MoonshineWaveformFeatures,
         adapter: Option<ResolvedLoraAdapterHandle>,
@@ -474,7 +469,7 @@ impl MoonshineGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_owned_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         encoder_output: MoonshineEncoderOutput,
         phrase_bias: Option<crate::PhraseBiasConfig>,
@@ -526,6 +521,10 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
 }
 
 impl GgmlAsrViewExecutor for MoonshineGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        MoonshineGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         MOONSHINE_EXECUTOR_ID
     }

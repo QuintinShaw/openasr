@@ -25,6 +25,3 @@ pub(crate) mod greedy;
 pub(crate) mod predictor;
 pub(crate) mod runtime_contract;
 pub(crate) mod tokenizer;
-
-pub(crate) const PARAKEET_TDT_MODEL_FAMILY: &str = "parakeet-tdt";
-pub(crate) const PARAKEET_TDT_GGML_ARCHITECTURE_ID: &str = "parakeet-fastconformer-tdt";

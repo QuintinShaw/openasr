@@ -15,7 +15,9 @@ use crate::api::native::{
     NativeAsrRuntimeReadiness, NativeAsrSession, NativeAsrSessionContext,
     NativeAsrStreamingSessionConfig, NativeAsrTensorLayoutRef,
 };
-use crate::arch::{OpenAsrArchitectureRegistry, StreamingPartialGranularity};
+use crate::arch::{
+    OpenAsrArchitectureRegistry, OpenAsrPhraseBiasStrategy, StreamingPartialGranularity,
+};
 use crate::device::{
     execution_policy::{
         AcceleratedDeviceConstraint, ExecutionCandidate, ExecutionIntent, ExecutionPlacement,
@@ -26,16 +28,8 @@ use crate::device::{
     },
 };
 use crate::ggml_runtime::RequestBackendPreference;
-use crate::models::executor_component_registry::builtin_executor_supports_phrase_bias_for_model_architecture;
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
-use crate::models::ggml_family_registry::{
-    COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, DOLPHIN_GGML_ARCHITECTURE_ID, GgmlFamilyRegistry,
-    MOONSHINE_GGML_ARCHITECTURE_ID, PARAKEET_CTC_GGML_ARCHITECTURE_ID,
-    QWEN3_ASR_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
-    WHISPER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
-};
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
-use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::realtime::RealtimeBackendCapabilities;
 use crate::{
     ExecutionTarget, GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionOptions,
@@ -98,13 +92,157 @@ impl NativeBackendExecutor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeRuntimeModelAdapter {
+struct NativeRuntimeModelProjection {
     descriptor: GgmlFamilyAdapterDescriptor,
     capabilities: NativeAsrCapabilities,
     language_mode: crate::models::language::LanguageMode,
 }
 
+#[derive(Clone)]
+enum NativeRuntimeModelProof {
+    Verified(Arc<crate::models::pack_verifier::VerifiedPack>),
+    #[cfg(test)]
+    UnverifiedFixture,
+}
+
+impl std::fmt::Debug for NativeRuntimeModelProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verified(pack) => formatter
+                .debug_struct("Verified")
+                .field("route", pack.route())
+                .field("path", &pack.preflight().runtime_source().path())
+                .finish(),
+            #[cfg(test)]
+            Self::UnverifiedFixture => formatter.write_str("UnverifiedFixture"),
+        }
+    }
+}
+
+/// Runtime-family projection plus the verification proof for the exact open
+/// pack generation from which the projection was derived.
+///
+/// Equality intentionally describes adapter semantics (family, capabilities,
+/// language mode), as it did before proofs were attached. It never hashes or
+/// compares multi-gigabyte pack contents as a side effect.
+#[derive(Debug, Clone)]
+pub struct NativeRuntimeModelAdapter {
+    descriptor: GgmlFamilyAdapterDescriptor,
+    capabilities: NativeAsrCapabilities,
+    language_mode: crate::models::language::LanguageMode,
+    proof: NativeRuntimeModelProof,
+}
+
+impl PartialEq for NativeRuntimeModelAdapter {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+            && self.capabilities == other.capabilities
+            && self.language_mode == other.language_mode
+    }
+}
+
+impl Eq for NativeRuntimeModelAdapter {}
+
 impl NativeRuntimeModelAdapter {
+    #[cfg(test)]
+    fn new(
+        descriptor: GgmlFamilyAdapterDescriptor,
+        metadata: &crate::GgufMetadata,
+        tensor_index: Option<&crate::GgufTensorIndex>,
+    ) -> Self {
+        let projection = NativeRuntimeModelProjection::new(descriptor, metadata, tensor_index);
+        Self {
+            descriptor: projection.descriptor,
+            capabilities: projection.capabilities,
+            language_mode: projection.language_mode,
+            proof: NativeRuntimeModelProof::UnverifiedFixture,
+        }
+    }
+
+    fn from_verified(
+        projection: NativeRuntimeModelProjection,
+        verified_pack: crate::models::pack_verifier::VerifiedPack,
+    ) -> Self {
+        Self {
+            descriptor: projection.descriptor,
+            capabilities: projection.capabilities,
+            language_mode: projection.language_mode,
+            proof: NativeRuntimeModelProof::Verified(Arc::new(verified_pack)),
+        }
+    }
+
+    fn verified_pack(
+        &self,
+    ) -> Result<&Arc<crate::models::pack_verifier::VerifiedPack>, NativeAsrError> {
+        match &self.proof {
+            NativeRuntimeModelProof::Verified(pack) => Ok(pack),
+            #[cfg(test)]
+            NativeRuntimeModelProof::UnverifiedFixture => Err(NativeAsrError::SessionFailed {
+                message: "test-only runtime adapter has no verified pack proof".to_string(),
+            }),
+        }
+    }
+
+    /// Resolve the caller-visible model id from the metadata already parsed by
+    /// the pack verifier. This deliberately does not read the GGUF again: the
+    /// returned identity and the adapter are projections of the same open,
+    /// content-addressed generation.
+    pub fn verified_runtime_model_identity(
+        &self,
+        explicit_model_id_fallback: Option<&str>,
+    ) -> Result<NativeRuntimeModelIdentity, NativeAsrError> {
+        const MODEL_ID_KEYS: [&str; 3] = ["openasr.model.id", "general.basename", "general.name"];
+        let verified_pack = self.verified_pack()?;
+        let preflight = verified_pack.preflight();
+        let metadata = MODEL_ID_KEYS
+            .iter()
+            .filter_map(|key| {
+                preflight
+                    .metadata
+                    .get_string(key)
+                    .map(|value| ((*key).to_string(), value.to_string()))
+            })
+            .collect();
+        native_model_id::resolve_native_runtime_model_identity_from_string_metadata(
+            &metadata,
+            preflight.runtime_source().path(),
+            explicit_model_id_fallback,
+        )
+        .map_err(|error| NativeAsrError::SessionFailed {
+            message: error.to_string(),
+        })
+    }
+
+    /// Bind a caller-visible model id to the exact verified source generation
+    /// that produced this adapter. Product offline and streaming execution use
+    /// this constructor so the proof crosses the executor seam with the pack
+    /// reference instead of being discarded and regenerated from `root`.
+    pub fn model_pack_ref(
+        &self,
+        id: impl Into<String>,
+    ) -> Result<NativeAsrModelPackRef, NativeAsrError> {
+        let verified_pack = Arc::clone(self.verified_pack()?);
+        Ok(NativeAsrModelPackRef::from_verified(
+            id,
+            self.descriptor.model_family,
+            verified_pack,
+        ))
+    }
+
+    /// Whether this model's own decode carries the speaker structure. Read
+    /// from the family descriptor (the single declaration); never re-derived
+    /// from pack metadata or an `adapter_id` string match.
+    #[cfg(test)]
+    fn segments_speakers_in_decoder(&self) -> bool {
+        self.descriptor.speaker_segmentation.is_in_decoder()
+    }
+
+    pub(crate) fn language_mode(&self) -> crate::models::language::LanguageMode {
+        self.language_mode
+    }
+}
+
+impl NativeRuntimeModelProjection {
     fn new(
         descriptor: GgmlFamilyAdapterDescriptor,
         metadata: &crate::GgufMetadata,
@@ -129,18 +267,6 @@ impl NativeRuntimeModelAdapter {
             language_mode,
         }
     }
-
-    /// Whether this model's own decode carries the speaker structure. Read
-    /// from the family descriptor (the single declaration); never re-derived
-    /// from pack metadata or an `adapter_id` string match.
-    #[cfg(test)]
-    fn segments_speakers_in_decoder(&self) -> bool {
-        self.descriptor.speaker_segmentation.is_in_decoder()
-    }
-
-    pub(crate) fn language_mode(&self) -> crate::models::language::LanguageMode {
-        self.language_mode
-    }
 }
 
 fn native_runtime_streaming_capabilities_for_descriptor(
@@ -164,38 +290,33 @@ fn native_runtime_streaming_capabilities_for_descriptor(
     NativeAsrCapabilities::native_true_streaming()
         .with_partial_results(true)
         .with_frame_sync_partials(matches!(
-            architecture.integration.streaming_partial_granularity,
+            architecture
+                .execution_contract
+                .streaming_partial_granularity,
             StreamingPartialGranularity::FrameSync
         ))
 }
 
 /// Phrase-bias capability for one runtime pack.
 ///
-/// This is family/architecture-level
-/// (`builtin_executor_supports_phrase_bias_for_model_architecture`, derived
-/// from the architecture integration descriptor) for every architecture except
-/// Dolphin, where the deep-biasing `context_module.*` weights are only present
-/// on some packs within the family (the multi-lingual `small`/`base` catalog
-/// tiers never trained them) -- reporting the family-wide `true` there let
+/// The descriptor strategy is architecture-level, while a `RequiresTensor`
+/// strategy binds availability to the already-preflighted pack. Dolphin's
+/// deep-biasing `context_module.*` weights are only present on some packs (the
+/// multi-lingual `small`/`base` catalog tiers never trained them); reporting
+/// an unconditional family-wide `true` there used to let
 /// requests reach `hotword_context.rs`, which then hard-fails with a
 /// `MissingWeight` error instead of a clean, pre-decode capability rejection.
-/// Dolphin therefore probes the pack's own GGUF tensor index for the
-/// context-module tensor rather than trusting the architecture constant; every
-/// other family keeps the architecture-level answer since their executors
-/// require the family's tensors unconditionally.
 fn native_runtime_descriptor_supports_phrase_bias(
     descriptor: &GgmlFamilyAdapterDescriptor,
     tensor_index: Option<&crate::GgufTensorIndex>,
 ) -> bool {
-    if descriptor.model_architecture == DOLPHIN_GGML_ARCHITECTURE_ID {
-        return tensor_index.is_some_and(|tensor_index| {
-            tensor_index
-                .get(crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME)
-                .is_some()
-        });
+    match descriptor.phrase_bias {
+        OpenAsrPhraseBiasStrategy::Unsupported => false,
+        OpenAsrPhraseBiasStrategy::Always => true,
+        OpenAsrPhraseBiasStrategy::RequiresTensor { tensor_name } => {
+            tensor_index.is_some_and(|tensor_index| tensor_index.get(tensor_name).is_some())
+        }
     }
-    builtin_executor_supports_phrase_bias_for_model_architecture(descriptor.model_architecture)
-        .unwrap_or(false)
 }
 
 impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
@@ -219,7 +340,16 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
     }
 
     fn supports_model_pack(&self, model_pack: &NativeAsrModelPackRef) -> bool {
-        model_pack.family == self.descriptor.model_family
+        if model_pack.family != self.descriptor.model_family {
+            return false;
+        }
+        match &self.proof {
+            NativeRuntimeModelProof::Verified(pack) => {
+                pack.preflight().runtime_source().path() == model_pack.root
+            }
+            #[cfg(test)]
+            NativeRuntimeModelProof::UnverifiedFixture => true,
+        }
     }
 
     fn start_streaming_session(
@@ -265,13 +395,23 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         )
         .map_err(native_backend_error_to_asr)?;
         let request_options = native_streaming_request_options_from_session_options(&options);
-        let runtime_preflight =
-            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
-                &model_pack.root,
-            )
-            .map_err(|error| NativeAsrError::SessionFailed {
-                message: format!("native decoder-state preflight failed: {error}"),
-            })?;
+        let verified_pack = self.verified_pack()?;
+        if !matches!(
+            verified_pack.route(),
+            crate::models::pack_verifier::PackRoute::Asr {
+                model_architecture,
+                ..
+            } if *model_architecture == self.descriptor.model_architecture
+        ) {
+            return Err(NativeAsrError::SessionFailed {
+                message: format!(
+                    "native streaming pack route {:?} does not match selected architecture '{}'",
+                    verified_pack.route(),
+                    self.descriptor.model_architecture
+                ),
+            });
+        }
+        let runtime_preflight = verified_pack.preflight().clone();
         let request_intent = execution_intent_from_hardware_target(target)?;
         let execution_plan = resolve_native_execution_plan_for_hardware_target(
             execution_services.as_ref(),
@@ -291,7 +431,6 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         let factory: Arc<dyn NativeStreamingSessionCandidateBuilder> =
             Arc::new(NativeStreamingSessionCandidateFactory {
                 execution_services,
-                runtime_source_path: model_pack.root.clone(),
                 runtime_preflight,
                 selected_family: self.descriptor.clone(),
                 request_options,
@@ -313,8 +452,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
 /// policy without teaching model-family executors about product fallback.
 struct NativeStreamingSessionCandidateFactory {
     execution_services: Arc<NativeExecutionServices>,
-    runtime_source_path: PathBuf,
-    runtime_preflight: crate::GgmlAsrRuntimeSourcePreflight,
+    runtime_preflight: crate::GgufRuntimeSourcePreflight,
     selected_family: GgmlFamilyAdapterDescriptor,
     request_options: GgmlAsrExecutionOptions,
     configured_diarize: bool,
@@ -387,8 +525,7 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                 let request = GgmlAsrStreamingSessionRequest {
                     execution_services: Arc::clone(&self.execution_services),
                     decoder_state,
-                    runtime_source_path: self.runtime_source_path.clone(),
-                    runtime_source_preflight: Some(self.runtime_preflight.clone()),
+                    runtime_source_preflight: self.runtime_preflight.clone(),
                     selected_family: self.selected_family.clone(),
                     request_options: self.request_options.clone(),
                     configured_diarize: self.configured_diarize,
@@ -746,32 +883,15 @@ impl NativeAsrExecutor for NativeBackendExecutor {
         model_pack: &NativeAsrModelPackRef,
         target: NativeAsrHardwareTarget,
     ) -> NativeAsrRuntimeReadiness {
-        if !adapter.supports_model_pack(model_pack) {
-            return NativeAsrRuntimeReadiness::UnsupportedModelPack {
-                reason: format!(
-                    "adapter '{}' for family '{}' does not support model pack '{}' ({})",
-                    adapter.adapter_id(),
-                    adapter.model_family(),
-                    model_pack.id,
-                    model_pack.family
-                ),
-            };
+        let policy_readiness = native_runtime_policy_readiness(adapter, model_pack, target);
+        if !matches!(policy_readiness, NativeAsrRuntimeReadiness::Ready) {
+            return policy_readiness;
         }
-        let intent = match execution_intent_from_hardware_target(target) {
-            Ok(intent) => intent,
-            Err(_) => return NativeAsrRuntimeReadiness::UnsupportedHardwareTarget { target },
-        };
-        if let ExecutionIntent::ConstrainedAcceleratedOnly(constraint) = intent {
-            let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
-            if !inventory
-                .iter()
-                .any(|device| accelerated_constraint_matches(constraint, device))
-            {
-                return NativeAsrRuntimeReadiness::ProviderUnavailable {
-                    provider: hardware_target_provider_label(target).to_string(),
-                };
-            }
-        }
+        // This explicit diagnostic probe answers a caller asking whether a
+        // bare path is ready. Product execution does not call it and then
+        // reopen the path: the offline path verifies once inside
+        // `run_native_transcription_impl`, while the streaming path consumes
+        // the exact `VerifiedPack` attached to `NativeRuntimeModelAdapter`.
         if !model_pack.root.exists() {
             return NativeAsrRuntimeReadiness::MissingLocalModelAsset {
                 path: model_pack.root.clone(),
@@ -792,7 +912,7 @@ impl NativeAsrExecutor for NativeBackendExecutor {
         target: NativeAsrHardwareTarget,
         request: NativeAsrOfflineRequest,
     ) -> Result<Transcription, NativeAsrError> {
-        match self.runtime_readiness(adapter, model_pack, target) {
+        match native_runtime_policy_readiness(adapter, model_pack, target) {
             NativeAsrRuntimeReadiness::Ready => {}
             other => {
                 return Err(NativeAsrError::try_from(other)
@@ -811,10 +931,12 @@ impl NativeAsrExecutor for NativeBackendExecutor {
         )?;
         let request =
             native_offline_request_to_transcription_request(model_pack, execution_target, request);
-        native_transcribe::run_native_transcription_with_intent(
+        let verified_pack = Arc::clone(model_pack.verified_pack()?);
+        native_transcribe::run_native_transcription_with_verified_pack(
             request,
             Arc::clone(&self.execution_services),
             Some(execution_intent),
+            verified_pack,
         )
         .map_err(native_backend_error_to_asr)
     }
@@ -844,7 +966,7 @@ impl NativeAsrExecutor for NativeBackendExecutor {
     ) -> Result<Box<dyn NativeAsrSession>, NativeAsrError> {
         let mut session_config = session_config;
         session_config.validate()?;
-        match self.runtime_readiness(adapter, model_pack, target) {
+        match native_runtime_policy_readiness(adapter, model_pack, target) {
             NativeAsrRuntimeReadiness::Ready => {}
             other => {
                 return Err(NativeAsrError::try_from(other)
@@ -878,6 +1000,44 @@ impl NativeAsrExecutor for NativeBackendExecutor {
             session_config,
         )
     }
+}
+
+/// Family/target readiness that does no filesystem I/O. Execution paths call
+/// this and then cross exactly one package-verification seam; the public
+/// `runtime_readiness` diagnostic adds a path probe only when explicitly
+/// requested by a caller.
+fn native_runtime_policy_readiness(
+    adapter: &dyn NativeAsrModelAdapter,
+    model_pack: &NativeAsrModelPackRef,
+    target: NativeAsrHardwareTarget,
+) -> NativeAsrRuntimeReadiness {
+    if !adapter.supports_model_pack(model_pack) {
+        return NativeAsrRuntimeReadiness::UnsupportedModelPack {
+            reason: format!(
+                "adapter '{}' for family '{}' does not support model pack '{}' ({})",
+                adapter.adapter_id(),
+                adapter.model_family(),
+                model_pack.id,
+                model_pack.family
+            ),
+        };
+    }
+    let intent = match execution_intent_from_hardware_target(target) {
+        Ok(intent) => intent,
+        Err(_) => return NativeAsrRuntimeReadiness::UnsupportedHardwareTarget { target },
+    };
+    if let ExecutionIntent::ConstrainedAcceleratedOnly(constraint) = intent {
+        let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+        if !inventory
+            .iter()
+            .any(|device| accelerated_constraint_matches(constraint, device))
+        {
+            return NativeAsrRuntimeReadiness::ProviderUnavailable {
+                provider: hardware_target_provider_label(target).to_string(),
+            };
+        }
+    }
+    NativeAsrRuntimeReadiness::Ready
 }
 
 fn native_execution_target_from_hardware_target(
@@ -1307,342 +1467,63 @@ fn native_runtime_capabilities_for_adapter(
 }
 
 static NATIVE_RUNTIME_MODEL_ADAPTER_CACHE: OnceLock<
-    Mutex<HashMap<String, Arc<OnceLock<Option<NativeRuntimeModelAdapter>>>>>,
+    Mutex<HashMap<String, Arc<OnceLock<Option<NativeRuntimeModelProjection>>>>>,
 > = OnceLock::new();
 
 /// Resolves and caches the runtime adapter for one immutable pack content.
 ///
-/// Validation and content-id derivation happen before the cache lookup so a
-/// same-path replacement gets a new key. A cache miss then runs the bounded
-/// metadata/index preflight exactly once on that already-open source; invalid
-/// paths, malformed packs, and unknown families are never cached as negative
-/// entries, so a later valid replacement can resolve normally.
+/// Full package/runtime verification and content-id derivation happen before
+/// the cache lookup so a same-path replacement gets a new key. The capability
+/// projection borrows that exact proof; invalid packs are never cached as
+/// negative entries, so a later valid replacement can resolve normally.
 pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
-    let runtime_source = native_path::validate_local_native_runtime_source(path).ok()?;
-    let cache_key = runtime_source.content_id().to_string();
+    let verified_pack = crate::models::pack_verifier::PackVerifier
+        .verify_candidate(crate::models::pack_verifier::PackCandidate::new(path))
+        .ok()?;
+    if !matches!(
+        verified_pack.route(),
+        crate::models::pack_verifier::PackRoute::Asr { .. }
+    ) {
+        return None;
+    }
+    let cache_key = verified_pack.content_id().to_string();
     let cache = NATIVE_RUNTIME_MODEL_ADAPTER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    native_content_cache_get_or_build(
+    let projection = native_content_cache_get_or_build(
         cache,
         NATIVE_RUNTIME_LOOKUP_CACHE_CAPACITY,
         cache_key,
-        || {
-            let preflight =
-                crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-                    &runtime_source,
-                )
-                .ok()?;
-            build_native_runtime_model_adapter_from_preflight(&preflight)
-        },
-    )
-}
-
-fn build_native_runtime_model_adapter_from_preflight(
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
-) -> Option<NativeRuntimeModelAdapter> {
-    let selection_metadata = selection_metadata_from_gguf(&preflight.metadata);
-    let registry = GgmlFamilyRegistry::with_builtin_adapters();
-    let descriptor = registry
-        .select_from_gguf_metadata_v1(&selection_metadata)
-        .ok()?
-        .clone();
-    // Only Dolphin's phrase-bias probe consults the tensor index. The shared
-    // preflight has already parsed it for every family, so this branch merely
-    // selects the existing index instead of opening/parsing the source again.
-    let tensor_index = if descriptor.model_architecture == DOLPHIN_GGML_ARCHITECTURE_ID {
-        Some(preflight.tensor_index.as_ref())
-    } else {
-        None
-    };
-    Some(NativeRuntimeModelAdapter::new(
-        descriptor,
-        &preflight.metadata,
-        tensor_index,
+        || build_native_runtime_model_adapter_from_preflight(verified_pack.preflight()),
+    )?;
+    // The global cache owns only the small, content-keyed family projection.
+    // The caller owns the exact open/mapped proof so a bounded cache cannot
+    // pin dozens of model files and mappings after their sessions are gone.
+    Some(NativeRuntimeModelAdapter::from_verified(
+        projection,
+        verified_pack,
     ))
 }
 
-pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), String> {
-    let runtime_source = native_path::validate_local_native_runtime_source(path)
-        .map_err(|error| error.to_string())?;
-    let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-        &runtime_source,
-    )
-    .map_err(|error| format!("GGUF preflight failed: {error}"))?;
-    let metadata = preflight.metadata.as_ref();
-    let tensor_index = preflight.tensor_index.as_ref();
-    // Auxiliary (non-ASR) packs -- diarization support (speaker embedder,
-    // speaker segmenter), translation (Hy-MT2), punctuation (FireRedPunc) --
-    // never select an ASR runtime adapter; their contract is "this family's own
-    // runtime-loader probe accepts the pack". One table
-    // (`aux_pack_registry::AUX_PACK_DESCRIPTORS`) dispatches all of them by
-    // `general.architecture`, fail-closed the same way ASR family-adapter
-    // selection is below: an aux pack with no ASR-shaped selection metadata
-    // never reaches (and is never rejected by) ASR adapter selection.
-    if let Some((kind, result)) =
-        crate::models::aux_pack_registry::validate_aux_runtime_pack_contract(
-            path,
-            metadata,
-            tensor_index,
-        )
-    {
-        return result.map_err(|error| format!("{}: {error}", kind.validation_failure_label()));
-    }
-    let selection_metadata = selection_metadata_from_gguf(metadata);
-    let registry = GgmlFamilyRegistry::with_builtin_adapters();
-    let descriptor = registry
-        .select_from_gguf_metadata_v1(&selection_metadata)
-        .map_err(|error| format!("runtime adapter selection failed: {error:?}"))?;
-    if matches!(
-        descriptor.model_architecture,
-        QWEN3_ASR_GGML_ARCHITECTURE_ID | COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID
-    ) {
-        return validate_builtin_runtime_tensor_contract_for_architecture(
-            descriptor.model_architecture,
-            metadata,
-            tensor_index,
-        )
-        .map(|_| ())
-        .map_err(|error| format!("runtime tensor contract validation failed: {error}"));
-    }
-    // Adapter selection above only checks the `openasr.*` family/architecture
-    // routing keys; it does not require the family's *runtime* scalar keys
-    // (e.g. whisper's decoder head_count). Without the check below, a pack
-    // missing those keys "installs successfully" and only fails closed the
-    // first time it is actually loaded for inference (see the turbo pack
-    // that shipped without `whisper.decoder.attention.head_count`). Dispatch
-    // to each family's existing required-metadata parser so install stays
-    // fail-closed at the same gate `openasr pull` already uses for
-    // qwen3/cohere above. Only families with such a parser are covered;
-    // families without one keep prior (adapter-selection-only) behavior and
-    // still fail closed later, at first load, via their executor.
-    match descriptor.model_architecture {
-        WHISPER_GGML_ARCHITECTURE_ID => {
-            crate::models::whisper::runtime_contract::validate_whisper_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "whisper runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        MOONSHINE_GGML_ARCHITECTURE_ID => {
-            crate::models::moonshine::runtime_contract::parse_moonshine_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "moonshine runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        PARAKEET_CTC_GGML_ARCHITECTURE_ID => {
-            crate::models::parakeet_ctc::runtime_contract::parse_parakeet_ctc_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "parakeet-ctc runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID => {
-            crate::models::parakeet_tdt::runtime_contract::parse_parakeet_tdt_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "parakeet-tdt runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => {
-            crate::models::wav2vec2_ctc::runtime_contract::parse_wav2vec2_ctc_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "wav2vec2-ctc runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => {
-            crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "xasr-zipformer runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        DOLPHIN_GGML_ARCHITECTURE_ID => {
-            // `max_ctx` resolution needs the tensor index (the baked
-            // position-table tensor's own shape is authoritative over the
-            // metadata scalar when present); see
-            // `runtime_contract::resolve_position_table_max_ctx`.
-            crate::models::dolphin::runtime_contract::parse_dolphin_execution_metadata(
-                metadata,
-                tensor_index,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "dolphin runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => {
-            crate::models::sensevoice::runtime_contract::parse_sensevoice_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "sensevoice runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => {
-            crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "firered-aed runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => {
-            crate::models::firered_llm::runtime_contract::parse_firered_llm_encoder_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .and_then(|()| {
-                crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(
-                    metadata,
-                )
-                .map(|_| ())
-            })
-            .and_then(|()| {
-                crate::models::firered_llm::runtime_contract::parse_firered_llm_decoder_metadata(
-                    metadata,
-                )
-                .map(|_| ())
-            })
-            .map_err(|error| {
-                format!(
-                    "firered-llm runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID => {
-            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_encoder_metadata(
-                metadata,
-            )
-            .map(|_| ())
-            .and_then(|()| {
-                crate::models::funasr_nano::runtime_contract::parse_funasr_nano_adapter_metadata(
-                    metadata,
-                )
-                .map(|_| ())
-            })
-            .and_then(|()| {
-                crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(
-                    metadata,
-                )
-                .map(|_| ())
-            })
-            .map_err(|error| {
-                format!(
-                    "funasr-nano runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                )
-            })
-        }
-        crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => {
-            crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(metadata)
-                .map(|_| ())
-                .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(metadata)
-                        .map(|_| ())
-                })
-                .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(metadata)
-                        .map(|_| ())
-                })
-                .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(metadata)
-                        .map(|_| ())
-                })
-                .and_then(|()| {
-                    crate::models::mimo_asr::runtime_contract::parse_mimo_special_tokens(metadata)
-                        .map(|_| ())
-                })
-                .map_err(|error| {
-                    format!(
-                        "mimo-asr runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                    )
-                })
-        }
-        crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
-            crate::models::moss_transcribe_diarize::runtime_contract::parse_encoder_metadata(metadata)
-                .map(|_| ())
-                .and_then(|()| {
-                    crate::models::moss_transcribe_diarize::runtime_contract::parse_adaptor_metadata(
-                        metadata,
-                    )
-                    .map(|_| ())
-                })
-                .and_then(|()| {
-                    crate::models::moss_transcribe_diarize::runtime_contract::parse_decoder_metadata(
-                        metadata,
-                    )
-                    .map(|_| ())
-                })
-                .map_err(|error| {
-                    format!(
-                        "moss-transcribe-diarize runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                    )
-                })
-        }
-        crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID => {
-            crate::models::granite_speech::runtime_contract::parse_encoder_metadata(metadata)
-                .map(|_| ())
-                .and_then(|()| {
-                    crate::models::granite_speech::runtime_contract::parse_projector_metadata(
-                        metadata,
-                    )
-                    .map(|_| ())
-                })
-                .and_then(|()| {
-                    crate::models::granite_speech::runtime_contract::parse_decoder_metadata(
-                        metadata,
-                    )
-                    .map(|_| ())
-                })
-                .map_err(|error| {
-                    format!(
-                        "granite-speech runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                    )
-                })
-        }
-        // No dedicated required-metadata parser for this architecture (yet):
-        // stay Ok() here, same as before this check existed. The executor
-        // still fails closed at first load if the pack is incomplete.
-        _ => Ok(()),
-    }
+fn build_native_runtime_model_adapter_from_preflight(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Option<NativeRuntimeModelProjection> {
+    let selection_metadata = selection_metadata_from_gguf(&preflight.metadata);
+    let selected = OpenAsrArchitectureRegistry::with_builtins()
+        .select_ggml_adapter_from_gguf_metadata_v1(&selection_metadata)
+        .ok()?;
+    let descriptor = crate::arch::builtin_adapter_descriptor(selected.identity.model_architecture);
+    Some(NativeRuntimeModelProjection::new(
+        descriptor,
+        &preflight.metadata,
+        Some(preflight.tensor_index.as_ref()),
+    ))
 }
 
-/// Shared hint appended to install-time runtime-contract failures: these
-/// always mean the pack is missing keys a current conversion pipeline would
-/// have written, not that the file is corrupt.
-const RUNTIME_CONTRACT_OUTDATED_PACK_HINT: &str = "this pack was likely produced by an outdated or incompatible conversion pipeline; re-convert or re-pull the model pack";
+pub fn verify_native_runtime_model_pack_path(path: &Path) -> Result<(), String> {
+    crate::models::pack_verifier::PackVerifier
+        .verify_candidate(crate::models::pack_verifier::PackCandidate::new(path))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 fn native_runtime_adapter_segments_speakers_in_decoder(
     adapter: Option<&NativeRuntimeModelAdapter>,
@@ -1933,40 +1814,12 @@ mod tests {
         TinyGgufFixtureSpec::new(metadata)
     }
 
-    fn qwen_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
-        TinyGgufFixtureSpec::qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id)
-    }
-
     fn whisper_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
         TinyGgufFixtureSpec::whisper_oasr_v1_metadata_ready_for_streaming_fail_closed(model_id)
     }
 
     fn cohere_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
         TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(model_id)
-    }
-
-    fn moonshine_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
-        TinyGgufFixtureSpec::moonshine_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id)
-    }
-
-    fn parakeet_ctc_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
-        streaming_runtime_fixture_spec(
-            "parakeet-ctc",
-            crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID,
-            crate::PARAKEET_CTC_AUDIO_FRONTEND_ID,
-            crate::PARAKEET_CTC_DECODE_POLICY_ID,
-            crate::PARAKEET_CTC_TOKENIZER_ID,
-        )
-    }
-
-    fn wav2vec2_ctc_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
-        streaming_runtime_fixture_spec(
-            "wav2vec2-ctc",
-            crate::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
-            crate::WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
-            crate::WAV2VEC2_CTC_DECODE_POLICY_ID,
-            crate::WAV2VEC2_CTC_TOKENIZER_ID,
-        )
     }
 
     fn xasr_zipformer_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
@@ -1982,69 +1835,34 @@ mod tests {
     #[derive(Clone, Copy)]
     struct StreamingRuntimeFixtureCase {
         slug: &'static str,
-        model_id: &'static str,
-        family: &'static str,
         adapter_id: &'static str,
-        expected_executor_id: &'static str,
-        expected_secondary_executor_id: Option<&'static str>,
-        fixture_spec: fn(&str) -> TinyGgufFixtureSpec,
     }
 
     fn streaming_runtime_fixture_cases() -> [StreamingRuntimeFixtureCase; 6] {
         [
             StreamingRuntimeFixtureCase {
                 slug: "cohere",
-                model_id: "cohere-streaming-runtime",
-                family: "cohere-transcribe",
                 adapter_id: crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
-                expected_executor_id: "cohere-transcribe-ggml-snapshot-streaming-executor-v1",
-                expected_secondary_executor_id: Some("cohere-transcribe-ggml-executor-v1"),
-                fixture_spec: cohere_streaming_runtime_fixture_spec,
             },
             StreamingRuntimeFixtureCase {
                 slug: "moonshine",
-                model_id: "moonshine-streaming-runtime",
-                family: crate::MOONSHINE_MODEL_FAMILY,
                 adapter_id: crate::MOONSHINE_GGML_ADAPTER_ID,
-                expected_executor_id: "moonshine-ggml-snapshot-streaming-executor-v1",
-                expected_secondary_executor_id: None,
-                fixture_spec: moonshine_streaming_runtime_fixture_spec,
             },
             StreamingRuntimeFixtureCase {
                 slug: "parakeet-ctc",
-                model_id: "parakeet-ctc-streaming-runtime",
-                family: "parakeet-ctc",
                 adapter_id: crate::PARAKEET_CTC_GGML_ADAPTER_ID,
-                expected_executor_id: "parakeet-ctc-ggml-snapshot-streaming-executor-v1",
-                expected_secondary_executor_id: None,
-                fixture_spec: parakeet_ctc_streaming_runtime_fixture_spec,
             },
             StreamingRuntimeFixtureCase {
                 slug: "wav2vec2-ctc",
-                model_id: "wav2vec2-ctc-streaming-runtime",
-                family: "wav2vec2-ctc",
                 adapter_id: crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
-                expected_executor_id: "wav2vec2-ctc-ggml-snapshot-streaming-executor-v1",
-                expected_secondary_executor_id: None,
-                fixture_spec: wav2vec2_ctc_streaming_runtime_fixture_spec,
             },
             StreamingRuntimeFixtureCase {
                 slug: "qwen",
-                model_id: "qwen-streaming-runtime",
-                family: crate::models::qwen::QWEN3_ASR_MODEL_FAMILY,
                 adapter_id: crate::QWEN3_ASR_GGML_ADAPTER_ID,
-                expected_executor_id: "qwen3-asr-ggml-snapshot-streaming-executor-v1",
-                expected_secondary_executor_id: None,
-                fixture_spec: qwen_streaming_runtime_fixture_spec,
             },
             StreamingRuntimeFixtureCase {
                 slug: "whisper",
-                model_id: "whisper-streaming-runtime",
-                family: crate::WHISPER_MODEL_FAMILY,
                 adapter_id: crate::WHISPER_GGML_ADAPTER_ID,
-                expected_executor_id: "whisper-ggml-snapshot-streaming-executor-v1",
-                expected_secondary_executor_id: None,
-                fixture_spec: whisper_streaming_runtime_fixture_spec,
             },
         ]
     }
@@ -2247,26 +2065,33 @@ mod tests {
         let registry = crate::arch::OpenAsrArchitectureRegistry::with_builtins();
         for descriptor in registry.descriptors() {
             let expected =
-                descriptor.model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
+                descriptor.identity.model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
             assert_eq!(
-                descriptor.speaker_segmentation.is_in_decoder(),
+                descriptor
+                    .execution_contract
+                    .speaker_segmentation
+                    .is_in_decoder(),
                 expected,
                 "'{}' speaker segmentation source mismatch",
-                descriptor.model_architecture
+                descriptor.identity.model_architecture
             );
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let cases: [(&str, fn(&str) -> TinyGgufFixtureSpec); 3] = [
-            ("cohere", cohere_streaming_runtime_fixture_spec),
-            ("whisper", whisper_streaming_runtime_fixture_spec),
-            ("qwen", qwen_streaming_runtime_fixture_spec),
+        let cases = [
+            ("cohere-transcribe", "cohere"),
+            ("whisper", "whisper"),
+            ("qwen3-asr", "qwen"),
         ];
-        for (name, build_spec) in cases {
-            let runtime_path = temp.path().join(format!("{name}-segmentation.gguf"));
-            write_tiny_gguf_runtime_source(&runtime_path, &build_spec(name)).unwrap();
-            let adapter = native_runtime_model_adapter_for_path(&runtime_path)
-                .unwrap_or_else(|| panic!("{name} fixture must resolve an adapter"));
+        let architecture_registry = OpenAsrArchitectureRegistry::with_builtins();
+        for (family, name) in cases {
+            let descriptor = architecture_registry
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.identity.model_family == family)
+                .unwrap_or_else(|| panic!("{name} family descriptor must be registered"))
+                .ggml_family_adapter_descriptor();
+            let adapter =
+                NativeRuntimeModelAdapter::new(descriptor, &crate::GgufMetadata::default(), None);
             assert!(
                 !adapter.segments_speakers_in_decoder(),
                 "'{name}' takes its speaker structure from an external source"
@@ -2313,18 +2138,18 @@ mod tests {
     fn native_streaming_rejects_voice_id_and_keeps_speakers_out_of_decode_options() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-redimnet-only-streaming.gguf");
-        let spec = whisper_streaming_runtime_fixture_spec("whisper-redimnet-only-streaming");
+        let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+            "whisper-redimnet-only-streaming",
+        )
+        .with_whisper_minimal_tokenizer();
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let redimnet_pack = temp.path().join("redimnet.oasr");
-        std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        let realtime_capabilities = crate::test_process_env::with_test_process_env(
-            [(
-                "OPENASR_REDIMNET_PACK",
-                Some(redimnet_pack.clone().into_os_string()),
-            )],
-            || native_runtime_realtime_capabilities_for_path(&runtime_path),
+        let adapter = NativeRuntimeModelAdapter::new(
+            crate::arch::builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
+            &crate::GgufMetadata::default(),
+            None,
         );
-        let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
+        let realtime_capabilities =
+            RealtimeBackendCapabilities::from_native_capabilities(&adapter.capabilities());
         assert!(adapter.capabilities().supports_true_streaming);
         assert!(!realtime_capabilities.diarization.supported);
         assert!(
@@ -2366,37 +2191,45 @@ mod tests {
 
     #[test]
     fn native_runtime_phrase_bias_capability_matrix_is_per_family() {
-        let cases: [(&str, fn(&str) -> TinyGgufFixtureSpec, bool); 7] = [
-            ("whisper", whisper_streaming_runtime_fixture_spec, true),
-            ("cohere", cohere_streaming_runtime_fixture_spec, true),
-            ("qwen", qwen_streaming_runtime_fixture_spec, true),
-            ("moonshine", moonshine_streaming_runtime_fixture_spec, true),
+        let cases: [(&str, &str, bool); 7] = [
+            ("whisper", crate::WHISPER_GGML_ARCHITECTURE_ID, true),
+            (
+                "cohere",
+                crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                true,
+            ),
+            ("qwen", crate::QWEN3_ASR_GGML_ARCHITECTURE_ID, true),
+            ("moonshine", crate::MOONSHINE_GGML_ARCHITECTURE_ID, true),
             (
                 "parakeet-ctc",
-                parakeet_ctc_streaming_runtime_fixture_spec,
+                crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID,
                 true,
             ),
             (
                 "wav2vec2-ctc",
-                wav2vec2_ctc_streaming_runtime_fixture_spec,
+                crate::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
                 true,
             ),
             (
                 "xasr-zipformer",
-                xasr_zipformer_streaming_runtime_fixture_spec,
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
                 false,
             ),
         ];
+        let architecture_registry = OpenAsrArchitectureRegistry::with_builtins();
 
-        for (slug, fixture_spec, expected_phrase_bias) in cases {
-            let temp = tempfile::tempdir().unwrap();
-            let runtime_path = temp.path().join(format!("{slug}.gguf"));
-            let spec = fixture_spec(slug);
-            write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-
-            let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
-            let transcription = native_runtime_transcription_capabilities_for_path(&runtime_path);
-            let realtime = native_runtime_realtime_capabilities_for_path(&runtime_path);
+        for (slug, architecture, expected_phrase_bias) in cases {
+            let descriptor = architecture_registry
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.identity.model_architecture == architecture)
+                .unwrap_or_else(|| panic!("{slug} descriptor must be registered"))
+                .ggml_family_adapter_descriptor();
+            let adapter =
+                NativeRuntimeModelAdapter::new(descriptor, &crate::GgufMetadata::default(), None);
+            let transcription = native_phrase_bias_capability_for_adapter(Some(&adapter));
+            let realtime =
+                RealtimeBackendCapabilities::from_native_capabilities(&adapter.capabilities());
 
             assert_eq!(
                 adapter.capabilities().supports_phrase_bias,
@@ -2404,7 +2237,7 @@ mod tests {
                 "{slug} adapter capability"
             );
             assert_eq!(
-                transcription.phrase_bias.supported, expected_phrase_bias,
+                transcription.supported, expected_phrase_bias,
                 "{slug} transcription capability"
             );
             assert_eq!(
@@ -2425,7 +2258,13 @@ mod tests {
         let runtime_path = temp.path().join("xasr-zipformer.gguf");
         let spec = xasr_zipformer_streaming_runtime_fixture_spec("xasr-zipformer");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
+        let adapter = NativeRuntimeModelAdapter::new(
+            crate::arch::builtin_adapter_descriptor(
+                crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            ),
+            &crate::GgufMetadata::default(),
+            None,
+        );
         let model_pack = NativeAsrModelPackRef::new(
             "xasr-zipformer",
             crate::arch::XASR_ZIPFORMER_MODEL_FAMILY,
@@ -2456,7 +2295,13 @@ mod tests {
         let runtime_path = temp.path().join("xasr-zipformer.gguf");
         let spec = xasr_zipformer_streaming_runtime_fixture_spec("xasr-zipformer");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
+        let adapter = NativeRuntimeModelAdapter::new(
+            crate::arch::builtin_adapter_descriptor(
+                crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            ),
+            &crate::GgufMetadata::default(),
+            None,
+        );
         let model_pack = NativeAsrModelPackRef::new(
             "xasr-zipformer",
             crate::arch::XASR_ZIPFORMER_MODEL_FAMILY,
@@ -2486,19 +2331,20 @@ mod tests {
 
     #[test]
     fn native_runtime_model_adapters_advertise_streaming_when_executor_is_registered() {
+        let architecture_registry = OpenAsrArchitectureRegistry::with_builtins();
         for case in streaming_runtime_fixture_cases() {
-            let temp = tempfile::tempdir().unwrap();
-            let runtime_path = temp.path().join(format!("{}.gguf", case.model_id));
-            let spec = (case.fixture_spec)(case.model_id);
-            write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-
-            let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
+            let descriptor = architecture_registry
+                .find_by_adapter_id(case.adapter_id)
+                .unwrap_or_else(|| panic!("{} adapter must be registered", case.slug))
+                .ggml_family_adapter_descriptor();
+            let adapter =
+                NativeRuntimeModelAdapter::new(descriptor, &crate::GgufMetadata::default(), None);
             let capabilities = adapter.capabilities();
             assert_eq!(adapter.adapter_id(), case.adapter_id, "{}", case.slug);
             assert!(capabilities.supports_true_streaming, "{}", case.slug);
             assert!(capabilities.supports_partials, "{}", case.slug);
 
-            let realtime = native_runtime_realtime_capabilities_for_path(&runtime_path);
+            let realtime = RealtimeBackendCapabilities::from_native_capabilities(&capabilities);
             assert_eq!(
                 realtime.mode,
                 crate::realtime::RealtimeBackendMode::TrueStreaming,
@@ -2510,72 +2356,78 @@ mod tests {
         }
     }
 
+    /// Public product-route smoke for one verifier-admitted Cohere pack:
+    /// admission -> adapter selection -> native executor -> streaming
+    /// dispatch. Other families' registry-derived streaming capabilities are
+    /// covered above; their metadata-only placeholders are intentionally not
+    /// treated as executable packs under fail-closed admission.
     #[test]
-    fn native_backend_starts_declared_streaming_sessions_through_product_route() {
-        for case in streaming_runtime_fixture_cases() {
-            let temp = tempfile::tempdir().unwrap();
-            let runtime_path = temp.path().join(format!("{}.gguf", case.model_id));
-            let spec = (case.fixture_spec)(case.model_id);
-            write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
+    fn native_backend_admits_and_dispatches_cohere_streaming_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("cohere-streaming-runtime.gguf");
+        let spec = cohere_streaming_runtime_fixture_spec("cohere-streaming-runtime");
+        write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
-            let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
-            let model_pack = NativeAsrModelPackRef::new(case.model_id, case.family, &runtime_path);
-            let backend = native_executor_for_test();
-            let session_id = format!("rt_{}_backend_streaming", case.slug.replace('-', "_"));
-            let mut session = NativeAsrExecutor::start_streaming_session(
-                &backend,
-                &adapter,
-                &model_pack,
-                NativeAsrHardwareTarget::Cpu,
-                NativeAsrSessionContext::new(&session_id),
-                NativeAsrRequestOptions::new().with_partial_results(true),
-                NativeAsrStreamingSessionConfig::new().with_partial_results(true),
-            )
-            .unwrap();
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("complete Cohere fixture must pass package admission");
+        let model_pack = NativeAsrModelPackRef::new(
+            "cohere-streaming-runtime",
+            "cohere-transcribe",
+            &runtime_path,
+        );
+        let backend = native_executor_for_test();
+        let session_id = "rt_cohere_backend_streaming";
+        let mut session = NativeAsrExecutor::start_streaming_session(
+            &backend,
+            &adapter,
+            &model_pack,
+            NativeAsrHardwareTarget::Cpu,
+            NativeAsrSessionContext::new(session_id),
+            NativeAsrRequestOptions::new().with_partial_results(true),
+            NativeAsrStreamingSessionConfig::new().with_partial_results(true),
+        )
+        .unwrap();
 
-            assert_eq!(session.session_id(), session_id, "{}", case.slug);
-            let _ = session.poll_events().unwrap();
+        assert_eq!(session.session_id(), session_id);
+        let _ = session.poll_events().unwrap();
 
-            let format = crate::realtime::RealtimeAudioFormat::pcm16_mono_16khz();
-            let sample_count = format.sample_count_for_duration_ms(20).unwrap();
-            // push_audio only buffers; the decode (which loads the fixture runtime
-            // and fails) runs in poll_events once enough audio passes the
-            // first-decode floor. Feed ~1.2s, then poll to surface the error.
-            for seq in 1..=60u64 {
-                session
-                    .push_audio(
-                        crate::realtime::RealtimeAudioFrame::new(
-                            seq,
-                            (seq - 1) * 20,
-                            format,
-                            vec![0; sample_count],
-                        )
-                        .unwrap(),
+        let format = crate::realtime::RealtimeAudioFormat::pcm16_mono_16khz();
+        let sample_count = format.sample_count_for_duration_ms(20).unwrap();
+        // push_audio only buffers; the decode runs in poll_events once enough
+        // audio passes the first-decode floor. Feed ~1.2s, then poll.
+        for seq in 1..=60u64 {
+            session
+                .push_audio(
+                    crate::realtime::RealtimeAudioFrame::new(
+                        seq,
+                        (seq - 1) * 20,
+                        format,
+                        vec![0; sample_count],
                     )
-                    .unwrap();
-            }
-            // A working fixture runtime yields a partial; a non-loadable one errors
-            // via its declared executor. Either proves the session routed correctly.
-            match session.poll_events() {
-                Ok(events) => assert!(
-                    events
-                        .iter()
-                        .any(|event| event.event_type == "transcript.partial"),
-                    "{}: expected a streaming partial via {}",
-                    case.slug,
-                    case.expected_executor_id
-                ),
-                Err(error) => {
-                    let error = error.to_string();
-                    assert!(
-                        error.contains(case.expected_executor_id),
-                        "{}: {error}",
-                        case.slug
-                    );
-                    if let Some(expected) = case.expected_secondary_executor_id {
-                        assert!(error.contains(expected), "{}: {error}", case.slug);
-                    }
-                }
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        // The tiny Cohere fixture is runnable enough to yield a partial; an
+        // executor-level error is also acceptable as long as it came through
+        // the declared streaming dispatch components.
+        match session.poll_events() {
+            Ok(events) => assert!(
+                events
+                    .iter()
+                    .any(|event| event.event_type == "transcript.partial"),
+                "expected a Cohere streaming partial"
+            ),
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    error.contains("cohere-transcribe-ggml-snapshot-streaming-executor-v1"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("cohere-transcribe-ggml-executor-v1"),
+                    "{error}"
+                );
             }
         }
     }
@@ -2817,22 +2669,22 @@ mod tests {
     fn native_runtime_model_adapter_cache_rekeys_same_path_content_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("dolphin-replacement.gguf");
-        let mut architecture_metadata = std::collections::BTreeMap::new();
-        architecture_metadata.insert(
-            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
-            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
-        );
 
         write_tiny_gguf_runtime_source(
             &runtime_path,
-            &TinyGgufFixtureSpec::new(architecture_metadata.clone()),
+            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready(
+                "dolphin-replacement-base",
+            ),
         )
         .unwrap();
         let base_adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("base Dolphin fixture must resolve");
         assert!(!base_adapter.capabilities().supports_phrase_bias);
 
-        let hotword_spec = TinyGgufFixtureSpec::new(architecture_metadata).with_added_tensor(
+        let hotword_spec = TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready(
+            "dolphin-replacement-hotword",
+        )
+        .with_added_tensor(
             crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
         );
         write_tiny_gguf_runtime_source(&runtime_path, &hotword_spec).unwrap();
@@ -3298,9 +3150,11 @@ mod tests {
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
             let backend = native_executor_for_test();
-            let adapter = TestNativeRuntimeAdapter { family: "cohere" };
-            let model_pack =
-                NativeAsrModelPackRef::new("cohere-runtime-fixture", "cohere", runtime_path);
+            let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+                .expect("fixture must resolve through the production verifier");
+            let model_pack = adapter
+                .model_pack_ref("cohere-runtime-fixture")
+                .expect("verified adapter must carry its exact pack proof");
             let request = NativeAsrOfflineRequest::new(sample_wav_fixture_path())
                 .with_options(NativeAsrRequestOptions::new().with_word_timestamps(true));
 
@@ -3440,16 +3294,11 @@ mod tests {
             &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture"),
         )
         .unwrap();
-        let descriptor = crate::cohere_transcribe_runtime_descriptor_v1();
-        let adapter = NativeRuntimeModelAdapter {
-            descriptor: descriptor.clone(),
-            capabilities: NativeAsrCapabilities::native_true_streaming()
-                .with_partial_results(true)
-                .with_timestamps(true),
-            language_mode: crate::models::language::LanguageMode::SpecifyOnly {
-                default_language: "en",
-            },
-        };
+        let descriptor = crate::arch::builtin_adapter_descriptor(
+            crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        );
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("valid Cohere fixture resolves a verified runtime adapter");
         let model_pack = NativeAsrModelPackRef::new(
             "cohere-runtime-fixture",
             descriptor.model_family,
@@ -3499,6 +3348,106 @@ mod tests {
     }
 
     #[test]
+    fn native_streaming_start_consumes_the_adapter_preflight_proof_without_reparse() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("cohere-single-preflight.gguf");
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-single-preflight"),
+        )
+        .unwrap();
+
+        let before = crate::ggml_runtime::bounded_parse_call_count_for_current_thread();
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("valid Cohere fixture resolves a verified runtime adapter");
+        let model_pack = NativeAsrModelPackRef::new(
+            "cohere-single-preflight",
+            adapter.model_family(),
+            runtime_path,
+        );
+        let session = NativeAsrExecutor::start_streaming_session(
+            &native_executor_for_test(),
+            &adapter,
+            &model_pack,
+            NativeAsrHardwareTarget::Cpu,
+            NativeAsrSessionContext::new("rt_single_preflight"),
+            NativeAsrRequestOptions::new().with_partial_results(true),
+            NativeAsrStreamingSessionConfig::new().with_partial_results(true),
+        )
+        .expect("streaming session construction consumes the attached proof");
+        let after = crate::ggml_runtime::bounded_parse_call_count_for_current_thread();
+        drop(session);
+
+        assert_eq!(
+            after - before,
+            1,
+            "adapter resolution and streaming start must share one bounded GGUF parse"
+        );
+    }
+
+    #[test]
+    fn verified_identity_and_model_pack_ref_project_without_reparse() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("cohere-identity-single-preflight.gguf");
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-identity-single-preflight"),
+        )
+        .unwrap();
+
+        let before = crate::ggml_runtime::bounded_parse_call_count_for_current_thread();
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("valid Cohere fixture resolves a verified runtime adapter");
+        let identity = adapter
+            .verified_runtime_model_identity(None)
+            .expect("identity projects from verifier metadata");
+        let model_pack = adapter
+            .model_pack_ref(identity.model_id)
+            .expect("pack ref projects from the same proof");
+        let after = crate::ggml_runtime::bounded_parse_call_count_for_current_thread();
+
+        assert_eq!(model_pack.root, runtime_path);
+        assert_eq!(
+            after - before,
+            1,
+            "adapter selection, admission identity, and execution pack ref must share one bounded GGUF parse"
+        );
+    }
+
+    #[test]
+    fn native_offline_start_consumes_the_model_pack_proof_without_reparse() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("cohere-offline-single-preflight.gguf");
+        write_tiny_gguf_runtime_source(
+            &runtime_path,
+            &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-offline-single-preflight"),
+        )
+        .unwrap();
+
+        let before = crate::ggml_runtime::bounded_parse_call_count_for_current_thread();
+        let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+            .expect("valid Cohere fixture resolves a verified runtime adapter");
+        let model_pack = adapter
+            .model_pack_ref("cohere-offline-single-preflight")
+            .expect("product adapter carries a verified model-pack proof");
+        let _error = NativeAsrExecutor::transcribe(
+            &native_executor_for_test(),
+            &adapter,
+            &model_pack,
+            NativeAsrHardwareTarget::Cpu,
+            NativeAsrOfflineRequest::new(temp.path().join("missing-audio.wav")),
+        )
+        .expect_err("fixture has no audio input");
+        let after = crate::ggml_runtime::bounded_parse_call_count_for_current_thread();
+
+        assert_eq!(
+            after - before,
+            1,
+            "adapter resolution and offline start must share one bounded GGUF parse"
+        );
+    }
+
+    #[test]
     fn native_backend_requires_model_pack_path() {
         let backend = native_backend_for_test();
         let request = TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-small");
@@ -3528,7 +3477,10 @@ mod tests {
                 // space, so the runtime must stop before loading either the ASR
                 // model or the external segmenter when ReDim is absent.
                 let runtime_path = temp.path().join("whisper-runtime.gguf");
-                let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
+                let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+                    "whisper-runtime-fixture",
+                )
+                .with_whisper_minimal_tokenizer();
                 write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
                 let backend = native_backend_for_test();
@@ -3571,7 +3523,7 @@ mod tests {
         }];
         crate::ggml_runtime::write_gguf_file_v0(&pack_path, &metadata, &tensors).unwrap();
 
-        match validate_native_runtime_model_pack_contract(&pack_path) {
+        match verify_native_runtime_model_pack_path(&pack_path) {
             Ok(()) => {
                 // Aux loader accepted the stub weight bag -- routing still succeeded.
             }
@@ -3594,9 +3546,13 @@ mod tests {
             "general.architecture".to_string(),
             crate::ggml_runtime::GgufWriteValue::String("not-a-real-family".to_string()),
         );
+        unknown_metadata.insert(
+            "openasr.package.version".to_string(),
+            crate::ggml_runtime::GgufWriteValue::String("1".to_string()),
+        );
         crate::ggml_runtime::write_gguf_file_v0(&unknown_path, &unknown_metadata, &tensors)
             .unwrap();
-        let unknown_error = validate_native_runtime_model_pack_contract(&unknown_path)
+        let unknown_error = verify_native_runtime_model_pack_path(&unknown_path)
             .expect_err("unknown architecture must fail ASR adapter selection");
         assert!(
             unknown_error.contains("runtime adapter selection failed"),
@@ -3615,8 +3571,8 @@ mod tests {
     /// present since the family shipped, unrelated to any quantization
     /// incident. Twin of
     /// `pull_contract_validation_routes_diarize_packs_to_their_loader` above,
-    /// but through the full public entry point (`write_gguf_file_v0` -> a
-    /// real `.oasr` file on disk -> `validate_native_runtime_model_pack_contract`)
+    /// but through the full public entry point (a temporary GGUF writer -> a
+    /// real `.oasr` file on disk -> `verify_native_runtime_model_pack_path`)
     /// rather than the internal aux-table function directly, and asserting
     /// both directions: complete metadata is accepted, and a bare-minimum
     /// pack is claimed by the aux table (never ASR selection) yet still
@@ -3677,7 +3633,7 @@ mod tests {
         crate::ggml_runtime::write_gguf_file_v0(&complete_path, &complete_metadata, &tensors)
             .unwrap();
         assert!(
-            validate_native_runtime_model_pack_contract(&complete_path).is_ok(),
+            verify_native_runtime_model_pack_path(&complete_path).is_ok(),
             "a pack carrying every qwen3_forced_aligner.* key plus the BPE tokenizer arrays \
              must pass install-time validation"
         );
@@ -3687,9 +3643,13 @@ mod tests {
             "general.architecture".to_string(),
             crate::ggml_runtime::GgufWriteValue::String("qwen3-forced-aligner".to_string()),
         );
+        bare_metadata.insert(
+            "openasr.package.version".to_string(),
+            crate::ggml_runtime::GgufWriteValue::String("1".to_string()),
+        );
         let bare_path = temp.path().join("forced-aligner-bare.oasr");
         crate::ggml_runtime::write_gguf_file_v0(&bare_path, &bare_metadata, &tensors).unwrap();
-        let bare_error = validate_native_runtime_model_pack_contract(&bare_path)
+        let bare_error = verify_native_runtime_model_pack_path(&bare_path)
             .expect_err("a pack missing every qwen3_forced_aligner.* key must fail closed");
         assert!(
             bare_error.contains("forced-alignment pack validation failed"),
@@ -3701,11 +3661,10 @@ mod tests {
         );
     }
 
-    /// `validate_native_runtime_model_pack_contract`'s per-family dispatch
-    /// (the `match descriptor.model_architecture { ... }` above) has a
-    /// catch-all `_ => Ok(())` arm for architectures with no dedicated
-    /// required-metadata parser (yet). That arm must never silently swallow
-    /// an architecture that *should* have fail-closed validation wired up.
+    /// `verify_native_runtime_model_pack_path` routes through the shared
+    /// PackVerifier and registry-owned family contracts. This coverage test
+    /// must never silently miss an architecture that *should* have fail-closed
+    /// validation wired up.
     ///
     /// Mirrors the sibling completeness tests in `builtin_execution_dispatch`
     /// (`builtins_cover_all_dedicated_runtime_architectures` /
@@ -3716,10 +3675,9 @@ mod tests {
     /// nothing else, and asserts install-time validation rejects it. Every
     /// architecture wired up today (via a dedicated `runtime_contract`
     /// parser, or via the qwen3/cohere tensor-contract check, or via the
-    /// aux-pack table) fails closed on such a bare-bones pack, so if a
-    /// future architecture's dispatch arm is missing (or someone widens the
-    /// `_` arm's reach), it would fall through to `Ok(())` here and this
-    /// test would catch it.
+    /// aux-pack table) fails closed on such a bare-bones pack, so if a future
+    /// architecture is missing from the registry-owned contract projection,
+    /// it would fall through to `Ok(())` here and this test would catch it.
     #[test]
     fn install_time_family_metadata_validation_covers_every_builtin_architecture() {
         use crate::arch::OpenAsrArchitectureRegistry;
@@ -3738,33 +3696,33 @@ mod tests {
             );
             metadata.insert(
                 OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
-                descriptor.model_family.to_string(),
+                descriptor.identity.model_family.to_string(),
             );
             metadata.insert(
                 OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
-                descriptor.model_architecture.to_string(),
+                descriptor.identity.model_architecture.to_string(),
             );
             metadata.insert(
                 OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
-                descriptor.audio_frontend_id.to_string(),
+                descriptor.pack_contract.audio_frontend_id.to_string(),
             );
             metadata.insert(
                 OASR_METADATA_KEY_DECODE_POLICY.to_string(),
-                descriptor.decode_policy_id.to_string(),
+                descriptor.topology_contract.decode_policy_id.to_string(),
             );
             let spec = TinyGgufFixtureSpec::new(metadata);
             let temp = tempfile::tempdir().unwrap();
             let pack_path = temp.path().join("fixture.gguf");
             write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
 
-            let result = validate_native_runtime_model_pack_contract(&pack_path);
+            let result = verify_native_runtime_model_pack_path(&pack_path);
             assert!(
                 result.is_err(),
                 "{} accepted an install-time pack that carries only bare \
                  adapter-selection metadata; every builtin architecture must fail \
                  closed on missing family-specific runtime metadata (a silent \
                  `_ => Ok(())` dispatch arm would let this through)",
-                descriptor.model_architecture,
+                descriptor.identity.model_architecture,
             );
         }
     }
@@ -3885,7 +3843,7 @@ mod tests {
     #[test]
     fn dolphin_phrase_bias_probe_reports_true_only_when_context_module_tensor_is_baked() {
         let dolphin_descriptor =
-            crate::models::ggml_family_registry::dolphin_runtime_descriptor_v1();
+            crate::arch::builtin_adapter_descriptor(crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID);
         let temp = tempfile::tempdir().unwrap();
 
         // Base-tier pack: no `context_module.*` weights baked -- must not
@@ -3925,13 +3883,14 @@ mod tests {
 
         // Every non-Dolphin architecture keeps the prior architecture-level
         // answer regardless of the (irrelevant) tensor index passed in.
-        let whisper_descriptor =
-            crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters()
-                .descriptors()
-                .iter()
-                .find(|descriptor| descriptor.model_architecture == WHISPER_GGML_ARCHITECTURE_ID)
-                .expect("whisper descriptor registered")
-                .clone();
+        let whisper_descriptor = OpenAsrArchitectureRegistry::with_builtins()
+            .descriptors()
+            .iter()
+            .find(|descriptor| {
+                descriptor.identity.model_architecture == crate::WHISPER_GGML_ARCHITECTURE_ID
+            })
+            .expect("whisper descriptor registered")
+            .ggml_family_adapter_descriptor();
         assert!(native_runtime_descriptor_supports_phrase_bias(
             &whisper_descriptor,
             Some(&base_tensor_index),
@@ -3943,26 +3902,21 @@ mod tests {
         // Regression test for the tensor-index read gating in
         // The shared preflight carries both metadata and tensor index, so this
         // exercises the full `native_runtime_model_adapter_for_path` ->
-        // family-registry selection -> Dolphin tensor-index probe path end to
+        // architecture-registry selection -> Dolphin tensor-index probe path end to
         // end (not just the already-covered
         // `native_runtime_descriptor_supports_phrase_bias` unit above).
         let temp = tempfile::tempdir().unwrap();
-        let mut architecture_only_metadata = std::collections::BTreeMap::new();
-        architecture_only_metadata.insert(
-            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
-            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
-        );
 
         let base_path = temp.path().join("dolphin-base-e2e.gguf");
         write_tiny_gguf_runtime_source(
             &base_path,
-            &TinyGgufFixtureSpec::new(architecture_only_metadata.clone()),
+            &TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-base-e2e"),
         )
         .unwrap();
         let base_adapter = native_runtime_model_adapter_for_path(&base_path).unwrap();
         assert_eq!(
             base_adapter.descriptor.model_architecture,
-            DOLPHIN_GGML_ARCHITECTURE_ID
+            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
         );
         assert!(
             !base_adapter.capabilities().supports_phrase_bias,
@@ -3970,9 +3924,11 @@ mod tests {
         );
 
         let hotword_path = temp.path().join("dolphin-hotword-e2e.gguf");
-        let hotword_spec = TinyGgufFixtureSpec::new(architecture_only_metadata).with_added_tensor(
-            crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
-        );
+        let hotword_spec =
+            TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_metadata_ready("dolphin-hotword-e2e")
+                .with_added_tensor(
+                crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+            );
         write_tiny_gguf_runtime_source(&hotword_path, &hotword_spec).unwrap();
         let hotword_adapter = native_runtime_model_adapter_for_path(&hotword_path).unwrap();
         assert!(
@@ -4080,9 +4036,14 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
-            error.contains("gguf metadata is missing required OASR v1 key 'openasr.decode.policy'"),
+            error.contains("runtime pack verification failed"),
             "{error}"
         );
+        assert!(
+            error.contains("runtime adapter selection failed"),
+            "{error}"
+        );
+        assert!(error.contains("openasr.decode.policy"), "{error}");
     }
 
     #[test]
@@ -4111,71 +4072,54 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
-            error.contains("gguf metadata does not match any registered family adapter"),
+            error.contains("runtime pack verification failed"),
             "{error}"
         );
+        assert!(
+            error.contains("runtime adapter selection failed"),
+            "{error}"
+        );
+        assert!(error.contains("UnknownFamily"), "{error}");
     }
 
     #[test]
-    fn native_backend_synthesizes_oasr_selection_keys_from_qwen_general_architecture() {
+    fn native_backend_rejects_qwen_pack_missing_audio_stem_tensor_before_execution() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("qwen3-asr-0.6b-q4_k.gguf");
-        let fixture_spec = TinyGgufFixtureSpec::new(
-            [
-                ("general.architecture", "qwen3-asr"),
-                ("qwen3-asr.sample_rate", "16000"),
-                ("qwen3-asr.n_mels", "80"),
-                ("qwen3-asr.n_fft", "400"),
-                ("qwen3-asr.win_length", "400"),
-                ("qwen3-asr.hop_length", "160"),
-                ("qwen3-asr.audio.n_layers", "2"),
-                ("qwen3-asr.audio.d_model", "16"),
-                ("qwen3-asr.audio.n_heads", "2"),
-                ("qwen3-asr.llm.n_layers", "2"),
-                ("qwen3-asr.llm.d_model", "16"),
-                ("qwen3-asr.llm.n_heads", "2"),
-                ("qwen3-asr.llm.n_kv_heads", "2"),
-                ("qwen3-asr.llm.head_dim", "8"),
-                ("qwen3-asr.llm.vocab_size", "32"),
-                ("qwen3-asr.llm.max_pos", "256"),
-                ("qwen3-asr.audio_start_token_id", "2"),
-                ("qwen3-asr.audio_end_token_id", "3"),
-                ("qwen3-asr.audio_pad_token_id", "4"),
-                ("qwen3-asr.eos_token_id", "5"),
-                ("qwen3-asr.pad_token_id", "6"),
-            ]
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect(),
-        )
-        .with_tensor_shape("audio.mel_filters", [80_u64, 201_u64])
-        .with_tensor_shape("audio.mel_window", [400_u64])
-        .with_tensor_shape("audio.conv_out.weight", [3_u64, 16_u64])
-        .with_tensor_shape("blk.0.attn_norm.weight", [16_u64])
-        .with_tensor_shape("blk.0.attn_q.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.0.attn_k.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.0.attn_v.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.0.attn_output.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.0.attn_q_norm.weight", [8_u64])
-        .with_tensor_shape("blk.0.attn_k_norm.weight", [8_u64])
-        .with_tensor_shape("blk.0.ffn_norm.weight", [16_u64])
-        .with_tensor_shape("blk.0.ffn_gate.weight", [32_u64, 16_u64])
-        .with_tensor_shape("blk.0.ffn_up.weight", [32_u64, 16_u64])
-        .with_tensor_shape("blk.0.ffn_down.weight", [16_u64, 32_u64])
-        .with_tensor_shape("blk.1.attn_norm.weight", [16_u64])
-        .with_tensor_shape("blk.1.attn_q.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.1.attn_k.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.1.attn_v.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.1.attn_output.weight", [16_u64, 16_u64])
-        .with_tensor_shape("blk.1.attn_q_norm.weight", [8_u64])
-        .with_tensor_shape("blk.1.attn_k_norm.weight", [8_u64])
-        .with_tensor_shape("blk.1.ffn_norm.weight", [16_u64])
-        .with_tensor_shape("blk.1.ffn_gate.weight", [32_u64, 16_u64])
-        .with_tensor_shape("blk.1.ffn_up.weight", [32_u64, 16_u64])
-        .with_tensor_shape("blk.1.ffn_down.weight", [16_u64, 32_u64])
-        .with_tensor_shape("token_embd.weight", [16_u64, 32_u64])
-        .with_tensor_shape("output.weight", [16_u64, 32_u64])
-        .with_tensor_shape("output_norm.weight", [16_u64]);
+        let fixture_spec =
+            TinyGgufFixtureSpec::qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(
+                "qwen3-asr-0.6b-q4_k",
+            )
+            .with_metadata("qwen3-asr.n_mels", "80")
+            .with_metadata("qwen3-asr.llm.max_pos", "256")
+            .with_tensor_shape("audio.mel_filters", [80_u64, 201_u64])
+            .with_tensor_shape("audio.mel_window", [400_u64])
+            .with_tensor_shape("audio.conv_out.weight", [3_u64, 16_u64])
+            .with_tensor_shape("blk.0.attn_norm.weight", [16_u64])
+            .with_tensor_shape("blk.0.attn_q.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.0.attn_k.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.0.attn_v.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.0.attn_output.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.0.attn_q_norm.weight", [8_u64])
+            .with_tensor_shape("blk.0.attn_k_norm.weight", [8_u64])
+            .with_tensor_shape("blk.0.ffn_norm.weight", [16_u64])
+            .with_tensor_shape("blk.0.ffn_gate.weight", [32_u64, 16_u64])
+            .with_tensor_shape("blk.0.ffn_up.weight", [32_u64, 16_u64])
+            .with_tensor_shape("blk.0.ffn_down.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.1.attn_norm.weight", [16_u64])
+            .with_tensor_shape("blk.1.attn_q.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.1.attn_k.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.1.attn_v.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.1.attn_output.weight", [16_u64, 16_u64])
+            .with_tensor_shape("blk.1.attn_q_norm.weight", [8_u64])
+            .with_tensor_shape("blk.1.attn_k_norm.weight", [8_u64])
+            .with_tensor_shape("blk.1.ffn_norm.weight", [16_u64])
+            .with_tensor_shape("blk.1.ffn_gate.weight", [32_u64, 16_u64])
+            .with_tensor_shape("blk.1.ffn_up.weight", [32_u64, 16_u64])
+            .with_tensor_shape("blk.1.ffn_down.weight", [16_u64, 32_u64])
+            .with_tensor_shape("token_embd.weight", [16_u64, 32_u64])
+            .with_tensor_shape("output.weight", [16_u64, 32_u64])
+            .with_tensor_shape("output_norm.weight", [16_u64]);
         let fixture_spec =
             add_qwen_audio_layer_shapes(add_qwen_audio_layer_shapes(fixture_spec, 0), 1);
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).unwrap();
@@ -4184,13 +4128,20 @@ mod tests {
         let request = TranscriptionRequest::new(sample_wav_fixture_path(), "qwen3-asr-0.6b-q4_k")
             .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
-        assert!(error.contains("qwen3-asr-ggml-executor-v1"), "{error}");
-        assert!(error.contains("qwen3-asr audio encoder"), "{error}");
+        assert!(
+            error.contains("runtime pack verification failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("qwen3-asr missing required GGUF tensor"),
+            "{error}"
+        );
         assert!(error.contains("audio.conv.1.weight"), "{error}");
+        assert!(!error.contains("qwen3-asr.ggml-executor.v1"), "{error}");
     }
 
     #[test]
-    fn native_backend_synthesizes_oasr_selection_keys_from_cohere_general_architecture() {
+    fn native_backend_routes_a_complete_cohere_pack_to_its_executor() {
         with_forced_cpu_backend_for_test(|| {
             let temp = tempfile::tempdir().unwrap();
             let runtime_path = temp.path().join("cohere-transcribe-q4_k.gguf");
@@ -4215,7 +4166,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_selects_whisper_executor_and_fails_on_missing_tensor_anchor() {
+    fn native_backend_rejects_whisper_pack_missing_tensor_anchor_before_execution() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-runtime.gguf");
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_missing_tensor(
@@ -4233,16 +4184,20 @@ mod tests {
         .with_model_pack_path(Some(runtime_path));
         let error = backend.transcribe(request).unwrap_err().to_string();
 
-        assert!(error.contains("whisper-ggml-executor-v1"), "{error}");
         assert!(
-            error.contains("whisper ggml executor missing required GGUF tensor"),
+            error.contains("runtime pack verification failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("missing required whisper gguf tensor slot"),
             "{error}"
         );
         assert!(error.contains("model.encoder.conv1.weight"), "{error}");
+        assert!(!error.contains("whisper-ggml-executor-v1"), "{error}");
     }
 
     #[test]
-    fn native_backend_whisper_encoder_graph_fixture_fails_closed_at_tokenizer_preflight() {
+    fn native_backend_rejects_whisper_pack_missing_tokenizer_before_execution() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-encoder-graph.gguf");
         let wav_path = temp.path().join("whisper-short.wav");
@@ -4257,7 +4212,7 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
-            error.contains("model family 'whisper' exact prompt token count is unavailable"),
+            error.contains("runtime pack verification failed"),
             "{error}"
         );
         assert!(
@@ -4273,7 +4228,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_whisper_executor_fails_closed_when_whisper_gguf_metadata_is_incomplete() {
+    fn native_backend_rejects_whisper_pack_with_incomplete_runtime_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-metadata-incomplete.gguf");
         let mut fixture_spec =
@@ -4291,7 +4246,11 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
-            error.contains("model family 'whisper' decoder-state metadata is unavailable"),
+            error.contains("runtime pack verification failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("whisper runtime metadata contract validation failed"),
             "{error}"
         );
         assert!(error.contains("whisper.encoder.block_count"), "{error}");
@@ -4324,7 +4283,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_whisper_executor_detects_layer_tensor_mismatch_from_fixture_metadata() {
+    fn native_backend_rejects_whisper_pack_with_layer_tensor_mismatch() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-layer-mismatch.gguf");
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_layer_count_mismatch(
@@ -4344,14 +4303,18 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
-            error.contains("whisper ggml executor missing required GGUF tensor"),
+            error.contains("runtime pack verification failed"),
             "{error}"
         );
-        assert!(error.contains("model.encoder.layers.1."), "{error}");
+        assert!(
+            error.contains("missing required whisper gguf tensor slot"),
+            "{error}"
+        );
+        assert!(error.contains("encoder.layers.1."), "{error}");
     }
 
     #[test]
-    fn native_backend_whisper_executor_detects_required_tensor_shape_mismatch() {
+    fn native_backend_rejects_whisper_pack_with_required_tensor_shape_mismatch() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("whisper-shape-mismatch.gguf");
         let fixture_spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_shape_mismatch(
@@ -4371,12 +4334,14 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(
-            error.contains(
-                "whisper ggml executor tensor 'model.encoder.conv2.bias' failed binding validation"
-            ),
+            error.contains("runtime pack verification failed"),
             "{error}"
         );
-        assert!(error.contains("shape=[2]"), "{error}");
+        assert!(
+            error.contains("whisper gguf tensor slot 'encoder.conv2.bias'"),
+            "{error}"
+        );
+        assert!(error.contains("invalid shape [2]"), "{error}");
     }
 
     #[test]

@@ -1,12 +1,16 @@
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
 
+#[cfg(test)]
+use super::validate_ggml_runtime_source_path;
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufCParserSandboxError, GgufMetadata,
     GgufTensorDataReadError, GgufTensorDataReader, GgufTensorIndex,
-    load_gguf_metadata_and_tensor_index_with_c_parser_sandbox, validate_ggml_runtime_source_path,
+    load_gguf_metadata_and_tensor_index_with_c_parser_sandbox,
 };
 
 /// One immutable GGUF generation parsed exactly once before admission.
@@ -23,14 +27,6 @@ pub struct GgufRuntimeSourcePreflight {
 }
 
 impl GgufRuntimeSourcePreflight {
-    /// Opens and bounded-parses one runtime source generation for reuse by
-    /// validation, admission, and materialization.
-    pub fn from_path(
-        path: impl AsRef<Path>,
-    ) -> Result<Self, RuntimeSourceMetadataAndTensorIndexPreflightError> {
-        load_runtime_source_metadata_and_tensor_index(path.as_ref())
-    }
-
     /// Bounded-parses the exact mapping already held by `runtime_source`.
     pub fn from_runtime_source(
         runtime_source: &GgmlRuntimeSource,
@@ -48,6 +44,14 @@ impl GgufRuntimeSourcePreflight {
 
     pub fn tensor_index(&self) -> &GgufTensorIndex {
         &self.tensor_index
+    }
+
+    /// Rebinds diagnostics to a new hard-link/installed name without
+    /// reopening or reparsing the exact mapping represented by this proof.
+    pub(crate) fn with_display_path(mut self, path: PathBuf) -> Self {
+        self.runtime_source = self.runtime_source.with_display_path(path.clone());
+        Arc::make_mut(&mut self.tensor_index).set_display_path(path);
+        self
     }
 
     /// Copy this exact admitted generation into anonymous immutable storage
@@ -93,6 +97,7 @@ pub(crate) enum RuntimeSourceTensorReaderError {
     },
 }
 
+#[cfg(test)]
 pub(crate) fn load_runtime_source_metadata_and_tensor_index(
     runtime_source_path: &Path,
 ) -> Result<GgufRuntimeSourcePreflight, RuntimeSourceMetadataAndTensorIndexPreflightError> {

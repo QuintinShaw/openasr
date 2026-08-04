@@ -305,7 +305,7 @@ pub(crate) fn validate_legacy_record(pack: &InstalledPack, quant_dir: &Path) -> 
     if metadata.len() != pack.size_bytes {
         return Err("legacy pack size does not match record".to_string());
     }
-    crate::validate_native_runtime_model_pack_contract(&pack.path)
+    crate::verify_native_runtime_model_pack_path(&pack.path)
         .map_err(|error| format!("legacy pack fails runtime validation: {error}"))?;
     Ok(())
 }

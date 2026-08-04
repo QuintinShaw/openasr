@@ -9,7 +9,8 @@ use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
 use crate::QWEN3_ASR_GGML_ARCHITECTURE_ID;
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+use crate::arch::OpenAsrPreparedRuntimeStrategy;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::runtime_component_bootstrap::{
     BuiltinRuntimeComponentBootstrap, BuiltinRuntimeComponentBootstrapError,
     BuiltinTokenizerMaterializationMode, build_builtin_runtime_component_bootstrap,
@@ -207,7 +208,7 @@ pub(crate) enum Qwen3AsrPreparedRuntimeError {
 }
 
 pub(crate) fn build_qwen_prepared_runtime(
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError> {
     let components = build_builtin_runtime_component_bootstrap(
@@ -238,7 +239,7 @@ pub(crate) fn build_qwen_prepared_runtime_from_components(
         .expect("qwen component bootstrap must return qwen frontend plan");
     let (audio_encoder_weights, token_embedding_table, logits_head, decoder_plan) =
         materialize_builtin_runtime_weight_components(
-            QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1,
             &tensor_reader,
             runtime_source,
             runtime_metadata,

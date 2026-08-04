@@ -745,7 +745,6 @@ pub struct NativeExecutionServices {
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
             crate::diarize::embed::RedimNetResidentRuntime,
         >,
-    stateful_executors: BuiltinStatefulExecutorScope,
     dispatches: NativeExecutionDispatches,
 }
 
@@ -764,7 +763,12 @@ impl NativeExecutionServices {
         policy_resolver: Arc<dyn ExecutionPolicyResolver>,
         memory_broker: Arc<DeviceMemoryBrokerSet>,
     ) -> Result<Self, NativeExecutionServicesError> {
-        let executor_scope = BuiltinStatefulExecutorScope::new();
+        let executor_scope = BuiltinStatefulExecutorScope::new().map_err(|error| {
+            NativeExecutionServicesError::DispatchBuild {
+                dispatch_kind: "executor-scope",
+                reason: error.to_string(),
+            }
+        })?;
         let offline = build_builtin_ggml_execution_dispatch(&executor_scope).map_err(|error| {
             NativeExecutionServicesError::DispatchBuild {
                 dispatch_kind: "offline",
@@ -818,7 +822,6 @@ impl NativeExecutionServices {
                         crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
                     ),
                 ),
-            stateful_executors: executor_scope,
             dispatches: NativeExecutionDispatches { offline, streaming },
         })
     }
@@ -901,38 +904,8 @@ impl NativeExecutionServices {
     /// caches. Pull/install callers must pass the service root explicitly.
     pub fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
         let _execution_scope = install_native_execution_services(self);
-        self.stateful_executors
-            .whisper()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .moonshine()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .cohere_transcribe()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .qwen3_asr()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .firered_aed()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .firered_llm()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .funasr_nano()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .moss_td()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .granite_speech()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .mimo_asr()
-            .evict_prepared_runtime_content_id(pack_content_id);
-        self.stateful_executors
-            .dolphin()
+        self.dispatches
+            .offline
             .evict_prepared_runtime_content_id(pack_content_id);
         self.auxiliary_runtime_owners
             .evict_content_id(pack_content_id);

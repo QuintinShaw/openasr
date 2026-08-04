@@ -63,7 +63,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::FunasrNanoTokenizer;
 
-const FUNASR_NANO_EXECUTOR_ID: &str = "funasr-nano-ggml-executor-v1";
+const FUNASR_NANO_EXECUTOR_ID: &str = crate::arch::FUNASR_NANO_EXECUTOR_COMPONENT_ID;
 const FUNASR_NANO_STREAMING_EXECUTOR_ID: &str = "funasr-nano-ggml-snapshot-streaming-executor-v1";
 /// Upstream single-utterance hard cap (the official runtime warns that a single
 /// clip beyond ~40s greedily repeats out of distribution; `--chunk 15` fixes
@@ -135,8 +135,6 @@ enum FunasrNanoExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("funasr-nano executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("funasr-nano runtime metadata contract failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("funasr-nano tokenizer materialization failed: {reason}")]
@@ -307,7 +305,7 @@ impl FunasrNanoGgmlExecutor {
 
     fn checkout_encoder_adapter_runtime(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
         adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
         backend: GgmlCpuGraphBackend,
@@ -349,7 +347,7 @@ impl FunasrNanoGgmlExecutor {
 
     fn encode_with_owned_encoder_adapter_runtime(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
         adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
         encoder_input: crate::models::sensevoice::encoder_graph::SenseVoiceEncoderInput,
@@ -413,7 +411,7 @@ impl FunasrNanoGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: GgmlCpuGraphBackend,
@@ -522,11 +520,7 @@ impl FunasrNanoGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| FunasrNanoExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
 
         let encoder_metadata =
             parse_funasr_nano_encoder_metadata(&*preflight.metadata).map_err(|error| {
@@ -595,7 +589,7 @@ impl FunasrNanoGgmlExecutor {
 
         let backend = request.resolved_runtime.backend();
         let (speech_rows, audio_token_count) = self.encode_with_owned_encoder_adapter_runtime(
-            &preflight,
+            preflight,
             encoder_metadata,
             adapter_metadata,
             encoder_input,
@@ -624,7 +618,7 @@ impl FunasrNanoGgmlExecutor {
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FunasrNanoExecutorError::DecoderStateCapacity { source })?;
         let decoder_actor =
-            self.checkout_decoder_runtime(&preflight, decoder_metadata, kv_capacity, backend)?;
+            self.checkout_decoder_runtime(preflight, decoder_metadata, kv_capacity, backend)?;
         let decoder_control = Arc::clone(&request.execution_context.control);
         let result = decoder_actor
             .call_mut(move |state| {
@@ -754,6 +748,10 @@ fn map_registry_error(
 }
 
 impl GgmlAsrViewExecutor for FunasrNanoGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        FunasrNanoGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         FUNASR_NANO_EXECUTOR_ID
     }

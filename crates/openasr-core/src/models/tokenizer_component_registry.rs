@@ -63,7 +63,7 @@ pub(crate) fn materialize_builtin_tokenizer_for_architecture(
                 model_architecture: model_architecture.to_string(),
             },
         )?;
-    materialize_builtin_tokenizer(descriptor.tokenizer_id, metadata)
+    materialize_builtin_tokenizer(descriptor.pack_contract.tokenizer_id, metadata)
 }
 
 pub(crate) fn materialize_builtin_tokenizer(

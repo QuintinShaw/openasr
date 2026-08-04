@@ -81,7 +81,7 @@ fn new_parakeet_tdt_runtime_pool() -> Arc<ParakeetTdtRuntimePool> {
 
 fn checkout_parakeet_tdt_prepared_runtime(
     pool: &ParakeetTdtRuntimePool,
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetTdtRuntimeActor, String> {
     let backend = crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config(
@@ -121,13 +121,9 @@ fn checkout_parakeet_tdt_prepared_runtime(
                 let encoder_weights = load_parakeet_tdt_encoder_weights(&reader, &metadata)
                     .map_err(|error| error.to_string())?;
                 let encoder_weights_bytes = encoder_weights.retained_system_memory_bytes()?;
-                let graph = ParakeetTdtEncoderGraph::new(
-                    &encoder_weights,
-                    metadata,
-                    Some(&preflight),
-                    backend,
-                )
-                .map_err(|error| error.to_string())?;
+                let graph =
+                    ParakeetTdtEncoderGraph::new(&encoder_weights, metadata, &preflight, backend)
+                        .map_err(|error| error.to_string())?;
                 let graph_bytes = graph.retained_system_memory_bytes()?;
                 drop(encoder_weights);
 
@@ -267,6 +263,7 @@ impl ParakeetTdtPreparedRuntime {
         &mut self,
         samples: &[f32],
         word_timestamps: bool,
+        is_canceled: &dyn Fn() -> bool,
     ) -> Result<ParakeetTdtTranscription, String> {
         let frontend = ParakeetFrontend::with_n_mels(self.metadata.n_mels);
         let features = frontend
@@ -292,6 +289,7 @@ impl ParakeetTdtPreparedRuntime {
             &self.metadata,
             &self.predictor,
             &self.joint,
+            is_canceled,
         )?;
         let token_ids: Vec<u32> = emitted.iter().map(|token| token.token_id).collect();
         let text = self.tokenizer.decode(&token_ids)?;
@@ -316,14 +314,17 @@ impl ParakeetTdtPreparedRuntime {
 fn transcribe_parakeet_tdt_pcm_cached(
     runtime_pool: &ParakeetTdtRuntimePool,
     samples: &[f32],
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
+    control: Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<ParakeetTdtTranscription, String> {
     let actor = checkout_parakeet_tdt_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
     actor
-        .call_mut(move |runtime| runtime.transcribe(&samples, word_timestamps))
+        .call_mut(move |runtime| {
+            runtime.transcribe(&samples, word_timestamps, &|| control.is_canceled())
+        })
         .map_err(|error| error.to_string())?
 }
 
@@ -349,7 +350,18 @@ impl Default for ParakeetTdtGgmlExecutor {
     }
 }
 
+impl ParakeetTdtGgmlExecutor {
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_pool
+            .evict_where(|(key, _lane)| key.pack_content_id == pack_content_id);
+    }
+}
+
 impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        ParakeetTdtGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         crate::arch::PARAKEET_TDT_EXECUTOR_COMPONENT_ID
     }
@@ -382,19 +394,17 @@ impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        // Fail-closed: validate the runtime source path before touching the
-        // pack (Gate-0 preflight), then run the cached prepared-runtime path
-        // against that same already-open source -- not a fresh reopen by
-        // path, which would race this preflight's own open.
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        // Fail-closed: consume the already-admitted Gate-0 proof, then run the
+        // cached prepared-runtime path against that same open source -- never
+        // reopen or reparse a path inside the executor.
+        let preflight = &request.runtime_source_preflight;
         let output = transcribe_parakeet_tdt_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight,
+            preflight,
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
+            Arc::clone(&request.execution_context.control),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -510,6 +520,7 @@ mod tests {
             &preflight,
             true,
             GgmlCpuGraphBackend::Cpu,
+            Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("transcribe");
         eprintln!("parakeet-tdt hypothesis: {:?}", output.text);

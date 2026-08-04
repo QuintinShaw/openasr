@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Catalog reader for the OpenASR publishing harness.
 
-Single source of truth = tooling/publish-model/models-core.toml plus
-tooling/publish-model/models-publish.toml. Bash scripts shell out to this for
-field lookups and quant-token mapping so the catalog is parsed in one place
-(Python 3.11+ stdlib tomllib) rather than re-implemented in fragile shell.
+Catalog authoring source = tooling/publish-model/models-core.toml plus
+tooling/publish-model/models-publish.toml. Runtime family capabilities are
+read from the generated tooling/model-family-inventory.v1.json; this module
+strictly validates that inventory before exposing any capability projection.
+Bash scripts shell out to this for field lookups and quant-token mapping so the
+catalog is parsed in one place (Python 3.11+ stdlib tomllib) rather than
+re-implemented in fragile shell.
 
 Usage:
   _catalog.py field   <model> <key>     # print one catalog value (lists -> space-joined)
@@ -41,6 +44,8 @@ CARDS_DIR = REPO_ROOT / "tooling" / "publish-model" / "cards"
 CATALOG = CATALOG_CORE
 CATALOG_URL = "https://catalog.openasr.org/v1/catalog.json"
 CATALOG_SCHEMA_VERSION = 1
+MODEL_FAMILY_INVENTORY = REPO_ROOT / "tooling" / "model-family-inventory.v1.json"
+MODEL_FAMILY_INVENTORY_SCHEMA = "openasr.model-family-inventory.v1"
 DEFAULT_MIN_CLI_VERSION = "0.1.0"
 REGISTRY_CARD_DEFAULTS = {
     "default_variant": "published",
@@ -54,7 +59,466 @@ SUPPORTED_CAPABILITY_ROLES = {
     "punctuation-restorer",
 }
 GIT_REVISION_RE = re.compile(r"[0-9a-fA-F]{40}")
+MODULE_SLUG_RE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 TRANSLATION_REQUIRED_LICENSE_FILES = {"LICENSE.txt", "NOTICE.openasr.txt"}
+
+
+_INVENTORY_TOP_LEVEL_KEYS = {"schema", "families"}
+_INVENTORY_FAMILY_KEYS = {
+    "catalog_family_id",
+    "model_family",
+    "model_architecture",
+    "runtime_architecture_aliases",
+    "adapter_id",
+    "module_slug",
+    "language",
+    "pack",
+    "execution",
+    "topology",
+    "optimization",
+    "quantization",
+    "conformance",
+}
+_INVENTORY_LANGUAGE_KEYS = {
+    "policy",
+    "default_language",
+    "reject_reason",
+    "languages",
+    "dialect_mode",
+    "selectable_dialect_codes",
+}
+_INVENTORY_PACK_KEYS = {
+    "audio_frontend_id",
+    "decode_policy_id",
+    "runtime_tensor_contract_id",
+    "tokenizer_id",
+    "hparam_schema",
+    "importer",
+}
+_INVENTORY_IMPORTER_KEYS = {"kind", "symbol", "relative_path"}
+_INVENTORY_EXECUTION_KEYS = {
+    "executor_component_id",
+    "executor",
+    "execution_capabilities",
+    "streaming_partial_granularity",
+    "speaker_segmentation",
+    "emits_punctuation",
+    "supports_phrase_bias",
+    "phrase_bias_strategy",
+    "phrase_bias_required_tensor",
+    "supports_translation_task",
+    "supports_source_language_hint",
+    "supports_lora_adapter",
+    "prepared_runtime",
+    "word_timestamp_strategy",
+    "invocation_span",
+}
+_INVENTORY_EXECUTION_CAPABILITIES_KEYS = {"cpu", "providers"}
+_INVENTORY_PROVIDER_KEYS = {"provider", "full_device", "hybrid"}
+_INVENTORY_INVOCATION_KEYS = {"policy", "max_seconds"}
+_INVENTORY_TOPOLOGY_KEYS = {
+    "decode_driver",
+    "decode_driver_reason",
+    "block_stack",
+    "block_stack_reason",
+    "decoder_state",
+}
+_INVENTORY_OPTIMIZATION_KEYS = {
+    "prefer_cpu_decoder_for_multichunk_metal",
+    "auto_gpu_policy",
+    "encoder_attention_span",
+    "encoder_attention_max_safe_chunk_seconds",
+    "ownership",
+    "prepared_runtime_eviction",
+    "graph_reuse",
+}
+_INVENTORY_QUANTIZATION_KEYS = {"tensor_classification", "quantized_axis"}
+_INVENTORY_TENSOR_CLASSIFICATIONS = {
+    "acoustic-encoder-prefixes-v1",
+    "semantic-roles-v1",
+}
+_INVENTORY_QUANTIZED_AXES = {"first", "last"}
+_INVENTORY_CONFORMANCE_KEYS = {"profile_id", "reference_dumper_source"}
+_INVENTORY_PHRASE_BIAS_STRATEGIES = {"unsupported", "always", "requires-tensor"}
+_INVENTORY_WORD_TIMESTAMP_STRATEGIES = {"decode-invariant", "decode-sensitive"}
+_INVENTORY_PREPARED_RUNTIME_SHARED_RE = re.compile(r"shared-[a-z0-9-]+-v[1-9][0-9]*")
+_INVENTORY_LANGUAGE_POLICIES = {
+    "selects-via-prompt",
+    "fixed-monolingual",
+    "fixed-multilingual",
+    "self-detects-rejects-hint",
+    "detect-and-selects-via-prompt",
+    "whisper-vocab-gated",
+}
+_INVENTORY_DIALECT_MODES = {
+    "not-advertised",
+    "recognizes-catalog-declared",
+    "selects-via-prompt",
+}
+_LANGUAGE_POLICY_TO_WIRE_MODE = {
+    "selects-via-prompt": "specify_only",
+    "fixed-monolingual": "fixed_monolingual",
+    "fixed-multilingual": "fixed_multilingual",
+    "self-detects-rejects-hint": "detect_implicit",
+    "detect-and-selects-via-prompt": "detect_and_specify",
+}
+
+
+def _inventory_error(path: str, message: str) -> ValueError:
+    return ValueError(f"model family inventory {path}: {message}")
+
+
+def _inventory_object(value: object, path: str) -> dict:
+    if not isinstance(value, dict):
+        raise _inventory_error(path, f"must be an object, got {type(value).__name__}")
+    return value
+
+
+def _inventory_exact_keys(value: dict, expected: set[str], path: str) -> None:
+    actual = set(value)
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing or unknown:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown {', '.join(unknown)}")
+        raise _inventory_error(path, "; ".join(details))
+
+
+def _inventory_string(value: object, path: str, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise _inventory_error(path, "must be a non-empty string")
+
+
+def _inventory_nullable_string(value: object, path: str) -> None:
+    if value is not None:
+        _inventory_string(value, path)
+
+
+def _inventory_string_list(value: object, path: str, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, list) or (not allow_empty and not value):
+        expected = "a string list" if allow_empty else "a non-empty string list"
+        raise _inventory_error(path, f"must be {expected}")
+    for index, item in enumerate(value):
+        _inventory_string(item, f"{path}[{index}]")
+
+
+def _inventory_base_language_list(value: object, path: str) -> None:
+    """Validate the canonical Rust-projected ISO 639 base-language list."""
+    _inventory_string_list(value, path)
+    assert isinstance(value, list)
+    if value != sorted(set(value)):
+        raise _inventory_error(path, "must be sorted and unique")
+    for index, code in enumerate(value):
+        if re.fullmatch(r"[a-z]{2,3}", code) is None:
+            raise _inventory_error(
+                f"{path}[{index}]",
+                "must be a lowercase ISO 639 base code (2-3 letters)",
+            )
+
+
+def _inventory_nullable_number(value: object, path: str, *, positive: bool = False) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _inventory_error(path, "must be a number or null")
+    if positive and value <= 0:
+        raise _inventory_error(path, "must be greater than zero")
+
+
+def _validate_model_family_inventory(payload: object) -> None:
+    root = _inventory_object(payload, "root")
+    _inventory_exact_keys(root, _INVENTORY_TOP_LEVEL_KEYS, "root")
+    if root["schema"] != MODEL_FAMILY_INVENTORY_SCHEMA:
+        raise _inventory_error(
+            "schema",
+            f"must be {MODEL_FAMILY_INVENTORY_SCHEMA!r}, got {root['schema']!r}",
+        )
+    families = root["families"]
+    if not isinstance(families, list) or not families:
+        raise _inventory_error("families", "must be a non-empty list")
+
+    seen_catalog_family_ids: set[str] = set()
+    seen_module_slugs: set[str] = set()
+    for index, raw_family in enumerate(families):
+        path = f"families[{index}]"
+        family = _inventory_object(raw_family, path)
+        _inventory_exact_keys(family, _INVENTORY_FAMILY_KEYS, path)
+        for field in (
+            "catalog_family_id",
+            "model_family",
+            "model_architecture",
+            "adapter_id",
+            "module_slug",
+        ):
+            _inventory_string(family[field], f"{path}.{field}")
+        catalog_family_id = family["catalog_family_id"]
+        if catalog_family_id in seen_catalog_family_ids:
+            raise _inventory_error(
+                f"{path}.catalog_family_id",
+                f"duplicate catalog_family_id {catalog_family_id!r}",
+            )
+        seen_catalog_family_ids.add(catalog_family_id)
+        module_slug = family["module_slug"]
+        if MODULE_SLUG_RE.fullmatch(module_slug) is None:
+            raise _inventory_error(
+                f"{path}.module_slug",
+                "must be a non-empty snake_case identifier",
+            )
+        if module_slug in seen_module_slugs:
+            raise _inventory_error(
+                f"{path}.module_slug",
+                f"duplicate module_slug {module_slug!r}",
+            )
+        seen_module_slugs.add(module_slug)
+        _inventory_string_list(
+            family["runtime_architecture_aliases"],
+            f"{path}.runtime_architecture_aliases",
+        )
+
+        language = _inventory_object(family["language"], f"{path}.language")
+        _inventory_exact_keys(language, _INVENTORY_LANGUAGE_KEYS, f"{path}.language")
+        policy = language["policy"]
+        if policy not in _INVENTORY_LANGUAGE_POLICIES:
+            raise _inventory_error(f"{path}.language.policy", f"unsupported policy {policy!r}")
+        _inventory_nullable_string(language["default_language"], f"{path}.language.default_language")
+        _inventory_nullable_string(language["reject_reason"], f"{path}.language.reject_reason")
+        _inventory_base_language_list(
+            family["language"]["languages"], f"{path}.language.languages"
+        )
+        dialect_mode = language["dialect_mode"]
+        if dialect_mode not in _INVENTORY_DIALECT_MODES:
+            raise _inventory_error(
+                f"{path}.language.dialect_mode",
+                f"unsupported dialect mode {dialect_mode!r}",
+            )
+        selectable_dialect_codes = language["selectable_dialect_codes"]
+        _inventory_string_list(
+            selectable_dialect_codes,
+            f"{path}.language.selectable_dialect_codes",
+            allow_empty=True,
+        )
+        if selectable_dialect_codes != sorted(set(selectable_dialect_codes)):
+            raise _inventory_error(
+                f"{path}.language.selectable_dialect_codes",
+                "must be sorted and unique",
+            )
+        if dialect_mode == "selects-via-prompt" and not selectable_dialect_codes:
+            raise _inventory_error(
+                f"{path}.language.selectable_dialect_codes",
+                "must be non-empty for selects-via-prompt",
+            )
+        if dialect_mode != "selects-via-prompt" and selectable_dialect_codes:
+            raise _inventory_error(
+                f"{path}.language.selectable_dialect_codes",
+                f"must be empty for {dialect_mode}",
+            )
+        default_language = language["default_language"]
+        reject_reason = language["reject_reason"]
+        languages = language["languages"]
+        if policy in {"selects-via-prompt", "fixed-monolingual"} and default_language is None:
+            raise _inventory_error(f"{path}.language.default_language", f"required for {policy}")
+        if policy in {"fixed-multilingual", "self-detects-rejects-hint", "detect-and-selects-via-prompt", "whisper-vocab-gated"} and default_language is not None:
+            raise _inventory_error(f"{path}.language.default_language", f"must be null for {policy}")
+        if policy == "self-detects-rejects-hint" and not reject_reason:
+            raise _inventory_error(f"{path}.language.reject_reason", "required for self-detects-rejects-hint")
+        if policy != "self-detects-rejects-hint" and reject_reason is not None:
+            raise _inventory_error(f"{path}.language.reject_reason", f"must be null for {policy}")
+        if policy == "fixed-monolingual" and len(languages) != 1:
+            raise _inventory_error(f"{path}.language.languages", "fixed-monolingual requires one language")
+        if policy == "fixed-multilingual" and not languages:
+            raise _inventory_error(f"{path}.language.languages", "fixed-multilingual requires languages")
+        if default_language is not None and default_language not in languages:
+            raise _inventory_error(
+                f"{path}.language.default_language",
+                f"must be present in languages for {policy}",
+            )
+
+        pack = _inventory_object(family["pack"], f"{path}.pack")
+        _inventory_exact_keys(pack, _INVENTORY_PACK_KEYS, f"{path}.pack")
+        for field in ("audio_frontend_id", "decode_policy_id", "runtime_tensor_contract_id", "tokenizer_id"):
+            _inventory_string(pack[field], f"{path}.pack.{field}")
+        _inventory_string_list(pack["hparam_schema"], f"{path}.pack.hparam_schema", allow_empty=True)
+        importer = _inventory_object(pack["importer"], f"{path}.pack.importer")
+        _inventory_exact_keys(importer, _INVENTORY_IMPORTER_KEYS, f"{path}.pack.importer")
+        importer_kind = importer["kind"]
+        if importer_kind == "core-convert":
+            _inventory_string(importer["symbol"], f"{path}.pack.importer.symbol")
+            if importer["relative_path"] is not None:
+                raise _inventory_error(f"{path}.pack.importer.relative_path", "must be null for core-convert")
+        elif importer_kind == "external-tooling":
+            if importer["symbol"] is not None:
+                raise _inventory_error(f"{path}.pack.importer.symbol", "must be null for external-tooling")
+            _inventory_string(importer["relative_path"], f"{path}.pack.importer.relative_path")
+        else:
+            raise _inventory_error(f"{path}.pack.importer.kind", f"unsupported kind {importer_kind!r}")
+
+        execution = _inventory_object(family["execution"], f"{path}.execution")
+        _inventory_exact_keys(execution, _INVENTORY_EXECUTION_KEYS, f"{path}.execution")
+        for field in ("executor_component_id", "executor", "streaming_partial_granularity"):
+            _inventory_string(execution[field], f"{path}.execution.{field}")
+        execution_capabilities = _inventory_object(
+            execution["execution_capabilities"], f"{path}.execution.execution_capabilities"
+        )
+        _inventory_exact_keys(
+            execution_capabilities,
+            _INVENTORY_EXECUTION_CAPABILITIES_KEYS,
+            f"{path}.execution.execution_capabilities",
+        )
+        if not isinstance(execution_capabilities["cpu"], bool):
+            raise _inventory_error(f"{path}.execution.execution_capabilities.cpu", "must be boolean")
+        providers = execution_capabilities["providers"]
+        if not isinstance(providers, list) or not providers:
+            raise _inventory_error(
+                f"{path}.execution.execution_capabilities.providers",
+                "must be a non-empty list",
+            )
+        seen_providers: set[str] = set()
+        for provider_index, raw_provider in enumerate(providers):
+            provider_path = f"{path}.execution.execution_capabilities.providers[{provider_index}]"
+            provider = _inventory_object(raw_provider, provider_path)
+            _inventory_exact_keys(provider, _INVENTORY_PROVIDER_KEYS, provider_path)
+            _inventory_string(provider["provider"], f"{provider_path}.provider")
+            if provider["provider"] in seen_providers:
+                raise _inventory_error(f"{provider_path}.provider", "duplicate provider")
+            seen_providers.add(provider["provider"])
+            for field in ("full_device", "hybrid"):
+                if not isinstance(provider[field], bool):
+                    raise _inventory_error(f"{provider_path}.{field}", "must be boolean")
+        if execution["speaker_segmentation"] not in {"external", "in-decoder"}:
+            raise _inventory_error(f"{path}.execution.speaker_segmentation", "must be external or in-decoder")
+        if execution["emits_punctuation"] is not None and not isinstance(execution["emits_punctuation"], bool):
+            raise _inventory_error(f"{path}.execution.emits_punctuation", "must be boolean or null")
+        for field in (
+            "supports_phrase_bias",
+            "supports_translation_task",
+            "supports_source_language_hint",
+            "supports_lora_adapter",
+        ):
+            if not isinstance(execution[field], bool):
+                raise _inventory_error(f"{path}.execution.{field}", "must be boolean")
+        phrase_bias_strategy = execution["phrase_bias_strategy"]
+        _inventory_string(phrase_bias_strategy, f"{path}.execution.phrase_bias_strategy")
+        if phrase_bias_strategy not in _INVENTORY_PHRASE_BIAS_STRATEGIES:
+            raise _inventory_error(
+                f"{path}.execution.phrase_bias_strategy",
+                f"unsupported strategy {phrase_bias_strategy!r}; expected unsupported, always, or requires-tensor",
+            )
+        if execution["supports_phrase_bias"] != (phrase_bias_strategy != "unsupported"):
+            raise _inventory_error(
+                f"{path}.execution.supports_phrase_bias",
+                "must be equivalent to phrase_bias_strategy != 'unsupported'",
+            )
+        phrase_bias_required_tensor = execution["phrase_bias_required_tensor"]
+        if phrase_bias_strategy == "requires-tensor":
+            _inventory_string(
+                phrase_bias_required_tensor,
+                f"{path}.execution.phrase_bias_required_tensor",
+            )
+        elif phrase_bias_required_tensor is not None:
+            raise _inventory_error(
+                f"{path}.execution.phrase_bias_required_tensor",
+                "must be null unless phrase_bias_strategy is 'requires-tensor'",
+            )
+        word_timestamp_strategy = execution["word_timestamp_strategy"]
+        _inventory_string(word_timestamp_strategy, f"{path}.execution.word_timestamp_strategy")
+        if word_timestamp_strategy not in _INVENTORY_WORD_TIMESTAMP_STRATEGIES:
+            raise _inventory_error(
+                f"{path}.execution.word_timestamp_strategy",
+                f"unsupported strategy {word_timestamp_strategy!r}; expected decode-invariant or decode-sensitive",
+            )
+        prepared_runtime = execution["prepared_runtime"]
+        _inventory_string(prepared_runtime, f"{path}.execution.prepared_runtime")
+        if prepared_runtime != "family-owned" and _INVENTORY_PREPARED_RUNTIME_SHARED_RE.fullmatch(prepared_runtime) is None:
+            raise _inventory_error(
+                f"{path}.execution.prepared_runtime",
+                "must be family-owned or match shared-[a-z0-9-]+-v[1-9][0-9]*",
+            )
+        invocation_span = _inventory_object(execution["invocation_span"], f"{path}.execution.invocation_span")
+        _inventory_exact_keys(invocation_span, _INVENTORY_INVOCATION_KEYS, f"{path}.execution.invocation_span")
+        if invocation_span["policy"] not in {"elastic", "bounded"}:
+            raise _inventory_error(f"{path}.execution.invocation_span.policy", "must be elastic or bounded")
+        _inventory_nullable_number(invocation_span["max_seconds"], f"{path}.execution.invocation_span.max_seconds", positive=True)
+        if invocation_span["policy"] == "elastic" and invocation_span["max_seconds"] is not None:
+            raise _inventory_error(f"{path}.execution.invocation_span.max_seconds", "must be null for elastic")
+        if invocation_span["policy"] == "bounded" and invocation_span["max_seconds"] is None:
+            raise _inventory_error(f"{path}.execution.invocation_span.max_seconds", "required for bounded")
+
+        topology = _inventory_object(family["topology"], f"{path}.topology")
+        _inventory_exact_keys(topology, _INVENTORY_TOPOLOGY_KEYS, f"{path}.topology")
+        for field in ("decode_driver", "block_stack", "decoder_state"):
+            _inventory_string(topology[field], f"{path}.topology.{field}")
+        for field in ("decode_driver_reason", "block_stack_reason"):
+            _inventory_nullable_string(topology[field], f"{path}.topology.{field}")
+        if topology["decode_driver"] == "dedicated" and not topology["decode_driver_reason"]:
+            raise _inventory_error(f"{path}.topology.decode_driver_reason", "required for dedicated")
+        if topology["decode_driver"] != "dedicated" and topology["decode_driver_reason"] is not None:
+            raise _inventory_error(f"{path}.topology.decode_driver_reason", "must be null for shared driver")
+        if topology["block_stack"] == "architecture-graph" and not topology["block_stack_reason"]:
+            raise _inventory_error(f"{path}.topology.block_stack_reason", "required for architecture-graph")
+        if topology["block_stack"] != "architecture-graph" and topology["block_stack_reason"] is not None:
+            raise _inventory_error(f"{path}.topology.block_stack_reason", "must be null for shared block stack")
+
+        optimization = _inventory_object(family["optimization"], f"{path}.optimization")
+        _inventory_exact_keys(optimization, _INVENTORY_OPTIMIZATION_KEYS, f"{path}.optimization")
+        if not isinstance(optimization["prefer_cpu_decoder_for_multichunk_metal"], bool):
+            raise _inventory_error(f"{path}.optimization.prefer_cpu_decoder_for_multichunk_metal", "must be boolean")
+        for field in ("auto_gpu_policy", "encoder_attention_span", "ownership", "prepared_runtime_eviction", "graph_reuse"):
+            _inventory_string(optimization[field], f"{path}.optimization.{field}")
+        _inventory_nullable_number(
+            optimization["encoder_attention_max_safe_chunk_seconds"],
+            f"{path}.optimization.encoder_attention_max_safe_chunk_seconds",
+            positive=True,
+        )
+
+        quantization = _inventory_object(family["quantization"], f"{path}.quantization")
+        _inventory_exact_keys(quantization, _INVENTORY_QUANTIZATION_KEYS, f"{path}.quantization")
+        tensor_classification = quantization["tensor_classification"]
+        _inventory_string(tensor_classification, f"{path}.quantization.tensor_classification")
+        if tensor_classification not in _INVENTORY_TENSOR_CLASSIFICATIONS:
+            raise _inventory_error(
+                f"{path}.quantization.tensor_classification",
+                f"unsupported classification {tensor_classification!r}",
+            )
+        quantized_axis = quantization["quantized_axis"]
+        if quantized_axis is not None:
+            _inventory_string(quantized_axis, f"{path}.quantization.quantized_axis")
+            if quantized_axis not in _INVENTORY_QUANTIZED_AXES:
+                raise _inventory_error(
+                    f"{path}.quantization.quantized_axis",
+                    f"unsupported axis {quantized_axis!r}; expected null, 'first', or 'last'",
+                )
+        if tensor_classification == "semantic-roles-v1" and quantized_axis not in _INVENTORY_QUANTIZED_AXES:
+            raise _inventory_error(
+                f"{path}.quantization.quantized_axis",
+                "semantic-roles-v1 requires 'first' or 'last'",
+            )
+        if tensor_classification == "acoustic-encoder-prefixes-v1" and quantized_axis is not None:
+            raise _inventory_error(
+                f"{path}.quantization.quantized_axis",
+                "acoustic-encoder-prefixes-v1 requires null",
+            )
+
+        conformance = _inventory_object(family["conformance"], f"{path}.conformance")
+        _inventory_exact_keys(conformance, _INVENTORY_CONFORMANCE_KEYS, f"{path}.conformance")
+        _inventory_string(conformance["profile_id"], f"{path}.conformance.profile_id")
+        _inventory_nullable_string(conformance["reference_dumper_source"], f"{path}.conformance.reference_dumper_source")
+
+
+def load_model_family_inventory(path: Path | None = None) -> dict[str, dict]:
+    """Load and strictly validate the generated Rust family inventory."""
+    inventory_path = MODEL_FAMILY_INVENTORY if path is None else Path(path)
+    try:
+        payload = json.loads(inventory_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"model family inventory cannot be read: {inventory_path}: {error}") from error
+    _validate_model_family_inventory(payload)
+    return {family["catalog_family_id"]: family for family in payload["families"]}
+
+
+MODEL_FAMILY_CAPABILITIES = load_model_family_inventory()
 
 
 @dataclass(frozen=True)
@@ -148,22 +612,6 @@ LANGUAGE_DISPLAY_LABELS = {
     "zh-zhejiang": ("Chinese (Zhejiang)", "中文（浙江话）"),
 }
 
-# Families that MAY enumerate dialect recognition codes in `languages`
-# (selective dialect collapse). Every other family collapses regional dialects
-# into the base language (`zh`), so a stray dialect code fails loudly instead
-# of shipping. Two distinct routes earn membership here:
-#  - dolphin: its executor ships a concrete code->prompt map, so a dialect
-#    code is actually SELECTABLE per request.
-#  - firered-aed / qwen: not selectable (firered-aed is a fixed bilingual
-#    vocab with no language prompt; qwen self-detects and rejects an explicit
-#    hint), but each has upstream-published, benchmark-verified per-dialect
-#    recognition coverage (FireRedASR2 README + arXiv:2603.10420 Table 2's 19
-#    dialect test sets; Qwen3-ASR's 22-dialect enumeration), so the dialect
-#    codes describe RECOGNIZED capability rather than a selectable parameter
-#    -- the same "recognizes whatever it hears" semantics FixedMultilingual
-#    families like parakeet-tdt already use for their base language list.
-DIALECT_CAPABLE_FAMILIES = {"dolphin", "firered-aed", "qwen"}
-
 # Shape of a recognition-language code: a lowercase ISO 639 base (2-3 letters)
 # with an OPTIONAL single `-region` subtag. Deliberately broader than the
 # translation-only `[a-z]{2,3}` check (validate_lang_list), matching Rust's
@@ -192,17 +640,24 @@ def validate_recognition_language_code(model: str, code: str) -> None:
 
 def validate_recognition_languages(model: str, family: str, languages: list[str]) -> None:
     """Validate a resolved recognition `languages` list and enforce SELECTIVE
-    dialect collapse: only a dialect-capable family may enumerate `-region`
-    dialect codes; every other family must fold regional dialects into `zh`.
+    dialect collapse from the generated family inventory: only a family whose
+    dialect mode advertises recognition may enumerate `-region` dialect codes;
+    every other family must fold regional dialects into `zh`.
     """
     for code in languages:
         validate_recognition_language_code(model, code)
     dialects = sorted(code for code in languages if "-" in code)
-    if dialects and family not in DIALECT_CAPABLE_FAMILIES:
+    family_inventory = MODEL_FAMILY_CAPABILITIES.get(family)
+    dialect_mode = (
+        family_inventory["language"]["dialect_mode"]
+        if family_inventory is not None
+        else "not-advertised"
+    )
+    if dialects and dialect_mode == "not-advertised":
         raise KeyError(
             f"model '{model}' family '{family}' advertises dialect code(s) "
-            f"{', '.join(dialects)} but is not dialect-capable; regional dialects "
-            "collapse into the base language unless the executor ships a code->prompt map"
+            f"{', '.join(dialects)} but its inventory dialect_mode is "
+            "'not-advertised'; regional dialects collapse into the base language"
         )
 
 
@@ -217,237 +672,54 @@ def language_labels_wire() -> dict:
     }
 
 
-# The exact set of Chinese-dialect codes the `dolphin-cn-dialect-*` pack
-# family can actually SELECT via its `<REGION>` prompt token (the domain of
-# `dolphin_region_token_for_code` in crate::models::dolphin::language -- Rust
-# mirror, kept in sync by hand). Distinct from (and a strict subset of) the
-# model-agnostic REGISTERED_DIALECT_CODES above, which is now a cross-family
-# typo-guard union: firered-aed and qwen also register dialect codes for
-# their own benchmark-verified (not selectable) recognition coverage, so the
-# global registry has grown codes Dolphin's own vocab has no region token
-# for. LANG_BY_FAMILY["dolphin"] must be built from THIS list, never the
-# global one, or a future cross-family dialect addition would silently make
-# Dolphin's family default advertise a region it cannot honor.
-DOLPHIN_CN_DIALECT_CODES = [
-    "zh-anhui",
-    "zh-guangdong",
-    "zh-hebei",
-    "zh-hubei",
-    "zh-jiangsu",
-    "zh-ningxia",
-    "zh-shaanxi",
-    "zh-shandong",
-    "zh-shanghai",
-    "zh-shanxi",
-    "zh-sichuan",
-    "zh-tianjin",
-    "zh-tw",
-]
+# Convert the inventory's language-policy names to the existing catalog wire tags.
+# Whisper remains pack-dependent: its vocabulary gate is resolved from the
+# model's effective language list below rather than from a fixed inventory row.
 
-# Per-family list of the natural languages a model officially supports, as
-# ISO 639-1 two-letter codes (ISO 639-3 where no 639-1 code exists), sorted.
-# RULE (SELECTIVE dialect collapse): by DEFAULT list LANGUAGES ONLY, NOT
-# dialects/accents -- Chinese is a single language "zh" (Mandarin/Cantonese/Wu/
-# Min and regional dialects fold into "zh"), English is "en" (US/UK not split),
-# and a card advertising "30 languages and 22 Chinese dialects" yields the 30
-# languages with the dialects folded into "zh". EXCEPTION: a dialect-capable
-# family (DIALECT_CAPABLE_FAMILIES -- see its own doc comment for the two ways
-# a family earns membership) MAY enumerate REGISTERED_DIALECT_CODES
-# (`zh-sichuan`, ...) alongside the base `zh`. If a model supports N
-# languages, list all N. See SKILL.md.
-LANG_BY_FAMILY = {
-    # Qwen3-ASR card lists 30 languages; Cantonese folds into zh -> 29 ISO langs.
-    "qwen": [
-        "ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi",
-        "hu", "id", "it", "ja", "ko", "mk", "ms", "nl", "pl", "pt", "ro", "ru",
-        "sv", "th", "tr", "vi", "zh",
-    ],
-    # CohereLabs cohere-transcribe card: trained on 14 languages.
-    "cohere": [
-        "ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt",
-        "vi", "zh",
-    ],
-    # OpenAI Whisper tokenizer LANGUAGES dict; Cantonese->zh, Nynorsk->no,
-    # jw->jv normalized -> 98 distinct ISO languages (haw is ISO 639-3).
-    "whisper": [
-        "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs",
-        "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
-        "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr", "ht", "hu", "hy",
-        "id", "is", "it", "ja", "jv", "ka", "kk", "km", "kn", "ko", "la", "lb",
-        "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
-        "my", "ne", "nl", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa",
-        "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw", "ta",
-        "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi", "yi",
-        "yo", "zh",
-    ],
-    # X-ASR-zh-en: bilingual Chinese + English.
-    "xasr-zipformer": ["en", "zh"],
-    # Dolphin cn-dialect small: Mandarin + 22 Chinese dialects (Sichuan, Wu,
-    # Minnan, ...). Dolphin is dialect-capable (its executor ships a
-    # code->region-prompt map), so it advertises the base `zh` plus every
-    # dialect code ITS OWN region-prompt map supports as selectable source
-    # languages -- DOLPHIN_CN_DIALECT_CODES, not the (now broader, cross-
-    # family) REGISTERED_DIALECT_CODES.
-    "dolphin": sorted(["zh", *DOLPHIN_CN_DIALECT_CODES]),
-    "moonshine": ["en"],
-    "parakeet": ["en"],
-    # parakeet-tdt-0.6b-v3 card: 25 European languages (bg hr cs da nl en et fi
-    # fr de el hu it lv lt mt pl pt ro sk sl es sv ru uk).
-    "parakeet-tdt": [
-        "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu",
-        "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv",
-        "uk",
-    ],
-    "wav2vec2": ["en"],
-    # SenseVoiceSmall: zh, yue (Cantonese), en, ja, ko with model-side LID.
-    "sensevoice": ["en", "ja", "ko", "yue", "zh"],
-    # FireRedASR-AED-L: fixed bilingual Mandarin + English char/SPM vocab, no
-    # language-selection prompt token (mirrors LanguageFamilyHint::
-    # FixedMultilingual { languages: &["zh", "en"] } in
-    # ggml_family_adapter.rs / arch/mod.rs).
-    "firered-aed": ["en", "zh"],
-    # FireRedASR2-LLM: fixed bilingual Mandarin + English Qwen2 BPE vocab, no
-    # language-selection prompt token (FixedMultilingual { languages:
-    # &["zh", "en"] } arch descriptor).
-    "firered2-llm": ["en", "zh"],
-    # MiMo-V2.5-ASR: fixed Mandarin + English + Cantonese Qwen2 BPE vocab, no
-    # language-selection prompt token (FixedMultilingual { languages:
-    # &["zh", "en", "yue"] } arch descriptor). "yue" is a base ISO 639-3 code
-    # (Cantonese), not a dialect subtag.
-    "mimo-asr": ["en", "yue", "zh"],
-    # moss-transcribe-diarize: conservative list from models-core.toml -- the
-    # upstream card's unenumerated "50+" claim is NOT mirrored; only languages
-    # with a concrete source (Mandarin meeting benchmarks + the 14 languages
-    # named for the 2nd MLC-SLM Challenge result).
-    "moss-transcribe-diarize": [
-        "de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "th", "tl", "tr",
-        "ur", "vi", "zh",
-    ],
-    # funasr-nano: FixedMultilingual zh+en (arch descriptor; upstream card also
-    # mentions Japanese, but the runtime only ships the zh+en fixed set).
-    "funasr-nano": ["en", "zh"],
-    # granite-speech: upstream trained-language list (en/fr/de/es/pt/ja).
-    "granite-speech": ["de", "en", "es", "fr", "ja", "pt"],
-}
 
-# Per-family source-language parameter policy for the catalog's `language_mode`
-# field, mirroring crates/openasr-core/src/models/ggml_family_adapter.rs's
-# `LanguageFamilyHint` (and the `LanguageMode` it resolves to in
-# crates/openasr-core/src/models/language.rs) 1:1. This is deliberately NOT an
-# authored per-model TOML field: whether a family accepts/requires/rejects an
-# explicit source-language selection is an architecture property owned by
-# core, not a per-release editorial choice, so it is derived here from the
-# same family the runtime dispatches on. "whisper" is intentionally absent --
-# WhisperVocabGated resolves per-PACK from the pack's own vocab (multilingual
-# vs English-only), so it is derived from the model's resolved `languages`
-# list in `language_mode_for_model()` below instead of a fixed per-family value.
-#
-# Values are the exact LanguageMode wire tags core already serializes on
-# `/v1/capabilities` (`LanguageCapability::mode` in
-# crates/openasr-core/src/api/backend/mod.rs), reused verbatim so the catalog
-# and the running-model capability surface never drift into two vocabularies
-# for the same axis.
-LANGUAGE_MODE_BY_FAMILY = {
-    # Qwen3-ASR: SelfDetectsRejectsHint -- self-detects, explicit hint rejected.
-    "qwen": "detect_implicit",
-    # Cohere transcribe: SelectsViaPrompt -- always conditions on a language
-    # token (its own default when the request omits one), never a true
-    # decode-time auto-detect.
-    "cohere": "specify_only",
-    # X-ASR zh-en: FixedMultilingual -- built-in bilingual set, no per-request
-    # language selection at all.
-    "xasr-zipformer": "fixed_multilingual",
-    # Dolphin: SelectsViaPrompt -- the dialect/region is chosen through prompt
-    # tokens (<sos> <zh> <SICHUAN> <asr> <notimestamp>), never a decode-time
-    # auto-detect, so it conditions on its default when the request omits one.
-    "dolphin": "specify_only",
-    # CTC / Moonshine: FixedMonolingual -- intrinsically a single language.
-    "moonshine": "fixed_monolingual",
-    "parakeet": "fixed_monolingual",
-    # parakeet-tdt: FixedMultilingual -- built-in 25-language set, decodes
-    # whatever it hears, no per-request language selection.
-    "parakeet-tdt": "fixed_multilingual",
-    "wav2vec2": "fixed_monolingual",
-    # SenseVoice: DetectAndSelectsViaPrompt -- explicit zh/yue/en/ja/ko selection
-    # via the 4-token prompt, decode-time LID (readable <|lang|> tag) when unset.
-    "sensevoice": "detect_and_specify",
-    # FireRedASR-AED: FixedMultilingual -- fixed zh+en char/SPM vocab, no
-    # per-request language selection or decode-time LID token at all.
-    "firered-aed": "fixed_multilingual",
-    # FireRedASR2-LLM / MiMo-V2.5-ASR: FixedMultilingual -- the Qwen2 BPE decoder
-    # has no language-selection prompt token and no decode-time LID token, so
-    # neither exposes a per-request source-language axis (mirrors the
-    # FixedMultilingual LanguageFamilyHint on both arch descriptors).
-    "firered2-llm": "fixed_multilingual",
-    "mimo-asr": "fixed_multilingual",
-    # MOSS-Transcribe-Diarize: SelfDetectsRejectsHint -- the Qwen3-style
-    # decoder auto-detects/produces the transcript language through free-text
-    # instruction-following (no dedicated language token), same shape as qwen.
-    "moss-transcribe-diarize": "detect_implicit",
-    # Fun-ASR-Nano: FixedMultilingual -- fixed zh+en Qwen3 BPE vocab, no
-    # per-request language selection or decode-time LID token.
-    "funasr-nano": "fixed_multilingual",
-    # Granite Speech: SelfDetectsRejectsHint -- free-text instruction-following
-    # auto-detects language (no dedicated language token), same shape as qwen.
-    "granite-speech": "detect_implicit",
-}
-
-# SpecifyOnly's conditioned default, mirroring the `default_language` literal
-# on each family's `LanguageFamilyHint::SelectsViaPrompt` in
-# ggml_family_adapter.rs. Not derivable from `languages` (English is not
-# `languages[0]` alphabetically for cohere), so kept as an explicit
-# same-source-of-truth constant instead of guessed.
-LANGUAGE_MODE_DEFAULT_BY_FAMILY = {
-    "cohere": "en",
-    "dolphin": "zh",
-}
+def _inventory_family_for_capability(family: str, capability: str) -> dict:
+    try:
+        return MODEL_FAMILY_CAPABILITIES[family]
+    except KeyError as error:
+        known = ", ".join(sorted(MODEL_FAMILY_CAPABILITIES))
+        raise KeyError(
+            f"model family '{family}' has no {capability} mapping in the model family inventory. "
+            f"Known families: {known}"
+        ) from error
 
 
 def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
-    """Per-model `language_mode` (+ `language_default` where applicable) for
-    the catalog, mirroring core's resolved `LanguageMode` for this model's
-    family (see module docstring on `LANGUAGE_MODE_BY_FAMILY`).
-
-    Returns {} for any kind other than asr-model: translation models (hymt2)
-    and capability packs (redimnet2/pyannote-segmentation) are not
-    GgmlFamilyAdapterDescriptor ASR families in core and have no per-request
-    source-language axis, so the field is omitted rather than guessed.
-    """
+    """Resolve the catalog language mode from the generated family inventory."""
     if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
         return {}
 
     family = entry["family"]
-    if family == "whisper":
+    language = _inventory_family_for_capability(family, "language_mode")["language"]
+    policy = language["policy"]
+    if policy == "whisper-vocab-gated":
         # WhisperVocabGated resolves per-pack from the pack's own vocab; the
-        # catalog mirrors that via the model's resolved `languages` list
-        # (English-only *.en checkpoints declare a single-element override).
+        # catalog mirrors that via the model's effective language list.
         if len(languages) == 1:
             return {"language_mode": "fixed_monolingual", "language_default": languages[0]}
         return {"language_mode": "detect_and_specify"}
 
-    mode = LANGUAGE_MODE_BY_FAMILY.get(family)
-    if mode is None:
-        known = ", ".join(sorted({*LANGUAGE_MODE_BY_FAMILY, "whisper"}))
-        raise KeyError(
-            f"model '{entry.get('id', '?')}' family '{family}' has no language_mode mapping. "
-            f"Known families: {known}"
-        )
-
+    mode = _LANGUAGE_POLICY_TO_WIRE_MODE[policy]
     if mode == "fixed_monolingual":
         if len(languages) != 1:
             raise KeyError(
                 f"model '{entry.get('id', '?')}' language_mode fixed_monolingual requires "
                 f"exactly one language, got {languages!r}"
             )
-        return {"language_mode": mode, "language_default": languages[0]}
+        default_language = language["default_language"]
+        if default_language not in languages:
+            raise KeyError(
+                f"model '{entry.get('id', '?')}' inventory default_language "
+                f"{default_language!r} is not in languages {languages!r}"
+            )
+        return {"language_mode": mode, "language_default": default_language}
 
     if mode == "specify_only":
-        default_language = LANGUAGE_MODE_DEFAULT_BY_FAMILY.get(family)
-        if default_language is None:
-            raise KeyError(
-                f"model '{entry.get('id', '?')}' family '{family}' has no "
-                "LANGUAGE_MODE_DEFAULT_BY_FAMILY entry"
-            )
+        default_language = language["default_language"]
         if default_language not in languages:
             raise KeyError(
                 f"model '{entry.get('id', '?')}' language_mode specify_only "
@@ -455,147 +727,36 @@ def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
             )
         return {"language_mode": mode, "language_default": default_language}
 
-    # detect_implicit / fixed_multilingual: no default_language (core's
-    # LanguageCapability leaves it unset for both -- there is either nothing to
-    # default (self-detected, unexposed) or no per-request selection at all).
+    # detect_implicit / fixed_multilingual / detect_and_specify: no default.
     return {"language_mode": mode}
 
 
-# Per-family whether the model's transcripts include punctuation, mirroring
-# whether the family's decoder/tokenizer can ever produce a punctuation token at
-# all (an architecture/training-corpus property, not a per-release editorial
-# choice -- like LANGUAGE_MODE_BY_FAMILY, derived here from the same family core
-# dispatches on). `wav2vec2`/`parakeet` (character/BPE CTC, no catalog entries
-# yet) are deliberately absent: whether a BYO-imported checkpoint's vocab
-# includes punctuation depends on that specific checkpoint, not the family, so
-# it cannot be stated as a fixed fact here.
-#
-# dolphin: DataoceanAI's cn-dialect-small training corpus is transcribed WITHOUT
-# punctuation and the model has no punctuation-prediction head/token to enable,
-# so its output is honestly unpunctuated -- product-decided (2026-07) to
-# disclose this in the model card and market UI rather than leave it
-# unexplained. Every other current asr-model family's training data/tokenizer
-# supports punctuation and its transcripts include it.
-#
-# Conceptual single source of truth: the Rust engine's own declaration of this
-# fact is `OpenAsrArchitectureDescriptor::emits_punctuation` in
-# crates/openasr-core/src/arch/mod.rs (one field per builtin architecture,
-# looked up via `emits_punctuation_for_model_architecture`). There is no
-# Rust<->Python codegen bridge yet -- and this dict is keyed by the catalog's
-# `family` string (e.g. "qwen", "cohere"), a different vocabulary from the
-# engine's `model_family`/`model_architecture` constants (e.g. "qwen3-asr",
-# "cohere-transcribe-conformer-transformer") -- so this table is hand-kept in
-# lockstep with the Rust descriptor rather than generated from it. Rust's
-# `registry/tests/catalog.rs::embedded_catalog_emits_punctuation_matches_family`
-# cross-checks the shipped catalog's values against the descriptor for every
-# family it can map, so a hand-edit here that drifts from the engine fact
-# fails that test. Keep any change to a family's punctuation behavior
-# synchronized on both sides.
-PUNCTUATION_BY_FAMILY = {
-    "qwen": True,
-    # parakeet-tdt: trained on transcripts that preserve punctuation and
-    # capitalization (verified on the imported pack: JFK decodes with full
-    # punctuation).
-    "parakeet-tdt": True,
-    "cohere": True,
-    "whisper": True,
-    "xasr-zipformer": True,
-    "dolphin": False,
-    "moonshine": True,
-    "sensevoice": True,
-    # firered-aed: the reference tokenizer's dict.txt has no punctuation/
-    # <space> entries (char + SPM vocab trained on unpunctuated Mandarin ASR
-    # corpora), so the raw decode is honestly punctuation-free (verified on
-    # the golden-diff fixture transcript).
-    "firered-aed": False,
-    # firered2-llm / mimo-asr: their Qwen2 ChatML decode is a plain
-    # transcription completion with no characterized punctuation-suppression
-    # behavior yet (arch descriptors declare emits_punctuation: None -- see
-    # arch/mod.rs). None means "unclaimed": the catalog omits the field rather
-    # than assert an unverified True/False (mirrors Option<bool>::None).
-    "firered2-llm": None,
-    "mimo-asr": None,
-    # moss-transcribe-diarize: the fixed instruction prompts for full
-    # punctuation-bearing prose, but this has not been verified against
-    # enough real transcripts to assert as a capability yet (arch descriptor
-    # declares emits_punctuation: None -- see arch/mod.rs) -- unclaimed.
-    "moss-transcribe-diarize": None,
-    # funasr-nano: stock Qwen3 ChatML decode can emit punctuation, but no
-    # punctuation-suppression behavior has been separately characterized
-    # (arch descriptor declares emits_punctuation: None) -- unclaimed.
-    "funasr-nano": None,
-    # granite-speech: observed punctuated on family goldens; arch descriptor
-    # declares emits_punctuation: Some(true) -- see arch/mod.rs.
-    "granite-speech": True,
-}
-
-
 def punctuation_for_model(entry: dict) -> dict:
-    """Per-model `emits_punctuation` for the catalog, mirroring whether this
-    model's family ever predicts punctuation tokens (see module docstring on
-    `PUNCTUATION_BY_FAMILY`).
-
-    Returns {} for any kind other than asr-model: translation models (hymt2)
-    and capability packs (redimnet2/pyannote-segmentation) don't produce an ASR
-    transcript, so the field is omitted rather than guessed.
-    """
+    """Resolve ``emits_punctuation`` from the generated family inventory."""
     if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
         return {}
 
     family = entry["family"]
-    if family not in PUNCTUATION_BY_FAMILY:
-        known = ", ".join(sorted(PUNCTUATION_BY_FAMILY))
-        raise KeyError(
-            f"model '{entry.get('id', '?')}' family '{family}' has no emits_punctuation "
-            f"mapping. Known families: {known}"
-        )
-    emits_punctuation = PUNCTUATION_BY_FAMILY[family]
-    # A mapped None mirrors the arch descriptor's Option<bool>::None ("this
-    # family's punctuation behavior is unclaimed"): omit the catalog field
-    # entirely rather than assert an unverified value. Distinct from an ABSENT
-    # family, which is a typo/onboarding gap and still fails loudly above.
+    emits_punctuation = _inventory_family_for_capability(family, "emits_punctuation")[
+        "execution"
+    ]["emits_punctuation"]
+    # Null is an explicit unclaimed capability: omit the catalog field.
     if emits_punctuation is None:
         return {}
     return {"emits_punctuation": emits_punctuation}
 
 
-# Which component owns recording-local speaker tracks. This mirrors
-# `OpenAsrArchitectureDescriptor::speaker_segmentation`: MOSS currently emits
-# speaker tracks in decoder tokens, while every other ASR family uses the
-# external segmenter/embedder pipeline. It is catalog data so Desktop can plan
-# explicit dependency downloads before launching a model, not a UI-maintained
-# model-id allowlist.
-SPEAKER_SOURCE_BY_FAMILY = {
-    "qwen": "external",
-    "parakeet-tdt": "external",
-    "cohere": "external",
-    "whisper": "external",
-    "xasr-zipformer": "external",
-    "dolphin": "external",
-    "moonshine": "external",
-    "sensevoice": "external",
-    "firered-aed": "external",
-    "firered2-llm": "external",
-    "mimo-asr": "external",
-    "moss-transcribe-diarize": "native",
-    "funasr-nano": "external",
-    "granite-speech": "external",
-}
-
-
 def speaker_source_for_model(entry: dict) -> dict:
-    """Return the normalized Voice-ID speaker-track source for ASR models."""
+    """Resolve the catalog Voice-ID source from the generated family inventory."""
     if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
         return {}
+
     family = entry["family"]
-    source = SPEAKER_SOURCE_BY_FAMILY.get(family)
-    if source is None:
-        known = ", ".join(sorted(SPEAKER_SOURCE_BY_FAMILY))
-        raise KeyError(
-            f"model '{entry.get('id', '?')}' family '{family}' has no speaker_source "
-            f"mapping. Known families: {known}"
-        )
-    return {"speaker_source": source}
+    source = _inventory_family_for_capability(family, "speaker_source")["execution"][
+        "speaker_segmentation"
+    ]
+    # Inventory uses architecture terminology; catalog uses the public wire tag.
+    return {"speaker_source": "native" if source == "in-decoder" else "external"}
 
 
 def apply_speaker_sources_to_catalog(
@@ -850,10 +1011,14 @@ def validate_lang_list(model: str, field: str, value: object) -> None:
 
 def languages_for_family(family: str) -> list[str]:
     try:
-        return list(LANG_BY_FAMILY[family])
+        language = MODEL_FAMILY_CAPABILITIES[family]["language"]
     except KeyError as error:
-        known = ", ".join(sorted(LANG_BY_FAMILY))
+        known = ", ".join(sorted(MODEL_FAMILY_CAPABILITIES))
         raise KeyError(f"unknown model family '{family}'. Known language mappings: {known}") from error
+    languages = list(language["languages"])
+    if language["dialect_mode"] == "selects-via-prompt":
+        languages = sorted(set(languages + language["selectable_dialect_codes"]))
+    return languages
 
 
 def languages_for_model(entry: dict) -> list[str]:
@@ -863,7 +1028,8 @@ def languages_for_model(entry: dict) -> list[str]:
     than its family default (e.g. Whisper's English-only `*.en` checkpoints support
     only `en` even though the multilingual Whisper family supports ~98). A model
     that needs to differ from the family default declares an explicit `languages`
-    list in models-core.toml; otherwise it inherits `LANG_BY_FAMILY[family]`.
+    list in models-core.toml; otherwise it inherits the generated Rust family
+    inventory (including prompt-selectable dialect codes where declared).
     """
     override = entry.get("languages")
     if override is not None:

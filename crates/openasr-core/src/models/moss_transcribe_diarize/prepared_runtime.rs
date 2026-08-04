@@ -225,7 +225,7 @@ pub(crate) enum MossTdPreparedRuntimeError {
 }
 
 pub(crate) fn build_moss_td_prepared_runtime(
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<MossTdPreparedRuntime, MossTdPreparedRuntimeError> {
     let encoder_metadata = parse_encoder_metadata(&preflight.metadata).map_err(|error| {

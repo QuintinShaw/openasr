@@ -93,6 +93,7 @@ fn resolved_pull_fixture() -> ResolvedCatalogPull {
     ResolvedCatalogPull {
         requested: "moonshine-tiny:q8".to_string(),
         model_id: "moonshine-tiny".to_string(),
+        catalog_family_id: "moonshine".to_string(),
         display_name: "Moonshine Tiny".to_string(),
         quant: "q8_0".to_string(),
         suffix: "q8".to_string(),
@@ -163,7 +164,9 @@ fn local_import_fixture_with_license(
     license_class: LicenseClass,
 ) -> (DistributionContext, PathBuf, PathBuf) {
     let pack_path = root.join("moonshine-tiny-q8_0.oasr");
-    write_mock_gguf_runtime_source(&pack_path, Some("moonshine-tiny"));
+    let spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny");
+    write_tiny_gguf_runtime_source(&pack_path, &spec)
+        .expect("write moonshine local import fixture");
     let pack_bytes = fs::read(&pack_path).expect("read local import fixture");
     let pack_sha256 = format!("{:x}", Sha256::digest(&pack_bytes));
 
@@ -472,16 +475,24 @@ fn write_valid_installed_pack_for_test(
 }
 
 fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Option<&str>) {
-    // Use the graph-complete whisper fixture (not the bare
-    // `whisper_oasr_v1_non_streaming_cpu`, which deliberately omits the
+    // Use the graph-complete, tokenizer-complete whisper fixture (not the
+    // bare `whisper_oasr_v1_non_streaming_cpu`, which deliberately omits the
     // whisper runtime scalar keys): `list_installed_packs` now re-validates
-    // on-disk packs through `validate_native_runtime_model_pack_contract` on
-    // every lookup, so an "installed" test fixture must satisfy that
-    // contract or it silently stops being recognized as installed.
-    let spec = metadata_model_id.map_or_else(
-        || TinyGgufFixtureSpec::new(Default::default()),
-        TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer,
-    );
+    // on-disk packs through the shared runtime verifier on every lookup, so
+    // an "installed" test fixture must satisfy that contract or it silently
+    // stops being recognized as installed.
+    let spec = match metadata_model_id {
+        None => TinyGgufFixtureSpec::new(Default::default()),
+        Some(model_id) if model_id.starts_with("moonshine") => {
+            TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(model_id)
+        }
+        Some(model_id) if model_id.starts_with("qwen") => {
+            TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready(model_id)
+        }
+        Some(model_id) => {
+            TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(model_id)
+        }
+    };
     write_tiny_gguf_runtime_source(path, &spec).expect("write mock gguf runtime source");
 }
 
@@ -1900,7 +1911,10 @@ fn native_server_runtime_rejects_directory_runtime_source() {
         model_pack_path: Some(pack_root),
     };
     let error = runtime.validate().unwrap_err().to_string();
-    assert!(error.contains("must be a regular file"), "{error}");
+    assert!(
+        error.contains("could not verify and select a native model adapter"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2555,7 +2569,7 @@ fn pull_job_failure_log_line_carries_job_identity_and_message() {
 async fn resume_pull_job_restarts_interrupted_job_to_completion() {
     let temp = tempfile::tempdir().unwrap();
     let pack_path = temp.path().join("source-moonshine-tiny-q8_0.oasr");
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    let spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny");
     write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
     let bytes = std::fs::read(&pack_path).unwrap();
 
@@ -2775,7 +2789,10 @@ fn native_server_runtime_rejects_non_gguf_runtime_source_file() {
         model_pack_path: Some(pack_path),
     };
     let error = runtime.validate().unwrap_err().to_string();
-    assert!(error.contains("has unknown magic bytes"), "{error}");
+    assert!(
+        error.contains("could not verify and select a native model adapter"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2791,7 +2808,10 @@ fn native_server_runtime_rejects_directory_runtime_source_without_file_fallback(
         model_pack_path: Some(pack_root),
     };
     let error = runtime.validate().unwrap_err().to_string();
-    assert!(error.contains("must be a regular file"), "{error}");
+    assert!(
+        error.contains("could not verify and select a native model adapter"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -2831,10 +2851,9 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
 /// real multipart POST to `/v1/audio/transcriptions` goes through --
 /// `axum::extract::Multipart` extraction, then `parse_transcription_multipart`
 /// -- with a real bare-ADTS `.aac` fixture, then feeds the resulting request
-/// into the real native transcription path. With no real model behind the
-/// fixture pack, the run must still fail -- but only at model load ("Could
-/// not transcribe audio"), never at audio preparation, proving the upload's
-/// extension survived and the file decoded.
+/// into the real native transcription path. The shared runtime-ready fixture
+/// must complete transcription, proving both that the upload's extension
+/// survived and that the decoded audio reached the unified native runtime.
 #[tokio::test]
 async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparation() {
     let temp = tempfile::tempdir().unwrap();
@@ -2892,7 +2911,7 @@ async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparati
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     };
-    let error = transcribe_with_runtime(
+    let transcription = transcribe_with_runtime(
         runtime,
         parsed.request,
         std::sync::Arc::new(openasr_core::RequestExecutionContext::uncancellable(
@@ -2900,14 +2919,10 @@ async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparati
         )),
     )
     .await
-    .unwrap_err();
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("Could not transcribe audio"),
-        "a real .aac upload must reach model loading, not fail at audio preparation: {rendered}"
-    );
-    assert!(!rendered.contains("Unsupported audio input"));
-    assert!(!rendered.contains("the file has no extension"));
+    .expect("a real .aac upload must complete through the unified native runtime");
+    assert_eq!(transcription.text, "fixture0");
+    assert_eq!(transcription.segments.len(), 1);
+    assert!(transcription.segments[0].end > transcription.segments[0].start);
 }
 
 #[cfg(unix)]
@@ -2968,7 +2983,7 @@ async fn native_audio_preparation_does_not_consume_model_capacity() {
     }
 
     let permit = runtime
-        .acquire_native_execution(None)
+        .acquire_native_execution("test-content", None)
         .expect("audio-only preparation must not consume native model capacity");
     drop(permit);
     std::fs::write(&release_path, b"release").unwrap();

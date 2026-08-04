@@ -42,6 +42,12 @@ use super::graph_config::whisper_decoder_graph_config;
 const GGML_TYPE_F16: i32 = 1;
 const WHISPER_DECODER_REUSE_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 
+enum RuntimeWeightSource<'a> {
+    Verified(&'a GgufRuntimeSourcePreflight),
+    #[cfg(test)]
+    Synthetic,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WhisperDecoderGraphInputShape {
     pub token_count: usize,
@@ -1479,7 +1485,7 @@ impl WhisperDecoderPersistentWeightCache {
         source: &dyn WhisperDecoderTensorSource,
         tensor_cache: &mut WhisperDecoderExecutionTensorCache,
         self_kv_max_positions: usize,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         Self::build_static_stage_with_n_seq(
             runner,
@@ -1492,13 +1498,72 @@ impl WhisperDecoderPersistentWeightCache {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn build_static_stage_synthetic(
+        runner: &mut GgmlCpuGraphRunner,
+        plan: &WhisperDecoderGraphPlan,
+        source: &dyn WhisperDecoderTensorSource,
+        tensor_cache: &mut WhisperDecoderExecutionTensorCache,
+        self_kv_max_positions: usize,
+    ) -> Result<Self, WhisperDecoderGraphExecutionError> {
+        Self::build_static_stage_with_n_seq_impl(
+            runner,
+            plan,
+            source,
+            tensor_cache,
+            self_kv_max_positions,
+            RuntimeWeightSource::Synthetic,
+            1,
+        )
+    }
+
     pub(crate) fn build_static_stage_with_n_seq(
         runner: &mut GgmlCpuGraphRunner,
         plan: &WhisperDecoderGraphPlan,
         source: &dyn WhisperDecoderTensorSource,
         tensor_cache: &mut WhisperDecoderExecutionTensorCache,
         self_kv_max_positions: usize,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        n_seq: usize,
+    ) -> Result<Self, WhisperDecoderGraphExecutionError> {
+        Self::build_static_stage_with_n_seq_impl(
+            runner,
+            plan,
+            source,
+            tensor_cache,
+            self_kv_max_positions,
+            RuntimeWeightSource::Verified(runtime_preflight),
+            n_seq,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_static_stage_with_n_seq_synthetic(
+        runner: &mut GgmlCpuGraphRunner,
+        plan: &WhisperDecoderGraphPlan,
+        source: &dyn WhisperDecoderTensorSource,
+        tensor_cache: &mut WhisperDecoderExecutionTensorCache,
+        self_kv_max_positions: usize,
+        n_seq: usize,
+    ) -> Result<Self, WhisperDecoderGraphExecutionError> {
+        Self::build_static_stage_with_n_seq_impl(
+            runner,
+            plan,
+            source,
+            tensor_cache,
+            self_kv_max_positions,
+            RuntimeWeightSource::Synthetic,
+            n_seq,
+        )
+    }
+
+    fn build_static_stage_with_n_seq_impl(
+        runner: &mut GgmlCpuGraphRunner,
+        plan: &WhisperDecoderGraphPlan,
+        source: &dyn WhisperDecoderTensorSource,
+        tensor_cache: &mut WhisperDecoderExecutionTensorCache,
+        self_kv_max_positions: usize,
+        runtime_source: RuntimeWeightSource<'_>,
         n_seq: usize,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         if n_seq == 0 {
@@ -1521,11 +1586,19 @@ impl WhisperDecoderPersistentWeightCache {
         // cross-attention K/V projections are EXCLUDED: their static arena tensors
         // are referenced directly by the cross-attention precompute task, so they
         // must remain arena-resident.
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
-            runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+        let loaded_weights = match runtime_source {
+            RuntimeWeightSource::Verified(preflight) => Some(
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(
+                        |source| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
+                            reason: format!("could not load decoder weight context: {source}"),
+                        },
+                    )?,
+            ),
+            #[cfg(test)]
+            RuntimeWeightSource::Synthetic => None,
+        };
         let cross_kv_excluded_keys: HashSet<LocalLinearWeightCacheKey> = plan
             .layers
             .iter()
@@ -6269,13 +6342,12 @@ mod tests {
                     GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
                         .expect("serial runner should initialize");
                 let mut tensor_cache = WhisperDecoderExecutionTensorCache::default();
-                let persistent = WhisperDecoderPersistentWeightCache::build_static_stage(
+                let persistent = WhisperDecoderPersistentWeightCache::build_static_stage_synthetic(
                     &mut runner,
                     &plan,
                     &source,
                     &mut tensor_cache,
                     plan.position_embedding.vocab_size,
-                    None,
                 )
                 .expect("serial persistent cache should build");
                 persistent
@@ -6308,16 +6380,16 @@ mod tests {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
             .expect("batched runner should initialize");
         let mut tensor_cache = WhisperDecoderExecutionTensorCache::default();
-        let persistent = WhisperDecoderPersistentWeightCache::build_static_stage_with_n_seq(
-            &mut runner,
-            &plan,
-            &source,
-            &mut tensor_cache,
-            plan.position_embedding.vocab_size,
-            None,
-            token_ids.len(),
-        )
-        .expect("batched persistent cache should build");
+        let persistent =
+            WhisperDecoderPersistentWeightCache::build_static_stage_with_n_seq_synthetic(
+                &mut runner,
+                &plan,
+                &source,
+                &mut tensor_cache,
+                plan.position_embedding.vocab_size,
+                token_ids.len(),
+            )
+            .expect("batched persistent cache should build");
         for (slot, encoder) in encoders.iter().enumerate() {
             persistent
                 .populate_cross_attention_stage_slot(
@@ -6418,16 +6490,16 @@ mod tests {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
             .expect("batched runner should initialize");
         let mut tensor_cache = WhisperDecoderExecutionTensorCache::default();
-        let persistent = WhisperDecoderPersistentWeightCache::build_static_stage_with_n_seq(
-            &mut runner,
-            &plan,
-            &source,
-            &mut tensor_cache,
-            plan.position_embedding.vocab_size,
-            None,
-            encoders.len(),
-        )
-        .expect("batched persistent cache should build");
+        let persistent =
+            WhisperDecoderPersistentWeightCache::build_static_stage_with_n_seq_synthetic(
+                &mut runner,
+                &plan,
+                &source,
+                &mut tensor_cache,
+                plan.position_embedding.vocab_size,
+                encoders.len(),
+            )
+            .expect("batched persistent cache should build");
         for (slot, encoder) in encoders.iter().enumerate() {
             persistent
                 .populate_cross_attention_stage_slot(

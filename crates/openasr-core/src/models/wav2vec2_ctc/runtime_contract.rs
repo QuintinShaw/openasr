@@ -184,6 +184,16 @@ pub(crate) fn parse_wav2vec2_ctc_execution_metadata<M: ScalarMetadataView>(
     })
 }
 
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_wav2vec2_ctc_execution_metadata(preflight.metadata())
+        .map(|_| ())
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("wav2vec2-ctc", error)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

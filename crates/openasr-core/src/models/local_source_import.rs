@@ -262,10 +262,6 @@ impl SafetensorsFile {
         })
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.mmap
-    }
-
     pub(crate) fn header(&self) -> &SafetensorsHeader {
         &self.header
     }

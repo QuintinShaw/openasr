@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, ExprMethodCall, ExprPath, ExprStruct, File, ImplItemFn, ItemFn, ItemImpl, ItemMod,
-    Lit, Member, Meta, Token,
+    Attribute, Expr, ExprMethodCall, ExprPath, ExprStruct, File, ImplItemFn, ItemFn, ItemImpl,
+    ItemMod, Lit, Member, Meta, Token,
 };
 
 const UNPREFLIGHTED_READER_METHODS: &[&str] =
@@ -78,6 +78,17 @@ impl<'ast> Visit<'ast> for ProductionRuntimeVisitor<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         if node.method == "load_gguf_weight_context" {
             self.reject("bare-source load_gguf_weight_context");
+        }
+        if node.method == "ok"
+            && let Expr::Call(call) = node.receiver.as_ref()
+            && let Expr::Path(function) = call.func.as_ref()
+            && function
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "load_gguf_weight_context_from_preflight")
+        {
+            self.reject("suppressed load_gguf_weight_context_from_preflight error");
         }
         visit::visit_expr_method_call(self, node);
     }
@@ -172,36 +183,36 @@ fn cfg_predicate_is_test_only(predicate: &Meta) -> bool {
     }
 }
 
+fn is_model_package_import_boundary(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("package_import.rs") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    // Every model family owns its import/conversion seam in a package_import.rs
+    // module. Match that shape instead of requiring a central family list.
+    path.ancestors()
+        .skip(1)
+        .any(|ancestor| ancestor.ends_with(Path::new("src/models")) && ancestor != parent)
+}
+
 fn is_explicit_import_boundary(path: &Path) -> bool {
     const IMPORT_BOUNDARIES: &[&str] = &[
-        "src/models/cohere/package_import.rs",
+        // Non-standard import/conversion seams that are not named
+        // `src/models/<family>/package_import.rs`.
         "src/models/diarize_pack_import.rs",
-        "src/models/dolphin/package_import.rs",
-        "src/models/firered_aed/package_import.rs",
-        "src/models/firered_llm/package_import.rs",
-        "src/models/firered_punc/package_import.rs",
-        "src/models/funasr_nano/package_import.rs",
-        "src/models/granite_speech/package_import.rs",
-        "src/models/hymt2/package_import.rs",
         "src/models/local_source_import.rs",
-        "src/models/moonshine/package_import.rs",
-        "src/models/moss_transcribe_diarize/package_import.rs",
-        "src/models/parakeet_ctc/package_import.rs",
-        "src/models/parakeet_tdt/package_import.rs",
-        "src/models/pyannote/package_import.rs",
         "src/models/qwen/forced_aligner_import.rs",
-        "src/models/qwen/package_import.rs",
-        "src/models/sensevoice/package_import.rs",
-        "src/models/wav2vec2_ctc/package_import.rs",
-        "src/models/whisper/package_import.rs",
-        "src/models/xasr_zipformer/package_import.rs",
         // Standalone public inspection ingress: it has no existing execution
         // preflight to reuse and returns only model identity.
         "src/api/backend/native_model_id.rs",
     ];
-    IMPORT_BOUNDARIES
-        .iter()
-        .any(|boundary| path.ends_with(boundary))
+    is_model_package_import_boundary(path)
+        || IMPORT_BOUNDARIES
+            .iter()
+            .any(|boundary| path.ends_with(boundary))
 }
 
 fn is_test_source(path: &Path) -> bool {
@@ -269,4 +280,48 @@ fn production_runtime_construction_cannot_bypass_gguf_preflight() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_model_family_package_import_is_an_import_boundary() {
+        assert!(is_model_package_import_boundary(Path::new(
+            "crates/openasr-core/src/models/new_family/package_import.rs"
+        )));
+        assert!(is_model_package_import_boundary(Path::new(
+            "src/models/new_family/variant/package_import.rs"
+        )));
+    }
+
+    #[test]
+    fn import_boundary_shape_is_fail_closed() {
+        assert!(!is_model_package_import_boundary(Path::new(
+            "crates/openasr-core/src/models/package_import.rs"
+        )));
+        assert!(!is_model_package_import_boundary(Path::new(
+            "crates/openasr-core/src/models/new_family/import.rs"
+        )));
+        assert!(!is_model_package_import_boundary(Path::new(
+            "crates/openasr-core/src/model_sources/new_family/package_import.rs"
+        )));
+    }
+
+    #[test]
+    fn non_standard_import_boundaries_remain_explicit_exceptions() {
+        assert!(is_explicit_import_boundary(Path::new(
+            "src/models/diarize_pack_import.rs"
+        )));
+        assert!(is_explicit_import_boundary(Path::new(
+            "src/models/local_source_import.rs"
+        )));
+        assert!(is_explicit_import_boundary(Path::new(
+            "src/models/qwen/forced_aligner_import.rs"
+        )));
+        assert!(is_explicit_import_boundary(Path::new(
+            "src/api/backend/native_model_id.rs"
+        )));
+    }
 }

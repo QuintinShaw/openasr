@@ -1825,6 +1825,13 @@ impl WsSession {
             .await?;
             return Err(());
         };
+        if let Err(message) =
+            crate::routes::transcription::validate_native_request_model(&adapter, &model_id)
+        {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
         let resolved_route = match crate::routes::transcription::resolve_execution_route_for_target(
             self.execution_target,
         ) {
@@ -1839,9 +1846,22 @@ impl WsSession {
                 return Err(());
             }
         };
+        let model_session_key =
+            match crate::routes::transcription::native_model_session_key(&adapter) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.emit_error(
+                        RealtimeErrorCode::StartupConfigError,
+                        &error.to_string(),
+                        false,
+                    )
+                    .await?;
+                    return Err(());
+                }
+            };
         let model_session_permit = match self
             .runtime
-            .acquire_native_execution(resolved_route.as_ref())
+            .acquire_native_execution(&model_session_key, resolved_route.as_ref())
         {
             Ok(permit) => permit,
             Err(error) => {
@@ -1852,8 +1872,18 @@ impl WsSession {
                 return Err(());
             }
         };
-        let model_pack =
-            NativeAsrModelPackRef::new(model_id, adapter.model_family(), model_pack_path);
+        let model_pack = match adapter.model_pack_ref(model_id) {
+            Ok(model_pack) => model_pack,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &error.to_string(),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
         let context = NativeAsrSessionContext::from_realtime_session_id(self.session_id.clone());
         // With translation active, session.language is the validated zh->en
         // translation source declaration consumed by the translation lane. Only

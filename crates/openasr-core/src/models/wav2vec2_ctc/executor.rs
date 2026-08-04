@@ -14,7 +14,10 @@ use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
-use crate::arch::{OpenAsrArchitectureRegistry, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID};
+use crate::arch::{
+    OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+};
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -26,8 +29,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrRuntimeSourcePreflight,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
+    GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
@@ -117,7 +120,7 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
     reader: &GgufTensorDataReader,
     gguf_metadata: &GgufMetadata,
     samples: &[f32],
-    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    runtime_preflight: &GgufRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -132,9 +135,8 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
     let weights =
         load_wav2vec2_ctc_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_wav2vec2_block_stack(metadata, &weights)?;
-    let mut graph =
-        Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(runtime_preflight), backend)
-            .map_err(|e| e.to_string())?;
+    let mut graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, runtime_preflight, backend)
+        .map_err(|e| e.to_string())?;
     let output = graph.encode(&audio.samples).map_err(|e| e.to_string())?;
     decode_wav2vec2_output(
         output,
@@ -148,7 +150,7 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
 fn transcribe_wav2vec2_ctc_pcm_cached(
     runtime_pool: &Wav2Vec2RuntimePool,
     samples: &[f32],
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -166,7 +168,7 @@ fn transcribe_wav2vec2_ctc_pcm_cached(
 fn decode_wav2vec2_ctc_pcm_cached(
     runtime_pool: &Wav2Vec2RuntimePool,
     samples: &[f32],
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
@@ -191,7 +193,7 @@ fn new_wav2vec2_runtime_pool() -> Arc<Wav2Vec2RuntimePool> {
 
 fn checkout_wav2vec2_prepared_runtime(
     runtime_pool: &Wav2Vec2RuntimePool,
-    preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+    preflight: &crate::GgufRuntimeSourcePreflight,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<Wav2Vec2RuntimeActor, String> {
     let backend = wav2vec2_ctc_encoder_graph_config(resolved_backend).backend;
@@ -227,9 +229,8 @@ fn checkout_wav2vec2_prepared_runtime(
                 let weights = load_wav2vec2_ctc_encoder_weights(&reader, &metadata)
                     .map_err(|error| error.to_string())?;
                 validate_wav2vec2_block_stack(metadata, &weights)?;
-                let graph =
-                    Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(&preflight), backend)
-                        .map_err(|error| error.to_string())?;
+                let graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, &preflight, backend)
+                    .map_err(|error| error.to_string())?;
                 let runtime = Wav2Vec2CtcPreparedRuntime { tokenizer, graph };
                 let retained = runtime.retained_system_memory_bytes()?;
                 // The count-only plan is the authoritative peak quote. Loader
@@ -327,7 +328,12 @@ fn validate_wav2vec2_block_stack(
     // descriptor's declared shape / block kind / tensor scope / layer count.
     let wav2vec2_block_stack = OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(WAV2VEC2_CTC_GGML_ARCHITECTURE_ID)
-        .and_then(|descriptor| descriptor.block_stack);
+        .and_then(
+            |descriptor| match descriptor.topology_contract.block_stack {
+                OpenAsrBlockStackStrategy::Shared(stack) => Some(stack),
+                OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => None,
+            },
+        );
     validate_stage_against_descriptor(
         WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
         wav2vec2_block_stack.as_ref(),
@@ -431,13 +437,11 @@ impl Wav2Vec2CtcGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        let preflight = &request.runtime_source_preflight;
         decode_wav2vec2_ctc_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight,
+            preflight,
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
         )
@@ -445,7 +449,18 @@ impl Wav2Vec2CtcGgmlExecutor {
     }
 }
 
+impl Wav2Vec2CtcGgmlExecutor {
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_pool
+            .evict_where(|(key, _lane)| key.pack_content_id == pack_content_id);
+    }
+}
+
 impl GgmlAsrViewExecutor for Wav2Vec2CtcGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        Wav2Vec2CtcGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         crate::arch::WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID
     }
@@ -478,15 +493,13 @@ impl GgmlAsrViewExecutor for Wav2Vec2CtcGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        // Fail-closed: validate the runtime source path before touching the pack
-        // (Gate-0 preflight), then run the cached prepared-runtime path.
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        // Fail-closed: consume the already-admitted Gate-0 proof, then run the
+        // cached prepared-runtime path against that exact source generation.
+        let preflight = &request.runtime_source_preflight;
         let output = transcribe_wav2vec2_ctc_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight,
+            preflight,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),

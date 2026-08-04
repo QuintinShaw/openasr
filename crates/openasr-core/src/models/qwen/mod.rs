@@ -59,12 +59,12 @@ pub(crate) use logits_head::{
     load_llm_logits_head_from_reader_with_tensor_names, load_qwen3_llm_logits_head_from_reader,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor, logits_head_ggml_enabled,
 };
-pub(crate) use package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
 pub use package_import::{
     Qwen3AsrLocalSourceError, Qwen3AsrLocalSourceImportRequest,
     Qwen3AsrLocalSourceImportRuntimeResult, Qwen3AsrRuntimeQuantizationMode,
     convert_local_qwen_source_to_runtime_pack,
 };
+pub(crate) use package_import::{TENSOR_QUANTIZATION_CONTRACT, qwen_tensor_role};
 pub(crate) use prepared_runtime::{
     Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError, build_qwen_prepared_runtime,
 };

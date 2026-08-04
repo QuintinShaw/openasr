@@ -20,8 +20,10 @@ use crate::{
             CheckedOutPinnedRuntimeActorCall, PinnedRuntimeActorError,
             call_checked_out_actor_mut_fallible_async,
         },
+        aux_pack_registry::AuxPackKind,
         aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
         native_execution_services::current_execution_candidate_failure,
+        pack_verifier::{PackCandidate, PackRoute, PackVerifier},
         policy_resolved_aux_runtime::{
             AuxiliaryPinnedRuntimeCacheKey, AuxiliaryRuntimeCacheKey, PolicyResolvedAuxRuntime,
             PolicyResolvedAuxRuntimeError, resolve_auxiliary_execution_plan,
@@ -339,11 +341,22 @@ impl PolicyResolvedSpeakerRuntime {
         let Some(pack_path) = redimnet_pack_path() else {
             return Ok(None);
         };
-        let source = crate::validate_ggml_runtime_source_path(&pack_path)
+        let verified_pack = PackVerifier
+            .verify_candidate(PackCandidate::new(&pack_path))
             .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
-        let preflight =
-            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(&source)
-                .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
+        if !matches!(
+            verified_pack.route(),
+            PackRoute::Aux {
+                kind: AuxPackKind::Diarization,
+                ..
+            }
+        ) {
+            return Err(EmbedError::Unavailable(format!(
+                "ReDimNet pack route is not auxiliary diarization: {:?}",
+                verified_pack.route()
+            )));
+        }
+        let preflight = verified_pack.preflight().clone();
         let content_id = preflight.runtime_source.content_id().to_string();
         let retained_quote =
             RedimNet2Embedder::quoted_persistent_host_commitment_bytes(&preflight.tensor_index)?;

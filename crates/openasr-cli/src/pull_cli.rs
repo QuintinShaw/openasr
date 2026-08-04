@@ -403,6 +403,7 @@ mod tests {
         ResolvedCatalogPull {
             requested: "diarizen-large-s80-v2".to_string(),
             model_id: "diarizen-large-s80-v2".to_string(),
+            catalog_family_id: "diarizen-segmentation".to_string(),
             display_name: "DiariZen Large-s80-md-v2".to_string(),
             quant: "fp16".to_string(),
             suffix: "fp16".to_string(),

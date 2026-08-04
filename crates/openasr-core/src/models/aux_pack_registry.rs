@@ -128,7 +128,7 @@ impl AuxiliaryRuntimeOwnership {
 }
 
 impl AuxPackKind {
-    /// The `"<label> failed: <error>"` prefix `validate_native_runtime_model_pack_contract`
+    /// The `"<label> failed: <error>"` prefix `verify_native_runtime_model_pack_path`
     /// reports for this kind (unchanged from the pre-consolidation call sites).
     pub(crate) fn validation_failure_label(self) -> &'static str {
         match self {
@@ -143,9 +143,14 @@ impl AuxPackKind {
 struct AuxPackDescriptor {
     /// `general.architecture` value that identifies this aux family's packs.
     architecture_id: &'static str,
+    /// Stable join key used by catalog authoring and publish receipts. This is
+    /// deliberately data on the canonical Rust route descriptor, not a Python
+    /// architecture-name table.
+    catalog_family_id: &'static str,
     kind: AuxPackKind,
     execution_policy: AuxiliaryExecutionPolicy,
     ownership: AuxiliaryRuntimeOwnership,
+    quantization_classification: crate::models::pack_quant::TensorQuantizationContract,
     /// Cheap pull-time contract probe: constructs/parses just enough of the
     /// pack to prove the runtime loader can build from it, without
     /// materializing full weights for execution.
@@ -225,30 +230,48 @@ pub(crate) const REDIMNET2_GGML_ARCHITECTURE_ID: &str = "redimnet2";
 const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
     AuxPackDescriptor {
         architecture_id: REDIMNET2_GGML_ARCHITECTURE_ID,
+        catalog_family_id: "redimnet2",
         kind: AuxPackKind::Diarization,
         execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack {
+                model_architecture: REDIMNET2_GGML_ARCHITECTURE_ID,
+            },
         validate: validate_redimnet2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
+        catalog_family_id: "pyannote-segmentation",
         kind: AuxPackKind::Diarization,
         execution_policy: AuxiliaryExecutionPolicy::FixedCpu,
         ownership: AuxiliaryRuntimeOwnership::AdmittedHostOwner,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
+                model_architecture: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
+                reason: "speaker segmentation has no audio-encoder quantization tier",
+            },
         validate: validate_pyannote,
     },
     AuxPackDescriptor {
         architecture_id: crate::diarize::segment::DIARIZEN_GGML_ARCHITECTURE_ID,
+        catalog_family_id: "diarizen-segmentation",
         kind: AuxPackKind::Diarization,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
             capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
+                model_architecture: crate::diarize::segment::DIARIZEN_GGML_ARCHITECTURE_ID,
+                reason: "speaker segmentation has no audio-encoder quantization tier",
+            },
         validate: validate_diarizen,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
+        catalog_family_id: "hymt2",
         kind: AuxPackKind::Translation,
         // Hy-MT2 selects one complete ggml backend; it has no implemented
         // partial-offload topology, so advertising Hybrid here would create a
@@ -259,26 +282,45 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
+                model_architecture: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
+                reason: "text translation has no acoustic encoder",
+            },
         validate: validate_hymt2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
+        catalog_family_id: "firered-punc",
         kind: AuxPackKind::Punctuation,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
             capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
+                model_architecture:
+                    crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
+                reason: "punctuation restoration has no acoustic encoder",
+            },
         validate: validate_firered_punc,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
             capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
+                model_architecture: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+                classify: crate::models::qwen::qwen_tensor_role,
+                quantized_axis: crate::models::pack_quant::QuantizedAxis::First,
+            },
         validate: validate_forced_aligner,
     },
 ];
@@ -302,6 +344,22 @@ pub(crate) fn auxiliary_runtime_ownership(
         .map(|descriptor| descriptor.ownership)
 }
 
+pub(crate) fn auxiliary_catalog_family_id(architecture_id: &str) -> Option<&'static str> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.architecture_id == architecture_id)
+        .map(|descriptor| descriptor.catalog_family_id)
+}
+
+pub(crate) fn auxiliary_quantization_classification(
+    architecture_id: &str,
+) -> Option<crate::models::pack_quant::TensorQuantizationContract> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.architecture_id == architecture_id)
+        .map(|descriptor| descriptor.quantization_classification)
+}
+
 /// Every aux family's `general.architecture` id. Lets a caller that needs the
 /// full non-ASR family list (e.g. `models::pack_quant_audit`'s quant-floor
 /// coverage test) enumerate it without depending on `AuxPackKind` or
@@ -317,7 +375,7 @@ pub(crate) fn aux_pack_architecture_ids() -> impl Iterator<Item = &'static str> 
 /// Pull-time contract dispatch for auxiliary (non-ASR) runtime packs.
 ///
 /// Returns `None` when `metadata` does not declare one of the known aux
-/// `general.architecture` values, so the caller (`validate_native_runtime_model_pack_contract`)
+/// `general.architecture` values, so the caller (`verify_native_runtime_model_pack_path`)
 /// falls through to ASR family-adapter selection -- which then fails closed on
 /// its own for a pack that matches neither table. Returns `Some((kind,
 /// result))` when an aux family claims the pack, `result` being that family's
@@ -354,7 +412,7 @@ mod tests {
     /// `OpenAsrArchitectureDescriptor::model_architecture`. A collision would
     /// otherwise be resolved by chain/table iteration order instead of an
     /// explicit `Ambiguous` error -- exactly the silent-shadowing failure mode
-    /// `GgmlFamilyRegistry::select_from_fields` refuses to allow within the ASR
+    /// The canonical architecture registry refuses to allow within the ASR
     /// table.
     #[test]
     fn aux_pack_architecture_ids_are_unique_and_disjoint_from_asr() {
@@ -389,6 +447,48 @@ mod tests {
                 "auxiliary family '{}' lost its ownership contract",
                 descriptor.architecture_id,
             );
+        }
+    }
+
+    #[test]
+    fn auxiliary_catalog_family_ids_are_nonempty_and_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for descriptor in AUX_PACK_DESCRIPTORS {
+            assert!(
+                !descriptor.catalog_family_id.trim().is_empty(),
+                "auxiliary architecture '{}' has an empty catalog family id",
+                descriptor.architecture_id,
+            );
+            assert!(
+                seen.insert(descriptor.catalog_family_id),
+                "duplicate auxiliary catalog family id: {}",
+                descriptor.catalog_family_id,
+            );
+            assert_eq!(
+                auxiliary_catalog_family_id(descriptor.architecture_id),
+                Some(descriptor.catalog_family_id),
+            );
+        }
+    }
+
+    #[test]
+    fn every_auxiliary_quantization_contract_is_owned_by_its_descriptor() {
+        for descriptor in AUX_PACK_DESCRIPTORS {
+            let quantization = descriptor.quantization_classification;
+            assert_eq!(
+                quantization.model_architecture(),
+                descriptor.architecture_id,
+                "auxiliary family '{}' has a quantization contract owned by '{}', not itself",
+                descriptor.architecture_id,
+                quantization.model_architecture(),
+            );
+            if let crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
+                reason,
+                ..
+            } = quantization
+            {
+                assert!(!reason.trim().is_empty());
+            }
         }
     }
 

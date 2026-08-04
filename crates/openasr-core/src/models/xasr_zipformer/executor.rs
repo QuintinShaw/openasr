@@ -7,12 +7,12 @@ use std::path::Path;
 use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription, WordTimestamp};
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
 use crate::models::frame_sync_streaming_driver::FrameSyncStreamingTranscriptDriver;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
-    GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
-    GgmlAsrViewExecutor,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 
@@ -91,7 +91,7 @@ pub(crate) fn transcribe_xasr_zipformer_pcm(
 fn transcribe_xasr_zipformer_pcm_cached(
     runtime_pool: &XasrRuntimeActorPool,
     samples: &[f32],
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -140,7 +140,18 @@ impl Default for XasrZipformerGgmlExecutor {
     }
 }
 
+impl XasrZipformerGgmlExecutor {
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_pool
+            .evict_where(|(key, _lane)| key.pack_content_id == pack_content_id);
+    }
+}
+
 impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        XasrZipformerGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         crate::arch::XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID
     }
@@ -176,13 +187,11 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
                 reason,
             )
         };
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        let preflight = &request.runtime_source_preflight;
         let output = transcribe_xasr_zipformer_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
-            &preflight,
+            preflight,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
@@ -250,9 +259,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             reject_xasr_phrase_bias(&request.selected_family)?;
         }
 
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        let preflight = &request.runtime_source_preflight;
         // The pool key and the prepared encoder graph bake the backend at
         // checkout, so the session's execution preference must be installed
         // before the runtime is selected.
@@ -261,7 +268,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
         );
         let runtime = checkout_prepared_runtime(
             &self.runtime_pool,
-            &preflight,
+            preflight,
             request.resolved_runtime.backend(),
         )
         .map_err(fail)?;

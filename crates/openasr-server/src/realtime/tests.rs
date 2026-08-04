@@ -1,6 +1,6 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
-use std::{collections::BTreeMap, fs, num::NonZeroUsize};
+use std::{fs, num::NonZeroUsize};
 
 use super::*;
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
@@ -173,131 +173,25 @@ fn required_env_path(name: &str) -> PathBuf {
     path
 }
 
-fn native_streaming_fixture_metadata(
-    model_id: &str,
-    family: &str,
-    architecture: &str,
-    audio_frontend: &str,
-    decode_policy: &str,
-    tokenizer: &str,
-) -> BTreeMap<String, String> {
-    let mut metadata = BTreeMap::new();
-    metadata.insert("openasr.model.id".to_string(), model_id.to_string());
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
-        openasr_core::models::oasr_metadata::OASR_PACKAGE_VERSION_V1.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
-        family.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
-        architecture.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
-        audio_frontend.to_string(),
-    );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY.to_string(),
-        decode_policy.to_string(),
-    );
-    metadata.insert(
-        openasr_core::GGML_TOKENIZER_ID_KEY.to_string(),
-        tokenizer.to_string(),
-    );
-    metadata
-}
-
-fn write_native_streaming_fixture_pack(
-    path: &std::path::Path,
-    model_id: &str,
-    family: &str,
-    architecture: &str,
-    audio_frontend: &str,
-    decode_policy: &str,
-    tokenizer: &str,
-) {
-    let metadata = native_streaming_fixture_metadata(
-        model_id,
-        family,
-        architecture,
-        audio_frontend,
-        decode_policy,
-        tokenizer,
-    );
-    let spec = openasr_core::testing::TinyGgufFixtureSpec::new(metadata);
-    openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
-        .expect("write native streaming fixture pack");
-}
-
 fn write_xasr_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
-    write_native_streaming_fixture_pack(
-        path,
-        model_id,
-        "xasr-zipformer",
-        openasr_core::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
-        openasr_core::XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
-        openasr_core::XASR_ZIPFORMER_DECODE_POLICY_ID,
-        openasr_core::XASR_ZIPFORMER_TOKENIZER_ID,
-    );
+    let spec = openasr_core::testing::TinyGgufFixtureSpec::
+        xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+    openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
+        .expect("write xasr native streaming fixture pack");
 }
 
 fn write_qwen_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
-    let mut metadata = native_streaming_fixture_metadata(
-        model_id,
-        openasr_core::QWEN3_ASR_MODEL_FAMILY,
-        openasr_core::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-        openasr_core::QWEN3_ASR_AUDIO_FRONTEND_ID,
-        openasr_core::QWEN3_ASR_DECODE_POLICY_ID,
-        openasr_core::QWEN3_ASR_TOKENIZER_ID,
-    );
-    // Session construction now proves the decoder-state envelope before it
-    // accepts audio. This fixture therefore declares the complete semantic
-    // shape contract used by that planner, while deliberately omitting real
-    // weights: these realtime tests exercise lifecycle/capability plumbing,
-    // not Qwen graph execution.
-    for (key, value) in [
-        ("general.architecture", "qwen3-asr"),
-        ("qwen3-asr.sample_rate", "16000"),
-        ("qwen3-asr.n_mels", "8"),
-        ("qwen3-asr.n_fft", "400"),
-        ("qwen3-asr.win_length", "400"),
-        ("qwen3-asr.hop_length", "160"),
-        ("qwen3-asr.audio.n_layers", "2"),
-        ("qwen3-asr.audio.d_model", "16"),
-        ("qwen3-asr.audio.n_heads", "2"),
-        ("qwen3-asr.llm.n_layers", "2"),
-        ("qwen3-asr.llm.d_model", "16"),
-        ("qwen3-asr.llm.n_heads", "2"),
-        ("qwen3-asr.llm.n_kv_heads", "2"),
-        ("qwen3-asr.llm.head_dim", "8"),
-        ("qwen3-asr.llm.vocab_size", "32"),
-        ("qwen3-asr.llm.max_pos", "4096"),
-        ("qwen3-asr.audio_start_token_id", "2"),
-        ("qwen3-asr.audio_end_token_id", "3"),
-        ("qwen3-asr.audio_pad_token_id", "4"),
-        ("qwen3-asr.eos_token_id", "0"),
-        ("qwen3-asr.pad_token_id", "6"),
-    ] {
-        metadata.insert(key.to_string(), value.to_string());
-    }
-    let spec = openasr_core::testing::TinyGgufFixtureSpec::new(metadata);
+    let spec =
+        openasr_core::testing::TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready(model_id);
     openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
         .expect("write qwen native streaming fixture pack");
 }
 
 fn write_moonshine_streaming_fixture_pack(path: &std::path::Path, model_id: &str) {
-    write_native_streaming_fixture_pack(
-        path,
-        model_id,
-        openasr_core::MOONSHINE_MODEL_FAMILY,
-        openasr_core::MOONSHINE_GGML_ARCHITECTURE_ID,
-        openasr_core::MOONSHINE_AUDIO_FRONTEND_ID,
-        openasr_core::MOONSHINE_DECODE_POLICY_ID,
-        openasr_core::MOONSHINE_TOKENIZER_ID,
-    );
+    let spec =
+        openasr_core::testing::TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(model_id);
+    openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
+        .expect("write moonshine native streaming fixture pack");
 }
 
 fn read_wav_mono_16k_pcm16(path: &std::path::Path) -> Result<Vec<i16>, String> {
@@ -566,7 +460,9 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
     // strictly before this result became observable above -- so this must
     // already succeed, not merely "eventually".
     assert!(
-        runtime.acquire_native_execution(None).is_ok(),
+        runtime
+            .acquire_native_execution("test-content", None)
+            .is_ok(),
         "the model-capacity permit must already be free once the canceled job's result is observed"
     );
 }
@@ -2699,7 +2595,7 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
         model_pack_path: Some(pack_path),
     };
     let occupied_slot = runtime
-        .acquire_native_execution(None)
+        .acquire_native_execution("test-content", None)
         .expect("fixture runtime must admit the active native session");
 
     tokio::time::timeout(
@@ -2710,12 +2606,16 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
     .expect("boot warm-up must skip instead of waiting for a busy model slot");
 
     assert!(
-        runtime.acquire_native_execution(None).is_err(),
+        runtime
+            .acquire_native_execution("test-content", None)
+            .is_err(),
         "the only capacity slot must still belong to the active native session"
     );
     drop(occupied_slot);
     assert!(
-        runtime.acquire_native_execution(None).is_ok(),
+        runtime
+            .acquire_native_execution("test-content", None)
+            .is_ok(),
         "skipped boot warm-up must not retain a capacity permit"
     );
 }
@@ -3994,7 +3894,7 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
             Some(openasr_core::ResolvedExecutionRoute::cpu())
         });
     let occupied_slot = runtime
-        .acquire_native_execution(occupied_route.as_ref())
+        .acquire_native_execution(&format!("native:{model_id}"), occupied_route.as_ref())
         .expect("fixture runtime must admit the occupied native session");
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
@@ -4212,7 +4112,6 @@ async fn local_native_streaming_session_rejects_voice_id() {
         .start_session(StartSession {
             model: Some(model_id.to_string()),
             partial_results: Some(true),
-            word_timestamps: Some(true),
             diarize: Some(true),
             ..StartSession::default()
         })

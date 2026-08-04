@@ -1,17 +1,22 @@
 //! Loader for speaker-embedder weight packs.
 //!
 //! Unlike the tiny vendored Stream-VAD model, speaker embedders are delivered as
-//! pulled `.oasr` packs, so weights are read from a file path at runtime — never
-//! `include_bytes!`. Raw safetensors remain supported as a dev fast path. `.oasr`
-//! packs are materialized into logical f32 buffers for the pure-Rust forward
-//! passes.
+//! pulled `.oasr` packs and production runtime construction receives a verified
+//! preflight rather than reopening a path. Raw safetensors remain a test-only
+//! converter/parity fixture. Packs are materialized into logical f32 buffers
+//! for the pure-Rust forward passes.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 
 use thiserror::Error;
 
-use crate::ggml_runtime::GgmlRuntimeSource;
+#[cfg(test)]
+use crate::models::{
+    aux_pack_registry::AuxPackKind,
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier},
+};
 
 #[derive(Debug, Error)]
 pub enum WeightsError {
@@ -57,6 +62,7 @@ pub(crate) struct Weights {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct SafetensorsWeightsQuote {
     pub(crate) retained_bytes: u64,
     pub(crate) parser_peak_bytes: u64,
@@ -106,6 +112,7 @@ impl Weights {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn quoted_safetensors_materialization(
         bytes: &[u8],
     ) -> Result<SafetensorsWeightsQuote, WeightsError> {
@@ -142,6 +149,7 @@ impl Weights {
     }
 
     /// Parse a safetensors byte buffer.
+    #[cfg(test)]
     pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
         let path = Path::new("<raw-safetensors-runtime-source>");
         let (data_offset, header) =
@@ -197,29 +205,13 @@ impl Weights {
     /// by pure-Rust forward passes, so no ggml dim reversal is applied on write
     /// or read. Quantized tensors are dequantized here into that same logical
     /// f32 order.
+    #[cfg(test)]
     pub(crate) fn from_oasr(path: &Path) -> Result<Self, WeightsError> {
-        // Explicit validate + `from_runtime_source` (equivalent to
-        // `from_path`, which does exactly this internally) so the open
-        // mapping identity/bytes contract is visible at this call site too;
-        // this loader is the sole opener of this pack (no earlier admission
-        // step to reuse), so there is no reopen race here either way.
-        let runtime_source = crate::ggml_runtime::validate_ggml_runtime_source_path(path)
-            .map_err(|e| WeightsError::Gguf(e.to_string()))?;
-        Self::from_runtime_source(&runtime_source)
-    }
-
-    /// Parse weights from the same already-open mapping whose content id keys
-    /// the resident runtime. This prevents a path replacement between cache-key
-    /// resolution and weight loading from binding different bytes to that key.
-    pub(crate) fn from_runtime_source(
-        runtime_source: &GgmlRuntimeSource,
-    ) -> Result<Self, WeightsError> {
-        let preflight =
-            crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-                runtime_source,
-            )
+        let verified_pack = PackVerifier
+            .verify_candidate(PackCandidate::new(path))
             .map_err(|error| WeightsError::Gguf(error.to_string()))?;
-        Self::from_preflight(&preflight)
+        ensure_diarization_pack_route(&verified_pack)?;
+        Self::from_preflight(verified_pack.preflight())
     }
 
     pub(crate) fn from_preflight(
@@ -294,6 +286,26 @@ impl Weights {
     }
 }
 
+#[cfg(test)]
+fn ensure_diarization_pack_route(
+    verified_pack: &crate::models::pack_verifier::VerifiedPack,
+) -> Result<(), WeightsError> {
+    if matches!(
+        verified_pack.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::Diarization,
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    Err(WeightsError::Gguf(format!(
+        "ReDimNet pack route is not auxiliary diarization: {:?}",
+        verified_pack.route()
+    )))
+}
+
+#[cfg(test)]
 fn quote_safetensors_header(
     header: &crate::models::local_source_import::SafetensorsHeader,
 ) -> Result<u64, WeightsError> {

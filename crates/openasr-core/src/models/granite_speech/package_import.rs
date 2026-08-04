@@ -39,28 +39,18 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::ggml_runtime::{
-    GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, read_gguf_tensor_index,
-    write_gguf_file_v0,
-};
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
+use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType, GgufWriteValue};
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
     read_source_json_file, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
-    insert_metadata_string_array,
+    OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
 };
-use crate::models::pack_quant::PackQuant;
+use crate::models::pack_quant::{PackQuant, TensorQuantizationContract};
 use crate::nn::half::f32_to_f16_bits;
 
-use crate::arch::{
-    GRANITE_SPEECH_AUDIO_FRONTEND_ID, GRANITE_SPEECH_DECODE_POLICY_ID,
-    GRANITE_SPEECH_GGML_ARCHITECTURE_ID, GRANITE_SPEECH_MODEL_FAMILY, GRANITE_SPEECH_TOKENIZER_ID,
-};
+use crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID;
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_INDEX_JSON: &str = "model.safetensors.index.json";
@@ -76,6 +66,13 @@ pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 pub(crate) const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
 pub type GraniteSpeechQuantizationMode = PackQuant;
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder.", "projector."];
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };
 
 #[derive(Debug, Clone)]
 pub struct GraniteSpeechImportRequest {
@@ -374,37 +371,7 @@ fn granite_speech_runtime_gguf_metadata(
     merges: &[String],
 ) -> BTreeMap<String, GgufWriteValue> {
     let mut metadata = BTreeMap::new();
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_PACKAGE_VERSION,
-        OASR_PACKAGE_VERSION_V1,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_FAMILY,
-        GRANITE_SPEECH_MODEL_FAMILY,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
-    );
     insert_metadata(&mut metadata, "openasr.model.id", request.model_id.as_str());
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        GRANITE_SPEECH_AUDIO_FRONTEND_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_DECODE_POLICY,
-        GRANITE_SPEECH_DECODE_POLICY_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        GGML_TOKENIZER_ID_KEY,
-        GRANITE_SPEECH_TOKENIZER_ID,
-    );
     insert_metadata(
         &mut metadata,
         "granite_speech.audio_token_index",
@@ -612,21 +579,22 @@ pub fn convert_local_granite_speech_source_to_runtime_pack(
     let merges = load_granite_speech_merges(&request.source_root)?;
     let metadata = granite_speech_runtime_gguf_metadata(&config, request, &vocab_tokens, &merges);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(GRANITE_SPEECH_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "granite-speech GGUF writer failed for '{}': {error}",
+            "granite-speech OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "granite-speech import produced an unreadable tensor index: {error}"
-        ))
-    })?;
     Ok(GraniteSpeechImportResult {
         output_path: request.output_root.clone(),
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
     })
 }
 

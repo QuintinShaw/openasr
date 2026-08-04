@@ -20,3 +20,6 @@ OPENASR_GGML_BACKEND = { value = "cpu", force = false }
 # actually crosses the wire. `force = false` still lets a one-off invocation
 # override it.
 TS_RS_LARGE_INT = { value = "number", force = false }
+
+[alias]
+xtask = "run --package openasr-xtask --"

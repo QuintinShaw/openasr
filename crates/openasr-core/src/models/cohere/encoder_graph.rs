@@ -23,6 +23,12 @@ const GGML_TYPE_F16: i32 = 1;
 const COHERE_DEBUG_ENCODER_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER";
 const COHERE_DEBUG_ENCODER_BUILD_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER_BUILD";
 
+enum RuntimeWeightSource<'a> {
+    Verified(&'a GgufRuntimeSourcePreflight),
+    #[cfg(test)]
+    Synthetic,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CohereTranscribeEncoderOutput {
     pub frame_count: usize,
@@ -138,14 +144,15 @@ fn loaded_or_static_tensor<'a>(
         .unwrap_or_else(|| arena.graph_tensor(tensor))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn encode_cohere_transcribe_audio_embeddings_from_weights(
     weights: &CohereTranscribeEncoderWeights,
     metadata: CohereTranscribeExecutionMetadata,
     mel_features: &CohereTranscribeMelFeatures,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
-    let mut runtime = CohereTranscribeEncoderGraphRuntime::new(weights, metadata, None, backend)?;
+    let mut runtime =
+        CohereTranscribeEncoderGraphRuntime::new_synthetic(weights, metadata, backend)?;
     runtime.encode(mel_features)
 }
 
@@ -153,7 +160,30 @@ impl CohereTranscribeEncoderGraphRuntime {
     pub(crate) fn new(
         weights: &CohereTranscribeEncoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, CohereTranscribeEncoderError> {
+        Self::new_impl(
+            weights,
+            metadata,
+            RuntimeWeightSource::Verified(runtime_preflight),
+            backend,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_synthetic(
+        weights: &CohereTranscribeEncoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, CohereTranscribeEncoderError> {
+        Self::new_impl(weights, metadata, RuntimeWeightSource::Synthetic, backend)
+    }
+
+    fn new_impl(
+        weights: &CohereTranscribeEncoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        runtime_source: RuntimeWeightSource<'_>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, CohereTranscribeEncoderError> {
         let build_debug = std::env::var_os(COHERE_DEBUG_ENCODER_BUILD_ENV).is_some();
@@ -177,11 +207,18 @@ impl CohereTranscribeEncoderGraphRuntime {
             }
         })?;
         let runner_ms = runner_start.elapsed().as_secs_f64() * 1000.0;
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
-            runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+        let loaded_weights = match runtime_source {
+            RuntimeWeightSource::Verified(preflight) => Some(
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
+                        step: "load_gguf_weight_context",
+                        source,
+                    })?,
+            ),
+            #[cfg(test)]
+            RuntimeWeightSource::Synthetic => None,
+        };
         let arena_start = Instant::now();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
@@ -1871,12 +1908,12 @@ mod tests {
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
     use crate::validate_ggml_runtime_source_path;
     use crate::{
-        GgmlAsrRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
+        GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
         read_gguf_tensor_index_from_runtime_source,
     };
     use tempfile::{NamedTempFile, TempPath};
 
-    fn write_runtime_ready_preflight() -> (TempPath, GgmlAsrRuntimeSourcePreflight) {
+    fn write_runtime_ready_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
         let file = NamedTempFile::new().expect("temp file");
         let persisted = file.into_temp_path();
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_non_streaming_cpu("cohere-runtime-fixture")
@@ -1892,7 +1929,7 @@ mod tests {
             .expect("read gguf tensor index");
         (
             persisted,
-            GgmlAsrRuntimeSourcePreflight {
+            GgufRuntimeSourcePreflight {
                 runtime_source,
                 metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),

@@ -4,13 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
-use crate::models::ggml_family_registry::{
+use crate::arch::{
     COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
     COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, COHERE_TRANSCRIBE_TOKENIZER_ID,
-    WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ARCHITECTURE_ID,
-    WHISPER_TOKENIZER_ID,
+    DOLPHIN_AUDIO_FRONTEND_ID, DOLPHIN_DECODE_POLICY_ID, DOLPHIN_GGML_ARCHITECTURE_ID,
+    DOLPHIN_TOKENIZER_ID, WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID,
+    WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID,
 };
+use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
@@ -186,6 +187,69 @@ impl TinyGgufFixtureSpec {
         }
     }
 
+    /// Metadata-complete Dolphin fixture used by capability probes that must
+    /// pass the shared package/runtime verifier before reading the tensor
+    /// index. The one placeholder tensor is intentional: these tests exercise
+    /// adapter selection and Dolphin's optional context-module probe, not a
+    /// decode. Keep the scalar values internally consistent with the
+    /// architecture contract (head_dim * n_heads == d_model, even cgMLP
+    /// units, odd convolution kernels, and in-range token ids).
+    pub fn dolphin_oasr_v1_runtime_metadata_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "dolphin".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            DOLPHIN_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            DOLPHIN_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            DOLPHIN_TOKENIZER_ID.to_string(),
+        );
+        metadata.insert(
+            "general.architecture".to_string(),
+            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        for (key, value) in [
+            ("dolphin.encoder.n_layers", "12"),
+            ("dolphin.encoder.d_model", "768"),
+            ("dolphin.encoder.n_heads", "12"),
+            ("dolphin.encoder.head_dim", "64"),
+            ("dolphin.encoder.ffn_dim", "3072"),
+            ("dolphin.encoder.cgmlp_units", "3072"),
+            ("dolphin.encoder.cgmlp_kernel", "31"),
+            ("dolphin.encoder.merge_kernel", "31"),
+            ("dolphin.encoder.feature_dim", "80"),
+            ("dolphin.encoder.max_ctx", "5000"),
+            ("dolphin.decoder.n_layers", "12"),
+            ("dolphin.decoder.n_heads", "12"),
+            ("dolphin.decoder.ffn_dim", "3072"),
+            ("dolphin.decoder.max_ctx", "5000"),
+            ("dolphin.vocab_size", "18173"),
+            ("dolphin.sos_token_id", "2"),
+            ("dolphin.eos_token_id", "3"),
+            ("ctc.blank_token_id", "0"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
     pub fn whisper_oasr_v1_non_streaming_cpu(model_id: impl Into<String>) -> Self {
         let model_id = model_id.into();
         let mut metadata = BTreeMap::new();
@@ -220,7 +284,7 @@ impl TinyGgufFixtureSpec {
     pub fn whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
         model_id: impl Into<String>,
     ) -> Self {
-        Self::whisper_oasr_v1_encoder_graph_one_layer(model_id)
+        Self::whisper_oasr_v1_encoder_graph_one_layer(model_id).with_whisper_minimal_tokenizer()
     }
 
     /// Production-window metadata and positional tensors, but still no
@@ -451,6 +515,57 @@ impl TinyGgufFixtureSpec {
         Self::new(metadata)
     }
 
+    /// Fully verifier-ready one-layer Moonshine skeleton. The deterministic
+    /// payloads are not quality fixtures; their shapes exist so install,
+    /// catalog binding, and capability tests cross the same tensor-contract
+    /// seam as a production pack without borrowing another family's route.
+    pub fn moonshine_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut spec = Self::moonshine_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        for (name, dims) in [
+            // Keep the last dimension > 1: GGUF canonical shape projection
+            // drops trailing singleton axes, while the Moonshine contract
+            // intentionally requires rank-3 convolution kernels.
+            ("enc.conv1.weight", vec![1, 1, 2]),
+            ("enc.conv2.weight", vec![1, 1, 2]),
+            ("enc.conv3.weight", vec![1, 1, 2]),
+            ("enc.conv2.bias", vec![1]),
+            ("enc.conv3.bias", vec![16]),
+            ("enc.groupnorm.weight", vec![16]),
+            ("enc.groupnorm.bias", vec![16]),
+            ("enc.out_norm.weight", vec![16]),
+            ("dec.out_norm.weight", vec![16]),
+            ("dec.emb.weight", vec![4, 16]),
+            ("enc.blk.0.attn_norm.weight", vec![16]),
+            ("enc.blk.0.ffn_norm.weight", vec![16]),
+            ("enc.blk.0.ffn_down.bias", vec![16]),
+            ("enc.blk.0.attn_q.weight", vec![16, 16]),
+            ("enc.blk.0.attn_k.weight", vec![16, 16]),
+            ("enc.blk.0.attn_v.weight", vec![16, 16]),
+            ("enc.blk.0.attn_o.weight", vec![16, 16]),
+            ("enc.blk.0.ffn_up.weight", vec![64, 16]),
+            ("enc.blk.0.ffn_up.bias", vec![64]),
+            ("enc.blk.0.ffn_down.weight", vec![16, 64]),
+            ("dec.blk.0.attn_norm.weight", vec![16]),
+            ("dec.blk.0.cross_norm.weight", vec![16]),
+            ("dec.blk.0.ffn_norm.weight", vec![16]),
+            ("dec.blk.0.ffn_down.bias", vec![16]),
+            ("dec.blk.0.attn_q.weight", vec![16, 16]),
+            ("dec.blk.0.attn_k.weight", vec![16, 16]),
+            ("dec.blk.0.attn_v.weight", vec![16, 16]),
+            ("dec.blk.0.attn_o.weight", vec![16, 16]),
+            ("dec.blk.0.cross_q.weight", vec![16, 16]),
+            ("dec.blk.0.cross_k.weight", vec![16, 16]),
+            ("dec.blk.0.cross_v.weight", vec![16, 16]),
+            ("dec.blk.0.cross_o.weight", vec![16, 16]),
+            ("dec.blk.0.ffn_up.weight", vec![128, 16]),
+            ("dec.blk.0.ffn_up.bias", vec![128]),
+            ("dec.blk.0.ffn_down.weight", vec![16, 64]),
+        ] {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
     /// Metadata-complete Qwen3-ASR routing fixture. As with the Moonshine
     /// counterpart, its placeholder tensor deliberately proves that failure
     /// happens inside the selected family executor rather than in topology
@@ -506,6 +621,122 @@ impl TinyGgufFixtureSpec {
             ("qwen3-asr.audio_pad_token_id", "4"),
             ("qwen3-asr.eos_token_id", "0"),
             ("qwen3-asr.pad_token_id", "6"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        Self::new(metadata)
+    }
+
+    /// Fully verifier-ready Qwen3-ASR skeleton. Descriptor-owned tensor
+    /// requirements are projected into canonical tiny shapes so the fixture
+    /// automatically follows additions to the shared runtime tensor contract;
+    /// the convolution stem stays explicit because its chained channel and
+    /// frequency geometry is a family mathematical invariant.
+    pub fn qwen3_asr_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::tensor_binding::TensorBindingDescriptorRequirement;
+
+        let mut spec = Self::qwen3_asr_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(&spec.metadata)
+                .expect("shared Qwen fixture metadata must parse");
+        for (name, dims) in [
+            ("audio.mel_filters", vec![8, 201]),
+            ("audio.mel_window", vec![400]),
+            ("audio.conv.1.weight", vec![3, 3, 1, 2]),
+            ("audio.conv.1.bias", vec![2]),
+            ("audio.conv.2.weight", vec![3, 3, 2, 2]),
+            ("audio.conv.2.bias", vec![2]),
+            ("audio.conv.3.weight", vec![3, 3, 2, 2]),
+            ("audio.conv.3.bias", vec![2]),
+            ("audio.conv_out.weight", vec![2, 16]),
+            ("audio.ln_post.weight", vec![16]),
+            ("audio.ln_post.bias", vec![16]),
+            ("audio.proj1.weight", vec![16, 16]),
+            ("audio.proj1.bias", vec![16]),
+            ("audio.proj2.weight", vec![16, 16]),
+            ("audio.proj2.bias", vec![16]),
+        ] {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        for descriptor in
+            crate::models::qwen::runtime_contract::qwen3_runtime_tensor_descriptors(metadata)
+        {
+            let dims = match descriptor.requirement {
+                TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
+                TensorBindingDescriptorRequirement::VectorLen(len) => vec![len],
+                TensorBindingDescriptorRequirement::NonEmptyVector => vec![1],
+                TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![dim, dim],
+                TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs)
+                | TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(lhs, rhs) => {
+                    vec![lhs, rhs]
+                }
+                TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+                    min_rank,
+                    axis,
+                    dim,
+                } => {
+                    let mut dims = vec![1; min_rank.max(axis.saturating_add(1))];
+                    dims[axis] = dim;
+                    dims
+                }
+            };
+            spec = spec.with_tensor_shape(
+                descriptor.tensor_name,
+                dims.into_iter().map(|dim| dim as u64),
+            );
+        }
+        spec
+    }
+
+    /// Metadata-complete X-ASR Zipformer routing fixture. Its placeholder
+    /// tensor is deliberately non-runnable: capability and request-gating
+    /// tests use it to prove adapter selection before graph construction.
+    pub fn xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "xasr-zipformer".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::XASR_ZIPFORMER_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::XASR_ZIPFORMER_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::XASR_ZIPFORMER_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", "xasr-zipformer"),
+            ("xasr.num_stacks", "1"),
+            ("xasr.num_encoder_layers", "1"),
+            ("xasr.encoder_dims", "16"),
+            ("xasr.query_head_dims", "8"),
+            ("xasr.value_head_dims", "8"),
+            ("xasr.num_heads", "2"),
+            ("xasr.cnn_module_kernels", "3"),
+            ("xasr.left_context_len", "16"),
+            ("xasr.downsampling_factors", "1"),
+            ("xasr.feature_dim", "8"),
+            ("xasr.decode_chunk_len", "4"),
+            ("xasr.joiner_dim", "16"),
+            ("xasr.decoder_context_size", "2"),
+            ("xasr.vocab_size", "32"),
+            ("xasr.blank_id", "0"),
         ] {
             metadata.insert(key.to_string(), value.to_string());
         }
@@ -2120,6 +2351,7 @@ fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::pack_verifier::{PackCandidate, PackVerifier};
     use crate::{read_gguf_metadata, read_gguf_tensor_index};
     use std::fs;
     use tempfile::NamedTempFile;
@@ -2133,6 +2365,49 @@ mod tests {
                 purpose: "fixture".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn shared_runtime_ready_family_skeletons_pass_the_production_pack_verifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "whisper.oasr",
+                TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+                    "whisper-fixture",
+                ),
+                "whisper",
+            ),
+            (
+                "moonshine.oasr",
+                TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-fixture"),
+                "moonshine",
+            ),
+            (
+                "qwen.oasr",
+                TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture"),
+                "qwen",
+            ),
+            (
+                "xasr.oasr",
+                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
+                    "xasr-fixture",
+                ),
+                "xasr-zipformer",
+            ),
+        ];
+        for (name, spec, expected_catalog_family) in cases {
+            let path = temp.path().join(name);
+            write_tiny_gguf_runtime_source(&path, &spec).unwrap();
+            let verified = PackVerifier
+                .verify_candidate(PackCandidate::new(&path))
+                .unwrap_or_else(|error| panic!("{name} must verify: {error}"));
+            assert_eq!(
+                verified.catalog_family_id(),
+                Some(expected_catalog_family),
+                "{name}"
+            );
+        }
     }
 
     #[test]

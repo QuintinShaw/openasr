@@ -151,15 +151,7 @@ impl PolicyResolvedDiariZenSegmenterRuntime {
         )
         .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
         let services_for_builder = Arc::clone(&execution_services);
-        let PreparedSegmenterSource::Gguf {
-            preflight,
-            content_id,
-        } = prepared.source
-        else {
-            return Err(SegmentError::LoadFailed(
-                "DiariZen runtime requires a GGUF .oasr source".to_string(),
-            ));
-        };
+        let (preflight, content_id) = prepared.source.into_parts();
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
             load_diarizen_actor(
                 services_for_builder.as_ref(),
@@ -310,19 +302,11 @@ fn build_admitted_pyannote(
     )
     .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
     let transaction = SystemMemoryOwner::try_allocate_transaction(quote, || {
-        let segmenter = match source {
-            PreparedSegmenterSource::Gguf { preflight, .. } => {
-                let snapshot = preflight
-                    .immutable_snapshot_matching_content_id(expected_content_id)
-                    .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-                PyannoteSegmenter::from_preflight(&snapshot).map_err(weights_error)?
-            }
-            PreparedSegmenterSource::Safetensors { path, .. } => {
-                let snapshot =
-                    super::pack::immutable_safetensors_snapshot(path, expected_content_id)?;
-                PyannoteSegmenter::from_safetensors(&snapshot).map_err(weights_error)?
-            }
-        };
+        let snapshot = source
+            .preflight()
+            .immutable_snapshot_matching_content_id(expected_content_id)
+            .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+        let segmenter = PyannoteSegmenter::from_preflight(&snapshot).map_err(weights_error)?;
         let actual_retained = segmenter
             .persistent_host_commitment_bytes()
             .map_err(weights_error)?;
@@ -343,49 +327,22 @@ fn build_admitted_pyannote(
 }
 
 fn pyannote_source_quote(source: &PreparedSegmenterSource) -> Result<(u64, u64), SegmentError> {
-    match source {
-        PreparedSegmenterSource::Gguf {
-            preflight,
-            content_id,
-        } => {
-            if preflight.runtime_source.content_id() != content_id {
-                return Err(content_changed(
-                    "segmenter",
-                    content_id,
-                    preflight.runtime_source.content_id(),
-                ));
-            }
-            let retained =
-                PyannoteSegmenter::quoted_persistent_host_commitment_bytes(&preflight.tensor_index)
-                    .map_err(weights_error)?;
-            let peak = preflight
-                .runtime_source
-                .immutable_snapshot_construction_peak_bytes(retained)
-                .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
-            Ok((retained, peak))
-        }
-        PreparedSegmenterSource::Safetensors {
-            source_bytes,
-            retained_quote,
-            parser_peak_quote,
-            ..
-        } => {
-            let copy_peak = source_bytes.checked_mul(2).ok_or_else(|| {
-                SegmentError::LoadFailed(
-                    "raw safetensors snapshot copy byte quote overflowed".to_string(),
-                )
-            })?;
-            let materialization_peak = source_bytes
-                .checked_add(*retained_quote)
-                .and_then(|bytes| bytes.checked_add(*parser_peak_quote))
-                .ok_or_else(|| {
-                    SegmentError::LoadFailed(
-                        "raw safetensors materialization byte quote overflowed".to_string(),
-                    )
-                })?;
-            Ok((*retained_quote, copy_peak.max(materialization_peak)))
-        }
+    let preflight = source.preflight();
+    if preflight.runtime_source.content_id() != source.content_id() {
+        return Err(content_changed(
+            "segmenter",
+            source.content_id(),
+            preflight.runtime_source.content_id(),
+        ));
     }
+    let retained =
+        PyannoteSegmenter::quoted_persistent_host_commitment_bytes(&preflight.tensor_index)
+            .map_err(weights_error)?;
+    let peak = preflight
+        .runtime_source
+        .immutable_snapshot_construction_peak_bytes(retained)
+        .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+    Ok((retained, peak))
 }
 
 fn weights_error(error: WeightsError) -> SegmentError {

@@ -17,6 +17,7 @@ from typing import Iterable
 @dataclass(frozen=True)
 class Family:
     name: str
+    inventory_profile_id: str
     source: str
     output_name: str
     import_args: tuple[str, ...]
@@ -42,6 +43,7 @@ class FamilySmokeResult:
 FAMILIES: tuple[Family, ...] = (
     Family(
         name="qwen",
+        inventory_profile_id="qwen",
         source="tmp/models/qwen3-asr/Qwen-source",
         output_name="qwen3-asr-0.6b-q4_k.streaming.oasr",
         import_args=(
@@ -64,6 +66,7 @@ FAMILIES: tuple[Family, ...] = (
     ),
     Family(
         name="whisper",
+        inventory_profile_id="whisper",
         source="tmp/models/whisper/hf/whisper-tiny.en",
         output_name="whisper-tiny-en-q4_k.streaming.oasr",
         import_args=(
@@ -84,6 +87,7 @@ FAMILIES: tuple[Family, ...] = (
     ),
     Family(
         name="cohere",
+        inventory_profile_id="cohere",
         source="tmp/models/cohere-transcribe-03-2026/CohereLabs-source",
         output_name="cohere-transcribe-03-2026-q4_k.streaming.oasr",
         import_args=(
@@ -106,6 +110,7 @@ FAMILIES: tuple[Family, ...] = (
     ),
     Family(
         name="moonshine",
+        inventory_profile_id="moonshine",
         source="tmp/models/moonshine-tiny-source",
         output_name="moonshine-tiny-q4_k.streaming.oasr",
         import_args=(
@@ -124,6 +129,7 @@ FAMILIES: tuple[Family, ...] = (
     ),
     Family(
         name="parakeet",
+        inventory_profile_id="parakeet",
         source="tmp/models/parakeet-ctc-0.6b",
         output_name="parakeet-ctc-0.6b-q4_k.streaming.oasr",
         import_args=(
@@ -140,6 +146,7 @@ FAMILIES: tuple[Family, ...] = (
     ),
     Family(
         name="wav2vec2",
+        inventory_profile_id="wav2vec2",
         source="tmp/models/wav2vec2-base-960h-source",
         output_name="wav2vec2-base-960h-q4_k.streaming.oasr",
         import_args=(
@@ -156,6 +163,7 @@ FAMILIES: tuple[Family, ...] = (
     ),
     Family(
         name="xasr",
+        inventory_profile_id="xasr-zipformer",
         source="tmp/models/xasr-zh-en",
         output_name="xasr-zh-en-q4_k.streaming.oasr",
         import_args=(
@@ -172,15 +180,70 @@ FAMILIES: tuple[Family, ...] = (
     ),
 )
 TEMP_STREAMING_PACK_SUFFIX = ".streaming.oasr"
-EXPECTED_RUNTIME_FAMILIES_BY_SMOKE_FAMILY = {
-    "qwen": {"qwen3-asr"},
-    "whisper": {"whisper"},
-    "cohere": {"cohere-transcribe"},
-    "moonshine": {"moonshine"},
-    "parakeet": {"parakeet-ctc"},
-    "wav2vec2": {"wav2vec2-ctc"},
-    "xasr": {"xasr-zipformer"},
-}
+MODEL_FAMILY_INVENTORY_SCHEMA = "openasr.model-family-inventory.v1"
+
+
+def load_model_family_inventory(
+    repo_root: Path,
+    recipes: Iterable[Family],
+) -> dict[str, str]:
+    """Load the generated inventory and project smoke profiles to runtime families.
+
+    The smoke recipes own only local asset details. Runtime family identity is
+    read from the generated inventory so a stale hand-written expectation cannot
+    make a valid pack look like the wrong architecture (or vice versa).
+    """
+
+    recipes = tuple(recipes)
+    path = repo_root / "tooling" / "model-family-inventory.v1.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load model-family inventory {path}: {error}") from error
+    if not isinstance(payload, dict) or payload.get("schema") != MODEL_FAMILY_INVENTORY_SCHEMA:
+        actual = payload.get("schema") if isinstance(payload, dict) else None
+        raise SystemExit(
+            f"model-family inventory schema mismatch: expected "
+            f"{MODEL_FAMILY_INVENTORY_SCHEMA!r}, got {actual!r} ({path})"
+        )
+    rows = payload.get("families")
+    if not isinstance(rows, list) or not rows:
+        raise SystemExit(f"model-family inventory families must be a non-empty list: {path}")
+
+    runtime_family_by_profile: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise SystemExit(f"model-family inventory families[{index}] must be an object: {path}")
+        model_family = row.get("model_family")
+        conformance = row.get("conformance")
+        profile_id = conformance.get("profile_id") if isinstance(conformance, dict) else None
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise SystemExit(
+                f"model-family inventory families[{index}] has no conformance.profile_id: {path}"
+            )
+        if not isinstance(model_family, str) or not model_family.strip():
+            raise SystemExit(
+                f"model-family inventory families[{index}] has no model_family: {path}"
+            )
+        if profile_id in runtime_family_by_profile:
+            raise SystemExit(
+                f"model-family inventory has duplicate conformance.profile_id {profile_id!r}: {path}"
+            )
+        runtime_family_by_profile[profile_id] = model_family
+
+    missing_profiles = sorted(
+        {
+            recipe.inventory_profile_id
+            for recipe in recipes
+            if recipe.inventory_profile_id not in runtime_family_by_profile
+        }
+    )
+    if missing_profiles:
+        raise SystemExit(
+            "native streaming smoke recipe profile(s) missing from model-family inventory: "
+            + ", ".join(missing_profiles)
+        )
+    return runtime_family_by_profile
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -368,16 +431,26 @@ def parse_inspect_metadata(output: str) -> tuple[str, str]:
     return model_identity, runtime_family
 
 
-def check_runtime_family(output: str, family: Family, pack: Path) -> tuple[str, str]:
+def check_runtime_family(
+    output: str,
+    family: Family,
+    pack: Path,
+    runtime_family_by_profile: dict[str, str],
+) -> tuple[str, str]:
     model_identity, runtime_family = parse_inspect_metadata(output)
-    expected = EXPECTED_RUNTIME_FAMILIES_BY_SMOKE_FAMILY.get(family.name, set())
+    try:
+        expected = runtime_family_by_profile[family.inventory_profile_id]
+    except KeyError as error:
+        raise SystemExit(
+            f"native streaming smoke recipe profile '{family.inventory_profile_id}' "
+            "has no loaded runtime-family projection"
+        ) from error
     if not model_identity:
         raise SystemExit(f"{pack} did not report Model identity in show output")
-    if runtime_family not in expected:
-        expected_text = ", ".join(sorted(expected)) or family.name
+    if runtime_family != expected:
         raise SystemExit(
             f"{pack} reported runtime family '{runtime_family or '<missing>'}' "
-            f"for smoke family '{family.name}', expected {expected_text}"
+            f"for smoke family '{family.name}', expected {expected}"
         )
     return model_identity, runtime_family
 
@@ -405,6 +478,7 @@ def smoke_family(
     max_ms: int,
     family: Family,
     skip_import: bool,
+    runtime_family_by_profile: dict[str, str],
     pack_override: str | None = None,
 ) -> FamilySmokeResult:
     source = resolve(repo_root, family.source)
@@ -435,7 +509,12 @@ def smoke_family(
         cwd=repo_root,
     )
     check_inspect_output(inspect_output, output)
-    model_identity, runtime_family = check_runtime_family(inspect_output, family, output)
+    model_identity, runtime_family = check_runtime_family(
+        inspect_output,
+        family,
+        output,
+        runtime_family_by_profile,
+    )
     run_streaming([str(openasr_bin), "verify", str(output)], cwd=repo_root)
     env = os.environ.copy()
     env["OPENASR_NATIVE_STREAMING_SMOKE_PACK"] = str(output)
@@ -608,6 +687,8 @@ def main(argv: Iterable[str]) -> int:
     if args.max_ms <= 0:
         raise SystemExit("--max-ms must be positive")
     repo_root = Path(args.repo_root).resolve()
+    families = selected_families(args.families)
+    runtime_family_by_profile = load_model_family_inventory(repo_root, families)
     openasr_bin = resolve(repo_root, args.bin)
     audio = resolve(repo_root, args.audio)
     workdir = resolve(repo_root, args.workdir)
@@ -616,7 +697,6 @@ def main(argv: Iterable[str]) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     ensure_cli(repo_root, openasr_bin)
 
-    families = selected_families(args.families)
     pack_overrides = parse_pack_overrides(args.pack)
     unselected_overrides = sorted(set(pack_overrides) - {family.name for family in families})
     if unselected_overrides:
@@ -637,6 +717,7 @@ def main(argv: Iterable[str]) -> int:
                 args.max_ms,
                 family,
                 args.skip_import,
+                runtime_family_by_profile,
                 pack_overrides.get(family.name),
             )
         )

@@ -13,7 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::models::ggml_asr_executor::{GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest};
+use crate::arch::OpenAsrArchitectureRegistry;
+use crate::models::ggml_asr_executor::GgmlAsrStreamingSessionRequest;
+use crate::models::pack_verifier::{PackCandidate, PackRoute, PackVerifier};
+use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::{
     GgmlAsrBackendPreference, GgmlAsrExecutionOptions, NativeAsrSession, NativeAsrSessionContext,
     NativeAsrStreamingSessionConfig, RealtimeAudioFormat, RealtimeAudioFrame, RealtimeEvent,
@@ -73,19 +76,47 @@ fn terminal_final_text(events: &[RealtimeEventEnvelope]) -> Option<String> {
     text
 }
 
-fn build_request(pack: &Path, descriptor_id: &str) -> GgmlAsrStreamingSessionRequest {
-    let selected_family = match descriptor_id {
-        "sensevoice" => crate::sensevoice_runtime_descriptor_v1(),
-        "qwen" => crate::qwen3_asr_runtime_descriptor_v1(),
-        "dolphin" => crate::dolphin_runtime_descriptor_v1(),
-        other => panic!("unknown descriptor {other}"),
+fn build_request(pack: &Path) -> GgmlAsrStreamingSessionRequest {
+    // Verify and open the source exactly once. The request retains this
+    // preflight (including its open source generation) through dispatch; the
+    // benchmark must not reconstruct a family from a path or re-run a second
+    // metadata/tensor-index scan before starting the session.
+    let verified_pack = PackVerifier
+        .verify_candidate(PackCandidate::new(pack.to_path_buf()))
+        .expect("benchmark runtime must pass PackVerifier");
+    let PackRoute::Asr {
+        model_architecture, ..
+    } = verified_pack.route()
+    else {
+        panic!("benchmark source is not an ASR pack: {}", pack.display());
     };
+    let model_architecture = *model_architecture;
+    let architecture = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .unwrap_or_else(|| {
+            panic!(
+                "verified benchmark architecture is absent from the canonical inventory: {model_architecture}"
+            )
+        });
+    let selection_metadata = selection_metadata_from_gguf(verified_pack.preflight().metadata());
+    let selected_family = OpenAsrArchitectureRegistry::with_builtins()
+        .select_ggml_adapter_from_gguf_metadata_v1(&selection_metadata)
+        .expect("verified ASR metadata must select one builtin family")
+        .ggml_family_adapter_descriptor();
+    assert_eq!(
+        selected_family.model_architecture, model_architecture,
+        "PackVerifier route and metadata family selection disagree"
+    );
+    assert_eq!(
+        architecture.identity.model_architecture, selected_family.model_architecture,
+        "architecture registry and adapter projection disagree"
+    );
+    let runtime_source_preflight = verified_pack.preflight().clone();
     GgmlAsrStreamingSessionRequest {
         execution_services:
             crate::models::native_execution_services::test_native_execution_services(),
         decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-        runtime_source_path: pack.to_path_buf(),
-        runtime_source_preflight: None,
+        runtime_source_preflight,
         selected_family,
         request_options: GgmlAsrExecutionOptions::default(),
         configured_diarize: false,
@@ -102,24 +133,16 @@ fn build_request(pack: &Path, descriptor_id: &str) -> GgmlAsrStreamingSessionReq
     }
 }
 
-fn start_session(
-    pack: &Path,
-    descriptor_id: &str,
-    partial_results: bool,
-) -> Box<dyn NativeAsrSession> {
-    let mut request = build_request(pack, descriptor_id);
+fn start_session(pack: &Path, partial_results: bool) -> Box<dyn NativeAsrSession> {
+    let mut request = build_request(pack);
     request.session_config = NativeAsrStreamingSessionConfig::new()
         .with_partial_results(partial_results)
         .into();
-    let session = match descriptor_id {
-        "sensevoice" => super::sensevoice::executor::SenseVoiceGgmlExecutor::default()
-            .start_streaming_session(&request),
-        "qwen" => super::qwen::Qwen3AsrGgmlExecutor::default().start_streaming_session(&request),
-        "dolphin" => super::dolphin::executor::DolphinGgmlExecutor::default()
-            .start_streaming_session(&request),
-        other => panic!("unknown descriptor {other}"),
-    };
-    session.expect("streaming session should start")
+    request
+        .execution_services
+        .streaming_dispatch()
+        .start_streaming_session(&request)
+        .expect("streaming session should start")
 }
 
 /// Offline batch reference: a partials-OFF session decodes the full buffer
@@ -127,8 +150,8 @@ fn start_session(
 /// offline `execute()` path — the parity contract's "batch" side. It sees the
 /// SAME audio the streaming run does (speech + 200 ms grace tail), so the tail
 /// cannot be the source of a spurious mismatch.
-fn batch_reference(pack: &Path, descriptor_id: &str, samples: &[f32]) -> String {
-    let mut session = start_session(pack, descriptor_id, false);
+fn batch_reference(pack: &Path, samples: &[f32]) -> String {
+    let mut session = start_session(pack, false);
     session.warm_up().expect("warm up");
     let mut seq = 0;
     for chunk in samples.chunks(320) {
@@ -165,12 +188,11 @@ struct RunOutcome {
 ///   is present, so finalize HITS the cache and reuses that decode.
 fn run_utterance(
     pack: &Path,
-    descriptor_id: &str,
     samples: &[f32],
     poll_every_ms: u64,
     poll_after_tail: bool,
 ) -> RunOutcome {
-    let mut session = start_session(pack, descriptor_id, true);
+    let mut session = start_session(pack, true);
     session.warm_up().expect("warm up");
     let mut seq = 0u64;
     let mut last_poll_ms = 0u64;
@@ -229,7 +251,7 @@ fn run_family_bench(descriptor_id: &str, pack: &Path, wav: &Path, iters: usize) 
         "[finalize-latency] {descriptor_id}: pack={} audio={audio_ms}ms",
         pack.display()
     );
-    let batch = batch_reference(pack, descriptor_id, &samples);
+    let batch = batch_reference(pack, &samples);
     eprintln!("[finalize-latency] {descriptor_id}: batch_reference={batch:?}");
 
     // Realistic dictation stop: grace tail arrives after the last poll -> reuse
@@ -239,14 +261,14 @@ fn run_family_bench(descriptor_id: &str, pack: &Path, wav: &Path, iters: usize) 
     // -> finalize HITS the reuse cache and skips the redundant decode.
     let mut ceiling_ms = Vec::with_capacity(iters);
     for i in 0..iters {
-        let realistic = run_utterance(pack, descriptor_id, &samples, 300, false);
+        let realistic = run_utterance(pack, &samples, 300, false);
         assert_eq!(
             realistic.final_text, batch,
             "iter {i}: realistic terminal final must equal offline batch (parity)"
         );
         realistic_ms.push(realistic.finalize_ms);
 
-        let ceiling = run_utterance(pack, descriptor_id, &samples, 300, true);
+        let ceiling = run_utterance(pack, &samples, 300, true);
         assert_eq!(
             ceiling.final_text, batch,
             "iter {i}: reuse-path terminal final must equal offline batch (parity)"

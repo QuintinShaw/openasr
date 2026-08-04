@@ -372,14 +372,16 @@ impl Default for SlidingProtocol {
 }
 
 impl PyannoteSegmenter {
-    pub fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
+    #[cfg(test)]
+    pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
         Ok(Self {
             model: PyannetModel::from_safetensors(bytes)?,
             protocol: SlidingProtocol::default(),
         })
     }
 
-    pub fn from_oasr(path: &std::path::Path) -> Result<Self, WeightsError> {
+    #[cfg(test)]
+    pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, WeightsError> {
         Ok(Self {
             model: PyannetModel::from_oasr(path)?,
             protocol: SlidingProtocol::default(),
@@ -399,12 +401,6 @@ impl PyannoteSegmenter {
         tensor_index: &crate::GgufTensorIndex,
     ) -> Result<u64, WeightsError> {
         PyannetModel::quoted_persistent_host_commitment_bytes(tensor_index)
-    }
-
-    pub(crate) fn quoted_safetensors_materialization(
-        bytes: &[u8],
-    ) -> Result<super::embed::weights::SafetensorsWeightsQuote, WeightsError> {
-        PyannetModel::quoted_safetensors_materialization(bytes)
     }
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {

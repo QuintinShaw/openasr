@@ -29,11 +29,11 @@ use std::{path::Path, sync::Arc};
 
 use crate::realtime::{RealtimeEvent, RealtimeTranscriptEvent, RealtimeTranscriptWord};
 use crate::{
-    NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrModelAdapter,
-    NativeAsrModelPackRef, NativeAsrRequestOptions, NativeAsrSession, NativeAsrSessionContext,
-    NativeAsrStreamingSessionConfig, NativeBackendExecutor, NativeExecutionServices,
-    RealtimeAudioFormat, RealtimeAudioFrame, RealtimeEventEnvelope, Segment, Transcription,
-    VadConfig, VadStateMachine, native_runtime_model_adapter_for_path,
+    NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrRequestOptions,
+    NativeAsrSession, NativeAsrSessionContext, NativeAsrStreamingSessionConfig,
+    NativeBackendExecutor, NativeExecutionServices, RealtimeAudioFormat, RealtimeAudioFrame,
+    RealtimeEventEnvelope, Segment, Transcription, VadConfig, VadStateMachine,
+    native_runtime_model_adapter_for_path,
 };
 
 /// The kind of a [`StreamingEvent`].
@@ -178,11 +178,7 @@ impl StreamingSession {
                 ),
             }
         })?;
-        let model_pack = NativeAsrModelPackRef::new(
-            "native-streaming",
-            adapter.model_family(),
-            pack_path.to_path_buf(),
-        );
+        let model_pack = adapter.model_pack_ref("native-streaming")?;
         let audio_format = RealtimeAudioFormat::pcm16_mono_16khz();
         let options = NativeAsrRequestOptions::new()
             .with_language(cfg.language.clone())

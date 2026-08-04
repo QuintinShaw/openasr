@@ -181,7 +181,6 @@ where
 
     // Clone the shared request fields once; each driver closure rebuilds the
     // per-decode request from them plus the (windowed) prepared audio.
-    let runtime_source_path = request.runtime_source_path.clone();
     let execution_services = std::sync::Arc::clone(&request.execution_services);
     let decode_execution_services = std::sync::Arc::clone(&request.execution_services);
     let resident_decoder_state = request.decoder_state.clone();
@@ -210,13 +209,7 @@ where
         let decoder_state = match resident_decoder_state.invocation_envelope() {
             None => resident_decoder_state.clone(),
             Some(envelope) => {
-                let preflight = runtime_source_preflight.as_ref().ok_or_else(|| {
-                    GgmlAsrExecutionError::executor_failed(
-                        executor_id,
-                        adapter_id,
-                        "planned streaming decoder state is missing its runtime preflight",
-                    )
-                })?;
+                let preflight = &runtime_source_preflight;
                 let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_decode_view(
                     preflight,
                     audio,
@@ -243,7 +236,6 @@ where
         Ok(GgmlAsrExecutionViewRequest {
             execution_services: std::sync::Arc::clone(&execution_services),
             decoder_state,
-            runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
             prepared_audio: audio.clone(),
@@ -1685,25 +1677,26 @@ mod tests {
         use crate::ggml_runtime::{
             GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
         };
-        use std::path::PathBuf;
-
         fn session_request(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> GgmlAsrStreamingSessionRequest {
             let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
                 backend_preference.request_backend_override(),
                 crate::arch::family_auto_gpu_policy_for_model_architecture(
-                    crate::qwen3_asr_runtime_descriptor_v1().model_architecture,
+                    crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
                 ),
             );
+            let runtime_source_preflight =
+                crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
             GgmlAsrStreamingSessionRequest {
                 execution_services:
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
-                runtime_source_preflight: None,
-                selected_family: crate::qwen3_asr_runtime_descriptor_v1(),
+                runtime_source_preflight,
+                selected_family: crate::arch::builtin_adapter_descriptor(
+                    crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                ),
                 request_options: crate::GgmlAsrExecutionOptions::default(),
                 configured_diarize: false,
                 backend_preference,

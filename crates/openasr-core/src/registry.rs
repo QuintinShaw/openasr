@@ -294,14 +294,10 @@ pub struct CatalogModel {
     // training-corpus property, not a per-release editorial choice. This field
     // is a read-only wire mirror, not an independent declaration: the single
     // Rust-side source of truth is
-    // `arch::OpenAsrArchitectureDescriptor::emits_punctuation` (see
-    // `arch::emits_punctuation_for_model_architecture`), and catalog authoring
-    // (`tooling/publish-model/scripts/_catalog.py`'s `punctuation_for_model` /
-    // `PUNCTUATION_BY_FAMILY`) is hand-kept in lockstep with it -- there is no
-    // Rust<->Python codegen bridge yet, so
-    // `registry/tests/catalog.rs`'s `embedded_catalog_emits_punctuation_matches_family`
-    // cross-checks the shipped catalog against the descriptor value for every
-    // family both sides know about, to catch drift. `None` means "unknown" (a
+    // `arch::OpenAsrArchitectureDescriptor::emits_punctuation`. The versioned
+    // model-family inventory projects that value into catalog authoring, and
+    // `registry/tests/catalog.rs` cross-checks the shipped catalog against the
+    // descriptor value. `None` means "unknown" (a
     // catalog predating this field, or a kind core has no
     // transcript-punctuation axis for, e.g. capability-pack); consumers must
     // treat `None` as "assume punctuated" (`true`) rather than surfacing a
@@ -786,6 +782,9 @@ pub struct CatalogPullRequest {
 pub struct ResolvedCatalogPull {
     pub requested: String,
     pub model_id: String,
+    /// Canonical family id carried by the signed catalog entry. Installation
+    /// binds this value to the route proven from the exact pack bytes.
+    pub catalog_family_id: String,
     pub display_name: String,
     pub quant: String,
     pub suffix: String,
@@ -819,6 +818,7 @@ impl ResolvedCatalogPull {
         Self {
             requested,
             model_id: model.id.clone(),
+            catalog_family_id: model.family.clone(),
             display_name: model.display_name.clone(),
             quant: quant.quant.clone(),
             suffix: quant.suffix.clone(),

@@ -9,13 +9,13 @@
 //! tree (external tooling paths, reference dumpers, public audit forms) and
 //! lock the embedded pre-audit family list to the on-disk SSOT file.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use thiserror::Error;
 
 use crate::arch::{
-    OpenAsrArchitectureDescriptor, OpenAsrArchitectureRegistry, OpenAsrPackImportSurface,
-    OpenAsrSharedDecodeDriver,
+    OpenAsrArchitectureDescriptor, OpenAsrArchitectureRegistry, OpenAsrDecodeDriverStrategy,
+    OpenAsrPackImportSurface,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentDescriptor, BuiltinDecodePolicyComponentRegistryError,
@@ -42,7 +42,7 @@ pub(crate) enum FamilyIntegrationAuditError {
     SharedDecodeMissing {
         model_family: String,
         decode_policy_id: String,
-        expected: OpenAsrSharedDecodeDriver,
+        expected: OpenAsrDecodeDriverStrategy,
         reason: String,
     },
     #[error(
@@ -51,7 +51,7 @@ pub(crate) enum FamilyIntegrationAuditError {
     SharedDecodeKindMismatch {
         model_family: String,
         decode_policy_id: String,
-        expected: OpenAsrSharedDecodeDriver,
+        expected: OpenAsrDecodeDriverStrategy,
         actual: BuiltinDecodePolicyExecutionKind,
     },
     #[error(
@@ -102,6 +102,14 @@ pub(crate) enum FamilyIntegrationAuditError {
         catalog_family_id: String,
         relative_path: String,
     },
+    #[error(
+        "native family '{catalog_family_id}' has an audit form at '{relative_path}' but remains in the pre-audit exemption list"
+    )]
+    #[cfg_attr(not(test), allow(dead_code))]
+    PreAuditFamilyHasAuditForm {
+        catalog_family_id: String,
+        relative_path: String,
+    },
 }
 
 /// Parse the embedded pre-audit family list (compile-time text, no disk I/O).
@@ -136,16 +144,16 @@ pub(crate) fn validate_runtime_family_wiring(
         BuiltinDecodePolicyComponentDescriptor,
         BuiltinDecodePolicyComponentRegistryError,
     >,
-    linked_pack_symbols: &BTreeMap<&'static str, usize>,
+    linked_pack_symbols: &BTreeSet<&'static str>,
 ) -> Result<(), FamilyIntegrationAuditError> {
     // Touch embedded SSOT so the include_str! payload stays linked and is
     // available to tests without implying runtime disk access.
     let _pre_audit = embedded_pre_audit_families();
 
     for descriptor in architectures {
-        if descriptor.integration.catalog_family_id.is_empty() {
+        if descriptor.identity.catalog_family_id.is_empty() {
             return Err(FamilyIntegrationAuditError::EmptyCatalogFamilyId {
-                model_family: descriptor.model_family.to_string(),
+                model_family: descriptor.identity.model_family.to_string(),
             });
         }
 
@@ -155,70 +163,72 @@ pub(crate) fn validate_runtime_family_wiring(
         // decode policy resolves without one, so fail closed on an empty id
         // instead of letting a half-declared family silently run without a
         // validated tensor contract.
-        if descriptor.runtime_tensor_contract_id.is_empty() {
+        if descriptor
+            .pack_contract
+            .runtime_tensor_contract_id
+            .is_empty()
+        {
             return Err(FamilyIntegrationAuditError::EmptyRuntimeTensorContractId {
-                model_family: descriptor.model_family.to_string(),
+                model_family: descriptor.identity.model_family.to_string(),
             });
         }
 
-        match descriptor.integration.shared_decode_driver {
-            OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy => {
-                let policy = decode_resolve(descriptor.decode_policy_id).map_err(|error| {
-                    FamilyIntegrationAuditError::SharedDecodeMissing {
-                        model_family: descriptor.model_family.to_string(),
-                        decode_policy_id: descriptor.decode_policy_id.to_string(),
-                        expected: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+        match descriptor.topology_contract.decode_driver {
+            OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy => {
+                let policy = decode_resolve(descriptor.topology_contract.decode_policy_id)
+                    .map_err(|error| FamilyIntegrationAuditError::SharedDecodeMissing {
+                        model_family: descriptor.identity.model_family.to_string(),
+                        decode_policy_id: descriptor.topology_contract.decode_policy_id.to_string(),
+                        expected: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                         reason: error.to_string(),
-                    }
-                })?;
+                    })?;
                 if policy.execution_kind != BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0 {
                     return Err(FamilyIntegrationAuditError::SharedDecodeKindMismatch {
-                        model_family: descriptor.model_family.to_string(),
-                        decode_policy_id: descriptor.decode_policy_id.to_string(),
-                        expected: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+                        model_family: descriptor.identity.model_family.to_string(),
+                        decode_policy_id: descriptor.topology_contract.decode_policy_id.to_string(),
+                        expected: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy,
                         actual: policy.execution_kind,
                     });
                 }
             }
-            OpenAsrSharedDecodeDriver::SharedCtcGreedy => {
-                let policy = decode_resolve(descriptor.decode_policy_id).map_err(|error| {
-                    FamilyIntegrationAuditError::SharedDecodeMissing {
-                        model_family: descriptor.model_family.to_string(),
-                        decode_policy_id: descriptor.decode_policy_id.to_string(),
-                        expected: OpenAsrSharedDecodeDriver::SharedCtcGreedy,
+            OpenAsrDecodeDriverStrategy::SharedCtcGreedy => {
+                let policy = decode_resolve(descriptor.topology_contract.decode_policy_id)
+                    .map_err(|error| FamilyIntegrationAuditError::SharedDecodeMissing {
+                        model_family: descriptor.identity.model_family.to_string(),
+                        decode_policy_id: descriptor.topology_contract.decode_policy_id.to_string(),
+                        expected: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
                         reason: error.to_string(),
-                    }
-                })?;
+                    })?;
                 if policy.execution_kind != BuiltinDecodePolicyExecutionKind::CtcGreedyV0 {
                     return Err(FamilyIntegrationAuditError::SharedDecodeKindMismatch {
-                        model_family: descriptor.model_family.to_string(),
-                        decode_policy_id: descriptor.decode_policy_id.to_string(),
-                        expected: OpenAsrSharedDecodeDriver::SharedCtcGreedy,
+                        model_family: descriptor.identity.model_family.to_string(),
+                        decode_policy_id: descriptor.topology_contract.decode_policy_id.to_string(),
+                        expected: OpenAsrDecodeDriverStrategy::SharedCtcGreedy,
                         actual: policy.execution_kind,
                     });
                 }
                 if policy.ctc_blank_token_id.is_none() {
                     return Err(FamilyIntegrationAuditError::CtcBlankMissing {
-                        model_family: descriptor.model_family.to_string(),
-                        decode_policy_id: descriptor.decode_policy_id.to_string(),
+                        model_family: descriptor.identity.model_family.to_string(),
+                        decode_policy_id: descriptor.topology_contract.decode_policy_id.to_string(),
                     });
                 }
             }
-            OpenAsrSharedDecodeDriver::Dedicated => {
-                if decode_resolve(descriptor.decode_policy_id).is_ok() {
+            OpenAsrDecodeDriverStrategy::Dedicated { .. } => {
+                if decode_resolve(descriptor.topology_contract.decode_policy_id).is_ok() {
                     return Err(FamilyIntegrationAuditError::DedicatedDecodeStillShared {
-                        model_family: descriptor.model_family.to_string(),
-                        decode_policy_id: descriptor.decode_policy_id.to_string(),
+                        model_family: descriptor.identity.model_family.to_string(),
+                        decode_policy_id: descriptor.topology_contract.decode_policy_id.to_string(),
                     });
                 }
             }
         }
 
-        match descriptor.integration.pack_import {
-            OpenAsrPackImportSurface::CoreConvert { symbol } => {
-                if !linked_pack_symbols.contains_key(symbol) {
+        match descriptor.pack_contract.pack_import {
+            OpenAsrPackImportSurface::CoreConvert { symbol, .. } => {
+                if !linked_pack_symbols.contains(symbol) {
                     return Err(FamilyIntegrationAuditError::PackImportSymbolUnlinked {
-                        model_family: descriptor.model_family.to_string(),
+                        model_family: descriptor.identity.model_family.to_string(),
                         symbol: symbol.to_string(),
                     });
                 }
@@ -226,17 +236,17 @@ pub(crate) fn validate_runtime_family_wiring(
             OpenAsrPackImportSurface::ExternalTooling { relative_path } => {
                 if relative_path.is_empty() {
                     return Err(FamilyIntegrationAuditError::PackImportToolingPathEmpty {
-                        model_family: descriptor.model_family.to_string(),
+                        model_family: descriptor.identity.model_family.to_string(),
                     });
                 }
             }
         }
 
-        if let Some(source) = descriptor.integration.reference_dumper_source
+        if let Some(source) = descriptor.conformance_contract.reference_dumper_source
             && source.is_empty()
         {
             return Err(FamilyIntegrationAuditError::ReferenceDumperPathEmpty {
-                model_family: descriptor.model_family.to_string(),
+                model_family: descriptor.identity.model_family.to_string(),
             });
         }
     }
@@ -316,29 +326,42 @@ pub(crate) mod source_tree_audit {
         let pre_audit_families = embedded_pre_audit_families();
         let public_families = public_catalog_family_ids(&repo_root);
 
+        // The pre-audit list is only for families whose release form is still
+        // missing. Once a form lands, keeping the family in the exemption set
+        // would silently let the source-tree audit skip it forever.
+        for catalog_family_id in &pre_audit_families {
+            let relative_path = required_audit_form_relative_path(catalog_family_id);
+            if repo_root.join(&relative_path).is_file() {
+                return Err(FamilyIntegrationAuditError::PreAuditFamilyHasAuditForm {
+                    catalog_family_id: (*catalog_family_id).to_string(),
+                    relative_path,
+                });
+            }
+        }
+
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
-            match descriptor.integration.pack_import {
+            match descriptor.pack_contract.pack_import {
                 OpenAsrPackImportSurface::CoreConvert { .. } => {}
                 OpenAsrPackImportSurface::ExternalTooling { relative_path } => {
                     if !repo_root.join(relative_path).is_file() {
                         return Err(FamilyIntegrationAuditError::PackImportToolingMissing {
-                            model_family: descriptor.model_family.to_string(),
+                            model_family: descriptor.identity.model_family.to_string(),
                             relative_path: relative_path.to_string(),
                         });
                     }
                 }
             }
 
-            if let Some(source) = descriptor.integration.reference_dumper_source
+            if let Some(source) = descriptor.conformance_contract.reference_dumper_source
                 && !repo_root.join(source).is_file()
             {
                 return Err(FamilyIntegrationAuditError::ReferenceDumperMissing {
-                    model_family: descriptor.model_family.to_string(),
+                    model_family: descriptor.identity.model_family.to_string(),
                     relative_path: source.to_string(),
                 });
             }
 
-            let catalog_family_id = descriptor.integration.catalog_family_id;
+            let catalog_family_id = descriptor.identity.catalog_family_id;
             if pre_audit_families.contains(catalog_family_id) {
                 continue;
             }
@@ -347,7 +370,7 @@ pub(crate) mod source_tree_audit {
                 && !repo_root.join(&relative_path).is_file()
             {
                 return Err(FamilyIntegrationAuditError::RequiredAuditFormMissing {
-                    model_family: descriptor.model_family.to_string(),
+                    model_family: descriptor.identity.model_family.to_string(),
                     catalog_family_id: catalog_family_id.to_string(),
                     relative_path,
                 });
@@ -381,26 +404,27 @@ pub(crate) mod source_tree_audit {
     /// fails closed on a half-connected driver.
     #[test]
     fn every_shared_greedy_family_forwards_the_driver_stop_reason() {
-        // hymt2 is a translation runtime, not an ASR family: it produces
-        // subtitle text from text, never a `Transcription` over audio, and is
-        // absent from the architecture registry's SharedSeq2SeqGreedy set. It
-        // has no transcript for a truncation signal to ride on, so the contract
-        // this test enforces does not apply to it.
-        const NON_TRANSCRIPT_FAMILY_DIRECTORIES: &[&str] = &["hymt2"];
-
         let models_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/models");
-        let mut checked = 0usize;
-        for entry in std::fs::read_dir(&models_dir).expect("models dir is readable") {
-            let entry = entry.expect("models dir entry");
-            if !entry.file_type().expect("entry file type").is_dir() {
-                continue;
-            }
-            let directory = entry.path();
-            let name = directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("family directory name")
-                .to_string();
+        let shared_families = OpenAsrArchitectureRegistry::with_builtins()
+            .descriptors()
+            .iter()
+            .filter(|descriptor| {
+                descriptor.topology_contract.decode_driver
+                    == OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !shared_families.is_empty(),
+            "shared seq2seq inventory must not be empty"
+        );
+
+        for descriptor in shared_families {
+            let name = descriptor.identity.module_slug;
+            let directory = models_dir.join(name);
+            assert!(
+                directory.is_dir(),
+                "inventory module_slug '{name}' must name a family directory"
+            );
             let sources: Vec<String> = std::fs::read_dir(&directory)
                 .expect("family dir is readable")
                 .filter_map(|file| file.ok())
@@ -411,15 +435,13 @@ pub(crate) mod source_tree_audit {
             // Match the call, turbofished or not, and never the `use` line:
             // `run_builtin_seq2seq_decode_policy(` alone silently skipped the
             // families that spell the call `...::<Seq2SeqGreedyDecodeError>(`.
-            let reaches_shared_driver = sources.iter().any(|source| {
-                source.contains("run_builtin_seq2seq_decode_policy(")
-                    || source.contains("run_builtin_seq2seq_decode_policy::<")
-            });
-            if !reaches_shared_driver || NON_TRANSCRIPT_FAMILY_DIRECTORIES.contains(&name.as_str())
-            {
-                continue;
-            }
-            checked += 1;
+            assert!(
+                sources.iter().any(|source| {
+                    source.contains("run_builtin_seq2seq_decode_policy(")
+                        || source.contains("run_builtin_seq2seq_decode_policy::<")
+                }),
+                "inventory family '{name}' declares SharedSeq2SeqGreedy but never calls the shared driver"
+            );
             assert!(
                 sources
                     .iter()
@@ -429,12 +451,6 @@ pub(crate) mod source_tree_audit {
                  as a complete one"
             );
         }
-        // Guards the walk itself: a rename that stops matching the driver call
-        // would otherwise make this test vacuously pass.
-        assert_eq!(
-            checked, 10,
-            "expected the 10 SharedSeq2SeqGreedy ASR families to be found by this walk"
-        );
     }
 
     #[test]
@@ -459,11 +475,23 @@ pub(crate) mod source_tree_audit {
     }
 
     #[test]
+    fn pre_audit_exemptions_do_not_have_audit_forms() {
+        let repo_root = repository_root();
+        for catalog_family_id in embedded_pre_audit_families() {
+            let relative_path = required_audit_form_relative_path(catalog_family_id);
+            assert!(
+                !repo_root.join(&relative_path).is_file(),
+                "family '{catalog_family_id}' has an audit form at '{relative_path}' but remains in the pre-audit exemption list"
+            );
+        }
+    }
+
+    #[test]
     fn half_wired_empty_runtime_tensor_contract_id_fails() {
         let mut descriptor = base_descriptor();
-        descriptor.model_family = "synthetic-half-wired";
-        descriptor.integration.catalog_family_id = "synthetic-half-wired";
-        descriptor.runtime_tensor_contract_id = "";
+        descriptor.identity.model_family = "synthetic-half-wired";
+        descriptor.identity.catalog_family_id = "synthetic-half-wired";
+        descriptor.pack_contract.runtime_tensor_contract_id = "";
 
         let error = validate_runtime_family_wiring(
             &[descriptor],
@@ -480,13 +508,14 @@ pub(crate) mod source_tree_audit {
     #[test]
     fn half_wired_shared_seq2seq_without_decode_policy_fails() {
         let mut descriptor = base_descriptor();
-        descriptor.model_family = "synthetic-half-wired";
-        descriptor.integration.catalog_family_id = "synthetic-half-wired";
-        descriptor.integration.shared_decode_driver =
-            OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy;
-        descriptor.decode_policy_id = "synthetic.greedy.seq2seq.v0";
-        descriptor.integration.pack_import = OpenAsrPackImportSurface::CoreConvert {
+        descriptor.identity.model_family = "synthetic-half-wired";
+        descriptor.identity.catalog_family_id = "synthetic-half-wired";
+        descriptor.topology_contract.decode_driver =
+            OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy;
+        descriptor.topology_contract.decode_policy_id = "synthetic.greedy.seq2seq.v0";
+        descriptor.pack_contract.pack_import = OpenAsrPackImportSurface::CoreConvert {
             symbol: "convert_local_whisper_hf_source_to_runtime_pack",
+            force_link: || {},
         };
 
         let error = validate_runtime_family_wiring(
@@ -504,13 +533,14 @@ pub(crate) mod source_tree_audit {
     #[test]
     fn half_wired_core_pack_import_symbol_fails() {
         let mut descriptor = base_descriptor();
-        descriptor.model_family = "synthetic-half-wired";
-        descriptor.integration.catalog_family_id = "whisper";
-        descriptor.integration.shared_decode_driver =
-            OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy;
-        descriptor.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
-        descriptor.integration.pack_import = OpenAsrPackImportSurface::CoreConvert {
+        descriptor.identity.model_family = "synthetic-half-wired";
+        descriptor.identity.catalog_family_id = "whisper";
+        descriptor.topology_contract.decode_driver =
+            OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy;
+        descriptor.topology_contract.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
+        descriptor.pack_contract.pack_import = OpenAsrPackImportSurface::CoreConvert {
             symbol: "convert_local_does_not_exist",
+            force_link: || {},
         };
 
         let error = validate_runtime_family_wiring(
@@ -528,15 +558,16 @@ pub(crate) mod source_tree_audit {
     #[test]
     fn half_wired_public_required_audit_form_fails() {
         let mut descriptor = base_descriptor();
-        descriptor.model_family = "synthetic-half-wired";
-        descriptor.integration.catalog_family_id = "synthetic-new-family";
-        descriptor.integration.shared_decode_driver =
-            OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy;
-        descriptor.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
-        descriptor.integration.pack_import = OpenAsrPackImportSurface::CoreConvert {
+        descriptor.identity.model_family = "synthetic-half-wired";
+        descriptor.identity.catalog_family_id = "synthetic-new-family";
+        descriptor.topology_contract.decode_driver =
+            OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy;
+        descriptor.topology_contract.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
+        descriptor.pack_contract.pack_import = OpenAsrPackImportSurface::CoreConvert {
             symbol: "convert_local_whisper_hf_source_to_runtime_pack",
+            force_link: || {},
         };
-        descriptor.integration.reference_dumper_source = None;
+        descriptor.conformance_contract.reference_dumper_source = None;
 
         // Source-tree audit path: inject via a local loop mirroring the public
         // Required check so the fail-closed contract stays explicit.
@@ -567,12 +598,15 @@ pub(crate) mod source_tree_audit {
     #[test]
     fn dedicated_decode_still_on_shared_registry_fails() {
         let mut descriptor = base_descriptor();
-        descriptor.model_family = "synthetic-dedicated";
-        descriptor.integration.catalog_family_id = "whisper";
-        descriptor.integration.shared_decode_driver = OpenAsrSharedDecodeDriver::Dedicated;
-        descriptor.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
-        descriptor.integration.pack_import = OpenAsrPackImportSurface::CoreConvert {
+        descriptor.identity.model_family = "synthetic-dedicated";
+        descriptor.identity.catalog_family_id = "whisper";
+        descriptor.topology_contract.decode_driver = OpenAsrDecodeDriverStrategy::Dedicated {
+            reason: "synthetic dedicated topology for audit coverage",
+        };
+        descriptor.topology_contract.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
+        descriptor.pack_contract.pack_import = OpenAsrPackImportSurface::CoreConvert {
             symbol: "convert_local_whisper_hf_source_to_runtime_pack",
+            force_link: || {},
         };
 
         let error = validate_runtime_family_wiring(
@@ -590,30 +624,45 @@ pub(crate) mod source_tree_audit {
     #[test]
     fn streaming_granularity_type_is_shared_with_dispatch() {
         use crate::arch::{
-            OpenAsrArchitectureDescriptor, OpenAsrEncoderAttentionSpan, OpenAsrPackImportSurface,
-            OpenAsrSharedDecodeDriver, StreamingPartialGranularity,
+            OpenAsrArchitectureDescriptor, OpenAsrDecodeDriverStrategy, OpenAsrExecutionContract,
+            OpenAsrIdentityContract, OpenAsrOptimizationContract, OpenAsrPackContract,
+            OpenAsrPackImportSurface, OpenAsrTopologyContract, StreamingPartialGranularity,
         };
         use crate::ggml_runtime::AutoGpuPolicy;
-        use crate::models::ggml_family_adapter::{GgmlExecutionCapability, LanguageFamilyHint};
+        use crate::models::ggml_family_adapter::LanguageFamilyHint;
 
         let value = StreamingPartialGranularity::FrameSync;
         let _dispatch_ty: crate::StreamingPartialGranularity = value;
+        let base = base_descriptor();
         let _ = OpenAsrArchitectureDescriptor {
-            integration: crate::arch::OpenAsrFamilyIntegrationDescriptor {
-                catalog_family_id: "x",
-                supports_phrase_bias: false,
-                streaming_partial_granularity: value,
-                shared_decode_driver: OpenAsrSharedDecodeDriver::Dedicated,
+            identity: OpenAsrIdentityContract {
+                language_family_hint: LanguageFamilyHint::FixedMonolingual { language: "en" },
+                ..base.identity
+            },
+            pack_contract: OpenAsrPackContract {
                 pack_import: OpenAsrPackImportSurface::ExternalTooling {
                     relative_path: "tooling/mimo-asr/convert_mimo_asr.py",
                 },
-                reference_dumper_source: None,
+                ..base.pack_contract
             },
-            language_family_hint: LanguageFamilyHint::FixedMonolingual { language: "en" },
-            execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            auto_gpu_policy: AutoGpuPolicy::AllBackends,
-            encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
-            ..base_descriptor()
+            execution_contract: OpenAsrExecutionContract {
+                phrase_bias: crate::arch::OpenAsrPhraseBiasStrategy::Unsupported,
+                streaming_partial_granularity: value,
+                ..base.execution_contract
+            },
+            topology_contract: OpenAsrTopologyContract {
+                decode_driver: OpenAsrDecodeDriverStrategy::Dedicated {
+                    reason: "synthetic dedicated topology for audit coverage",
+                },
+                ..base.topology_contract
+            },
+            optimization_contract: OpenAsrOptimizationContract {
+                auto_gpu_policy: AutoGpuPolicy::AllBackends,
+                encoder_attention_span: crate::arch::OpenAsrEncoderAttentionSpan::FixedWindow,
+                ..base.optimization_contract
+            },
+            quantization_contract: base.quantization_contract,
+            conformance_contract: base.conformance_contract,
         };
     }
 
@@ -631,26 +680,27 @@ pub(crate) mod source_tree_audit {
             GgmlAsrExecutionOptions, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
             GgmlAsrExecutor, GgmlAsrPreparedAudioView,
         };
-        use std::path::PathBuf;
         use std::sync::Arc;
 
         const FAKE_ADAPTER_ID: &str = "ggml-family-synthetic-fake-family-v1";
 
         let mut descriptor = base_descriptor();
-        descriptor.model_family = "synthetic-fake-family";
-        descriptor.model_architecture = "synthetic-fake-family-arch-v1";
-        descriptor.adapter_id = FAKE_ADAPTER_ID;
-        descriptor.integration.catalog_family_id = "synthetic-fake-family";
-        descriptor.runtime_tensor_contract_id = "synthetic-fake-family.runtime-tensors.v1";
+        descriptor.identity.model_family = "synthetic-fake-family";
+        descriptor.identity.model_architecture = "synthetic-fake-family-arch-v1";
+        descriptor.identity.adapter_id = FAKE_ADAPTER_ID;
+        descriptor.identity.catalog_family_id = "synthetic-fake-family";
+        descriptor.pack_contract.runtime_tensor_contract_id =
+            "synthetic-fake-family.runtime-tensors.v1";
         // Reuses whisper's already-registered shared decode policy and
         // pack-import symbol rather than declaring new ones: the point of
         // this test is the backend/cancel plumbing a family no longer has to
         // write, not authoring a full new decode policy.
-        descriptor.integration.shared_decode_driver =
-            OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy;
-        descriptor.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
-        descriptor.integration.pack_import = OpenAsrPackImportSurface::CoreConvert {
+        descriptor.topology_contract.decode_driver =
+            OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy;
+        descriptor.topology_contract.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
+        descriptor.pack_contract.pack_import = OpenAsrPackImportSurface::CoreConvert {
             symbol: "convert_local_whisper_hf_source_to_runtime_pack",
+            force_link: || {},
         };
 
         // (a) Startup wiring gate: descriptor + tensor contract alone pass.
@@ -711,12 +761,13 @@ pub(crate) mod source_tree_audit {
 
         let dispatch = GgmlAsrExecutionDispatch::default()
             .with_executor_for_adapter(FAKE_ADAPTER_ID, Arc::new(MinimalFakeExecutor));
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
         let request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: PathBuf::from("fixtures/synthetic-fake-family.gguf"),
-            runtime_source_preflight: None,
+            runtime_source_preflight,
             selected_family: descriptor.ggml_family_adapter_descriptor(),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),

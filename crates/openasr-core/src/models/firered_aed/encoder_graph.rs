@@ -14,7 +14,7 @@
 //! with three *independent* LayerNorms (same input, different affine params)
 //! and has zero biases anywhere in attention or the conv module. Reusing the
 //! shared block would silently produce the wrong math, so this follows the
-//! dolphin/sensevoice/xasr precedent: hand-written, `block_stack: None`,
+//! dolphin/sensevoice/xasr precedent: hand-written, `ArchitectureGraph`,
 //! built from the lower-level `nn::attn` / `nn::norm` / `nn::conv` primitives.
 //! The relative-position table math IS bit-identical to cohere/parakeet-ctc's
 //! shared Transformer-XL formula (same ESPnet/WeNet lineage), so the shared

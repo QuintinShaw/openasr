@@ -144,7 +144,8 @@ pub struct RedimNet2Embedder {
 }
 
 impl RedimNet2Embedder {
-    pub fn from_oasr(path: &std::path::Path) -> Result<Self, EmbedError> {
+    #[cfg(test)]
+    pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, EmbedError> {
         let model =
             RedimNet2Model::from_oasr(path).map_err(|e| EmbedError::Unavailable(e.to_string()))?;
         Ok(Self {

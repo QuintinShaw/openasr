@@ -294,9 +294,11 @@ impl FunasrNanoEncoderGraph {
                 source,
             }
         })?;
-        let loaded_weights = runner
-            .load_gguf_weight_context_from_preflight(preflight)
-            .ok();
+        let loaded_weights = Some(
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .map_err(bf("loaded_weight_context"))?,
+        );
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES)

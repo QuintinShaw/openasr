@@ -14,12 +14,17 @@
 
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::ggml_runtime::{
     GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
     build_runtime_tensor_reader_from_preflight,
-    load_runtime_source_metadata_and_tensor_index_from_source,
 };
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
+use crate::models::{
+    aux_pack_registry::AuxPackKind,
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier},
+};
 
 use super::audio_encoder::{
     Qwen3AsrAudioEncoderError, Qwen3AsrAudioEncoderRuntime, Qwen3AsrAudioEncoderWeights,
@@ -545,27 +550,34 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
     // stage-level execution candidate and passes the backend explicitly; do
     // not re-derive from process defaults here or a vendor-constrained request
     // could silently run the aligner on another GPU.
-    // Open once: `load_forced_aligner_prepared_assets` and `align_forced`
-    // both need this pack's tensor data, and this tier's own doc comment
-    // above already promises "loads the pack fresh... at most once per
-    // `transcribe` call" -- sharing one `GgmlRuntimeSource` between them
-    // (instead of each independently opening `pack_path`) is what actually
-    // keeps that promise: two independent opens of the same path could race
-    // a pack replacement and see different file generations.
-    let runtime_source = crate::validate_ggml_runtime_source_path(pack_path).map_err(|error| {
-        Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-            key: "<runtime source>",
-            reason: error.to_string(),
-        }
-    })?;
-    let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+    // The capability stage receives the same proof-carrying package gate as
+    // primary ASR. The verifier opens and parses one immutable generation;
+    // both asset preparation and execution borrow that exact preflight.
+    let verified = PackVerifier
+        .verify_candidate(PackCandidate::new(pack_path))
         .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-            key: "<gguf preflight>",
+            key: "<pack verifier>",
             reason: error.to_string(),
         })?;
-    let assets = load_forced_aligner_prepared_assets(&preflight, backend)?;
+    if !matches!(
+        verified.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::ForcedAlignment,
+            ..
+        }
+    ) {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<pack route>",
+            reason: format!(
+                "expected auxiliary forced-alignment pack, got {:?}",
+                verified.route()
+            ),
+        });
+    }
+    let preflight = verified.preflight();
+    let assets = load_forced_aligner_prepared_assets(preflight, backend)?;
     align_forced(
-        &preflight,
+        preflight,
         &assets,
         audio_samples_16khz_mono,
         text,

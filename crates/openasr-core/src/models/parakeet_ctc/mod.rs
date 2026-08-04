@@ -19,9 +19,3 @@ pub(crate) mod frontend;
 pub(crate) mod graph_config;
 pub(crate) mod runtime_contract;
 pub(crate) mod tokenizer;
-
-/// Crate-internal model-family + architecture ids for parakeet-ctc. The full
-/// architecture descriptor + component-id wiring lands in S4; the importer (S2)
-/// only needs these as pack metadata strings.
-pub(crate) const PARAKEET_CTC_MODEL_FAMILY: &str = "parakeet-ctc";
-pub(crate) const PARAKEET_CTC_GGML_ARCHITECTURE_ID: &str = "parakeet-fastconformer-ctc";

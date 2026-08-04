@@ -28,7 +28,7 @@ use super::lora::{MoonshineLoraAdapter, MoonshineLoraTarget, moonshine_lora_adap
 use super::prepared_runtime::{MoonshinePreparedRuntime, build_moonshine_prepared_runtime};
 use super::runtime_contract::MoonshineExecutionMetadata;
 use crate::{
-    GgmlAsrRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
+    GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
     read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
 };
 
@@ -85,14 +85,14 @@ fn resolve_real_pack() -> PathBuf {
     path
 }
 
-fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
+fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
     let runtime_source =
         validate_ggml_runtime_source_path(runtime_path).expect("valid runtime source path");
     let metadata =
         read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
     let tensor_index =
         read_gguf_tensor_index_from_runtime_source(&runtime_source).expect("read tensor index");
-    GgmlAsrRuntimeSourcePreflight {
+    GgufRuntimeSourcePreflight {
         runtime_source,
         metadata: Arc::new(metadata),
         tensor_index: Arc::new(tensor_index),
@@ -119,7 +119,7 @@ fn synthetic_encoder_output(
 /// Constant-fill adapter over the given base tensors, with the `alpha/rank`
 /// scaling pre-folded into B exactly as the production loader does.
 fn constant_fill_adapter(
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     fingerprint: &str,
     target_names: &[&str],
     rank: usize,
@@ -156,7 +156,7 @@ fn constant_fill_adapter(
 
 fn first_step_logits(
     prepared: &MoonshinePreparedRuntime,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     encoder_output: &MoonshineEncoderOutput,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
@@ -168,7 +168,7 @@ fn first_step_logits(
             backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         },
         true,
-        Some(preflight),
+        preflight,
         adapter,
     )
     .expect("decoder runtime");
@@ -262,7 +262,7 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
                 backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
             },
             true,
-            Some(&preflight),
+            &preflight,
             adapter,
         )
         .expect("decoder runtime");
@@ -398,14 +398,14 @@ fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveform
 
 fn encoder_rows(
     prepared: &MoonshinePreparedRuntime,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     features: &super::frontend::MoonshineWaveformFeatures,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
     let mut runtime = super::encoder_graph::MoonshineEncoderGraphRuntime::new(
         &prepared.encoder_weights,
         prepared.metadata,
-        Some(preflight),
+        preflight,
         adapter,
         crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
     )

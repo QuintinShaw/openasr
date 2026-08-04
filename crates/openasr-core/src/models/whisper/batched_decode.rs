@@ -24,13 +24,13 @@ use super::tokenizer::WhisperTokenizer;
 use crate::PhraseBiasConfig;
 use crate::Segment;
 use crate::capacity::topology::StateKind;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
     build_builtin_seq2seq_decode_policy_config, resolve_builtin_decode_policy,
 };
 use crate::models::decode_token_history::build_longform_token_history_carry;
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
@@ -83,7 +83,7 @@ pub(crate) struct WhisperServeBatchJob {
     /// mapping instead of a fresh `File::open`/`load_gguf_weight_context` by
     /// path, so identity and weight bytes come from one open even across
     /// this thread boundary.
-    pub runtime_preflight: GgmlAsrRuntimeSourcePreflight,
+    pub runtime_preflight: GgufRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -319,7 +319,7 @@ impl WhisperServeDecoderRuntime {
                 &job.decoder_weights.tensor_source,
                 &mut tensor_cache,
                 job.decoder_state.self_attention.resident_positions,
-                Some(&job.runtime_preflight),
+                &job.runtime_preflight,
                 n_seq,
             )
             .map_err(map_decoder_error)?;
@@ -1015,7 +1015,7 @@ mod tests {
         TOKENIZER_GGML_TOKENS_KEY, TOKENIZER_GGML_TRANSCRIBE_TOKEN_ID_KEY,
     };
     use crate::{
-        GgmlAsrRuntimeSourcePreflight, GgufMetadata, GgufMetadataValue,
+        GgufMetadata, GgufMetadataValue, GgufRuntimeSourcePreflight,
         read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
         validate_ggml_runtime_source_path,
     };
@@ -1060,14 +1060,14 @@ mod tests {
         )
     }
 
-    fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
+    fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
         let runtime_source =
             validate_ggml_runtime_source_path(runtime_path).expect("valid runtime source path");
         let metadata =
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        GgmlAsrRuntimeSourcePreflight {
+        GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     fn load_real_pack_decoder_components(
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
     ) -> (
         WhisperGgmlExecutionMetadata,
         WhisperTokenizer,

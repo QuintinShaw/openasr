@@ -23,6 +23,31 @@ model-registry/          # bundled catalog + signed manifest (public verificatio
 perf/                    # performance harness, suite.toml, committed baselines
 ```
 
+## Model-family onboarding (read before changing `models/`)
+
+The normative lifecycle is [Model-family lifecycle](docs/design/model-family-lifecycle.md).
+Read it together with [Model Onboarding](docs/MODEL_ONBOARDING.md), the
+[Model Onboarding Contract](docs/design/model-onboarding-contract.md), and the
+[`.oasr` Package Contract](docs/format/OASR_PACKAGE_CONTRACT_V1.md) before adding
+or migrating a family. The live Rust inventory is the authority; these documents
+describe the gates and the required ownership boundaries.
+
+Hard rules for a new family:
+
+- Evolve the one `OpenAsrArchitectureDescriptor` inventory row and fill every
+  required facet. Do not add a parallel registry, `Default` escape, wildcard
+  match, or runtime `Deferred` state.
+- Write through the shared `PackEnvelope` and verify once through `PackVerifier`.
+  Product paths carry `VerifiedPack`/`AdmittedPack`; the public direct-path
+  ingress must turn its candidate into the same proof exactly once before
+  dispatch. A bare path is not proof of a valid pack.
+- Use generated dispatch, validator, eviction, force-link, and audit projections.
+  Once a projection owns a behavior, delete the old hand-written table and its
+  tests/docs rather than keeping two sources of truth.
+- Keep family code limited to frontend/tensor binding/topology assembly. Reuse
+  shared blocks, decode/cancel drivers, and backend-neutral placement; a
+  dedicated graph requires a structural reason and conformance coverage.
+
 ## Building from source (the part agents forget)
 
 The ggml backend is a **git submodule** compiled from source, so a plain clone will

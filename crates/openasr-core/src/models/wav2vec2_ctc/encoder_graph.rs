@@ -232,7 +232,7 @@ impl Wav2Vec2CtcEncoderGraph {
     pub(crate) fn new(
         weights: &Wav2Vec2EncoderWeights,
         metadata: Wav2Vec2CtcExecutionMetadata,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Wav2Vec2EncoderError> {
         let mut config = wav2vec2_ctc_encoder_graph_config(backend);
@@ -250,11 +250,14 @@ impl Wav2Vec2CtcEncoderGraph {
                 source,
             }
         })?;
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
+        let loaded_weights = Some(
             runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+                .load_gguf_weight_context_from_preflight(runtime_preflight)
+                .map_err(|source| Wav2Vec2EncoderError::GraphBuildFailed {
+                    step: "load_gguf_weight_context",
+                    source,
+                })?,
+        );
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES)

@@ -9,12 +9,11 @@ catches it.
 
 ## The defect: golden-diff-correct, GPU-invisible
 
-Dolphin's E-Branchformer encoder and (independently) X-ASR/Zipformer's
-encoder both passed golden-diff / parity review -- the transcripts were
-byte-identical to the reference. Both still shipped with their encoder
-running **100% on CPU** even when the process was configured for a GPU
-backend (Metal/HIP/Vulkan), because their encoder weights were never placed
-in a buffer the ggml scheduler is allowed to offload.
+An encoder can pass golden-diff / parity review -- the transcripts are
+byte-identical to the reference -- while still running **100% on CPU** even
+when the process is configured for a GPU backend (Metal/HIP/Vulkan). This
+happens when its weights are never placed in a buffer the ggml scheduler is
+allowed to offload.
 
 **Why golden-diff didn't catch it:** golden/parity fixtures are short audio
 clips run to prove numerical correctness, and ggml produces numerically
@@ -36,7 +35,7 @@ and only two of them produce a WEIGHTS-usage buffer:
 | Path | Entry point | Buffer usage | GPU-offload eligible? |
 |---|---|---|---|
 | **A. Static arena** | `GgmlStaticTensorArena` (`ggml_runtime/cpu_graph.rs`, `ensure_backend_buffer()` -> `allocate_with_usage(..., USAGE_WEIGHTS)`) | WEIGHTS | Yes |
-| **B. Zero-copy bind** | `load_gguf_weight_context` / `bind_loaded` (`ggml_runtime/cpu_graph.rs`, `maybe_allocate_weight_buffer_from_host_ptr` -> `from_raw(..., USAGE_WEIGHTS)`) | WEIGHTS | Yes |
+| **B. Zero-copy bind** | `load_gguf_weight_context_from_preflight` / `bind_loaded` (`ggml_runtime/cpu_graph.rs`, `maybe_allocate_weight_buffer_from_host_ptr` -> `from_raw(..., USAGE_WEIGHTS)`) | WEIGHTS | Yes |
 | **C. Per-request upload** | `runner.start_graph()` + `uploads.push(...)` / `pending_uploads.push(...)` / `<binding>.upload(...)` | the graph's transient **compute** buffer | **No** -- the scheduler puts the whole subgraph on CPU |
 
 Path C exists for a reason: it is the *correct* way to feed genuine per-request
@@ -46,14 +45,15 @@ matmul weights** -- something that should be loaded once and reused across
 every request, not re-uploaded (and thereby CPU-pinned) on every call.
 
 **Correct pattern for a new encoder/decoder:** bind 2D matmul weights via path
-B (`load_gguf_weight_context`, keeps the native quantized type, zero-copy) and
+B (`load_gguf_weight_context_from_preflight`, keeps the native quantized type,
+zero-copy) and
 1D norm/bias tensors via path A (`GgmlStaticTensorArena`). Never carry
 persistent weights through `start_graph()` + an upload call -- that call
 shape is reserved for real per-request input. `whisper`, `qwen3-asr` (matmul
 path), `cohere`, `moonshine`, `parakeet-tdt`/`parakeet-ctc` (via the shared
 `fastconformer` core), `sensevoice`, `firered-aed`, and `wav2vec2-ctc` all
-follow this pattern today; `dolphin`'s and `xasr_zipformer`'s encoders do not
-(tracked: #131, #115).
+follow this pattern today. Every family must use these resident WEIGHTS paths;
+there are no exceptions.
 
 ## The acceptance gate
 
@@ -67,25 +67,19 @@ script's own header comment for why: some families, like whisper, legitimately
 split "the per-request graph" from "the resident weight arena" across two
 files) and flags the family when that scope shows upload-fed graph
 construction (`start_graph()` + an upload call) but **no** evidence anywhere in
-scope of ever binding a WEIGHTS-usage buffer (`load_gguf_weight_context` /
+scope of ever binding a WEIGHTS-usage buffer (`load_gguf_weight_context_from_preflight` /
 `GgmlStaticTensorArena` / `bind_loaded`).
 
 Run it locally:
 
 ```bash
-scripts/gpu-weight-placement-gate.sh          # gate mode: exit 1 on a new, un-allowlisted finding
+scripts/gpu-weight-placement-gate.sh          # gate mode: exit 1 on any finding
 scripts/gpu-weight-placement-gate.sh --list   # report mode: always exit 0, just print findings
 ```
 
-Two known, already-tracked violations (`dolphin`, `xasr_zipformer`) are
-pre-declared in an `ALLOWLIST` at the top of the script so the gate does not
-immediately fail every unrelated PR. **A new family must never be added to
-`ALLOWLIST`** -- the allowlist exists only to grandfather the two families
-found by the initial audit until they are fixed; a new architecture that hits
-this gate has a real bug to fix, not a list entry to add. When a family's
-encoder is fixed, remove its entry from `ALLOWLIST` in the same PR (the script
-prints a "stale allowlist entry" note if it detects the family no longer
-reproduces, as a reminder).
+The gate has zero exemptions: every finding fails immediately. A family that
+hits this check has a real weight-placement defect to fix, not an entry to add
+to a suppression list.
 
 This is a heuristic over source text, not a proof -- see the script header for
 the false-positive analysis that was done by hand across all eleven onboarded
@@ -96,7 +90,7 @@ at least *attempted* to use a WEIGHTS-usage path.
 ### Dynamic half: one real forward pass with the scheduler's split dump
 
 The static gate can be fooled by a family that technically calls
-`load_gguf_weight_context` somewhere in scope but doesn't actually route the
+`load_gguf_weight_context_from_preflight` somewhere in scope but doesn't actually route the
 encoder's hot matmuls through the bound tensors (or binds only a token
 embedding while the real transformer stack still uploads per-request). The
 static gate narrows the search space; this step proves placement empirically.
@@ -122,7 +116,7 @@ dump like:
 **Pass condition:** the encoder's/decoder's matmul-heavy splits show the
 target GPU backend, not `CPU`. **Fail condition:** the encoder's op range is
 entirely (or mostly) under a `## SPLIT #N: CPU` block while a GPU backend was
-requested -- this is exactly the Dolphin/X-ASR signature, and it means the
+requested -- this is the failure signature, and it means the
 weights loaded via whatever mechanism the code uses are not actually reaching
 a WEIGHTS-usage buffer for the hot matmuls.
 
@@ -140,14 +134,16 @@ not a ggml graph at all).
 Add to the [Model Onboarding Contract](model-onboarding-contract.md) reviewer
 checklist and to the [Model Onboarding](../MODEL_ONBOARDING.md) walkthrough:
 
-- [ ] `scripts/gpu-weight-placement-gate.sh` passes for the new family (no new,
-      un-allowlisted finding).
+- [ ] `scripts/gpu-weight-placement-gate.sh` passes for the new family (no
+      finding).
 - [ ] A one-shot `GGML_SCHED_DEBUG=2 GGML_DEBUG=1 OPENASR_GGML_BACKEND=<gpu
       backend>` real forward pass shows the encoder's/decoder's matmul splits
       on the GPU backend, not `CPU` -- pasted into the PR description (or a
       structural reason cited for why a subgraph is intentionally host-side).
-- [ ] 2D matmul weights bind via `load_gguf_weight_context` (native quantized
-      type, zero-copy); 1D norm/bias tensors bind via `GgmlStaticTensorArena`.
+- [ ] 2D matmul weights bind via `load_gguf_weight_context_from_preflight`
+      (native quantized type, zero-copy); 1D norm/bias tensors bind via
+      `GgmlStaticTensorArena`. The bare-source loader is test-only; production
+      code carries the existing preflight proof.
       `runner.start_graph()` + an upload call (`uploads.push` /
       `pending_uploads.push` / `.upload(...)`) is reserved for genuine
       per-request input (features, token ids, step state) -- never for

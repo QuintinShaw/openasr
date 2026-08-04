@@ -13,7 +13,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | --- | --- |
 | [Roadmap](ROADMAP.md) | Implementation truth, sequencing, and active priorities; the Implemented-baseline section records what runs today (active `mock`/`native` backends, the eight native model families, the `arch/` registry, the `.oasr`-only pack contract) and what is deferred. OpenASR is Apache-2.0 open core. |
 | [Quickstart](QUICKSTART.md) | Three commands to a real transcript: build, transcribe (native by default, consent-pull on first run), and pick a model. |
-| [Model Onboarding](MODEL_ONBOARDING.md) | Contributor checklist for adding a new ASR architecture: shared `nn/` blocks plus a thin per-family step executor gated by a load-bearing block-stack descriptor (the llama.cpp model). |
+| [Model Onboarding](MODEL_ONBOARDING.md) | Contributor checklist for adding or migrating a family: one descriptor inventory row, a narrow adapter, shared compute/runtime seams, pack proof, and conformance gates. |
 | [Model Release Audits](model-audits/README.md) | Per-family release audit forms (`model-audits/<family>.md`, from `model-audits/TEMPLATE.md`): ten performance/completeness dimensions, three-state status with mandatory justifications, enforced fail-closed by the publish pipeline before a family goes `public:true`. |
 | [Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md) | Catalog ownership chain (human-edited publishing catalog -> generated `model-registry/catalog.json`), `openasr pull` install mechanics, the local `model-registry/models/*.toml` cards, signed catalog hosting/cache, and the no-implicit-download boundary. |
 | [Catalog Forward Compatibility and Client Resilience](CATALOG_COMPATIBILITY.md) | What a running build must do with a catalog from a different epoch: fail-closed boundary (signature/epoch rollback/schema-major/required fields) vs. must-tolerate degradation (unknown language codes, unknown kind/license_class/capability role -> hide the entry, not the catalog); the epoch floor's narrower boot-local-candidate exception; the verify-then-persist + cache/embedded fallback chain; the `catalog_degraded` status surface (`doctor`, `/health`); and the 2026-07-16 cache-pollution incident this hardens against. |
@@ -37,9 +37,13 @@ in the root [README](../README.md#docker).
 
 | Doc | What it covers |
 | --- | --- |
+| [Model-family lifecycle](design/model-family-lifecycle.md) | Normative v2 lifecycle: required descriptor facets, the PackCandidate -> VerifiedPack -> AdmittedPack proof chain, Optimization A/B/C, generated projections, compute-layer boundary, reference migration order, and cleanup gates. |
 | [Model Onboarding Contract](design/model-onboarding-contract.md) | Reviewer-facing anti-fragmentation contract for new ASR-architecture PRs: the shared registration/decode/packaging/tokenizer/`nn/`/capabilities/progress facilities every family must reuse instead of re-implementing, plus a PR checklist. Written after the FireRedASR-AED long-audio repetition bug (issue #60) showed the cost of a family bypassing the shared decode driver. |
 | [Decoder State and Native Memory Planning](design/decoder-state-memory-planning.md) | Four-layer contract for family token topology, native backend physical-footprint quotes, process-wide atomic memory admission, and semantics-preserving execution fallback. Includes the 30/60-second product envelope and decoder-family onboarding checklist. |
 | [Runtime Source Preflight and Provenance](design/runtime-source-preflight.md) | One-open/one-preflight construction contract for GGUF metadata, tensor indexes, readers, native weight contexts, content-keyed caches, and new-family anti-bypass gates. |
+
+For model-family changes, the lifecycle row above is the top-level entry point;
+the onboarding and reviewer contract are its implementation and review views.
 
 ## Speaker diarization
 

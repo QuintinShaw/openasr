@@ -1080,15 +1080,22 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     )
     .ok()
     .flatten();
-    let Ok(model_session_permit) = runtime.acquire_native_execution(resolved_route.as_ref()) else {
-        return;
-    };
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
         return;
     };
-    let model_pack =
-        NativeAsrModelPackRef::new("native-default", adapter.model_family(), model_pack_path);
+    let Ok(model_session_key) = crate::routes::transcription::native_model_session_key(&adapter)
+    else {
+        return;
+    };
+    let Ok(model_session_permit) =
+        runtime.acquire_native_execution(&model_session_key, resolved_route.as_ref())
+    else {
+        return;
+    };
+    let Ok(model_pack) = adapter.model_pack_ref("native-default") else {
+        return;
+    };
     let context = NativeAsrSessionContext::new("boot-warmup");
     // Same saved-preferences fallback a real WS attach applies when a session
     // does not set an explicit `execution_target`/`inference_threads`

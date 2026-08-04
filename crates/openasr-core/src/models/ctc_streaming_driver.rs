@@ -62,7 +62,6 @@ where
         .session_config
         .partial_floor_ms(tuning.min_partial_interval_ms());
 
-    let runtime_source_path = request.runtime_source_path.clone();
     let partial_execution_services = std::sync::Arc::clone(&request.execution_services);
     let partial_decode_execution_services = std::sync::Arc::clone(&request.execution_services);
     let partial_decoder_state = request.decoder_state.clone();
@@ -79,7 +78,6 @@ where
         move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
             execution_services: std::sync::Arc::clone(&partial_execution_services),
             decoder_state: partial_decoder_state.clone(),
-            runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
             prepared_audio: audio.clone(),
@@ -122,7 +120,6 @@ where
     let final_execution_services = std::sync::Arc::clone(&request.execution_services);
     let final_decode_execution_services = std::sync::Arc::clone(&request.execution_services);
     let final_decoder_state = request.decoder_state.clone();
-    let runtime_source_path = request.runtime_source_path.clone();
     let runtime_source_preflight = request.runtime_source_preflight.clone();
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
@@ -131,7 +128,6 @@ where
         move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
             execution_services: std::sync::Arc::clone(&final_execution_services),
             decoder_state: final_decoder_state.clone(),
-            runtime_source_path: runtime_source_path.clone(),
             runtime_source_preflight: runtime_source_preflight.clone(),
             selected_family: selected_family.clone(),
             prepared_audio: audio.clone(),
@@ -478,25 +474,26 @@ mod tests {
         use crate::ggml_runtime::{
             GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
         };
-        use std::path::PathBuf;
-
         fn session_request(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> GgmlAsrStreamingSessionRequest {
             let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
                 backend_preference.request_backend_override(),
                 crate::arch::family_auto_gpu_policy_for_model_architecture(
-                    crate::wav2vec2_ctc_runtime_descriptor_v1().model_architecture,
+                    crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
                 ),
             );
+            let runtime_source_preflight =
+                crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
             GgmlAsrStreamingSessionRequest {
                 execution_services:
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
-                runtime_source_preflight: None,
-                selected_family: crate::wav2vec2_ctc_runtime_descriptor_v1(),
+                runtime_source_preflight,
+                selected_family: crate::arch::builtin_adapter_descriptor(
+                    crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+                ),
                 request_options: crate::GgmlAsrExecutionOptions::default(),
                 configured_diarize: false,
                 backend_preference,

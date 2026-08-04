@@ -12,6 +12,7 @@
 //! metadata aborts the import without writing the output pack.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -23,7 +24,8 @@ use thiserror::Error;
 use super::config::{
     HUNYUAN_DENSE_ARCHITECTURE_VALUE, HYMT2_EXPECTED_LAYERS, HYMT2_EXPECTED_VOCAB_SIZE,
 };
-use crate::models::oasr_metadata::{OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1};
+use crate::ggml_runtime::GgufWriteValue;
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 
 /// Pinned upstream base (safetensors) repository for provenance metadata.
 pub const HYMT2_UPSTREAM_BASE_REPO: &str = "tencent/Hy-MT2-1.8B";
@@ -143,6 +145,8 @@ pub enum Hymt2ImportError {
     NoticeMissingRevision { revision: String },
     #[error("hymt2 import metadata value for {field} cannot contain NUL bytes")]
     FieldContainsNul { field: &'static str },
+    #[error("hymt2 OASR writer failed: {reason}")]
+    PackWrite { reason: String },
 }
 
 fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> Hymt2ImportError + '_ {
@@ -226,22 +230,53 @@ pub fn import_hymt2_gguf_to_runtime_pack(
         });
     }
 
-    let appended = build_openasr_metadata_entries(request, &source_sha256)?;
+    let mut inherited_envelope_metadata = BTreeMap::new();
+    inherited_envelope_metadata.insert(
+        GENERAL_ARCHITECTURE_KEY.to_string(),
+        GgufWriteValue::String(
+            validator
+                .architecture
+                .clone()
+                .expect("validated source architecture is present"),
+        ),
+    );
+    let transaction = OasrPackWriter::begin_repack(
+        &request.output_pack,
+        PackEnvelope::aux(HUNYUAN_DENSE_ARCHITECTURE_VALUE),
+        build_openasr_metadata_entries(request, &source_sha256)?,
+        &inherited_envelope_metadata,
+    )
+    .map_err(|error| Hymt2ImportError::PackWrite {
+        reason: error.to_string(),
+    })?;
+    let appended = transaction.sealed_metadata();
     let appended_count = appended.len() as u64;
     let mut appended_bytes = Vec::new();
-    for (key, value) in &appended {
+    for (key, value) in appended {
         write_gguf_string(&mut appended_bytes, key);
         match value {
-            SplicedValue::String(text) => {
+            GgufWriteValue::String(text) => {
                 appended_bytes.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
                 write_gguf_string(&mut appended_bytes, text);
             }
-            SplicedValue::StringArray(items) => {
+            GgufWriteValue::U32(value) => {
+                appended_bytes.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+                appended_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            GgufWriteValue::StringArray(items) => {
                 appended_bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
                 appended_bytes.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
                 appended_bytes.extend_from_slice(&(items.len() as u64).to_le_bytes());
                 for item in items {
                     write_gguf_string(&mut appended_bytes, item);
+                }
+            }
+            GgufWriteValue::U32Array(items) => {
+                appended_bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+                appended_bytes.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+                appended_bytes.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                for item in items {
+                    appended_bytes.extend_from_slice(&item.to_le_bytes());
                 }
             }
         }
@@ -260,7 +295,7 @@ pub fn import_hymt2_gguf_to_runtime_pack(
     let output_padding = output_header_end.next_multiple_of(alignment) - output_header_end;
 
     write_output_pack(
-        request,
+        transaction.staging_path(),
         tensor_count,
         kv_count + appended_count,
         &appended_bytes,
@@ -268,17 +303,24 @@ pub fn import_hymt2_gguf_to_runtime_pack(
         output_padding,
         &mut reader,
     )?;
-
-    let pack_sha256 = file_sha256(&request.output_pack)?;
-    let pack_size_bytes = std::fs::metadata(&request.output_pack)
-        .map_err(io_error(&request.output_pack))?
-        .len();
+    let appended_metadata_entries = appended.len();
+    let verified = transaction
+        .commit()
+        .map_err(|error| Hymt2ImportError::PackWrite {
+            reason: error.to_string(),
+        })?;
+    let pack_sha256 = verified
+        .content_id()
+        .strip_prefix("sha256:")
+        .expect("runtime content ids use sha256")
+        .to_string();
+    let pack_size_bytes = verified.preflight().runtime_source().byte_len();
     Ok(Hymt2ImportResult {
         output_path: request.output_pack.clone(),
         source_sha256,
         pack_sha256,
         pack_size_bytes,
-        appended_metadata_entries: appended.len(),
+        appended_metadata_entries,
         tensor_count,
     })
 }
@@ -327,84 +369,75 @@ fn validate_request(request: &Hymt2ImportRequest) -> Result<(), Hymt2ImportError
     Ok(())
 }
 
-enum SplicedValue {
-    String(String),
-    StringArray(Vec<&'static str>),
-}
-
 fn build_openasr_metadata_entries(
     request: &Hymt2ImportRequest,
     source_sha256: &str,
-) -> Result<Vec<(String, SplicedValue)>, Hymt2ImportError> {
-    Ok(vec![
-        // `.oasr` v1 package contract (docs/format/OASR_PACKAGE_CONTRACT_V1.md):
-        // `openasr.package.version = "1"` is REQUIRED by the generic pull
-        // preflight; a pack without it can be built but never installed.
-        (
-            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
-            SplicedValue::String(OASR_PACKAGE_VERSION_V1.to_string()),
-        ),
+) -> Result<BTreeMap<String, GgufWriteValue>, Hymt2ImportError> {
+    Ok(BTreeMap::from([
         (
             "openasr.model.kind".to_string(),
-            SplicedValue::String("translation-model".to_string()),
+            GgufWriteValue::String("translation-model".to_string()),
         ),
         (
             "openasr.model.id".to_string(),
-            SplicedValue::String(request.model_id.clone()),
+            GgufWriteValue::String(request.model_id.clone()),
         ),
         (
             "openasr.quantization".to_string(),
-            SplicedValue::String(request.quantization.clone()),
+            GgufWriteValue::String(request.quantization.clone()),
         ),
         (
             "openasr.translation.source_langs".to_string(),
-            SplicedValue::StringArray(vec!["zh"]),
+            GgufWriteValue::StringArray(vec!["zh".to_string()]),
         ),
         (
             "openasr.translation.target_langs".to_string(),
-            SplicedValue::StringArray(vec!["en"]),
+            GgufWriteValue::StringArray(vec!["en".to_string()]),
         ),
         (
             "openasr.upstream.base_repo".to_string(),
-            SplicedValue::String(HYMT2_UPSTREAM_BASE_REPO.to_string()),
+            GgufWriteValue::String(HYMT2_UPSTREAM_BASE_REPO.to_string()),
         ),
         (
             "openasr.upstream.base_revision".to_string(),
-            SplicedValue::String(HYMT2_UPSTREAM_BASE_REVISION.to_string()),
+            GgufWriteValue::String(HYMT2_UPSTREAM_BASE_REVISION.to_string()),
         ),
         (
             "openasr.upstream.gguf_repo".to_string(),
-            SplicedValue::String(HYMT2_UPSTREAM_GGUF_REPO.to_string()),
+            GgufWriteValue::String(HYMT2_UPSTREAM_GGUF_REPO.to_string()),
         ),
         (
             "openasr.upstream.gguf_revision".to_string(),
-            SplicedValue::String(HYMT2_UPSTREAM_GGUF_REVISION.to_string()),
+            GgufWriteValue::String(HYMT2_UPSTREAM_GGUF_REVISION.to_string()),
         ),
         (
             "openasr.upstream.gguf_sha256".to_string(),
-            SplicedValue::String(source_sha256.to_string()),
+            GgufWriteValue::String(source_sha256.to_string()),
         ),
         (
             "openasr.license.name".to_string(),
-            SplicedValue::String("Apache-2.0".to_string()),
+            GgufWriteValue::String("Apache-2.0".to_string()),
         ),
         (
             "openasr.license.source".to_string(),
-            SplicedValue::String(HYMT2_LICENSE_SOURCE_URL.to_string()),
+            GgufWriteValue::String(HYMT2_LICENSE_SOURCE_URL.to_string()),
         ),
         (
             "openasr.license.files".to_string(),
-            SplicedValue::StringArray(vec!["LICENSE.txt", "NOTICE.openasr.txt"]),
+            GgufWriteValue::StringArray(vec![
+                "LICENSE.txt".to_string(),
+                "NOTICE.openasr.txt".to_string(),
+            ]),
         ),
         (
             "openasr.license.file.LICENSE.txt".to_string(),
-            SplicedValue::String(request.license_text.clone()),
+            GgufWriteValue::String(request.license_text.clone()),
         ),
         (
             "openasr.license.file.NOTICE.openasr.txt".to_string(),
-            SplicedValue::String(request.notice_text.clone()),
+            GgufWriteValue::String(request.notice_text.clone()),
         ),
-    ])
+    ]))
 }
 
 #[derive(Default)]
@@ -658,7 +691,7 @@ fn skip_bytes<R: Read>(reader: &mut R, len: u64, path: &Path) -> Result<(), Hymt
 }
 
 fn write_output_pack<R: Read>(
-    request: &Hymt2ImportRequest,
+    output_path: &Path,
     tensor_count: u64,
     kv_count: u64,
     appended_bytes: &[u8],
@@ -666,7 +699,6 @@ fn write_output_pack<R: Read>(
     padding: u64,
     tensor_data: &mut R,
 ) -> Result<(), Hymt2ImportError> {
-    let output_path = &request.output_pack;
     let output_file = File::options()
         .write(true)
         .create_new(true)
@@ -835,61 +867,57 @@ mod tests {
     }
 
     #[test]
-    fn import_preserves_tensor_data_and_prepends_openasr_metadata() {
-        let (dir, result) = run_import(&SyntheticOverrides::default(), |_| {});
-        let result = result.expect("import succeeds");
-        assert_eq!(result.tensor_count, 1);
-        assert_eq!(result.appended_metadata_entries, 16);
+    fn byte_preserving_staging_writer_keeps_sections_and_tensor_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = dir.path().join("staging.oasr");
+        let appended = b"sealed-envelope";
+        let captured = b"source-kv-and-tensor-index";
+        let padding = 11;
+        let mut tensor_data = std::io::Cursor::new(SYNTHETIC_TENSOR_DATA);
 
-        let output_bytes =
-            std::fs::read(dir.path().join("hymt2-1.8b-q4_k_m.oasr")).expect("read output");
-        assert_eq!(&output_bytes[0..4], &GGUF_MAGIC);
-        let kv_count = u64::from_le_bytes(output_bytes[16..24].try_into().expect("kv count"));
-        assert_eq!(kv_count, 7 + 16);
-        // Tensor data preserved byte-for-byte at the aligned tail.
+        write_output_pack(
+            &staging,
+            1,
+            2,
+            appended,
+            captured,
+            padding,
+            &mut tensor_data,
+        )
+        .expect("write staging image");
+
+        let output = std::fs::read(staging).expect("read staging image");
+        assert_eq!(&output[..4], &GGUF_MAGIC);
+        assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(output[16..24].try_into().unwrap()), 2);
+        assert_eq!(&output[24..24 + appended.len()], appended);
         assert_eq!(
-            &output_bytes[output_bytes.len() - SYNTHETIC_TENSOR_DATA.len()..],
+            &output[24 + appended.len()..24 + appended.len() + captured.len()],
+            captured
+        );
+        assert_eq!(
+            &output[output.len() - SYNTHETIC_TENSOR_DATA.len()..],
             SYNTHETIC_TENSOR_DATA
         );
-        assert_eq!(
-            (output_bytes.len() - SYNTHETIC_TENSOR_DATA.len()) % GGUF_DEFAULT_ALIGNMENT as usize,
-            0
-        );
-        // Publish preflight markers must appear in the leading header window.
-        let head = &output_bytes[..output_bytes.len().min(64 * 1024)];
-        for marker in [
-            b"openasr.package.version".as_slice(),
-            b"openasr.model.kind".as_slice(),
-            b"translation-model",
-            b"openasr.translation.source_langs",
-            b"openasr.translation.target_langs",
-            b"openasr.upstream.base_revision",
-            HYMT2_UPSTREAM_BASE_REVISION.as_bytes(),
-            b"openasr.upstream.gguf_revision",
-            HYMT2_UPSTREAM_GGUF_REVISION.as_bytes(),
-            b"openasr.license.files",
-            b"LICENSE.txt",
-            b"NOTICE.openasr.txt",
-            b"Apache License",
-        ] {
-            assert!(
-                head.windows(marker.len()).any(|window| window == marker),
-                "marker missing from header window: {}",
-                String::from_utf8_lossy(marker)
-            );
-        }
     }
 
-    /// Regression test for the shipped pack that failed `openasr pull` with
-    /// "missing required metadata 'openasr.package.version'": every importer
-    /// output must pass the generic pull GGUF preflight gate.
+    /// The small fixture intentionally cannot represent all 32 layers of the
+    /// fixed Hy-MT2 architecture. The production writer must therefore fail
+    /// closed and keep the destination invisible instead of accepting a pack
+    /// that only satisfies the generic GGUF envelope.
     #[test]
-    fn import_output_passes_generic_pull_gguf_preflight() {
+    fn runtime_incomplete_source_cannot_be_exposed_as_an_oasr_pack() {
         let (dir, result) = run_import(&SyntheticOverrides::default(), |_| {});
-        let result = result.expect("import succeeds");
-        crate::pull::preflight_gguf_package_contract(&result.output_path)
-            .expect("imported pack must pass the generic pull GGUF preflight");
-        drop(dir);
+        let error = result.expect_err("incomplete runtime pack must be rejected");
+        assert!(
+            matches!(error, Hymt2ImportError::PackWrite { ref reason }
+                if reason.contains("runtime pack contract failed")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !dir.path().join("hymt2-1.8b-q4_k_m.oasr").exists(),
+            "failed verification must not expose the output"
+        );
     }
 
     /// Full pull-time preflight (GGUF contract + runtime-source validation +

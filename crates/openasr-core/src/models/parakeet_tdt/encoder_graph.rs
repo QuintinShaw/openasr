@@ -73,7 +73,7 @@ impl ParakeetTdtEncoderGraph {
     pub(crate) fn new(
         weights: &ParakeetTdtEncoderWeights,
         metadata: ParakeetTdtExecutionMetadata,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetTdtEncoderError> {
         let config = parakeet_tdt_encoder_graph_config(backend);
@@ -224,7 +224,7 @@ mod tests {
         let mut graph = ParakeetTdtEncoderGraph::new(
             &weights,
             metadata,
-            Some(&preflight),
+            &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("graph");

@@ -438,3 +438,14 @@ fn render_shape(shape: &[u64]) -> String {
         .join(", ");
     format!("[{parts}]")
 }
+
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    let execution_metadata =
+        parse_moonshine_execution_metadata(preflight.metadata()).map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("moonshine", error)
+        })?;
+    validate_moonshine_runtime_tensors_with_index(preflight.tensor_index(), execution_metadata)
+        .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
+}

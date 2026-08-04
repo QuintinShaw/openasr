@@ -5,12 +5,14 @@
 //! The dedicated-executor families (Whisper, Moonshine, Parakeet-CTC, wav2vec2/
 //! data2vec-CTC) materialize their weights in their own family modules and never
 //! reach this enum; that boundary is enforced at the frontend chokepoint (see
-//! [`super::frontend_component_registry`]). An unrecognized architecture here is
-//! therefore a programming error and fails closed via `UnknownArchitecture`.
+//! [`super::frontend_component_registry`]). Callers pass the typed reusable
+//! component strategy selected from the family inventory; this registry never
+//! switches on family identity itself.
 
 use thiserror::Error;
 
 use crate::GgufTensorDataReader;
+use crate::arch::OpenAsrPreparedRuntimeStrategy;
 use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
 
 use super::cohere::{
@@ -87,8 +89,8 @@ impl BuiltinRuntimeWeightComponents {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum BuiltinRuntimeWeightComponentRegistryError {
-    #[error("unknown builtin model architecture '{model_architecture}'")]
-    UnknownArchitecture { model_architecture: String },
+    #[error("a family-owned runtime cannot enter the shared composer registry")]
+    FamilyOwnedRuntime,
     #[error("builtin runtime weights expected metadata for '{expected_kind}', got '{found_kind}'")]
     MetadataKindMismatch {
         expected_kind: &'static str,
@@ -102,15 +104,15 @@ pub(crate) enum BuiltinRuntimeWeightComponentRegistryError {
 }
 
 pub(crate) fn materialize_builtin_runtime_weight_components(
-    model_architecture: &str,
+    strategy: OpenAsrPreparedRuntimeStrategy,
     reader: &GgufTensorDataReader,
     runtime_source: &crate::GgmlRuntimeSource,
     metadata: RuntimeTensorContractMetadata,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<BuiltinRuntimeWeightComponents, BuiltinRuntimeWeightComponentRegistryError> {
-    match (model_architecture, metadata) {
+    match (strategy, metadata) {
         (
-            crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
             RuntimeTensorContractMetadata::CohereTranscribe(metadata),
         ) => {
             let encoder_weights =
@@ -134,7 +136,7 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
             })
         }
         (
-            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1,
             RuntimeTensorContractMetadata::Qwen3Asr(metadata),
         ) => {
             let audio_encoder_weights =
@@ -179,23 +181,21 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                 decoder_plan,
             })
         }
-        (crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, metadata) => Err(
+        (OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1, metadata) => Err(
             BuiltinRuntimeWeightComponentRegistryError::MetadataKindMismatch {
                 expected_kind: "cohere-transcribe",
                 found_kind: metadata_kind_label(metadata),
             },
         ),
-        (crate::QWEN3_ASR_GGML_ARCHITECTURE_ID, metadata) => Err(
+        (OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1, metadata) => Err(
             BuiltinRuntimeWeightComponentRegistryError::MetadataKindMismatch {
                 expected_kind: QWEN3_ASR_MODEL_FAMILY,
                 found_kind: metadata_kind_label(metadata),
             },
         ),
-        _ => Err(
-            BuiltinRuntimeWeightComponentRegistryError::UnknownArchitecture {
-                model_architecture: model_architecture.to_string(),
-            },
-        ),
+        (OpenAsrPreparedRuntimeStrategy::FamilyOwned, _) => {
+            Err(BuiltinRuntimeWeightComponentRegistryError::FamilyOwnedRuntime)
+        }
     }
 }
 

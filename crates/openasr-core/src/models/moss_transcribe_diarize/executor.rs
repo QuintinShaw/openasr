@@ -106,8 +106,6 @@ enum MossTdExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("moss-transcribe-diarize executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("moss-transcribe-diarize runtime metadata contract failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("moss-transcribe-diarize tokenizer materialization failed: {reason}")]
@@ -219,7 +217,7 @@ impl Default for MossTdGgmlExecutor {
     }
 }
 
-const MOSS_TD_EXECUTOR_ID: &str = "moss-transcribe-diarize-ggml-executor-v1";
+const MOSS_TD_EXECUTOR_ID: &str = crate::arch::MOSS_TD_EXECUTOR_COMPONENT_ID;
 const MOSS_TD_STREAMING_EXECUTOR_ID: &str =
     "moss-transcribe-diarize-ggml-snapshot-streaming-executor-v1";
 
@@ -768,7 +766,7 @@ impl MossTdGgmlExecutor {
 
     fn prepared_runtime_for_preflight(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<PreparedRuntimeHandle<MossTdPreparedRuntime>, MossTdExecutorError> {
         self.prepared_runtimes.get_or_try_insert_with(
@@ -800,7 +798,7 @@ impl MossTdGgmlExecutor {
 
     fn checkout_encoder_runtime(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<MossTdEncoderRuntimeActor, MossTdExecutorError> {
@@ -834,7 +832,7 @@ impl MossTdGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
@@ -938,14 +936,10 @@ impl MossTdGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| MossTdExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
 
         let backend = request.resolved_runtime.backend();
-        let prepared = self.prepared_runtime_for_preflight(&preflight, backend)?;
+        let prepared = self.prepared_runtime_for_preflight(preflight, backend)?;
         let encoder_metadata = prepared.encoder_metadata;
         let adaptor_metadata = prepared.adaptor_metadata;
         let decoder_metadata = prepared.decoder_metadata;
@@ -981,7 +975,7 @@ impl MossTdGgmlExecutor {
             max_source_positions: encoder_metadata.max_source_positions,
         };
         let encoder_actor =
-            self.checkout_encoder_runtime(&preflight, Arc::clone(&prepared), backend)?;
+            self.checkout_encoder_runtime(preflight, Arc::clone(&prepared), backend)?;
         let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
             &encoder_actor,
             encoder_config,
@@ -1065,7 +1059,7 @@ impl MossTdGgmlExecutor {
         }
 
         let decoder_actor =
-            self.checkout_decoder_runtime(&preflight, prepared, kv_capacity_plan, backend)?;
+            self.checkout_decoder_runtime(preflight, prepared, kv_capacity_plan, backend)?;
         let decoded = run_moss_td_decoder_with_cached_runtime(
             &decoder_actor,
             decoder_metadata,
@@ -1123,6 +1117,10 @@ fn map_registry_error(
 }
 
 impl GgmlAsrViewExecutor for MossTdGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        MossTdGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         MOSS_TD_EXECUTOR_ID
     }
@@ -1201,9 +1199,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use crate::arch::builtin_adapter_descriptor;
     use crate::ggml_runtime::install_request_backend_override;
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
-    use crate::models::ggml_family_registry::moss_transcribe_diarize_runtime_descriptor_v1;
 
     use crate::api::backend::Segment;
 
@@ -1350,14 +1348,18 @@ mod tests {
         )
         .expect("load wav fixture");
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &pack_path,
+            )
+            .expect("moss runtime must pass preflight");
 
         let request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             // The goldens pin the reference decode including its speaker
             // structure, so ask for it -- with Voice ID off the normalizer
@@ -1414,13 +1416,17 @@ mod tests {
             "moss-td e2e test",
         )
         .expect("load wav fixture");
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &pack_path,
+            )
+            .expect("moss runtime must pass preflight");
         let request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: crate::models::ggml_asr_executor::GgmlAsrExecutionOptions {
                 in_decoder_speakers: true,

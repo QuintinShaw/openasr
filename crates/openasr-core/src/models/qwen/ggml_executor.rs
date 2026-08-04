@@ -42,7 +42,9 @@ use crate::arch::hparams::{QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY};
 use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
-use crate::arch::{OpenAsrArchitectureRegistry, QWEN3_ASR_GGML_ARCHITECTURE_ID};
+use crate::arch::{
+    OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy, QWEN3_ASR_GGML_ARCHITECTURE_ID,
+};
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphError, env_var_truthy};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -79,11 +81,11 @@ use crate::{
 
 #[cfg(test)]
 use super::runtime_contract::parse_qwen3_execution_metadata;
-use crate::GgmlAsrRuntimeSourcePreflight;
+use crate::GgufRuntimeSourcePreflight;
 #[cfg(test)]
 use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
 
-const QWEN3_EXECUTOR_ID: &str = "qwen3-asr-ggml-executor-v1";
+const QWEN3_EXECUTOR_ID: &str = crate::arch::QWEN3_ASR_EXECUTOR_COMPONENT_ID;
 const QWEN3_STREAMING_EXECUTOR_ID: &str = "qwen3-asr-ggml-snapshot-streaming-executor-v1";
 const QWEN3_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const QWEN3_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
@@ -274,7 +276,7 @@ impl Qwen3AsrGgmlExecutor {
 
     fn checkout_audio_encoder_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Qwen3AsrAudioEncoderRuntimeActor, Qwen3AsrGgmlExecutorError> {
@@ -305,7 +307,7 @@ impl Qwen3AsrGgmlExecutor {
 
     fn encode_with_owned_audio_encoder_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         mel_features: Qwen3AsrMelFeatures,
         backend: GgmlCpuGraphBackend,
@@ -333,7 +335,7 @@ impl Qwen3AsrGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
@@ -405,13 +407,7 @@ impl Qwen3AsrGgmlExecutor {
 
         let profile_started_at = qwen_decode_profile_start();
         let preflight_started_at = qwen_decode_profile_start();
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(
-                |error| Qwen3AsrGgmlExecutorError::RuntimeMetadataReadFailed {
-                    reason: error.to_string(),
-                },
-            )?;
+        let preflight = &request.runtime_source_preflight;
         qwen_decode_profile_log_opt("runtime_preflight", preflight_started_at);
         let prepared_runtime_started_at = qwen_decode_profile_start();
         let result = self
@@ -419,7 +415,7 @@ impl Qwen3AsrGgmlExecutor {
             .prepared_runtime_for_preflight(
                 PreparedRuntimeLookup {
                     model_architecture: request.selected_family.model_architecture,
-                    preflight: preflight.as_ref(),
+                    preflight,
                     backend: request.resolved_runtime.backend(),
                 },
                 map_prepared_runtime_registry_error,
@@ -428,7 +424,7 @@ impl Qwen3AsrGgmlExecutor {
             .and_then(|prepared_runtime_owner| {
                 self.execute_with_prepared_runtime(
                     request,
-                    preflight.as_ref(),
+                    preflight,
                     &prepared_runtime_owner,
                     skip_serve_batch,
                 )
@@ -441,7 +437,7 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_prepared_runtime(
         &self,
         request: &GgmlAsrExecutionViewRequest,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prepared_runtime_owner: &PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
@@ -483,7 +479,7 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionViewRequest,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         mel_frontend_plan: &Qwen3AsrMelFrontendPlan,
@@ -524,7 +520,7 @@ impl Qwen3AsrGgmlExecutor {
     fn decode_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionViewRequest,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         token_embedding_table: Arc<super::token_embedding::Qwen3AsrTokenEmbeddingTable>,
@@ -953,9 +949,12 @@ impl Qwen3AsrGgmlExecutor {
     ) -> Result<(), Qwen3AsrGgmlExecutorError> {
         let qwen_descriptor = OpenAsrArchitectureRegistry::with_builtins()
             .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID);
-        let qwen_block_stack = qwen_descriptor
-            .as_ref()
-            .and_then(|descriptor| descriptor.block_stack.as_ref());
+        let qwen_block_stack = qwen_descriptor.as_ref().and_then(|descriptor| {
+            match &descriptor.topology_contract.block_stack {
+                OpenAsrBlockStackStrategy::Shared(stack) => Some(stack),
+                OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => None,
+            }
+        });
         let layer_resolver = Qwen3AsrLayerCountResolver {
             audio_layers: metadata.audio_layers,
             llm_layers: metadata.llm_layers,
@@ -1016,7 +1015,7 @@ impl Qwen3AsrGgmlExecutor {
     fn build_prepared_runtime(
         &self,
         model_architecture: &str,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
     ) -> Result<Qwen3AsrPreparedRuntime, Qwen3AsrGgmlExecutorError> {
         build_builtin_prepared_runtime(PreparedRuntimeLookup {
             model_architecture,
@@ -1750,6 +1749,10 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
 }
 
 impl GgmlAsrViewExecutor for Qwen3AsrGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        Qwen3AsrGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         QWEN3_EXECUTOR_ID
     }
@@ -1884,13 +1887,13 @@ mod tests {
         llm_layer_tensor_names,
     };
 
+    use crate::arch::builtin_adapter_descriptor;
     use crate::testing::{
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrExecutionViewRequest,
-        GgmlAsrPreparedAudioView, LongFormOptions, qwen3_asr_runtime_descriptor_v1,
-        whisper_runtime_descriptor_v1,
+        GgmlAsrPreparedAudioView, LongFormOptions,
     };
 
     use super::*;
@@ -2022,13 +2025,25 @@ mod tests {
     }
 
     fn qwen_request(runtime_source_path: PathBuf) -> GgmlAsrExecutionViewRequest<'static> {
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &runtime_source_path,
+            )
+            .expect("qwen runtime fixture must pass preflight");
+        qwen_request_from_preflight(runtime_source_preflight)
+    }
+
+    fn qwen_request_from_preflight(
+        runtime_source_preflight: crate::GgufRuntimeSourcePreflight,
+    ) -> GgmlAsrExecutionViewRequest<'static> {
         GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path,
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0; 160]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -2043,10 +2058,7 @@ mod tests {
     }
 
     fn plan_qwen_request_decoder_state(request: &mut GgmlAsrExecutionViewRequest<'_>) {
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .expect("resolve qwen runtime preflight")
-            .into_owned();
+        let preflight = &request.runtime_source_preflight;
         // The shared view intentionally borrows PCM, while the common offline
         // planning helper accepts the public owned DTO. This copy is test-only
         // and keeps the production execute_view path zero-copy.
@@ -2056,7 +2068,7 @@ mod tests {
             samples_f32: request.prepared_audio.samples_f32.to_vec(),
         };
         let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_offline_request(
-            &preflight,
+            preflight,
             &prepared_audio,
             &request.request_options,
             request.resolved_runtime.backend(),
@@ -2069,7 +2081,6 @@ mod tests {
                 plan,
                 planning_input.envelope,
             );
-        request.runtime_source_preflight = Some(preflight);
     }
 
     #[test]
@@ -2103,8 +2114,11 @@ mod tests {
 
     #[test]
     fn qwen_executor_rejects_non_qwen_adapter() {
-        let mut request = qwen_request(PathBuf::from("/tmp/qwen3-asr.gguf"));
-        request.selected_family = whisper_runtime_descriptor_v1();
+        let mut request = qwen_request_from_preflight(
+            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
+        );
+        request.selected_family =
+            builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
         let executor = Qwen3AsrGgmlExecutor::default();
         let error = executor
             .execute_view(&request)
@@ -2261,14 +2275,9 @@ mod tests {
             write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec)
                 .expect("write gguf fixture");
             let request = qwen_request(runtime_path);
-            let preflight = request
-                .resolve_runtime_source_preflight()
-                .expect("runtime preflight");
+            let preflight = &request.runtime_source_preflight;
             executor
-                .build_prepared_runtime(
-                    request.selected_family.model_architecture,
-                    preflight.as_ref(),
-                )
+                .build_prepared_runtime(request.selected_family.model_architecture, preflight)
                 .expect("prepared runtime should build");
         }
     }
@@ -2280,36 +2289,16 @@ mod tests {
         let fixture_spec = qwen_tensor_ready_fixture_spec();
         write_tiny_gguf_runtime_source(&runtime_path, &fixture_spec).expect("write gguf fixture");
         let request = qwen_request(runtime_path);
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .expect("runtime preflight");
+        let preflight = &request.runtime_source_preflight;
         let executor = Qwen3AsrGgmlExecutor::default();
         let prepared = executor
-            .build_prepared_runtime(
-                request.selected_family.model_architecture,
-                preflight.as_ref(),
-            )
+            .build_prepared_runtime(request.selected_family.model_architecture, preflight)
             .expect("prepared runtime should build");
         assert!(
             prepared
                 .audio_encoder_weights
                 .zero_copy_audio_projection_payloads_dropped_for_test()
         );
-    }
-
-    #[test]
-    fn qwen_executor_fails_closed_when_runtime_metadata_cannot_be_read() {
-        let request = qwen_request(PathBuf::from("/tmp/does-not-exist-qwen3.gguf"));
-        let executor = Qwen3AsrGgmlExecutor::default();
-        let error = executor
-            .execute_view(&request)
-            .expect_err("missing runtime source must fail");
-        match error {
-            GgmlAsrExecutionError::ExecutorFailed { reason, .. } => {
-                assert!(reason.contains("runtime metadata read failed"), "{reason}");
-            }
-            other => panic!("unexpected error {other:?}"),
-        }
     }
 
     #[test]
@@ -2385,9 +2374,14 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            runtime_source_preflight:
+                crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                    &pack_path,
+                )
+                .expect("qwen runtime pack must pass preflight"),
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,

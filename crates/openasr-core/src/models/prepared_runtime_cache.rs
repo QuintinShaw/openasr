@@ -46,7 +46,7 @@ pub(crate) trait SystemMemoryMaterialization: Send + Sync + 'static {
 /// infer heap growth from the pack's file size.
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedRuntimeQuoteContext<'a> {
-    /// Engine integration identity selected by the architecture registry.
+    /// Engine architecture identity selected by the architecture registry.
     /// This is intentionally distinct from GGUF `general.architecture`, whose
     /// runtime-format alias is family-specific.
     pub(crate) model_architecture: &'a str,

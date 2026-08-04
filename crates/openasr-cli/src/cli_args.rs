@@ -665,6 +665,13 @@ pub(crate) enum ModelPackCommand {
     Preflight {
         /// Path to a local `.oasr` pack file.
         path: PathBuf,
+        /// Copy into this new destination and verify the staged bytes. The
+        /// destination is never overwritten and is sealed read-only on success.
+        #[arg(long)]
+        stage: Option<PathBuf>,
+        /// Emit the versioned verification receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Audit a pack's tensor quantization against the current policy: the
     /// audio-encoder Q8_0 floor (unconditional) plus, when `--quant` names the

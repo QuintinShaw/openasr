@@ -53,8 +53,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::models::ggml_streaming_session::{
         GgmlAsrStreamingTranscriptUpdate, GgmlAsrStreamingTranscriptUpdate::Partial,
@@ -62,7 +60,7 @@ mod tests {
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, NativeAsrStreamingSessionConfig,
         RealtimeAudioFormat, RealtimeAudioFrame, RealtimeEvent, RealtimeTranscriptEvent,
-        TranscriptUpdate, qwen3_asr_runtime_descriptor_v1,
+        TranscriptUpdate,
     };
 
     struct ScriptFactory;
@@ -99,13 +97,16 @@ mod tests {
     }
 
     fn request() -> GgmlAsrStreamingSessionRequest {
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
         GgmlAsrStreamingSessionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: PathBuf::from("fixtures/qwen.gguf"),
-            runtime_source_preflight: None,
-            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: crate::arch::builtin_adapter_descriptor(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ),
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: GgmlAsrBackendPreference::Auto,

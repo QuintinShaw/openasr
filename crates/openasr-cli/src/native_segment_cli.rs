@@ -1355,6 +1355,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use openasr_core::testing::TinyGgufFixtureSpec;
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tower::ServiceExt;
@@ -1734,33 +1735,10 @@ mod tests {
     fn phrase_bias_cli_rejects_xasr_model_pack_early() {
         let temp = tempfile::tempdir().unwrap();
         let pack_path = temp.path().join("xasr-cli.oasr");
-        let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert("openasr.model.id".to_string(), "xasr-cli".to_string());
-        metadata.insert(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
-            openasr_core::models::oasr_metadata::OASR_PACKAGE_VERSION_V1.to_string(),
-        );
-        metadata.insert(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
-            "xasr-zipformer".to_string(),
-        );
-        metadata.insert(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
-            openasr_core::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID.to_string(),
-        );
-        metadata.insert(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
-            openasr_core::XASR_ZIPFORMER_AUDIO_FRONTEND_ID.to_string(),
-        );
-        metadata.insert(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY.to_string(),
-            openasr_core::XASR_ZIPFORMER_DECODE_POLICY_ID.to_string(),
-        );
-        metadata.insert(
-            openasr_core::GGML_TOKENIZER_ID_KEY.to_string(),
-            openasr_core::XASR_ZIPFORMER_TOKENIZER_ID.to_string(),
-        );
-        let spec = openasr_core::testing::TinyGgufFixtureSpec::new(metadata);
+        let spec =
+            TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
+                "xasr-cli",
+            );
         openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
         let config = openasr_core::PhraseBiasConfig::from_phrases([("OpenASR", 2.0)])
             .expect("phrase bias fixture");

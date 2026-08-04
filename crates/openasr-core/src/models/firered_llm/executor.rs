@@ -111,7 +111,7 @@ type FireRedLlmDecoderRuntimePool =
 type FireRedLlmDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
 
-const FIRERED_LLM_EXECUTOR_ID: &str = "firered-llm-ggml-executor-v1";
+const FIRERED_LLM_EXECUTOR_ID: &str = crate::arch::FIRERED_LLM_EXECUTOR_COMPONENT_ID;
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
 const CMVN_NEG_MEAN_TENSOR: &str = "frontend.cmvn.neg_mean";
 const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
@@ -133,8 +133,6 @@ enum FireRedLlmExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("firered-llm executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("firered-llm runtime metadata contract failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("firered-llm tokenizer materialization failed: {reason}")]
@@ -304,7 +302,7 @@ impl FireRedLlmGgmlExecutor {
 
     fn checkout_decoder_runtime(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: super::runtime_contract::FireRedLlmDecoderMetadata,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: GgmlCpuGraphBackend,
@@ -409,11 +407,7 @@ impl FireRedLlmGgmlExecutor {
                 found: request.selected_family.adapter_id.to_string(),
             });
         }
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| FireRedLlmExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
 
         let encoder_metadata =
             parse_firered_llm_encoder_metadata(&*preflight.metadata).map_err(|error| {
@@ -449,7 +443,7 @@ impl FireRedLlmGgmlExecutor {
             });
         }
 
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
             FireRedLlmExecutorError::CmvnBuildFailed {
                 reason: error.to_string(),
             }
@@ -480,7 +474,7 @@ impl FireRedLlmGgmlExecutor {
         )?;
 
         let mut encoder_runtime = FireRedEncoderGraphRuntime::new_from_preflight(
-            &preflight,
+            preflight,
             encoder_metadata,
             request.resolved_runtime.backend(),
         )
@@ -495,7 +489,7 @@ impl FireRedLlmGgmlExecutor {
 
         let adapter_profile_started_at = std::time::Instant::now();
         let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
-            &preflight,
+            preflight,
             request.resolved_runtime.backend(),
         )
         .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
@@ -552,7 +546,7 @@ impl FireRedLlmGgmlExecutor {
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FireRedLlmExecutorError::DecoderStateCapacity { source })?;
         let decoder_actor = self.checkout_decoder_runtime(
-            &preflight,
+            preflight,
             decoder_metadata,
             kv_capacity,
             decoder_backend,
@@ -678,6 +672,10 @@ fn map_registry_error(
 }
 
 impl GgmlAsrViewExecutor for FireRedLlmGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        FireRedLlmGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         FIRERED_LLM_EXECUTOR_ID
     }
@@ -746,9 +744,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use crate::arch::builtin_adapter_descriptor;
     use crate::models::ggml_asr_executor::GgmlAsrBackendPreference;
     use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
-    use crate::models::ggml_family_registry::firered_llm_runtime_descriptor_v1;
 
     use super::*;
 
@@ -828,6 +826,11 @@ mod tests {
         )
         .expect("load wav fixture");
         let audio_duration_seconds = samples.len() as f32 / 16_000.0;
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &pack_path,
+            )
+            .expect("firered-llm test runtime must pass preflight");
 
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             backend_preference.request_backend_override(),
@@ -839,9 +842,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: firered_llm_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,

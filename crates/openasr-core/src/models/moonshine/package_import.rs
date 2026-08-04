@@ -3,29 +3,22 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, validate_ggml_runtime_source_path, write_gguf_file_v0,
-};
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
-use crate::models::ggml_family_registry::{
-    MOONSHINE_AUDIO_FRONTEND_ID, MOONSHINE_DECODE_POLICY_ID, MOONSHINE_GGML_ARCHITECTURE_ID,
-    MOONSHINE_TOKENIZER_ID,
 };
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32,
     read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
-use crate::models::moonshine::MOONSHINE_MODEL_FAMILY;
 use crate::models::moonshine::runtime_contract;
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
+    OasrPackWriter, PackEnvelope, insert_metadata,
     insert_metadata_string_array as insert_string_array, insert_metadata_u32 as insert_u32,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
-use crate::{read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source};
+use crate::models::pack_quant::{
+    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
+};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
@@ -109,58 +102,24 @@ pub fn convert_local_moonshine_source_to_runtime_pack(
     let model_id = compose_model_id(&request.package_id, request.package_variant.as_deref());
     let metadata = moonshine_runtime_gguf_metadata(&fields, request, &model_id, &vocab_tokens);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(MOONSHINE_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "Moonshine local-source GGUF writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    // Fail closed: verify runtime contract via preflight reader/index validation.
-    let runtime_source =
-        validate_ggml_runtime_source_path(&request.output_root).map_err(|error| {
-            validate_error(format!(
-                "Moonshine local-source import produced invalid runtime path '{}': {error}",
-                request.output_root.display()
-            ))
-        })?;
-    let metadata_read =
-        read_gguf_metadata_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Moonshine import produced unreadable GGUF metadata: {error}"
-            ))
-        })?;
-    let tensor_index =
-        read_gguf_tensor_index_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Moonshine import produced unreadable GGUF tensor index: {error}"
-            ))
-        })?;
-    let execution_metadata = runtime_contract::parse_moonshine_execution_metadata(&metadata_read)
-        .map_err(|error| {
-        validate_error(format!(
-            "Moonshine runtime metadata contract validation failed: {error}"
-        ))
-    })?;
-    runtime_contract::validate_moonshine_runtime_tensors_with_index(
-        &tensor_index,
-        execution_metadata,
-    )
-    .map_err(|error| {
-        validate_error(format!(
-            "Moonshine runtime tensor contract validation failed: {error}"
-        ))
-    })?;
-
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "Moonshine local-source GGUF writer produced unreadable tensor index: {error}"
-        ))
-    })?;
+    let preflight = verified.preflight();
     Ok(MoonshineLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
         model_id,
-        tensor_count: index.tensors().len(),
+        tensor_count: preflight.tensor_index().tensors().len(),
     })
 }
 
@@ -431,6 +390,12 @@ fn quantized_tensor_type_for_moonshine_tensor(
 /// source of truth for "which moonshine tensors are audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: MOONSHINE_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };
+
 #[derive(Debug, Clone)]
 struct MoonshineMetadataFields {
     vocab_size: usize,
@@ -489,38 +454,7 @@ fn moonshine_runtime_gguf_metadata(
     vocab_tokens: &[String],
 ) -> BTreeMap<String, GgufWriteValue> {
     let mut metadata = BTreeMap::new();
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_PACKAGE_VERSION,
-        OASR_PACKAGE_VERSION_V1,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_FAMILY,
-        MOONSHINE_MODEL_FAMILY,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        MOONSHINE_GGML_ARCHITECTURE_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        MOONSHINE_AUDIO_FRONTEND_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_DECODE_POLICY,
-        MOONSHINE_DECODE_POLICY_ID,
-    );
-    insert_metadata(&mut metadata, GGML_TOKENIZER_ID_KEY, MOONSHINE_TOKENIZER_ID);
     insert_metadata(&mut metadata, OPENASR_MODEL_ID_KEY, model_id);
-    insert_metadata(
-        &mut metadata,
-        runtime_contract::GENERAL_ARCHITECTURE_KEY,
-        runtime_contract::MOONSHINE_ARCHITECTURE_VALUE,
-    );
 
     insert_u32(
         &mut metadata,
@@ -724,15 +658,8 @@ mod tests {
         }
     }
 
-    fn string_metadata<'a>(metadata: &'a BTreeMap<String, GgufWriteValue>, key: &str) -> &'a str {
-        match metadata.get(key) {
-            Some(GgufWriteValue::String(value)) => value,
-            other => panic!("expected string metadata for {key}, got {other:?}"),
-        }
-    }
-
     #[test]
-    fn moonshine_runtime_metadata_declares_snapshot_streaming_feature() {
+    fn moonshine_runtime_metadata_leaves_envelope_keys_to_shared_writer() {
         let tokens = vec![
             "<pad>".to_string(),
             "<s>".to_string(),
@@ -747,13 +674,19 @@ mod tests {
             &tokens,
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            MOONSHINE_MODEL_FAMILY
-        );
-        assert_eq!(
-            string_metadata(&metadata, GGML_TOKENIZER_ID_KEY),
-            MOONSHINE_TOKENIZER_ID
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
     }
 }

@@ -35,13 +35,13 @@ use crate::adapter_pack::{
     plan_lora_adapter_resources, read_lora_adapter_pack_from_runtime_source,
     validate_lora_adapter_base_binding_from_runtime_source,
 };
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlStaticTensor, GgmlStaticTensorArena, validate_ggml_runtime_source_path,
 };
 use crate::models::admitted_host_object_cache::{
     AdmittedHostObjectCache, AdmittedHostObjectCacheLimits,
 };
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use crate::models::system_memory_owner::{
     AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
     SystemMemoryAllocationTransactionError, SystemMemoryCapacity, SystemMemoryOwner,
@@ -227,7 +227,7 @@ impl ResolvedLoraAdapterCache {
 pub(crate) fn resolve_lora_adapter(
     cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     contract_id: &'static str,
     is_target: fn(&str) -> bool,
     model_label: &'static str,
@@ -386,7 +386,7 @@ fn capacity_quote_failure(reason: impl Into<String>) -> LoraResolveError {
 
 fn convert_validated_pack(
     pack: LoraAdapterPack,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     is_target: fn(&str) -> bool,
     model_label: &'static str,
     allowed: &'static str,

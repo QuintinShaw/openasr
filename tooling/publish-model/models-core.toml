@@ -13,10 +13,10 @@ display_name = "Qwen3-ASR 1.7B"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE"
 license_class = "permissive"
-# Explicit override: the family default (LANG_BY_FAMILY["qwen"]) folds all
+# Explicit override: the family default from the generated Rust inventory folds all
 # Chinese dialects into "zh". Qwen3-ASR's own model card enumerates 22 Chinese
 # dialects (same 0.6B/1.7B checkpoint family), so this model is dialect-
-# capable (see DIALECT_CAPABLE_FAMILIES) and lists the family's 29 base
+# capable (see the generated family descriptor/inventory) and lists the family's 29 base
 # languages plus every registered dialect it supports. zh-shanghai is listed
 # on the strength of Qwen's own "Wu dialects" claim (the card's Wu-language
 # coverage is presumed to include Shanghainese, its most prominent variety;
@@ -146,7 +146,7 @@ upstream_release_date = "2026-05-18"
 
 # Parakeet TDT 0.6B v3 (NVIDIA FastConformer + Token-and-Duration Transducer,
 # 25 European languages, CC-BY-4.0). Languages inherit
-# LANG_BY_FAMILY["parakeet-tdt"] (the 25-language set from NVIDIA's card,
+# The generated Rust inventory's parakeet-tdt family row (the 25-language set from NVIDIA's card,
 # post-dialect-collapse; see _catalog.py).
 ["parakeet-tdt-0.6b-v3"]
 family = "parakeet-tdt"
@@ -177,7 +177,7 @@ min_cli_version = "0.1.9"
 # pinned to the immutable HF revision + per-pack sha256. Dolphin is
 # dialect-capable (its executor ships a code->region-prompt map), so unlike other
 # Chinese models it does NOT collapse regional dialects into a single `zh`:
-# LANG_BY_FAMILY["dolphin"] advertises the base `zh` plus the registered province
+# The generated Rust inventory's dolphin row advertises the base `zh` plus the registered province
 # dialect codes (zh-sichuan, ...) as selectable source languages (see _catalog.py).
 ["dolphin-cn-dialect-small"]
 family = "dolphin"
@@ -197,7 +197,7 @@ display_name = "Dolphin CN-Dialect Small"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md"
 license_class = "permissive"
-# Explicit Chinese-only override (same value LANG_BY_FAMILY["dolphin"]
+# Explicit Chinese-only override (same value as the generated dolphin inventory row
 # already resolves to, pinned here so this model's language claim can never
 # silently drift if the family default in _catalog.py changes) -- this is
 # the "language=Chinese-only" marking, the same mechanism whisper's `*.en`
@@ -623,12 +623,12 @@ display_name = "FireRedASR2 AED-L"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/FireRedTeam/FireRedASR2-AED/blob/main/README.md"
 license_class = "permissive"
-# Explicit override: the family default (LANG_BY_FAMILY["firered-aed"]) folds
+# Explicit override: the family default from the generated firered-aed inventory row folds
 # all Chinese dialects into "zh". FireRedASR2's own README lists 20+ Chinese
 # dialects and arXiv:2603.10420 Table 2 benchmarks this AED checkpoint on 19
 # public dialect/accent test sets (Sichuan x4, Shanghai, Henan, Hunan, Wuhan,
-# Tianjin, ...), so this model is dialect-capable (see
-# DIALECT_CAPABLE_FAMILIES) and lists every registered dialect it was tested
+# Tianjin, ...), so this model is dialect-capable (see the generated family
+# descriptor/inventory) and lists every registered dialect it was tested
 # on. The paper's "Liaoning" test set is a Northeastern-Mandarin variety and
 # is normalized to the registered zh-dongbei code rather than added as a
 # separate zh-liaoning code.
@@ -669,7 +669,7 @@ display_name = "FireRedASR2 LLM"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/FireRedTeam/FireRedASR2-LLM"
 license_class = "permissive"
-# Explicit per-model list, kept in lockstep with LANG_BY_FAMILY["firered2-llm"]:
+# Explicit per-model list, kept in lockstep with the generated firered2-llm inventory row:
 # bilingual Mandarin + English, mirroring the Qwen2 BPE decoder's
 # FixedMultilingual { languages: &["zh", "en"] } arch descriptor.
 languages = ["en", "zh"]
@@ -703,7 +703,7 @@ display_name = "MiMo-V2.5-ASR"
 license_name = "MIT"
 license_source = "https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR/blob/main/README.md"
 license_class = "permissive"
-# Explicit per-model list, kept in lockstep with LANG_BY_FAMILY["mimo-asr"]:
+# Explicit per-model list, kept in lockstep with the generated mimo-asr inventory row:
 # Mandarin + English + Cantonese, mirroring the Qwen2 BPE decoder's
 # FixedMultilingual { languages: &["zh", "en", "yue"] } arch descriptor. "yue"
 # is a base ISO 639-3 code (Cantonese), not a dialect subtag.

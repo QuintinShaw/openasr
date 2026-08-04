@@ -115,6 +115,7 @@ pub(crate) struct PyannetModel {
 }
 
 impl PyannetModel {
+    #[cfg(test)]
     pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
         Ok(Self {
             w: Weights::from_safetensors(bytes)?,
@@ -122,6 +123,7 @@ impl PyannetModel {
     }
 
     /// Load from a diarization `.oasr` (GGUF-v0) pack.
+    #[cfg(test)]
     pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, WeightsError> {
         Ok(Self {
             w: Weights::from_oasr(path)?,
@@ -140,12 +142,6 @@ impl PyannetModel {
         tensor_index: &crate::GgufTensorIndex,
     ) -> Result<u64, WeightsError> {
         Weights::quoted_persistent_host_commitment_bytes(tensor_index)
-    }
-
-    pub(crate) fn quoted_safetensors_materialization(
-        bytes: &[u8],
-    ) -> Result<crate::diarize::embed::weights::SafetensorsWeightsQuote, WeightsError> {
-        Weights::quoted_safetensors_materialization(bytes)
     }
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, WeightsError> {

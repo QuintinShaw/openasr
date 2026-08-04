@@ -229,13 +229,13 @@ mod tests {
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
     use crate::validate_ggml_runtime_source_path;
     use crate::{
-        GgmlAsrRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
+        GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
         read_gguf_tensor_index_from_runtime_source,
     };
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempPath};
 
-    fn write_runtime_ready_preflight() -> (TempPath, GgmlAsrRuntimeSourcePreflight) {
+    fn write_runtime_ready_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
         let file = NamedTempFile::new().expect("temp file");
         let persisted = file.into_temp_path();
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -249,7 +249,7 @@ mod tests {
             .expect("read gguf tensor index");
         (
             persisted,
-            GgmlAsrRuntimeSourcePreflight {
+            GgufRuntimeSourcePreflight {
                 runtime_source,
                 metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
@@ -294,7 +294,7 @@ mod tests {
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        let preflight = GgmlAsrRuntimeSourcePreflight {
+        let preflight = GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
@@ -329,7 +329,7 @@ mod tests {
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        let preflight = GgmlAsrRuntimeSourcePreflight {
+        let preflight = GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),

@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::models::pack_verifier::{
+    AdmittedPack, PackCandidate, PackRoute, PackVerificationError, PackVerifier,
+};
 use crate::{
     CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor, CatalogModel,
     CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
@@ -22,13 +25,8 @@ use crate::{
     catalog_series::family_aliases_match,
     content_store,
     download_source::{self, DownloadSource},
-    ggml_runtime::{
-        MAX_RUNTIME_GGUF_ARRAY_ELEMENTS, MAX_RUNTIME_GGUF_METADATA_ENTRIES,
-        MAX_RUNTIME_GGUF_STRING_BYTES, MAX_RUNTIME_GGUF_TENSORS,
-    },
     has_openasr_runtime_pack_extension, http, parse_model_ref, resolve_catalog_pull,
     safety::{validate_safe_relative_path, validate_sha256},
-    validate_ggml_runtime_source_path, validate_native_runtime_model_pack_contract,
 };
 
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
@@ -125,10 +123,6 @@ const SEGMENT_LOW_SPEED_REFERENCE_CAPACITY: usize = 64;
 /// incompatible format -- as a valid segment bitmap. Bumping the segment size
 /// or the bitmap's shape must also bump this string.
 const PARALLEL_META_FORMAT: &str = "segmented-v1";
-const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
-const MAX_GGUF_DIMS: u32 = 8;
-const OASR_PACKAGE_VERSION_KEY: &str = "openasr.package.version";
-const OASR_PACKAGE_VERSION_V1: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledPack {
@@ -301,6 +295,10 @@ pub enum PullError {
 #[derive(Clone, Debug)]
 struct PullTarget {
     model_id: String,
+    /// Present only for targets resolved from a signed catalog. Explicit
+    /// legacy-store migration has no catalog assertion to invent; it trusts
+    /// the route already proven from its admitted bytes.
+    expected_catalog_family_id: Option<String>,
     display_name: String,
     quant: String,
     suffix: String,
@@ -687,23 +685,37 @@ pub fn resolve_catalog_model_pack_from_path(
 fn admit_model_content(
     source_path: &Path,
     home: &Path,
-) -> Result<content_store::AdmittedContent, PullError> {
-    admit_model_content_into_root(source_path, &models_root(home))
+    expected_catalog_family_id: Option<&str>,
+) -> Result<AdmittedPack, PullError> {
+    admit_model_content_into_root(source_path, &models_root(home), expected_catalog_family_id)
 }
 
 fn admit_model_content_into_root(
     source_path: &Path,
     root: &Path,
-) -> Result<content_store::AdmittedContent, PullError> {
+    expected_catalog_family_id: Option<&str>,
+) -> Result<AdmittedPack, PullError> {
     ensure_safe_directory_under_root(root, root)?;
     ensure_safe_directory_under_root(root, &root.join("staging"))?;
     ensure_safe_directory_under_root(root, &content_store::objects_root(root))?;
-    content_store::admit_file(source_path, root, |lease| {
-        preflight_model_pack_for_install(lease.path())
+    let content = content_store::admit_file(source_path, root, |lease| {
+        let verified = PackVerifier
+            .verify_admission_lease(lease)
+            .map_err(pack_verification_to_pull_error)?;
+        ensure_catalog_family_matches(
+            expected_catalog_family_id,
+            verified.catalog_family_id(),
+            lease.path(),
+        )?;
+        Ok(verified)
     })
     .map_err(|error| match error {
         content_store::ContentStoreError::Preflight(error) => *error,
         other => PullError::ContentStore(other),
+    })?;
+    AdmittedPack::from_content(content).map_err(|reason| PullError::RuntimeValidation {
+        path: source_path.to_path_buf(),
+        reason,
     })
 }
 
@@ -728,7 +740,11 @@ fn install_model_pack_from_path_with_target(
     // Admission needs no exclusion: the staging name is process-unique and an
     // object is keyed by its own digest. The pull lock is taken once, by
     // `install_admitted_model_pack`, around publishing the ref.
-    let admitted = admit_model_content(source_path, home.as_ref())?;
+    let admitted = admit_model_content(
+        source_path,
+        home.as_ref(),
+        target.expected_catalog_family_id.as_deref(),
+    )?;
     install_admitted_model_pack(
         target,
         home.as_ref(),
@@ -741,24 +757,29 @@ fn install_model_pack_from_path_with_target(
 fn install_admitted_model_pack(
     target: &PullTarget,
     home: &Path,
-    admitted: content_store::AdmittedContent,
+    admitted: AdmittedPack,
     execution_services: Option<&crate::NativeExecutionServices>,
     mut progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
-    if admitted.size_bytes != target.size_bytes {
+    if admitted.size_bytes() != target.size_bytes {
         return Err(PullError::SizeMismatch {
-            path: admitted.object_path,
+            path: admitted.object_path().to_path_buf(),
             expected: target.size_bytes,
-            actual: admitted.size_bytes,
+            actual: admitted.size_bytes(),
         });
     }
-    if admitted.digest != target.sha256 {
+    if admitted.digest() != target.sha256 {
         return Err(PullError::ShaMismatch {
-            path: admitted.object_path,
+            path: admitted.object_path().to_path_buf(),
             expected: target.sha256.clone(),
-            actual: admitted.digest,
+            actual: admitted.digest().to_string(),
         });
     }
+    ensure_catalog_family_matches_target(
+        target,
+        admitted.catalog_family_id(),
+        admitted.object_path(),
+    )?;
     let paths = pull_paths(home, target)?;
     ensure_storage_dir_within_root(home, &paths)?;
     let _lock = PullLock::acquire(&paths.lock_path)?;
@@ -770,7 +791,7 @@ fn install_admitted_model_pack(
     // Keep the descriptor that was hashed and preflighted alive until its
     // durable logical reference is visible; do not switch validation authority
     // back to a display path during commit.
-    let _validated_lease = admitted.into_lease();
+    let (_validated_lease, _verified_pack, _, _, _) = admitted.into_parts();
     let pack = write_installed_record(target, &paths)?;
     if let Some(old_content_id) = previous_pack_content_id {
         evict_resident_runtime_caches_for_content_id(execution_services, &old_content_id);
@@ -970,19 +991,20 @@ fn migrate_one_legacy_record(
         });
     }
 
-    // Verify before moving: a pack that cannot pass install preflight must never
-    // reach the content namespace, and rejecting it here leaves it in place for
-    // the operator to inspect.
-    preflight_model_pack_for_install(&legacy.path)?;
-    // The digest is recomputed rather than taken from `installed.json`. Content
-    // addressing's whole premise is that the path equals the checksum; seeding
-    // an object from an unverified metadata field would let one stale record
-    // mislabel a blob permanently, and after sealing nothing would ever recheck
-    // it. Within a filesystem this hash is the only O(n) cost of the migration.
-    let (size_bytes, digest) = file_size_and_sha256(&legacy.path)?;
+    // Legacy migration uses the same lease-based admission seam as every new
+    // install. The old zero-copy branch preflighted one path generation, then
+    // hashed and renamed that pathname later; a replacement in between could
+    // therefore put runtime-invalid bytes under a trusted digest. Admission
+    // copies, hashes and verifies one held descriptor generation before any
+    // object becomes visible. Migration is a one-time cold operation, so that
+    // correctness boundary is worth the copy and removes the special writer.
+    let admitted = admit_model_content(&legacy.path, home, None)?;
+    let size_bytes = admitted.size_bytes();
+    let digest = admitted.digest().to_string();
 
     let target = PullTarget {
         model_id: legacy.model_id.clone(),
+        expected_catalog_family_id: None,
         display_name: legacy.display_name.clone(),
         quant: legacy.quant.clone(),
         suffix: legacy.suffix.clone(),
@@ -1007,34 +1029,13 @@ fn migrate_one_legacy_record(
         });
     }
 
-    let mut reclaimed_bytes = 0;
-    match content_store::link_file_as_object(&legacy.path, root, &digest) {
-        // Bytes moved with no copy; the legacy name is already gone.
-        Ok(true) => {}
-        // The same content is already an object, so the legacy file is a pure
-        // duplicate. Revalidating the existing object is what makes dropping
-        // these bytes safe.
-        Ok(false) => {
-            content_store::open_verified_lease(root, &digest)?;
-            reclaimed_bytes += remove_file_reporting_size(&legacy.path)?;
-        }
-        // Cross-device (or any other rename refusal): fall back to copying the
-        // pack in through the normal admission path, then drop the original.
-        Err(_) => {
-            let admitted = admit_model_content(&legacy.path, home)?;
-            if admitted.digest != digest {
-                return Err(PullError::ShaMismatch {
-                    path: legacy.path.clone(),
-                    expected: digest,
-                    actual: admitted.digest,
-                });
-            }
-            reclaimed_bytes += remove_file_reporting_size(&legacy.path)?;
-        }
-    }
+    let mut reclaimed_bytes = remove_file_reporting_size(&legacy.path)?;
 
     // Content is durable before the ref that names it exists.
     write_installed_record(&target, &paths)?;
+    // Keep the exact verified admission lease alive until the durable logical
+    // reference is visible. No later path-based validation is substituted.
+    let (_validated_lease, _verified_pack, _, _, _) = admitted.into_parts();
     reclaimed_bytes += discard_legacy_quant_dir(root, quant_path)?;
     Ok(LegacyRecordOutcome {
         published_ref: true,
@@ -2781,10 +2782,6 @@ fn verify_partial_and_install(
             actual: actual_sha,
         });
     }
-    if let Err(error) = preflight_model_pack_for_install(&paths.partial_path) {
-        cleanup_partial(paths);
-        return Err(error);
-    }
     cancel_before_commit(target, paths, should_cancel)?;
     // Resolve the pack this install supersedes (if any) *before* the reference
     // moves, so its content id is still hashable from the old bytes. The new
@@ -2797,15 +2794,29 @@ fn verify_partial_and_install(
     // The verified staging file is copied into an immutable content-addressed
     // object before the logical reference becomes visible. Existing objects are
     // never replaced, which removes the Windows same-path mmap failure mode.
-    let admitted =
-        admit_model_content_into_root(&paths.partial_path, &models_root_for_paths(paths))?;
-    if admitted.digest != target.sha256 || admitted.size_bytes != target.size_bytes {
+    let admitted = match admit_model_content_into_root(
+        &paths.partial_path,
+        &models_root_for_paths(paths),
+        target.expected_catalog_family_id.as_deref(),
+    ) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            cleanup_partial(paths);
+            return Err(error);
+        }
+    };
+    if admitted.digest() != target.sha256 || admitted.size_bytes() != target.size_bytes {
         return Err(PullError::ShaMismatch {
-            path: admitted.object_path,
+            path: admitted.object_path().to_path_buf(),
             expected: target.sha256.clone(),
-            actual: admitted.digest,
+            actual: admitted.digest().to_string(),
         });
     }
+    ensure_catalog_family_matches_target(
+        target,
+        admitted.catalog_family_id(),
+        admitted.object_path(),
+    )?;
     let _ = fs::remove_file(&paths.partial_path);
     let _ = fs::remove_file(&paths.partial_meta_path);
     // A resume can switch from the chunked/parallel path (which persists
@@ -2890,9 +2901,11 @@ fn cancel_before_commit(
 /// parser does not recognise -- falls back to hashing the whole file, the
 /// only way to prove identity for bytes nothing has pinned.
 ///
-/// Either way the container contract is still probed before the object
+/// Either way the exact install-time verifier still runs before the object
 /// stands in for a download: skipping the download on the strength of a
-/// digest must not skip proving the pack is actually loadable.
+/// digest must not skip route selection or the family runtime contract. This
+/// also upgrades objects admitted by older clients instead of reporting an
+/// unusable legacy object as successfully installed.
 fn installed_matches(target: &PullTarget, paths: &PullPaths) -> Result<bool, PullError> {
     let Ok(metadata) = fs::metadata(&paths.final_path) else {
         return Ok(false);
@@ -2914,8 +2927,48 @@ fn installed_matches(target: &PullTarget, paths: &PullPaths) -> Result<bool, Pul
     if !matched {
         return Ok(false);
     }
-    preflight_gguf_package_contract(&paths.final_path)?;
+    let verified = PackVerifier
+        .verify_candidate(PackCandidate::new(&paths.final_path))
+        .map_err(pack_verification_to_pull_error)?;
+    ensure_catalog_family_matches_target(target, verified.catalog_family_id(), &paths.final_path)?;
     Ok(true)
+}
+
+fn ensure_catalog_family_matches_target(
+    target: &PullTarget,
+    actual_catalog_family_id: Option<&str>,
+    path: &Path,
+) -> Result<(), PullError> {
+    ensure_catalog_family_matches(
+        target.expected_catalog_family_id.as_deref(),
+        actual_catalog_family_id,
+        path,
+    )
+}
+
+fn ensure_catalog_family_matches(
+    expected_catalog_family_id: Option<&str>,
+    actual_catalog_family_id: Option<&str>,
+    path: &Path,
+) -> Result<(), PullError> {
+    let Some(expected) = expected_catalog_family_id else {
+        return Ok(());
+    };
+    match actual_catalog_family_id {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(PullError::RuntimeValidation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "verified pack catalog family '{actual}' does not match signed catalog target family '{expected}'"
+            ),
+        }),
+        None => Err(PullError::RuntimeValidation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "verified pack route has no canonical catalog family; expected '{expected}'"
+            ),
+        }),
+    }
 }
 
 fn prepare_partial_for_resume(target: &PullTarget, paths: &PullPaths) -> Result<u64, PullError> {
@@ -3631,6 +3684,12 @@ impl PullTarget {
                 reason: "size_bytes must be greater than zero".to_string(),
             });
         }
+        if resolved.catalog_family_id.trim().is_empty() {
+            return Err(PullError::InvalidTarget {
+                field: "catalog_family_id",
+                reason: "catalog family id must not be empty".to_string(),
+            });
+        }
         if !resolved
             .filename
             .ends_with(&format!(".{OPENASR_RUNTIME_PACK_EXTENSION}"))
@@ -3646,6 +3705,7 @@ impl PullTarget {
         }
         Ok(Self {
             model_id: resolved.model_id.clone(),
+            expected_catalog_family_id: Some(resolved.catalog_family_id.clone()),
             display_name: resolved.display_name.clone(),
             quant: resolved.quant.clone(),
             suffix: resolved.suffix.clone(),
@@ -4176,29 +4236,128 @@ fn reserve_space_bytes(bytes: u64) -> u64 {
 }
 
 /// Full pre-install validation every model pack must pass after download (or
-/// local import) and before it is committed into the local model store:
-///
-/// 1. [`preflight_gguf_package_contract`] — structural GGUF scan plus the
-///    `.oasr` v1 required-metadata gate (`openasr.package.version = "1"`).
-/// 2. Runtime-source path validation (magic probe, fail-closed sandbox rules).
-/// 3. The native runtime model-pack contract (family adapter selection or a
-///    registered non-ASR pack contract such as diarization/translation packs).
+/// local import) and before it is committed into the local model store.
+/// [`PackVerifier`] owns the single fail-closed gate: it checks the `.oasr` v1
+/// package contract, validates the runtime source path, and then applies the
+/// registry-owned runtime contract for the selected ASR or auxiliary family.
+/// The individual checks remain exposed for callers that need one structural
+/// or backend-specific preflight, but installation always uses this unified
+/// verifier path.
 ///
 /// Importer tests reuse this exact function so a pack a family importer can
 /// build but `openasr pull` would reject can never ship.
 pub fn preflight_model_pack_for_install(path: &Path) -> Result<(), PullError> {
-    preflight_gguf_package_contract(path)?;
-    validate_ggml_runtime_source_path(path).map_err(|source| PullError::RuntimeValidation {
-        path: path.to_path_buf(),
-        reason: source.to_string(),
-    })?;
-    validate_native_runtime_model_pack_contract(path).map_err(|reason| {
-        PullError::RuntimeValidation {
-            path: path.to_path_buf(),
-            reason,
+    PackVerifier
+        .verify_candidate(PackCandidate::new(path))
+        .map(|_| ())
+        .map_err(pack_verification_to_pull_error)
+}
+
+/// Stable, machine-readable evidence emitted by the exact install-time pack
+/// verifier. Tooling may persist this receipt, but it is not itself an
+/// execution capability: only the in-process `VerifiedPack` can authorize
+/// install/runtime use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPackPreflightReceipt {
+    pub schema: String,
+    pub content_id: String,
+    pub size_bytes: u64,
+    pub route: String,
+    pub catalog_family_id: String,
+    pub model_family: Option<String>,
+    pub model_architecture: String,
+    pub build_commit: Option<String>,
+}
+
+/// Run the client verifier once and project its proof into a data-only receipt
+/// for release tooling. The digest and size come from the exact open mapping
+/// that passed the package and runtime contracts, never from a later path
+/// reopen.
+pub fn preflight_model_pack_with_receipt(
+    path: &Path,
+) -> Result<ModelPackPreflightReceipt, PullError> {
+    let verified = PackVerifier
+        .verify_candidate(PackCandidate::new(path))
+        .map_err(pack_verification_to_pull_error)?;
+    let (route, catalog_family_id, model_family, model_architecture) = match verified.route() {
+        PackRoute::Asr {
+            model_family,
+            model_architecture,
+        } => {
+            let catalog_family_id = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(model_architecture)
+                .map(|descriptor| descriptor.identity.catalog_family_id)
+                .ok_or_else(|| PullError::RuntimeValidation {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "verified ASR architecture '{model_architecture}' has no canonical inventory row"
+                    ),
+                })?;
+            (
+                "asr".to_string(),
+                catalog_family_id.to_string(),
+                Some((*model_family).to_string()),
+                (*model_architecture).to_string(),
+            )
         }
-    })?;
-    Ok(())
+        PackRoute::Aux {
+            model_architecture, ..
+        } => {
+            let catalog_family_id =
+                crate::models::aux_pack_registry::auxiliary_catalog_family_id(model_architecture)
+                    .ok_or_else(|| PullError::RuntimeValidation {
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "verified auxiliary architecture '{model_architecture}' has no canonical catalog family"
+                        ),
+                    })?;
+            (
+                "aux".to_string(),
+                catalog_family_id.to_string(),
+                None,
+                model_architecture.clone(),
+            )
+        }
+    };
+    Ok(ModelPackPreflightReceipt {
+        schema: "openasr.model-pack-preflight.v1".to_string(),
+        content_id: verified.content_id().to_string(),
+        size_bytes: verified.preflight().runtime_source().byte_len(),
+        route,
+        catalog_family_id,
+        model_family,
+        model_architecture,
+        build_commit: verified
+            .preflight()
+            .metadata()
+            .get_string(crate::ggml_runtime::OASR_METADATA_KEY_BUILD_COMMIT)
+            .map(str::to_string),
+    })
+}
+
+fn pack_verification_to_pull_error(error: PackVerificationError) -> PullError {
+    let path = match &error {
+        PackVerificationError::RuntimeSource { path, .. } => path.clone(),
+        PackVerificationError::PackageContract { path, .. }
+        | PackVerificationError::RuntimePreflight { path, .. }
+        | PackVerificationError::RuntimeContract { path, .. } => path.clone(),
+    };
+    match error {
+        PackVerificationError::PackageContract { reason, .. } => {
+            PullError::GgufPreflight { path, reason }
+        }
+        PackVerificationError::RuntimeSource {
+            source: crate::GgmlRuntimeSourcePathError::Probe(source),
+            ..
+        } => PullError::GgufPreflight {
+            path,
+            reason: source.to_string(),
+        },
+        other => PullError::RuntimeValidation {
+            path,
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// The binary shape a downloaded backend-pack file must have, for the magic-byte
@@ -4217,7 +4376,7 @@ pub enum BackendFileFormat {
 const BACKEND_PREFLIGHT_HEAD_BYTES: u64 = 4096;
 
 /// Preflight a downloaded backend-pack file by its magic bytes BEFORE it is
-/// installed or loaded — the backend analogue of [`preflight_gguf_package_contract`]
+/// installed or loaded — the backend analogue of [`preflight_model_pack_for_install`]
 /// for the model path. sha256 is the integrity boundary; this gate fails closed
 /// on the common corruption mode a hash alone still accepts only after the fact:
 /// a mirror that returns a 404 HTML page, a captive-portal redirect, or a
@@ -4695,283 +4854,6 @@ fn extract_backend_archive(
         })?;
     }
     Ok(())
-}
-
-/// Structural GGUF preflight plus the `.oasr` v1 required-metadata gate: the
-/// pack must carry `openasr.package.version = "1"` or the pull fails closed.
-pub fn preflight_gguf_package_contract(path: &Path) -> Result<(), PullError> {
-    let file = File::open(path).map_err(|source| PullError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| PullError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
-    let mut reader = GgufPreflightReader::new(file, file_len, path);
-    reader.scan().map_err(|reason| PullError::GgufPreflight {
-        path: path.to_path_buf(),
-        reason,
-    })
-}
-
-struct GgufPreflightReader<'a> {
-    file: BufReader<File>,
-    file_len: u64,
-    cursor: u64,
-    path: &'a Path,
-    alignment: u64,
-    package_version: Option<String>,
-}
-
-impl<'a> GgufPreflightReader<'a> {
-    fn new(file: File, file_len: u64, path: &'a Path) -> Self {
-        Self {
-            file: BufReader::new(file),
-            file_len,
-            cursor: 0,
-            path,
-            alignment: GGUF_DEFAULT_ALIGNMENT,
-            package_version: None,
-        }
-    }
-
-    fn scan(&mut self) -> Result<(), String> {
-        let mut magic = [0_u8; 4];
-        self.read_exact(&mut magic)?;
-        if &magic != b"GGUF" {
-            return Err(format!("expected GGUF magic in '{}'", self.path.display()));
-        }
-        let version = self.read_u32()?;
-        if version != 3 {
-            return Err(format!("unsupported GGUF version {version}; expected 3"));
-        }
-        let tensor_count = self.read_u64()?;
-        let kv_count = self.read_u64()?;
-        if tensor_count == 0 || tensor_count > MAX_RUNTIME_GGUF_TENSORS {
-            return Err(format!(
-                "tensor count {tensor_count} is outside supported bounds"
-            ));
-        }
-        if kv_count > MAX_RUNTIME_GGUF_METADATA_ENTRIES {
-            return Err(format!(
-                "metadata entry count {kv_count} is outside supported bounds"
-            ));
-        }
-        for _ in 0..kv_count {
-            self.read_metadata_entry()?;
-        }
-        let mut tensor_spans = Vec::with_capacity(usize::try_from(tensor_count).unwrap_or(0));
-        for _ in 0..tensor_count {
-            let _name = self.read_string()?;
-            let n_dims = self.read_u32()?;
-            if n_dims == 0 || n_dims > MAX_GGUF_DIMS {
-                return Err(format!(
-                    "tensor dim count {n_dims} is outside supported bounds"
-                ));
-            }
-            let mut elements = 1_u64;
-            for _ in 0..n_dims {
-                let dim = self.read_u64()?;
-                if dim == 0 {
-                    return Err("tensor dimensions must be greater than zero".to_string());
-                }
-                elements = elements
-                    .checked_mul(dim)
-                    .ok_or_else(|| "tensor element count overflowed u64".to_string())?;
-            }
-            let ggml_type = self.read_u32()?;
-            let offset = self.read_u64()?;
-            let size = ggml_tensor_payload_size(ggml_type, elements)?;
-            tensor_spans.push((offset, size));
-        }
-        let data_start = align_up_u64(self.cursor, self.alignment)?;
-        if data_start > self.file_len {
-            return Err("GGUF data section starts past end of file".to_string());
-        }
-        for (offset, size) in tensor_spans {
-            let start = data_start
-                .checked_add(offset)
-                .ok_or_else(|| "tensor absolute offset overflowed u64".to_string())?;
-            let end = start
-                .checked_add(size)
-                .ok_or_else(|| "tensor end offset overflowed u64".to_string())?;
-            if end > self.file_len {
-                return Err(format!(
-                    "tensor payload range [{start}, {end}) exceeds file size {}",
-                    self.file_len
-                ));
-            }
-        }
-        match self.package_version.as_deref() {
-            Some(OASR_PACKAGE_VERSION_V1) => Ok(()),
-            Some(value) => Err(format!(
-                "unsupported OpenASR package version '{value}'; expected {OASR_PACKAGE_VERSION_V1}"
-            )),
-            None => Err(format!(
-                "missing required metadata '{OASR_PACKAGE_VERSION_KEY}'"
-            )),
-        }
-    }
-
-    fn read_metadata_entry(&mut self) -> Result<(), String> {
-        let key = self.read_string()?;
-        let value_type = self.read_u32()?;
-        match value_type {
-            0 | 1 | 7 => self.skip(1)?,
-            2 | 3 => self.skip(2)?,
-            4..=6 => {
-                if key == "general.alignment" {
-                    let value = self.read_u32()?;
-                    self.set_alignment(u64::from(value))?;
-                } else {
-                    self.skip(4)?;
-                }
-            }
-            8 => {
-                let value = self.read_string()?;
-                if key == OASR_PACKAGE_VERSION_KEY {
-                    self.package_version = Some(value);
-                }
-            }
-            9 => self.skip_array_value()?,
-            10..=12 => {
-                if key == "general.alignment" && value_type == 10 {
-                    let value = self.read_u64()?;
-                    self.set_alignment(value)?;
-                } else {
-                    self.skip(8)?;
-                }
-            }
-            other => return Err(format!("unsupported GGUF metadata value type {other}")),
-        }
-        Ok(())
-    }
-
-    fn skip_array_value(&mut self) -> Result<(), String> {
-        let item_type = self.read_u32()?;
-        let item_count = self.read_u64()?;
-        if item_count > MAX_RUNTIME_GGUF_ARRAY_ELEMENTS {
-            return Err(format!(
-                "GGUF array length {item_count} exceeds supported bounds"
-            ));
-        }
-        match item_type {
-            0 | 1 | 7 => self.skip(item_count)?,
-            2 | 3 => self.skip(item_count.saturating_mul(2))?,
-            4..=6 => self.skip(item_count.saturating_mul(4))?,
-            8 => {
-                for _ in 0..item_count {
-                    let _ = self.read_string()?;
-                }
-            }
-            10..=12 => self.skip(item_count.saturating_mul(8))?,
-            other => return Err(format!("unsupported GGUF array item type {other}")),
-        }
-        Ok(())
-    }
-
-    fn set_alignment(&mut self, value: u64) -> Result<(), String> {
-        if value == 0 || !value.is_power_of_two() || value > 4096 {
-            return Err(format!("unsupported GGUF alignment {value}"));
-        }
-        self.alignment = value;
-        Ok(())
-    }
-
-    fn read_string(&mut self) -> Result<String, String> {
-        let len = self.read_u64()?;
-        if len > MAX_RUNTIME_GGUF_STRING_BYTES {
-            return Err(format!("GGUF string length {len} exceeds supported bounds"));
-        }
-        let len_usize = usize::try_from(len).map_err(|_| "string length overflow".to_string())?;
-        let mut bytes = vec![0_u8; len_usize];
-        self.read_exact(&mut bytes)?;
-        String::from_utf8(bytes).map_err(|source| format!("GGUF string is not UTF-8: {source}"))
-    }
-
-    fn read_u32(&mut self) -> Result<u32, String> {
-        let mut bytes = [0_u8; 4];
-        self.read_exact(&mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
-
-    fn read_u64(&mut self) -> Result<u64, String> {
-        let mut bytes = [0_u8; 8];
-        self.read_exact(&mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), String> {
-        self.file
-            .read_exact(bytes)
-            .map_err(|source| format!("unexpected EOF while scanning GGUF: {source}"))?;
-        self.cursor = self.cursor.saturating_add(bytes.len() as u64);
-        Ok(())
-    }
-
-    fn skip(&mut self, bytes: u64) -> Result<(), String> {
-        let next = self
-            .cursor
-            .checked_add(bytes)
-            .ok_or_else(|| "GGUF cursor overflowed while skipping".to_string())?;
-        if next > self.file_len {
-            return Err("GGUF metadata extends past end of file".to_string());
-        }
-        self.file
-            .seek(SeekFrom::Start(next))
-            .map_err(|source| format!("could not seek while scanning GGUF: {source}"))?;
-        self.cursor = next;
-        Ok(())
-    }
-}
-
-fn ggml_tensor_payload_size(ggml_type: u32, elements: u64) -> Result<u64, String> {
-    match ggml_type {
-        0 => elements
-            .checked_mul(4)
-            .ok_or_else(|| "f32 tensor size overflow".to_string()),
-        1 | 30 => elements
-            .checked_mul(2)
-            .ok_or_else(|| "f16/bf16 tensor size overflow".to_string()),
-        2 => block_payload(elements, 32, 18),
-        8 => block_payload(elements, 32, 34),
-        11 => block_payload(elements, 256, 110),
-        12 => block_payload(elements, 256, 144),
-        13 => block_payload(elements, 256, 176),
-        14 => block_payload(elements, 256, 210),
-        24 => Ok(elements),
-        25 => elements
-            .checked_mul(2)
-            .ok_or_else(|| "i16 tensor size overflow".to_string()),
-        26 => elements
-            .checked_mul(4)
-            .ok_or_else(|| "i32 tensor size overflow".to_string()),
-        27 | 28 => elements
-            .checked_mul(8)
-            .ok_or_else(|| "i64/f64 tensor size overflow".to_string()),
-        other => Err(format!("unsupported GGML tensor type {other}")),
-    }
-}
-
-fn block_payload(elements: u64, block_elements: u64, block_bytes: u64) -> Result<u64, String> {
-    let blocks = elements
-        .checked_add(block_elements - 1)
-        .ok_or_else(|| "quantized tensor block count overflow".to_string())?
-        / block_elements;
-    blocks
-        .checked_mul(block_bytes)
-        .ok_or_else(|| "quantized tensor size overflow".to_string())
-}
-
-fn align_up_u64(value: u64, alignment: u64) -> Result<u64, String> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| "alignment overflowed u64".to_string())
 }
 
 fn unix_seconds_now() -> u64 {

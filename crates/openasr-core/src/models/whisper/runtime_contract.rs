@@ -7,6 +7,8 @@ use crate::models::runtime_contract::{
     validate_positive_usize as validate_positive_usize_contract,
 };
 
+use super::ggml_tensor_binding::{WhisperGgufTensorBindingContext, bind_whisper_gguf_tensors};
+use super::tokenizer::WhisperTokenizer;
 use super::tokenizer::{TOKENIZER_GGML_EOT_TOKEN_ID_KEY, TOKENIZER_GGML_SOT_TOKEN_ID_KEY};
 use crate::arch::{
     GENERAL_ARCHITECTURE_KEY,
@@ -135,6 +137,36 @@ pub(crate) fn validate_whisper_execution_metadata(
         eos_token_id,
         encoder_mels_count,
     })
+}
+
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    let metadata = validate_whisper_execution_metadata(preflight.metadata()).map_err(|error| {
+        crate::models::runtime_pack_contract::metadata_validation_error("whisper", error)
+    })?;
+    let binding_context = WhisperGgufTensorBindingContext {
+        n_audio_layer: metadata.encoder_layers,
+        n_audio_state: metadata.encoder_hidden_size,
+        n_audio_head: metadata.encoder_attention_heads,
+        n_mels: metadata.encoder_mels_count,
+        n_audio_ctx: metadata.encoder_context_length,
+        n_text_layer: metadata.decoder_layers,
+        n_text_state: metadata.decoder_hidden_size,
+        n_text_head: metadata.decoder_attention_heads,
+        n_text_ctx: metadata.max_target_positions,
+        n_vocab: metadata.vocab_size,
+    };
+    bind_whisper_gguf_tensors(&binding_context, preflight.tensor_index())
+        .map_err(crate::models::runtime_pack_contract::tensor_validation_error)?;
+    WhisperTokenizer::from_gguf_metadata(preflight.metadata())
+        .map(|_| ())
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error(
+                "whisper tokenizer",
+                error,
+            )
+        })
 }
 
 #[cfg(test)]

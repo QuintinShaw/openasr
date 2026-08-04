@@ -12,13 +12,12 @@ use openasr_core::realtime::history::{
 use openasr_core::{
     AudioPreparationOptions, BackendKind, CatalogError, ExecutionTarget, LongFormMode,
     LongFormOptions, ModelResolutionError, NativeAsrError, NativeAsrExecutor,
-    NativeAsrHardwareTarget, NativeAsrModelAdapter, NativeAsrModelPackRef, NativeAsrOfflineRequest,
-    NativeAsrRequestOptions, NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig,
-    ResponseFormat, RuntimeModelResolutionError, TranscriptionRequest, TranscriptionTask,
+    NativeAsrHardwareTarget, NativeAsrOfflineRequest, NativeAsrRequestOptions,
+    NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig, ResponseFormat,
+    RuntimeModelResolutionError, TranscriptionRequest, TranscriptionTask,
     add_segment_word_timestamps, config::MAX_INFERENCE_THREADS,
     native_runtime_model_adapter_for_path, parse_model_ref, prepare_audio_input,
-    render_transcription, resolve_local_native_runtime_model_identity, resolve_runtime_model_ref,
-    runtime_registry,
+    render_transcription, resolve_runtime_model_ref, runtime_registry,
 };
 
 use crate::*;
@@ -362,10 +361,6 @@ async fn run_offline_transcription(
         );
     }
     let history_request = parsed.request.clone();
-    if runtime.backend == BackendKind::Native {
-        validate_native_request_model(&runtime, &parsed.request.model_id)
-            .map_err(ApiError::BadRequest)?;
-    }
     // Register an in-session pause/cancel control when the client supplied a
     // transcription id and the native backend is in use (control acts at
     // long-form slice boundaries; the mock backend has no such loop). The
@@ -1049,28 +1044,35 @@ pub(crate) fn load_runtime_model_catalog(
 
 pub(crate) fn validate_native_runtime_pack(
     pack_root: &Path,
-) -> Result<openasr_core::NativeRuntimeModelIdentity, openasr_core::BackendError> {
-    resolve_native_runtime_model_identity(pack_root, None)
+) -> Result<openasr_core::NativeRuntimeModelAdapter, openasr_core::BackendError> {
+    native_runtime_model_adapter_for_path(pack_root).ok_or_else(|| {
+        openasr_core::BackendError::NativeFailClosed {
+            reason: format!(
+                "could not verify and select a native model adapter from runtime source '{}'",
+                pack_root.display()
+            ),
+        }
+    })
 }
 
-fn resolve_native_runtime_model_identity(
-    pack_root: &Path,
+pub(crate) fn resolve_verified_native_runtime_model_identity(
+    adapter: &openasr_core::NativeRuntimeModelAdapter,
     explicit_model_id_fallback: Option<&str>,
 ) -> Result<openasr_core::NativeRuntimeModelIdentity, openasr_core::BackendError> {
-    let mut identity =
-        resolve_local_native_runtime_model_identity(pack_root, explicit_model_id_fallback)
-            .map_err(|error| openasr_core::BackendError::NativeFailClosed {
-                reason: format!(
-                    "could not resolve native model id from ggml runtime source '{}': {error}",
-                    pack_root.display()
-                ),
-            })?;
+    let mut identity = adapter
+        .verified_runtime_model_identity(explicit_model_id_fallback)
+        .map_err(|error| openasr_core::BackendError::NativeFailClosed {
+            reason: format!(
+                "could not resolve native model id from verified runtime pack: {error}"
+            ),
+        })?;
     if is_retired_native_model_ref(&identity.model_id)
         && matches!(
             identity.source,
             NativeRuntimeModelIdSource::MetadataGgufKey { .. }
         )
-        && let Some(stem) = pack_root.file_stem().and_then(|value| value.to_str())
+        && let Ok(model_pack) = adapter.model_pack_ref(identity.model_id.clone())
+        && let Some(stem) = model_pack.root.file_stem().and_then(|value| value.to_str())
     {
         let normalized_stem = stem.trim();
         if !normalized_stem.is_empty()
@@ -1126,21 +1128,10 @@ pub(crate) fn resolve_and_validate_form_model_id(
 // Native model handling is intentionally two-phase: form parsing rejects invalid
 // or retired ids, then runtime validation checks that the loaded pack matches.
 pub(crate) fn validate_native_request_model(
-    runtime: &ServerRuntime,
+    adapter: &openasr_core::NativeRuntimeModelAdapter,
     model: &str,
 ) -> Result<(), String> {
-    let Some(model_pack_path) = runtime.model_pack_path.as_deref() else {
-        // No model bound at all: a fresh install with zero pulled models is a
-        // normal daemon state (it starts and answers /health fine), but a
-        // transcription request needs a model, so this is where that need
-        // becomes a fail-closed, structured error.
-        return Err(format!(
-            "Model '{model}' is not installed. No models are installed on this server yet -- install one first (openasr pull {model}, or via the model market)."
-        ));
-    };
-    let pack_root = openasr_core::validate_local_native_model_pack_path(model_pack_path)
-        .map_err(|error| error.to_string())?;
-    let identity = resolve_native_runtime_model_identity(&pack_root, Some(model))
+    let identity = resolve_verified_native_runtime_model_identity(adapter, Some(model))
         .map_err(|error| error.to_string())?;
     match identity.source {
         NativeRuntimeModelIdSource::ExplicitModelIdFallback => Ok(()),
@@ -1165,18 +1156,14 @@ fn native_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
     openasr_core::native_runtime_model_refs_match(requested, runtime_source_id)
 }
 
-/// Stable identity for the actual native runtime that will execute requests.
-///
-/// It intentionally ignores the client-supplied model spelling: aliases and a
-/// bare runtime metadata id must all share one capacity slot. The identity comes
-/// from the validated runtime pack, never from an unbounded request value.
-pub(crate) fn native_model_session_key(runtime: &ServerRuntime) -> Result<String, ApiError> {
-    let model_pack_path = runtime.model_pack_path.as_deref().ok_or_else(|| {
-        ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRequired)
-    })?;
-    let pack_root = openasr_core::validate_local_native_model_pack_path(model_pack_path)
-        .map_err(ApiError::Backend)?;
-    let identity = validate_native_runtime_pack(&pack_root).map_err(ApiError::Backend)?;
+/// Stable admission identity projected from the same verified pack generation
+/// that will execute. This preserves the one-slot-per-logical-model contract
+/// across aliases and pack replacement without reopening the path.
+pub(crate) fn native_model_session_key(
+    adapter: &openasr_core::NativeRuntimeModelAdapter,
+) -> Result<String, ApiError> {
+    let identity =
+        resolve_verified_native_runtime_model_identity(adapter, None).map_err(ApiError::Backend)?;
     let model_ref = parse_model_ref(&identity.model_id).map_err(|error| {
         ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
             reason: format!(
@@ -1658,6 +1645,24 @@ pub(crate) async fn transcribe_with_runtime(
         }
         BackendKind::Native => {
             tokio::task::spawn_blocking(move || {
+                let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
+                    ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRejected {
+                        reason: format!(
+                            "Model '{}' is not installed. No models are installed on this server yet -- install one first (openasr pull {}, or via the model market).",
+                            request.model_id, request.model_id
+                        ),
+                    })
+                })?;
+                let adapter = native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
+                    ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
+                        reason: format!(
+                            "could not verify and select a native model adapter from runtime source '{}'",
+                            model_pack_path.display()
+                        ),
+                    })
+                })?;
+                validate_native_request_model(&adapter, &request.model_id)
+                    .map_err(ApiError::BadRequest)?;
                 // Audio normalization may run an external converter or decode a
                 // full upload in process, but it does not touch a native model
                 // runtime. Keep it outside the per-model admission window so
@@ -1673,42 +1678,22 @@ pub(crate) async fn transcribe_with_runtime(
                 .map_err(ApiError::AudioPreparation)?;
                 let resolved_route = resolve_execution_route_for_target(request.execution_target)
                     .map_err(ApiError::Backend)?;
-                let model_session_permit =
-                    runtime.acquire_native_execution(resolved_route.as_ref())?;
+                let model_session_key = native_model_session_key(&adapter)?;
+                let model_session_permit = runtime
+                    .acquire_native_execution(&model_session_key, resolved_route.as_ref())?;
                 run_admitted_native_transcription(model_session_permit, move || {
                     // Marks this offline (file-transcription / realtime-per-utterance
                     // backend-job) decode as active for the whole synchronous run, so
                     // the idle_unload reaper never evicts the model runtime cache out
                     // from under it; dropped (any exit path) once the decode returns.
                     let _activity_guard = NativeActivityGuard::enter();
-                    let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
-                        TranscriptionRuntimeError::Backend(
-                        openasr_core::BackendError::NativeModelPackPathRejected {
-                            reason:
-                                "native backend requires an explicit local .oasr runtime pack path"
-                                    .to_string(),
-                        },
-                    )
-                    })?;
-                    let adapter =
-                native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
-                    TranscriptionRuntimeError::Backend(
-                        openasr_core::BackendError::NativeFailClosed {
-                            reason: format!(
-                                "could not select a native model adapter from runtime source '{}'",
-                                model_pack_path.display()
-                            ),
-                        },
-                    )
-                })?;
                     let mut request = request;
                     request.input_path = prepared.path().to_path_buf();
                     let word_timestamps = request.word_timestamps;
-                    let model_pack = NativeAsrModelPackRef::new(
-                        request.model_id.clone(),
-                        adapter.model_family(),
-                        model_pack_path,
-                    );
+                    let model_pack = adapter
+                        .model_pack_ref(request.model_id.clone())
+                        .map_err(native_asr_error_to_backend)
+                        .map_err(TranscriptionRuntimeError::Backend)?;
                     let offline_request = NativeAsrOfflineRequest::new(request.input_path.clone())
                         .with_options(
                             NativeAsrRequestOptions::new()

@@ -17,10 +17,9 @@
 # uploads.push(...) / pending_uploads.push(...) / <binding>.upload(...) puts
 # those tensors in the graph's transient *compute* buffer, not a WEIGHTS
 # buffer -- so the scheduler can never offload their matmuls, no matter how
-# much GPU memory is free. This is exactly the defect found in Dolphin's
-# E-Branchformer encoder and (independently) X-ASR/Zipformer's encoder: both
-# passed golden/parity review because the *numbers* were right, but their
-# encoders silently ran 100% on CPU under a GPU backend.
+# much GPU memory is free. Golden/parity review does not catch this defect:
+# the numbers can be right while the encoder silently runs 100% on CPU under
+# a GPU backend.
 #
 # This script is the static half of the two-part acceptance gate (see
 # docs/design/gpu-weight-placement.md for the dynamic half, a one-shot
@@ -49,14 +48,8 @@
 # buffer to hold their matmul weights in the first place. A family with zero
 # safe-path evidence anywhere in its encoder/executor files is a real finding,
 # not a false positive from this ambiguity -- confirmed by manual review for
-# every family in this tree as of 2026-07 (see ALLOWLIST below and
-# docs/design/gpu-weight-placement.md).
-#
-# Known findings are pre-declared in ALLOWLIST below so the gate does not
-# immediately fail every unrelated PR on families we already know about and
-# haven't fixed yet. Fixing a family's weight placement means removing it from
-# ALLOWLIST in the same PR -- the script will tell you to if it detects the
-# family no longer violates the check.
+# every family in this tree as of 2026-07 (see docs/design/gpu-weight-placement.md).
+# Every finding fails the gate; there are no exemptions or escape lists.
 #
 # Usage:
 #   scripts/gpu-weight-placement-gate.sh            # run the gate (CI mode)
@@ -71,32 +64,6 @@ if [[ ! -d "$models_dir" ]]; then
   exit 1
 fi
 
-# --- Known findings -----------------------------------------------------
-# family|tracking note. Remove an entry once its encoder's matmul weights are
-# re-bound through GgmlStaticTensorArena or load_gguf_weight_context and the
-# gate stops flagging it -- do not remove an entry just because it becomes
-# inconvenient; verify with GGML_SCHED_DEBUG=2 first
-# (docs/design/gpu-weight-placement.md). Deliberately a plain indexed array,
-# not an associative one (`declare -A`) -- macOS ships bash 3.2, which lacks
-# associative arrays, and this script must run unmodified there too.
-ALLOWLIST=(
-)
-
-allowlist_note_for() {
-  local family="$1" entry
-  # macOS ships bash 3.2, where "${ALLOWLIST[@]}" on an empty array is an
-  # unbound-variable error under `set -u`; short-circuit when the allowlist is
-  # empty (the intended steady state once every family is fixed).
-  [[ ${#ALLOWLIST[@]} -eq 0 ]] && return 1
-  for entry in "${ALLOWLIST[@]}"; do
-    if [[ "${entry%%|*}" == "$family" ]]; then
-      echo "${entry#*|}"
-      return 0
-    fi
-  done
-  return 1
-}
-
 mode="${1:-}"
 list_only=0
 if [[ "$mode" == "--list" ]]; then
@@ -109,8 +76,7 @@ fi
 risk_pattern='uploads\.push\(|pending_uploads\.push\(|\.upload\('
 safe_pattern='load_gguf_weight_context|GgmlStaticTensorArena|bind_loaded'
 
-new_violations=()
-stale_allowlist=()
+violations=()
 findings_report=()
 
 for family_dir in "$models_dir"/*/; do
@@ -153,15 +119,7 @@ for family_dir in "$models_dir"/*/; do
     ${f#"$repo_root"/} (first hit: ${line})"
     done
     findings_report+=("$detail")
-    if allowlist_note_for "$family" >/dev/null; then
-      : # known finding, allowlisted -- do not fail the build
-    else
-      new_violations+=("$family")
-    fi
-  else
-    if allowlist_note_for "$family" >/dev/null; then
-      stale_allowlist+=("$family")
-    fi
+    violations+=("$family")
   fi
 done
 
@@ -181,34 +139,22 @@ if [[ ${#findings_report[@]} -eq 0 ]]; then
   echo "(GgmlStaticTensorArena / load_gguf_weight_context / bind_loaded)."
 fi
 
-if [[ ${#stale_allowlist[@]} -gt 0 ]]; then
-  echo
-  echo "note: ALLOWLIST entries no longer reproduce and should be removed from"
-  echo "scripts/gpu-weight-placement-gate.sh (confirm with GGML_SCHED_DEBUG=2 first, then remove):"
-  for family in "${stale_allowlist[@]}"; do
-    echo "  - $family ($(allowlist_note_for "$family"))"
-  done
-fi
-
 if [[ $list_only -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ${#new_violations[@]} -gt 0 ]]; then
+if [[ ${#violations[@]} -gt 0 ]]; then
   echo
-  echo "FAIL: new GPU weight placement violation(s) not in ALLOWLIST:"
-  for family in "${new_violations[@]}"; do
+  echo "FAIL: GPU weight placement violation(s):"
+  for family in "${violations[@]}"; do
     echo "  - $family"
   done
   echo
   echo "Fix: bind the encoder/executor's 2D matmul weights via load_gguf_weight_context"
   echo "(zero-copy) or GgmlStaticTensorArena (norm/bias), not runner.start_graph() +"
   echo "uploads.push()/.upload(). See docs/design/gpu-weight-placement.md."
-  echo "If this is a known, not-yet-fixed family, add it to ALLOWLIST in this script"
-  echo "with a tracking issue reference -- do not silently widen the risk pattern to"
-  echo "dodge the finding."
   exit 1
 fi
 
 echo
-echo "PASS (allowlisted findings, if any, are pre-existing and tracked above)."
+echo "PASS."

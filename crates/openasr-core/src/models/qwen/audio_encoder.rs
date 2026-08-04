@@ -18,7 +18,10 @@ use crate::{GgufTensorDataReadError, GgufTensorDataReader, GgufTensorMetadata};
 
 use super::frontend::Qwen3AsrMelFeatures;
 use super::graph_config::qwen_encoder_graph_config;
-use super::runtime_contract::Qwen3AsrExecutionMetadata;
+use super::runtime_contract::{
+    QWEN3_AUDIO_CONV_DILATION, QWEN3_AUDIO_CONV_PADDING, QWEN3_AUDIO_CONV_STRIDE,
+    Qwen3AsrExecutionMetadata, qwen3_audio_conv_output_len,
+};
 
 /// Env flag to emit a per-chunk audio-encoder timing split. `setup_us` covers
 /// graph build/upload; `compute_us` covers the GPU graph compute. Used to
@@ -45,10 +48,6 @@ use super::tensor_names::{
 };
 
 const QWEN3_AUDIO_CHUNK_FRAMES: usize = 100;
-const QWEN3_AUDIO_CONV_KERNEL: usize = 3;
-const QWEN3_AUDIO_CONV_STRIDE: usize = 2;
-const QWEN3_AUDIO_CONV_PADDING: usize = 1;
-const QWEN3_AUDIO_CONV_DILATION: usize = 1;
 const QWEN3_AUDIO_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 
 /// Worst-case forward-graph node budget for the qwen3-asr audio encoder, used to
@@ -275,10 +274,16 @@ impl Qwen3AsrAudioEncoderRuntime {
         // goals 7+8 Step 1: bind the encoder's 2D projection weights zero-copy from
         // the mmap'd pack (native q8/f16) instead of dequantizing them to f32. The
         // loader (1b) does not materialize f32 for these — `loaded` is the only
-        // source. `None` (no path) only happens off the production executor path.
-        let loaded = runner
-            .load_gguf_weight_context_from_preflight(preflight)
-            .ok();
+        // source. A production preflight whose native binding cannot be built
+        // fails here instead of silently falling back to arena/CPU placement.
+        let loaded = Some(
+            runner
+                .load_gguf_weight_context_from_preflight(preflight)
+                .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
+                    step: "loaded_weight_context",
+                    source,
+                })?,
+        );
         Ok(Self { runner, loaded })
     }
 
@@ -777,7 +782,8 @@ fn pack_mel_into_chunked_layout(
 }
 
 fn conv_out_len(input: usize) -> usize {
-    (input + 2 * QWEN3_AUDIO_CONV_PADDING - QWEN3_AUDIO_CONV_KERNEL) / QWEN3_AUDIO_CONV_STRIDE + 1
+    qwen3_audio_conv_output_len(input)
+        .expect("positive Qwen mel geometry must survive its fixed convolution stage")
 }
 
 /// Post-encoder audio tokens this family splices into the decoder prompt for

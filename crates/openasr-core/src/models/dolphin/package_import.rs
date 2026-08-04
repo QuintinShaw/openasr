@@ -48,13 +48,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::arch::{
-    DOLPHIN_AUDIO_FRONTEND_ID, DOLPHIN_DECODE_POLICY_ID, DOLPHIN_GGML_ARCHITECTURE_ID,
-    DOLPHIN_MODEL_FAMILY, DOLPHIN_TOKENIZER_ID,
-};
+use crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, write_gguf_file_v0,
 };
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::models::dolphin::language::{
@@ -62,17 +58,14 @@ use crate::models::dolphin::language::{
     DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES, build_dolphin_decode_prefix,
     build_dolphin_multilingual_decode_prefix,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
     validate_error, validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::nn::half::f32_to_f16_bits;
 
 // --- E-Branchformer / Transformer configuration -------------------------------
@@ -215,21 +208,22 @@ pub fn convert_local_dolphin_wenet_source_to_runtime_pack(
     }
 
     let metadata = dolphin_runtime_gguf_metadata(request, &vocab_tokens, &architecture);
-    write_gguf_file_v0(&request.output_path, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_path,
+        PackEnvelope::asr(DOLPHIN_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "dolphin GGUF writer failed for '{}': {error}",
             request.output_path.display()
         ))
     })?;
 
-    let index = read_gguf_tensor_index(&request.output_path).map_err(|error| {
-        validate_error(format!(
-            "dolphin import produced an unreadable tensor index: {error}"
-        ))
-    })?;
     Ok(DolphinImportResult {
         output_path: request.output_path.clone(),
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
         vocab_size,
         blank_token_id: architecture.blank_token_id,
     })
@@ -723,26 +717,37 @@ fn dolphin_quant_type_for_tensor(
     if !name.ends_with(".weight") || shape.len() != 2 {
         return None;
     }
-    // Reversed ne0 == the safetensors innermost (last) dim == `in`.
-    let ne0 = *shape.last()?;
-    // dolphin keeps WeNet source names: the acoustic encoder is `encoder.*`;
-    // `decoder.*` / `ctc.*` / `context_module.*` (hotword) are downstream.
-    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
-    } else {
-        QuantComponent::Decoder
-    };
-    classify_quant_tensor(ne0, quantization, component)
+    classify_quant_tensor_role(
+        shape,
+        quantization,
+        dolphin_tensor_role(name),
+        DOLPHIN_QUANTIZED_AXIS,
+    )
 }
 
-/// Runtime tensor name prefix for the dolphin (WeNet E-Branchformer) acoustic
-/// encoder (`encoder.*`). Shared with `models::pack_quant_audit`'s
-/// encoder-floor rule -- the single source of truth for "which dolphin
-/// tensors are audio-encoder".
-pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder."];
+/// Dolphin preserves WeNet matrix order, so ggml's contiguous quantized axis
+/// is the final stored dimension. The descriptor and writer share this
+/// constant to keep that mathematical layout fact authoritative.
+pub(crate) const DOLPHIN_QUANTIZED_AXIS: QuantizedAxis = QuantizedAxis::Last;
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: DOLPHIN_GGML_ARCHITECTURE_ID,
+        classify: dolphin_tensor_role,
+        quantized_axis: DOLPHIN_QUANTIZED_AXIS,
+    };
+
+/// Map Dolphin's preserved WeNet names into mathematical quantization roles.
+/// The writer and post-build audit both call this exact function.
+pub(crate) fn dolphin_tensor_role(name: &str) -> TensorRole {
+    if name.starts_with("encoder.") && name.ends_with(".weight") {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
+    } else {
+        TensorRole::NonQuantizable
+    }
+}
 
 /// Build one runtime tensor. Quantizable rank-2 `.weight` matrices are block-
 /// quantized with **reversed dims** (ne0 = the contiguous `in` axis); the runtime
@@ -836,16 +841,6 @@ fn dolphin_runtime_gguf_metadata(
     let mut put_str = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put_str("general.architecture", DOLPHIN_GGML_ARCHITECTURE_ID);
-    put_str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
-    put_str(OASR_METADATA_KEY_MODEL_FAMILY, DOLPHIN_MODEL_FAMILY);
-    put_str(
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        DOLPHIN_GGML_ARCHITECTURE_ID,
-    );
-    put_str(OASR_METADATA_KEY_AUDIO_FRONTEND, DOLPHIN_AUDIO_FRONTEND_ID);
-    put_str(OASR_METADATA_KEY_DECODE_POLICY, DOLPHIN_DECODE_POLICY_ID);
-    put_str(GGML_TOKENIZER_ID_KEY, DOLPHIN_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
     put_str("dolphin.tokenizer.model", "char");
     // Selects the decode-prefix builder at runtime (executor.rs): the
@@ -936,13 +931,6 @@ mod tests {
     // `use`-importing a bare variant has to name the real enum, not the alias.
     use PackQuant::Fp16;
 
-    fn string_metadata(metadata: &BTreeMap<String, GgufWriteValue>, key: &str) -> Option<String> {
-        match metadata.get(key) {
-            Some(GgufWriteValue::String(value)) => Some(value.clone()),
-            _ => None,
-        }
-    }
-
     fn u32_metadata(metadata: &BTreeMap<String, GgufWriteValue>, key: &str) -> Option<u32> {
         match metadata.get(key) {
             Some(GgufWriteValue::U32(value)) => Some(*value),
@@ -990,18 +978,20 @@ mod tests {
         let tokens: Vec<String> = (0..18173).map(|i| format!("t{i}")).collect();
         let metadata =
             dolphin_runtime_gguf_metadata(&fixture_request(), &tokens, &small_cn_architecture());
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            Some(DOLPHIN_MODEL_FAMILY.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_ARCHITECTURE),
-            Some(DOLPHIN_GGML_ARCHITECTURE_ID.to_string())
-        );
-        assert_eq!(
-            string_metadata(&metadata, GGML_TOKENIZER_ID_KEY),
-            Some(DOLPHIN_TOKENIZER_ID.to_string())
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
         assert_eq!(u32_metadata(&metadata, "dolphin.vocab_size"), Some(18173));
         assert_eq!(u32_metadata(&metadata, "ctc.blank_token_id"), Some(0));
         assert_eq!(

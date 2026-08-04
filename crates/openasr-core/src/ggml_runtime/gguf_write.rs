@@ -37,7 +37,8 @@ fn is_commit_sha(value: &str) -> bool {
 /// [`BUILD_COMMIT_ENV`]. `None` when the variable is unset/empty (no
 /// provenance claimed); an error when it IS set but malformed -- a builder
 /// that claims provenance must claim it correctly.
-fn build_provenance_from_env() -> Result<Option<(String, GgufWriteValue)>, GgufWriteError> {
+pub(crate) fn build_provenance_from_env() -> Result<Option<(String, GgufWriteValue)>, GgufWriteError>
+{
     match std::env::var(BUILD_COMMIT_ENV) {
         Ok(raw) => {
             let commit = raw.trim().to_ascii_lowercase();

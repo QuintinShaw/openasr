@@ -81,7 +81,7 @@ impl ParakeetCtcEncoderGraph {
     pub(crate) fn new(
         weights: &ParakeetEncoderWeights,
         metadata: ParakeetCtcExecutionMetadata,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetEncoderError> {
         let config = parakeet_ctc_encoder_graph_config(backend);
@@ -240,7 +240,7 @@ mod tests {
         let mut graph = ParakeetCtcEncoderGraph::new(
             &weights,
             metadata,
-            Some(&preflight),
+            &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("graph");

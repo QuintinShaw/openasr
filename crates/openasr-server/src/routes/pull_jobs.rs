@@ -66,6 +66,7 @@ const PULL_PROGRESS_SPEED_EMA_ALPHA: f64 = 0.25;
 pub(crate) struct PullJobResolvedSpec {
     pub(crate) requested: String,
     pub(crate) model_id: String,
+    pub(crate) catalog_family_id: String,
     pub(crate) display_name: String,
     pub(crate) quant: String,
     pub(crate) suffix: String,
@@ -87,6 +88,7 @@ impl PullJobResolvedSpec {
         Self {
             requested: resolved.requested.clone(),
             model_id: resolved.model_id.clone(),
+            catalog_family_id: resolved.catalog_family_id.clone(),
             display_name: resolved.display_name.clone(),
             quant: resolved.quant.clone(),
             suffix: resolved.suffix.clone(),
@@ -109,6 +111,7 @@ impl From<PullJobResolvedSpec> for ResolvedCatalogPull {
         Self {
             requested: spec.requested,
             model_id: spec.model_id,
+            catalog_family_id: spec.catalog_family_id,
             display_name: spec.display_name,
             quant: spec.quant,
             suffix: spec.suffix,

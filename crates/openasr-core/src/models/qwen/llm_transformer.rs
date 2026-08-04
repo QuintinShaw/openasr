@@ -2230,9 +2230,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
         let runner = GgmlCpuGraphRunner::new(config)?;
-        let loaded = runner
-            .load_gguf_weight_context_from_preflight(preflight)
-            .ok();
+        let loaded = Some(runner.load_gguf_weight_context_from_preflight(preflight)?);
         let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
         let mut layers = Vec::with_capacity(plan.layers.len());
         let mut dims = None;

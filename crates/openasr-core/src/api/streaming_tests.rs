@@ -438,9 +438,9 @@ fn cancellation_token_setter_is_accepted() {
 #[ignore = "requires a real .oasr pack via OPENASR_TEST_STREAMING_PACK"]
 fn streaming_matches_batch_transcribe() {
     use crate::{
-        NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrModelAdapter, NativeAsrModelPackRef,
-        NativeAsrOfflineRequest, NativeAsrRequestOptions, NativeBackendExecutor,
-        load_native_wav_16khz_mono_f32_v0, native_runtime_model_adapter_for_path,
+        NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrOfflineRequest,
+        NativeAsrRequestOptions, NativeBackendExecutor, load_native_wav_16khz_mono_f32_v0,
+        native_runtime_model_adapter_for_path,
     };
     use std::path::PathBuf;
 
@@ -490,8 +490,9 @@ fn streaming_matches_batch_transcribe() {
     let adapter = native_runtime_model_adapter_for_path(&pack).expect("adapter");
     let identity = crate::resolve_local_native_runtime_model_identity(&pack, None)
         .expect("resolve pack model identity");
-    let model_pack =
-        NativeAsrModelPackRef::new(identity.model_id, adapter.model_family(), pack.clone());
+    let model_pack = adapter
+        .model_pack_ref(identity.model_id)
+        .expect("verified adapter produces the matching pack reference");
     let batch = NativeAsrExecutor::transcribe(
         &NativeBackendExecutor::new(execution_services),
         &adapter,

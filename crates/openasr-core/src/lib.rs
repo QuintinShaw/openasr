@@ -25,7 +25,32 @@ pub mod adapter_pack;
 pub mod api;
 pub mod apikeys;
 mod arch;
+pub use arch::{
+    COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
+    COHERE_TRANSCRIBE_GGML_ADAPTER_ID, COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+    COHERE_TRANSCRIBE_TOKENIZER_ID, DOLPHIN_AUDIO_FRONTEND_ID, DOLPHIN_DECODE_POLICY_ID,
+    DOLPHIN_GGML_ADAPTER_ID, DOLPHIN_GGML_ARCHITECTURE_ID, DOLPHIN_TOKENIZER_ID,
+    MOONSHINE_AUDIO_FRONTEND_ID, MOONSHINE_DECODE_POLICY_ID, MOONSHINE_GGML_ADAPTER_ID,
+    MOONSHINE_GGML_ARCHITECTURE_ID, MOONSHINE_TOKENIZER_ID, PARAKEET_CTC_AUDIO_FRONTEND_ID,
+    PARAKEET_CTC_DECODE_POLICY_ID, PARAKEET_CTC_GGML_ADAPTER_ID, PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+    PARAKEET_CTC_TOKENIZER_ID, PARAKEET_TDT_AUDIO_FRONTEND_ID, PARAKEET_TDT_DECODE_POLICY_ID,
+    PARAKEET_TDT_GGML_ADAPTER_ID, PARAKEET_TDT_GGML_ARCHITECTURE_ID, PARAKEET_TDT_TOKENIZER_ID,
+    QWEN3_ASR_AUDIO_FRONTEND_ID, QWEN3_ASR_DECODE_POLICY_ID, QWEN3_ASR_GGML_ADAPTER_ID,
+    QWEN3_ASR_GGML_ARCHITECTURE_ID, QWEN3_ASR_TOKENIZER_ID, SENSEVOICE_AUDIO_FRONTEND_ID,
+    SENSEVOICE_DECODE_POLICY_ID, SENSEVOICE_GGML_ADAPTER_ID, SENSEVOICE_GGML_ARCHITECTURE_ID,
+    SENSEVOICE_TOKENIZER_ID, WAV2VEC2_CTC_AUDIO_FRONTEND_ID, WAV2VEC2_CTC_DECODE_POLICY_ID,
+    WAV2VEC2_CTC_GGML_ADAPTER_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_TOKENIZER_ID,
+    WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ADAPTER_ID,
+    WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID, XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
+    XASR_ZIPFORMER_DECODE_POLICY_ID, XASR_ZIPFORMER_GGML_ADAPTER_ID,
+    XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_TOKENIZER_ID,
+};
 pub(crate) mod audio;
+pub mod family_inventory;
+pub use family_inventory::{
+    ExecutionCapabilitiesInventoryV1, ExecutionProviderInventoryV1, ModelFamilyInventoryEntryV1,
+    ModelFamilyInventoryV1, builtin_model_family_inventory,
+};
 // `pub` (not `pub(crate)`): the desktop app reaches this by path
 // (`openasr_core::backend_manifest::verify_and_parse`) to verify the
 // downloaded inference-kernel manifest -- see the module doc comment.
@@ -80,7 +105,7 @@ pub use api::backend::{
     native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
-    validate_native_runtime_model_pack_contract,
+    verify_native_runtime_model_pack_path,
 };
 pub use api::native::{
     NativeAsrBackpressurePolicy, NativeAsrBenchmarkStatus, NativeAsrCapabilities,
@@ -231,39 +256,14 @@ pub use models::{
     ggml_asr_executor::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-        GgmlAsrPreparedAudio, GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor,
-        GgmlAsrStreamingSessionConfig, GgmlAsrStreamingSessionRequest, RuntimeBuildIdentity,
-        RuntimeBuildIdentitySource, StreamingPartialGranularity,
+        GgmlAsrPreparedAudio, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionConfig,
+        GgmlAsrStreamingSessionRequest, RuntimeBuildIdentity, RuntimeBuildIdentitySource,
+        StreamingPartialGranularity,
     },
     ggml_family_adapter::{
         GGML_TOKENIZER_ID_KEY, GgmlAdapterMetadataSource, GgmlExecutionCapability,
         GgmlFamilyAdapterDescriptor, GgmlFamilyAdapterSelectionFields,
         GgmlFamilyAdapterSelectionSpec, OasrV1AdapterSelectionMetadata, OasrV1MetadataError,
-    },
-    ggml_family_registry::{
-        COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
-        COHERE_TRANSCRIBE_GGML_ADAPTER_ID, COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-        COHERE_TRANSCRIBE_TOKENIZER_ID, GgmlFamilyRegistry, GgmlFamilyRegistrySelectionError,
-        MOONSHINE_AUDIO_FRONTEND_ID, MOONSHINE_DECODE_POLICY_ID, MOONSHINE_GGML_ADAPTER_ID,
-        MOONSHINE_GGML_ARCHITECTURE_ID, MOONSHINE_TOKENIZER_ID, PARAKEET_CTC_AUDIO_FRONTEND_ID,
-        PARAKEET_CTC_DECODE_POLICY_ID, PARAKEET_CTC_GGML_ADAPTER_ID,
-        PARAKEET_CTC_GGML_ARCHITECTURE_ID, PARAKEET_CTC_TOKENIZER_ID,
-        PARAKEET_TDT_AUDIO_FRONTEND_ID, PARAKEET_TDT_DECODE_POLICY_ID,
-        PARAKEET_TDT_GGML_ADAPTER_ID, PARAKEET_TDT_GGML_ARCHITECTURE_ID, PARAKEET_TDT_TOKENIZER_ID,
-        QWEN3_ASR_AUDIO_FRONTEND_ID, QWEN3_ASR_DECODE_POLICY_ID, QWEN3_ASR_GGML_ADAPTER_ID,
-        QWEN3_ASR_GGML_ARCHITECTURE_ID, QWEN3_ASR_TOKENIZER_ID, SENSEVOICE_DECODE_POLICY_ID,
-        SENSEVOICE_GGML_ADAPTER_ID, SENSEVOICE_GGML_ARCHITECTURE_ID,
-        WAV2VEC2_CTC_AUDIO_FRONTEND_ID, WAV2VEC2_CTC_DECODE_POLICY_ID,
-        WAV2VEC2_CTC_GGML_ADAPTER_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_TOKENIZER_ID,
-        WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ADAPTER_ID,
-        WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID, XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
-        XASR_ZIPFORMER_DECODE_POLICY_ID, XASR_ZIPFORMER_GGML_ADAPTER_ID,
-        XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_TOKENIZER_ID,
-        cohere_transcribe_runtime_descriptor_v1, dolphin_runtime_descriptor_v1,
-        moonshine_runtime_descriptor_v1, parakeet_ctc_runtime_descriptor_v1,
-        parakeet_tdt_runtime_descriptor_v1, qwen3_asr_runtime_descriptor_v1,
-        sensevoice_runtime_descriptor_v1, wav2vec2_ctc_runtime_descriptor_v1,
-        whisper_runtime_descriptor_v1, xasr_zipformer_runtime_descriptor_v1,
     },
     hymt2::{
         HYMT2_PINNED_SOURCE_GGUF_SHA256, Hymt2ConfigError, Hymt2DecodeResult, Hymt2DecodeTimings,
@@ -322,14 +322,15 @@ pub use models::{
 pub use output::{OutputWriteError, atomic_write_text};
 pub use pull::{
     BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, LegacyMigrationFailure,
-    LegacyMigrationReport, PullError, PullModelPackRequest, PullProgress,
-    available_disk_space_bytes, default_pack_pointer_path, install_backend_pack,
+    LegacyMigrationReport, ModelPackPreflightReceipt, PullError, PullModelPackRequest,
+    PullProgress, available_disk_space_bytes, default_pack_pointer_path, install_backend_pack,
     install_catalog_model_pack_from_path,
     install_catalog_model_pack_from_path_with_execution_services, install_model_pack_from_path,
     install_model_pack_from_path_with_execution_services, list_installed_packs,
     migrate_legacy_model_store, migrate_model_store_at_startup, open_installed_content_lease,
-    persist_default_pack_pointer, preflight_model_pack_for_install, pull_model_pack,
-    read_default_pack_pointer, remove_model_pack, remove_model_pack_with_execution_services,
+    persist_default_pack_pointer, preflight_model_pack_for_install,
+    preflight_model_pack_with_receipt, pull_model_pack, read_default_pack_pointer,
+    remove_model_pack, remove_model_pack_with_execution_services,
     resolve_catalog_model_pack_from_path, resolve_installed_pack_path,
     resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
 };

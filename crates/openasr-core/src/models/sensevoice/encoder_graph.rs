@@ -206,7 +206,7 @@ impl SenseVoiceEncoderGraph {
     pub(crate) fn new(
         weights: &SenseVoiceEncoderWeights,
         metadata: SenseVoiceExecutionMetadata,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, SenseVoiceEncoderError> {
         let mut config = sensevoice_encoder_graph_config(backend);
@@ -219,11 +219,14 @@ impl SenseVoiceEncoderGraph {
                 source,
             }
         })?;
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
+        let loaded_weights = Some(
             runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+                .load_gguf_weight_context_from_preflight(runtime_preflight)
+                .map_err(|source| SenseVoiceEncoderError::GraphBuildFailed {
+                    step: "load_gguf_weight_context",
+                    source,
+                })?,
+        );
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES)
@@ -620,7 +623,7 @@ mod tests {
         let mut graph = SenseVoiceEncoderGraph::new(
             &weights,
             metadata,
-            Some(&preflight),
+            &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("graph");

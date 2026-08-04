@@ -6,7 +6,7 @@ import unittest
 from _catalog import (
     CATALOG,
     DEFAULT_CATALOG_MODEL_KIND,
-    LANG_BY_FAMILY,
+    MODEL_FAMILY_CAPABILITIES,
     QUANT_METADATA,
     apply_catalog_series_defaults,
     languages_for_family,
@@ -62,7 +62,7 @@ class PublishHelpersTest(unittest.TestCase):
 
         for model, entry in sorted(catalog.items()):
             family = entry["family"]
-            if family not in LANG_BY_FAMILY:
+            if family not in MODEL_FAMILY_CAPABILITIES:
                 # Language-agnostic support packs (e.g. the speaker-diarization
                 # embedder/segmenter) have no family-wide ASR language list;
                 # each such model must then declare an explicit override.

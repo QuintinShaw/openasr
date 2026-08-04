@@ -3,29 +3,20 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_tensor_index, validate_ggml_runtime_source_path, write_gguf_file_v0,
 };
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
-use crate::models::ggml_family_registry::{
-    COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
-    COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, COHERE_TRANSCRIBE_TOKENIZER_ID,
-};
+use crate::models::cohere::runtime_contract;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_json_file,
     tensor_element_count, validate_error, validate_output_pack_extension,
 };
-use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, OasrMetadataBuilder,
+use crate::models::oasr_metadata::{OasrMetadataBuilder, OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::{
+    PackQuant, QuantComponent, TensorQuantizationContract, classify_quant_tensor,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
-use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
-use crate::models::{cohere::COHERE_TRANSCRIBE_MODEL_FAMILY, cohere::runtime_contract};
-use crate::{read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source};
 
 use super::tensor_names::{
     DEC_EMB_LN_BIAS, DEC_EMB_LN_WEIGHT, DEC_EMB_WEIGHT, DEC_HEAD_BIAS, DEC_HEAD_WEIGHT,
@@ -42,8 +33,6 @@ const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
 const TOKENIZER_GGML_MODEL_VALUE_LLAMA: &str = "llama";
 const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
-const COHERE_ARCHITECTURE_VALUE: &str = "cohere-transcribe";
 
 pub type CohereLocalSourceError = LocalSourceImportError;
 
@@ -154,53 +143,24 @@ pub fn convert_local_cohere_source_to_runtime_pack(
     let metadata =
         cohere_runtime_gguf_metadata(&metadata_fields, request, &model_id, &vocab_tokens);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
             "Cohere local-source GGUF writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
 
-    // Fail closed: verify runtime contract via preflight reader/index validation.
-    let runtime_source =
-        validate_ggml_runtime_source_path(&request.output_root).map_err(|error| {
-            validate_error(format!(
-                "Cohere local-source import produced invalid runtime path '{}': {error}",
-                request.output_root.display()
-            ))
-        })?;
-    let metadata_read =
-        read_gguf_metadata_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Cohere import produced unreadable GGUF metadata: {error}"
-            ))
-        })?;
-    let tensor_index =
-        read_gguf_tensor_index_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Cohere import produced unreadable GGUF tensor index: {error}"
-            ))
-        })?;
-    validate_builtin_runtime_tensor_contract_for_architecture(
-        COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-        &metadata_read,
-        &tensor_index,
-    )
-    .map_err(|error| {
-        validate_error(format!(
-            "Cohere runtime contract validation failed: {error}"
-        ))
-    })?;
-
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "Cohere local-source GGUF writer produced unreadable tensor index: {error}"
-        ))
-    })?;
+    let preflight = verified.preflight();
     Ok(CohereLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
         model_id,
-        tensor_count: index.tensors().len(),
+        tensor_count: preflight.tensor_index().tensors().len(),
     })
 }
 
@@ -557,6 +517,12 @@ fn quantized_tensor_type_for_cohere_tensor(
 /// source of truth for "which cohere-transcribe tensors are audio-encoder".
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::AcousticEncoderPrefixesV1 {
+        model_architecture: COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        prefixes: AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+    };
+
 /// The encoder carries the shared Q8_0 floor (see `classify_quant_tensor`).
 fn cohere_quant_component(name: &str) -> QuantComponent {
     if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
@@ -697,26 +663,7 @@ fn cohere_runtime_gguf_metadata(
     vocab_tokens: &[String],
 ) -> BTreeMap<String, GgufWriteValue> {
     OasrMetadataBuilder::new()
-        .str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1)
-        .str(
-            OASR_METADATA_KEY_MODEL_FAMILY,
-            COHERE_TRANSCRIBE_MODEL_FAMILY,
-        )
-        .str(
-            OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-            COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-        )
-        .str(
-            OASR_METADATA_KEY_AUDIO_FRONTEND,
-            COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
-        )
-        .str(
-            OASR_METADATA_KEY_DECODE_POLICY,
-            COHERE_TRANSCRIBE_DECODE_POLICY_ID,
-        )
-        .str(GGML_TOKENIZER_ID_KEY, COHERE_TRANSCRIBE_TOKENIZER_ID)
         .str(OPENASR_MODEL_ID_KEY, model_id)
-        .str(GENERAL_ARCHITECTURE_KEY, COHERE_ARCHITECTURE_VALUE)
         .u32(
             runtime_contract::COHERE_TRANSCRIBE_VOCAB_SIZE_KEY,
             fields.vocab_size as u32,
@@ -799,7 +746,7 @@ fn cohere_runtime_gguf_metadata(
         .str("openasr.source.revision", &request.source_revision)
         .str("openasr.license.name", &request.license_name)
         .str("openasr.license.source", &request.license_source)
-        .build()
+        .build_family_metadata()
 }
 
 fn build_vocab_tokens(
@@ -927,15 +874,8 @@ mod tests {
         }
     }
 
-    fn string_metadata<'a>(metadata: &'a BTreeMap<String, GgufWriteValue>, key: &str) -> &'a str {
-        match metadata.get(key) {
-            Some(GgufWriteValue::String(value)) => value,
-            other => panic!("expected string metadata for {key}, got {other:?}"),
-        }
-    }
-
     #[test]
-    fn cohere_runtime_metadata_declares_snapshot_streaming_feature() {
+    fn cohere_runtime_metadata_leaves_envelope_keys_to_shared_writer() {
         let tokens = vec![
             "<pad>".to_string(),
             "<s>".to_string(),
@@ -950,13 +890,19 @@ mod tests {
             &tokens,
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
-            COHERE_TRANSCRIBE_MODEL_FAMILY
-        );
-        assert_eq!(
-            string_metadata(&metadata, GGML_TOKENIZER_ID_KEY),
-            COHERE_TRANSCRIBE_TOKENIZER_ID
-        );
+        for key in [
+            crate::arch::GENERAL_ARCHITECTURE_KEY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_PACKAGE_VERSION,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_FAMILY,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
+            crate::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
+            crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY,
+        ] {
+            assert!(
+                !metadata.contains_key(key),
+                "family metadata must not own envelope key {key}"
+            );
+        }
     }
 }

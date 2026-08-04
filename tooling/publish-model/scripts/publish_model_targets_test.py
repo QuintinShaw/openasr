@@ -10,6 +10,33 @@ from unittest import mock
 import publish_model_targets as publish
 
 
+def _fake_run_with_receipts(commands: list[list[str]]):
+    def fake_run(
+        args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None
+    ) -> str:
+        del cwd, env
+        commands.append(args)
+        if args[1:3] == ["model-pack", "preflight"]:
+            source = Path(args[3])
+            return json.dumps(
+                {
+                    "schema": publish.PREFLIGHT_RECEIPT_SCHEMA,
+                    "content_id": "sha256:" + "a" * 64,
+                    "size_bytes": source.stat().st_size,
+                    "route": "asr",
+                    "catalog_family_id": "qwen",
+                    "model_family": "qwen3-asr",
+                    "model_architecture": "qwen3-asr",
+                    "build_commit": "d" * 40,
+                }
+            )
+        if args == ["git", "rev-parse", "HEAD"]:
+            return "d" * 40
+        return ""
+
+    return fake_run
+
+
 class PublishModelTargetsTest(unittest.TestCase):
     def test_scope_is_limited_to_release_lane_and_full_quant_sets(self) -> None:
         publish.validate_scope(
@@ -58,15 +85,26 @@ class PublishModelTargetsTest(unittest.TestCase):
 
             entry = {
                 "hf_repo": "OpenASR/qwen3-asr-0.6b",
+                "family": "qwen",
+                "kind": "asr-model",
                 "release_public": True,
                 "license_name": "Apache-2.0",
             }
             old_root = publish.REPO_ROOT
+            commands: list[list[str]] = []
             try:
                 publish.REPO_ROOT = root
-                publish.publish_hf(
-                    "qwen3-asr-0.6b", entry, list(publish.DEFAULT_QUANTS), True
-                )
+                with (
+                    mock.patch.object(
+                        publish, "openasr_release_binary", return_value=root / "openasr"
+                    ),
+                    mock.patch.object(
+                        publish, "run", side_effect=_fake_run_with_receipts(commands)
+                    ),
+                ):
+                    publish.publish_hf(
+                        "qwen3-asr-0.6b", entry, list(publish.DEFAULT_QUANTS), True
+                    )
             finally:
                 publish.REPO_ROOT = old_root
 
@@ -165,6 +203,8 @@ class PublishModelTargetsTest(unittest.TestCase):
 
             entry = {
                 "hf_repo": "OpenASR/qwen3-asr-0.6b",
+                "family": "qwen",
+                "kind": "asr-model",
                 "release_public": True,
                 "license_name": "Apache-2.0",
             }
@@ -174,9 +214,18 @@ class PublishModelTargetsTest(unittest.TestCase):
                 calls.append([repo, token, str(dry_run)])
 
             old_root = publish.REPO_ROOT
+            commands: list[list[str]] = []
             try:
                 publish.REPO_ROOT = root
-                with mock.patch.object(publish, "ensure_hf_repo", side_effect=fake_ensure_hf_repo):
+                with (
+                    mock.patch.object(publish, "ensure_hf_repo", side_effect=fake_ensure_hf_repo),
+                    mock.patch.object(
+                        publish, "openasr_release_binary", return_value=root / "openasr"
+                    ),
+                    mock.patch.object(
+                        publish, "run", side_effect=_fake_run_with_receipts(commands)
+                    ),
+                ):
                     publish.publish_hf(
                         "qwen3-asr-0.6b", entry, list(publish.DEFAULT_QUANTS), True
                     )
@@ -188,13 +237,14 @@ class PublishModelTargetsTest(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0][0], "OpenASR/qwen3-asr-0.6b")
 
-    def test_pack_result_rejects_legacy_qwen_architecture_metadata(self) -> None:
+    def test_copy_stage_uses_cli_receipt_and_does_not_copy_pack_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             packs = root / "tmp" / "publish" / "qwen3-asr-0.6b" / "packs"
             packs.mkdir(parents=True)
+            quants = ["q8_0"]
             pack = packs / "qwen3-asr-0.6b-q8_0.oasr"
-            pack.write_bytes(b"general.architecture\0qwen3asr\0")
+            pack.write_bytes(b"not scanned in Python")
             (packs / "qwen3-asr-0.6b.q8_0.result.json").write_text(
                 json.dumps(
                     {
@@ -206,33 +256,149 @@ class PublishModelTargetsTest(unittest.TestCase):
             )
 
             old_root = publish.REPO_ROOT
+            commands: list[list[str]] = []
             try:
                 publish.REPO_ROOT = root
-                with self.assertRaisesRegex(SystemExit, "legacy qwen"):
-                    publish.pack_result("qwen3-asr-0.6b", "q8_0")
+                stage = root / "stage"
+                with (
+                    mock.patch.object(
+                        publish, "openasr_release_binary", return_value=root / "openasr"
+                    ),
+                    mock.patch.object(
+                        publish, "run", side_effect=_fake_run_with_receipts(commands)
+                    ),
+                ):
+                    publish.copy_stage(
+                        "qwen3-asr-0.6b",
+                        {"family": "qwen"},
+                        quants,
+                        "README\n",
+                        stage,
+                    )
             finally:
                 publish.REPO_ROOT = old_root
 
-    def test_diarizen_publish_requires_pinned_license_provenance(self) -> None:
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(
+                commands[0][1:],
+                [
+                    "model-pack",
+                    "preflight",
+                    str(pack),
+                    "--stage",
+                    str(stage / pack.name),
+                    "--json",
+                ],
+            )
+            self.assertFalse((stage / pack.name).exists())
+            self.assertEqual((stage / "README.md").read_text(), "README\n")
+            self.assertTrue((stage / ".gitattributes").exists())
+
+    def test_copy_stage_rejects_receipt_content_id_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            pack = Path(temp) / "diarizen.oasr"
-            pack.write_bytes(
-                b"general.architecture\0diarizen-wavlm-conformer-segmentation\0"
-                b"openasr.source.name\0BUT-FIT/diarizen-wavlm-large-s80-md-v2\0"
-                b"openasr.source.revision\0f27b9ffbedcf422856d104ecee9b94be37ea578e\0"
-                b"openasr.license.name\0CC BY-NC 4.0\0"
+            root = Path(temp)
+            packs = root / "tmp" / "publish" / "qwen3-asr-0.6b" / "packs"
+            packs.mkdir(parents=True)
+            pack = packs / "qwen3-asr-0.6b-fp16.oasr"
+            pack.write_bytes(b"receipt mismatch")
+            (packs / "qwen3-asr-0.6b.fp16.result.json").write_text(
+                json.dumps(
+                    {
+                        "pack": str(pack),
+                        "size_bytes": pack.stat().st_size,
+                        "sha256": "a" * 64,
+                    }
+                )
             )
 
-            with self.assertRaisesRegex(SystemExit, "openasr.license.source"):
-                publish.validate_pack_runtime_metadata("diarizen-large-s80-v2", pack)
+            def mismatched_receipt(
+                args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None
+            ) -> str:
+                del cwd, env
+                if args[1:3] == ["model-pack", "preflight"]:
+                    destination = Path(args[5])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(pack.read_bytes())
+                    destination.chmod(0o444)
+                    return json.dumps(
+                        {
+                            "schema": publish.PREFLIGHT_RECEIPT_SCHEMA,
+                            "content_id": "sha256:" + "b" * 64,
+                            "size_bytes": pack.stat().st_size,
+                            "route": "asr",
+                            "catalog_family_id": "qwen",
+                            "build_commit": "d" * 40,
+                        }
+                    )
+                return ""
 
-            pack.write_bytes(
-                pack.read_bytes()
-                + b"openasr.license.source\0"
-                + b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/"
-                + b"f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md\0"
+            old_root = publish.REPO_ROOT
+            try:
+                publish.REPO_ROOT = root
+                with (
+                    mock.patch.object(
+                        publish, "openasr_release_binary", return_value=root / "openasr"
+                    ),
+                    mock.patch.object(publish, "run", side_effect=mismatched_receipt),
+                    self.assertRaisesRegex(SystemExit, "content_id mismatch"),
+                ):
+                    publish.copy_stage(
+                        "qwen3-asr-0.6b",
+                        {"family": "qwen"},
+                        ["fp16"],
+                        "README\n",
+                        root / "stage",
+                    )
+            finally:
+                publish.REPO_ROOT = old_root
+            self.assertFalse((root / "stage" / pack.name).exists())
+
+    def test_copy_stage_rejects_a_valid_pack_from_another_catalog_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "other-family.oasr"
+            source.write_bytes(b"verified elsewhere")
+            result = {
+                "pack_path": source,
+                "size_bytes": source.stat().st_size,
+                "sha256": "a" * 64,
+            }
+            receipt = json.dumps(
+                {
+                    "schema": publish.PREFLIGHT_RECEIPT_SCHEMA,
+                    "content_id": "sha256:" + "a" * 64,
+                    "size_bytes": source.stat().st_size,
+                    "route": "asr",
+                    "catalog_family_id": "whisper",
+                    "build_commit": "d" * 40,
+                }
             )
-            publish.validate_pack_runtime_metadata("diarizen-large-s80-v2", pack)
+
+            def wrong_family_receipt(
+                args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None
+            ) -> str:
+                del cwd, env
+                destination = Path(args[5])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(0o444)
+                return receipt
+
+            stage = root / "stage"
+            with (
+                mock.patch.object(publish, "pack_result", return_value=result),
+                mock.patch.object(publish, "openasr_release_binary", return_value=root / "openasr"),
+                mock.patch.object(publish, "run", side_effect=wrong_family_receipt),
+                self.assertRaisesRegex(SystemExit, "family mismatch"),
+            ):
+                publish.copy_stage(
+                    "qwen3-asr-0.6b",
+                    {"family": "qwen", "kind": "asr-model"},
+                    ["fp16"],
+                    "README\n",
+                    stage,
+                )
+            self.assertFalse((stage / source.name).exists())
 
 
 if __name__ == "__main__":

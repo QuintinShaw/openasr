@@ -853,6 +853,10 @@ impl DolphinGgmlExecutor {
 }
 
 impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        DolphinGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         crate::arch::DOLPHIN_EXECUTOR_COMPONENT_ID
     }
@@ -882,10 +886,9 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        // Gate-0: validate the runtime source and load its metadata + tensor index.
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        // Gate-0 has already validated and admitted the source; use its
+        // proof-carrying metadata and tensor index without reopening the path.
+        let preflight = &request.runtime_source_preflight;
         // Fail closed on an incomplete pack (missing runtime scalar keys).
         parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
@@ -911,7 +914,7 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         // `auto_gpu_policy = AllBackends`), carried as an explicit field --
         // never re-derived from a thread-local here.
         let backend = request.resolved_runtime.backend();
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+        let reader = build_runtime_tensor_reader_from_preflight(preflight)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
         // The immutable dequantized/native-mapped table is admitted once per
         // content id. Backend-bound mutable runtimes are then checked out from
@@ -1014,9 +1017,7 @@ impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
         // and aborts the whole process instead of returning a Rust error (the
         // idle_unload short-press crash), so the driver must skip that decode
         // call entirely rather than rely on catching an error afterward.
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| fail(error.to_string()))?;
+        let preflight = &request.runtime_source_preflight;
         let language_scheme = parse_dolphin_language_scheme(&preflight.metadata).map_err(fail)?;
         let min_frames = minimum_subsample_input_frames();
         let min_samples = match language_scheme {
@@ -1435,7 +1436,7 @@ mod tests {
             // The produced pack must clear the fail-closed install gate (adapter
             // selection + the dolphin runtime-metadata contract) exactly as
             // `openasr pull` would enforce it.
-            crate::validate_native_runtime_model_pack_contract(&pack)
+            crate::verify_native_runtime_model_pack_path(&pack)
                 .expect("dolphin pack must pass the native install gate");
 
             // Vocab is a property of the produced pack (the char tokenizer table the

@@ -732,6 +732,7 @@ fn cohere_runtime_tensor_contract_id() -> &'static str {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
         .expect("cohere architecture must be registered")
+        .pack_contract
         .runtime_tensor_contract_id
 }
 
@@ -787,6 +788,18 @@ fn invalid_tensor_shape(
         shape: render_shape(shape),
         reason,
     }
+}
+
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture(
+        crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        preflight.metadata(),
+        preflight.tensor_index(),
+    )
+    .map(|_| ())
+    .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
 }
 
 #[cfg(test)]

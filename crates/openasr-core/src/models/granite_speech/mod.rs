@@ -35,7 +35,7 @@ pub(crate) mod tokenizer;
 #[cfg(test)]
 mod parity;
 
-// Force-linked pack-import surface: the architecture integration descriptor
+// Force-linked pack-import surface: the architecture registry descriptor
 // names this convert symbol, and `models::pack_import_surface` proves it stays
 // linked. Re-exported at the module root to match every other family's shape.
 pub use package_import::convert_local_granite_speech_source_to_runtime_pack;

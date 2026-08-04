@@ -3,37 +3,29 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::arch::hparams::QWEN3_ARCHITECTURE_VALUE;
+use crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
-    read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
-    write_gguf_file_v0,
 };
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
-use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
-use crate::models::ggml_family_registry::{
-    QWEN3_ASR_AUDIO_FRONTEND_ID, QWEN3_ASR_DECODE_POLICY_ID, QWEN3_ASR_GGML_ARCHITECTURE_ID,
-    QWEN3_ASR_TOKENIZER_ID,
-};
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_file_bytes,
     read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
-    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+    OasrPackWriter, PackEnvelope, TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY,
+    TOKENIZER_GGML_TOKENS_KEY,
 };
 // Re-exported at `pub(super)` (not just imported) because `forced_aligner_import.rs`
 // pulls these in via `use super::package_import::{insert_metadata, ...}`.
 pub(super) use crate::models::oasr_metadata::{
     insert_metadata, insert_metadata_string_array, insert_metadata_u32,
 };
-use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
-use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
-use crate::models::{qwen::QWEN3_ASR_MODEL_FAMILY, qwen::runtime_contract};
+use crate::models::pack_quant::{
+    PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
+};
+use crate::models::qwen::runtime_contract;
 
 use super::tensor_names::{
     AUDIO_CONV_OUT_BIAS, AUDIO_CONV_OUT_WEIGHT, AUDIO_CONV1_BIAS, AUDIO_CONV1_WEIGHT,
@@ -47,12 +39,8 @@ const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_VOCAB_JSON: &str = "vocab.json";
 const SOURCE_MERGES_TXT: &str = "merges.txt";
 const SOURCE_TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
-const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
-const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
-const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
-const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 
 pub type Qwen3AsrLocalSourceError = LocalSourceImportError;
 
@@ -156,7 +144,7 @@ pub fn convert_local_qwen_source_to_runtime_pack(
     }
 
     let safetensor_files = discover_safetensor_files(request)?;
-    let mut tensors = build_qwen_runtime_tensors(
+    let tensors = build_qwen_runtime_tensors(
         &safetensor_files,
         request.quantization,
         metadata_fields.n_mels,
@@ -169,49 +157,22 @@ pub fn convert_local_qwen_source_to_runtime_pack(
     let metadata =
         qwen_runtime_gguf_metadata(request, &metadata_fields, &model_id, &tokens, &merges);
 
-    write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
+    let verified = OasrPackWriter::write(
+        &request.output_root,
+        PackEnvelope::asr(QWEN3_ASR_GGML_ARCHITECTURE_ID),
+        metadata,
+        &tensors,
+    )
+    .map_err(|error| {
         validate_error(format!(
-            "Qwen local-source GGUF writer failed for '{}': {error}",
+            "Qwen local-source OASR writer failed for '{}': {error}",
             request.output_root.display()
         ))
     })?;
-
-    let runtime_source =
-        validate_ggml_runtime_source_path(&request.output_root).map_err(|error| {
-            validate_error(format!(
-                "Qwen local-source import produced invalid runtime path '{}': {error}",
-                request.output_root.display()
-            ))
-        })?;
-    let metadata_read =
-        read_gguf_metadata_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Qwen import produced unreadable GGUF metadata: {error}"
-            ))
-        })?;
-    let tensor_index =
-        read_gguf_tensor_index_from_runtime_source(&runtime_source).map_err(|error| {
-            validate_error(format!(
-                "Qwen import produced unreadable GGUF tensor index: {error}"
-            ))
-        })?;
-    validate_builtin_runtime_tensor_contract_for_architecture(
-        QWEN3_ASR_GGML_ARCHITECTURE_ID,
-        &metadata_read,
-        &tensor_index,
-    )
-    .map_err(|error| validate_error(format!("Qwen runtime contract validation failed: {error}")))?;
-
-    let index = read_gguf_tensor_index(&request.output_root).map_err(|error| {
-        validate_error(format!(
-            "Qwen local-source GGUF writer produced unreadable tensor index: {error}"
-        ))
-    })?;
-    tensors.clear();
     Ok(Qwen3AsrLocalSourceImportRuntimeResult {
         output_path: request.output_root.clone(),
         model_id,
-        tensor_count: index.tensors().len(),
+        tensor_count: verified.preflight().tensor_index().tensors().len(),
     })
 }
 
@@ -264,7 +225,7 @@ pub(super) fn build_qwen_runtime_tensors(
             };
             let force_f32 = is_qwen_f32_tensor(&mapped_name, target_dims.len());
             let qtype = quantized_tensor_type_for_qwen(
-                &mapped_name,
+                qwen_tensor_role(&mapped_name),
                 &effective_dims,
                 force_f32,
                 quantization,
@@ -469,38 +430,7 @@ fn qwen_runtime_gguf_metadata(
     merges: &[String],
 ) -> BTreeMap<String, GgufWriteValue> {
     let mut metadata = BTreeMap::new();
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_PACKAGE_VERSION,
-        OASR_PACKAGE_VERSION_V1,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_FAMILY,
-        QWEN3_ASR_MODEL_FAMILY,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        QWEN3_ASR_GGML_ARCHITECTURE_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        QWEN3_ASR_AUDIO_FRONTEND_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_DECODE_POLICY,
-        QWEN3_ASR_DECODE_POLICY_ID,
-    );
-    insert_metadata(&mut metadata, GGML_TOKENIZER_ID_KEY, QWEN3_ASR_TOKENIZER_ID);
     insert_metadata(&mut metadata, OPENASR_MODEL_ID_KEY, model_id);
-    insert_metadata(
-        &mut metadata,
-        GENERAL_ARCHITECTURE_KEY,
-        QWEN3_ARCHITECTURE_VALUE,
-    );
 
     insert_metadata_u32(
         &mut metadata,
@@ -759,7 +689,7 @@ fn should_reverse_qwen_tensor_dims(
 }
 
 fn quantized_tensor_type_for_qwen(
-    name: &str,
+    role: TensorRole,
     dims: &[u64],
     force_f32: bool,
     quantization: Qwen3AsrRuntimeQuantizationMode,
@@ -767,34 +697,39 @@ fn quantized_tensor_type_for_qwen(
     if force_f32 || quantization == Qwen3AsrRuntimeQuantizationMode::Fp16 {
         return None;
     }
-    if !name.ends_with(".weight") || dims.len() != 2 {
+    if dims.len() != 2 {
         return None;
     }
-    let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization, qwen_quant_component(name))
+    classify_quant_tensor_role(dims, quantization, role, QWEN_QUANTIZED_AXIS)
 }
 
-/// Runtime tensor name prefixes for the qwen3 audio tower (`audio.conv*`,
-/// `audio.proj*`, `audio.blk.*`, `audio.ln_post`). Shared with
-/// `models::pack_quant_audit`'s encoder-floor rule for both
-/// `QWEN3_ASR_GGML_ARCHITECTURE_ID` and
-/// `QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID` (the forced-aligner shares this
-/// importer's audio tower) -- the single source of truth for "which qwen3
-/// tensors are audio-encoder", so the audit can never drift from what this
-/// importer actually classifies as `QuantComponent::Encoder`.
-pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["audio."];
+/// Qwen runtime matrices are written with the ggml-quantized contiguous axis
+/// in `dims[0]`. The descriptor and writer share this constant so storage
+/// orientation cannot drift from the semantic quantization contract.
+pub(crate) const QWEN_QUANTIZED_AXIS: QuantizedAxis = QuantizedAxis::First;
+
+pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =
+    TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: QWEN3_ASR_GGML_ARCHITECTURE_ID,
+        classify: qwen_tensor_role,
+        quantized_axis: QWEN_QUANTIZED_AXIS,
+    };
 
 /// Everything under the audio-tower namespace is the encoder side; everything
 /// else (`blk.*` LLM layers, `token_embd`, `output*`) is the decoder side. The
-/// audio tower carries the shared Q8_0 floor (see `classify_quant_tensor`).
-fn qwen_quant_component(name: &str) -> QuantComponent {
-    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        QuantComponent::Encoder
+/// audio tower carries the shared Q8_0 floor. The pack audit calls this exact
+/// classifier too, so a naming change cannot desynchronize write and verify.
+pub(crate) fn qwen_tensor_role(name: &str) -> TensorRole {
+    if name == TOKEN_EMBD_WEIGHT {
+        TensorRole::EmbeddingTable
+    } else if name == OUTPUT_WEIGHT {
+        TensorRole::OutputProjection
+    } else if name.starts_with("audio.") && name.ends_with(".weight") {
+        TensorRole::AcousticEncoderMatrix
+    } else if name.starts_with("blk.") && name.ends_with(".weight") {
+        TensorRole::TextDecoderMatrix
     } else {
-        QuantComponent::Decoder
+        TensorRole::NonQuantizable
     }
 }
 
@@ -897,7 +832,9 @@ fn slaney_mel_filterbank(
 
 #[cfg(test)]
 mod tests {
-    use super::{quantized_tensor_type_for_qwen, should_reverse_qwen_tensor_dims};
+    use super::{
+        quantized_tensor_type_for_qwen, qwen_tensor_role, should_reverse_qwen_tensor_dims,
+    };
     use crate::ggml_runtime::GgufWriteTensorType;
     use crate::models::pack_quant::PackQuant;
 
@@ -912,12 +849,22 @@ mod tests {
             "audio.conv_out.weight",
         ] {
             assert_eq!(
-                quantized_tensor_type_for_qwen(name, &[2048, 896], false, PackQuant::Q4_K),
+                quantized_tensor_type_for_qwen(
+                    qwen_tensor_role(name),
+                    &[2048, 896],
+                    false,
+                    PackQuant::Q4_K,
+                ),
                 Some(GgufWriteTensorType::Q8_0),
                 "{name}"
             );
             assert_eq!(
-                quantized_tensor_type_for_qwen(name, &[2048, 896], false, PackQuant::Q3_K),
+                quantized_tensor_type_for_qwen(
+                    qwen_tensor_role(name),
+                    &[2048, 896],
+                    false,
+                    PackQuant::Q3_K,
+                ),
                 Some(GgufWriteTensorType::Q8_0),
                 "{name}"
             );
@@ -930,7 +877,7 @@ mod tests {
         // weight still quantizes to q4_k.
         assert_eq!(
             quantized_tensor_type_for_qwen(
-                "blk.0.attn_q.weight",
+                qwen_tensor_role("blk.0.attn_q.weight"),
                 &[2048, 2048],
                 false,
                 PackQuant::Q4_K
@@ -939,7 +886,7 @@ mod tests {
         );
         assert_eq!(
             quantized_tensor_type_for_qwen(
-                "blk.5.ffn_down.weight",
+                qwen_tensor_role("blk.5.ffn_down.weight"),
                 &[2048, 4096],
                 false,
                 PackQuant::Q4_K

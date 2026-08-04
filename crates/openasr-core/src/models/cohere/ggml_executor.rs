@@ -32,7 +32,9 @@ use crate::arch::hparams::{
 use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
-use crate::arch::{COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, OpenAsrArchitectureRegistry};
+use crate::arch::{
+    COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy,
+};
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufRuntimeSourcePreflight};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -57,7 +59,7 @@ use crate::models::runtime_prepared_registry::{
 use crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity;
 use crate::models::system_memory_owner::SystemMemoryOwner;
 
-const COHERE_EXECUTOR_ID: &str = "cohere-transcribe-ggml-executor-v1";
+const COHERE_EXECUTOR_ID: &str = crate::arch::COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID;
 const COHERE_STREAMING_EXECUTOR_ID: &str = "cohere-transcribe-ggml-snapshot-streaming-executor-v1";
 const COHERE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const COHERE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
@@ -145,8 +147,6 @@ enum CohereTranscribeGgmlExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("cohere-transcribe ggml executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("cohere-transcribe ggml executor runtime preparation failed: {reason}")]
     PreparedRuntimeFailed { reason: String },
     #[error("cohere-transcribe ggml executor frontend failed: {reason}")]
@@ -237,19 +237,13 @@ impl CohereTranscribeGgmlExecutor {
             })?;
 
         let preflight_start = debug_timing_start();
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(
-                |error| CohereTranscribeGgmlExecutorError::RuntimePreflightFailed {
-                    reason: error.to_string(),
-                },
-            )?;
+        let preflight = &request.runtime_source_preflight;
         emit_cohere_debug_timing_if_enabled("runtime_preflight", preflight_start, None);
         let prepared_runtime_start = debug_timing_start();
         let prepared_runtime_owner = self.runtime_cache_by_path.prepared_runtime_for_preflight(
             PreparedRuntimeLookup {
                 model_architecture: request.selected_family.model_architecture,
-                preflight: preflight.as_ref(),
+                preflight,
                 backend: request.resolved_runtime.backend(),
             },
             map_prepared_runtime_registry_error,
@@ -281,7 +275,7 @@ impl CohereTranscribeGgmlExecutor {
         );
         emit_cohere_debug_feature_preview_if_enabled(&features);
         self.decode_with_prepared_runtime(
-            &preflight,
+            preflight,
             request,
             prepared_runtime,
             Arc::clone(&prepared_runtime_owner),
@@ -311,9 +305,13 @@ impl CohereTranscribeGgmlExecutor {
         // the hand-wired composers disagree — never silently build the wrong thing.
         let cohere_descriptor = OpenAsrArchitectureRegistry::with_builtins()
             .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID);
-        let cohere_block_stack = cohere_descriptor
-            .as_ref()
-            .and_then(|descriptor| descriptor.block_stack.as_ref());
+        let cohere_block_stack =
+            cohere_descriptor.as_ref().and_then(|descriptor| {
+                match &descriptor.topology_contract.block_stack {
+                    OpenAsrBlockStackStrategy::Shared(stack) => Some(stack),
+                    OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => None,
+                }
+            });
         let layer_resolver = CohereLayerCountResolver {
             encoder_layers: prepared_runtime.metadata.encoder_layers,
             decoder_layers: prepared_runtime.metadata.decoder_layers,
@@ -588,7 +586,7 @@ impl CohereTranscribeGgmlExecutor {
                 let runtime = CohereTranscribeEncoderGraphRuntime::new(
                     &prepared_runtime.encoder_weights,
                     prepared_runtime.metadata,
-                    Some(&preflight),
+                    &preflight,
                     backend,
                 )
                 .map_err(|error| {
@@ -742,6 +740,10 @@ impl CohereTranscribeGgmlExecutor {
 }
 
 impl GgmlAsrViewExecutor for CohereTranscribeGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        CohereTranscribeGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         COHERE_EXECUTOR_ID
     }
@@ -1038,13 +1040,14 @@ mod tests {
 
     use super::*;
     use crate::api::backend::{NativeBackend, TranscriptionBackend};
+    use crate::arch::builtin_adapter_descriptor;
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::testing::{
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, GgmlAsrPreparedAudioView,
-        LongFormOptions, TranscriptionRequest, cohere_transcribe_runtime_descriptor_v1,
+        LongFormOptions, TranscriptionRequest,
     };
 
     fn sample_wav_fixture_path() -> PathBuf {
@@ -1060,10 +1063,7 @@ mod tests {
     ) {
         use std::num::NonZeroU32;
 
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .expect("resolve cohere runtime preflight")
-            .into_owned();
+        let preflight = &request.runtime_source_preflight;
         let sample_rate = NonZeroU32::new(request.prepared_audio.sample_rate_hz)
             .expect("test sample rate is non-zero");
         let invocation = crate::capacity::topology::InvocationShapeInput::new(
@@ -1079,7 +1079,7 @@ mod tests {
         )
         .expect("valid cohere test envelope");
         let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput {
-            preflight: &preflight,
+            preflight,
             invocation,
             envelope,
             request_options: &request.request_options,
@@ -1089,17 +1089,22 @@ mod tests {
             .expect("plan cohere decoder state");
         request.decoder_state =
             crate::models::ggml_asr_executor::GgmlAsrDecoderState::planned_for_test(plan, envelope);
-        request.runtime_source_preflight = Some(preflight);
     }
 
     fn runtime_ready_request(runtime_path: PathBuf) -> GgmlAsrExecutionViewRequest<'static> {
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &runtime_path,
+            )
+            .expect("cohere runtime fixture must pass preflight");
         let mut request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: runtime_path,
-            runtime_source_preflight: None,
-            selected_family: cohere_transcribe_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(
                 crate::api::audio_io::load_wav_16khz_mono_f32_v0(
                     sample_wav_fixture_path(),
@@ -1277,7 +1282,7 @@ mod tests {
             // the request an explicit preflight built from the held source,
             // instead of letting it re-resolve `path` itself.
             let mut request = runtime_ready_request(path.clone());
-            request.runtime_source_preflight = Some(old_preflight.clone());
+            request.runtime_source_preflight = old_preflight.clone();
             executor
                 .execute_view(&request)
                 .expect("first execute against old pack via held preflight");
@@ -1291,9 +1296,9 @@ mod tests {
 
             // The already-held old runtime source keeps reading its own,
             // untouched mapping: its content id must not change, and reusing
-            // it (the request's `runtime_source_path` still equals the held
-            // preflight's path, so the resolver accepts it without
-            // re-opening) must still hit the OLD content id's cache entry.
+            // it (the request carries the held preflight directly, without a
+            // path resolver or re-open) must still hit the OLD content id's
+            // cache entry.
             assert_eq!(
                 old_runtime_source.content_id(),
                 old_content_id,
@@ -1301,7 +1306,7 @@ mod tests {
                  it was opened from was later replaced"
             );
             let mut old_request = runtime_ready_request(path.clone());
-            old_request.runtime_source_preflight = Some(old_preflight);
+            old_request.runtime_source_preflight = old_preflight;
             executor
                 .execute_view(&old_request)
                 .expect("second execute reusing the held old preflight after replacement");
@@ -1567,16 +1572,13 @@ mod tests {
         let executor = CohereTranscribeGgmlExecutor::default();
 
         let request = runtime_ready_request(runtime_path.clone());
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .expect("preflight should resolve")
-            .into_owned();
+        let preflight = &request.runtime_source_preflight;
         let runtime_a = executor
             .runtime_cache_by_path
             .prepared_runtime_for_preflight(
                 PreparedRuntimeLookup {
                     model_architecture: request.selected_family.model_architecture,
-                    preflight: &preflight,
+                    preflight,
                     backend: request.resolved_runtime.backend(),
                 },
                 map_prepared_runtime_registry_error,
@@ -1588,7 +1590,7 @@ mod tests {
             .prepared_runtime_for_preflight(
                 PreparedRuntimeLookup {
                     model_architecture: request.selected_family.model_architecture,
-                    preflight: &preflight,
+                    preflight,
                     backend: request.resolved_runtime.backend(),
                 },
                 map_prepared_runtime_registry_error,
@@ -1618,14 +1620,9 @@ mod tests {
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
 
-            let scope =
-                crate::models::executor_component_registry::BuiltinStatefulExecutorScope::new();
-            let shared = scope.cohere_transcribe();
+            let shared = CohereTranscribeGgmlExecutor::default();
             let request = runtime_ready_request(runtime_path);
-            let preflight = request
-                .resolve_runtime_source_preflight()
-                .expect("preflight should resolve")
-                .into_owned();
+            let preflight = &request.runtime_source_preflight;
 
             // Cold fetch through the exact call `execute_inner` makes
             // internally for the offline path (`with_cohere_transcribe_runtime_for_preflight`
@@ -1637,7 +1634,7 @@ mod tests {
                 .prepared_runtime_for_preflight(
                     PreparedRuntimeLookup {
                         model_architecture: request.selected_family.model_architecture,
-                        preflight: &preflight,
+                        preflight,
                         backend: request.resolved_runtime.backend(),
                     },
                     map_prepared_runtime_registry_error,
@@ -1659,7 +1656,7 @@ mod tests {
                 .prepared_runtime_for_preflight(
                     PreparedRuntimeLookup {
                         model_architecture: request.selected_family.model_architecture,
-                        preflight: &preflight,
+                        preflight,
                         backend: request.resolved_runtime.backend(),
                     },
                     map_prepared_runtime_registry_error,
@@ -1696,7 +1693,8 @@ mod tests {
         write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
         let executor = CohereTranscribeGgmlExecutor::default();
         let mut request = runtime_ready_request(runtime_path);
-        request.selected_family = crate::whisper_runtime_descriptor_v1();
+        request.selected_family =
+            builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
         let error = executor
             .execute_view(&request)
             .expect_err("adapter mismatch must fail closed")
@@ -1779,14 +1777,20 @@ mod tests {
                 "cohere cache-reuse test",
             )
             .expect("load zh_sample.wav");
+            let runtime_source_preflight =
+                crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                    &pack_path,
+                )
+                .expect("cohere runtime fixture must pass preflight");
             let mut req_zh = GgmlAsrExecutionViewRequest {
                 execution_services:
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_path: pack_path,
-                runtime_source_preflight: None,
-                selected_family: cohere_transcribe_runtime_descriptor_v1(),
+                runtime_source_preflight,
+                selected_family: builtin_adapter_descriptor(
+                    crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                ),
                 prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(zh_samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,

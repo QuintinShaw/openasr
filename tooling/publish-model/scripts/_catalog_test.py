@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
+import re
+import tempfile
 import unittest
 from datetime import date, timedelta
+from pathlib import Path
 
 from _catalog import (
-    DOLPHIN_CN_DIALECT_CODES,
     LANGUAGE_DISPLAY_LABELS,
-    LANG_BY_FAMILY,
+    MODEL_FAMILY_INVENTORY,
+    MODEL_FAMILY_INVENTORY_SCHEMA,
     REGISTERED_DIALECT_CODES,
     _check_no_halfwidth_punct_between_cjk,
     apply_catalog_series_defaults,
@@ -15,6 +19,7 @@ from _catalog import (
     language_labels_wire,
     language_mode_for_model,
     languages_for_model,
+    load_model_family_inventory,
     prose_locale_source_sha256,
     punctuation_for_model,
     speaker_source_for_model,
@@ -34,6 +39,339 @@ EN_HIGHLIGHTS = [
     "🎙️ **Dedicated ASR** — audio-in, text-out model built specifically for transcription",
     "🌍 **14 languages** — covers a wide range of scripts",
 ]
+
+
+class ModelFamilyInventoryTest(unittest.TestCase):
+    def _write_payload(self, payload: dict) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "inventory.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _committed_payload(self) -> dict:
+        return json.loads(MODEL_FAMILY_INVENTORY.read_text(encoding="utf-8"))
+
+    def test_committed_inventory_is_strictly_valid(self) -> None:
+        inventory = load_model_family_inventory()
+        payload = self._committed_payload()
+        self.assertEqual(payload["schema"], MODEL_FAMILY_INVENTORY_SCHEMA)
+        self.assertEqual(len(inventory), len(set(inventory)))
+        self.assertEqual(set(inventory), {family["catalog_family_id"] for family in payload["families"]})
+
+    def test_rejects_wrong_schema(self) -> None:
+        payload = self._committed_payload()
+        payload["schema"] = "openasr.model-family-inventory.v0"
+        with self.assertRaisesRegex(ValueError, "schema"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_non_list_families(self) -> None:
+        payload = self._committed_payload()
+        payload["families"] = {}
+        with self.assertRaisesRegex(ValueError, "families.*non-empty list"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_non_object_family_entry(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0] = "not-an-object"
+        with self.assertRaisesRegex(ValueError, r"families\[0\].*object"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_duplicate_catalog_family_id(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][1]["catalog_family_id"] = payload["families"][0]["catalog_family_id"]
+        with self.assertRaisesRegex(ValueError, "duplicate catalog_family_id"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_missing_required_family_field(self) -> None:
+        payload = self._committed_payload()
+        del payload["families"][0]["execution"]
+        with self.assertRaisesRegex(ValueError, r"families\[0\].*missing execution"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_execution_capability_projection_requires_booleans(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["execution"]["supports_translation_task"] = "yes"
+        with self.assertRaisesRegex(
+            ValueError,
+            r"families\[0\]\.execution\.supports_translation_task.*boolean",
+        ):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_execution_typed_capability_projection(self) -> None:
+        inventory = load_model_family_inventory()
+        phrase_bias_strategies = {
+            family["execution"]["phrase_bias_strategy"]
+            for family in inventory.values()
+        }
+        word_timestamp_strategies = {
+            family["execution"]["word_timestamp_strategy"]
+            for family in inventory.values()
+        }
+        prepared_runtime_strategies = {
+            family["execution"]["prepared_runtime"]
+            for family in inventory.values()
+        }
+
+        self.assertEqual(
+            phrase_bias_strategies,
+            {"unsupported", "always", "requires-tensor"},
+        )
+        self.assertEqual(
+            word_timestamp_strategies,
+            {"decode-invariant", "decode-sensitive"},
+        )
+        self.assertIn("family-owned", prepared_runtime_strategies)
+        self.assertTrue(
+            any(
+                prepared_runtime.startswith("shared-")
+                for prepared_runtime in prepared_runtime_strategies
+            )
+        )
+
+        for family in inventory.values():
+            execution = family["execution"]
+            self.assertIsInstance(execution["supports_lora_adapter"], bool)
+            self.assertEqual(
+                execution["supports_phrase_bias"],
+                execution["phrase_bias_strategy"] != "unsupported",
+            )
+            if execution["phrase_bias_strategy"] == "requires-tensor":
+                self.assertIsInstance(execution["phrase_bias_required_tensor"], str)
+                self.assertTrue(execution["phrase_bias_required_tensor"])
+            else:
+                self.assertIsNone(execution["phrase_bias_required_tensor"])
+            self.assertIn(
+                execution["word_timestamp_strategy"],
+                {"decode-invariant", "decode-sensitive"},
+            )
+            prepared_runtime = execution["prepared_runtime"]
+            self.assertTrue(
+                prepared_runtime == "family-owned"
+                or re.fullmatch(
+                    r"shared-[a-z0-9-]+-v[1-9][0-9]*", prepared_runtime
+                )
+            )
+
+    def test_accepts_new_shared_prepared_runtime_component_without_allowlist(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["execution"]["prepared_runtime"] = "shared-future-component-v17"
+        load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_non_boolean_lora_binding(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["execution"]["supports_lora_adapter"] = "yes"
+        with self.assertRaisesRegex(
+            ValueError,
+            r"families\[0\]\.execution\.supports_lora_adapter.*boolean",
+        ):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_phrase_bias_strategy_mismatch(self) -> None:
+        payload = self._committed_payload()
+        execution = payload["families"][0]["execution"]
+        execution["supports_phrase_bias"] = not execution["supports_phrase_bias"]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"supports_phrase_bias.*equivalent to phrase_bias_strategy",
+        ):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_invalid_phrase_bias_strategy(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["execution"]["phrase_bias_strategy"] = "sometimes"
+        with self.assertRaisesRegex(ValueError, "unsupported strategy 'sometimes'"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_phrase_bias_required_tensor_for_non_tensor_strategy(self) -> None:
+        payload = self._committed_payload()
+        execution = payload["families"][0]["execution"]
+        execution["phrase_bias_required_tensor"] = "unexpected.tensor"
+        with self.assertRaisesRegex(
+            ValueError,
+            r"phrase_bias_required_tensor.*must be null unless",
+        ):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_missing_phrase_bias_required_tensor(self) -> None:
+        payload = self._committed_payload()
+        execution = next(
+            family["execution"]
+            for family in payload["families"]
+            if family["execution"]["phrase_bias_strategy"] == "requires-tensor"
+        )
+        execution["phrase_bias_required_tensor"] = None
+        with self.assertRaisesRegex(
+            ValueError,
+            r"phrase_bias_required_tensor.*non-empty string",
+        ):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_invalid_word_timestamp_strategy(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["execution"]["word_timestamp_strategy"] = "sometimes"
+        with self.assertRaisesRegex(ValueError, "unsupported strategy 'sometimes'"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_invalid_prepared_runtime_strategy(self) -> None:
+        for prepared_runtime in ("shared-future-component-v0", "shared-Future-v1", "runtime-owned"):
+            payload = self._committed_payload()
+            payload["families"][0]["execution"]["prepared_runtime"] = prepared_runtime
+            with self.subTest(prepared_runtime=prepared_runtime):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"prepared_runtime.*family-owned or match shared-",
+                ):
+                    load_model_family_inventory(self._write_payload(payload))
+
+    def test_quantization_contract_declares_axis_by_classification(self) -> None:
+        inventory = load_model_family_inventory()
+        for family in inventory.values():
+            quantization = family["quantization"]
+            if quantization["tensor_classification"] == "semantic-roles-v1":
+                self.assertIn(quantization["quantized_axis"], {"first", "last"})
+            else:
+                self.assertEqual(
+                    quantization["tensor_classification"],
+                    "acoustic-encoder-prefixes-v1",
+                )
+                self.assertIsNone(quantization["quantized_axis"])
+
+    def test_dialect_projection_declares_all_three_strategies(self) -> None:
+        inventory = load_model_family_inventory()
+        self.assertEqual(
+            inventory["dolphin"]["language"]["dialect_mode"],
+            "selects-via-prompt",
+        )
+        self.assertEqual(
+            inventory["qwen"]["language"]["dialect_mode"],
+            "recognizes-catalog-declared",
+        )
+        self.assertEqual(
+            inventory["firered-aed"]["language"]["dialect_mode"],
+            "recognizes-catalog-declared",
+        )
+        self.assertTrue(
+            inventory["dolphin"]["language"]["selectable_dialect_codes"]
+        )
+        self.assertEqual(
+            inventory["dolphin"]["language"]["selectable_dialect_codes"],
+            sorted(set(inventory["dolphin"]["language"]["selectable_dialect_codes"])),
+        )
+        self.assertTrue(
+            all(
+                family["language"]["dialect_mode"] == "not-advertised"
+                and not family["language"]["selectable_dialect_codes"]
+                for catalog_family_id, family in inventory.items()
+                if catalog_family_id not in {"dolphin", "qwen", "firered-aed"}
+            )
+        )
+
+    def test_rejects_invalid_dialect_projection(self) -> None:
+        payload = self._committed_payload()
+        dolphin = next(family for family in payload["families"] if family["catalog_family_id"] == "dolphin")
+        dolphin["language"]["dialect_mode"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "unsupported dialect mode"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        dolphin = next(family for family in payload["families"] if family["catalog_family_id"] == "dolphin")
+        dolphin["language"]["selectable_dialect_codes"] = []
+        with self.assertRaisesRegex(ValueError, "must be non-empty for selects-via-prompt"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        qwen = next(family for family in payload["families"] if family["catalog_family_id"] == "qwen")
+        qwen["language"]["selectable_dialect_codes"] = ["zh-sichuan"]
+        with self.assertRaisesRegex(ValueError, "must be empty for recognizes-catalog-declared"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        dolphin = next(family for family in payload["families"] if family["catalog_family_id"] == "dolphin")
+        codes = dolphin["language"]["selectable_dialect_codes"]
+        dolphin["language"]["selectable_dialect_codes"] = [codes[1], codes[0], codes[0]]
+        with self.assertRaisesRegex(ValueError, "must be sorted and unique"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_invalid_language_projection(self) -> None:
+        payload = self._committed_payload()
+        family = payload["families"][0]
+        family["language"]["languages"] = []
+        with self.assertRaisesRegex(ValueError, r"language\.languages.*non-empty"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        family = payload["families"][0]
+        family["language"]["languages"] = ["en", "en"]
+        with self.assertRaisesRegex(ValueError, r"language\.languages.*sorted and unique"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        family = payload["families"][0]
+        family["language"]["languages"] = ["EN"]
+        with self.assertRaisesRegex(ValueError, r"language\.languages.*ISO 639"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        family = next(
+            family for family in payload["families"] if family["language"]["policy"] == "selects-via-prompt"
+        )
+        family["language"]["default_language"] = "xx"
+        with self.assertRaisesRegex(ValueError, r"default_language.*present in languages"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_invalid_module_slug(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["module_slug"] = "not-a-slug"
+        with self.assertRaisesRegex(ValueError, r"module_slug.*snake_case"):
+            load_model_family_inventory(self._write_payload(payload))
+
+        payload = self._committed_payload()
+        payload["families"][1]["module_slug"] = payload["families"][0]["module_slug"]
+        with self.assertRaisesRegex(ValueError, r"module_slug.*duplicate"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_missing_quantized_axis(self) -> None:
+        payload = self._committed_payload()
+        del payload["families"][0]["quantization"]["quantized_axis"]
+        with self.assertRaisesRegex(ValueError, r"families\[0\]\.quantization.*missing quantized_axis"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_semantic_roles_without_quantized_axis(self) -> None:
+        payload = self._committed_payload()
+        family = next(
+            family
+            for family in payload["families"]
+            if family["quantization"]["tensor_classification"] == "semantic-roles-v1"
+        )
+        family["quantization"]["quantized_axis"] = None
+        with self.assertRaisesRegex(ValueError, "semantic-roles-v1 requires 'first' or 'last'"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_acoustic_encoder_prefixes_with_quantized_axis(self) -> None:
+        payload = self._committed_payload()
+        family = next(
+            family
+            for family in payload["families"]
+            if family["quantization"]["tensor_classification"]
+            == "acoustic-encoder-prefixes-v1"
+        )
+        family["quantization"]["quantized_axis"] = "first"
+        with self.assertRaisesRegex(
+            ValueError,
+            "acoustic-encoder-prefixes-v1 requires null",
+        ):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_rejects_unknown_quantized_axis(self) -> None:
+        payload = self._committed_payload()
+        payload["families"][0]["quantization"]["quantized_axis"] = "middle"
+        with self.assertRaisesRegex(ValueError, "unsupported axis 'middle'"):
+            load_model_family_inventory(self._write_payload(payload))
+
+    def test_unknown_family_capability_fails_closed(self) -> None:
+        with self.assertRaisesRegex(KeyError, "no emits_punctuation mapping"):
+            punctuation_for_model({"kind": "asr-model", "family": "unknown"})
 
 
 def valid_locale_block() -> dict:
@@ -320,6 +658,13 @@ class PunctuationForModelTest(unittest.TestCase):
                 f"family {family!r} should emit punctuation",
             )
 
+    def test_null_inventory_punctuation_is_omitted(self) -> None:
+        for family in ("funasr-nano", "firered2-llm", "mimo-asr", "moss-transcribe-diarize"):
+            with self.subTest(family=family):
+                self.assertEqual(
+                    punctuation_for_model({"kind": "asr-model", "family": family}), {}
+                )
+
     def test_translation_model_is_omitted(self) -> None:
         entry = {"kind": "translation-model", "family": "hymt2"}
         self.assertEqual(punctuation_for_model(entry), {})
@@ -414,27 +759,26 @@ class RecognitionLanguageValidatorTest(unittest.TestCase):
 
     def test_selective_collapse_blocks_dialect_on_non_dialect_family(self) -> None:
         # A non-dialect-capable family may not enumerate dialect codes.
-        with self.assertRaisesRegex(KeyError, "not dialect-capable"):
+        with self.assertRaisesRegex(KeyError, "not-advertised"):
             validate_recognition_languages("cohere-transcribe", "cohere", ["zh", "zh-sichuan"])
         # Dolphin (dialect-capable via a code->prompt map) may.
         validate_recognition_languages(
             "dolphin-cn-dialect-small", "dolphin", ["zh", "zh-sichuan"]
         )
-        # firered-aed and qwen (dialect-capable via benchmark-verified
-        # recognition coverage, not a selectable prompt -- see
-        # DIALECT_CAPABLE_FAMILIES's doc comment) may too.
+        # firered-aed and qwen advertise catalog-declared recognition coverage,
+        # not a selectable prompt, so they may enumerate dialects too.
         validate_recognition_languages(
             "firered-aed-l-v2", "firered-aed", ["en", "zh", "zh-sichuan"]
         )
         validate_recognition_languages("qwen3-asr-1.7b", "qwen", ["zh", "zh-sichuan"])
 
     def test_dolphin_family_advertises_base_plus_its_own_dialect_codes(self) -> None:
-        # Dolphin's family default is built from DOLPHIN_CN_DIALECT_CODES (its
-        # own region-prompt capability), not the broader cross-family
-        # REGISTERED_DIALECT_CODES -- see that constant's doc comment.
-        expected = sorted(["zh", *DOLPHIN_CN_DIALECT_CODES])
-        self.assertEqual(LANG_BY_FAMILY["dolphin"], expected)
-        self.assertLess(set(DOLPHIN_CN_DIALECT_CODES), set(REGISTERED_DIALECT_CODES))
+        # Dolphin's family default is built from its inventory selectable codes,
+        # not the broader cross-family REGISTERED_DIALECT_CODES set.
+        inventory = load_model_family_inventory()
+        codes = inventory["dolphin"]["language"]["selectable_dialect_codes"]
+        expected = sorted(["zh", *codes])
+        self.assertLess(set(codes), set(REGISTERED_DIALECT_CODES))
         # Resolving through the public seam validates + returns the same set.
         resolved = languages_for_model({"id": "dolphin-cn-dialect-small", "family": "dolphin"})
         self.assertEqual(resolved, expected)

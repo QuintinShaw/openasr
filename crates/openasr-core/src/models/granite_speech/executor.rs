@@ -51,6 +51,7 @@ use super::runtime_provider::load_tensors_from_preflight;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -61,7 +62,7 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
-    GgmlAsrPreparedAudioView, GgmlAsrRuntimeSourcePreflight, GgmlAsrViewExecutor,
+    GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
@@ -114,7 +115,7 @@ struct GraniteSpeechPreparedRuntime {
 
 impl GraniteSpeechPreparedRuntime {
     fn quoted_system_memory_bytes(
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
     ) -> Result<(u64, u64), GraniteSpeechGgmlExecutorError> {
         let metadata = &preflight.metadata;
         let encoder_config = parse_encoder_metadata(metadata).map_err(|error| {
@@ -217,7 +218,7 @@ impl GraniteSpeechPreparedRuntime {
     /// given `(pack, backend)`. This is the whole ~4.2s cost the resident cache
     /// exists to pay exactly once instead of per request.
     fn build(
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechGgmlExecutorError> {
         let metadata = &preflight.metadata;
@@ -369,7 +370,7 @@ type GraniteSpeechPreparedRuntimeActor = PinnedRuntimeActorCheckout<
     GraniteSpeechPreparedRuntimeActorState,
 >;
 
-const GRANITE_SPEECH_EXECUTOR_ID: &str = "granite-speech-ggml-executor-v1";
+const GRANITE_SPEECH_EXECUTOR_ID: &str = crate::arch::GRANITE_SPEECH_EXECUTOR_COMPONENT_ID;
 const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
 /// Fail-closed backstop against a non-terminating decode -- greedy decode stops
 /// at `<|end_of_text|>` well before this in practice. Also a first-class input
@@ -384,8 +385,6 @@ enum GraniteSpeechGgmlExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("granite-speech ggml executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error(
         "granite-speech audio duration {seconds:.1}s exceeds the derived {limit:.0}s \
          single-decode cap (decoder context {ctx} tokens at {rate:.0} audio tokens/s; \
@@ -493,7 +492,7 @@ impl GraniteSpeechGgmlExecutor {
 
     fn checkout_prepared_runtime(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         kv_capacity: GraniteSpeechKvCacheCapacity,
     ) -> Result<GraniteSpeechPreparedRuntimeActor, GraniteSpeechGgmlExecutorError> {
@@ -560,13 +559,7 @@ impl GraniteSpeechGgmlExecutor {
             });
         }
 
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(
-                |error| GraniteSpeechGgmlExecutorError::RuntimePreflightFailed {
-                    reason: error.to_string(),
-                },
-            )?;
+        let preflight = &request.runtime_source_preflight;
         let samples = downmix_prepared_audio(&request.prepared_audio);
         // Duration gate before any frontend / encoder / projector work: the
         // limit is the decoder-context-derived ceiling in `super::capacity`
@@ -593,7 +586,7 @@ impl GraniteSpeechGgmlExecutor {
                 capacity.validate_hard_cap(super::capacity::GRANITE_SPEECH_DECODER_MAX_POSITIONS)
             })
             .map_err(|source| GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(&preflight, backend, kv_capacity)?;
+        let actor = self.checkout_prepared_runtime(preflight, backend, kv_capacity)?;
         let control = Arc::clone(&request.execution_context.control);
         let result = actor
             .call_mut(move |state| {
@@ -731,6 +724,10 @@ fn downmix_prepared_audio<'a>(audio: &'a GgmlAsrPreparedAudioView<'_>) -> Cow<'a
 }
 
 impl GgmlAsrViewExecutor for GraniteSpeechGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        GraniteSpeechGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         GRANITE_SPEECH_EXECUTOR_ID
     }
@@ -840,8 +837,8 @@ mod tests {
         DecodeTruncationReason, ExecutionTarget, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
         TranscriptionBackend, TranscriptionRequest,
     };
+    use crate::arch::builtin_adapter_descriptor;
     use crate::models::ggml_asr_executor::GgmlAsrBackendPreference;
-    use crate::models::ggml_family_registry::granite_speech_runtime_descriptor_v1;
     use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStopReason;
     use crate::{LongFormMode, LongFormOptions};
 
@@ -970,6 +967,11 @@ mod tests {
             "granite-speech e2e test",
         )
         .expect("load wav fixture");
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                &pack_path,
+            )
+            .expect("granite runtime must pass preflight");
 
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             backend_preference.request_backend_override(),
@@ -993,9 +995,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: granite_speech_runtime_descriptor_v1(),
+            runtime_source_preflight,
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,

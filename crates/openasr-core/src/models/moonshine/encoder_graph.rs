@@ -16,6 +16,12 @@ use super::weights::{MoonshineEncoderLayerWeights, MoonshineEncoderWeights, Moon
 const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const MOONSHINE_GROUP_NORM_EPSILON: f32 = 1.0e-5;
 
+enum RuntimeWeightSource<'a> {
+    Verified(&'a GgufRuntimeSourcePreflight),
+    #[cfg(test)]
+    Synthetic,
+}
+
 // Conv stem strides/kernels are architecture constants.
 const CONV1_KERNEL: usize = 127;
 const CONV1_STRIDE: usize = 64;
@@ -170,7 +176,40 @@ impl MoonshineEncoderGraphRuntime {
     pub(crate) fn new(
         weights: &MoonshineEncoderWeights,
         metadata: MoonshineExecutionMetadata,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        adapter: Option<&MoonshineLoraAdapter>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, MoonshineEncoderError> {
+        Self::new_impl(
+            weights,
+            metadata,
+            RuntimeWeightSource::Verified(runtime_preflight),
+            adapter,
+            backend,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_synthetic(
+        weights: &MoonshineEncoderWeights,
+        metadata: MoonshineExecutionMetadata,
+        adapter: Option<&MoonshineLoraAdapter>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, MoonshineEncoderError> {
+        Self::new_impl(
+            weights,
+            metadata,
+            RuntimeWeightSource::Synthetic,
+            adapter,
+            backend,
+        )
+    }
+
+    fn new_impl(
+        weights: &MoonshineEncoderWeights,
+        metadata: MoonshineExecutionMetadata,
+        runtime_source: RuntimeWeightSource<'_>,
         adapter: Option<&MoonshineLoraAdapter>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MoonshineEncoderError> {
@@ -191,11 +230,15 @@ impl MoonshineEncoderGraphRuntime {
         // mmap'd pack (native q8_0 [in,out]) instead of dequantizing them to
         // resident f32 host Vecs. The weights loader supplies these meta-only
         // (empty values), so binding is mandatory (fails closed below).
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
-            runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+        let loaded_weights = match runtime_source {
+            RuntimeWeightSource::Verified(preflight) => Some(
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(build_err("load_gguf_weight_context"))?,
+            ),
+            #[cfg(test)]
+            RuntimeWeightSource::Synthetic => None,
+        };
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)

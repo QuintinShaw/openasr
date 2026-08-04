@@ -9,7 +9,7 @@ use super::weights::{
     MoonshineDecoderWeights, MoonshineEncoderWeights, load_moonshine_decoder_weights,
     load_moonshine_encoder_weights,
 };
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 
 #[derive(Debug, Clone)]
@@ -168,7 +168,7 @@ pub(crate) enum MoonshinePreparedRuntimeError {
 }
 
 pub(crate) fn build_moonshine_prepared_runtime(
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<MoonshinePreparedRuntime, MoonshinePreparedRuntimeError> {
     let metadata = parse_moonshine_execution_metadata(&preflight.metadata).map_err(|error| {
         MoonshinePreparedRuntimeError::RuntimeContractViolation {

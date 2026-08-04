@@ -6,7 +6,6 @@ use super::frontend_component_registry::{
     BuiltinAudioFrontendComponent, BuiltinAudioFrontendComponentRegistryError,
     materialize_builtin_audio_frontend_for_architecture,
 };
-use super::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use super::runtime_asset_bootstrap::{
     BuiltinRuntimeAssetBootstrapError, build_builtin_runtime_asset_bootstrap,
 };
@@ -15,6 +14,7 @@ use super::tokenizer_component_registry::{
     BuiltinTokenizerComponent, BuiltinTokenizerComponentRegistryError,
     materialize_builtin_tokenizer_for_architecture,
 };
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinTokenizerMaterializationMode {
@@ -51,7 +51,7 @@ pub(crate) enum BuiltinRuntimeComponentBootstrapError {
 
 pub(crate) fn build_builtin_runtime_component_bootstrap(
     model_architecture: &str,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
     tokenizer_mode: BuiltinTokenizerMaterializationMode,
 ) -> Result<BuiltinRuntimeComponentBootstrap, BuiltinRuntimeComponentBootstrapError> {
     let asset_bootstrap = build_builtin_runtime_asset_bootstrap(model_architecture, preflight)
@@ -96,14 +96,14 @@ mod tests {
     use tempfile::{NamedTempFile, TempPath};
 
     use super::*;
-    use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+    use crate::ggml_runtime::GgufRuntimeSourcePreflight;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
     use crate::{
         read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
         validate_ggml_runtime_source_path,
     };
 
-    fn write_cohere_preflight() -> (TempPath, GgmlAsrRuntimeSourcePreflight) {
+    fn write_cohere_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
         let file = NamedTempFile::new().expect("temp file");
         let persisted = file.into_temp_path();
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -117,7 +117,7 @@ mod tests {
             .expect("read gguf tensor index");
         (
             persisted,
-            GgmlAsrRuntimeSourcePreflight {
+            GgufRuntimeSourcePreflight {
                 runtime_source,
                 metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
@@ -241,7 +241,7 @@ mod tests {
             .with_tensor_shape("blk.1.ffn_down.weight", [16_u64, 32_u64])
     }
 
-    fn write_qwen_preflight() -> (TempPath, GgmlAsrRuntimeSourcePreflight) {
+    fn write_qwen_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
         let file = NamedTempFile::new().expect("temp file");
         let persisted = file.into_temp_path();
         let spec = qwen_frontend_fixture_spec();
@@ -255,7 +255,7 @@ mod tests {
             .expect("read gguf tensor index");
         (
             persisted,
-            GgmlAsrRuntimeSourcePreflight {
+            GgufRuntimeSourcePreflight {
                 runtime_source,
                 metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),

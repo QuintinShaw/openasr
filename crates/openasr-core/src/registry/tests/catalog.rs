@@ -1679,12 +1679,12 @@ fn embedded_catalog_emits_punctuation_matches_family() {
         "dolphin's training corpus is unpunctuated; it never predicts punctuation tokens"
     );
 
-    // Cross-check the catalog's Python-authored values against the Rust arch
+    // Cross-check the generated catalog values against the Rust arch
     // descriptor's single declaration of this fact
     // (`arch::OpenAsrArchitectureDescriptor::emits_punctuation`, via
-    // `emits_punctuation_for_model_architecture`) so `_catalog.py`'s
-    // `PUNCTUATION_BY_FAMILY` cannot silently drift from the compiled-in
-    // engine fact for any family both sides know about.
+    // `emits_punctuation_for_model_architecture`) so the committed inventory
+    // projection and catalog cannot silently drift from the compiled-in engine
+    // fact for any family both sides know about.
     for (id, model_architecture) in [
         ("qwen3-asr-1.7b", crate::QWEN3_ASR_GGML_ARCHITECTURE_ID),
         (
@@ -1731,24 +1731,6 @@ fn embedded_catalog_speaker_source_matches_architecture_registry() {
         .expect("embedded catalog should verify and parse offline");
     let architectures = crate::arch::OpenAsrArchitectureRegistry::with_builtins();
 
-    let architecture_for_family = |family: &str| match family {
-        "qwen" => Some(crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID),
-        "parakeet-tdt" => Some(crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID),
-        "cohere" => Some(crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID),
-        "whisper" => Some(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
-        "xasr-zipformer" => Some(crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID),
-        "dolphin" => Some(crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID),
-        "moonshine" => Some(crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID),
-        "sensevoice" => Some(crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID),
-        "firered-aed" => Some(crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID),
-        "firered2-llm" => Some(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
-        "mimo-asr" => Some(crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID),
-        "moss-transcribe-diarize" => Some(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
-        "funasr-nano" => Some(crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID),
-        "granite-speech" => Some(crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID),
-        _ => None,
-    };
-
     for model in &catalog.models {
         if model.kind != CatalogModelKind::AsrModel {
             assert_eq!(
@@ -1758,16 +1740,22 @@ fn embedded_catalog_speaker_source_matches_architecture_registry() {
             );
             continue;
         }
-        let architecture = architecture_for_family(&model.family).unwrap_or_else(|| {
-            panic!(
-                "ASR catalog family '{}' has no Rust architecture mapping",
-                model.family
-            )
-        });
         let descriptor = architectures
-            .find_by_model_architecture(architecture)
-            .unwrap_or_else(|| panic!("missing architecture descriptor '{architecture}'"));
-        let expected = if descriptor.speaker_segmentation.is_in_decoder() {
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.identity.catalog_family_id == model.family)
+            .unwrap_or_else(|| {
+                panic!(
+                    "ASR catalog family '{}' has no canonical architecture descriptor",
+                    model.family
+                )
+            });
+        let architecture = descriptor.identity.model_architecture;
+        let expected = if descriptor
+            .execution_contract
+            .speaker_segmentation
+            .is_in_decoder()
+        {
             CatalogSpeakerSource::Native
         } else {
             CatalogSpeakerSource::External

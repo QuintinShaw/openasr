@@ -22,7 +22,7 @@ impl ScalarMetadataView for GgufMetadata {
 }
 
 /// Forwarding impl so call sites can pass `&Arc<GgufMetadata>` (as stored on
-/// `GgmlAsrRuntimeSourcePreflight::metadata`) directly, without an explicit
+/// `GgufRuntimeSourcePreflight::metadata`) directly, without an explicit
 /// deref at every one of the ~25 read sites across model families.
 impl<T: ScalarMetadataView + ?Sized> ScalarMetadataView for Arc<T> {
     fn get_string_scalar(&self, key: &str) -> Option<&str> {

@@ -708,7 +708,7 @@ mod tests {
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
     use crate::{
-        GgmlAsrRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
+        GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
         read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
     };
     use std::ffi::OsString;
@@ -861,22 +861,21 @@ mod tests {
         )
     }
 
-    fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
+    fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
         let runtime_source =
             validate_ggml_runtime_source_path(runtime_path).expect("valid runtime source path");
         let metadata =
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        GgmlAsrRuntimeSourcePreflight {
+        GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
         }
     }
 
-    fn write_runtime_ready_preflight() -> (tempfile::TempDir, PathBuf, GgmlAsrRuntimeSourcePreflight)
-    {
+    fn write_runtime_ready_preflight() -> (tempfile::TempDir, PathBuf, GgufRuntimeSourcePreflight) {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -1046,7 +1045,7 @@ mod tests {
 
     fn run_static_batch_fixture_with_preflight(
         runtime_path: &Path,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prefer_cpu_backend: bool,
         encoder_frame_count: usize,
         strict_logit_parity: bool,
@@ -1182,7 +1181,7 @@ mod tests {
 
     fn run_refill_fixture_with_preflight(
         runtime_path: &Path,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
         prefer_cpu_backend: bool,
         encoder_frame_count: usize,
     ) {

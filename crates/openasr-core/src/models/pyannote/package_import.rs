@@ -19,7 +19,7 @@ use crate::models::diarize_pack_import::convert_diarize_safetensors_to_oasr;
 use crate::models::local_source_import::LocalSourceImportError;
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_FEATURE_DIARIZATION, OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-    OASR_METADATA_KEY_MODEL_FAMILY, OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+    OASR_METADATA_KEY_MODEL_FAMILY,
 };
 
 use super::{PYANNOTE_GGML_ARCHITECTURE_ID, PYANNOTE_MODEL_FAMILY};
@@ -50,6 +50,7 @@ pub fn convert_local_pyannote_source_to_runtime_pack(
     let tensor_count = convert_diarize_safetensors_to_oasr(
         &request.source_safetensors,
         &request.output_root,
+        PYANNOTE_GGML_ARCHITECTURE_ID,
         &runtime_metadata(request),
     )?;
     Ok(PyannoteImportResult {
@@ -63,8 +64,6 @@ fn runtime_metadata(request: &PyannoteImportRequest) -> BTreeMap<String, GgufWri
     let mut put = |key: &str, value: &str| {
         metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
     };
-    put("general.architecture", PYANNOTE_GGML_ARCHITECTURE_ID);
-    put(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1);
     put(OASR_METADATA_KEY_MODEL_FAMILY, PYANNOTE_MODEL_FAMILY);
     put(
         OASR_METADATA_KEY_MODEL_ARCHITECTURE,

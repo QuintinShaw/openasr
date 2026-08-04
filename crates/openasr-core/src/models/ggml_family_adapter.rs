@@ -20,6 +20,30 @@ pub enum GgmlExecutionCapability {
     NativeGraphLoweringV1,
 }
 
+/// Fail-closed errors returned when the canonical architecture registry
+/// resolves a GGML adapter from package metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GgmlFamilyAdapterSelectionError {
+    InvalidMetadata(OasrV1MetadataError),
+    UnsupportedPackageVersion {
+        expected: &'static str,
+        found: String,
+    },
+    UnknownFamily {
+        model_family: String,
+    },
+    NoMatchingAdapter {
+        model_family: String,
+        model_architecture: String,
+        audio_frontend_id: String,
+        decode_policy_id: String,
+        tokenizer_id: Option<String>,
+    },
+    Ambiguous {
+        adapter_ids: Vec<&'static str>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GgmlFamilyAdapterSelectionSpec<'a> {
     pub source: GgmlAdapterMetadataSource,
@@ -70,6 +94,12 @@ pub struct GgmlFamilyAdapterDescriptor {
     pub decode_policy_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub execution_capabilities: crate::device::execution_policy::ExecutionCapabilities,
+    /// Whether the selected family exposes a complete LoRA/OADP adapter
+    /// binding. This is projected from the canonical architecture execution
+    /// contract; runtime gates must not maintain a family-name allowlist.
+    pub supports_lora_adapter: bool,
+    pub phrase_bias: crate::arch::OpenAsrPhraseBiasStrategy,
+    pub word_timestamps: crate::arch::OpenAsrWordTimestampStrategy,
     pub language_family_hint: LanguageFamilyHint,
     /// Where this family's speaker turns come from. Mirrored verbatim from
     /// `arch::OpenAsrArchitectureDescriptor::speaker_segmentation`, which is

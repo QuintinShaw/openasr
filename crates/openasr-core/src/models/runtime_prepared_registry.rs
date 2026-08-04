@@ -1,11 +1,11 @@
 use thiserror::Error;
 
+use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrPreparedRuntimeStrategy};
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 
 use super::cohere::{
     CoherePreparedRuntime, CoherePreparedRuntimeError, build_cohere_prepared_runtime,
 };
-use super::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
 use super::prepared_runtime_cache::{
     HostNeutralPreparedRuntime, PreparedRuntimeCache, PreparedRuntimeHandle,
     PreparedRuntimeQuoteContext, SystemMemoryMaterialization,
@@ -14,6 +14,7 @@ use super::qwen::{
     Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError, build_qwen_prepared_runtime,
 };
 use super::system_memory_owner::{SystemMemoryAllocationQuote, SystemMemoryOwnerError};
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 
 // The per-family prepared runtimes differ in size (qwen carries the LLM decode
 // state), but this enum is always held behind an `Arc` in the runtime cache, so
@@ -40,17 +41,34 @@ impl HostNeutralPreparedRuntime for BuiltinPreparedRuntime {
         context: PreparedRuntimeQuoteContext<'_>,
         pack_content_id: &str,
     ) -> Result<SystemMemoryAllocationQuote, SystemMemoryOwnerError> {
-        match context.model_architecture {
-            crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
+        let strategy = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(context.model_architecture)
+            .map(|descriptor| descriptor.execution_contract.prepared_runtime)
+            .ok_or_else(|| {
+                SystemMemoryOwnerError::capacity_failure(
+                    "prepared_runtime_quote",
+                    format!(
+                        "unknown builtin prepared runtime architecture '{}'",
+                        context.model_architecture
+                    ),
+                )
+            })?;
+        match strategy {
+            OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1 => {
                 CoherePreparedRuntime::system_memory_quote(context, pack_content_id)
             }
-            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID => {
+            OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1 => {
                 Qwen3AsrPreparedRuntime::system_memory_quote(context, pack_content_id)
             }
-            architecture => Err(SystemMemoryOwnerError::capacity_failure(
-                "prepared_runtime_quote",
-                format!("unknown builtin prepared runtime architecture '{architecture}'"),
-            )),
+            OpenAsrPreparedRuntimeStrategy::FamilyOwned => {
+                Err(SystemMemoryOwnerError::capacity_failure(
+                    "prepared_runtime_quote",
+                    format!(
+                        "architecture '{}' owns its prepared runtime and cannot enter the shared composer cache",
+                        context.model_architecture
+                    ),
+                ))
+            }
         }
     }
 }
@@ -83,6 +101,10 @@ impl BuiltinPreparedRuntime {
 pub(crate) enum BuiltinPreparedRuntimeRegistryError {
     #[error("unknown builtin prepared runtime architecture '{model_architecture}'")]
     UnknownArchitecture { model_architecture: String },
+    #[error(
+        "architecture '{model_architecture}' owns its prepared runtime and cannot enter the shared composer registry"
+    )]
+    FamilyOwnedArchitecture { model_architecture: String },
     #[error("builtin cohere prepared runtime build failed: {source}")]
     CohereTranscribeBuild {
         #[source]
@@ -109,7 +131,7 @@ pub(crate) enum BuiltinPreparedRuntimeRegistryError {
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedRuntimeLookup<'a> {
     pub(crate) model_architecture: &'a str,
-    pub(crate) preflight: &'a GgmlAsrRuntimeSourcePreflight,
+    pub(crate) preflight: &'a GgufRuntimeSourcePreflight,
     pub(crate) backend: GgmlCpuGraphBackend,
 }
 
@@ -121,7 +143,7 @@ pub(crate) struct BuiltinPreparedRuntimeCache {
 impl BuiltinPreparedRuntimeCache {
     pub(crate) fn ready_for_preflight(
         &self,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
+        preflight: &GgufRuntimeSourcePreflight,
     ) -> Option<PreparedRuntimeHandle<BuiltinPreparedRuntime>> {
         self.runtimes_by_content.ready(&preflight.runtime_source)
     }
@@ -219,22 +241,32 @@ impl BuiltinPreparedRuntimeCache {
 pub(crate) fn build_builtin_prepared_runtime(
     lookup: PreparedRuntimeLookup<'_>,
 ) -> Result<BuiltinPreparedRuntime, BuiltinPreparedRuntimeRegistryError> {
-    match lookup.model_architecture {
-        crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
+    let strategy = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(lookup.model_architecture)
+        .map(|descriptor| descriptor.execution_contract.prepared_runtime)
+        .ok_or_else(
+            || BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
+                model_architecture: lookup.model_architecture.to_string(),
+            },
+        )?;
+    match strategy {
+        OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1 => {
             build_cohere_prepared_runtime(lookup.preflight, lookup.backend)
                 .map(BuiltinPreparedRuntime::CohereTranscribe)
                 .map_err(
                     |source| BuiltinPreparedRuntimeRegistryError::CohereTranscribeBuild { source },
                 )
         }
-        crate::QWEN3_ASR_GGML_ARCHITECTURE_ID => {
+        OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1 => {
             build_qwen_prepared_runtime(lookup.preflight, lookup.backend)
                 .map(BuiltinPreparedRuntime::Qwen3Asr)
                 .map_err(|source| BuiltinPreparedRuntimeRegistryError::Qwen3AsrBuild { source })
         }
-        _ => Err(BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
-            model_architecture: lookup.model_architecture.to_string(),
-        }),
+        OpenAsrPreparedRuntimeStrategy::FamilyOwned => Err(
+            BuiltinPreparedRuntimeRegistryError::FamilyOwnedArchitecture {
+                model_architecture: lookup.model_architecture.to_string(),
+            },
+        ),
     }
 }
 
@@ -246,12 +278,12 @@ mod tests {
     use tempfile::{NamedTempFile, TempPath};
 
     use super::*;
-    use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+    use crate::ggml_runtime::GgufRuntimeSourcePreflight;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
     #[test]
-    fn quote_dispatch_uses_integration_identity_not_raw_gguf_alias() {
-        for (integration_architecture, gguf_alias) in [
+    fn quote_dispatch_uses_architecture_identity_not_raw_gguf_alias() {
+        for (registry_architecture, gguf_alias) in [
             (
                 crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                 crate::arch::hparams::COHERE_TRANSCRIBE_ARCHITECTURE_VALUE,
@@ -261,7 +293,7 @@ mod tests {
                 crate::arch::hparams::QWEN3_ARCHITECTURE_VALUE,
             ),
         ] {
-            assert_ne!(integration_architecture, gguf_alias);
+            assert_ne!(registry_architecture, gguf_alias);
             let mut values = BTreeMap::new();
             values.insert(
                 "general.architecture".to_string(),
@@ -271,7 +303,7 @@ mod tests {
             let tensor_index = crate::GgufTensorIndex::empty_for_test("alias.gguf".into());
             let result = BuiltinPreparedRuntime::system_memory_quote(
                 PreparedRuntimeQuoteContext {
-                    model_architecture: integration_architecture,
+                    model_architecture: registry_architecture,
                     metadata: &metadata,
                     tensor_index: &tensor_index,
                     backend: GgmlCpuGraphBackend::Cpu,
@@ -281,13 +313,13 @@ mod tests {
             if let Err(error) = result {
                 assert!(
                     !error.to_string().contains("unknown builtin"),
-                    "integration identity must dispatch before the family validates its raw GGUF alias: {error}"
+                    "architecture identity must dispatch before the family validates its raw GGUF alias: {error}"
                 );
             }
         }
     }
 
-    fn write_cohere_preflight() -> (TempPath, GgmlAsrRuntimeSourcePreflight) {
+    fn write_cohere_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
         let file = NamedTempFile::new().expect("temp file");
         let persisted = file.into_temp_path();
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -301,7 +333,7 @@ mod tests {
             .expect("tensor index");
         (
             persisted,
-            GgmlAsrRuntimeSourcePreflight {
+            GgufRuntimeSourcePreflight {
                 runtime_source,
                 metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
@@ -323,6 +355,23 @@ mod tests {
             error,
             BuiltinPreparedRuntimeRegistryError::UnknownArchitecture { model_architecture }
             if model_architecture == "unknown-arch"
+        ));
+    }
+
+    #[test]
+    fn shared_registry_rejects_family_owned_prepared_runtime() {
+        let (_runtime_path, preflight) = write_cohere_preflight();
+
+        let error = build_builtin_prepared_runtime(PreparedRuntimeLookup {
+            model_architecture: crate::WHISPER_GGML_ARCHITECTURE_ID,
+            preflight: &preflight,
+            backend: GgmlCpuGraphBackend::Cpu,
+        })
+        .expect_err("family-owned runtime must not enter the shared registry");
+        assert!(matches!(
+            error,
+            BuiltinPreparedRuntimeRegistryError::FamilyOwnedArchitecture { model_architecture }
+            if model_architecture == crate::WHISPER_GGML_ARCHITECTURE_ID
         ));
     }
 

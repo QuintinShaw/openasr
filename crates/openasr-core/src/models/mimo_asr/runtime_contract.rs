@@ -402,6 +402,20 @@ pub(crate) fn parse_mimo_special_tokens(
     })
 }
 
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_mimo_llm_metadata(preflight.metadata())
+        .map(|_| ())
+        .and_then(|()| parse_mimo_inlocal_metadata(preflight.metadata()).map(|_| ()))
+        .and_then(|()| parse_mimo_audiotok_metadata(preflight.metadata()).map(|_| ()))
+        .and_then(|()| parse_mimo_mel_metadata(preflight.metadata()).map(|_| ()))
+        .and_then(|()| parse_mimo_special_tokens(preflight.metadata()).map(|_| ()))
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("mimo-asr", error)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

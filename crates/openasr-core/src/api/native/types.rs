@@ -3,6 +3,8 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use crate::realtime::RealtimeSessionId;
 use crate::{LongFormOptions, PhraseBiasConfig, RequestSource, TranscriptionTask};
 
+use super::errors::NativeAsrError;
+
 macro_rules! impl_enum_str_display {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         impl $name {
@@ -168,23 +170,100 @@ impl NativeAsrCapabilities {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
+enum NativeAsrModelPackProof {
+    Verified(Arc<crate::models::pack_verifier::VerifiedPack>),
+    #[cfg(test)]
+    UnverifiedFixture,
+}
+
+#[derive(Clone)]
 pub struct NativeAsrModelPackRef {
     pub id: String,
     pub family: String,
     pub variant: Option<String>,
     pub root: PathBuf,
     pub manifest_path: Option<PathBuf>,
+    proof: NativeAsrModelPackProof,
 }
 
+impl fmt::Debug for NativeAsrModelPackRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeAsrModelPackRef")
+            .field("id", &self.id)
+            .field("family", &self.family)
+            .field("variant", &self.variant)
+            .field("root", &self.root)
+            .field("manifest_path", &self.manifest_path)
+            .field(
+                "verified",
+                &matches!(self.proof, NativeAsrModelPackProof::Verified(_)),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for NativeAsrModelPackRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.family == other.family
+            && self.variant == other.variant
+            && self.root == other.root
+            && self.manifest_path == other.manifest_path
+    }
+}
+
+impl Eq for NativeAsrModelPackRef {}
+
 impl NativeAsrModelPackRef {
-    pub fn new(id: impl Into<String>, family: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+    /// Build an unverified pack reference for unit fixtures. Product code can
+    /// only obtain this type from a verified runtime adapter.
+    #[cfg(test)]
+    pub(crate) fn new(
+        id: impl Into<String>,
+        family: impl Into<String>,
+        root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             id: id.into(),
             family: family.into(),
             variant: None,
             root: root.into(),
             manifest_path: None,
+            proof: NativeAsrModelPackProof::UnverifiedFixture,
+        }
+    }
+
+    pub(crate) fn from_verified(
+        id: impl Into<String>,
+        family: impl Into<String>,
+        verified_pack: Arc<crate::models::pack_verifier::VerifiedPack>,
+    ) -> Self {
+        let root = verified_pack
+            .preflight()
+            .runtime_source()
+            .path()
+            .to_path_buf();
+        Self {
+            id: id.into(),
+            family: family.into(),
+            variant: None,
+            root,
+            manifest_path: None,
+            proof: NativeAsrModelPackProof::Verified(verified_pack),
+        }
+    }
+
+    pub(crate) fn verified_pack(
+        &self,
+    ) -> Result<&Arc<crate::models::pack_verifier::VerifiedPack>, NativeAsrError> {
+        match &self.proof {
+            NativeAsrModelPackProof::Verified(pack) => Ok(pack),
+            #[cfg(test)]
+            NativeAsrModelPackProof::UnverifiedFixture => Err(NativeAsrError::SessionFailed {
+                message: "test-only model-pack reference has no verification proof".to_string(),
+            }),
         }
     }
 

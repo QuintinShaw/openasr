@@ -2345,18 +2345,22 @@ fn build_encoder_resident_weight_cache<'weights>(
     source_tensors: &HashMap<&str, &'weights WhisperMaterializedTensor>,
     encoder_weights: &'weights WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
-    runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+    runtime_preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<WhisperEncoderResidentWeightCache, WhisperGgmlExecutorError> {
     let mut arena = runner
         .start_static_tensor_arena(context_bytes)
         .map_err(|error| map_encoder_graph_error("ggml_static_tensor_arena", error))?;
     // Bind large quantized linear weights zero-copy to the mmap'd pack (no host
     // copy, no arena upload). Falls back to the arena path when unavailable.
-    let loaded_weights = runtime_preflight.and_then(|preflight| {
+    let loaded_weights = Some(
         runner
-            .load_gguf_weight_context_from_preflight(preflight)
-            .ok()
-    });
+            .load_gguf_weight_context_from_preflight(runtime_preflight)
+            .map_err(
+                |source| WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
+                    reason: format!("could not load encoder weight context: {source}"),
+                },
+            )?,
+    );
     let mut tensors_by_name = HashMap::with_capacity(source_tensors.len());
     let mut loaded_tensors_by_name = HashMap::new();
     let mut uploads: Vec<WhisperEncoderResidentWeightUpload<'weights>> = Vec::new();
@@ -3470,7 +3474,7 @@ fn run_whisper_encoder_actor(
 impl WhisperGgmlExecutor {
     fn prepared_runtime_for_preflight(
         &self,
-        preflight: &crate::GgmlAsrRuntimeSourcePreflight,
+        preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<PreparedRuntimeHandle<WhisperPreparedRuntime>, WhisperGgmlExecutorError> {
         self.runtime_cache_by_path.get_or_try_insert_with(
@@ -3514,8 +3518,12 @@ fn whisper_runtime_cache_slot_unavailable() -> WhisperGgmlExecutorError {
 }
 
 impl GgmlAsrViewExecutor for WhisperGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        WhisperGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
-        "whisper-ggml-executor-v1"
+        crate::arch::WHISPER_EXECUTOR_COMPONENT_ID
     }
 
     fn supports_phrase_bias(&self) -> bool {
@@ -3600,16 +3608,10 @@ impl WhisperGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason: error.to_string(),
         })?;
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrViewExecutor::executor_id(self),
-                adapter_id: request.selected_family.adapter_id,
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
         let reuse_runtime_state = request.request_options.longform_mode_enabled();
         let prepared_runtime = self
-            .prepared_runtime_for_preflight(preflight.as_ref(), request.resolved_runtime.backend())
+            .prepared_runtime_for_preflight(preflight, request.resolved_runtime.backend())
             .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
                 executor_id: GgmlAsrViewExecutor::executor_id(self),
                 adapter_id: request.selected_family.adapter_id,
@@ -3617,7 +3619,7 @@ impl WhisperGgmlExecutor {
             })?;
         let output = execute_whisper_with_prepared_runtime(
             &request.selected_family,
-            preflight.as_ref(),
+            preflight,
             &request.prepared_audio,
             prepared_runtime,
             decoder_state,
@@ -3850,7 +3852,7 @@ fn build_whisper_encoder_persistent_static_session(
             &encoder_tensor_index,
             encoder_weights,
             plan,
-            Some(runtime_preflight),
+            runtime_preflight,
         )?;
         emit_encoder_resident_weight_trace(
             cache.upload_stats.count,
@@ -3991,7 +3993,7 @@ fn build_whisper_decoder_persistent_static_session(
                 &runtime.decoder_weights.tensor_source,
                 &mut persistent_weight_tensor_cache,
                 decoder_state.self_attention.resident_positions,
-                Some(runtime_preflight),
+                runtime_preflight,
             )
         })
         .map_err(

@@ -296,6 +296,16 @@ where
     }
 }
 
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_dolphin_execution_metadata(preflight.metadata(), preflight.tensor_index())
+        .map(|_| ())
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("dolphin", error)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

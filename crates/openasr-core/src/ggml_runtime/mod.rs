@@ -65,6 +65,8 @@ pub use gguf_c_parser_sandbox::{
     GGUF_C_PARSER_SANDBOX_HELPER_ARG, GgufCParserSandboxError,
     render_gguf_c_parser_sandbox_child_output,
 };
+#[cfg(test)]
+pub(crate) use gguf_metadata::bounded_parse_call_count_for_current_thread;
 pub use gguf_metadata::{
     GgufMetadata, GgufMetadataReadError, GgufMetadataValue, read_gguf_metadata,
     read_gguf_metadata_from_runtime_source,
@@ -85,8 +87,8 @@ pub use gguf_tensor_index::{
 };
 pub use gguf_write::{BUILD_COMMIT_ENV, OASR_METADATA_KEY_BUILD_COMMIT};
 pub(crate) use gguf_write::{
-    GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
-    write_gguf_file_v0,
+    GgufWriteError, GgufWriteTensor, GgufWriteTensorType, GgufWriteValue,
+    build_provenance_from_env, quantize_f32_to_ggml_tensor_data, write_gguf_file_v0,
 };
 pub(crate) use job_cancel::{
     InheritedJobCancelGuard, arm_thread_job_cancel_flag, cancel_flag_requested_from_data,
@@ -103,12 +105,13 @@ pub use package_probe::{
     GgmlPackageProbeError, OPENASR_RUNTIME_PACK_EXTENSION, has_openasr_runtime_pack_extension,
     probe_ggml_package_model_identity, probe_ggml_package_path,
 };
+#[cfg(test)]
+pub(crate) use runtime_preflight::load_runtime_source_metadata_and_tensor_index;
 pub use runtime_preflight::{
     GgufRuntimeSourcePreflight, RuntimeSourceMetadataAndTensorIndexPreflightError,
 };
 pub(crate) use runtime_preflight::{
     RuntimeSourceTensorReaderError, build_runtime_tensor_reader_from_preflight,
-    load_runtime_source_metadata_and_tensor_index,
     load_runtime_source_metadata_and_tensor_index_from_source,
 };
 pub use runtime_source::{

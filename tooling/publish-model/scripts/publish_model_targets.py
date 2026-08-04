@@ -5,15 +5,17 @@ Default scope is intentionally narrow for the public release lane:
 qwen3-asr-0.6b with fp16/q8_0/q4_k. The script writes immutable revision
 sidecars under tmp/publish/<model>/ so _manifest.py can generate signed catalogs.
 
-Before any upload, every pack is forced through the client's install-time
-preflight (`openasr model-pack preflight`, fail-closed) so a pack a client
-would reject can never enter a release lane.
+Before any upload, every pack is staged by the client's install-time preflight
+(`openasr model-pack preflight`, fail-closed). The CLI verifies the source,
+creates the destination, and seals it read-only; this publisher only validates
+the receipt and never copies pack bytes itself.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import shutil
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,36 +32,8 @@ DEFAULT_QUANTS = ("fp16", "q8_0", "q4_k")
 ALL_TARGETS = ("hf",)
 DEFAULT_TARGETS = ("hf",)
 HF_TOKEN_ENV = "HF_TOKEN"
-QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE = b"qwen3-asr"
-QWEN3_ASR_LEGACY_GENERAL_ARCHITECTURE = b"qwen3asr"
-XASR_ZIPFORMER_EXPECTED_GENERAL_ARCHITECTURE = b"xasr-zipformer-transducer"
-HYMT2_EXPECTED_GENERAL_ARCHITECTURE = b"hunyuan-dense"
-FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE = b"firered-punc"
-REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE = b"redimnet2"
-DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE = b"diarizen-wavlm-conformer-segmentation"
-DIARIZEN_REQUIRED_HEADER_MARKERS = (
-    b"openasr.source.name",
-    b"BUT-FIT/diarizen-wavlm-large-s80-md-v2",
-    b"openasr.source.revision",
-    b"f27b9ffbedcf422856d104ecee9b94be37ea578e",
-    b"openasr.license.name",
-    b"CC BY-NC 4.0",
-    b"openasr.license.source",
-    b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md",
-)
-HYMT2_REQUIRED_HEADER_MARKERS = (
-    b"openasr.model.kind",
-    b"translation-model",
-    b"openasr.translation.source_langs",
-    b"openasr.translation.target_langs",
-    b"openasr.upstream.base_revision",
-    b"9a341cd1b679d3efd23b46e847b01745a71ed792",
-    b"openasr.upstream.gguf_revision",
-    b"1cd5208700acedef4ef93019b6cfc148b8522d45",
-    b"openasr.license.files",
-    b"LICENSE.txt",
-    b"NOTICE.openasr.txt",
-)
+PREFLIGHT_RECEIPT_SCHEMA = "openasr.model-pack-preflight.v1"
+BUILD_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # Models cleared for this pack-publish lane. Repository visibility and public
 # catalog listing remain separately gated; DiariZen stays `release_public=false`.
 RELEASE_LANE_MODELS = (
@@ -97,7 +71,6 @@ RELEASE_LANE_MODELS = (
     "funasr-nano",
     "granite-speech-4.1-2b",
 )
-GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 
 
 def run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
@@ -122,52 +95,6 @@ def work_root(model: str) -> Path:
     return REPO_ROOT / "tmp" / "publish" / model
 
 
-def expected_general_architecture(model: str) -> bytes | None:
-    if model.startswith("qwen3-asr-"):
-        return QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "xasr-zh-en":
-        return XASR_ZIPFORMER_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "hymt2-1.8b":
-        return HYMT2_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "firered-punc":
-        return FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "redimnet2-b6-cn":
-        return REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "diarizen-large-s80-v2":
-        return DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE
-    return None
-
-
-def validate_pack_runtime_metadata(model: str, pack: Path) -> None:
-    expected = expected_general_architecture(model)
-    if expected is None:
-        return
-    with pack.open("rb") as handle:
-        header = handle.read(4 * 1024 * 1024)
-    key_index = header.find(GGUF_GENERAL_ARCHITECTURE_KEY)
-    if key_index < 0:
-        raise SystemExit(f"pack missing general.architecture metadata: {pack}")
-    window = header[key_index : key_index + 1024]
-    if QWEN3_ASR_LEGACY_GENERAL_ARCHITECTURE in window:
-        raise SystemExit(f"pack uses legacy qwen general.architecture 'qwen3asr': {pack}")
-    if expected not in window:
-        raise SystemExit(
-            f"pack general.architecture mismatch for {model}: expected {expected.decode()}: {pack}"
-        )
-    if model == "hymt2-1.8b":
-        for marker in HYMT2_REQUIRED_HEADER_MARKERS:
-            if marker not in header:
-                raise SystemExit(
-                    f"pack missing Hy-MT2 required metadata marker {marker.decode(errors='replace')}: {pack}"
-                )
-    if model == "diarizen-large-s80-v2":
-        for marker in DIARIZEN_REQUIRED_HEADER_MARKERS:
-            if marker not in header:
-                raise SystemExit(
-                    f"pack missing DiariZen license provenance marker {marker.decode(errors='replace')}: {pack}"
-                )
-
-
 def pack_result(model: str, quant: str) -> dict:
     result = load_required_json(work_root(model) / "packs" / f"{model}.{quant}.result.json")
     pack = Path(result["pack"])
@@ -178,7 +105,6 @@ def pack_result(model: str, quant: str) -> dict:
         raise SystemExit(f"pack file missing for {model}:{quant}: {pack}")
     if pack.stat().st_size != result["size_bytes"]:
         raise SystemExit(f"pack size mismatch for {model}:{quant}: {pack}")
-    validate_pack_runtime_metadata(model, pack)
     return {**result, "pack_path": pack}
 
 
@@ -193,31 +119,14 @@ def openasr_release_binary() -> Path:
         return path
     path = REPO_ROOT / "target" / "release" / "openasr"
     if not path.is_file() or not os.access(path, os.X_OK):
-        # Fail closed: the gate below refuses to publish on a guess. A missing
-        # binary is a toolchain fault, never a reason to skip the gate.
+        # Fail closed: a missing binary is a toolchain fault, never a reason to
+        # skip the receipt/staging contract.
         raise SystemExit(
             f"release binary missing: {path}; build it with "
             "`cargo build --release -p openasr-cli` before publishing "
-            "(the install-preflight gate refuses to run without it)"
+            "(the preflight staging gate refuses to run without it)"
         )
     return path
-
-
-def preflight_packs_for_install(model: str, quants: list[str]) -> None:
-    """Fail-closed gate: every pack must pass the exact preflight a client
-    applies at install time (`openasr model-pack preflight` ->
-    `openasr_core::preflight_model_pack_for_install`: structural GGUF scan,
-    the `.oasr` v1 required-metadata gate `openasr.package.version = "1"`,
-    runtime-source validation, and the family runtime contract) BEFORE any
-    upload. The funasr-nano packs that shipped without
-    `openasr.package.version` were install-rejected in an endless
-    download loop; this gate makes that state unreachable from the lane.
-    """
-    binary = openasr_release_binary()
-    for quant in quants:
-        pack = pack_result(model, quant)["pack_path"]
-        run([str(binary), "model-pack", "preflight", str(pack)])
-        print(f"preflight ok: {pack}")
 
 
 def validate_scope(model: str, quants: list[str], catalog_quants: list[str]) -> None:
@@ -235,13 +144,90 @@ def validate_scope(model: str, quants: list[str], catalog_quants: list[str]) -> 
         )
 
 
-def copy_stage(model: str, quants: list[str], readme: str, stage: Path) -> None:
+def reject_staged_pack(destination: Path, message: str) -> None:
+    """Remove a CLI-verified stage that fails release-identity binding."""
+    if destination.exists():
+        try:
+            destination.chmod(0o600)
+        except OSError:
+            pass
+        try:
+            destination.unlink()
+        except OSError as error:
+            raise SystemExit(f"{message}; could not remove rejected stage: {error}") from error
+    raise SystemExit(message)
+
+
+def copy_stage(model: str, entry: dict, quants: list[str], readme: str, stage: Path) -> None:
     stage.mkdir(parents=True, exist_ok=True)
     (stage / "README.md").write_text(readme, encoding="utf-8")
     (stage / ".gitattributes").write_text("*.oasr filter=lfs diff=lfs merge=lfs -text\n")
+    binary = openasr_release_binary()
     for quant in quants:
         result = pack_result(model, quant)
-        shutil.copy2(result["pack_path"], stage / Path(result["pack_path"]).name)
+        source = result["pack_path"]
+        destination = stage / source.name
+        receipt_output = run(
+            [
+                str(binary),
+                "model-pack",
+                "preflight",
+                str(source),
+                "--stage",
+                str(destination),
+                "--json",
+            ]
+        )
+        try:
+            receipt = json.loads(receipt_output)
+        except json.JSONDecodeError as error:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt is not one JSON object for {source}: {error}"
+            )
+        if not isinstance(receipt, dict):
+            reject_staged_pack(
+                destination, f"preflight receipt is not a JSON object for {source}"
+            )
+        if receipt.get("schema") != PREFLIGHT_RECEIPT_SCHEMA:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt schema mismatch for {source}: "
+                f"expected {PREFLIGHT_RECEIPT_SCHEMA}, got {receipt.get('schema')!r}"
+            )
+        expected_route = "asr" if entry.get("kind", "asr-model") == "asr-model" else "aux"
+        if receipt.get("route") != expected_route:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt route mismatch for {source}: "
+                f"expected {expected_route}, got {receipt.get('route')!r}"
+            )
+        if receipt.get("catalog_family_id") != entry["family"]:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt family mismatch for {source}: "
+                f"expected {entry['family']}, got {receipt.get('catalog_family_id')!r}"
+            )
+        build_commit = receipt.get("build_commit")
+        if not isinstance(build_commit, str) or BUILD_COMMIT_RE.fullmatch(build_commit) is None:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt has no pinned 40-hex build_commit for {source}: "
+                f"{build_commit!r}; rebuild through convert.sh with OPENASR_BUILD_COMMIT"
+            )
+        if receipt.get("size_bytes") != result["size_bytes"]:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt size mismatch for {source}: "
+                f"expected {result['size_bytes']}, got {receipt.get('size_bytes')!r}"
+            )
+        expected_content_id = f"sha256:{result['sha256']}"
+        if receipt.get("content_id") != expected_content_id:
+            reject_staged_pack(
+                destination,
+                f"preflight receipt content_id mismatch for {source}: "
+                f"expected {expected_content_id}, got {receipt.get('content_id')!r}"
+            )
 
 
 def hf_readme(model: str) -> str:
@@ -319,7 +305,7 @@ def publish_hf(model: str, entry: dict, quants: list[str], dry_run: bool) -> str
     repo = entry["hf_repo"]
     with tempfile.TemporaryDirectory(prefix=f"openasr-hf-{model}.") as tmp:
         stage = Path(tmp)
-        copy_stage(model, quants, hf_readme(model), stage)
+        copy_stage(model, entry, quants, hf_readme(model), stage)
         commit_stage(stage, f"publish {model} OpenASR packs", use_lfs=not dry_run)
         ensure_hf_repo(repo, token or "", dry_run)
         revision = push_git(stage, hf_remote(repo, token or "DRY_RUN_TOKEN"), dry_run)
@@ -346,11 +332,6 @@ def main(argv: list[str]) -> int:
     entry = catalog[args.model]
     quants = args.quants or list(entry["quants"])
     validate_scope(args.model, quants, list(entry["quants"]))
-    # Before any target sees the packs, every one of them must clear the
-    # client's install-time preflight -- a pack the client would reject is
-    # never uploaded. Applies to dry runs too: the gate validates local
-    # files and must fail the rehearsal exactly like the real publish.
-    preflight_packs_for_install(args.model, quants)
     targets = args.target or list(DEFAULT_TARGETS)
     if "hf" in targets:
         revision = publish_hf(args.model, entry, quants, args.dry_run)

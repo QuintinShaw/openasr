@@ -12,6 +12,10 @@ use crate::models::ggml_asr_executor::{
 use crate::models::policy_resolved_aux_runtime::{
     PolicyResolvedAuxRuntime, PolicyResolvedAuxRuntimeError, resolve_auxiliary_execution_plan,
 };
+use crate::models::{
+    aux_pack_registry::AuxPackKind,
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier},
+};
 use crate::punctuation::{PunctuationError, should_apply_punctuation};
 
 use super::{
@@ -65,33 +69,34 @@ impl PolicyResolvedStreamingPunctuator {
         let Some(pack_path) = resolve_firered_punc_pack_path() else {
             return Ok(None);
         };
-        let prepared_source = match crate::validate_ggml_runtime_source_path(&pack_path) {
-            Ok(source) => source,
+        let verified_pack = match PackVerifier.verify_candidate(PackCandidate::new(&pack_path)) {
+            Ok(verified) => verified,
             Err(error) => {
                 crate::stage_timing::log_detail_event(
                     "native_auxiliary_runtime",
                     format_args!(
-                        "stage=streaming_punctuation event=disabled reason=pack-validation detail={error}"
+                        "stage=streaming_punctuation event=disabled reason=pack-verification detail={error}"
                     ),
                 );
                 return Ok(None);
             }
         };
-        let prepared_preflight =
-            match crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source(
-                &prepared_source,
-            ) {
-                Ok(preflight) => preflight,
-                Err(error) => {
-                    crate::stage_timing::log_detail_event(
-                        "native_auxiliary_runtime",
-                        format_args!(
-                            "stage=streaming_punctuation event=disabled reason=pack-preflight detail={error}"
-                        ),
-                    );
-                    return Ok(None);
-                }
-            };
+        if !matches!(
+            verified_pack.route(),
+            PackRoute::Aux {
+                kind: AuxPackKind::Punctuation,
+                ..
+            }
+        ) {
+            crate::stage_timing::log_detail_event(
+                "native_auxiliary_runtime",
+                format_args!(
+                    "stage=streaming_punctuation event=disabled reason=pack-route-mismatch"
+                ),
+            );
+            return Ok(None);
+        }
+        let prepared_preflight = verified_pack.preflight().clone();
         let prepared_content_id = prepared_preflight.runtime_source.content_id().to_string();
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
@@ -216,11 +221,10 @@ mod tests {
     #[test]
     fn stage_applies_only_to_unpunctuated_architectures() {
         assert!(streaming_punctuation_stage_applies(
-            crate::models::ggml_family_registry::firered_aed_runtime_descriptor_v1()
-                .model_architecture
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID
         ));
         assert!(!streaming_punctuation_stage_applies(
-            crate::qwen3_asr_runtime_descriptor_v1().model_architecture
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID
         ));
         assert!(!streaming_punctuation_stage_applies("no-such-architecture"));
     }

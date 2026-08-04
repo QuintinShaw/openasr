@@ -7,7 +7,7 @@
 //! graph modules.
 
 use crate::adapter_pack::is_moonshine_lora_target_tensor_name;
-use crate::models::ggml_asr_executor::GgmlAsrRuntimeSourcePreflight;
+use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::lora_adapter::{
     LoraResolveError, ResolvedLoraAdapter, ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle,
     adapter_cache_fingerprint, resolve_lora_adapter,
@@ -42,7 +42,7 @@ pub(crate) fn moonshine_adapter_cache_fingerprint(
 pub(crate) fn resolve_moonshine_lora_adapter(
     cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
+    preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<Option<ResolvedLoraAdapterHandle>, MoonshineLoraError> {
     resolve_lora_adapter(
         cache,

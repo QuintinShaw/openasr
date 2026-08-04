@@ -88,10 +88,9 @@ fn installed_capability_pack(home: &Path, model_id_hint: &str) -> Option<PathBuf
     matches.first().map(|pack| pack.path.clone())
 }
 
-/// Whether `path` is a GGUF (`.oasr`) pack, by sniffing the 4-byte magic rather
-/// than trusting the extension. A capability pack may be delivered as either a
-/// pulled GGUF `.oasr` or a raw `.safetensors` (the dev fast path), so loaders
-/// branch on this.
+/// Test-only format discriminator retained for converter parity fixtures.
+/// Production capability runtime ingress accepts verified `.oasr` packs only.
+#[cfg(test)]
 pub(crate) fn is_gguf_capability_pack(path: &Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 4];

@@ -49,7 +49,7 @@ class FamilyCountStringsTest(unittest.TestCase):
             return errors
 
     def test_matching_count_passes(self) -> None:
-        expected = len(drift.LANG_BY_FAMILY)
+        expected = len(drift.MODEL_FAMILY_CAPABILITIES)
         words = {v: k for k, v in drift.WORD_TO_NUMBER.items()}
         word = words[expected]
         errors = self._run_with(f"OpenASR runs {word} native families offline.")

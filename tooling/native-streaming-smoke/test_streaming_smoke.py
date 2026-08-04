@@ -25,6 +25,12 @@ assert SPEC.loader is not None
 sys.modules["streaming_smoke"] = streaming_smoke
 SPEC.loader.exec_module(streaming_smoke)
 
+REPO_ROOT = SCRIPT_PATH.parents[2]
+RUNTIME_FAMILY_BY_PROFILE = streaming_smoke.load_model_family_inventory(
+    REPO_ROOT,
+    streaming_smoke.FAMILIES,
+)
+
 
 class NativeStreamingSmokeTests(unittest.TestCase):
     def test_parse_args_accepts_summary_outputs(self) -> None:
@@ -160,6 +166,7 @@ class NativeStreamingSmokeTests(unittest.TestCase):
                 output,
                 streaming_smoke.FAMILIES[0],
                 Path("qwen.oasr"),
+                RUNTIME_FAMILY_BY_PROFILE,
             ),
             ("qwen3-asr-0.6b:q4_k", "qwen3-asr"),
         )
@@ -170,13 +177,99 @@ class NativeStreamingSmokeTests(unittest.TestCase):
                 output.replace("qwen3-asr", "whisper"),
                 streaming_smoke.FAMILIES[0],
                 Path("qwen.oasr"),
+                RUNTIME_FAMILY_BY_PROFILE,
             )
         with self.assertRaisesRegex(SystemExit, "did not report Model identity"):
             streaming_smoke.check_runtime_family(
                 "- openasr.model.family: qwen3-asr",
                 streaming_smoke.FAMILIES[0],
                 Path("qwen.oasr"),
+                RUNTIME_FAMILY_BY_PROFILE,
             )
+
+    def test_inventory_projection_uses_canonical_profile_ids(self) -> None:
+        self.assertEqual(RUNTIME_FAMILY_BY_PROFILE["qwen"], "qwen3-asr")
+        self.assertEqual(RUNTIME_FAMILY_BY_PROFILE["xasr-zipformer"], "xasr-zipformer")
+
+    def test_inventory_loader_rejects_invalid_or_incomplete_temporary_inventory(self) -> None:
+        def recipe(profile_id: str) -> streaming_smoke.Family:
+            return streaming_smoke.Family(
+                name="fixture",
+                inventory_profile_id=profile_id,
+                source="source",
+                output_name="fixture.oasr",
+                import_args=(),
+            )
+
+        def inventory(*rows: dict) -> dict:
+            return {
+                "schema": streaming_smoke.MODEL_FAMILY_INVENTORY_SCHEMA,
+                "families": list(rows),
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            inventory_path = root / "tooling" / "model-family-inventory.v1.json"
+            inventory_path.parent.mkdir()
+
+            inventory_path.write_text(
+                json.dumps(
+                    inventory(
+                        {
+                            "model_family": "fixture-family",
+                            "conformance": {"profile_id": "fixture"},
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                streaming_smoke.load_model_family_inventory(root, [recipe("fixture")]),
+                {"fixture": "fixture-family"},
+            )
+
+            invalid_schema = inventory_path.read_text(encoding="utf-8")
+            inventory_path.write_text(
+                invalid_schema.replace(
+                    streaming_smoke.MODEL_FAMILY_INVENTORY_SCHEMA,
+                    "openasr.model-family-inventory.v0",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "schema mismatch"):
+                streaming_smoke.load_model_family_inventory(root, [recipe("fixture")])
+
+            inventory_path.write_text(
+                json.dumps(
+                    inventory(
+                        {
+                            "model_family": "fixture-family",
+                            "conformance": {"profile_id": "fixture"},
+                        },
+                        {
+                            "model_family": "other-family",
+                            "conformance": {"profile_id": "fixture"},
+                        },
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "duplicate"):
+                streaming_smoke.load_model_family_inventory(root, [recipe("fixture")])
+
+            inventory_path.write_text(
+                json.dumps(
+                    inventory(
+                        {
+                            "model_family": "fixture-family",
+                            "conformance": {"profile_id": "fixture"},
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "missing from model-family inventory"):
+                streaming_smoke.load_model_family_inventory(root, [recipe("missing")])
 
     def test_final_text_from_line_strips_smoke_prefix(self) -> None:
         self.assertEqual(
@@ -202,6 +295,7 @@ class NativeStreamingSmokeTests(unittest.TestCase):
         repo_root = Path("/repo")
         family = streaming_smoke.Family(
             name="qwen",
+            inventory_profile_id="qwen",
             source="tmp/models/qwen3-asr/Qwen-source",
             output_name="qwen.oasr",
             import_args=(),
@@ -250,6 +344,7 @@ class NativeStreamingSmokeTests(unittest.TestCase):
         repo_root = Path("/repo")
         family = streaming_smoke.Family(
             name="qwen",
+            inventory_profile_id="qwen",
             source="tmp/models/qwen3-asr/Qwen-source",
             output_name="qwen.oasr",
             import_args=(),
@@ -308,6 +403,7 @@ class NativeStreamingSmokeTests(unittest.TestCase):
         )
         family = streaming_smoke.Family(
             name="qwen",
+            inventory_profile_id="qwen",
             source="missing/source",
             output_name="unused.oasr",
             import_args=("model-pack", "import", "qwen", "{source}", "{output}"),
@@ -341,6 +437,7 @@ class NativeStreamingSmokeTests(unittest.TestCase):
                         max_ms=4000,
                         family=family,
                         skip_import=False,
+                        runtime_family_by_profile=RUNTIME_FAMILY_BY_PROFILE,
                         pack_override=str(pack),
                     )
             finally:

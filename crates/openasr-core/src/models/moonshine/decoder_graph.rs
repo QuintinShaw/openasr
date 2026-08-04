@@ -47,6 +47,12 @@ const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// `16_384` headroom (`moonshine_encoder_graph_config`).
 const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
 
+enum RuntimeWeightSource<'a> {
+    Verified(&'a GgufRuntimeSourcePreflight),
+    #[cfg(test)]
+    Synthetic,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MoonshineDecodeOutput {
     pub transcription: Transcription,
@@ -449,7 +455,7 @@ impl MoonshineDecoderGraphRuntime {
     pub(crate) fn new(
         input: MoonshineDecoderRuntimeInput<'_>,
         prefer_cpu_backend: bool,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq(
@@ -464,6 +470,25 @@ impl MoonshineDecoderGraphRuntime {
         )
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_synthetic(
+        input: MoonshineDecoderRuntimeInput<'_>,
+        prefer_cpu_backend: bool,
+        adapter: Option<&MoonshineLoraAdapter>,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            input.decoder_weights,
+            input.metadata,
+            input.decoder_state,
+            input.backend,
+            prefer_cpu_backend,
+            RuntimeWeightSource::Synthetic,
+            1,
+            adapter,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_n_seq(
         decoder_weights: &MoonshineDecoderWeights,
@@ -471,7 +496,53 @@ impl MoonshineDecoderGraphRuntime {
         decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
-        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        n_seq: usize,
+        adapter: Option<&MoonshineLoraAdapter>,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            backend,
+            prefer_cpu_backend,
+            RuntimeWeightSource::Verified(runtime_preflight),
+            n_seq,
+            adapter,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_n_seq_synthetic(
+        decoder_weights: &MoonshineDecoderWeights,
+        metadata: MoonshineExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        n_seq: usize,
+        adapter: Option<&MoonshineLoraAdapter>,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            backend,
+            prefer_cpu_backend,
+            RuntimeWeightSource::Synthetic,
+            n_seq,
+            adapter,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_n_seq_impl(
+        decoder_weights: &MoonshineDecoderWeights,
+        metadata: MoonshineExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        runtime_source: RuntimeWeightSource<'_>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
@@ -518,11 +589,15 @@ impl MoonshineDecoderGraphRuntime {
         // mmap'd pack (native q8_0 [in,out]); the loader supplies them meta-only, so
         // binding is mandatory. The tied embedding stays arena-resident (it feeds
         // get_rows + tied-logits mul_mat and is loaded full).
-        let loaded_weights = runtime_preflight.and_then(|preflight| {
-            runner
-                .load_gguf_weight_context_from_preflight(preflight)
-                .ok()
-        });
+        let loaded_weights = match runtime_source {
+            RuntimeWeightSource::Verified(preflight) => Some(
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(build_err("load_gguf_weight_context"))?,
+            ),
+            #[cfg(test)]
+            RuntimeWeightSource::Synthetic => None,
+        };
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
@@ -2749,20 +2824,20 @@ mod tests {
     use super::*;
     use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
     use crate::{
-        GgmlAsrRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
+        GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
         read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
     };
 
     const MOONSHINE_BATCH_REAL_PACK_ENV: &str = "OPENASR_MOONSHINE_BATCH_REAL_PACK";
 
-    fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {
+    fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
         let runtime_source =
             validate_ggml_runtime_source_path(runtime_path).expect("valid runtime source path");
         let metadata =
             read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
         let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
             .expect("read gguf tensor index");
-        GgmlAsrRuntimeSourcePreflight {
+        GgufRuntimeSourcePreflight {
             runtime_source,
             metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
@@ -2870,7 +2945,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight),
+            &preflight,
             None,
         )
         .expect("serial runtime 0");
@@ -2889,7 +2964,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight),
+            &preflight,
             None,
         )
         .expect("serial runtime 1");
@@ -2906,7 +2981,7 @@ mod tests {
             decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
-            Some(&preflight),
+            &preflight,
             2,
             None,
         )
@@ -2955,7 +3030,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight),
+            &preflight,
             None,
         )
         .expect("serial runtime 0");
@@ -2979,7 +3054,7 @@ mod tests {
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
             false,
-            Some(&preflight),
+            &preflight,
             None,
         )
         .expect("serial runtime 1");
@@ -3001,7 +3076,7 @@ mod tests {
             decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
-            Some(&preflight),
+            &preflight,
             2,
             None,
         )

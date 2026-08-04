@@ -1,0 +1,2141 @@
+{
+  "schema": "openasr.model-family-inventory.v1",
+  "families": [
+    {
+      "catalog_family_id": "cohere",
+      "model_family": "cohere-transcribe",
+      "model_architecture": "cohere-transcribe-conformer-transformer",
+      "runtime_architecture_aliases": [
+        "cohere-transcribe"
+      ],
+      "adapter_id": "ggml-family-cohere-transcribe-runtime-v1",
+      "module_slug": "cohere",
+      "language": {
+        "policy": "selects-via-prompt",
+        "default_language": "en",
+        "reject_reason": null,
+        "languages": [
+          "ar",
+          "de",
+          "el",
+          "en",
+          "es",
+          "fr",
+          "it",
+          "ja",
+          "ko",
+          "nl",
+          "pl",
+          "pt",
+          "vi",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "cohere-transcribe.logmel128.preemphasis.16khz.mono.v0",
+        "decode_policy_id": "cohere-transcribe.greedy.seq2seq.v1",
+        "runtime_tensor_contract_id": "cohere-transcribe.runtime-tensors.v1",
+        "tokenizer_id": "cohere-transcribe.spm.v1",
+        "hparam_schema": [
+          "cohere_transcribe.vocab_size",
+          "cohere_transcribe.encoder.n_layers",
+          "cohere_transcribe.encoder.d_model",
+          "cohere_transcribe.encoder.n_heads",
+          "cohere_transcribe.encoder.head_dim",
+          "cohere_transcribe.encoder.ffn_dim",
+          "cohere_transcribe.encoder.conv_kernel",
+          "cohere_transcribe.decoder.n_layers",
+          "cohere_transcribe.decoder.d_model",
+          "cohere_transcribe.decoder.n_heads",
+          "cohere_transcribe.decoder.head_dim",
+          "cohere_transcribe.decoder.ffn_dim",
+          "cohere_transcribe.decoder.max_ctx",
+          "cohere_transcribe.decoder.start_token_id",
+          "cohere_transcribe.audio.sample_rate",
+          "cohere_transcribe.audio.n_mels",
+          "cohere_transcribe.audio.n_fft",
+          "cohere_transcribe.audio.hop_length",
+          "cohere_transcribe.audio.win_length"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_cohere_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "cohere-transcribe.ggml-executor.v1",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": true,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "shared-cohere-transcribe-v1",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "shared",
+        "block_stack_reason": null,
+        "decoder_state": "encoder-decoder-self-and-cross-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": true,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "cohere",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "dolphin",
+      "model_family": "dolphin",
+      "model_architecture": "dolphin-ebranchformer-ctc-attention",
+      "runtime_architecture_aliases": [
+        "dolphin-ebranchformer-ctc-attention",
+        "dolphin"
+      ],
+      "adapter_id": "ggml-family-dolphin-runtime-v1",
+      "module_slug": "dolphin",
+      "language": {
+        "policy": "selects-via-prompt",
+        "default_language": "zh",
+        "reject_reason": null,
+        "languages": [
+          "zh"
+        ],
+        "dialect_mode": "selects-via-prompt",
+        "selectable_dialect_codes": [
+          "zh-anhui",
+          "zh-guangdong",
+          "zh-hebei",
+          "zh-hubei",
+          "zh-jiangsu",
+          "zh-ningxia",
+          "zh-shaanxi",
+          "zh-shandong",
+          "zh-shanghai",
+          "zh-shanxi",
+          "zh-sichuan",
+          "zh-tianjin",
+          "zh-tw"
+        ]
+      },
+      "pack": {
+        "audio_frontend_id": "dolphin.fbank80.16khz.mono.v0",
+        "decode_policy_id": "dolphin.attention-rescoring.v0",
+        "runtime_tensor_contract_id": "dolphin.runtime-tensors.v0",
+        "tokenizer_id": "dolphin.char.v0",
+        "hparam_schema": [
+          "dolphin.encoder.n_layers",
+          "dolphin.encoder.d_model",
+          "dolphin.encoder.n_heads",
+          "dolphin.encoder.head_dim",
+          "dolphin.encoder.ffn_dim",
+          "dolphin.encoder.cgmlp_units",
+          "dolphin.encoder.cgmlp_kernel",
+          "dolphin.encoder.merge_kernel",
+          "dolphin.encoder.feature_dim",
+          "dolphin.encoder.max_ctx",
+          "dolphin.decoder.n_layers",
+          "dolphin.decoder.n_heads",
+          "dolphin.decoder.ffn_dim",
+          "dolphin.decoder.max_ctx",
+          "dolphin.vocab_size",
+          "dolphin.sos_token_id",
+          "dolphin.eos_token_id",
+          "ctc.blank_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_dolphin_wenet_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "dolphin.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": false,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "requires-tensor",
+        "phrase_bias_required_tensor": "context_module.context_extractor.word_embedding.weight",
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "dedicated",
+        "decode_driver_reason": "Dolphin attention rescoring is a second-pass topology outside the shared CTC and seq2seq greedy drivers.",
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "Dolphin composes a Wenet encoder with architecture-specific attention rescoring.",
+        "decoder_state": "none"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "last"
+      },
+      "conformance": {
+        "profile_id": "dolphin",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "firered-aed",
+      "model_family": "firered-aed",
+      "model_architecture": "firered-conformer-aed",
+      "runtime_architecture_aliases": [
+        "firered-conformer-aed",
+        "firered-aed"
+      ],
+      "adapter_id": "ggml-family-firered-aed-runtime-v1",
+      "module_slug": "firered_aed",
+      "language": {
+        "policy": "fixed-multilingual",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "en",
+          "zh"
+        ],
+        "dialect_mode": "recognizes-catalog-declared",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "firered-aed.fbank80.16khz.mono.v0",
+        "decode_policy_id": "firered-aed.greedy.seq2seq.v0",
+        "runtime_tensor_contract_id": "firered-aed.runtime-tensors.v0",
+        "tokenizer_id": "firered-aed.char-spm.v0",
+        "hparam_schema": [
+          "firered.encoder.n_layers",
+          "firered.encoder.d_model",
+          "firered.encoder.n_heads",
+          "firered.encoder.head_dim",
+          "firered.encoder.ffn_dim",
+          "firered.encoder.conv_kernel",
+          "firered.encoder.subsample_channels",
+          "firered.encoder.subsample_out_dim",
+          "firered.encoder.feature_dim",
+          "firered.encoder.pe_len",
+          "firered.decoder.n_layers",
+          "firered.decoder.ffn_dim",
+          "firered.decoder.pe_len",
+          "firered.vocab_size",
+          "firered.sos_token_id",
+          "firered.eos_token_id",
+          "firered.pad_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_firered_aed_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "firered-aed.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": false,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "FireRed AED's Conformer encoder and attention decoder are not yet represented by the shared block composer.",
+        "decoder_state": "encoder-decoder-self-and-cross-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "firered-aed",
+        "reference_dumper_source": "tooling/firered2-reference-dumper/dump_aed_encoder.py"
+      }
+    },
+    {
+      "catalog_family_id": "firered2-llm",
+      "model_family": "firered2-llm",
+      "model_architecture": "firered-llm-conformer-adapter-qwen2",
+      "runtime_architecture_aliases": [
+        "firered-llm-conformer-adapter-qwen2",
+        "firered2-llm"
+      ],
+      "adapter_id": "ggml-family-firered-llm-runtime-v1",
+      "module_slug": "firered_llm",
+      "language": {
+        "policy": "fixed-multilingual",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "en",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "firered-llm.fbank80.16khz.mono.v0",
+        "decode_policy_id": "firered-llm.greedy.seq2seq.v0",
+        "runtime_tensor_contract_id": "firered-llm.runtime-tensors.v0",
+        "tokenizer_id": "firered-llm.qwen2-bpe.v0",
+        "hparam_schema": [
+          "firered.encoder.n_layers",
+          "firered.encoder.d_model",
+          "firered.encoder.n_heads",
+          "firered.encoder.head_dim",
+          "firered.encoder.ffn_dim",
+          "firered.encoder.conv_kernel",
+          "firered.encoder.subsample_channels",
+          "firered.encoder.subsample_out_dim",
+          "firered.encoder.feature_dim",
+          "firered.encoder.pe_len",
+          "firered_llm.adapter.downsample_rate",
+          "firered_llm.adapter.llm_dim",
+          "firered_llm.llm.n_layers",
+          "firered_llm.llm.d_model",
+          "firered_llm.llm.n_heads",
+          "firered_llm.llm.n_kv_heads",
+          "firered_llm.llm.head_dim",
+          "firered_llm.llm.ffn_dim",
+          "firered_llm.llm.vocab_size",
+          "firered_llm.llm.max_positions",
+          "firered_llm.llm.chatml_im_start_token_id",
+          "firered_llm.llm.chatml_im_end_token_id",
+          "firered_llm.llm.endoftext_token_id",
+          "firered_llm.llm.speech_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_firered_llm_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "firered-llm.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": null,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 40.0
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "FireRed LLM composes a speech encoder and adapter with a Qwen language-model backbone.",
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "firered2-llm",
+        "reference_dumper_source": "tooling/firered2-reference-dumper/dump_reference.py"
+      }
+    },
+    {
+      "catalog_family_id": "funasr-nano",
+      "model_family": "funasr-nano",
+      "model_architecture": "funasr-nano-sanm-adapter-qwen3",
+      "runtime_architecture_aliases": [
+        "funasr-nano-sanm-adapter-qwen3",
+        "funasr-nano"
+      ],
+      "adapter_id": "ggml-family-funasr-nano-runtime-v1",
+      "module_slug": "funasr_nano",
+      "language": {
+        "policy": "fixed-multilingual",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "en",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "funasr-nano.fbank80-lfr.16khz.mono.v0",
+        "decode_policy_id": "funasr-nano.greedy.seq2seq.v0",
+        "runtime_tensor_contract_id": "funasr-nano.runtime-tensors.v0",
+        "tokenizer_id": "funasr-nano.qwen3-bpe.v0",
+        "hparam_schema": [
+          "funasr.enc.n_layers",
+          "funasr.enc.tp_blocks",
+          "funasr.enc.d_model",
+          "funasr.enc.n_heads",
+          "funasr.enc.head_dim",
+          "funasr.enc.ffn_dim",
+          "funasr.enc.fsmn_kernel",
+          "funasr.enc.feature_dim",
+          "funasr.adp.n_layers",
+          "funasr.adp.n_heads",
+          "funasr.adp.encoder_dim",
+          "funasr.adp.llm_dim",
+          "funasr.llm.n_layers",
+          "funasr.llm.d_model",
+          "funasr.llm.n_heads",
+          "funasr.llm.n_kv_heads",
+          "funasr.llm.head_dim",
+          "funasr.llm.ffn_dim",
+          "funasr.llm.vocab_size",
+          "funasr.llm.max_positions",
+          "funasr.llm.chatml_im_start_token_id",
+          "funasr.llm.chatml_im_end_token_id",
+          "funasr.llm.endoftext_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_funasr_nano_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "funasr-nano.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": null,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 40.0
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "FunASR Nano composes a SAN-M encoder and adaptor with a Qwen language-model decoder.",
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "funasr-nano",
+        "reference_dumper_source": "tooling/publish-model/scripts/funasr_nano_reference_oracle.py"
+      }
+    },
+    {
+      "catalog_family_id": "granite-speech",
+      "model_family": "granite-speech",
+      "model_architecture": "granite-speech",
+      "runtime_architecture_aliases": [
+        "granite-speech"
+      ],
+      "adapter_id": "ggml-family-granite-speech-runtime-v1",
+      "module_slug": "granite_speech",
+      "language": {
+        "policy": "self-detects-rejects-hint",
+        "default_language": null,
+        "reject_reason": "Granite Speech auto-detects the source language through free-text prompting and does not accept an explicit selection.",
+        "languages": [
+          "de",
+          "en",
+          "es",
+          "fr",
+          "ja",
+          "pt"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "granite-speech.mel80x2.16khz.mono.v0",
+        "decode_policy_id": "granite-speech.greedy.seq2seq.v0",
+        "runtime_tensor_contract_id": "granite-speech.runtime-tensors.v0",
+        "tokenizer_id": "granite-speech.gpt2-bpe.v0",
+        "hparam_schema": [
+          "granite_speech.audio_token_index",
+          "granite_speech.downsample_rate",
+          "granite_speech.window_size",
+          "granite_speech.encoder.input_dim",
+          "granite_speech.encoder.hidden_dim",
+          "granite_speech.encoder.num_layers",
+          "granite_speech.encoder.num_heads",
+          "granite_speech.encoder.dim_head",
+          "granite_speech.encoder.feedforward_mult",
+          "granite_speech.encoder.conv_kernel_size",
+          "granite_speech.encoder.conv_expansion_factor",
+          "granite_speech.encoder.context_size",
+          "granite_speech.encoder.max_pos_emb",
+          "granite_speech.encoder.output_dim",
+          "granite_speech.projector.hidden_size",
+          "granite_speech.projector.encoder_hidden_size",
+          "granite_speech.projector.num_hidden_layers",
+          "granite_speech.projector.num_attention_heads",
+          "granite_speech.projector.intermediate_size",
+          "granite_speech.projector.cross_attention_frequency",
+          "granite_speech.decoder.hidden_size",
+          "granite_speech.decoder.num_hidden_layers",
+          "granite_speech.decoder.num_attention_heads",
+          "granite_speech.decoder.num_key_value_heads",
+          "granite_speech.decoder.head_dim",
+          "granite_speech.decoder.intermediate_size",
+          "granite_speech.decoder.vocab_size",
+          "granite_speech.decoder.rms_norm_eps",
+          "granite_speech.decoder.rope_theta",
+          "granite_speech.decoder.attention_multiplier",
+          "granite_speech.decoder.embedding_multiplier",
+          "granite_speech.decoder.residual_multiplier",
+          "granite_speech.decoder.logits_scaling"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_granite_speech_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "granite-speech.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 381.0
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "Granite Speech composes a Conformer encoder and Q-Former projector with its language-model decoder.",
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "local-chunked",
+        "encoder_attention_max_safe_chunk_seconds": null,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "granite-speech",
+        "reference_dumper_source": "tooling/granite-speech-reference-dumper/dump_golden.py"
+      }
+    },
+    {
+      "catalog_family_id": "mimo-asr",
+      "model_family": "mimo-asr",
+      "model_architecture": "mimo-asr",
+      "runtime_architecture_aliases": [
+        "mimo-asr"
+      ],
+      "adapter_id": "ggml-family-mimo-asr-runtime-v1",
+      "module_slug": "mimo_asr",
+      "language": {
+        "policy": "fixed-multilingual",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "en",
+          "yue",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "mimo-tokenizer-rvq-v0",
+        "decode_policy_id": "mimo-asr.greedy.seq2seq.v0",
+        "runtime_tensor_contract_id": "mimo-asr.runtime-tensors.v0",
+        "tokenizer_id": "mimo-asr.gpt2-bpe.v0",
+        "hparam_schema": [
+          "mimo.llm.block_count",
+          "mimo.llm.embedding_length",
+          "mimo.llm.attention.head_count",
+          "mimo.llm.attention.head_count_kv",
+          "mimo.llm.attention.key_length",
+          "mimo.llm.feed_forward_length",
+          "mimo.llm.vocab_size",
+          "mimo.llm.context_length",
+          "mimo.llm.attention.layer_norm_rms_epsilon",
+          "mimo.llm.rope.freq_base",
+          "mimo.llm.attention.qkv_bias",
+          "mimo.llm.attention.qk_norm",
+          "mimo.audio.channels",
+          "mimo.audio.group_size",
+          "mimo.inlocal.block_count",
+          "mimo.inlocal.embedding_length",
+          "mimo.inlocal.attention.head_count",
+          "mimo.inlocal.attention.head_dim",
+          "mimo.inlocal.feed_forward_length",
+          "mimo.inlocal.full_attention",
+          "mimo.inlocal.rope.freq_base",
+          "mimo.tok.block_count",
+          "mimo.tok.embedding_length",
+          "mimo.tok.attention.head_count",
+          "mimo.tok.feed_forward_length",
+          "mimo.tok.encoder.skip_layer_id",
+          "mimo.tok.conv.kernel_size",
+          "mimo.tok.conv1.stride",
+          "mimo.tok.conv2.stride",
+          "mimo.tok.down_sample.stride",
+          "mimo.tok.rope.freq_base",
+          "mimo.tok.rvq.num_quantizers_packed",
+          "mimo.tok.rvq.codebook_sizes",
+          "mimo.mel.sample_rate",
+          "mimo.mel.n_fft",
+          "mimo.mel.hop_length",
+          "mimo.mel.win_length",
+          "mimo.mel.n_mels",
+          "mimo.mel.log_clip",
+          "mimo.special.eos_id",
+          "mimo.special.im_start_id",
+          "mimo.special.im_end_id",
+          "mimo.special.sosp_id",
+          "mimo.special.eosp_id",
+          "mimo.special.empty_id",
+          "mimo.special.eot_id",
+          "mimo.special.eostm_id"
+        ],
+        "importer": {
+          "kind": "external-tooling",
+          "symbol": null,
+          "relative_path": "tooling/mimo-asr/convert_mimo_asr.py"
+        }
+      },
+      "execution": {
+        "executor_component_id": "mimo-asr.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": null,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 30.0
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "MiMo composes a speech tokenizer and input-local adapter with its language-model decoder.",
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "mimo-asr",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "moonshine",
+      "model_family": "moonshine",
+      "model_architecture": "moonshine-encoder-decoder",
+      "runtime_architecture_aliases": [
+        "moonshine",
+        "moonshine-encoder-decoder"
+      ],
+      "adapter_id": "ggml-family-moonshine-runtime-v1",
+      "module_slug": "moonshine",
+      "language": {
+        "policy": "fixed-monolingual",
+        "default_language": "en",
+        "reject_reason": null,
+        "languages": [
+          "en"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "moonshine.raw-waveform.16khz.mono.v0",
+        "decode_policy_id": "moonshine.greedy.seq2seq.v1",
+        "runtime_tensor_contract_id": "moonshine.runtime-tensors.v0",
+        "tokenizer_id": "moonshine.spm-bpe.v0",
+        "hparam_schema": [
+          "moonshine.vocab_size",
+          "moonshine.d_model",
+          "moonshine.encoder.n_layers",
+          "moonshine.decoder.n_layers",
+          "moonshine.n_heads",
+          "moonshine.head_dim",
+          "moonshine.rotary_dim",
+          "moonshine.rope_theta",
+          "moonshine.encoder.ffn_dim",
+          "moonshine.decoder.ffn_dim",
+          "moonshine.decoder.max_ctx",
+          "moonshine.decoder.bos_token_id",
+          "moonshine.decoder.eos_token_id",
+          "moonshine.audio.sample_rate"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_moonshine_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "moonshine.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": true,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "Moonshine's convolutional encoder and decoder graph are not represented by the shared block composer.",
+        "decoder_state": "encoder-decoder-self-and-cross-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "moonshine",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "moss-transcribe-diarize",
+      "model_family": "moss-transcribe-diarize",
+      "model_architecture": "moss-transcribe-diarize-whisper-qwen3",
+      "runtime_architecture_aliases": [
+        "moss-transcribe-diarize-whisper-qwen3"
+      ],
+      "adapter_id": "ggml-family-moss-transcribe-diarize-runtime-v1",
+      "module_slug": "moss_transcribe_diarize",
+      "language": {
+        "policy": "self-detects-rejects-hint",
+        "default_language": null,
+        "reject_reason": "MOSS-Transcribe-Diarize auto-detects the source language via its Qwen3 decoder and does not accept an explicit selection; use a multilingual Whisper pack to force or report a language.",
+        "languages": [
+          "de",
+          "en",
+          "es",
+          "fr",
+          "it",
+          "ja",
+          "ko",
+          "pt",
+          "ru",
+          "th",
+          "tl",
+          "tr",
+          "ur",
+          "vi",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "moss-transcribe-diarize.fbank80.16khz.mono.v0",
+        "decode_policy_id": "moss-transcribe-diarize.greedy.seq2seq.v0",
+        "runtime_tensor_contract_id": "moss-transcribe-diarize.runtime-tensors.v0",
+        "tokenizer_id": "moss-transcribe-diarize.qwen3-bpe.v0",
+        "hparam_schema": [
+          "moss_td.encoder.n_layers",
+          "moss_td.encoder.d_model",
+          "moss_td.encoder.n_heads",
+          "moss_td.encoder.ffn_dim",
+          "moss_td.encoder.n_mels",
+          "moss_td.encoder.max_source_positions",
+          "moss_td.adaptor.merge_size",
+          "moss_td.adaptor.input_dim",
+          "moss_td.llm.n_layers",
+          "moss_td.llm.d_model",
+          "moss_td.llm.ffn_dim",
+          "moss_td.llm.n_heads",
+          "moss_td.llm.n_kv_heads",
+          "moss_td.llm.head_dim",
+          "moss_td.llm.vocab_size",
+          "moss_td.llm.max_positions",
+          "moss_td.llm.audio_start_token_id",
+          "moss_td.llm.audio_end_token_id",
+          "moss_td.llm.audio_pad_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_moss_transcribe_diarize_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "moss-transcribe-diarize.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "in-decoder",
+        "emits_punctuation": null,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 60.0
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "MOSS transcription/diarization uses an architecture-specific audio encoder and decoder graph.",
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "fixed-window",
+        "encoder_attention_max_safe_chunk_seconds": null,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "moss-transcribe-diarize",
+        "reference_dumper_source": "tooling/moss-reference-dumper/dump_golden.py"
+      }
+    },
+    {
+      "catalog_family_id": "parakeet",
+      "model_family": "parakeet-ctc",
+      "model_architecture": "parakeet-fastconformer-ctc",
+      "runtime_architecture_aliases": [
+        "parakeet-ctc",
+        "parakeet"
+      ],
+      "adapter_id": "ggml-family-parakeet-ctc-runtime-v1",
+      "module_slug": "parakeet_ctc",
+      "language": {
+        "policy": "fixed-monolingual",
+        "default_language": "en",
+        "reject_reason": null,
+        "languages": [
+          "en"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "parakeet-ctc.logmel80.16khz.mono.v0",
+        "decode_policy_id": "parakeet-ctc.greedy.ctc.v0",
+        "runtime_tensor_contract_id": "parakeet-ctc.runtime-tensors.v0",
+        "tokenizer_id": "parakeet-ctc.spm-bpe.v0",
+        "hparam_schema": [
+          "parakeet.n_layers",
+          "parakeet.hidden_size",
+          "parakeet.n_heads",
+          "parakeet.head_dim",
+          "parakeet.ffn_dim",
+          "parakeet.conv_kernel",
+          "parakeet.n_mels",
+          "parakeet.subsampling_factor",
+          "parakeet.subsampling_channels",
+          "parakeet.vocab_size",
+          "ctc.blank_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_parakeet_ctc_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "parakeet-ctc.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": false
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": null,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-ctc-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "shared",
+        "block_stack_reason": null,
+        "decoder_state": "none"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "parakeet",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "parakeet-tdt",
+      "model_family": "parakeet-tdt",
+      "model_architecture": "parakeet-fastconformer-tdt",
+      "runtime_architecture_aliases": [
+        "parakeet-tdt"
+      ],
+      "adapter_id": "ggml-family-parakeet-tdt-runtime-v1",
+      "module_slug": "parakeet_tdt",
+      "language": {
+        "policy": "fixed-multilingual",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "bg",
+          "cs",
+          "da",
+          "de",
+          "el",
+          "en",
+          "es",
+          "et",
+          "fi",
+          "fr",
+          "hr",
+          "hu",
+          "it",
+          "lt",
+          "lv",
+          "mt",
+          "nl",
+          "pl",
+          "pt",
+          "ro",
+          "ru",
+          "sk",
+          "sl",
+          "sv",
+          "uk"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "parakeet-tdt.logmel128.16khz.mono.v0",
+        "decode_policy_id": "parakeet-tdt.greedy.tdt.v0",
+        "runtime_tensor_contract_id": "parakeet-tdt.runtime-tensors.v0",
+        "tokenizer_id": "parakeet-tdt.spm-bpe.v0",
+        "hparam_schema": [
+          "parakeet-tdt.n_layers",
+          "parakeet-tdt.hidden_size",
+          "parakeet-tdt.n_heads",
+          "parakeet-tdt.head_dim",
+          "parakeet-tdt.ffn_dim",
+          "parakeet-tdt.conv_kernel",
+          "parakeet-tdt.n_mels",
+          "parakeet-tdt.subsampling_factor",
+          "parakeet-tdt.subsampling_channels",
+          "parakeet-tdt.scale_input",
+          "parakeet-tdt.vocab_size",
+          "parakeet-tdt.blank_token_id",
+          "parakeet-tdt.pred_hidden",
+          "parakeet-tdt.pred_layers",
+          "parakeet-tdt.joint_hidden",
+          "parakeet-tdt.n_durations",
+          "parakeet-tdt.durations",
+          "parakeet-tdt.max_symbols_per_step"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_parakeet_tdt_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "parakeet-tdt.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": false
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "dedicated",
+        "decode_driver_reason": "TDT transducer decoding requires predictor and joint-network state that is neither CTC nor seq2seq greedy.",
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "TDT requires encoder, predictor, and joint-network graph orchestration.",
+        "decoder_state": "none"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "parakeet-tdt",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "qwen",
+      "model_family": "qwen3-asr",
+      "model_architecture": "qwen3-asr-encoder-decoder",
+      "runtime_architecture_aliases": [
+        "qwen3-asr"
+      ],
+      "adapter_id": "ggml-family-qwen3-asr-runtime-v1",
+      "module_slug": "qwen",
+      "language": {
+        "policy": "self-detects-rejects-hint",
+        "default_language": null,
+        "reject_reason": "Qwen3-ASR auto-detects the source language and does not accept an explicit selection; use a multilingual Whisper pack to force or report a language.",
+        "languages": [
+          "ar",
+          "cs",
+          "da",
+          "de",
+          "el",
+          "en",
+          "es",
+          "fa",
+          "fi",
+          "fil",
+          "fr",
+          "hi",
+          "hu",
+          "id",
+          "it",
+          "ja",
+          "ko",
+          "mk",
+          "ms",
+          "nl",
+          "pl",
+          "pt",
+          "ro",
+          "ru",
+          "sv",
+          "th",
+          "tr",
+          "vi",
+          "zh"
+        ],
+        "dialect_mode": "recognizes-catalog-declared",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "qwen3-asr.fbank.16khz.mono.v0",
+        "decode_policy_id": "qwen3-asr.greedy.seq2seq.v1",
+        "runtime_tensor_contract_id": "qwen3-asr.runtime-tensors.v1",
+        "tokenizer_id": "qwen3-asr.spm.v1",
+        "hparam_schema": [
+          "qwen3-asr.sample_rate",
+          "qwen3-asr.n_mels",
+          "qwen3-asr.n_fft",
+          "qwen3-asr.win_length",
+          "qwen3-asr.hop_length",
+          "qwen3-asr.audio.n_layers",
+          "qwen3-asr.audio.d_model",
+          "qwen3-asr.audio.n_heads",
+          "qwen3-asr.llm.n_layers",
+          "qwen3-asr.llm.d_model",
+          "qwen3-asr.llm.n_heads",
+          "qwen3-asr.llm.n_kv_heads",
+          "qwen3-asr.llm.head_dim",
+          "qwen3-asr.llm.vocab_size",
+          "qwen3-asr.llm.max_pos",
+          "qwen3-asr.audio_start_token_id",
+          "qwen3-asr.audio_end_token_id",
+          "qwen3-asr.audio_pad_token_id",
+          "qwen3-asr.eos_token_id",
+          "qwen3-asr.pad_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_qwen_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "qwen3-asr.ggml-executor.v1",
+        "executor": "native-graph-lowering-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": true,
+        "prepared_runtime": "shared-qwen3-asr-v1",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "shared",
+        "block_stack_reason": null,
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
+      },
+      "conformance": {
+        "profile_id": "qwen",
+        "reference_dumper_source": "tooling/qwen-reference-dumper/dump_golden.py"
+      }
+    },
+    {
+      "catalog_family_id": "sensevoice",
+      "model_family": "sensevoice",
+      "model_architecture": "sensevoice-sanm-ctc",
+      "runtime_architecture_aliases": [
+        "sensevoice-sanm-ctc",
+        "sensevoice"
+      ],
+      "adapter_id": "ggml-family-sensevoice-runtime-v1",
+      "module_slug": "sensevoice",
+      "language": {
+        "policy": "detect-and-selects-via-prompt",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "en",
+          "ja",
+          "ko",
+          "yue",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "sensevoice.fbank80-lfr7x6.16khz.mono.v0",
+        "decode_policy_id": "sensevoice.greedy.ctc.v0",
+        "runtime_tensor_contract_id": "sensevoice.runtime-tensors.v0",
+        "tokenizer_id": "sensevoice.spm-bpe.v0",
+        "hparam_schema": [
+          "sensevoice.n_layers",
+          "sensevoice.tp_layers",
+          "sensevoice.d_model",
+          "sensevoice.n_heads",
+          "sensevoice.ffn_dim",
+          "sensevoice.fsmn_kernel",
+          "sensevoice.feature_dim",
+          "sensevoice.vocab_size",
+          "ctc.blank_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_sensevoice_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "sensevoice.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": false
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-ctc-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "shared",
+        "block_stack_reason": null,
+        "decoder_state": "none"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "sensevoice",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "wav2vec2",
+      "model_family": "wav2vec2-ctc",
+      "model_architecture": "wav2vec2-ctc",
+      "runtime_architecture_aliases": [
+        "wav2vec2-ctc",
+        "wav2vec2"
+      ],
+      "adapter_id": "ggml-family-wav2vec2-ctc-runtime-v1",
+      "module_slug": "wav2vec2_ctc",
+      "language": {
+        "policy": "fixed-monolingual",
+        "default_language": "en",
+        "reject_reason": null,
+        "languages": [
+          "en"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "wav2vec2-ctc.raw-waveform.16khz.mono.v0",
+        "decode_policy_id": "wav2vec2-ctc.greedy.ctc.v0",
+        "runtime_tensor_contract_id": "wav2vec2-ctc.runtime-tensors.v0",
+        "tokenizer_id": "wav2vec2-ctc.char.v0",
+        "hparam_schema": [
+          "wav2vec2.n_layers",
+          "wav2vec2.hidden_size",
+          "wav2vec2.n_heads",
+          "wav2vec2.head_dim",
+          "wav2vec2.ffn_dim",
+          "wav2vec2.vocab_size",
+          "wav2vec2.num_conv_pos_embeddings",
+          "wav2vec2.num_conv_pos_embedding_groups",
+          "ctc.blank_token_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_wav2vec2_ctc_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "wav2vec2-ctc.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": false
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": null,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-ctc-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "shared",
+        "block_stack_reason": null,
+        "decoder_state": "none"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "wav2vec2",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "whisper",
+      "model_family": "whisper",
+      "model_architecture": "whisper-encoder-decoder",
+      "runtime_architecture_aliases": [
+        "whisper"
+      ],
+      "adapter_id": "ggml-family-whisper-runtime-v1",
+      "module_slug": "whisper",
+      "language": {
+        "policy": "whisper-vocab-gated",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "af",
+          "am",
+          "ar",
+          "as",
+          "az",
+          "ba",
+          "be",
+          "bg",
+          "bn",
+          "bo",
+          "br",
+          "bs",
+          "ca",
+          "cs",
+          "cy",
+          "da",
+          "de",
+          "el",
+          "en",
+          "es",
+          "et",
+          "eu",
+          "fa",
+          "fi",
+          "fo",
+          "fr",
+          "gl",
+          "gu",
+          "ha",
+          "haw",
+          "he",
+          "hi",
+          "hr",
+          "ht",
+          "hu",
+          "hy",
+          "id",
+          "is",
+          "it",
+          "ja",
+          "jv",
+          "ka",
+          "kk",
+          "km",
+          "kn",
+          "ko",
+          "la",
+          "lb",
+          "ln",
+          "lo",
+          "lt",
+          "lv",
+          "mg",
+          "mi",
+          "mk",
+          "ml",
+          "mn",
+          "mr",
+          "ms",
+          "mt",
+          "my",
+          "ne",
+          "nl",
+          "no",
+          "oc",
+          "pa",
+          "pl",
+          "ps",
+          "pt",
+          "ro",
+          "ru",
+          "sa",
+          "sd",
+          "si",
+          "sk",
+          "sl",
+          "sn",
+          "so",
+          "sq",
+          "sr",
+          "su",
+          "sv",
+          "sw",
+          "ta",
+          "te",
+          "tg",
+          "th",
+          "tk",
+          "tl",
+          "tr",
+          "tt",
+          "uk",
+          "ur",
+          "uz",
+          "vi",
+          "yi",
+          "yo",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "whisper.logmel.16khz.mono.v0",
+        "decode_policy_id": "whisper.greedy.seq2seq.v1",
+        "runtime_tensor_contract_id": "whisper.runtime-tensors.v1",
+        "tokenizer_id": "whisper.hf-bpe.v1",
+        "hparam_schema": [
+          "whisper.encoder.block_count",
+          "whisper.encoder.embedding_length",
+          "whisper.encoder.attention.head_count",
+          "whisper.encoder.context_length",
+          "whisper.encoder.mels_count",
+          "whisper.decoder.block_count",
+          "whisper.decoder.embedding_length",
+          "whisper.decoder.attention.head_count",
+          "whisper.decoder.context_length",
+          "whisper.vocab_size"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_whisper_hf_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "whisper.ggml-executor.v1",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "hip",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "metal",
+              "full_device": false,
+              "hybrid": true
+            },
+            {
+              "provider": "vulkan",
+              "full_device": false,
+              "hybrid": true
+            }
+          ]
+        },
+        "streaming_partial_granularity": "buffered",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": true,
+        "phrase_bias_strategy": "always",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": true,
+        "supports_source_language_hint": true,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-sensitive",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 30.0
+        }
+      },
+      "topology": {
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "Whisper's convolutional frontend and fixed-window encoder/decoder graph are not represented by the shared block composer.",
+        "decoder_state": "encoder-decoder-self-and-cross-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "fixed-window",
+        "encoder_attention_max_safe_chunk_seconds": null,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "whisper",
+        "reference_dumper_source": null
+      }
+    },
+    {
+      "catalog_family_id": "xasr-zipformer",
+      "model_family": "xasr-zipformer",
+      "model_architecture": "xasr-zipformer-transducer",
+      "runtime_architecture_aliases": [
+        "xasr-zipformer",
+        "xasr-zh-en"
+      ],
+      "adapter_id": "ggml-family-xasr-zipformer-runtime-v1",
+      "module_slug": "xasr_zipformer",
+      "language": {
+        "policy": "fixed-multilingual",
+        "default_language": null,
+        "reject_reason": null,
+        "languages": [
+          "en",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "xasr-zipformer.fbank80.16khz.mono.v0",
+        "decode_policy_id": "xasr-zipformer.greedy.transducer.v0",
+        "runtime_tensor_contract_id": "xasr-zipformer.runtime-tensors.v0",
+        "tokenizer_id": "xasr-zipformer.bpe.v0",
+        "hparam_schema": [
+          "xasr.num_stacks",
+          "xasr.num_encoder_layers",
+          "xasr.encoder_dims",
+          "xasr.query_head_dims",
+          "xasr.value_head_dims",
+          "xasr.num_heads",
+          "xasr.cnn_module_kernels",
+          "xasr.left_context_len",
+          "xasr.downsampling_factors",
+          "xasr.feature_dim",
+          "xasr.decode_chunk_len",
+          "xasr.joiner_dim",
+          "xasr.decoder_context_size",
+          "xasr.vocab_size",
+          "xasr.blank_id"
+        ],
+        "importer": {
+          "kind": "core-convert",
+          "symbol": "convert_local_xasr_zipformer_source_to_runtime_pack",
+          "relative_path": null
+        }
+      },
+      "execution": {
+        "executor_component_id": "xasr-zipformer.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": false
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": false
+            }
+          ]
+        },
+        "streaming_partial_granularity": "frame-sync",
+        "speaker_segmentation": "external",
+        "emits_punctuation": true,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": false,
+        "supports_lora_adapter": false,
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "elastic",
+          "max_seconds": null
+        }
+      },
+      "topology": {
+        "decode_driver": "dedicated",
+        "decode_driver_reason": "Zipformer transducer decoding requires architecture-specific predictor and joiner orchestration.",
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "Zipformer uses multi-resolution encoder blocks and architecture-specific transducer heads.",
+        "decoder_state": "none"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "except-metal",
+        "encoder_attention_span": "local-chunked",
+        "encoder_attention_max_safe_chunk_seconds": null,
+        "ownership": "native-execution-services",
+        "prepared_runtime_eviction": "content-id",
+        "graph_reuse": "prepared-runtime-pool"
+      },
+      "quantization": {
+        "tensor_classification": "acoustic-encoder-prefixes-v1",
+        "quantized_axis": null
+      },
+      "conformance": {
+        "profile_id": "xasr-zipformer",
+        "reference_dumper_source": null
+      }
+    }
+  ]
+}

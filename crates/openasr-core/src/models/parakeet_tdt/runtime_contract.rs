@@ -167,6 +167,16 @@ pub(crate) fn parse_parakeet_tdt_execution_metadata(
     })
 }
 
+pub(crate) fn validate_runtime_pack_contract(
+    preflight: &crate::GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    parse_parakeet_tdt_execution_metadata(preflight.metadata())
+        .map(|_| ())
+        .map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("parakeet-tdt", error)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

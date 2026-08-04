@@ -62,7 +62,7 @@ use super::frontend::{FireRedFbankFrontend, apply_cmvn};
 use super::runtime_contract::{FireRedAedExecutionMetadata, parse_firered_aed_execution_metadata};
 use super::tokenizer::FireRedTokenizer;
 
-const FIRERED_AED_EXECUTOR_ID: &str = "firered-aed-ggml-executor-v1";
+const FIRERED_AED_EXECUTOR_ID: &str = crate::arch::FIRERED_AED_EXECUTOR_COMPONENT_ID;
 const FIRERED_AED_STREAMING_EXECUTOR_ID: &str = "firered-aed-ggml-snapshot-streaming-executor-v1";
 const CMVN_NEG_MEAN_TENSOR: &str = "frontend.cmvn.neg_mean";
 const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
@@ -98,8 +98,6 @@ enum FireRedAedExecutorError {
         expected: &'static str,
         found: String,
     },
-    #[error("firered-aed executor runtime preflight failed: {reason}")]
-    RuntimePreflightFailed { reason: String },
     #[error("firered-aed runtime metadata contract failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("firered-aed tokenizer materialization failed: {reason}")]
@@ -367,12 +365,13 @@ impl FireRedAedGgmlExecutor {
         self.decoder_runtimes.clear();
     }
 
-    /// The checkout pool currently exposes epoch-safe whole-pool invalidation,
-    /// not targeted eviction. FireRed-AED keeps only four idle actors per
-    /// stage, so conservatively clearing both tiny pools on one pack replace
-    /// gives deterministic release without weakening content-addressed keys.
-    pub(crate) fn evict_prepared_runtime_content_id(&self, _pack_content_id: &str) {
-        self.clear_runtime_actors();
+    /// Evicts only actors prepared from the replaced content generation.
+    /// Other packs in this service root stay warm.
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.encoder_runtimes
+            .evict_where(|(pack, _)| pack.pack_content_id == pack_content_id);
+        self.decoder_runtimes
+            .evict_where(|(pack, _, _)| pack.pack_content_id == pack_content_id);
     }
 
     fn execute_inner(
@@ -393,11 +392,7 @@ impl FireRedAedGgmlExecutor {
             .map_err(|error| FireRedAedExecutorError::DecoderFailed {
                 reason: error.to_string(),
             })?;
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| FireRedAedExecutorError::RuntimePreflightFailed {
-                reason: error.to_string(),
-            })?;
+        let preflight = &request.runtime_source_preflight;
         let metadata =
             parse_firered_aed_execution_metadata(&preflight.metadata).map_err(|error| {
                 FireRedAedExecutorError::RuntimeContractViolation {
@@ -413,7 +408,7 @@ impl FireRedAedGgmlExecutor {
             .to_vec();
         let tokenizer = FireRedTokenizer::new(tokens);
 
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
+        let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
             FireRedAedExecutorError::CmvnBuildFailed {
                 reason: error.to_string(),
             }
@@ -486,7 +481,7 @@ impl FireRedAedGgmlExecutor {
         let backend = request.resolved_runtime.backend();
         let feature_frames = features.n_frames;
         let encoder_output = self.encode_with_owned_runtime(
-            &preflight,
+            preflight,
             metadata,
             features.data,
             feature_frames,
@@ -494,7 +489,7 @@ impl FireRedAedGgmlExecutor {
         )?;
 
         let decode = self.decode_with_owned_runtime(
-            &preflight,
+            preflight,
             metadata,
             encoder_output.rows,
             encoder_output.frame_count,
@@ -536,6 +531,10 @@ impl FireRedAedGgmlExecutor {
 }
 
 impl GgmlAsrViewExecutor for FireRedAedGgmlExecutor {
+    fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        FireRedAedGgmlExecutor::evict_prepared_runtime_content_id(self, pack_content_id);
+    }
+
     fn executor_id(&self) -> &'static str {
         FIRERED_AED_EXECUTOR_ID
     }
@@ -602,14 +601,14 @@ impl GgmlAsrStreamingExecutor for FireRedAedGgmlExecutor {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    use crate::arch::builtin_adapter_descriptor;
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
-    use crate::models::ggml_family_registry::firered_aed_runtime_descriptor_v1;
 
     use super::*;
 
@@ -795,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn replaced_pack_content_id_never_reuses_the_old_actor() {
+    fn targeted_content_eviction_preserves_other_pack_and_rebuilds_only_old_pack() {
         let pool = test_runtime_pool();
         let builds = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
@@ -812,12 +811,23 @@ mod tests {
         drop(replacement);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
 
-        // The product replacement callback conservatively clears both
-        // FireRed-AED stage pools; the checkout pool's epoch prevents either
-        // old-content actor from reappearing afterward.
+        pool.evict_where(|key| key == "sha256:old");
+        assert_eq!(pool.usage_for_test(), (1, 32));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let still_warm =
+            checkout_test_runtime(&pool, "sha256:new", Arc::clone(&builds), Arc::clone(&drops))
+                .unwrap();
+        assert_eq!(still_warm.call_mut(|runtime| runtime.id).unwrap(), 2);
+        drop(still_warm);
+
+        let rebuilt_old =
+            checkout_test_runtime(&pool, "sha256:old", Arc::clone(&builds), Arc::clone(&drops))
+                .unwrap();
+        assert_eq!(rebuilt_old.call_mut(|runtime| runtime.id).unwrap(), 3);
+        drop(rebuilt_old);
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
         pool.clear();
-        assert_eq!(pool.usage_for_test(), (0, 0));
-        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     fn dev_pack_path() -> PathBuf {
@@ -831,6 +841,11 @@ mod tests {
 
     fn zh_wav_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
+    }
+
+    fn test_runtime_preflight(path: &Path) -> GgufRuntimeSourcePreflight {
+        crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(path)
+            .expect("firered-aed test runtime must pass preflight")
     }
 
     fn decoder_runtime_state(
@@ -866,10 +881,7 @@ mod tests {
     ) -> Result<(), String> {
         use std::num::NonZeroU32;
 
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .map_err(|error| error.to_string())?
-            .into_owned();
+        let preflight = &request.runtime_source_preflight;
         let sample_rate = NonZeroU32::new(request.prepared_audio.sample_rate_hz)
             .ok_or_else(|| "test sample rate is zero".to_string())?;
         let invocation = crate::capacity::topology::InvocationShapeInput::new(
@@ -885,7 +897,7 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput {
-            preflight: &preflight,
+            preflight,
             invocation,
             envelope,
             request_options: &request.request_options,
@@ -895,7 +907,6 @@ mod tests {
             .map_err(|error| error.to_string())?;
         request.decoder_state =
             crate::models::ggml_asr_executor::GgmlAsrDecoderState::planned_for_test(plan, envelope);
-        request.runtime_source_preflight = Some(preflight);
         Ok(())
     }
 
@@ -916,9 +927,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: firered_aed_runtime_descriptor_v1(),
+            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -984,9 +996,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: firered_aed_runtime_descriptor_v1(),
+            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples.clone()),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -999,15 +1012,13 @@ mod tests {
             )),
         };
         plan_request_decoder_state(&mut request, None).expect("plan firered-aed decoder state");
-        let preflight = request
-            .resolve_runtime_source_preflight()
-            .expect("resolve runtime source preflight");
+        let preflight = &request.runtime_source_preflight;
         let metadata = parse_firered_aed_execution_metadata(&preflight.metadata)
             .expect("parse execution metadata");
 
         // Frontend + CMVN + CPU encoder: one shared encoder output feeds both
         // decoder runtimes, so any divergence below is decode-path-only.
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+        let reader = build_runtime_tensor_reader_from_preflight(preflight)
             .expect("build runtime tensor reader");
         let feature_dim_shape = [metadata.feature_dim as u64];
         let neg_mean = reader
@@ -1021,7 +1032,7 @@ mod tests {
         apply_cmvn(&mut features.data, features.n_mels, &neg_mean, &inv_stddev)
             .expect("apply cmvn");
         let mut encoder_runtime =
-            FireRedEncoderGraphRuntime::new(&preflight, metadata, GgmlCpuGraphBackend::Cpu)
+            FireRedEncoderGraphRuntime::new(preflight, metadata, GgmlCpuGraphBackend::Cpu)
                 .expect("build cpu encoder runtime");
         let encoder_output = encoder_runtime
             .encode(&features.data, features.n_frames)
@@ -1034,7 +1045,7 @@ mod tests {
         // recorded fresh-pass logits for the identical prefix.
         let max_steps = 256usize;
         let mut fresh_runtime = match FireRedDecoderGraphRuntime::new(
-            &preflight,
+            preflight,
             metadata,
             decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,
@@ -1078,7 +1089,7 @@ mod tests {
         );
 
         let mut reused_runtime = FireRedDecoderGraphRuntime::new(
-            &preflight,
+            preflight,
             metadata,
             decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,
@@ -1162,9 +1173,10 @@ mod tests {
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_path: pack_path.clone(),
-                runtime_source_preflight: None,
-                selected_family: firered_aed_runtime_descriptor_v1(),
+                runtime_source_preflight: test_runtime_preflight(&pack_path),
+                selected_family: builtin_adapter_descriptor(
+                    crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+                ),
                 prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples.clone()),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -1229,9 +1241,10 @@ mod tests {
                     crate::models::native_execution_services::test_native_execution_services(),
                 decoder_state:
                     crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-                runtime_source_path: pack_path.clone(),
-                runtime_source_preflight: None,
-                selected_family: firered_aed_runtime_descriptor_v1(),
+                runtime_source_preflight: test_runtime_preflight(&pack_path),
+                selected_family: builtin_adapter_descriptor(
+                    crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+                ),
                 prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -1304,9 +1317,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: firered_aed_runtime_descriptor_v1(),
+            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -1358,9 +1372,10 @@ mod tests {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
-            runtime_source_path: pack_path,
-            runtime_source_preflight: None,
-            selected_family: firered_aed_runtime_descriptor_v1(),
+            runtime_source_preflight: test_runtime_preflight(&pack_path),
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            ),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,

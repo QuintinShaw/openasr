@@ -45,9 +45,9 @@ use openasr_core::{
     resolve_runtime_model_ref, runtime_registry,
 };
 use openasr_core::{
-    NativeAsrExecutor, NativeAsrModelAdapter, NativeAsrModelPackRef, NativeAsrRequestOptions,
-    NativeAsrSession, NativeAsrSessionContext, NativeAsrStreamingSessionConfig,
-    NativeBackendExecutor, PolicyResolvedHymt2TranslationRuntime,
+    NativeAsrExecutor, NativeAsrModelAdapter, NativeAsrRequestOptions, NativeAsrSession,
+    NativeAsrSessionContext, NativeAsrStreamingSessionConfig, NativeBackendExecutor,
+    PolicyResolvedHymt2TranslationRuntime,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -900,9 +900,7 @@ fn resolve_model(
                     "Model '{model}' is a retired legacy metadata id and is not executable in native mode."
                 ));
             }
-            let model_id = model.to_string();
-            super::validate_native_request_model(runtime, &model_id)?;
-            Ok(model_id)
+            Ok(model.to_string())
         }
     }
 }

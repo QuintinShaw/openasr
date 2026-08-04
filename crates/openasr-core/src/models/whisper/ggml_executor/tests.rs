@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use super::*;
+use crate::arch::builtin_adapter_descriptor;
 use crate::models::whisper::ggml_tensor_binding::WhisperGgufTensorSlot;
 use crate::models::whisper::tokenizer::{
     TOKENIZER_GGML_EOT_TOKEN_ID_KEY, TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY,
@@ -19,7 +20,7 @@ use crate::testing::{
 };
 use crate::{
     GgufMetadata, GgufMetadataValue, read_gguf_metadata_from_runtime_source,
-    validate_ggml_runtime_source_path, whisper_runtime_descriptor_v1,
+    validate_ggml_runtime_source_path,
 };
 use sha2::{Digest, Sha256};
 
@@ -407,7 +408,7 @@ fn whisper_preflight_fails_on_missing_metadata_before_encoder_prelude() {
         called: Arc::clone(&mel_called),
         outcome: TestMelFeatureInputProviderOutcome::RealFrontend,
     };
-    let adapter = whisper_runtime_descriptor_v1();
+    let adapter = builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
         &adapter,
@@ -468,7 +469,7 @@ fn whisper_tensor_shape_mismatch_fails_before_encoder_prelude() {
         called: Arc::clone(&mel_called),
         outcome: TestMelFeatureInputProviderOutcome::RealFrontend,
     };
-    let adapter = whisper_runtime_descriptor_v1();
+    let adapter = builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
         &adapter,
@@ -526,7 +527,7 @@ fn whisper_tensor_type_mismatch_fails_before_encoder_prelude() {
         called: Arc::clone(&mel_called),
         outcome: TestMelFeatureInputProviderOutcome::RealFrontend,
     };
-    let adapter = whisper_runtime_descriptor_v1();
+    let adapter = builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
         &adapter,
@@ -592,7 +593,7 @@ fn mel_feature_extraction_failure_fails_before_encoder_execution() {
             reason: "frontend fft failed".to_string(),
         },
     };
-    let adapter = whisper_runtime_descriptor_v1();
+    let adapter = builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
         &adapter,
@@ -703,7 +704,7 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
     }
 
     let output = execute_whisper_ggml_non_streaming_cpu(
-        &whisper_runtime_descriptor_v1(),
+        &builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
         &runtime_source,
         &metadata,
         &load_whisper_tensor_index(&runtime_source).expect("load tensor index"),
@@ -777,7 +778,7 @@ fn invalid_sample_rate_fails_closed_before_encoder_execution() {
     invalid_audio.sample_rate_hz = 8_000;
 
     let error = execute_whisper_ggml_non_streaming_cpu(
-        &whisper_runtime_descriptor_v1(),
+        &builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
         &runtime_source,
         &metadata,
         &load_whisper_tensor_index(&runtime_source).expect("load tensor index"),
@@ -855,7 +856,7 @@ fn nan_audio_fails_closed_before_encoder_execution() {
     let nan_audio = GgmlAsrPreparedAudioView::mono_16khz(nan_samples);
 
     let error = execute_whisper_ggml_non_streaming_cpu(
-        &whisper_runtime_descriptor_v1(),
+        &builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
         &runtime_source,
         &metadata,
         &load_whisper_tensor_index(&runtime_source).expect("load tensor index"),
@@ -913,7 +914,7 @@ fn unsupported_primitive_fixture_fails_closed_with_real_prelude_runner() {
         validate_ggml_runtime_source_path(&runtime_path).expect("validate runtime source");
     let metadata =
         read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
-    let adapter = whisper_runtime_descriptor_v1();
+    let adapter = builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
     let runner = WhisperCpuEncoderPreludeComputeRunnerV0;
     let graph_runner = WhisperCpuEncoderGraphComputeRunnerV0;
     let mel_provider = TestMelFeatureInputProvider {
