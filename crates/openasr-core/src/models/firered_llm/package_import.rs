@@ -252,7 +252,8 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
     let llm_tensors = build_llm_runtime_tensors(&qwen2_safetensors, request.quantization)?;
     tensors.extend(llm_tensors);
 
-    let mut tokens = load_gpt2_bpe_vocab_tokens(&request.qwen2_metadata_source_root, "firered-llm")?;
+    let mut tokens =
+        load_gpt2_bpe_vocab_tokens(&request.qwen2_metadata_source_root, "firered-llm")?;
     let merges = load_gpt2_bpe_merges(&request.qwen2_metadata_source_root, "firered-llm")?;
     if tokens.len() != SPEECH_TOKEN_ID as usize {
         return Err(validate_error(format!(
