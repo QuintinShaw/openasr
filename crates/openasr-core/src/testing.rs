@@ -703,6 +703,128 @@ impl TinyGgufFixtureSpec {
         spec
     }
 
+    /// Metadata-complete firered-aed routing fixture. Its placeholder tensor
+    /// is deliberately non-runnable: the family's depth-complete admission
+    /// contract (metadata + frontend + tensors + tokenizer) is what gates a
+    /// real pack, and capability tests use this skeleton to prove adapter
+    /// selection before graph construction.
+    pub fn firered_aed_oasr_v1_metadata_ready_for_runtime_fail_closed(
+        model_id: impl Into<String>,
+    ) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "firered-aed".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::FIRERED_AED_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::FIRERED_AED_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::FIRERED_AED_TOKENIZER_ID.to_string(),
+        );
+        // Tiny internally-consistent geometry: 1 Conformer block + 1 decoder
+        // block, d_model 16 = 2 heads x 8, feature_dim 8 -> subsample_out_dim
+        // 4 x (((8-1)/2 - 1)/2) = 4, odd conv kernel and rel-pos table length,
+        // every special token id inside the 8-token vocab.
+        for (key, value) in [
+            ("general.architecture", "firered-conformer-aed"),
+            ("firered.encoder.n_layers", "1"),
+            ("firered.encoder.d_model", "16"),
+            ("firered.encoder.n_heads", "2"),
+            ("firered.encoder.head_dim", "8"),
+            ("firered.encoder.ffn_dim", "32"),
+            ("firered.encoder.conv_kernel", "5"),
+            ("firered.encoder.subsample_channels", "4"),
+            ("firered.encoder.subsample_out_dim", "4"),
+            ("firered.encoder.feature_dim", "8"),
+            ("firered.encoder.pe_len", "7"),
+            ("firered.decoder.n_layers", "1"),
+            ("firered.decoder.ffn_dim", "32"),
+            ("firered.decoder.pe_len", "8"),
+            ("firered.vocab_size", "8"),
+            ("firered.sos_token_id", "3"),
+            ("firered.eos_token_id", "4"),
+            ("firered.pad_token_id", "2"),
+            ("firered.audio.sample_rate", "16000"),
+            ("firered.audio.n_fft", "512"),
+            ("firered.audio.frame_length_ms", "25"),
+            ("firered.audio.frame_shift_ms", "10"),
+            ("firered.audio.n_mels", "8"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        // The admission contract proves tokenizer coverage of every sampleable
+        // id from the pack metadata, so the skeleton carries the same
+        // char+SPM-style vocab the importer writes (exactly vocab_size
+        // entries, `<pad>`/`<sos>`/`<eos>` at the ids the metadata declares).
+        Self::new(metadata).with_string_array_metadata(
+            "tokenizer.ggml.tokens",
+            [
+                "<blank>", "<unk>", "<pad>", "<sos>", "<eos>", "he", "llo", "<sil>",
+            ],
+        )
+    }
+
+    /// Fully verifier-ready firered-aed skeleton. The runtime tensor set is
+    /// projected from the family's own binding descriptors (the validator and
+    /// this fixture agree through one contract); the deterministic payloads
+    /// are not quality fixtures, their shapes exist so install, catalog
+    /// binding, and capability tests cross the same PackVerifier seam as a
+    /// production pack without borrowing another family's route.
+    pub fn firered_aed_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        use crate::models::tensor_binding::TensorBindingDescriptorRequirement;
+
+        let mut spec = Self::firered_aed_oasr_v1_metadata_ready_for_runtime_fail_closed(model_id);
+        let metadata =
+            crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("shared firered-aed fixture metadata must parse");
+        for descriptor in
+            crate::models::firered_aed::runtime_contract::firered_aed_runtime_tensor_binding_descriptors(&metadata)
+        {
+            let dims = match descriptor.requirement {
+                TensorBindingDescriptorRequirement::ExactDims(dims) => dims,
+                TensorBindingDescriptorRequirement::VectorLen(len) => vec![len],
+                TensorBindingDescriptorRequirement::NonEmptyVector => vec![1],
+                TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![dim, dim],
+                TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs)
+                | TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(lhs, rhs) => {
+                    vec![lhs, rhs]
+                }
+                TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+                    min_rank,
+                    axis,
+                    dim,
+                } => {
+                    let mut dims = vec![1; min_rank.max(axis.saturating_add(1))];
+                    dims[axis] = dim;
+                    dims
+                }
+            };
+            spec = spec.with_tensor_shape(
+                descriptor.tensor_name,
+                dims.into_iter().map(|dim| dim as u64),
+            );
+        }
+        spec
+    }
+
     /// Metadata-complete X-ASR Zipformer routing fixture. Its placeholder
     /// tensor is deliberately non-runnable: capability and request-gating
     /// tests use it to prove adapter selection before graph construction.
@@ -2454,6 +2576,11 @@ mod tests {
                 "qwen.oasr",
                 TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture"),
                 "qwen",
+            ),
+            (
+                "firered-aed.oasr",
+                TinyGgufFixtureSpec::firered_aed_oasr_v1_runtime_ready("firered-aed-fixture"),
+                "firered-aed",
             ),
             (
                 "xasr.oasr",
