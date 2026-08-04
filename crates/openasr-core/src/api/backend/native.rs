@@ -3997,7 +3997,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("Expected a local GGUF-backed runtime file"));
+        assert!(error.contains("Expected a local GGUF-backed OpenASR runtime package"));
     }
 
     #[test]
@@ -4013,7 +4013,7 @@ mod tests {
     #[test]
     fn native_model_pack_path_rejects_directory_without_openasr_suffix() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("not-a-pack");
+        let directory = temp.path().join("not-a-pack.oasr");
         std::fs::create_dir_all(&directory).unwrap();
 
         let error = validate_local_native_model_pack_path(&directory)

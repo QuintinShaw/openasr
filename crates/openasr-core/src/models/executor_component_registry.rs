@@ -312,4 +312,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn builtin_inventory_matches_concrete_executor_adapter_bindings() {
+        let scope = BuiltinStatefulExecutorScope::new().expect("executor scope");
+
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            let model_architecture = descriptor.identity.model_architecture;
+            let selected_family = descriptor.ggml_family_adapter_descriptor();
+            let executor = scope
+                .view(model_architecture)
+                .unwrap_or_else(|| panic!("missing executor for {model_architecture}"));
+            let provided = executor
+                .adapter_binding_strategy_for(&selected_family)
+                .unwrap_or_else(|error| {
+                    panic!("{model_architecture} adapter-binding lookup failed: {error}")
+                });
+
+            assert_eq!(
+                provided, descriptor.execution_contract.adapter_binding,
+                "{model_architecture} concrete executor adapter binding must match the inventory"
+            );
+        }
+    }
 }

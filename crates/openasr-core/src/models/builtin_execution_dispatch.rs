@@ -208,19 +208,19 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
 
-    fn unplanned_runtime_request() -> GgmlAsrExecutionViewRequest<'static> {
+    fn unplanned_runtime_request_for_architecture(
+        model_architecture: &'static str,
+    ) -> GgmlAsrExecutionViewRequest<'static> {
         let verified_pack = crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
             crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
-            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            model_architecture,
         );
         GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             verified_pack,
-            selected_family: crate::arch::builtin_adapter_descriptor(
-                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            ),
+            selected_family: crate::arch::builtin_adapter_descriptor(model_architecture),
             prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(vec![0.0, 0.1]),
             request_options: crate::GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -234,19 +234,19 @@ mod tests {
         }
     }
 
-    fn unplanned_runtime_owned_request() -> crate::GgmlAsrExecutionRequest {
+    fn unplanned_runtime_owned_request_for_architecture(
+        model_architecture: &'static str,
+    ) -> crate::GgmlAsrExecutionRequest {
         let verified_pack = crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
             crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
-            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            model_architecture,
         );
         crate::GgmlAsrExecutionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             verified_pack,
-            selected_family: crate::arch::builtin_adapter_descriptor(
-                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            ),
+            selected_family: crate::arch::builtin_adapter_descriptor(model_architecture),
             prepared_audio: crate::GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: crate::GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -345,19 +345,19 @@ mod tests {
         }
     }
 
-    fn streaming_runtime_request() -> GgmlAsrStreamingSessionRequest {
+    fn streaming_runtime_request_for_architecture(
+        model_architecture: &'static str,
+    ) -> GgmlAsrStreamingSessionRequest {
         let verified_pack = crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
             crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
-            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            model_architecture,
         );
         GgmlAsrStreamingSessionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
             verified_pack,
-            selected_family: crate::arch::builtin_adapter_descriptor(
-                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            ),
+            selected_family: crate::arch::builtin_adapter_descriptor(model_architecture),
             request_options: crate::GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
@@ -411,7 +411,9 @@ mod tests {
     fn builtin_dispatch_rejects_unplanned_qwen_request_before_executor() {
         let dispatch = build_test_offline_dispatch().expect("builtin dispatch");
         let error = dispatch
-            .execute(&unplanned_runtime_owned_request())
+            .execute(&unplanned_runtime_owned_request_for_architecture(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            ))
             .expect_err("decoder family request without a plan must fail closed");
         assert!(matches!(
             error,
@@ -424,9 +426,9 @@ mod tests {
 
     #[test]
     fn builtin_dispatch_rejects_unplanned_whisper_request_before_executor() {
-        let mut request = unplanned_runtime_owned_request();
-        request.selected_family =
-            crate::arch::builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID);
+        let request = unplanned_runtime_owned_request_for_architecture(
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+        );
         let dispatch = build_test_offline_dispatch().expect("builtin dispatch");
         let error = dispatch
             .execute(&request)
@@ -442,8 +444,7 @@ mod tests {
 
     #[test]
     fn builtin_dispatch_routes_xasr_zipformer_dedicated_runtime_executor() {
-        let mut request = unplanned_runtime_request();
-        request.selected_family = crate::arch::builtin_adapter_descriptor(
+        let request = unplanned_runtime_request_for_architecture(
             crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
         );
         let dispatch = build_test_offline_dispatch().expect("builtin dispatch");
@@ -471,8 +472,7 @@ mod tests {
     #[test]
     fn builtin_streaming_dispatch_registers_xasr_zipformer_native_streaming() {
         let dispatch = build_test_streaming_dispatch().expect("builtin streaming dispatch");
-        let mut request = streaming_runtime_request();
-        request.selected_family = crate::arch::builtin_adapter_descriptor(
+        let request = streaming_runtime_request_for_architecture(
             crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
         );
 

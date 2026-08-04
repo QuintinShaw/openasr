@@ -1535,7 +1535,7 @@ mod tests {
     #[test]
     fn native_model_source_resolution_without_model_uses_auto_sentinel() {
         let temp = tempfile::tempdir().unwrap();
-        let pack_root = temp.path().join("invalid model id!!.gguf");
+        let pack_root = temp.path().join("invalid model id!!.oasr");
         fs::write(&pack_root, b"GGUFpayload").unwrap();
 
         let source = resolve_model_source_for_backend(
@@ -1568,7 +1568,7 @@ mod tests {
     #[test]
     fn native_model_source_resolution_uses_local_catalog_aliases_when_available() {
         let temp = tempfile::tempdir().unwrap();
-        let pack_root = temp.path().join("qwen3-asr-0.6b-q8_0.gguf");
+        let pack_root = temp.path().join("qwen3-asr-0.6b-q8_0.oasr");
         fs::write(&pack_root, b"GGUFpayload").unwrap();
 
         let source = resolve_model_source_for_backend(

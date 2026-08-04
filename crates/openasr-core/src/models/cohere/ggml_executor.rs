@@ -1718,7 +1718,7 @@ mod tests {
     fn native_backend_selects_cohere_executor_after_registration() {
         with_forced_cpu_backend_for_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
-            let runtime_path = temp.path().join("cohere-runtime.gguf");
+            let runtime_path = temp.path().join("cohere-runtime.oasr");
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
             write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
 
