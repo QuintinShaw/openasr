@@ -498,7 +498,10 @@ fn load_convolution_module(
     })
 }
 
-fn layer_prefix(stack: usize, layer: usize) -> String {
+/// Per-(stack, layer) tensor-name prefix. Shared by the runtime weight loader
+/// and the admission-time runtime tensor-contract validator so both resolve the
+/// same pack names through one contract.
+pub(super) fn layer_prefix(stack: usize, layer: usize) -> String {
     if stack == 0 {
         format!("encoder.encoders.{stack}.layers.{layer}")
     } else {
