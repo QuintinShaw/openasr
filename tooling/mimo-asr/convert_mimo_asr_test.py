@@ -13,9 +13,11 @@ blood-lesson corrections have explicit assertions:
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -175,7 +177,9 @@ def _meta_dict(items):
 class MetadataTest(unittest.TestCase):
     def setUp(self):
         self.main, self.tok = _tiny_hparams()
-        self.items = C.build_metadata(self.main, self.tok, "mimo-v2.5-asr-q8_0", "q8_0")
+        self.items = C.build_metadata(
+            self.main, self.tok, "mimo-v2.5-asr:q8_0", "q8_0", ["a"], ["a b"]
+        )
         self.md = _meta_dict(self.items)
 
     def test_skip_layer_id(self):
@@ -194,8 +198,82 @@ class MetadataTest(unittest.TestCase):
     def test_backbone_flags(self):
         self.assertTrue(self.md["mimo.llm.attention.qkv_bias"])
         self.assertFalse(self.md["mimo.llm.attention.qk_norm"])
+
+    def test_public_envelope_keys(self):
+        # The full routing envelope the production PackVerifier resolves --
+        # an external pack must carry the same public contract as a
+        # Rust-imported one.
+        self.assertEqual(self.md["openasr.package.version"], "1")
         self.assertEqual(self.md["openasr.model.family"], "mimo-asr")
+        self.assertEqual(self.md["openasr.model.architecture"], "mimo-asr")
+        self.assertEqual(self.md["openasr.model.id"], "mimo-v2.5-asr:q8_0")
+        self.assertEqual(self.md["openasr.audio.frontend"], "mimo-tokenizer-rvq-v0")
+        self.assertEqual(self.md["openasr.decode.policy"], "mimo-asr.greedy.seq2seq.v0")
+        self.assertEqual(self.md["openasr.tokenizer.id"], "mimo-asr.gpt2-bpe.v0")
         self.assertEqual(self.md["openasr.pack.quant"], "q8_0")
+        # Provenance is opt-in: absent unless a build commit is supplied.
+        self.assertNotIn("openasr.build.commit", self.md)
+
+    def test_build_commit_written_when_supplied(self):
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        items = C.build_metadata(
+            self.main, self.tok, "mimo-v2.5-asr:q8_0", "q8_0", ["a"], ["a b"],
+            build_commit=commit,
+        )
+        self.assertEqual(_meta_dict(items)["openasr.build.commit"], commit)
+
+
+# ---------------------------------------------------------------------------
+# build provenance (OPENASR_BUILD_COMMIT env semantics mirror the Rust writer)
+# ---------------------------------------------------------------------------
+
+class BuildProvenanceTest(unittest.TestCase):
+    def test_unset_env_claims_no_provenance(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(C.build_provenance_from_env())
+
+    def test_empty_env_claims_no_provenance(self):
+        with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: "   "}):
+            self.assertIsNone(C.build_provenance_from_env())
+
+    def test_valid_commit_normalized_to_lowercase(self):
+        commit = "0123456789ABCDEF0123456789ABCDEF01234567"
+        with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: commit}):
+            self.assertEqual(
+                C.build_provenance_from_env(), commit.lower()
+            )
+
+    def test_malformed_commit_fails_closed(self):
+        for bad in ["not-a-sha", "0123456789abcdef", "g" * 40, "a" * 41]:
+            with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: bad}):
+                with self.assertRaises(C.ConversionError):
+                    C.build_provenance_from_env()
+
+
+# ---------------------------------------------------------------------------
+# CLI quant tokens (publish lane spelling)
+# ---------------------------------------------------------------------------
+
+class QuantTokenTest(unittest.TestCase):
+    def test_lane_tokens_map_to_canonical_labels(self):
+        self.assertEqual(C.QUANT_TOKEN_TO_LABEL["fp16"], "fp16")
+        self.assertEqual(C.QUANT_TOKEN_TO_LABEL["q8-0"], "q8_0")
+        self.assertEqual(C.QUANT_TOKEN_TO_LABEL["q4-k"], "q4_k")
+
+    def test_q4_k_fails_closed_until_a_rust_requant_seam_exists(self):
+        # gguf-py implements no K-quant quantization; the converter must
+        # refuse instead of emitting a mislabeled pack or forking ggml's
+        # quantization math into Python.
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "mimo-tiny-q4_k.oasr"
+            with self.assertRaises(C.ConversionError):
+                C.main([
+                    "--main-dir", "/nonexistent-main",
+                    "--tokenizer", "/nonexistent-tok.safetensors",
+                    "--out", str(out),
+                    "--quant", "q4-k",
+                ])
+            self.assertFalse(out.exists())
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +482,10 @@ class RoundTripTest(unittest.TestCase):
             root = Path(td)
             main_dir, tok_path, main_src, tok_src = _write_tiny_sources(root)
             out = root / "mimo-tiny-q8_0.oasr"
-            res = C.write_pack(main_dir, tok_path, out, "q8_0", "mimo-tiny-q8_0", verbose=False)
+            # Deterministic provenance: no build commit claimed regardless of
+            # the surrounding environment.
+            with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: ""}):
+                res = C.write_pack(main_dir, tok_path, out, "q8_0", "mimo-tiny-q8_0", verbose=False)
             self.assertTrue(out.exists())
             self.assertGreater(res["tensor_count"], 0)
 
@@ -482,6 +563,42 @@ class RoundTripTest(unittest.TestCase):
             self.assertEqual(tokens[17:20], ["<|sosp|>", "<|eosp|>", "<|empty|>"])
             self.assertEqual(_kv_str_array(reader, "tokenizer.ggml.merges"), ["a b"])
 
+            # --- public envelope present in the actual file ---
+            self.assertEqual(_kv_str(reader, "openasr.package.version"), "1")
+            self.assertEqual(_kv_str(reader, "openasr.model.family"), "mimo-asr")
+            self.assertEqual(_kv_str(reader, "openasr.model.architecture"), "mimo-asr")
+            self.assertEqual(_kv_str(reader, "openasr.audio.frontend"), "mimo-tokenizer-rvq-v0")
+            self.assertEqual(_kv_str(reader, "openasr.decode.policy"), "mimo-asr.greedy.seq2seq.v0")
+            self.assertEqual(_kv_str(reader, "openasr.tokenizer.id"), "mimo-asr.gpt2-bpe.v0")
+            self.assertEqual(_kv_str(reader, "openasr.pack.quant"), "q8_0")
+            # general.architecture comes from GGUFWriter's arch argument
+            self.assertEqual(_kv_str(reader, "general.architecture"), "mimo-asr")
+            # no provenance claimed without OPENASR_BUILD_COMMIT
+            self.assertIsNone(reader.get_field("openasr.build.commit"))
+
+    def test_build_commit_env_baked_into_pack_metadata(self):
+        import gguf
+
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            main_dir, tok_path, _, _ = _write_tiny_sources(root)
+            out = root / "mimo-tiny-prov.oasr"
+            with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: commit}):
+                C.write_pack(main_dir, tok_path, out, "fp16", "mimo-tiny:fp16", verbose=False)
+            reader = gguf.GGUFReader(str(out))
+            self.assertEqual(_kv_str(reader, "openasr.build.commit"), commit)
+
+    def test_missing_vocab_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            main_dir, tok_path, _, _ = _write_tiny_sources(root)
+            (main_dir / "vocab.json").unlink()
+            out = root / "mimo-tiny-notoken.oasr"
+            with self.assertRaises(C.ConversionError):
+                C.write_pack(main_dir, tok_path, out, "fp16", "mimo-tiny:fp16", verbose=False)
+            self.assertFalse(out.exists())
+
     def test_fp16_pack_has_no_quantized_tensors(self):
         import gguf
 
@@ -489,7 +606,8 @@ class RoundTripTest(unittest.TestCase):
             root = Path(td)
             main_dir, tok_path, _, _ = _write_tiny_sources(root)
             out = root / "mimo-tiny-fp16.oasr"
-            C.write_pack(main_dir, tok_path, out, "fp16", "mimo-tiny-fp16", verbose=False)
+            with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: ""}):
+                C.write_pack(main_dir, tok_path, out, "fp16", "mimo-tiny-fp16", verbose=False)
             reader = gguf.GGUFReader(str(out))
             for t in reader.tensors:
                 self.assertIn(t.tensor_type.name, ("F16", "F32"), f"{t.name}={t.tensor_type.name}")
