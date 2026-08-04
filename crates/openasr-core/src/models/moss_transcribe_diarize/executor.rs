@@ -311,10 +311,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
 /// loop below so the slice-planning math can be pinned by a weight-free unit
 /// test (`moss_td_chunk_frame_math_tests`) that runs in every default
 /// `cargo nextest run`, unlike the family's real end-to-end `golden_diff_*`
-/// tests, which need the private dev-only fp16 pack and stay `#[ignore]`d
-/// (same artifact-policy constraint every other builtin family's CI golden
-/// coverage works around -- see e.g. firered-aed's weight-free frontend
-/// golden).
+/// tests, which need a local real fp16 pack and stay `#[ignore]`d because
+/// weight-bearing fixtures are not part of weight-free CI (the same artifact
+/// policy every other builtin family's CI golden coverage works around -- see
+/// e.g. firered-aed's weight-free frontend golden).
 pub(crate) fn moss_td_chunk_token_length(chunk_samples: usize, token_stride: usize) -> usize {
     (chunk_samples - 1) / token_stride.max(1) + 1
 }
@@ -368,9 +368,9 @@ fn moss_td_generated_token_budget(
 
 /// Weight-free, always-on coverage for the executor's chunk/slice-planning
 /// arithmetic: pure integer math with no model pack involved, so (unlike the
-/// family's `golden_diff_*` end-to-end tests below, which need the private
-/// dev-only fp16 pack and stay `#[ignore]`d) these run in every default
-/// `cargo nextest run --workspace`. Constants are pinned against the real
+/// family's `golden_diff_*` end-to-end tests below, which need a local real
+/// fp16 pack and stay `#[ignore]`d outside weight-free CI) these run in every
+/// default `cargo nextest run --workspace`. Constants are pinned against the real
 /// checkpoint's shape (`runtime_contract::tests::parses_adaptor_metadata_matching_real_checkpoint`'s
 /// `merge_size == 4`, `package_import`'s `audio_merge_size: 4`, and
 /// `parses_encoder_metadata_matching_real_checkpoint`'s
@@ -525,7 +525,7 @@ mod moss_td_chunk_frame_math_tests {
 
     #[test]
     fn decode_budget_scales_to_the_real_moss_golden_lengths() {
-        // The private-reference goldens emit 71 tokens for JFK (11s), 76 for
+        // The reference goldens emit 71 tokens for JFK (11s), 76 for
         // the mixed clip (13s), and 920 for the three-minute AISHELL-4 clip.
         // The two short clips stay on the proportional floor (no fixed
         // 4096-token Metal reuse-graph reservation for a few seconds of
@@ -1208,9 +1208,8 @@ mod tests {
     use super::super::speaker_segments::parse_moss_td_speaker_segments;
     use super::*;
 
-    /// Real converted dev pack (fp16), NOT committed -- same dev-only-artifact
-    /// convention as `decode_prompt`'s own `dev_pack_path` and mimo-asr's
-    /// `mimo-v2.5-asr-q8_0.oasr`.
+    /// Real converted local pack (fp16), not committed. It is a weight-bearing
+    /// fixture supplied for opt-in tests, which remain outside weight-free CI.
     fn dev_pack_path() -> Option<PathBuf> {
         crate::testing::external_test_fixture_path(
             "OPENASR_MOSS_TRANSCRIBE_DIARIZE_PACK",
@@ -1244,7 +1243,7 @@ mod tests {
     // (different words, shifted anchors, a lost speaker change) still show up
     // here instead of being hidden by the stripping.
     //
-    // Pinned to the real dev-pack CPU decode (backend forced to CPU below).
+    // Pinned to the real-pack CPU baseline decode (backend forced to CPU below).
     // The encoder binds its 2D projection weights zero-copy as native f16 and
     // runs flash attention (see `encoder_graph`), so this decode path is f16
     // weights + flash, NOT the f32-naive path -- do not assert flash == naive or
@@ -1283,23 +1282,23 @@ mod tests {
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
-        // Force CPU. This family's Metal path has two open defects (encoder
-        // numeric divergence -> empty-shell output, and a per-step wired-memory
-        // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
-        // reference decode is CPU-only.
+        // Force CPU for a deterministic reference baseline. The family policy
+        // is `AutoGpuPolicy::AllBackends`; the accelerated variants below cover
+        // the explicit Metal path separately rather than mixing backends into
+        // the CPU golden.
         transcribe_with_dev_pack_backend(wav_path, GgmlAsrBackendPreference::CpuOnly).map(
             |(text, _, elapsed, audio_duration_seconds)| (text, elapsed, audio_duration_seconds),
         )
     }
 
-    /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but lets the
+    /// Same real-pack e2e path as [`transcribe_with_dev_pack`], but lets the
     /// caller pick the backend preference -- used by the `_accelerated`
     /// variants below to drive an explicit `execution_target=accelerated`
     /// request end to end (encoder AND decode), the same override an
     /// `Accelerated` request installs in production (see
     /// `GgmlAsrBackendPreference::request_backend_override`'s doc and
-    /// `graph_config.rs`'s note that an explicit request always wins over
-    /// Auto Metal; family policy is AllBackends).
+    /// `graph_config.rs`'s note that an explicit request wins over Auto under
+    /// `AutoGpuPolicy::AllBackends`).
     fn transcribe_with_dev_pack_backend(
         wav_path: PathBuf,
         backend_preference: GgmlAsrBackendPreference,
@@ -1308,7 +1307,7 @@ mod tests {
         transcribe_with_dev_pack_backend_using_executor(&executor, wav_path, backend_preference)
     }
 
-    /// Execute one dev-pack request through the caller-provided executor.
+    /// Execute one real-pack request through the caller-provided executor.
     /// Keeping the executor outside this helper lets tests prove that the
     /// owner-actor pools retain and reuse runtimes across requests, while the
     /// ordinary fixture helpers below still get an isolated default executor.
@@ -1389,7 +1388,7 @@ mod tests {
         ))
     }
 
-    /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but returns the
+    /// Same real-pack e2e path as [`transcribe_with_dev_pack`], but returns the
     /// full [`Segment`] list instead of only the flat text -- used to check
     /// that the real decode's speaker/time-anchor markup round-trips through
     /// `speaker_segments::parse_moss_td_speaker_segments` (as wired into the
@@ -1511,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a local moss-transcribe-diarize .oasr pack and jfk.wav; runs the CPU host-prefill path"]
+    #[ignore = "requires a local real moss-transcribe-diarize .oasr pack and jfk.wav; runs the CPU host-prefill path outside weight-free CI"]
     fn voice_id_disabled_real_jfk_request_prefills_without_prior_host_history() {
         // A server request with `diarize=false` reaches this native MOSS
         // executor before any optional diarization or Voice ID post-processing.
@@ -1527,8 +1526,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; runs the CPU reference baseline outside weight-free CI"]
     fn golden_diff_end_to_end_transcribe_jfk_wav() {
         let Some((text, elapsed, audio_duration_seconds)) =
             transcribe_with_dev_pack(dev_sample_path("jfk.wav"))
@@ -1548,8 +1547,8 @@ mod tests {
     /// observable: the second call's transcript is byte-for-byte identical to
     /// the first (and to `GOLDEN_JFK_TEXT`).
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; runs the CPU reference baseline outside weight-free CI"]
     fn resident_runtime_cache_hits_on_a_second_transcribe_call_for_the_same_pack() {
         let executor = MossTdGgmlExecutor::default();
         let Some((first_text, _, _, _)) = transcribe_with_dev_pack_backend_using_executor(
@@ -1595,8 +1594,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; runs the CPU reference baseline outside weight-free CI"]
     fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav() {
         let Some((text, elapsed, audio_duration_seconds)) =
             transcribe_with_dev_pack(dev_sample_path("en_zh_mixed.wav"))
@@ -1611,15 +1610,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; runs the CPU reference baseline outside weight-free CI"]
     fn golden_diff_end_to_end_transcribe_jfk_wav_speaker_segments() {
         let Some(segments) = transcribe_with_dev_pack_segments(dev_sample_path("jfk.wav")) else {
             return;
         };
         // Same three speaker turns the flat-text golden's `[Sxx]`/`[t]` tags
         // encode (see `golden_diff_end_to_end_transcribe_jfk_wav` and
-        // `GOLDEN_JFK_TEXT`) -- this asserts the executor's real dev-pack
+        // `GOLDEN_JFK_TEXT`) -- this asserts the executor's real-pack
         // decode round-trips through `speaker_segments` into that same
         // structure, not just that the flat string matches.
         let expected =
@@ -1629,8 +1628,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; runs the CPU reference baseline outside weight-free CI"]
     fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_speaker_segments() {
         let Some(segments) = transcribe_with_dev_pack_segments(dev_sample_path("en_zh_mixed.wav"))
         else {
@@ -1645,11 +1644,11 @@ mod tests {
     }
 
     /// Snapshot of the shape `speaker_segments` produces for the two golden
-    /// transcripts pinned above, independent of any dev-pack decode -- pins
+    /// transcripts pinned above, independent of any real-pack decode -- pins
     /// the exact segment count/speaker-label/start/end/text tuple this PR's
     /// parser derives from the reference HF text, so a future edit to the
     /// grammar (e.g. changing how a back-to-back closing/opening anchor pair
-    /// is split) shows up as a diff here even without the private pack.
+    /// is split) shows up as a diff here even without a local real pack.
     #[test]
     fn snapshot_jfk_and_en_zh_mixed_golden_speaker_segments() {
         let jfk =
@@ -1796,10 +1795,10 @@ mod tests {
     // Explicit `execution_target=accelerated` e2e smoke: an explicit
     // `Accelerated` request installs the same thread-local override
     // `graph_config.rs` documents as always winning over this family's
-    // AllBackends Auto / explicit accelerated, so the encoder graph builds on Metal instead
-    // of being downgraded to CPU (the gate only ever pins what *Auto*
-    // resolves to -- see `encoder_graph_config_honors_explicit_accelerated_
-    // request` in `graph_config.rs`). Decode already runs on Metal under
+    // `AutoGpuPolicy::AllBackends`, so Auto may resolve the encoder to Metal
+    // when available and an explicit accelerated request selects it directly
+    // (see `encoder_graph_config_honors_explicit_accelerated_request` in
+    // `graph_config.rs`). Decode also runs on Metal under
     // Auto today (the shared qwen decode path is `AllBackends`, and #180
     // fixed its reuse-path graph so Metal decode reuses its graph), so this
     // is the full accelerated-request path: Metal encoder + Metal decode,
@@ -1811,9 +1810,10 @@ mod tests {
     // jfk.wav: byte-for-byte identical to the CPU golden, anchors included
     // (diff = 0.0 on every anchor).
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
-                (Metal encoder + Metal decode) and needs a Metal device"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
+                (Metal encoder + Metal decode) and needs a Metal device; remains outside \
+                weight-free CI"]
     fn golden_diff_end_to_end_transcribe_jfk_wav_accelerated() {
         let Some((_, segments, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("jfk.wav"),
@@ -1859,9 +1859,10 @@ mod tests {
     // and the firered-aed parity precedent it cites) -- neither is "the
     // bug".
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
-                and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
-                (Metal encoder + Metal decode) and needs a Metal device"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and \
+                tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
+                (Metal encoder + Metal decode) and needs a Metal device; remains outside \
+                weight-free CI"]
     fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_accelerated() {
         let Some((_, segments, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("en_zh_mixed.wav"),
@@ -1882,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack and the 3-minute AISHELL-4 fixture; drives an explicit accelerated request"]
+    #[ignore = "requires a local real moss-transcribe-diarize-fp16.oasr pack and the 3-minute AISHELL-4 fixture; drives an explicit accelerated request outside weight-free CI"]
     fn accelerated_aishell4_three_minute_smoke_completes_with_structured_transcript() {
         let Some((text, segments, _, _)) = transcribe_with_dev_pack_backend(
             dev_sample_path("aishell4_multispeaker_3min.wav"),

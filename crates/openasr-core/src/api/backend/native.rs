@@ -1476,7 +1476,7 @@ static NATIVE_RUNTIME_MODEL_ADAPTER_CACHE: OnceLock<
 /// projection borrows that exact proof; invalid packs are never cached as
 /// negative entries, so a later valid replacement can resolve normally.
 pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
-    if !crate::has_openasr_runtime_pack_extension(path) {
+    if !native_path::has_supported_native_runtime_pack_path_shape(path) {
         return None;
     }
     let verified_pack = crate::models::pack_verifier::PackVerifier
@@ -2613,7 +2613,7 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_model_adapter_rejects_invalid_runtime_source() {
+    fn native_runtime_model_adapter_enforces_product_pack_shapes() {
         let temp = tempfile::tempdir().unwrap();
         let invalid_path = temp.path().join("not-a-runtime.oasr");
         fs::write(&invalid_path, b"not gguf").unwrap();
@@ -2629,7 +2629,7 @@ mod tests {
 
         // A structurally valid GGUF payload is still not a product runtime
         // package when it is exposed under the raw `.gguf` extension. The
-        // product adapter seam accepts only the published `.oasr` envelope.
+        // product adapter seam accepts `.oasr` or the installed object shape.
         let valid_gguf_path = temp.path().join("valid-runtime.gguf");
         let valid_oasr_path = temp.path().join("valid-runtime.oasr");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("valid-runtime");
@@ -2643,6 +2643,18 @@ mod tests {
         assert!(
             native_runtime_model_adapter_for_path(&valid_oasr_path).is_some(),
             "the same valid payload is accepted once wrapped at the .oasr ingress"
+        );
+
+        let installed_object_path = temp
+            .path()
+            .join("objects/sha256")
+            .join("0".repeat(64))
+            .join("content");
+        fs::create_dir_all(installed_object_path.parent().unwrap()).unwrap();
+        write_tiny_gguf_runtime_source(&installed_object_path, &spec).unwrap();
+        assert!(
+            native_runtime_model_adapter_for_path(&installed_object_path).is_some(),
+            "an installed content-addressed pack must remain executable without a .oasr suffix"
         );
     }
 
@@ -4011,7 +4023,7 @@ mod tests {
     }
 
     #[test]
-    fn native_model_pack_path_rejects_directory_without_openasr_suffix() {
+    fn native_model_pack_path_rejects_directory_even_with_openasr_suffix() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("not-a-pack.oasr");
         std::fs::create_dir_all(&directory).unwrap();
@@ -4032,7 +4044,25 @@ mod tests {
         let error = validate_local_native_model_pack_path(&pack_file)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("expected the .oasr extension"), "{error}");
+        assert!(
+            error.contains("expected a .oasr file or an installed content-addressed pack object"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_model_pack_path_accepts_installed_content_addressed_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let object = temp
+            .path()
+            .join("objects/sha256")
+            .join("f".repeat(64))
+            .join("content");
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, b"GGUFpayload").unwrap();
+
+        let validated = validate_local_native_model_pack_path(&object).unwrap();
+        assert_eq!(validated, object);
     }
 
     #[test]

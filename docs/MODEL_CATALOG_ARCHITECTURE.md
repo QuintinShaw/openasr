@@ -3,6 +3,9 @@
 This note defines the current model-distribution catalog ownership chain, the
 `openasr pull` install mechanics, and the local registry cards. For current
 product behavior, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
+For the transition from a core model-family integration to a staged or
+public-ready release candidate, start at
+[Model Onboarding, Step 5](MODEL_ONBOARDING.md#step-5--choose-the-integration-scope-and-close-the-release-handoff).
 
 ## Invariants
 

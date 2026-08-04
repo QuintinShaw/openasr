@@ -5,15 +5,20 @@
 //! Model License v1.1** (<https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE>),
 //! not Apache-2.0 -- see `ACKNOWLEDGMENTS` / catalog license fields.
 //!
-//! Stage status:
-//! - Frontend (fbank + LFR + CMVN) and prompt/language selection are implemented
-//!   and unit-tested here ([`frontend`], [`language`]).
-//! - The FunASR-checkpoint-to-GGUF importer lives in [`package_import`].
-//! - The SAN-M/FSMN encoder graph, CTC executor, and weight loader land in the
-//!   executor stage.
+//! Current status:
+//! - Frontend (fbank + LFR + CMVN), prompt/language selection, and the
+//!   FunASR-checkpoint-to-GGUF importer are implemented here ([`frontend`],
+//!   [`language`], [`package_import`]).
+//! - The SAN-M/FSMN encoder graph, CTC executor, and weight loader are
+//!   implemented and registered through the builtin architecture, executor,
+//!   decode-policy, and runtime-contract registries.
+//! - Public `sensevoice-small` packs are listed in
+//!   `model-registry/catalog.public.json`. Emotion/event tags remain shadowed,
+//!   speaker segmentation remains external, and real-pack parity/end-to-end
+//!   checks are fixture-gated; no performance claim is made here.
 
-// The tag parser + re-exports are consumed by the SenseVoice executor (later
-// stage); until then they are exercised only by the unit tests here.
+// The tag parser and re-exports are consumed by the SenseVoice executor and are
+// also unit-tested here so tag shaping stays covered independently of fixtures.
 #![allow(dead_code)]
 
 pub(crate) mod encoder_graph;

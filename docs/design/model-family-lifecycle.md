@@ -304,6 +304,15 @@ regeneration, and static GPU-placement gates. Real weights, backend smoke, and
 benchmark receipts are release/manual C-class obligations and are deliberately
 outside this command.
 
+Lifecycle integration and distribution are separate milestones. Every change
+states whether it is **core-only**, a **staged release candidate**, or
+**public-ready**. The first needs no fabricated catalog state; the latter two
+follow [Model Onboarding, Step 5](../MODEL_ONBOARDING.md#step-5--choose-the-integration-scope-and-close-the-release-handoff)
+and the catalog ownership chain. Human-edited publishing inputs may be staged,
+but generated registry/catalog files never become a second source of truth.
+Public visibility, signing, uploading, and deployment remain separately
+authorized release actions.
+
 ## Acceptance and cleanup
 
 A migration is complete only when:
@@ -316,6 +325,11 @@ A migration is complete only when:
 - FunASR, Parakeet-CTC, Qwen, and TDT reference paths pass their real gates; and
 - obsolete paths, tests, names, and documentation are deleted after the new
   path owns the behavior.
+
+A staged/public-ready model additionally satisfies the Step 5 catalog,
+family-audit, real-weight receipt, and family-regression obligations appropriate
+to that scope. Passing this architecture contract alone never implies that a
+model is published or performance-qualified.
 
 Do not leave a compatibility alias merely to make a stale example compile. The
 source tree and the docs must teach the current path so a later contributor

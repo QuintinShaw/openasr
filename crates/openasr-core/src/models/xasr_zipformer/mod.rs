@@ -5,10 +5,18 @@
 //! (downsampled stacks, NonlinAttention, BiasNorm, bypass), so it gets its own
 //! module rather than reusing the shared `nn::encoder::conformer_block`.
 //!
-//! Status: executor onboarding in progress. The importer is **name-preserving**
-//! at the semantic level and uses `compact_xasr_name()` as the shared pack ↔
-//! runtime tensor naming contract. Runtime code must resolve upstream icefall
-//! names through the same compaction function rather than hard-coding GGUF names.
+//! Status: X-ASR is registered as a builtin architecture with a dedicated
+//! Zipformer/RNN-T executor, dedicated transducer decode policy, runtime tensor
+//! contract, and core pack importer. The public `xasr-zh-en` catalog entry points
+//! to published packs. The importer remains **name-preserving** at the semantic
+//! level and uses `compact_xasr_name()` as the shared pack ↔ runtime tensor
+//! naming contract; runtime code must resolve upstream icefall names through the
+//! same compaction function rather than hard-coding GGUF names.
+//!
+//! The shipped surface is fixed bilingual zh/en with frame-synchronous streaming
+//! and offline transcription. Phrase bias, translation, explicit source-language
+//! hints, and in-core speaker segmentation remain unsupported/external. Backend
+//! selection is architecture-specific; this module makes no performance claim.
 #![allow(dead_code)]
 
 pub(crate) mod decoder;

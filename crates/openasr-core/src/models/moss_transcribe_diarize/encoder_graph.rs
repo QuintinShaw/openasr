@@ -1118,12 +1118,12 @@ fn build_moss_encoder_resident_weights<'a>(
 
 #[cfg(test)]
 mod parity_tests {
-    //! CPU-vs-Metal numeric-divergence bisection for the "encoder decorrelates
-    //! on Metal" defect (`arch/mod.rs`'s `MOSS_TD_GGML_ARCHITECTURE_ID`
-    //! historical ExceptMetal pin (now AllBackends); defect investigation notes). Dev-only:
-    //! needs the real ~1.8 GB `moss-transcribe-diarize-fp16.oasr` pack (never
-    //! committed) and a real Metal device, so every test here is `#[ignore]`d
-    //! and points at the pack through an env var rather than a fixed path.
+    //! CPU-vs-Metal parity bisection for the encoder under this family's
+    //! `AutoGpuPolicy::AllBackends`. It needs a local real ~1.8 GB
+    //! `moss-transcribe-diarize-fp16.oasr` pack (not committed) and a real
+    //! Metal device, so every test here is `#[ignore]`d and points at the pack
+    //! through an env var rather than a fixed path. These weight-bearing tests
+    //! remain outside weight-free CI.
     //!
     //! Methodology mirrors firered-aed's CPU-vs-PyTorch bisection
     //! (`models/firered_aed/encoder_graph.rs`'s `parity_tests` module doc):
@@ -1152,7 +1152,7 @@ mod parity_tests {
     const CHUNK_OFFSET_ENV: &str = "OPENASR_MOSS_TD_ENCODER_CHUNK_OFFSET_SECS";
     /// `WhisperFeatureExtractor`'s target frame count for one 30s chunk
     /// (mirrors `executor.rs`'s `MEL_TARGET_FRAMES`; not exported from there
-    /// since that module keeps it private).
+    /// because that module keeps the constant internal).
     const MEL_TARGET_FRAMES: usize = 3000;
 
     fn real_pack_path() -> std::path::PathBuf {
@@ -1287,13 +1287,11 @@ mod parity_tests {
             GgmlCpuGraphConfig::BACKEND_ENV,
             Some(env_value.into()),
         )]);
-        // Under the historical ExceptMetal pin, graph_config downgraded an
-        // Auto-resolved Metal -- including one steered by `BACKEND_ENV` above
-        // -- to CPU, so env-var steering alone can never reach the Metal leg.
-        // Install an explicit `Accelerated` request override for that leg:
-        // the documented production path the gate always honors (an explicit
-        // per-request preference wins over any Auto-mode gate), i.e. exactly
-        // what an `execution_target=accelerated` request runs in production.
+        // Resolve the Metal leg with an explicit `Accelerated` request. The
+        // production path gives explicit per-request preferences precedence
+        // over Auto while the family descriptor remains
+        // `AutoGpuPolicy::AllBackends`, so this harness exercises the same
+        // backend selection as `execution_target=accelerated`.
         let explicit_preference = (backend == GgmlCpuGraphBackend::Metal)
             .then_some(crate::ggml_runtime::RequestBackendPreference::Accelerated);
         let _accelerated_override = explicit_preference.clone().map(|preference| {
@@ -1386,15 +1384,12 @@ mod parity_tests {
         );
     }
 
-    /// The actual regression gate this defect's fix must satisfy (see
-    /// `arch/mod.rs` auto_gpu_policy note): historically flip
-    /// `auto_gpu_policy` back to `AllBackends` and un-ignore this test.
+    /// CPU-vs-Metal parity gate for the family's current
+    /// `AutoGpuPolicy::AllBackends` descriptor (see `arch/mod.rs`).
     ///
-    /// Status: the Metal leg is now reachable (previously it silently
-    /// was once downgraded to CPU under ExceptMetal even when
-    /// driven via `BACKEND_ENV`, so it never actually ran on Metal -- fixed
-    /// by installing an explicit `Accelerated` request override, see this
-    /// module's `run_tapped_encoder`) and currently PASSES on this host: on
+    /// Status: the Metal leg is reachable under the current policy, and the
+    /// explicit accelerated request in this harness currently PASSES on this
+    /// host: on
     /// `fixtures/jfk.wav`'s 30s chunk, `encoder_out` cosine = 0.999542
     /// (threshold 0.999); the per-layer breakdown from
     /// `dump_cpu_vs_metal_layer_cosine_table` shows layer 7 onward carrying
@@ -1404,19 +1399,16 @@ mod parity_tests {
     /// the pass/fail metric here) and layer 23 is the sharpest single-layer
     /// drop (cosine 0.999128) before recovering slightly at `encoder_out`.
     ///
-    /// This does NOT flip `auto_gpu_policy` to `AllBackends` on its own --
-    /// that is a separate, explicitly user-gated decision (this pass is one
-    /// data point: one host, one 30s clip; the `en_zh_mixed`-clip e2e smoke
-    /// in `executor.rs` found a small but real divergence at the decoded-
-    /// text level on a different clip, so do not read this test alone as
-    /// "Metal is safe to default to").
+    /// This remains a measured parity data point rather than a performance
+    /// claim: it covers one host and one 30s clip, while the `en_zh_mixed` e2e
+    /// smoke in `executor.rs` exercises a different clip and tolerates its
+    /// measured anchor delta.
     ///
-    /// Kept `#[ignore]` regardless of the above: it needs a private,
-    /// uncommitted dev-only `.oasr` pack (`real_pack_path` panics without
-    /// `OPENASR_MOSS_TD_ENCODER_REAL_PACK` set) and a real Metal device,
-    /// neither of which CI has -- there is no small synthetic fixture this
-    /// could run against instead (the encoder graph needs real converted
-    /// checkpoint weights, not a hand-built tensor). Run locally with:
+    /// Kept `#[ignore]` because it needs a local real, uncommitted `.oasr` pack
+    /// (`real_pack_path` panics without `OPENASR_MOSS_TD_ENCODER_REAL_PACK`)
+    /// and a real Metal device. Weight-free CI has neither model weights nor a
+    /// Metal fixture; there is no small synthetic substitute for this graph.
+    /// Run locally with:
     ///
     /// ```text
     /// OPENASR_MOSS_TD_ENCODER_REAL_PACK=/path/to/moss-transcribe-diarize-fp16.oasr \
@@ -1429,9 +1421,9 @@ mod parity_tests {
     /// optionally `OPENASR_MOSS_TD_ENCODER_CHUNK_OFFSET_SECS=<secs>`) to
     /// retest against a different clip or a later 30s window of a long one.
     #[test]
-    #[ignore = "requires a private dev-only moss-transcribe-diarize .oasr pack via \
-                OPENASR_MOSS_TD_ENCODER_REAL_PACK and a real Metal device -- see the doc \
-                comment above for current pass/fail status and the local run command"]
+    #[ignore = "requires a local real moss-transcribe-diarize .oasr pack via \
+                OPENASR_MOSS_TD_ENCODER_REAL_PACK and a real Metal device; remains outside \
+                weight-free CI -- see the doc comment above for the local run command"]
     fn metal_encoder_matches_cpu_reference() {
         let cpu = run_tapped_encoder(GgmlCpuGraphBackend::Cpu);
         let metal = run_tapped_encoder(GgmlCpuGraphBackend::Metal);

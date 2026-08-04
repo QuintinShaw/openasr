@@ -814,11 +814,11 @@ role = "punctuation-restorer"
 # the arch descriptor) via free-text instruction-following, with no
 # language-selection prompt token (LanguageFamilyHint::SelfDetectsRejectsHint,
 # same shape as qwen3-asr) -- language_mode is therefore "detect_implicit".
-# Staged PRIVATE like firered2-llm/mimo-asr were in c847ae2: release_public
-# only gates the eventual `--public` flip (which also needs a completed
-# docs/model-audits/moss-transcribe-diarize.md form -- see _manifest.py's
-# ensure_release_audit_form); the catalog entry itself stays absent until a
-# deliberate later publish step, so this staging is not itself a release.
+# Public release state: `release_public` projects this source row into the
+# generated signed/public catalogs, which pin the immutable HF revision and all
+# three quant artifacts. Future artifact, hash, or catalog changes still require
+# a completed release audit and explicit publication authorization; this boolean
+# records current state and never grants a later publish action by itself.
 ["moss-transcribe-diarize"]
 family = "moss-transcribe-diarize"
 hf_repo = "OpenASR/moss-transcribe-diarize"

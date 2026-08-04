@@ -972,7 +972,7 @@ pub enum BackendError {
         reason: &'static str,
     },
     #[error(
-        "Native ASR Core backend requires an explicit local runtime pack path.\nCurrent status: native stays fail-closed without a caller-provided runtime pack.\nRun with --backend native --model-pack /absolute/or/relative/path/to/model.gguf (or .oasr; active .oasr packs are GGUF-backed).\nNo remote URLs or downloads are allowed."
+        "Native ASR Core backend requires an explicit local runtime pack path.\nCurrent status: native stays fail-closed without a caller-provided runtime pack.\nRun with --backend native --model-pack /absolute/or/relative/path/to/model.oasr, or use an installed model reference.\nRaw .gguf paths, remote URLs, and implicit downloads are not allowed."
     )]
     NativeModelPackPathRequired,
     #[error(

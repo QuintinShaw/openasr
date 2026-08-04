@@ -3929,31 +3929,69 @@ fn native_runtime_backend_label(backend: GgmlCpuGraphBackend) -> &'static str {
     }
 }
 
-/// Best-effort quant tag for the `stage=request_context` log line: installed
-/// packs live at `<home>/models/<model>/<quant>/<model>-<quant>.oasr` (see
-/// `pull.rs`'s `InstalledPack` layout), so the runtime pack path's *parent
-/// directory name* already is the quant tag -- no second GGUF/metadata read
-/// needed. Falls back to the tag parsed off the request's own model ref
-/// (`family:quant`) for a pack laid out outside that convention (e.g.
-/// `--model-pack` pointed at an arbitrary file), and finally to `"unknown"`
-/// rather than fabricating a value.
+/// Best-effort quant tag for the `stage=request_context` log line without a
+/// second GGUF/metadata read. The resolved request model ref is authoritative
+/// for current content-addressed installs; their path parent is a SHA-256
+/// digest, never a quant tag. The parent-directory fallback exists only for
+/// legacy `<model>/<quant>/<pack>.oasr` layouts and is accepted when it is a
+/// known quant token. Arbitrary path segments become `"unknown"` rather than
+/// fabricated telemetry.
 fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> String {
+    let from_request_tag = parse_model_ref(requested_model_id)
+        .ok()
+        .and_then(|reference| reference.tag);
     let from_parent_dir = runtime_pack_path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str());
-    let from_request_tag = parse_model_ref(requested_model_id)
-        .ok()
-        .and_then(|reference| reference.tag);
-    match from_parent_dir.or(from_request_tag.as_deref()) {
-        Some(tag) => crate::canonical_quant_tag(tag).to_string(),
-        None => "unknown".to_string(),
+    for candidate in [from_request_tag.as_deref(), from_parent_dir]
+        .into_iter()
+        .flatten()
+    {
+        let canonical = crate::canonical_quant_tag(candidate);
+        if matches!(canonical, "f32" | "fp16" | "q8_0" | "q4_k" | "q3_k") {
+            return canonical.to_string();
+        }
     }
+    "unknown".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_context_quant_prefers_model_ref_over_content_digest() {
+        let object = Path::new(
+            "/models/objects/sha256/0044546efb95d4d08e85f5574da2b042a5a4fb2490678c666b65404f1ac94c04/content",
+        );
+        assert_eq!(
+            quant_tag_for_log("moss-transcribe-diarize:q4", object),
+            "q4_k"
+        );
+        assert_eq!(
+            quant_tag_for_log("moss-transcribe-diarize", object),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn request_context_quant_accepts_only_known_legacy_parent_tags() {
+        assert_eq!(
+            quant_tag_for_log(
+                "moss-transcribe-diarize",
+                Path::new("/models/moss-transcribe-diarize/q8_0/model.oasr")
+            ),
+            "q8_0"
+        );
+        assert_eq!(
+            quant_tag_for_log(
+                "moss-transcribe-diarize",
+                Path::new("/arbitrary/not-a-quant/model.oasr")
+            ),
+            "unknown"
+        );
+    }
 
     #[test]
     fn native_request_auto_honors_backend_environment_as_typed_intent() {

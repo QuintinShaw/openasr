@@ -22,6 +22,16 @@
 
 <!-- Add CLI/API/example smoke checks, if any. -->
 
+## Model-family changes (when applicable)
+
+- [ ] I followed the root `AGENTS.md` model-family onboarding entry point and
+      ran `cargo xtask family conformance --profile-id <profile-id>`.
+- [ ] I stated `core-only`, `staged release candidate`, or `public-ready`; any
+      staged/public-ready work completes Model Onboarding Step 5 without
+      hand-editing generated catalog/registry truth.
+- [ ] Real-weight quality/performance claims have artifact-backed evidence;
+      otherwise they are explicitly listed as unverified.
+
 ## Docs updated
 
 - [ ] README or docs updated, if behavior or limitations changed.

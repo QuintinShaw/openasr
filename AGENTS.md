@@ -52,6 +52,21 @@ Hard rules for a new family:
   policy consumes typed backend capabilities; provider-name parsing belongs only
   at the shared runtime boundary.
 
+Start and finish the weight-free integration through the repository-owned
+commands; do not hand-scaffold a parallel path:
+
+```bash
+cargo xtask family new <module_slug> --profile-id <profile-id>
+# implement the generated fail-closed skeleton, then:
+cargo xtask family conformance --profile-id <profile-id>
+```
+
+Before a new model becomes a staged or public release candidate, complete the
+scope and catalog handoff in [Model Onboarding, Step 5](docs/MODEL_ONBOARDING.md#step-5--choose-the-integration-scope-and-close-the-release-handoff).
+Publishing metadata has a separate human-edited source of truth; never hand-edit
+generated registry/catalog files, fabricate hashes/URLs, or treat a passing
+weight-free gate as release evidence.
+
 ## Building from source (the part agents forget)
 
 The ggml backend is a **git submodule** compiled from source, so a plain clone will

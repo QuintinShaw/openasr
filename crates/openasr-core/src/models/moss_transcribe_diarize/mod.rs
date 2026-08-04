@@ -13,20 +13,22 @@
 //! special tokens, moss-td's tags are literal characters, so stripping them
 //! from the plain/CLI text output would rewrite what the model actually said.
 //!
-//! Stage status: the checkpoint-to-GGUF importer ([`package_import`]) and the
-//! full ggml execution graph (Whisper encoder reuse via [`encoder_graph`],
+//! Current status: the checkpoint-to-GGUF importer ([`package_import`]) and
+//! the full ggml execution graph (Whisper encoder reuse via [`encoder_graph`],
 //! the [`adaptor_graph`] bridge, Qwen3 decoder reuse via [`llm_decoder`], and
 //! decode-policy/executor/tensor-contract registration in [`executor`] and
-//! `arch/mod.rs`) are both implemented and registered as a builtin
-//! architecture -- a pack produced by this importer runs end-to-end through
-//! `openasr transcribe --model-pack <pack>` (CPU; the Metal path has a known
-//! encoder-numerics defect, see the arch descriptor's `auto_gpu_policy`
-//! doc). What is NOT yet wired: a public `openasr model-pack import`
-//! subcommand (the importer above is reachable only from Rust/tests, same
-//! pre-CLI-wiring stage `qwen3-forced-aligner` was at) and publication to
-//! the model catalog/registry (see `tooling/publish-model/models-core.toml`'s
-//! `moss-transcribe-diarize` entry, staged `release_public` but not yet
-//! public).
+//! `arch/mod.rs`) are implemented and registered as a builtin architecture.
+//! A pack produced by this importer runs through `openasr transcribe
+//! --model-pack <pack>`, and `openasr model-pack import moss` dispatches the
+//! importer. Public catalog coverage is live in
+//! `model-registry/catalog.public.json` with the three published quantization
+//! tiers: `fp16`, `q8_0`, and `q4_k`.
+//!
+//! Auto backend selection follows `AutoGpuPolicy::AllBackends`, so Auto may
+//! resolve to Metal on Apple Silicon and explicit accelerated requests use the
+//! same registered family path. End-to-end text/speaker/timestamp checks still
+//! require a local real pack and reference fixtures, so those `#[ignore]` tests
+//! remain outside weight-free CI; this module makes no performance claim.
 
 mod adaptor_graph;
 pub(crate) mod capacity;
@@ -44,12 +46,9 @@ pub(crate) mod speaker_segments;
 pub(crate) mod tensor_names;
 mod tokenizer;
 
-// Not yet consumed by any CLI/tooling entry point (see the module doc above
-// for stage status) -- re-exported now so a future CLI `model-pack import`
-// case can reach these without touching this file again. Matches every
-// other family module's `pub use` shape in this crate (e.g. `firered_llm`,
-// `mimo_asr`), which stay unused the same way until their own CLI wiring
-// lands.
+// Re-exported for the `openasr model-pack import moss` dispatch and crate-level
+// consumers. The converter is also covered by fixture-gated unit tests, while
+// tests that require a local real pack remain outside weight-free CI.
 #[allow(unused_imports)]
 pub use package_import::{
     MossTdImportRequest, MossTdImportResult, MossTdQuantizationMode,

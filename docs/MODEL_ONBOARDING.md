@@ -266,6 +266,52 @@ pass review on golden-diff output alone. This is exactly how Dolphin's and
 X-ASR/Zipformer's encoders shipped GPU-invisible despite passing golden/parity
 (#131/#115).
 
+## Step 5 — choose the integration scope and close the release handoff
+
+Runtime integration and public model distribution are separate scopes. Record
+one of these scopes in the change and do not silently drift from one to another:
+
+- **Core-only:** the family, importer, runtime, fixtures, and weight-free gates
+  are complete, but there is no release candidate. Do not invent a publishing
+  row, registry card, URL, digest, metrics, or public catalog entry merely to make
+  the integration look complete.
+- **Staged release candidate:** add the human-edited model source and publishing
+  inputs under `tooling/publish-model/` with `release_public = false`, including
+  `models-core.toml`, the corresponding `models-publish.toml` entry, and
+  `cards/<model-id>.toml`. Copy `docs/model-audits/TEMPLATE.md` to
+  `docs/model-audits/<family>.md` and begin recording real evidence. Generated
+  `model-registry/models/*.toml` and catalog files are outputs; never edit them
+  as independent truth. A source-only staged row is valid while real artifacts
+  do not yet exist.
+- **Public-ready:** in addition to the staged inputs, every shipped quant has a
+  verified `.oasr` result sidecar, immutable upstream/Hugging Face revision,
+  measured C-class receipt, completed family audit, and a real regression case
+  plus committed golden under `tooling/family-regression/`. The release tooling,
+  not the model-family code, decides when those facts may project to
+  `public:true`.
+
+The catalog ownership and staging rules are normative in
+[Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md).
+Use the read-only readiness report to identify the next safe release action:
+
+```bash
+python3 tooling/publish-model/scripts/onboarding_readiness.py --model <model-id>
+```
+
+For generated registry/catalog output, follow that document and use
+`tooling/publish-model/scripts/regenerate_all.sh`; `--check` is the CI-safe drift
+gate. Before the first public release, complete the audit requirements in
+[Model release audits](model-audits/README.md) and register the smallest public
+checkpoint/quant with a committed golden as described by
+[`tooling/family-regression/README.md`](../tooling/family-regression/README.md).
+The real-model workflow is deliberately outside PR CI because it downloads
+weights and runs native inference.
+
+No integration task authorizes upload, `release_public = true`, catalog signing,
+publication, or deployment. Those are separately authorized release actions.
+Until that authorization and the public-listing gate both exist, keep the model
+core-only or staged and state the remaining evidence explicitly.
+
 ## Runtime contract: keep quantized weights quantized
 
 **Hard requirement.** A quantized `.oasr` pack MUST feed its weights to ggml

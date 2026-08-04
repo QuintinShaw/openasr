@@ -911,8 +911,9 @@ fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // themselves are the same tokens the tagged reference decode produced; only
 // the markup is gone, and the per-turn split shows up as the ordinary
 // inter-segment space the longform assembler joins segments with. Pinned
-// against `OPENASR_GGML_BACKEND=cpu` (this family's Metal path has a known
-// encoder numerics defect, see the arch descriptor's `auto_gpu_policy` doc).
+// against `OPENASR_GGML_BACKEND=cpu` to preserve the measured CPU reference.
+// Metal is separately measured and supported by the family's
+// `AutoGpuPolicy::AllBackends` contract.
 const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you, ask what you can ",
     "do for your country. ",
@@ -927,7 +928,7 @@ const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
 );
 
 #[test]
-#[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack; runs the real \
+#[ignore = "requires an opt-in MOSS Transcribe Diarize fp16 .oasr pack; runs the real \
             longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu"]
 fn moss_transcribe_diarize_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     let pack_path = match external_test_fixture_path(

@@ -9,7 +9,7 @@
 //! The only transform is the proven cohere/parakeet dim-reversal of rank>=2
 //! `.weight` tensors (HF `[out, in]` -> ggml `[in, out]` for `mul_mat`; conv
 //! kernels `[OC, IC, kh, kw]` -> `[kw, kh, IC, OC]`), decided BEFORE quantization.
-//! The `xasr_zipformer` executor (later stage) consumes these names directly.
+//! The registered `xasr_zipformer` executor consumes these names directly.
 //!
 //! The normal source route is checkpoint/HF safetensors -> canonical
 //! safetensors -> `.oasr`. X-ASR's deployed ONNX weights are a deliberate

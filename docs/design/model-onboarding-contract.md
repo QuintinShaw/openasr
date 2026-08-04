@@ -385,6 +385,15 @@ with a one-line structural justification for going another way):
       (golden-diff / stash-diff per [Model Onboarding](../MODEL_ONBOARDING.md#step-4--gate-the-pack-runtime-and-output)).
       A brand-new family adds a bench-suite entry and freezes its first
       transcript as the reference instead.
+- [ ] The integration scope is explicit: `core-only`, `staged release
+      candidate`, or `public-ready`. Staged/public-ready work follows
+      [Model Onboarding, Step 5](../MODEL_ONBOARDING.md#step-5--choose-the-integration-scope-and-close-the-release-handoff):
+      publishing inputs are human-edited, registry/catalog files are generated,
+      and no URL, digest, revision, metric, or public status is fabricated.
+- [ ] Before a first public release, the family audit is complete and the
+      smallest public checkpoint/quant has a committed real-model regression
+      golden plus workflow entry. Weight-free conformance is not presented as
+      WER, RTF, RSS, accelerator-utilization, or quantization-quality evidence.
 
 ## Relationship to Model Onboarding
 

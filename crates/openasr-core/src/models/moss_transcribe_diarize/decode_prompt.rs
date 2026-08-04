@@ -378,11 +378,11 @@ mod tests {
             .expect("tokenizer")
     }
 
-    /// Real converted dev pack (see `package_import`'s own
+    /// Real converted local pack (see `package_import`'s own
     /// `golden_diff_converted_pack_tensors_match_source_checkpoint_bit_for_bit`
-    /// for the tensor-parity half of this pack's provenance), NOT committed
-    /// to the repo -- same dev-only-artifact convention as
-    /// `mimo_asr::executor::tests::dev_pack_path`.
+    /// for the tensor-parity half of this pack's provenance), not committed to
+    /// the repo. It is an opt-in weight-bearing fixture, so tests using it stay
+    /// outside weight-free CI.
     fn dev_pack_path() -> Option<std::path::PathBuf> {
         match crate::testing::external_test_fixture_path(
             "OPENASR_MOSS_TRANSCRIBE_DIARIZE_PACK",

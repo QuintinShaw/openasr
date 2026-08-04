@@ -47,13 +47,22 @@
 //! live -- none of the three audio tokens are exposed via `vocab.json` or
 //! `added_tokens.json` alone, only in `tokenizer.json`.
 //!
-//! **Stage status**: this importer produces a well-formed, self-describing
-//! GGUF with every tensor this family needs and full tokenizer metadata. It
-//! is NOT yet wired into `arch/mod.rs`'s family-descriptor table (no
-//! `MOSS_TRANSCRIBE_DIARIZE_*` architecture/decode-policy/executor-component
-//! registration exists yet), so a pack produced here is not yet runnable by
-//! `openasr transcribe` -- the ggml execution graph (Whisper encoder reuse +
-//! adaptor + Qwen3 decoder + decode-policy registration) is follow-up work.
+//! **Current status**: this importer produces a well-formed, self-describing
+//! GGUF with every tensor this family needs and full tokenizer metadata. It is
+//! wired into the canonical architecture descriptor and builtin dedicated
+//! executor/decode-policy/runtime-contract registries, and the `moss` variant
+//! of `openasr model-pack import` invokes it. Packs produced here are consumed
+//! by the builtin runtime and the public `moss-transcribe-diarize` packs are
+//! listed in `model-registry/catalog.public.json`.
+//!
+//! Runtime semantics still follow the family contract: MOSS has no true
+//! realtime/incremental path (its registered streaming surface is buffered),
+//! has a bounded 60-second invocation envelope, and rejects explicit
+//! source-language hints. End-to-end text/speaker/timestamp parity is covered
+//! by fixture-gated tests in `moss_transcribe_diarize::executor`; those tests
+//! require a local real pack and reference fixtures and remain outside
+//! weight-free CI. This importer test only checks tensor-level parity and makes
+//! no performance claim.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1258,11 +1267,10 @@ mod tests {
 
     // --- Real-checkpoint conversion + tensor parity ------------------------
     //
-    // Points at the private dev-only checkpoint download (~1.7GB bf16
-    // safetensors, NOT committed -- same convention as every other family's
-    // real-dev-pack test in this crate, e.g. `firered_llm::executor`'s
-    // `dev_pack_path()`). Skips silently when absent so this stays runnable
-    // without the multi-GB download.
+    // Points at a local source-checkpoint fixture (~1.7GB bf16 safetensors,
+    // not committed). Weight-bearing fixtures are opt-in, so this test skips
+    // when the source is absent and keeps weight-free CI runnable without the
+    // multi-GB download.
     fn dev_checkpoint_root() -> Option<PathBuf> {
         crate::testing::external_test_fixture_path(
             "OPENASR_MOSS_TRANSCRIBE_DIARIZE_SOURCE",
@@ -1301,10 +1309,10 @@ mod tests {
         // each of the three branches: fp16 conversion is lossy relative to
         // the source bf16 (both are 16-bit but with different
         // mantissa/exponent splits), so this asserts closeness, not bit
-        // equality -- the golden-diff test at the ggml-execution layer
-        // (follow-up work, see this module's doc comment) is where
-        // token-level parity against the reference PyTorch forward pass
-        // gets checked.
+        // equality. Fixture-gated end-to-end golden tests in
+        // `moss_transcribe_diarize::executor` cover token/text,
+        // speaker-label, and timestamp parity when a local real pack and
+        // reference fixtures are available.
         let safetensors = open_safetensors_shard(&source_root).expect("open safetensors");
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&output_root)
             .expect("open converted pack for parity read");

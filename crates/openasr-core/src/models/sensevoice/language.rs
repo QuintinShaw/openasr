@@ -17,7 +17,8 @@
 //! mirroring `dolphin::language` and the whisper missing-language path.
 
 // The prompt builder + tag-shadow flag are consumed by the SenseVoice executor
-// (later stage); until then they are exercised only by the unit tests here.
+// and are also unit-tested here so prompt/tag shaping stays covered without
+// requiring a weight-bearing fixture.
 #![allow(dead_code)]
 
 use crate::models::language::normalize_language;

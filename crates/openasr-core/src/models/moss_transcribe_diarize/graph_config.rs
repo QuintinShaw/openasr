@@ -59,9 +59,8 @@ mod tests {
     #[test]
     fn encoder_graph_config_follows_family_auto_policy_under_auto() {
         // With AllBackends, Auto may resolve to Metal on Apple Silicon. The
-        // encoder config must match what an explicit resolution for this
-        // family's policy gives, not silently force CPU (the old
-        // ExceptMetal trap).
+        // encoder config must match the descriptor's resolved backend and must
+        // not reintroduce a CPU-only gate.
         let policy = family_auto_gpu_policy_for_model_architecture(MOSS_TD_GGML_ARCHITECTURE_ID);
         let backend = ResolvedFamilyRuntimeInput::resolve(None, policy).backend();
         assert_eq!(moss_td_encoder_graph_config(backend).backend, backend);
