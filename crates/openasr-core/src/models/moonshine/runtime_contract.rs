@@ -1,10 +1,13 @@
 use thiserror::Error;
 
+use crate::models::oasr_metadata::{TOKENIZER_GGML_TOKENS_KEY, required_metadata_string_array};
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
     u64_to_u32, u64_to_usize, validate_positive_usize,
 };
 use crate::{GgufTensorIndex, GgufTensorMetadata};
+
+use super::tokenizer::MoonshineTokenizer;
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 pub(crate) const MOONSHINE_ARCHITECTURE_VALUE: &str = "moonshine-encoder-decoder";
@@ -124,6 +127,22 @@ pub(crate) fn parse_moonshine_execution_metadata<M: ScalarMetadataView>(
             key: MOONSHINE_ROPE_THETA_KEY,
             reason: format!("rope_theta={rope_theta} must be finite and positive"),
         });
+    }
+
+    // The decoder samples ids in [0, vocab_size) and detokenizes them through
+    // the pack-carried vocab; a special id outside that range can never be
+    // produced or decoded. Fail closed here (moss/funasr precedent) instead of
+    // mid-decode.
+    for (key, id) in [
+        (MOONSHINE_BOS_TOKEN_ID_KEY, bos_token_id),
+        (MOONSHINE_EOS_TOKEN_ID_KEY, eos_token_id),
+    ] {
+        if (id as usize) >= vocab_size {
+            return Err(MoonshineRuntimeContractError::InvalidMetadataValue {
+                key,
+                reason: format!("token id {id} out of range for vocab_size {vocab_size}"),
+            });
+        }
     }
 
     Ok(MoonshineExecutionMetadata {
@@ -447,5 +466,196 @@ pub(crate) fn validate_runtime_pack_contract(
             crate::models::runtime_pack_contract::metadata_validation_error("moonshine", error)
         })?;
     validate_moonshine_runtime_tensors_with_index(preflight.tensor_index(), execution_metadata)
-        .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
+        .map_err(crate::models::runtime_pack_contract::tensor_validation_error)?;
+    validate_moonshine_tokenizer_contract(preflight.metadata(), execution_metadata).map_err(
+        |error| {
+            crate::models::runtime_pack_contract::metadata_validation_error(
+                "moonshine tokenizer",
+                error,
+            )
+        },
+    )
+}
+
+/// Admission-time tokenizer contract. The runtime materializes the tokenizer
+/// from exactly these keys (`MoonshineTokenizer::from_gguf_metadata`), so a
+/// pack that omits them or carries an incompatible `tokenizer.ggml.model`
+/// must fail closed at pack admission, not at prepared-runtime construction.
+/// The vocab coverage proof additionally guarantees that every id the decoder
+/// can sample (`[0, vocab_size)`, the tied-embedding logits width) has a
+/// detokenization entry; the importer writes exactly `vocab_size` tokens, so a
+/// shorter array means a truncated or mis-converted pack.
+pub(crate) fn validate_moonshine_tokenizer_contract(
+    metadata: &crate::GgufMetadata,
+    execution_metadata: MoonshineExecutionMetadata,
+) -> Result<(), MoonshineRuntimeContractError> {
+    MoonshineTokenizer::from_gguf_metadata(metadata).map_err(|error| {
+        MoonshineRuntimeContractError::InvalidMetadataValue {
+            key: "tokenizer.ggml",
+            reason: error.to_string(),
+        }
+    })?;
+    let tokens = required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY, "Moonshine")
+        .map_err(
+        |error| MoonshineRuntimeContractError::InvalidMetadataValue {
+            key: TOKENIZER_GGML_TOKENS_KEY,
+            reason: error.to_string(),
+        },
+    )?;
+    if tokens.len() < execution_metadata.vocab_size {
+        return Err(MoonshineRuntimeContractError::InvalidMetadataValue {
+            key: TOKENIZER_GGML_TOKENS_KEY,
+            reason: format!(
+                "tokenizer vocab carries {} tokens but {MOONSHINE_VOCAB_SIZE_KEY}={} requires coverage of every sampleable id",
+                tokens.len(),
+                execution_metadata.vocab_size
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::{GgufMetadata, GgufMetadataValue};
+
+    use super::*;
+
+    fn scalar_metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn valid_metadata() -> BTreeMap<String, String> {
+        scalar_metadata(&[
+            (GENERAL_ARCHITECTURE_KEY, MOONSHINE_ARCHITECTURE_VALUE),
+            (MOONSHINE_VOCAB_SIZE_KEY, "4"),
+            (MOONSHINE_D_MODEL_KEY, "16"),
+            (MOONSHINE_ENCODER_LAYERS_KEY, "1"),
+            (MOONSHINE_DECODER_LAYERS_KEY, "1"),
+            (MOONSHINE_HEADS_KEY, "2"),
+            (MOONSHINE_HEAD_DIM_KEY, "8"),
+            (MOONSHINE_ROTARY_DIM_KEY, "4"),
+            (MOONSHINE_ENCODER_FFN_DIM_KEY, "64"),
+            (MOONSHINE_DECODER_FFN_DIM_KEY, "64"),
+            (MOONSHINE_MAX_CONTEXT_KEY, "128"),
+            (MOONSHINE_BOS_TOKEN_ID_KEY, "1"),
+            (MOONSHINE_EOS_TOKEN_ID_KEY, "2"),
+            (MOONSHINE_SAMPLE_RATE_KEY, "16000"),
+            (MOONSHINE_ROPE_THETA_KEY, "10000"),
+        ])
+    }
+
+    fn execution_metadata() -> MoonshineExecutionMetadata {
+        parse_moonshine_execution_metadata(&valid_metadata()).expect("metadata must parse")
+    }
+
+    fn tokenizer_gguf_metadata(model: &str, tokens: &[&str]) -> GgufMetadata {
+        let mut values = BTreeMap::new();
+        values.insert(
+            crate::models::oasr_metadata::TOKENIZER_GGML_MODEL_KEY.to_string(),
+            GgufMetadataValue::String(model.to_string()),
+        );
+        values.insert(
+            TOKENIZER_GGML_TOKENS_KEY.to_string(),
+            GgufMetadataValue::StringArray(
+                tokens.iter().map(|token| (*token).to_string()).collect(),
+            ),
+        );
+        GgufMetadata::from_values_for_test(values)
+    }
+
+    #[test]
+    fn accepts_special_token_ids_inside_the_vocab_range() {
+        assert_eq!(execution_metadata().bos_token_id, 1);
+    }
+
+    #[test]
+    fn rejects_bos_token_id_outside_the_vocab_range() {
+        let mut metadata = valid_metadata();
+        metadata.insert(MOONSHINE_BOS_TOKEN_ID_KEY.to_string(), "4".to_string());
+        let error =
+            parse_moonshine_execution_metadata(&metadata).expect_err("bos id must fail closed");
+        match error {
+            MoonshineRuntimeContractError::InvalidMetadataValue { key, reason } => {
+                assert_eq!(key, MOONSHINE_BOS_TOKEN_ID_KEY);
+                assert!(reason.contains("vocab_size"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_eos_token_id_outside_the_vocab_range() {
+        let mut metadata = valid_metadata();
+        metadata.insert(MOONSHINE_EOS_TOKEN_ID_KEY.to_string(), "9".to_string());
+        let error =
+            parse_moonshine_execution_metadata(&metadata).expect_err("eos id must fail closed");
+        match error {
+            MoonshineRuntimeContractError::InvalidMetadataValue { key, reason } => {
+                assert_eq!(key, MOONSHINE_EOS_TOKEN_ID_KEY);
+                assert!(reason.contains("token id 9"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenizer_contract_accepts_full_vocab_coverage() {
+        let metadata = tokenizer_gguf_metadata("llama", &["<pad>", "<s>", "</s>", "fixture"]);
+        validate_moonshine_tokenizer_contract(&metadata, execution_metadata())
+            .expect("vocab covering every sampleable id must pass");
+    }
+
+    #[test]
+    fn tokenizer_contract_accepts_an_oversized_vocab() {
+        // Extra unreachable entries are harmless; coverage is the invariant.
+        let metadata =
+            tokenizer_gguf_metadata("llama", &["<pad>", "<s>", "</s>", "fixture", "<extra>"]);
+        validate_moonshine_tokenizer_contract(&metadata, execution_metadata())
+            .expect("oversized vocab still covers every sampleable id");
+    }
+
+    #[test]
+    fn tokenizer_contract_rejects_a_truncated_vocab() {
+        let metadata = tokenizer_gguf_metadata("llama", &["<pad>", "<s>", "</s>"]);
+        let error = validate_moonshine_tokenizer_contract(&metadata, execution_metadata())
+            .expect_err("short vocab must fail closed");
+        match error {
+            MoonshineRuntimeContractError::InvalidMetadataValue { key, reason } => {
+                assert_eq!(key, TOKENIZER_GGML_TOKENS_KEY);
+                assert!(reason.contains("3 tokens"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenizer_contract_rejects_a_missing_tokens_array() {
+        let mut values = BTreeMap::new();
+        values.insert(
+            crate::models::oasr_metadata::TOKENIZER_GGML_MODEL_KEY.to_string(),
+            GgufMetadataValue::String("llama".to_string()),
+        );
+        let metadata = GgufMetadata::from_values_for_test(values);
+        assert!(validate_moonshine_tokenizer_contract(&metadata, execution_metadata()).is_err());
+    }
+
+    #[test]
+    fn tokenizer_contract_rejects_an_incompatible_tokenizer_model() {
+        let metadata = tokenizer_gguf_metadata("gpt2", &["<pad>", "<s>", "</s>", "fixture"]);
+        let error = validate_moonshine_tokenizer_contract(&metadata, execution_metadata())
+            .expect_err("non-llama tokenizer model must fail closed");
+        match error {
+            MoonshineRuntimeContractError::InvalidMetadataValue { key, reason } => {
+                assert_eq!(key, "tokenizer.ggml");
+                assert!(reason.contains("llama"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

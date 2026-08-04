@@ -8,6 +8,7 @@
 
 use crate::adapter_pack::is_moonshine_lora_target_tensor_name;
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
+use crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy;
 use crate::models::lora_adapter::{
     LoraResolveError, ResolvedLoraAdapter, ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle,
     adapter_cache_fingerprint, resolve_lora_adapter,
@@ -39,6 +40,11 @@ pub(crate) fn moonshine_adapter_cache_fingerprint(
 /// the `OPENASR_ADAPTER` env var) for a moonshine execution. Returns `Ok(None)`
 /// when no adapter is configured; otherwise the adapter must load AND bind to
 /// this exact base pack or the whole transcription fails (fail-closed).
+///
+/// The cache contract id is the typed `GgmlAdapterBindingStrategy` label the
+/// inventory row declares for this family -- the executable binding facet is
+/// the single source of truth, so the resolution key can never drift from the
+/// descriptor.
 pub(crate) fn resolve_moonshine_lora_adapter(
     cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
@@ -48,7 +54,7 @@ pub(crate) fn resolve_moonshine_lora_adapter(
         cache,
         request_adapter_path,
         preflight,
-        "moonshine-lora-v1",
+        GgmlAdapterBindingStrategy::MoonshineLoraV1.label(),
         is_moonshine_lora_target_tensor_name,
         "moonshine",
         MOONSHINE_LORA_ALLOWED_TARGETS,
