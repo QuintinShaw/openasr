@@ -394,10 +394,30 @@ fn resolve_timeline_identities_with_matcher(
     let planned = evidence::plan_timeline_windows(&timeline.turns)
         .into_iter()
         .map(|(speaker, windows)| (speaker.label(), windows))
-        .collect();
+        .collect::<BTreeMap<_, _>>();
+    let planned_windows = planned.values().map(Vec::len).sum::<usize>();
     let mut refusals = BTreeMap::new();
+    let evidence_started = std::time::Instant::now();
     let evidence = collect_label_evidence(embedder, planned, samples, 0, &mut refusals)?;
+    crate::stage_timing::log_detail_event(
+        "speaker_identity",
+        format_args!(
+            "stage=evidence speakers={} planned_windows={} duration_ms={:.3}",
+            speakers.len(),
+            planned_windows,
+            evidence_started.elapsed().as_secs_f64() * 1000.0,
+        ),
+    );
+    let matching_started = std::time::Instant::now();
     let matches = match_label_evidence(matcher, evidence, &mut refusals);
+    crate::stage_timing::log_detail_event(
+        "speaker_identity",
+        format_args!(
+            "stage=matching matched={} duration_ms={:.3}",
+            matches.len(),
+            matching_started.elapsed().as_secs_f64() * 1000.0,
+        ),
+    );
 
     let mut assignments = BTreeMap::new();
     let mut unnamed_speakers = Vec::new();
@@ -433,35 +453,67 @@ fn collect_label_evidence(
     scope_index: usize,
     refusals: &mut BTreeMap<String, SpeakerNamingRefusal>,
 ) -> Result<BTreeMap<String, LabelEvidence>, SpeakerIdentityError> {
-    let mut evidence = BTreeMap::new();
+    struct LabelWindows {
+        planned: usize,
+        embeddings: Vec<SpeakerEmbedding>,
+        spans: Vec<TimeRange>,
+    }
+
+    struct PendingWindow<'a> {
+        label: String,
+        span: TimeRange,
+        clip: &'a [f32],
+    }
+
+    let mut labels = BTreeMap::<String, LabelWindows>::new();
+    let mut pending = Vec::<PendingWindow<'_>>::new();
     for (label, windows) in planned {
         let planned_windows = windows.len();
-        let mut clips = Vec::with_capacity(windows.len());
-        let mut valid_windows = Vec::with_capacity(windows.len());
+        labels.insert(
+            label.clone(),
+            LabelWindows {
+                planned: planned_windows,
+                embeddings: Vec::with_capacity(planned_windows),
+                spans: Vec::with_capacity(planned_windows),
+            },
+        );
         for window in windows {
             let Some(clip) = window_clip(&window, samples) else {
                 continue;
             };
-            clips.push(clip);
-            valid_windows.push(window);
+            pending.push(PendingWindow {
+                label: label.clone(),
+                span: window,
+                clip,
+            });
         }
+    }
+
+    // Batch across labels, not once per label. The identity verdict remains
+    // label-local below, but pooling the independent forwards avoids a partly
+    // idle final actor wave for every short speaker. Keep the same bounded
+    // batch as recording-level diarization so a many-speaker meeting cannot
+    // materialize every frontend feature tensor at once.
+    for batch in pending.chunks(crate::diarize::embed::REDIMNET_BOUNDED_BATCH_SIZE) {
+        let clips = batch.iter().map(|window| window.clip).collect::<Vec<_>>();
         let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
-        if results.len() != valid_windows.len() {
+        if results.len() != batch.len() {
             return Err(SpeakerIdentityError::EmbeddingFailed {
                 reason: format!(
                     "embedder returned {} results for {} evidence windows",
                     results.len(),
-                    valid_windows.len()
+                    batch.len()
                 ),
             });
         }
-        let mut embeddings = Vec::with_capacity(valid_windows.len());
-        let mut spans = Vec::with_capacity(valid_windows.len());
-        for (window, result) in valid_windows.into_iter().zip(results) {
+        for (window, result) in batch.iter().zip(results) {
             match result {
                 Ok(embedding) => {
-                    embeddings.push(embedding);
-                    spans.push(window);
+                    let label = labels
+                        .get_mut(&window.label)
+                        .expect("pending evidence label was initialized");
+                    label.embeddings.push(embedding);
+                    label.spans.push(window.span);
                 }
                 Err(crate::diarize::embed::EmbedError::TooShort) => {}
                 Err(crate::diarize::embed::EmbedError::Canceled) => {
@@ -474,6 +526,13 @@ fn collect_label_evidence(
                 }
             }
         }
+    }
+
+    let mut evidence = BTreeMap::new();
+    for (label, windows) in labels {
+        let planned_windows = windows.planned;
+        let embeddings = windows.embeddings;
+        let spans = windows.spans;
         if embeddings.is_empty() {
             log_naming_debug(format_args!(
                 "stage=voice-id-evidence label={label} scope={scope_index} planned_windows={planned_windows} embedded_windows=0 decision=no-usable-window"
@@ -1605,6 +1664,46 @@ mod tests {
             .expect("observed starts");
         assert!(starts.len() > 1);
         assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn voice_id_evidence_batches_across_short_speaker_labels() {
+        let seconds = 39.0_f32;
+        let samples: Vec<f32> = (0..(seconds * EMBEDDER_SAMPLE_RATE_HZ as f32) as usize)
+            .map(|index| index as f32)
+            .collect();
+        let mut segments = (0..5)
+            .map(|index| {
+                let start = index as f32 * 8.0;
+                labeled(start, start + 7.0, Some(&format!("SPEAKER_{index:02}")))
+            })
+            .collect::<Vec<_>>();
+        let embedder = BatchProbeEmbedder::new();
+
+        name_speakers_across_scopes_with(
+            Some(&embedder),
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &samples,
+            }],
+        )
+        .expect("batched multi-speaker evidence");
+
+        assert_eq!(
+            embedder
+                .batch_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "25 windows should use one shared 16-window batch plus one tail batch"
+        );
+        assert_eq!(
+            embedder
+                .observed_starts
+                .lock()
+                .expect("observed starts")
+                .len(),
+            25
+        );
     }
 
     #[test]

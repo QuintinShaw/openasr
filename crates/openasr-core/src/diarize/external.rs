@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -33,13 +34,11 @@ use crate::models::system_memory_owner::SystemMemoryOwner;
 const SAMPLE_RATE_HZ: u32 = 16_000;
 const EMBEDDING_WINDOW_S: f64 = 1.5;
 const EMBEDDING_STEP_S: f64 = 0.75;
-/// ReDimNet's bounded pool supports four persistent workers. Keeping four
-/// queued windows per worker saturates that pool without retaining an
-/// unbounded meeting-length waveform expansion: the resulting 16-window batch
-/// caps 16 kHz padded clip storage at about 1.5 MiB.
-const EMBEDDING_WINDOWS_PER_BATCH_WORKER: usize = 4;
-const EMBEDDING_BATCH_SIZE: usize =
-    super::embed::REDIMNET_MAX_BATCH_WORKERS * EMBEDDING_WINDOWS_PER_BATCH_WORKER;
+/// ReDimNet's bounded pool supports four persistent workers. The shared
+/// bounded batch keeps four queued windows per worker without retaining an
+/// unbounded meeting-length waveform expansion; at 1.5 s per clip it caps
+/// 16 kHz padded waveform storage at about 1.5 MiB.
+const EMBEDDING_BATCH_SIZE: usize = super::embed::REDIMNET_BOUNDED_BATCH_SIZE;
 const VAD_FRAME_STEP_SAMPLES: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,6 +581,7 @@ impl ExternalDiarizer {
             &dyn Fn() -> bool,
         ) -> Result<(Vec<SpeakerId>, T), AutomaticClusteringError>,
     ) -> Result<(SpeakerTimeline, T), ExternalDiarizationError> {
+        let total_started = Instant::now();
         if sample_rate_hz != SAMPLE_RATE_HZ {
             return Err(ExternalDiarizationError::UnsupportedSampleRate(
                 sample_rate_hz,
@@ -603,6 +603,7 @@ impl ExternalDiarizer {
         if !prepared.embeddings.is_empty() {
             cancel_checkpoint(canceled)?;
         }
+        let clustering_started = Instant::now();
         let (labels, output) = cluster(
             &self.clusterer,
             &prepared.embedded_chunks,
@@ -611,9 +612,33 @@ impl ExternalDiarizer {
             canceled,
         )
         .map_err(external_clustering_error)?;
+        crate::stage_timing::log_detail_stage(
+            "external_diarization",
+            "clustering",
+            clustering_started.elapsed(),
+        );
         cancel_checkpoint(canceled)?;
         debug_assert_eq!(labels.len(), prepared.embeddings.len());
-        Ok((assemble_recording(&prepared, &labels), output))
+        let reconstruction_started = Instant::now();
+        let timeline = assemble_recording(&prepared, &labels);
+        crate::stage_timing::log_detail_stage(
+            "external_diarization",
+            "reconstruction",
+            reconstruction_started.elapsed(),
+        );
+        crate::stage_timing::log_detail_event(
+            "external_diarization",
+            format_args!(
+                "stage=complete provider={:?} audio_duration_s={:.3} embedding_chunks={} speakers={} turns={} duration_ms={:.3}",
+                self.segmenter.provider(),
+                prepared.audio_duration_s,
+                prepared.embeddings.len(),
+                timeline.centroids.len(),
+                timeline.turns.len(),
+                total_started.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
+        Ok((timeline, output))
     }
 
     fn prepare_recording(
@@ -628,16 +653,35 @@ impl ExternalDiarizer {
             ));
         }
         cancel_checkpoint(canceled)?;
+        let segmenter_started = Instant::now();
         let activity = self.segmenter.adapter().segment_local_activity(
             samples.clone(),
             sample_rate_hz,
             canceled,
         )?;
+        crate::stage_timing::log_detail_stage(
+            "external_diarization",
+            "segmenter",
+            segmenter_started.elapsed(),
+        );
         cancel_checkpoint(canceled)?;
+        let vad_started = Instant::now();
         let vad_regions = self.vad_regions(samples.as_slice(), sample_rate_hz, canceled)?;
+        crate::stage_timing::log_detail_stage(
+            "external_diarization",
+            "firered_vad",
+            vad_started.elapsed(),
+        );
+        let planning_started = Instant::now();
         let activity_regions = activity.valid_regions(samples.len() as f64 / sample_rate_hz as f64);
         let speech = union_regions(vad_regions.into_iter().chain(activity_regions));
         let chunks = embedding_chunks(&speech);
+        crate::stage_timing::log_detail_stage(
+            "external_diarization",
+            "embedding_plan",
+            planning_started.elapsed(),
+        );
+        let embedding_started = Instant::now();
         let (embedded_chunks, embeddings) = embed_chunks(
             self.embedder.as_ref(),
             samples.as_slice(),
@@ -645,6 +689,11 @@ impl ExternalDiarizer {
             &chunks,
             canceled,
         )?;
+        crate::stage_timing::log_detail_stage(
+            "external_diarization",
+            "redimnet_embedding",
+            embedding_started.elapsed(),
+        );
         Ok(PreparedExternalRecording {
             activity,
             embedded_chunks,
@@ -1444,6 +1493,28 @@ mod tests {
             ],
             "overlap state changes must split turns instead of tainting each speaker's whole continuous run",
         );
+    }
+
+    #[test]
+    fn reconstruction_does_not_invent_a_zero_overlap_hungarian_mapping() {
+        let activity = LocalActivity {
+            frame_clock: clock(),
+            windows: vec![LocalActivityWindow {
+                start_sample: 0,
+                frame_activity: vec![0b11, 0b11],
+            }],
+            local_speaker_slots: 2,
+            speaker_count: vec![2, 2],
+        };
+        let clusters = vec![ClusterSegment {
+            range: TimeRange::new(0.0, 0.2),
+            speaker: SpeakerId(0),
+        }];
+
+        let turns = reconstruct_global_turns(&activity, &clusters, 2, 0.2);
+
+        assert!(turns.iter().all(|turn| turn.speaker == SpeakerId(0)));
+        assert!(turns.iter().all(|turn| !turn.overlap));
     }
 
     #[test]

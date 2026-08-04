@@ -1657,11 +1657,17 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             )
             .backend();
+            let session_load_started = Instant::now();
             let session = Qwen3ForcedAlignerSession::load(&pack_path, backend).map_err(|error| {
                 BackendError::WordTimestampAlignmentFailed {
                     reason: error.to_string(),
                 }
             })?;
+            crate::stage_timing::log_detail_stage(
+                "forced_aligner",
+                "session_load",
+                session_load_started.elapsed(),
+            );
             let mut refined = transcription.clone();
             let audio_samples = prepared_audio.as_slice().len();
             for (index, segment) in refined.segments.iter_mut().enumerate() {
@@ -1675,6 +1681,8 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                             segment.start, segment.end
                         ),
                     })?;
+                let segment_audio_seconds = range.len() as f64 / 16_000.0;
+                let alignment_started = Instant::now();
                 let items = session
                     .align(
                         prepared_audio.slice(range),
@@ -1684,6 +1692,14 @@ fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     .map_err(|error| BackendError::WordTimestampAlignmentFailed {
                         reason: format!("segment {index}: {error}"),
                     })?;
+                crate::stage_timing::log_detail_event(
+                    "forced_aligner",
+                    format_args!(
+                        "stage=segment_align index={index} audio_duration_s={segment_audio_seconds:.3} words={} duration_ms={:.3}",
+                        items.len(),
+                        alignment_started.elapsed().as_secs_f64() * 1000.0,
+                    ),
+                );
                 assign_local_aligned_words(segment, &items);
             }
             Ok(refined)
@@ -2941,15 +2957,22 @@ fn compute_speaker_attribution(
     hint: crate::diarize::contract::DiarizeHint,
     execution_context: &crate::RequestExecutionContext,
 ) -> Result<SpeakerAttribution, BackendError> {
+    let total_started = Instant::now();
     let diarize_debug = crate::diarize::debug::diarize_debug_enabled();
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
+    let diarization_started = Instant::now();
     let timeline = diarizer
         .diarize(samples.clone(), 16_000, hint, &|| {
             execution_context.is_canceled()
         })
         .map_err(external_diarization_error_to_backend)?;
+    crate::stage_timing::log_detail_stage(
+        "speaker_attribution",
+        "diarization",
+        diarization_started.elapsed(),
+    );
     if execution_context.is_canceled() {
         return Err(BackendError::TranscriptionCanceled);
     }
@@ -2969,12 +2992,31 @@ fn compute_speaker_attribution(
             );
         }
     }
+    let identity_started = Instant::now();
     let identity = crate::diarize::voice_id::resolve_timeline_identities_with_embedder(
         embedder,
         &timeline,
         samples.as_slice(),
     )
     .map_err(speaker_identity_error_to_backend)?;
+    crate::stage_timing::log_detail_stage(
+        "speaker_attribution",
+        "identity",
+        identity_started.elapsed(),
+    );
+    crate::stage_timing::log_detail_event(
+        "speaker_attribution",
+        format_args!(
+            "stage=complete speakers={} named={} unnamed={} duration_ms={:.3}",
+            timeline.centroids.len(),
+            identity
+                .assignments
+                .len()
+                .saturating_sub(identity.unnamed_speakers.len()),
+            identity.unnamed_speakers.len(),
+            total_started.elapsed().as_secs_f64() * 1000.0,
+        ),
+    );
     Ok(SpeakerAttribution {
         timeline,
         identities: identity.assignments,

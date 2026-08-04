@@ -752,6 +752,26 @@ mod decode_tests {
     }
 
     #[test]
+    fn count_aggregation_matches_numpy_rint_at_half_ties() {
+        let clock = ActivityFrameClock::new(0, 1, 1, 1);
+        let windows = vec![
+            LocalActivityWindow {
+                start_sample: 0,
+                frame_activity: vec![0],
+            },
+            LocalActivityWindow {
+                start_sample: 0,
+                frame_activity: vec![0b01],
+            },
+        ];
+        assert_eq!(
+            aggregate_speaker_count(&windows, clock, 1),
+            vec![0],
+            "the official 3D-Speaker path uses numpy.rint, whose 0.5 tie rounds to even"
+        );
+    }
+
+    #[test]
     fn valid_regions_are_activity_only() {
         let activity = LocalActivity {
             frame_clock: ActivityFrameClock::new(0, 2, 1, 10),
