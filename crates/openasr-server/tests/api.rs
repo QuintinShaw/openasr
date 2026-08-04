@@ -122,9 +122,7 @@ fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Opt
 }
 
 fn write_xasr_gguf_runtime_source(path: &std::path::Path, metadata_model_id: &str) {
-    let spec = TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_metadata_ready_for_runtime_fail_closed(
-        metadata_model_id,
-    );
+    let spec = TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready(metadata_model_id);
     write_tiny_gguf_runtime_source(path, &spec).expect("write xasr gguf runtime source");
 }
 
