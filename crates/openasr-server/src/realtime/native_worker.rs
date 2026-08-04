@@ -1023,9 +1023,10 @@ pub(crate) fn warm_up_native_streaming_session_once(
 /// in the background, right after `serve_with_launch_options` finishes
 /// binding the listener -- so the very first real dictation session does not
 /// pay the cold model-pack-load cost (observed 1.7-2.1s) before its first
-/// partial. Fire-and-forget: never blocks bind/serve/health, and any failure
-/// here (bad pack, no adapter, ...) is swallowed silently -- a real request
-/// still fails closed with a proper error through the normal request path.
+/// partial. Fire-and-forget: never blocks bind/serve/health, and a failure here
+/// (bad pack, no adapter, ...) is reported as a one-line diagnostic without
+/// changing daemon readiness -- a real request still fails closed through the
+/// normal request path.
 /// Derives its `hardware_target`/`inference_threads` from the user's saved
 /// preferences the same way a real WS attach without an explicit per-session
 /// override does (see `realtime_execution_target_preference` /
@@ -1122,7 +1123,18 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
         session_config,
     ) {
         Ok(session) => session,
-        Err(_) => return,
+        Err(error) => {
+            openasr_core::stage_timing::log_event(
+                "realtime_warmup",
+                format_args!(
+                    "stage=session_start_failed model_pack_path={} hardware_target={} error={}",
+                    model_pack.root.display(),
+                    hardware_target,
+                    single_line_log_value(&error.to_string()),
+                ),
+            );
+            return;
+        }
     };
     let key = NativeStreamingWorkerKey::with_route(
         model_pack.root.clone(),
@@ -1130,7 +1142,23 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
         resolved_route.as_ref(),
         inference_threads,
     );
-    attach_and_run_boot_warmup(key, session, Some(model_session_permit)).await;
+    let diagnostic_key = key.clone();
+    if let Err(error) = attach_and_run_boot_warmup(key, session, Some(model_session_permit)).await {
+        openasr_core::stage_timing::log_event(
+            "realtime_warmup",
+            format_args!(
+                "stage=failed model_pack_path={} hardware_target={} execution_route_key={} error={}",
+                diagnostic_key.model_pack_path.display(),
+                diagnostic_key.hardware_target,
+                diagnostic_key.execution_route_key,
+                single_line_log_value(&error),
+            ),
+        );
+    }
+}
+
+pub(crate) fn single_line_log_value(value: &str) -> String {
+    value.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 /// The generic (session-agnostic) half of the boot warm-up: attach `session`
@@ -1145,28 +1173,45 @@ pub(crate) async fn attach_and_run_boot_warmup(
     key: NativeStreamingWorkerKey,
     session: Box<dyn NativeAsrSession>,
     model_session_permit: Option<ModelSessionPermit>,
-) {
-    let Ok(mut worker) =
-        NativeStreamingDecodeWorker::attach_admitted(key, session, model_session_permit).await
-    else {
-        return;
-    };
+) -> Result<(), String> {
+    let mut worker =
+        NativeStreamingDecodeWorker::attach_admitted(key, session, model_session_permit)
+            .await
+            .map_err(|error| format!("worker attach failed: {error}"))?;
     let envelope = NativeStreamingCommandEnvelope {
         kind: NativeStreamingCommandKind::Warm,
         command: NativeStreamingCommand::Warm,
     };
-    if worker.commands.send(envelope).await.is_ok() {
-        // Wait for the Warm outcome so this session -- and the worker-key
-        // acquisition it holds -- does not release before warm-up actually
-        // finishes; otherwise a concurrent real attach would not meaningfully
-        // "queue behind" this one.
-        let _ = worker.outcomes.recv().await;
-    }
+    let result = match worker.commands.send(envelope).await {
+        Ok(()) => {
+            // Wait for the Warm outcome so this session -- and the worker-key
+            // acquisition it holds -- does not release before warm-up actually
+            // finishes; otherwise a concurrent real attach would not meaningfully
+            // "queue behind" this one.
+            match worker.outcomes.recv().await {
+                Some(NativeStreamingOutcome::Events {
+                    kind: NativeStreamingCommandKind::Warm,
+                    ..
+                }) => Ok(()),
+                Some(NativeStreamingOutcome::Error {
+                    kind: NativeStreamingCommandKind::Warm,
+                    message,
+                }) => Err(message),
+                Some(outcome) => Err(format!(
+                    "worker returned unexpected {:?} outcome for boot warm-up",
+                    outcome.kind()
+                )),
+                None => Err("worker stopped before returning the boot warm-up outcome".to_string()),
+            }
+        }
+        Err(_) => Err("worker stopped before accepting the boot warm-up command".to_string()),
+    };
     // No Finish/Cancel is sent, so the worker thread cancels this session on
     // its behalf (see `run_native_streaming_session_on_worker`) and loops
     // straight back to accept the next real Attach -- the thread-local warm
     // state this call just primed stays resident for it.
     worker.join();
+    result
 }
 
 pub(crate) fn finish_native_streaming_session_in_worker(

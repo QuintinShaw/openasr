@@ -2575,7 +2575,8 @@ async fn boot_native_warmup_runs_in_background_without_blocking_a_concurrent_tas
 
     warmup_handle
         .await
-        .expect("boot warmup task must not panic");
+        .expect("boot warmup task must not panic")
+        .expect("boot warmup must succeed");
     assert_eq!(
         warm_calls.load(Ordering::Acquire),
         1,
@@ -2661,7 +2662,8 @@ async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
 
     warmup_handle
         .await
-        .expect("boot warmup task must not panic");
+        .expect("boot warmup task must not panic")
+        .expect("boot warmup must succeed");
     assert_eq!(warm_calls.load(Ordering::Acquire), 1);
 }
 
@@ -2686,7 +2688,9 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
         warm_sleep: Duration::from_millis(50),
         warm_calls: Arc::clone(&warm_calls),
     });
-    attach_and_run_boot_warmup(key.clone(), boot_session, None).await;
+    attach_and_run_boot_warmup(key.clone(), boot_session, None)
+        .await
+        .expect("boot warmup must succeed");
     assert_eq!(warm_calls.load(Ordering::Acquire), 1);
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
@@ -2720,6 +2724,31 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
          worker thread -- warm_up() must not run a second time"
     );
     real_session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn boot_native_warmup_preserves_the_first_failure_message() {
+    let key = test_native_streaming_worker_key("boot-warmup-failure-diagnostic");
+    let session = Box::new(WarmFailingNativeSession {
+        inner: TestServerNativeSession::new("boot-warmup-failure-diagnostic"),
+    });
+
+    let error = attach_and_run_boot_warmup(key, session, None)
+        .await
+        .expect_err("the warm-up fixture must fail");
+
+    assert!(
+        error.contains("simulated warm-up allocation failure"),
+        "the boot task must preserve the worker's first causal error: {error}"
+    );
+}
+
+#[test]
+fn boot_native_warmup_log_value_stays_on_one_line_without_losing_boundaries() {
+    assert_eq!(
+        single_line_log_value("first\r\nsecond\nthird"),
+        "first\\r\\nsecond\\nthird"
+    );
 }
 
 #[tokio::test]

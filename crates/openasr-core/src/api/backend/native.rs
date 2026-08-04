@@ -1272,9 +1272,11 @@ fn native_offline_request_to_transcription_request(
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
-    NativeAsrError::SessionFailed {
-        message: error.to_string(),
-    }
+    let message = match error {
+        BackendError::NativeFailClosed { reason } => reason,
+        error => error.to_string(),
+    };
+    NativeAsrError::SessionFailed { message }
 }
 
 pub fn validate_local_native_model_pack_path(
@@ -1564,6 +1566,20 @@ mod tests {
         sync::Barrier,
         sync::atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn native_backend_error_mapping_does_not_nest_the_fail_closed_envelope() {
+        let error = native_backend_error_to_asr(BackendError::NativeFailClosed {
+            reason: "first causal failure".to_string(),
+        });
+
+        assert_eq!(
+            error,
+            NativeAsrError::SessionFailed {
+                message: "first causal failure".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn native_content_cache_singleflights_concurrent_cold_misses() {
