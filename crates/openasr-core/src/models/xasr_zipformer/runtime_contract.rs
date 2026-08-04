@@ -516,7 +516,11 @@ pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
                     &format!("{prefix}.{name}.in_proj.weight"),
                     vec![dim, 2 * dim],
                 );
-                push(&mut out, &format!("{prefix}.{name}.in_proj.bias"), vec![2 * dim]);
+                push(
+                    &mut out,
+                    &format!("{prefix}.{name}.in_proj.bias"),
+                    vec![2 * dim],
+                );
                 push(
                     &mut out,
                     &format!("{prefix}.{name}.out_proj.weight"),
@@ -555,7 +559,11 @@ pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
                     &format!("{prefix}.{name}.out_proj.weight"),
                     vec![4, dim],
                 );
-                push(&mut out, &format!("{prefix}.{name}.out_proj.bias"), vec![dim]);
+                push(
+                    &mut out,
+                    &format!("{prefix}.{name}.out_proj.bias"),
+                    vec![dim],
+                );
             }
             push(
                 &mut out,
@@ -618,11 +626,19 @@ pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
                     &format!("{prefix}.{name}.out_proj.weight"),
                     vec![dim, dim],
                 );
-                push(&mut out, &format!("{prefix}.{name}.out_proj.bias"), vec![dim]);
+                push(
+                    &mut out,
+                    &format!("{prefix}.{name}.out_proj.bias"),
+                    vec![dim],
+                );
             }
             push(&mut out, &format!("{prefix}.norm.bias"), vec![dim]);
             push(&mut out, &format!("{prefix}.norm.log_scale"), vec![1]);
-            push(&mut out, &format!("{prefix}.bypass.bypass_scale"), vec![dim]);
+            push(
+                &mut out,
+                &format!("{prefix}.bypass.bypass_scale"),
+                vec![dim],
+            );
             push(
                 &mut out,
                 &format!("{prefix}.bypass_mid.bypass_scale"),
@@ -638,7 +654,11 @@ pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
 
     let decoder_dim = metadata.decoder_dim() as u64;
     let vocab = metadata.vocab_size as u64;
-    push(&mut out, "decoder.embedding.weight", vec![decoder_dim, vocab]);
+    push(
+        &mut out,
+        "decoder.embedding.weight",
+        vec![decoder_dim, vocab],
+    );
     push(
         &mut out,
         "decoder.conv.weight",
@@ -647,7 +667,11 @@ pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
 
     let joiner = metadata.joiner_dim as u64;
     let enc_out = metadata.encoder_output_dim() as u64;
-    push(&mut out, "joiner.encoder_proj.weight", vec![enc_out, joiner]);
+    push(
+        &mut out,
+        "joiner.encoder_proj.weight",
+        vec![enc_out, joiner],
+    );
     push(&mut out, "joiner.encoder_proj.bias", vec![joiner]);
     push(&mut out, "joiner.decoder_proj.weight", vec![joiner, joiner]);
     push(&mut out, "joiner.decoder_proj.bias", vec![joiner]);
