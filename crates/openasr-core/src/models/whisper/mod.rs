@@ -13,7 +13,6 @@ mod ggml_tensor_binding;
 mod graph_config;
 mod greedy_decode;
 mod lid;
-mod local_source;
 mod mel;
 mod package_import;
 mod prompt;
@@ -22,11 +21,11 @@ mod tokenizer;
 
 pub use frontend::whisper_log_mel_spectrogram_16khz_mono_v0;
 pub(crate) use ggml_executor::WhisperGgmlExecutor;
-pub use local_source::WhisperLocalSourceError;
 pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{
-    WhisperLocalSourceImportRequest, WhisperLocalSourceImportRuntimeResult,
-    WhisperRuntimeQuantizationMode, convert_local_whisper_hf_source_to_runtime_pack,
+    WhisperLocalSourceError, WhisperLocalSourceImportRequest,
+    WhisperLocalSourceImportRuntimeResult, WhisperRuntimeQuantizationMode,
+    convert_local_whisper_hf_source_to_runtime_pack,
 };
 pub use tokenizer::WhisperTokenizer;
 pub(crate) use tokenizer::whisper_metadata_is_multilingual;

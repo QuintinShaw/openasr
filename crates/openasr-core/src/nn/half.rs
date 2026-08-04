@@ -152,11 +152,6 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-/// Convert a slice of f16 bit patterns to `f32` values element-wise.
-pub(crate) fn f16_bits_slice_to_f32(bits: &[u16]) -> Vec<f32> {
-    bits.iter().copied().map(f16_bits_to_f32).collect()
-}
-
 /// Round `value >> shift` to the nearest integer, ties to even, using only
 /// integer arithmetic (exact for every input; no float intermediate).
 fn round_to_even_shift_right(value: u32, shift: u32) -> u32 {
@@ -508,12 +503,5 @@ mod f16_bits_to_f32_tests {
                 "bits {bits:#06x}: ours={ours:?} ggml={theirs:?}"
             );
         }
-    }
-
-    #[test]
-    fn slice_conversion_matches_scalar() {
-        let values: [u16; 5] = [0x0000, 0x3c00, 0xbc00, 0x7c00, 0x0001];
-        let expected: Vec<f32> = values.iter().copied().map(f16_bits_to_f32).collect();
-        assert_eq!(f16_bits_slice_to_f32(&values), expected);
     }
 }

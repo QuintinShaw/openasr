@@ -223,8 +223,7 @@ struct RawSafetensorsTensorHeader {
 /// header-length prefix is ever used to size an allocation (see [`SafetensorsFile::open`]).
 /// 128 MiB comfortably covers every real header in the tree (a header holds one
 /// small JSON record per tensor, not tensor payloads) while bounding the
-/// allocation a hostile file can force. Mirrors
-/// `whisper::local_source::safetensors::SAFETENSORS_HEADER_MAX_BYTES_V0`.
+/// allocation a hostile file can force.
 pub(crate) const SAFETENSORS_HEADER_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) struct SafetensorsFile {
@@ -446,7 +445,6 @@ pub(crate) fn parse_safetensors_header(
 /// the shape/dtype byte cross-check for a `Some` result, per the S4/S5
 /// design: unknown dtypes still get the range/overflow checks, just not the
 /// cross-check against a size table entry that does not exist for them.
-/// Mirrors `whisper::local_source::safetensors::dtype::safetensors_dtype_size_bytes`.
 fn dtype_size_bytes(dtype: &str) -> Option<u64> {
     match dtype.trim().to_ascii_uppercase().as_str() {
         "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" => Some(1),
@@ -462,8 +460,7 @@ fn dtype_size_bytes(dtype: &str) -> Option<u64> {
 /// This is the safetensors on-disk contract; mmap bounds-checking on
 /// individual tensor reads (see `SafetensorsFile::tensor_data`) is a lazy
 /// last line of defense and does not by itself catch a header whose tensors
-/// leave gaps or overlap each other. Mirrors
-/// `whisper::local_source::safetensors::dtype::validate_safetensors_tensor_offset_ranges`.
+/// leave gaps or overlap each other.
 fn validate_tensor_offset_ranges(
     tensors: &[SafetensorsTensorHeader],
     data_length_bytes: u64,
@@ -572,7 +569,13 @@ fn decode_f32_payload(tensor_name: &str, data: &[u8]) -> Result<Vec<f32>, LocalS
     }
     let mut out = Vec::with_capacity(data.len() / 4);
     for chunk in data.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if !value.is_finite() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{tensor_name}' contains non-finite F32 value"
+            )));
+        }
+        out.push(value);
     }
     Ok(out)
 }
@@ -599,7 +602,16 @@ fn decode_f16_payload_as_f32(
     data: &[u8],
 ) -> Result<Vec<f32>, LocalSourceImportError> {
     let bits = decode_f16_payload_bits(tensor_name, data)?;
-    Ok(bits.into_iter().map(f16_bits_to_f32).collect())
+    let mut out = Vec::with_capacity(bits.len());
+    for value in bits.into_iter().map(f16_bits_to_f32) {
+        if !value.is_finite() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{tensor_name}' contains non-finite F16 value"
+            )));
+        }
+        out.push(value);
+    }
+    Ok(out)
 }
 
 fn decode_bf16_payload_as_f32(
@@ -615,7 +627,13 @@ fn decode_bf16_payload_as_f32(
     let mut out = Vec::with_capacity(data.len() / 2);
     for chunk in data.chunks_exact(2) {
         let upper = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
-        out.push(f32::from_bits(upper << 16));
+        let value = f32::from_bits(upper << 16);
+        if !value.is_finite() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{tensor_name}' contains non-finite BF16 value"
+            )));
+        }
+        out.push(value);
     }
     Ok(out)
 }
