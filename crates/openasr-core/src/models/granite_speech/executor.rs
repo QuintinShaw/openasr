@@ -784,11 +784,14 @@ fn granite_speech_execute_error_to_ggml(
 impl GraniteSpeechGgmlExecutor {
     /// Streaming decode: re-runs the SAME offline pipeline (`execute_inner`)
     /// against the growing/windowed audio buffer the shared streaming driver
-    /// hands it -- there is no incremental KV-cache session to plug in yet
-    /// (see `decode_executor.rs`'s O(n^2) recompute-per-step note), so every
-    /// partial re-does frontend + encoder + Q-Former + a full prefill-style
-    /// decode from scratch. This is registered to satisfy the codebase's
-    /// fail-closed streaming-completeness gate
+    /// hands it. The resident session's incremental-KV decode is scoped to one
+    /// request's own generated tokens; a streaming partial cannot reuse a prior
+    /// partial's KV, because each partial re-splices a LONGER audio prompt
+    /// (different projected rows, different prompt embeddings), which
+    /// invalidates every cached position. So every partial re-does frontend +
+    /// encoder + Q-Former + a full prefill-style decode from scratch. This is
+    /// registered to satisfy the codebase's fail-closed streaming-completeness
+    /// gate
     /// (`builtin_execution_dispatch::build_builtin_ggml_streaming_execution_dispatch`
     /// rejects the WHOLE dispatch, for every family, if any registered
     /// architecture has no streaming executor at all) -- it is correctness-

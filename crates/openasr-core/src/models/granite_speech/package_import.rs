@@ -1,8 +1,7 @@
 //! Convert a local `ibm-granite/granite-speech-4.1-2b` HF source (sharded
 //! safetensors + `config.json`) into an OpenASR `.oasr` (GGUF-v0) runtime pack.
 //!
-//! fp16-only this pass (`PackQuant::Fp16`; q8_0/q4_k rungs are a follow-up).
-//! Every tensor keeps its original HF name verbatim (`encoder.layers.0.attn.
+//! fp16-only this pass (q8_0/q4_k rungs are a follow-up); every tensor keeps its original HF name verbatim (`encoder.layers.0.attn.
 //! to_q.weight`, `projector.query`, `language_model.model.layers.0....`)
 //! rather than remapping to a family-local convention: the encoder/projector
 //! ggml graphs (`encoder_graph.rs`/`qformer.rs`) already load by these exact
@@ -27,12 +26,12 @@
 //! variant; `insert_metadata` accepts any `ToString`, so this is the
 //! established convention other families already use for non-integer hparams).
 //!
-//! The decoder ggml graph, greedy-decode-policy registration, and end-to-end
-//! golden are a separate follow-up pass (see `mod.rs`); this converter still
-//! carries the decoder's tensors + hparams now so that pass does not need a
-//! second converter revision.
-
-#![allow(dead_code)]
+//! The converter writes through the shared `PackEnvelope`/`OasrPackWriter`
+//! seam and returns the writer's `VerifiedPack`; the runtime contract in
+//! `runtime_contract.rs` re-proves the exact same metadata keys and the full
+//! three-stage tensor set at pack admission, so a pack this writer produced
+//! and a pack an attacker trimmed cannot reach the executor through the same
+//! door.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,7 +47,7 @@ use crate::models::local_source_import::{
 use crate::models::oasr_metadata::{
     OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
 };
-use crate::models::pack_quant::{PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole};
+use crate::models::pack_quant::{QuantizedAxis, TensorQuantizationContract, TensorRole};
 use crate::nn::half::f32_to_f16_bits;
 
 use crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID;
@@ -66,7 +65,6 @@ pub(crate) const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 pub(crate) const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
-pub type GraniteSpeechQuantizationMode = PackQuant;
 pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder.", "projector."];
 
 pub(crate) const TENSOR_QUANTIZATION_CONTRACT: TensorQuantizationContract =

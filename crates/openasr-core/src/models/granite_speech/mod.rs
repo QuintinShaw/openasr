@@ -1,9 +1,8 @@
 //! IBM Granite Speech 4.1 (`ibm-granite/granite-speech-4.1-2b`) model family.
 //!
 //! Architecture (verified against the HF `GraniteSpeechForConditionalGeneration`
-//! source and cross-checked against upstream llama.cpp's `granite-speech.cpp`
-//! ggml graph, since llama.cpp is a reference implementation only, not an
-//! OpenASR upstream):
+//! source; llama.cpp's `granite-speech.cpp` ggml graph was a cross-check
+//! reference only, never an OpenASR upstream):
 //!   16-layer Conformer CTC encoder (Shaw relative-position self-attention,
 //!   4-second block-local attention windows, GLU + depthwise-conv module,
 //!   self-conditioned CTC tap after layer 8) -> BLIP-2 Q-Former projector
@@ -11,12 +10,36 @@
 //!   dense decoder-only LLM (GQA + RoPE + SwiGLU, with the four Granite scaling
 //!   scalars: attention/embedding/residual multipliers + logits scaling).
 //!
-//! This pass ships the encoder + projector numeric core only (validated by the
-//! `parity` dev harness against an HF `transformers` fp32 reference) and the
-//! safetensors -> `.oasr` converter for all three weight segments (encoder,
-//! projector, decoder). The decoder ggml graph, shared greedy-decode-driver
-//! registration, and end-to-end golden are a separate follow-up pass -- see
-//! `docs` note in `encoder_graph.rs` on the long-audio context-window bound.
+//! Current status: the safetensors -> `.oasr` converter ([`package_import`])
+//! carries all three weight segments, and the full execution path is
+//! implemented: [`encoder_graph`] + [`qformer`] numeric cores (validated by
+//! the `parity` dev harness against an HF `transformers` fp32 reference), the
+//! keep-quantized resident decoder session ([`decode_session`]), and the
+//! dedicated executor in [`executor`]. Greedy decode rides the one shared
+//! seq2seq driver through the `GRANITE_SPEECH_DECODE_POLICY_ID` policy
+//! descriptor (no family-local argmax loop), and cancellation stays on the
+//! shared request control end to end: the driver polls it at every token
+//! boundary, and the pinned-runtime actor pool republishes the request's
+//! graph-abort flag on the owner thread so the encoder, projector, prefill,
+//! and step graphs observe it under the shared L2 fence. The family's
+//! complete lifecycle row -- identity, pack, execution, topology,
+//! optimization, quantization, and conformance facets -- is declared in the
+//! canonical architecture inventory (`arch/mod.rs`); offline/streaming
+//! dispatch, executor materialization, runtime-validator routing, and
+//! content-id eviction are generated projections of that row, not
+//! family-specific central wiring. The runtime validator
+//! ([`runtime_contract`]) proves the three-stage metadata, the full 938-tensor
+//! set, and the packed tokenizer at pack admission.
+//!
+//! Honest gaps, tracked outside weight-free CI: the importer is fp16-only
+//! and is reachable only through its force-linked CoreConvert symbol (no
+//! `openasr model-pack import granite-speech` subcommand yet -- the publish
+//! tooling records this), the encoder/projector still bind through the
+//! host-f32 loader in [`runtime_provider`] (their keep-quantized migration is
+//! a follow-up; the decoder already binds zero-copy), streaming re-runs the
+//! whole offline pipeline per partial (correctness-only cadence), and the
+//! end-to-end golden tests need a local real pack, so they stay `#[ignore]`d.
+//! This module makes no performance claim.
 
 pub(crate) mod capacity;
 pub(crate) mod decode_executor;
