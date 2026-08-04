@@ -81,6 +81,8 @@ pub use gguf_tensor_data::{
     GgufTensorDataReader, GgufWeightTensorElementType, GgufWeightTensorPayload,
 };
 pub(crate) use gguf_tensor_data::{dequantize_ggml_row_to_f32, ggml_row_size_bytes};
+#[cfg(test)]
+pub(crate) use gguf_tensor_index::GgufTensorIndexSnapshot;
 pub(crate) use gguf_tensor_index::read_gguf_tensor_index_from_runtime_source_with_limits;
 pub use gguf_tensor_index::{
     GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index,
