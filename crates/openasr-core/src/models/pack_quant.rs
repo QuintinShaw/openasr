@@ -77,7 +77,7 @@ pub(crate) enum TensorQuantizationContract {
     EntireAcousticPack { model_architecture: &'static str },
     /// The pack has no acoustic encoder to which the ASR Q8 floor applies.
     /// A reason is mandatory so `NotApplicable` cannot become a disguised
-    /// backlog state in a multi-agent registry.
+    /// backlog state in the runtime inventory.
     NotApplicable {
         model_architecture: &'static str,
         reason: &'static str,
