@@ -14,6 +14,11 @@ use crate::arch::hparams::{
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
+use crate::models::local_source_import::{
+    LocalSourceImportError, SafetensorsFile, SafetensorsHeader, SafetensorsTensorHeader,
+    decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32, encode_f16_bits_le,
+    read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
+};
 use crate::models::{
     oasr_metadata::{
         OasrPackWriter, PackEnvelope, insert_metadata, insert_metadata_string_array,
@@ -24,15 +29,12 @@ use crate::models::{
         classify_quant_tensor_role,
     },
 };
-use crate::nn::half::{f16_bits_slice_to_f32, f32_to_f16_bits};
 
-use crate::models::local_source_import::{
-    SafetensorsFile, SafetensorsHeader, SafetensorsTensorHeader,
-};
+/// Whisper's importer rides the shared local-source import contract; the
+/// per-family error name survives as an alias so the public convert surface
+/// keeps its documented type without a second implementation.
+pub type WhisperLocalSourceError = LocalSourceImportError;
 
-use super::local_source::{
-    WhisperLocalSourceError, source_io::read_source_json_file, validate_error,
-};
 use super::tokenizer::{
     TOKENIZER_GGML_EOT_TOKEN_ID_KEY, TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY,
     TOKENIZER_GGML_MODEL_VALUE_GPT2, TOKENIZER_GGML_NO_TIMESTAMPS_TOKEN_ID_KEY,
@@ -326,16 +328,7 @@ fn gguf_runtime_f16_tensor_from_safetensors(
     tensor: &SafetensorsTensorHeader,
     data: &[u8],
 ) -> Result<GgufWriteTensor, WhisperLocalSourceError> {
-    let values = match tensor.dtype.as_str() {
-        "F32" => decode_f32_safetensors_payload_as_f16_bits(&tensor.name, data)?,
-        "F16" => decode_f16_safetensors_payload_bits(&tensor.name, data)?,
-        other => {
-            return Err(validate_error(format!(
-                "Whisper local-source GGUF import runtime f16 tensor '{}' supports only F32/F16, got '{other}'",
-                tensor.name
-            )));
-        }
-    };
+    let values = decode_safetensors_payload_as_f16_bits(&tensor.name, &tensor.dtype, data)?;
     let expected = tensor_element_count(&tensor.name, &tensor.shape)?;
     if values.len() != expected {
         return Err(validate_error(format!(
@@ -363,16 +356,7 @@ fn gguf_runtime_decoder_token_embedding_tensor_from_safetensors(
             tensor.name, tensor.shape
         )));
     };
-    let values = match tensor.dtype.as_str() {
-        "F32" => decode_f32_safetensors_payload_as_f16_bits(&tensor.name, data)?,
-        "F16" => decode_f16_safetensors_payload_bits(&tensor.name, data)?,
-        other => {
-            return Err(validate_error(format!(
-                "Whisper local-source GGUF import decoder token embedding tensor '{}' supports only F32/F16, got '{other}'",
-                tensor.name
-            )));
-        }
-    };
+    let values = decode_safetensors_payload_as_f16_bits(&tensor.name, &tensor.dtype, data)?;
     let expected = tensor_element_count(&tensor.name, &tensor.shape)?;
     if values.len() != expected {
         return Err(validate_error(format!(
@@ -403,16 +387,7 @@ fn gguf_runtime_encoder_linear_tensor_from_safetensors(
             tensor.name, tensor.shape
         )));
     };
-    let values = match tensor.dtype.as_str() {
-        "F32" => decode_f32_safetensors_payload_as_f16_bits(&tensor.name, data)?,
-        "F16" => decode_f16_safetensors_payload_bits(&tensor.name, data)?,
-        other => {
-            return Err(validate_error(format!(
-                "Whisper local-source GGUF import encoder linear tensor '{}' supports only F32/F16, got '{other}'",
-                tensor.name
-            )));
-        }
-    };
+    let values = decode_safetensors_payload_as_f16_bits(&tensor.name, &tensor.dtype, data)?;
     let expected_u64 = (*input_dim).checked_mul(*output_dim).ok_or_else(|| {
         validate_error(format!(
             "Whisper local-source GGUF import encoder linear tensor '{}' shape {:?} overflows",
@@ -439,106 +414,6 @@ fn gguf_runtime_encoder_linear_tensor_from_safetensors(
         tensor_type: GgufWriteTensorType::F16,
         data: encode_f16_bits_le(values),
     })
-}
-
-fn tensor_element_count(
-    tensor_name: &str,
-    shape: &[u64],
-) -> Result<usize, WhisperLocalSourceError> {
-    let count = shape.iter().try_fold(1_u64, |acc, dim| {
-        acc.checked_mul(*dim).ok_or_else(|| {
-            validate_error(format!(
-                "Whisper local-source GGUF import tensor '{tensor_name}' shape {shape:?} overflows"
-            ))
-        })
-    })?;
-    usize::try_from(count).map_err(|_| {
-        validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' element count does not fit usize"
-        ))
-    })
-}
-
-fn encode_f16_bits_le(values: Vec<u16>) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(values.len().saturating_mul(2));
-    for value in values {
-        encoded.extend_from_slice(&value.to_le_bytes());
-    }
-    encoded
-}
-
-fn decode_f32_safetensors_payload_as_f16_bits(
-    tensor_name: &str,
-    data: &[u8],
-) -> Result<Vec<u16>, WhisperLocalSourceError> {
-    if !data.len().is_multiple_of(4) {
-        return Err(validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' F32 payload byte length {} is not divisible by 4",
-            data.len()
-        )));
-    }
-    data.chunks_exact(4)
-        .map(|chunk| {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            if !value.is_finite() {
-                return Err(validate_error(format!(
-                    "Whisper local-source GGUF import tensor '{tensor_name}' contains non-finite F32 value"
-                )));
-            }
-            Ok(f32_to_f16_bits(value))
-        })
-        .collect()
-}
-
-fn decode_f16_safetensors_payload_bits(
-    tensor_name: &str,
-    data: &[u8],
-) -> Result<Vec<u16>, WhisperLocalSourceError> {
-    if !data.len().is_multiple_of(2) {
-        return Err(validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' F16 payload byte length {} is not divisible by 2",
-            data.len()
-        )));
-    }
-    Ok(data
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect())
-}
-
-fn decode_safetensors_payload_as_f32(
-    tensor_name: &str,
-    dtype: &str,
-    data: &[u8],
-) -> Result<Vec<f32>, WhisperLocalSourceError> {
-    match dtype {
-        "F32" => {
-            if !data.len().is_multiple_of(4) {
-                return Err(validate_error(format!(
-                    "Whisper local-source GGUF import tensor '{tensor_name}' F32 payload byte length {} is not divisible by 4",
-                    data.len()
-                )));
-            }
-            data.chunks_exact(4)
-                .map(|chunk| {
-                    let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    if !value.is_finite() {
-                        return Err(validate_error(format!(
-                            "Whisper local-source GGUF import tensor '{tensor_name}' contains non-finite F32 value"
-                        )));
-                    }
-                    Ok(value)
-                })
-                .collect()
-        }
-        "F16" => {
-            let values = decode_f16_safetensors_payload_bits(tensor_name, data)?;
-            Ok(f16_bits_slice_to_f32(&values))
-        }
-        other => Err(validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' quantization supports only F32/F16 source tensors, got '{other}'"
-        ))),
-    }
 }
 
 fn gguf_tensor_type_from_safetensors_dtype(
@@ -768,12 +643,7 @@ fn validate_request(
     }
     // Same user-facing `.oasr`-only output contract as the CLI + the other
     // converters (the on-disk container stays GGUF-structured internally).
-    if !crate::has_openasr_runtime_pack_extension(&request.output_root) {
-        return Err(validate_error(format!(
-            "Whisper local-source converter output '{}' must end with .oasr (OpenASR native runtime pack)",
-            request.output_root.display()
-        )));
-    }
+    validate_output_pack_extension(&request.output_root)?;
     Ok(())
 }
 

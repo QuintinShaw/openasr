@@ -223,8 +223,7 @@ struct RawSafetensorsTensorHeader {
 /// header-length prefix is ever used to size an allocation (see [`SafetensorsFile::open`]).
 /// 128 MiB comfortably covers every real header in the tree (a header holds one
 /// small JSON record per tensor, not tensor payloads) while bounding the
-/// allocation a hostile file can force. Mirrors
-/// `whisper::local_source::safetensors::SAFETENSORS_HEADER_MAX_BYTES_V0`.
+/// allocation a hostile file can force.
 pub(crate) const SAFETENSORS_HEADER_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) struct SafetensorsFile {
@@ -446,7 +445,6 @@ pub(crate) fn parse_safetensors_header(
 /// the shape/dtype byte cross-check for a `Some` result, per the S4/S5
 /// design: unknown dtypes still get the range/overflow checks, just not the
 /// cross-check against a size table entry that does not exist for them.
-/// Mirrors `whisper::local_source::safetensors::dtype::safetensors_dtype_size_bytes`.
 fn dtype_size_bytes(dtype: &str) -> Option<u64> {
     match dtype.trim().to_ascii_uppercase().as_str() {
         "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" => Some(1),
@@ -462,8 +460,7 @@ fn dtype_size_bytes(dtype: &str) -> Option<u64> {
 /// This is the safetensors on-disk contract; mmap bounds-checking on
 /// individual tensor reads (see `SafetensorsFile::tensor_data`) is a lazy
 /// last line of defense and does not by itself catch a header whose tensors
-/// leave gaps or overlap each other. Mirrors
-/// `whisper::local_source::safetensors::dtype::validate_safetensors_tensor_offset_ranges`.
+/// leave gaps or overlap each other.
 fn validate_tensor_offset_ranges(
     tensors: &[SafetensorsTensorHeader],
     data_length_bytes: u64,
@@ -572,7 +569,13 @@ fn decode_f32_payload(tensor_name: &str, data: &[u8]) -> Result<Vec<f32>, LocalS
     }
     let mut out = Vec::with_capacity(data.len() / 4);
     for chunk in data.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if !value.is_finite() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{tensor_name}' contains non-finite F32 value"
+            )));
+        }
+        out.push(value);
     }
     Ok(out)
 }
@@ -599,7 +602,16 @@ fn decode_f16_payload_as_f32(
     data: &[u8],
 ) -> Result<Vec<f32>, LocalSourceImportError> {
     let bits = decode_f16_payload_bits(tensor_name, data)?;
-    Ok(bits.into_iter().map(f16_bits_to_f32).collect())
+    let mut out = Vec::with_capacity(bits.len());
+    for value in bits.into_iter().map(f16_bits_to_f32) {
+        if !value.is_finite() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{tensor_name}' contains non-finite F16 value"
+            )));
+        }
+        out.push(value);
+    }
+    Ok(out)
 }
 
 fn decode_bf16_payload_as_f32(
@@ -615,7 +627,13 @@ fn decode_bf16_payload_as_f32(
     let mut out = Vec::with_capacity(data.len() / 2);
     for chunk in data.chunks_exact(2) {
         let upper = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
-        out.push(f32::from_bits(upper << 16));
+        let value = f32::from_bits(upper << 16);
+        if !value.is_finite() {
+            return Err(validate_error(format!(
+                "safetensors tensor '{tensor_name}' contains non-finite BF16 value"
+            )));
+        }
+        out.push(value);
     }
     Ok(out)
 }
@@ -624,11 +642,69 @@ fn decode_bf16_payload_as_f32(
 mod tests {
     use super::{
         LocalSourceImportError, SAFETENSORS_HEADER_MAX_BYTES, SafetensorsFile,
+        decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32,
         validate_output_pack_extension,
     };
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// Assert a payload-decode `Validate` error and return its message.
+    fn expect_decode_validate_error<T>(result: Result<T, LocalSourceImportError>) -> String {
+        match result {
+            Ok(_) => panic!("expected a Validate error, got Ok"),
+            Err(LocalSourceImportError::Validate(message)) => message,
+            Err(other) => panic!("expected LocalSourceImportError::Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_f32_payload_rejects_non_finite_values() {
+        // A NaN F32 weight is a corrupt source, not a value to quantize: the
+        // shared decoder fails closed instead of propagating it into a pack.
+        let payload = f32::NAN.to_le_bytes();
+        let message =
+            expect_decode_validate_error(decode_safetensors_payload_as_f32("t", "F32", &payload));
+        assert!(message.contains("non-finite"), "{message}");
+        // The f16 conversion path shares the same fail-closed decoder.
+        let message = expect_decode_validate_error(decode_safetensors_payload_as_f16_bits(
+            "t", "F32", &payload,
+        ));
+        assert!(message.contains("non-finite"), "{message}");
+    }
+
+    #[test]
+    fn decode_f16_payload_rejects_non_finite_values() {
+        // f16 +Inf (0x7C00) is non-finite and must be rejected on the way to f32.
+        let payload = 0x7C00_u16.to_le_bytes();
+        let message =
+            expect_decode_validate_error(decode_safetensors_payload_as_f32("t", "F16", &payload));
+        assert!(message.contains("non-finite"), "{message}");
+    }
+
+    #[test]
+    fn decode_bf16_payload_rejects_non_finite_values() {
+        // bf16 +Inf is the f32 upper half 0x7F80; widen and reject.
+        let payload = 0x7F80_u16.to_le_bytes();
+        let message =
+            expect_decode_validate_error(decode_safetensors_payload_as_f32("t", "BF16", &payload));
+        assert!(message.contains("non-finite"), "{message}");
+    }
+
+    #[test]
+    fn decode_payloads_accept_finite_values() {
+        // Control: finite payloads still decode through the shared track.
+        let f32_payload = 1.5_f32.to_le_bytes();
+        assert_eq!(
+            decode_safetensors_payload_as_f32("t", "F32", &f32_payload).expect("finite f32"),
+            vec![1.5]
+        );
+        assert_eq!(
+            decode_safetensors_payload_as_f16_bits("t", "F32", &f32_payload)
+                .expect("finite f32 -> f16"),
+            vec![0x3E00] // 1.5 in IEEE binary16
+        );
+    }
 
     #[test]
     fn output_pack_extension_accepts_oasr() {
