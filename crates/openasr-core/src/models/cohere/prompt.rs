@@ -1,5 +1,7 @@
 use crate::GgmlAsrExecutionOptions;
+use crate::arch::{COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, OpenAsrArchitectureRegistry};
 use crate::models::decode_token_history::trim_prompt_token_tail;
+use crate::models::ggml_family_adapter::LanguageFamilyHint;
 
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 use super::tokenizer::CohereTranscribeTokenizer;
@@ -108,6 +110,23 @@ pub(crate) fn cohere_stable_prompt_positions(
         })
 }
 
+/// The language the decode prompt conditions on when a request leaves it unset.
+/// Read from the descriptor's typed `SelectsViaPrompt` facet -- the same single
+/// source of truth the language gate and capability surface resolve through
+/// `resolve_language_mode` -- so the prompt default cannot drift from what the
+/// family advertises.
+pub(crate) fn cohere_conditioned_default_language() -> &'static str {
+    match OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
+        .expect("cohere architecture must be registered")
+        .identity
+        .language_family_hint
+    {
+        LanguageFamilyHint::SelectsViaPrompt { default_language } => default_language,
+        other => unreachable!("cohere language hint must remain SelectsViaPrompt, found {other:?}"),
+    }
+}
+
 pub(crate) fn build_cohere_transcribe_decode_prompt(
     tokenizer: &CohereTranscribeTokenizer,
     _decoder_start_token_id: u32,
@@ -117,7 +136,7 @@ pub(crate) fn build_cohere_transcribe_decode_prompt(
     let mut token_ids = Vec::with_capacity(9);
     let requested_language = language
         .or(options.language.as_deref())
-        .unwrap_or("en")
+        .unwrap_or_else(|| cohere_conditioned_default_language())
         .trim()
         .to_lowercase();
     let language_token = format!("<|{}|>", requested_language);
@@ -206,6 +225,31 @@ mod tests {
         .expect("prompt");
         assert_eq!(prompt.token_ids, vec![0, 1, 2, 3, 3, 4, 5, 6, 8]);
         assert_eq!(prompt.eos_token_id, Some(10));
+    }
+
+    /// An unset language conditions on the descriptor's typed `SelectsViaPrompt`
+    /// default, never a family-local literal: the prompt must be byte-identical
+    /// to explicitly selecting that default.
+    #[test]
+    fn unset_language_resolves_the_descriptor_conditioned_default() {
+        assert_eq!(cohere_conditioned_default_language(), "en");
+        let tokenizer = tokenizer();
+        let defaulted = build_cohere_transcribe_decode_prompt(
+            &tokenizer,
+            13764,
+            None,
+            &GgmlAsrExecutionOptions::default(),
+        )
+        .expect("prompt");
+        let explicit = build_cohere_transcribe_decode_prompt(
+            &tokenizer,
+            13764,
+            Some("en"),
+            &GgmlAsrExecutionOptions::default(),
+        )
+        .expect("prompt");
+        assert_eq!(defaulted.token_ids, explicit.token_ids);
+        assert_eq!(defaulted.eos_token_id, explicit.eos_token_id);
     }
 
     /// The plain-transcript control tokens are unconditional: asking for
