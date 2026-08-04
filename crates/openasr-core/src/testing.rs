@@ -156,6 +156,13 @@ pub enum WhisperExecutionFailureStage {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TinyGgufPayloadProfile {
+    #[default]
+    Legacy,
+    NumericallyStableDeepGraphV1,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TinyGgufFixtureSpec {
     pub metadata: BTreeMap<String, String>,
@@ -164,6 +171,7 @@ pub struct TinyGgufFixtureSpec {
     pub tensor_names: Vec<String>,
     tensor_dims: BTreeMap<String, Vec<u64>>,
     tensor_types: BTreeMap<String, i32>,
+    payload_profile: TinyGgufPayloadProfile,
 }
 
 impl TinyGgufFixtureSpec {
@@ -184,6 +192,7 @@ impl TinyGgufFixtureSpec {
             tensor_names,
             tensor_dims,
             tensor_types,
+            payload_profile: TinyGgufPayloadProfile::default(),
         }
     }
 
@@ -458,6 +467,12 @@ impl TinyGgufFixtureSpec {
         Self::cohere_oasr_v1_non_streaming_cpu(model_id)
             .with_cohere_graph_metadata(2, 2, 16, 2, 8, 32, 5, 32, 32)
             .with_cohere_runtime_tensors_with_layers(2, 2)
+            .with_payload_profile(TinyGgufPayloadProfile::NumericallyStableDeepGraphV1)
+    }
+
+    fn with_payload_profile(mut self, payload_profile: TinyGgufPayloadProfile) -> Self {
+        self.payload_profile = payload_profile;
+        self
     }
 
     /// Metadata-complete Moonshine fixture used to prove product routing up
@@ -2188,7 +2203,7 @@ pub fn write_tiny_gguf_runtime_source(
     let aligned_length = align_up(bytes.len(), GGUF_DEFAULT_ALIGNMENT);
     bytes.resize(aligned_length, 0);
     for (tensor_index, tensor) in tensor_entries.iter().enumerate() {
-        let payload = deterministic_tensor_payload(tensor, tensor_index);
+        let payload = deterministic_tensor_payload(tensor, tensor_index, spec.payload_profile);
         bytes.extend_from_slice(&payload);
         debug_assert_eq!(payload.len() as u64, tensor_payload_sizes[tensor_index]);
         let next_aligned = align_up(bytes.len(), GGUF_DEFAULT_ALIGNMENT);
@@ -2275,14 +2290,20 @@ fn payload_size_for_tensor(ggml_type: i32, dims: &[u64]) -> u64 {
     }
 }
 
-fn deterministic_tensor_payload(tensor: &TinyGgufTensorEntry, tensor_index: usize) -> Vec<u8> {
+fn deterministic_tensor_payload(
+    tensor: &TinyGgufTensorEntry,
+    tensor_index: usize,
+    payload_profile: TinyGgufPayloadProfile,
+) -> Vec<u8> {
     let num_elements = tensor
         .dims
         .iter()
         .fold(1_u64, |acc, dim| acc.saturating_mul(*dim));
     let seed = deterministic_tensor_seed(&tensor.name, tensor_index);
     match tensor.ggml_type {
-        GGML_TYPE_F32 => deterministic_f32_payload(&tensor.name, seed, num_elements),
+        GGML_TYPE_F32 => {
+            deterministic_f32_payload(&tensor.name, seed, num_elements, payload_profile)
+        }
         GGML_TYPE_F16 => deterministic_f16_payload(seed, num_elements),
         _ => vec![0_u8; payload_size_for_tensor(tensor.ggml_type, &tensor.dims) as usize],
     }
@@ -2297,16 +2318,28 @@ fn deterministic_tensor_seed(tensor_name: &str, tensor_index: usize) -> u64 {
     hash ^ ((tensor_index as u64).wrapping_mul(2_862_933_555_777_941_757_u64))
 }
 
-fn deterministic_f32_payload(tensor_name: &str, seed: u64, num_elements: u64) -> Vec<u8> {
+fn deterministic_f32_payload(
+    tensor_name: &str,
+    seed: u64,
+    num_elements: u64,
+    payload_profile: TinyGgufPayloadProfile,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity((num_elements as usize).saturating_mul(4));
     for index in 0..num_elements {
-        let value = deterministic_f32_value(tensor_name, seed, index, num_elements);
+        let value =
+            deterministic_f32_value(tensor_name, seed, index, num_elements, payload_profile);
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
 }
 
-fn deterministic_f32_value(tensor_name: &str, seed: u64, index: u64, num_elements: u64) -> f32 {
+fn deterministic_f32_value(
+    tensor_name: &str,
+    seed: u64,
+    index: u64,
+    num_elements: u64,
+    payload_profile: TinyGgufPayloadProfile,
+) -> f32 {
     if matches!(tensor_name, "fe.window" | "audio.mel_window") {
         if num_elements <= 1 {
             return 1.0;
@@ -2322,11 +2355,34 @@ fn deterministic_f32_value(tensor_name: &str, seed: u64, index: u64, num_element
         let bucket = (seed.wrapping_add(index.wrapping_mul(13)) % 19) as f32;
         return 0.5 + bucket / 32.0;
     }
+    if matches!(
+        payload_profile,
+        TinyGgufPayloadProfile::NumericallyStableDeepGraphV1
+    ) {
+        if tensor_name.ends_with(".bias") || tensor_name.ends_with(".bn.mean") {
+            return 0.0;
+        }
+        if tensor_name.ends_with(".norm.weight")
+            || tensor_name.ends_with("_ln.weight")
+            || tensor_name.ends_with(".bn.weight")
+        {
+            return 1.0;
+        }
+    }
     let mixed = seed
         .wrapping_add(index.wrapping_mul(1_103_515_245_u64))
         .wrapping_add(12_345);
     let centered = (mixed % 2_049_u64) as i32 - 1_024;
-    centered as f32 / 256.0
+    let denominator = match payload_profile {
+        TinyGgufPayloadProfile::Legacy => 256.0,
+        // Deep synthetic graphs must exercise non-zero loaded tensors without
+        // using the old [-4, 4] envelope, whose repeated affine products can
+        // overflow differently across GGML CPU kernels. This bound is small
+        // enough for the largest tiny-fixture fan-in while preserving signs
+        // and deterministic cross-platform coverage.
+        TinyGgufPayloadProfile::NumericallyStableDeepGraphV1 => 65_536.0,
+    };
+    centered as f32 / denominator
 }
 
 fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
@@ -2605,6 +2661,35 @@ mod tests {
             spec.tensor_dims.get("dec.pos.weight"),
             Some(&vec![32_u64, 16_u64])
         );
+        assert_eq!(
+            spec.payload_profile,
+            TinyGgufPayloadProfile::NumericallyStableDeepGraphV1
+        );
+    }
+
+    #[test]
+    fn deep_graph_payload_profile_has_bounded_affine_parameters() {
+        let profile = TinyGgufPayloadProfile::NumericallyStableDeepGraphV1;
+        assert_eq!(
+            deterministic_f32_value("enc.pre.out.bias", 7, 0, 16, profile),
+            0.0
+        );
+        assert_eq!(
+            deterministic_f32_value("dec.emb_ln.weight", 7, 0, 16, profile),
+            1.0
+        );
+        assert_eq!(
+            deterministic_f32_value("enc.blk.0.conv.bn.weight", 7, 0, 16, profile),
+            1.0
+        );
+
+        let values = (0..2_049)
+            .map(|index| deterministic_f32_value("enc.pre.out.weight", 7, index, 2_049, profile))
+            .collect::<Vec<_>>();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.iter().all(|value| value.abs() <= 1.0 / 64.0));
+        assert!(values.iter().any(|value| *value < 0.0));
+        assert!(values.iter().any(|value| *value > 0.0));
     }
 
     #[test]
