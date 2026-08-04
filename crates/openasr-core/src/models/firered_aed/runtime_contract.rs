@@ -653,11 +653,11 @@ pub(crate) fn validate_firered_aed_tokenizer_contract(
     metadata: &GgufMetadata,
     vocab_size: usize,
 ) -> Result<(), MetadataContractError> {
-    let tokens = metadata
-        .get_string_array(TOKENIZER_GGML_TOKENS_KEY)
-        .ok_or_else(|| MetadataContractError::MissingRequiredKey {
+    let tokens = metadata.get_string_array(TOKENIZER_GGML_TOKENS_KEY).ok_or(
+        MetadataContractError::MissingRequiredKey {
             key: TOKENIZER_GGML_TOKENS_KEY,
-        })?;
+        },
+    )?;
     if tokens.is_empty() {
         return Err(MetadataContractError::InvalidValue {
             key: TOKENIZER_GGML_TOKENS_KEY,
