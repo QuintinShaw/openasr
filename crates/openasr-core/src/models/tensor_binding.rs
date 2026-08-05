@@ -23,19 +23,6 @@ impl TensorReadGuard {
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
-
-    /// Install this guard as the active by-name allowlist on `index` for the
-    /// lifetime of the returned scope. Shared loaders that only call
-    /// [`crate::GgufTensorIndex::get`] then fail closed on any name outside
-    /// this set (including names present in the pack but absent from the
-    /// contract). Prefer this over hand-rolling `contains` checks when the
-    /// loader path crosses a shared API that cannot take a guard parameter.
-    pub(crate) fn enforce_on_index<'a>(
-        &self,
-        index: &'a crate::GgufTensorIndex,
-    ) -> crate::ggml_runtime::GgufTensorReadAllowlistGuard<'a> {
-        index.enforce_read_allowlist(self.names.iter().cloned())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

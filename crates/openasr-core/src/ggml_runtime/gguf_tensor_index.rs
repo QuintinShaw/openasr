@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::CStr,
     path::{Path, PathBuf},
     sync::{
@@ -85,60 +85,6 @@ impl GgufTensorAccessTrace {
     }
 }
 
-/// Shared opt-in allowlist behind [`GgufTensorIndex::enforce_read_allowlist`].
-/// When enabled, [`GgufTensorIndex::get`] only returns tensors whose names are
-/// in the set — off-contract names resolve as missing even if present in the
-/// pack. Cloned indexes share one allowlist (same Arc pattern as the access
-/// trace) so a reader and any clone enforce the same closed read set. Off by
-/// default; never part of index equality.
-#[derive(Default)]
-struct GgufTensorReadAllowlist {
-    enabled: AtomicBool,
-    allowed: Mutex<BTreeSet<String>>,
-}
-
-impl GgufTensorReadAllowlist {
-    fn allows(&self, name: &str) -> bool {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return true;
-        }
-        self.allowed
-            .lock()
-            .expect("tensor read allowlist mutex poisoned")
-            .contains(name)
-    }
-
-    fn install(&self, names: BTreeSet<String>) {
-        *self
-            .allowed
-            .lock()
-            .expect("tensor read allowlist mutex poisoned") = names;
-        self.enabled.store(true, Ordering::Relaxed);
-    }
-
-    fn clear(&self) {
-        self.enabled.store(false, Ordering::Relaxed);
-        self.allowed
-            .lock()
-            .expect("tensor read allowlist mutex poisoned")
-            .clear();
-    }
-}
-
-/// RAII scope for [`GgufTensorIndex::enforce_read_allowlist`]: clearing the
-/// allowlist on drop so a shared index cannot leak a narrowed read set into a
-/// later loader (e.g. decoder guard must not still be on when the encoder half
-/// loads through the same preflight Arc).
-pub struct GgufTensorReadAllowlistGuard<'a> {
-    index: &'a GgufTensorIndex,
-}
-
-impl Drop for GgufTensorReadAllowlistGuard<'_> {
-    fn drop(&mut self) {
-        self.index.read_allowlist.clear();
-    }
-}
-
 #[derive(Clone)]
 pub struct GgufTensorIndex {
     path: PathBuf,
@@ -148,8 +94,6 @@ pub struct GgufTensorIndex {
     /// Never part of equality or debug identity: two indexes over the same
     /// pack are the same index no matter what has been traced.
     access_trace: Arc<GgufTensorAccessTrace>,
-    /// Never part of equality or debug identity (same rationale as access_trace).
-    read_allowlist: Arc<GgufTensorReadAllowlist>,
 }
 
 impl PartialEq for GgufTensorIndex {
@@ -194,7 +138,6 @@ impl GgufTensorIndex {
             tensors: Vec::new(),
             tensor_index_by_name: BTreeMap::new(),
             access_trace: Arc::new(GgufTensorAccessTrace::default()),
-            read_allowlist: Arc::new(GgufTensorReadAllowlist::default()),
         }
     }
 
@@ -211,33 +154,12 @@ impl GgufTensorIndex {
     }
 
     pub fn get(&self, name: &str) -> Option<&GgufTensorMetadata> {
-        if !self.read_allowlist.allows(name) {
-            // Fail closed: an enabled allowlist treats off-contract names as
-            // missing so shared loaders that only call `get` cannot consume
-            // tensors outside the installed contract set.
-            return None;
-        }
         let tensor = self
             .tensor_index_by_name
             .get(name)
             .and_then(|index| self.tensors.get(*index))?;
         self.access_trace.record(tensor);
         Some(tensor)
-    }
-
-    /// Install an opt-in fail-closed allowlist for by-name lookups. While the
-    /// returned guard is alive, [`Self::get`] only returns tensors whose names
-    /// appear in `allowed_names`; every other name (including ones present in
-    /// the pack) resolves as missing. Dropping the guard clears the allowlist.
-    /// Default is off and costs one relaxed load per lookup while off.
-    pub fn enforce_read_allowlist<I, S>(&self, allowed_names: I) -> GgufTensorReadAllowlistGuard<'_>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.read_allowlist
-            .install(allowed_names.into_iter().map(Into::into).collect());
-        GgufTensorReadAllowlistGuard { index: self }
     }
 
     /// Start recording every successful by-name lookup ([`Self::get`]) this
@@ -286,7 +208,6 @@ impl GgufTensorIndex {
             tensors: snapshot.tensors,
             tensor_index_by_name,
             access_trace: Arc::new(GgufTensorAccessTrace::default()),
-            read_allowlist: Arc::new(GgufTensorReadAllowlist::default()),
         })
     }
 }
@@ -620,7 +541,6 @@ pub(crate) fn read_gguf_tensor_index_from_context(
         tensors,
         tensor_index_by_name,
         access_trace: Arc::new(GgufTensorAccessTrace::default()),
-        read_allowlist: Arc::new(GgufTensorReadAllowlist::default()),
     })
 }
 
@@ -804,52 +724,6 @@ mod tests {
         let _ = left.get("encoder.weight");
 
         assert_eq!(left, right, "traced lookups are not part of index identity");
-    }
-
-    #[test]
-    fn read_allowlist_is_off_until_enabled_and_hides_off_contract_names() {
-        let file = NamedTempFile::new().expect("temp file");
-        write_single_tensor_gguf_fixture(file.path());
-
-        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
-        assert!(
-            index.get("encoder.weight").is_some(),
-            "allowlist off: existing tensors remain visible"
-        );
-
-        {
-            let _guard = index.enforce_read_allowlist(["other.weight".to_string()]);
-            assert!(
-                index.get("encoder.weight").is_none(),
-                "allowlist on: off-contract names must resolve as missing"
-            );
-        }
-        assert!(
-            index.get("encoder.weight").is_some(),
-            "dropping the allowlist guard must restore unrestricted gets"
-        );
-
-        let _guard = index.enforce_read_allowlist(["encoder.weight".to_string()]);
-        assert!(
-            index.get("encoder.weight").is_some(),
-            "allowlisted names must still resolve"
-        );
-    }
-
-    #[test]
-    fn read_allowlist_is_shared_with_clones_and_ignored_by_equality() {
-        let file = NamedTempFile::new().expect("temp file");
-        write_single_tensor_gguf_fixture(file.path());
-
-        let left = read_gguf_tensor_index(file.path()).expect("read tensor index");
-        let right = read_gguf_tensor_index(file.path()).expect("read tensor index");
-        let cloned = left.clone();
-        let _guard = left.enforce_read_allowlist(std::iter::empty::<String>());
-        assert!(
-            cloned.get("encoder.weight").is_none(),
-            "a clone must share the allowlist with its source index"
-        );
-        assert_eq!(left, right, "allowlist state is not part of index identity");
     }
 
     #[cfg(unix)]

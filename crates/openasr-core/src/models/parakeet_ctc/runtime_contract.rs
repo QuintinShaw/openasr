@@ -552,4 +552,54 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    /// Transposed rectangular weights used to pass under Rank2EitherDims; the
+    /// ordered ExactDims contract must reject them at the production validator
+    /// entry so a pack cannot ship the HF [out, in] orientation the graph
+    /// cannot consume.
+    #[test]
+    fn rejects_transposed_subsampling_linear_weight() {
+        let metadata = tiny_execution_metadata();
+        let mut shapes = parakeet_ctc_runtime_tensors(&metadata);
+        let linear = shapes
+            .iter_mut()
+            .find(|(name, _)| name == "enc.sub.linear.weight")
+            .expect("subsampling linear");
+        // Correct is ggml [flatten, hidden]; swap to [hidden, flatten].
+        linear.1 = vec![metadata.hidden_size as u64, linear.1[0]];
+        let index = tensor_index_from_shapes(&shapes);
+        let error = validate_parakeet_ctc_runtime_tensors_with_index(&index, &metadata)
+            .expect_err("transposed enc.sub.linear.weight must fail closed");
+        assert!(
+            matches!(
+                error,
+                ParakeetCtcTensorContractError::InvalidTensorShape { ref name, .. }
+                    if name == "enc.sub.linear.weight"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_transposed_ffn_up_weight() {
+        let metadata = tiny_execution_metadata();
+        let mut shapes = parakeet_ctc_runtime_tensors(&metadata);
+        let ff1_up = shapes
+            .iter_mut()
+            .find(|(name, _)| name == "enc.blk.0.ff1.up.weight")
+            .expect("ff1.up");
+        // Correct is ggml [hidden, ffn]; swap to [ffn, hidden].
+        ff1_up.1 = vec![metadata.ffn_dim as u64, metadata.hidden_size as u64];
+        let index = tensor_index_from_shapes(&shapes);
+        let error = validate_parakeet_ctc_runtime_tensors_with_index(&index, &metadata)
+            .expect_err("transposed ff1.up.weight must fail closed");
+        assert!(
+            matches!(
+                error,
+                ParakeetCtcTensorContractError::InvalidTensorShape { ref name, .. }
+                    if name == "enc.blk.0.ff1.up.weight"
+            ),
+            "unexpected error: {error}"
+        );
+    }
 }
