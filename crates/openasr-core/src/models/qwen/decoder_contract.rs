@@ -102,10 +102,7 @@ impl QwenDecoderContractOptions {
         qkv_bias: false,
     };
 
-    /// Qwen2-class option pair (MiMo backbone / FireRedASR2-LLM). Not yet
-    /// referenced from production adapters on this commit; kept as the typed
-    /// variation constant tests and upcoming migrations share.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Qwen2-class option pair (MiMo backbone / FireRedASR2-LLM).
     pub(crate) const QWEN2: Self = Self {
         qk_norm: false,
         qkv_bias: true,
