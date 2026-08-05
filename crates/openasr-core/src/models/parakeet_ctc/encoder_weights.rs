@@ -33,11 +33,18 @@ pub(crate) enum ParakeetEncoderWeightsError {
     },
     #[error("parakeet-ctc encoder conv BatchNorm fold failed: {reason}")]
     BatchNormFold { reason: String },
+    #[error("parakeet-ctc tensor '{name}' is not part of the runtime tensor contract")]
+    NotInContract { name: String },
+    #[error("parakeet-ctc weight expectation overflowed: {reason}")]
+    ExpectationOverflow { reason: String },
 }
 
 impl FastConformerWeightsError for ParakeetEncoderWeightsError {
     fn batchnorm_fold(reason: String) -> Self {
         Self::BatchNormFold { reason }
+    }
+    fn not_in_contract(name: String) -> Self {
+        Self::NotInContract { name }
     }
 }
 
@@ -65,12 +72,25 @@ impl ParakeetEncoderWeights {
     }
 }
 
+/// The read guard for one pack's full parakeet-ctc tensor contract (shared
+/// FastConformer encoder plus the CTC head): every tensor the loader reads
+/// must be enumerated here.
+pub(crate) fn parakeet_ctc_read_guard(
+    metadata: &ParakeetCtcExecutionMetadata,
+) -> crate::models::tensor_binding::TensorReadGuard {
+    crate::models::tensor_binding::TensorReadGuard::from_descriptors(
+        &super::runtime_contract::parakeet_ctc_runtime_tensor_binding_descriptors(metadata),
+    )
+}
+
 pub(crate) fn load_parakeet_ctc_encoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetCtcExecutionMetadata,
 ) -> Result<ParakeetEncoderWeights, ParakeetEncoderWeightsError> {
-    let subsampling =
-        fastconformer::load_fastconformer_subsampling::<ParakeetEncoderWeightsError>(reader)?;
+    let guard = parakeet_ctc_read_guard(metadata);
+    let subsampling = fastconformer::load_fastconformer_subsampling::<ParakeetEncoderWeightsError>(
+        reader, &guard,
+    )?;
 
     let mut layers = Vec::with_capacity(metadata.n_layers);
     for layer in 0..metadata.n_layers {
@@ -79,6 +99,7 @@ pub(crate) fn load_parakeet_ctc_encoder_weights(
             ParakeetEncoderWeightsError,
         >(
             reader,
+            &guard,
             layer,
             metadata.hidden_size,
             metadata.ffn_dim,
@@ -86,11 +107,19 @@ pub(crate) fn load_parakeet_ctc_encoder_weights(
         )?);
     }
 
-    let mut ctc_head_weight: NamedTensor =
-        fastconformer::load_named::<ParakeetEncoderWeightsError>(reader, "ctc.head.weight")?;
+    let mut ctc_head_weight: NamedTensor = fastconformer::load_named::<ParakeetEncoderWeightsError>(
+        reader,
+        &guard,
+        "ctc.head.weight",
+    )?;
     let ctc_head_bias: NamedTensor =
-        fastconformer::load_named::<ParakeetEncoderWeightsError>(reader, "ctc.head.bias")?;
-    let expected_head = metadata.vocab_size * metadata.hidden_size;
+        fastconformer::load_named::<ParakeetEncoderWeightsError>(reader, &guard, "ctc.head.bias")?;
+    let expected_head = metadata
+        .vocab_size
+        .checked_mul(metadata.hidden_size)
+        .ok_or_else(|| ParakeetEncoderWeightsError::ExpectationOverflow {
+            reason: "vocab_size * hidden_size overflows".to_string(),
+        })?;
     if ctc_head_weight.element_count() != expected_head {
         return Err(ParakeetEncoderWeightsError::ElementCount {
             name: ctc_head_weight.name.clone(),
@@ -175,5 +204,86 @@ mod tests {
             .find(|t| t.name == "enc.sub.linear.weight")
             .expect("subsampling linear");
         assert!(sub_linear.values.is_empty());
+    }
+
+    /// The equivalence evidence the count-plus-sampling pin used to fake: run
+    /// the REAL encoder + CTC-head loader over a synthetic pack projected
+    /// from the contract enumeration itself, with the tensor index's access
+    /// trace enabled, and assert the traced read set equals the descriptor
+    /// set name for name and shape for shape. Any drift -- a loader reading a
+    /// tensor the contract does not list, a descriptor no loader reads, or a
+    /// read violating the descriptor's shape -- fails here. Also exercises
+    /// the read guard: every read is contract-listed.
+    #[test]
+    fn full_loader_read_trace_equals_the_descriptor_set() {
+        use super::super::runtime_contract::{
+            parakeet_ctc_runtime_tensor_binding_descriptors, parakeet_ctc_runtime_tensors,
+        };
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+        let metadata = super::tests_support::tiny_execution_metadata();
+        let shapes = parakeet_ctc_runtime_tensors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("parakeet-ctc-trace.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in shapes {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write trace pack");
+
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+        reader.tensor_index().enable_access_trace();
+        load_parakeet_ctc_encoder_weights(&reader, &metadata).expect("full encoder load");
+
+        crate::models::tensor_binding::assert_trace_matches_descriptor_set(
+            &reader.tensor_index().access_trace(),
+            &parakeet_ctc_runtime_tensor_binding_descriptors(&metadata),
+        );
+    }
+
+    /// The read guard fails closed on any tensor the contract does not
+    /// enumerate, so a loader/name drift cannot read off-contract.
+    #[test]
+    fn read_guard_rejects_off_contract_tensors() {
+        use crate::models::fastconformer::load_named;
+
+        let metadata = super::tests_support::tiny_execution_metadata();
+        let guard = parakeet_ctc_read_guard(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("parakeet-ctc-guard.oasr");
+        let spec = crate::testing::TinyGgufFixtureSpec::new(std::collections::BTreeMap::new())
+            .with_tensor_shape("off.contract.weight", vec![2, 2]);
+        crate::testing::write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+
+        let error =
+            load_named::<ParakeetEncoderWeightsError>(&reader, &guard, "off.contract.weight")
+                .expect_err("off-contract reads must fail closed");
+        assert!(
+            matches!(error, ParakeetEncoderWeightsError::NotInContract { ref name } if name == "off.contract.weight"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// Test-only geometry support for this module's weight-free tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::super::runtime_contract::ParakeetCtcExecutionMetadata;
+
+    pub(crate) fn tiny_execution_metadata() -> ParakeetCtcExecutionMetadata {
+        ParakeetCtcExecutionMetadata {
+            n_layers: 1,
+            hidden_size: 16,
+            n_heads: 2,
+            head_dim: 8,
+            ffn_dim: 32,
+            conv_kernel: 9,
+            n_mels: 80,
+            subsampling_factor: 8,
+            subsampling_channels: 24,
+            vocab_size: 12,
+            blank_token_id: 11,
+        }
     }
 }

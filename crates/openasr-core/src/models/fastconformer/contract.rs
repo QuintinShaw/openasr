@@ -12,6 +12,13 @@
 //! two extents in either stored orientation, and the depthwise kernel pins its
 //! exact `[conv_kernel, 1, hidden]` ggml layout (the only tensor with a single
 //! valid orientation, matching the sensevoice FSMN precedent).
+//!
+//! Overflow safety: the geometry arrives already bounded by each family's
+//! metadata parser (architecture ceilings checked fail-closed at parse time),
+//! so the few derived extents computed here use saturating arithmetic as
+//! defense in depth -- a hypothetical saturation produces a requirement no
+//! pack tensor can satisfy, which stays fail-closed at validation instead of
+//! wrapping into an admitting shape.
 
 use crate::models::tensor_binding::{TensorBindingDescriptor, TensorBindingDescriptorRequirement};
 
@@ -204,14 +211,14 @@ fn fastconformer_layer_tensor_descriptors(
         ),
         descriptor(
             n("conv.pw1.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, 2 * hidden),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, hidden.saturating_mul(2)),
             "conv pointwise1 must map hidden_size to 2*hidden_size (GLU)",
         ),
     ]);
     if geometry.bias_present {
         descriptors.push(descriptor(
             n("conv.pw1.bias"),
-            TensorBindingDescriptorRequirement::VectorLen(2 * hidden),
+            TensorBindingDescriptorRequirement::VectorLen(hidden.saturating_mul(2)),
             "conv pointwise1 bias must span 2*hidden_size",
         ));
     }
@@ -324,4 +331,16 @@ pub(crate) fn fastconformer_encoder_tensor_descriptors(
         descriptors.extend(fastconformer_layer_tensor_descriptors(geometry, layer));
     }
     descriptors
+}
+
+/// The number of tensor obligations the shared encoder contributes for one
+/// geometry, computed from the builders themselves so a family parser's
+/// closed-form total-obligation count can never drift from the enumeration
+/// it bounds.
+pub(crate) fn fastconformer_encoder_descriptor_count(
+    geometry: &FastConformerContractGeometry,
+) -> usize {
+    let subsampling = fastconformer_subsampling_tensor_descriptors(geometry).len();
+    let per_layer = fastconformer_layer_tensor_descriptors(geometry, 0).len();
+    subsampling.saturating_add(geometry.n_layers.saturating_mul(per_layer))
 }

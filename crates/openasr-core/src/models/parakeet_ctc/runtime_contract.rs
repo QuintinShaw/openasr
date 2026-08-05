@@ -7,11 +7,12 @@
 
 use crate::GgufTensorIndex;
 use crate::models::fastconformer::{
-    FastConformerContractGeometry, fastconformer_encoder_tensor_descriptors,
+    FastConformerContractGeometry, fastconformer_encoder_descriptor_count,
+    fastconformer_encoder_tensor_descriptors,
 };
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_u64_scalar, u64_to_u32, u64_to_usize,
-    validate_positive_usize,
+    validate_bounded_usize, validate_positive_usize,
 };
 use crate::models::tensor_binding::{
     TensorBindingDescriptor, TensorBindingDescriptorRequirement, render_shape,
@@ -29,6 +30,33 @@ pub(crate) const PARAKEET_SUBSAMPLING_FACTOR_KEY: &str = "parakeet.subsampling_f
 pub(crate) const PARAKEET_SUBSAMPLING_CHANNELS_KEY: &str = "parakeet.subsampling_channels";
 pub(crate) const PARAKEET_VOCAB_SIZE_KEY: &str = "parakeet.vocab_size";
 pub(crate) const PARAKEET_CTC_BLANK_TOKEN_ID_KEY: &str = "ctc.blank_token_id";
+
+/// The dw-striding subsampling prelude + the frontend/frame bookkeeping the
+/// shared graph hardcodes amount to exactly three stride-2 stages; the
+/// contract admits no other factor (parakeet-tdt carries the same pin).
+pub(crate) const PARAKEET_CTC_SUBSAMPLING_FACTOR: usize = 8;
+
+/// Architecture ceilings for pack-supplied geometry, with generous headroom
+/// over the production checkpoint (24 layers, hidden 1024, ffn 4096, vocab
+/// 1025). They bound every contract-derived arithmetic expression and the
+/// tensor-obligation count a malicious metadata set can construct, so
+/// contract building stays allocation-bounded and overflow-free on untrusted
+/// input; parse fails closed above them.
+pub(crate) const PARAKEET_CTC_MAX_N_LAYERS: usize = 512;
+pub(crate) const PARAKEET_CTC_MAX_HIDDEN_SIZE: usize = 65_536;
+pub(crate) const PARAKEET_CTC_MAX_FFN_DIM: usize = 262_144;
+pub(crate) const PARAKEET_CTC_MAX_N_HEADS: usize = 1_024;
+pub(crate) const PARAKEET_CTC_MAX_HEAD_DIM: usize = 65_536;
+pub(crate) const PARAKEET_CTC_MAX_CONV_KERNEL: usize = 4_096;
+pub(crate) const PARAKEET_CTC_MAX_N_MELS: usize = 4_096;
+pub(crate) const PARAKEET_CTC_MAX_SUBSAMPLING_CHANNELS: usize = 65_536;
+pub(crate) const PARAKEET_CTC_MAX_VOCAB_SIZE: usize = 1_000_000;
+/// Global ceiling on the tensor obligations one pack's contract may
+/// construct; far above the production 950, far below anything that could
+/// exhaust the verifier.
+pub(crate) const PARAKEET_CTC_MAX_TENSOR_OBLIGATIONS: usize = 1_000_000;
+/// The CTC head tensors appended after the shared FastConformer encoder.
+const PARAKEET_CTC_TAIL_DESCRIPTOR_COUNT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParakeetCtcExecutionMetadata {
@@ -80,6 +108,48 @@ pub(crate) fn parse_parakeet_ctc_execution_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
+    // Architecture ceilings: keep contract construction bounded and
+    // overflow-free on untrusted metadata (fail closed above them).
+    for (key, value, max) in [
+        (PARAKEET_N_LAYERS_KEY, n_layers, PARAKEET_CTC_MAX_N_LAYERS),
+        (
+            PARAKEET_HIDDEN_SIZE_KEY,
+            hidden_size,
+            PARAKEET_CTC_MAX_HIDDEN_SIZE,
+        ),
+        (PARAKEET_N_HEADS_KEY, n_heads, PARAKEET_CTC_MAX_N_HEADS),
+        (PARAKEET_HEAD_DIM_KEY, head_dim, PARAKEET_CTC_MAX_HEAD_DIM),
+        (PARAKEET_FFN_DIM_KEY, ffn_dim, PARAKEET_CTC_MAX_FFN_DIM),
+        (
+            PARAKEET_CONV_KERNEL_KEY,
+            conv_kernel,
+            PARAKEET_CTC_MAX_CONV_KERNEL,
+        ),
+        (PARAKEET_N_MELS_KEY, n_mels, PARAKEET_CTC_MAX_N_MELS),
+        (
+            PARAKEET_SUBSAMPLING_CHANNELS_KEY,
+            subsampling_channels,
+            PARAKEET_CTC_MAX_SUBSAMPLING_CHANNELS,
+        ),
+        (
+            PARAKEET_VOCAB_SIZE_KEY,
+            vocab_size,
+            PARAKEET_CTC_MAX_VOCAB_SIZE,
+        ),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
+    // The shared subsampling prelude and the frontend frame bookkeeping
+    // hardcode three stride-2 stages; admit no other factor.
+    if subsampling_factor != PARAKEET_CTC_SUBSAMPLING_FACTOR {
+        return Err(MetadataContractError::InvalidValue {
+            key: PARAKEET_SUBSAMPLING_FACTOR_KEY,
+            reason: format!(
+                "the shared graph fixes three stride-2 subsampling stages (factor \
+                 {PARAKEET_CTC_SUBSAMPLING_FACTOR}), got {subsampling_factor}"
+            ),
+        });
+    }
     // The blank id must be the last vocab slot (vocab includes the blank).
     if (blank_token_id as usize) >= vocab_size {
         return Err(MetadataContractError::InvalidValue {
@@ -87,10 +157,34 @@ pub(crate) fn parse_parakeet_ctc_execution_metadata<M: ScalarMetadataView>(
             reason: format!("blank {blank_token_id} out of range for vocab_size {vocab_size}"),
         });
     }
-    if head_dim * n_heads != hidden_size {
+    if head_dim.checked_mul(n_heads) != Some(hidden_size) {
         return Err(MetadataContractError::InvalidValue {
             key: PARAKEET_HEAD_DIM_KEY,
             reason: format!("head_dim {head_dim} * n_heads {n_heads} != hidden_size {hidden_size}"),
+        });
+    }
+    // Bound the tensor obligations this geometry's contract will construct,
+    // fail-closed, before any descriptor allocation happens. The count is
+    // derived from the same builders the contract uses, so it cannot drift.
+    let total_obligations =
+        fastconformer_encoder_descriptor_count(&FastConformerContractGeometry {
+            n_layers,
+            hidden_size,
+            ffn_dim,
+            conv_kernel,
+            n_heads,
+            head_dim,
+            subsampling_channels,
+            bias_present: true,
+        })
+        .saturating_add(PARAKEET_CTC_TAIL_DESCRIPTOR_COUNT);
+    if total_obligations > PARAKEET_CTC_MAX_TENSOR_OBLIGATIONS {
+        return Err(MetadataContractError::InvalidValue {
+            key: PARAKEET_N_LAYERS_KEY,
+            reason: format!(
+                "geometry constructs {total_obligations} tensor obligations, exceeding the \
+                 ceiling {PARAKEET_CTC_MAX_TENSOR_OBLIGATIONS}"
+            ),
         });
     }
 
@@ -318,14 +412,17 @@ mod tests {
         .expect("unique tensor names")
     }
 
-    /// The requirement enumeration IS the loader read set: pin it on the full
-    /// production geometry (parakeet-ctc-0.6b: 24 bias-complete layers). The
-    /// shared encoder contributes 12 subsampling + 39 per-layer tensors
-    /// (24 always-loaded + 11 biases + 4 BatchNorm-fold statistics), plus the
+    /// Structural pins on the production geometry (parakeet-ctc-0.6b: 24
+    /// bias-complete layers). The loader-equivalence evidence lives in
+    /// `full_loader_read_trace_equals_the_descriptor_set` (encoder_weights);
+    /// this test holds the enumeration's production shape stable: the shared
+    /// encoder contributes 12 subsampling + 39 per-layer tensors (24
+    /// always-loaded + 11 biases + 4 BatchNorm-fold statistics), plus the
     /// 2-tensor CTC head tail.
     #[test]
-    fn descriptor_set_matches_the_loader_read_set_on_production_geometry() {
+    fn descriptor_set_stays_pinned_on_production_geometry() {
         let parsed = parse_parakeet_ctc_execution_metadata(&parakeet_metadata()).expect("parse");
+        assert_eq!(parsed.subsampling_factor, PARAKEET_CTC_SUBSAMPLING_FACTOR);
         let descriptors = parakeet_ctc_runtime_tensor_binding_descriptors(&parsed);
         assert_eq!(descriptors.len(), 12 + 24 * 39 + 2);
         let names: std::collections::BTreeSet<&str> = descriptors
@@ -333,19 +430,84 @@ mod tests {
             .map(|descriptor| descriptor.tensor_name.as_str())
             .collect();
         assert_eq!(names.len(), descriptors.len(), "names must be unique");
-        for required in [
-            "enc.sub.layers.0.weight",
-            "enc.sub.layers.6.bias",
-            "enc.sub.linear.weight",
-            "enc.blk.0.ff1.up.bias",
-            "enc.blk.0.attn.pos_bias_u",
-            "enc.blk.0.conv.bn.var",
-            "enc.blk.23.out.norm.bias",
-            "ctc.head.weight",
-            "ctc.head.bias",
-        ] {
-            assert!(names.contains(required), "contract must cover {required}");
+    }
+
+    #[test]
+    fn rejects_a_subsampling_factor_the_shared_graph_cannot_express() {
+        for factor in [1u64, 2, 4, 16, 32] {
+            let mut metadata = parakeet_metadata();
+            metadata.insert(
+                PARAKEET_SUBSAMPLING_FACTOR_KEY.to_string(),
+                factor.to_string(),
+            );
+            let error = parse_parakeet_ctc_execution_metadata(&metadata).expect_err(
+                "the shared graph fixes three stride-2 stages; only factor 8 is admissible",
+            );
+            assert!(matches!(
+                error,
+                MetadataContractError::InvalidValue {
+                    key: PARAKEET_SUBSAMPLING_FACTOR_KEY,
+                    ..
+                }
+            ));
         }
+    }
+
+    /// Architecture ceilings fail closed on untrusted metadata, keeping
+    /// contract construction allocation-bounded and overflow-free.
+    #[test]
+    fn rejects_geometry_above_architecture_ceilings() {
+        for (key, value) in [
+            (PARAKEET_N_LAYERS_KEY, PARAKEET_CTC_MAX_N_LAYERS as u64 + 1),
+            (PARAKEET_FFN_DIM_KEY, PARAKEET_CTC_MAX_FFN_DIM as u64 + 1),
+            (
+                PARAKEET_CONV_KERNEL_KEY,
+                PARAKEET_CTC_MAX_CONV_KERNEL as u64 + 1,
+            ),
+            (PARAKEET_N_MELS_KEY, PARAKEET_CTC_MAX_N_MELS as u64 + 1),
+            (
+                PARAKEET_SUBSAMPLING_CHANNELS_KEY,
+                PARAKEET_CTC_MAX_SUBSAMPLING_CHANNELS as u64 + 1,
+            ),
+            (
+                PARAKEET_VOCAB_SIZE_KEY,
+                PARAKEET_CTC_MAX_VOCAB_SIZE as u64 + 1,
+            ),
+        ] {
+            let mut metadata = parakeet_metadata();
+            metadata.insert(key.to_string(), value.to_string());
+            assert!(
+                parse_parakeet_ctc_execution_metadata(&metadata).is_err(),
+                "must reject {key} = {value} above its ceiling"
+            );
+        }
+    }
+
+    /// Boundary: geometry exactly at the ceilings stays admissible.
+    #[test]
+    fn accepts_geometry_at_the_architecture_ceilings() {
+        let mut metadata = parakeet_metadata();
+        metadata.insert(
+            PARAKEET_N_LAYERS_KEY.to_string(),
+            PARAKEET_CTC_MAX_N_LAYERS.to_string(),
+        );
+        metadata.insert(
+            PARAKEET_FFN_DIM_KEY.to_string(),
+            PARAKEET_CTC_MAX_FFN_DIM.to_string(),
+        );
+        assert!(parse_parakeet_ctc_execution_metadata(&metadata).is_ok());
+    }
+
+    /// Overflowing head geometry must fail closed through checked arithmetic
+    /// instead of wrapping into an accidentally satisfying product.
+    #[test]
+    fn rejects_overflowing_head_geometry_without_wrapping() {
+        let mut metadata = parakeet_metadata();
+        metadata.insert(PARAKEET_HEAD_DIM_KEY.to_string(), u64::MAX.to_string());
+        metadata.insert(PARAKEET_N_HEADS_KEY.to_string(), u64::MAX.to_string());
+        // The head_dim ceiling fires first; either way parse fails closed
+        // without panicking or wrapping the product.
+        assert!(parse_parakeet_ctc_execution_metadata(&metadata).is_err());
     }
 
     #[test]

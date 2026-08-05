@@ -6,6 +6,7 @@
 //! zero-bias synthesis and error-type names).
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::models::tensor_binding::TensorReadGuard;
 
 use super::FastConformerWeightsError;
 
@@ -84,10 +85,17 @@ pub(crate) struct FastConformerLayerWeights {
     pub out_norm_bias: NamedTensor,
 }
 
+/// Read one tensor by name, guarded by the family's runtime tensor contract:
+/// a name the contract does not enumerate fails closed, so the descriptor
+/// enumeration stays the authoritative loader read list.
 pub(crate) fn load_named<E: FastConformerWeightsError>(
     reader: &GgufTensorDataReader,
+    guard: &TensorReadGuard,
     name: &str,
 ) -> Result<NamedTensor, E> {
+    if !guard.contains(name) {
+        return Err(E::not_in_contract(name.to_string()));
+    }
     let tensor = reader.tensor_index().get(name).ok_or_else(|| {
         E::from(GgufTensorDataReadError::TensorNotFound {
             path: reader.tensor_index().path().to_path_buf(),
@@ -123,6 +131,7 @@ fn zero_bias(name: String, len: usize) -> NamedTensor {
 /// (parakeet-tdt-0.6b-v3, whose HF conversion has no bias tensors at all).
 pub(crate) fn load_fastconformer_layer<E: FastConformerWeightsError>(
     reader: &GgufTensorDataReader,
+    guard: &TensorReadGuard,
     layer: usize,
     d_model: usize,
     ffn_dim: usize,
@@ -131,49 +140,49 @@ pub(crate) fn load_fastconformer_layer<E: FastConformerWeightsError>(
     let n = |suffix: &str| format!("enc.blk.{layer}.{suffix}");
     let bias = |suffix: &str, len: usize| -> Result<NamedTensor, E> {
         if bias_present {
-            load_named::<E>(reader, &n(suffix))
+            load_named::<E>(reader, guard, &n(suffix))
         } else {
             Ok(zero_bias(n(suffix), len))
         }
     };
     let mut weights = FastConformerLayerWeights {
-        ff1_norm_weight: load_named::<E>(reader, &n("ff1.norm.weight"))?,
-        ff1_norm_bias: load_named::<E>(reader, &n("ff1.norm.bias"))?,
-        ff1_up_weight: load_named::<E>(reader, &n("ff1.up.weight"))?,
+        ff1_norm_weight: load_named::<E>(reader, guard, &n("ff1.norm.weight"))?,
+        ff1_norm_bias: load_named::<E>(reader, guard, &n("ff1.norm.bias"))?,
+        ff1_up_weight: load_named::<E>(reader, guard, &n("ff1.up.weight"))?,
         ff1_up_bias: bias("ff1.up.bias", ffn_dim)?,
-        ff1_down_weight: load_named::<E>(reader, &n("ff1.down.weight"))?,
+        ff1_down_weight: load_named::<E>(reader, guard, &n("ff1.down.weight"))?,
         ff1_down_bias: bias("ff1.down.bias", d_model)?,
-        attn_norm_weight: load_named::<E>(reader, &n("attn.norm.weight"))?,
-        attn_norm_bias: load_named::<E>(reader, &n("attn.norm.bias"))?,
-        attn_q_weight: load_named::<E>(reader, &n("attn.q.weight"))?,
+        attn_norm_weight: load_named::<E>(reader, guard, &n("attn.norm.weight"))?,
+        attn_norm_bias: load_named::<E>(reader, guard, &n("attn.norm.bias"))?,
+        attn_q_weight: load_named::<E>(reader, guard, &n("attn.q.weight"))?,
         attn_q_bias: bias("attn.q.bias", d_model)?,
-        attn_k_weight: load_named::<E>(reader, &n("attn.k.weight"))?,
+        attn_k_weight: load_named::<E>(reader, guard, &n("attn.k.weight"))?,
         attn_k_bias: bias("attn.k.bias", d_model)?,
-        attn_v_weight: load_named::<E>(reader, &n("attn.v.weight"))?,
+        attn_v_weight: load_named::<E>(reader, guard, &n("attn.v.weight"))?,
         attn_v_bias: bias("attn.v.bias", d_model)?,
-        attn_out_weight: load_named::<E>(reader, &n("attn.out.weight"))?,
+        attn_out_weight: load_named::<E>(reader, guard, &n("attn.out.weight"))?,
         attn_out_bias: bias("attn.out.bias", d_model)?,
-        attn_pos_weight: load_named::<E>(reader, &n("attn.pos.weight"))?,
-        attn_pos_bias_u: load_named::<E>(reader, &n("attn.pos_bias_u"))?,
-        attn_pos_bias_v: load_named::<E>(reader, &n("attn.pos_bias_v"))?,
-        conv_norm_weight: load_named::<E>(reader, &n("conv.norm.weight"))?,
-        conv_norm_bias: load_named::<E>(reader, &n("conv.norm.bias"))?,
-        conv_pw1_weight: load_named::<E>(reader, &n("conv.pw1.weight"))?,
-        conv_pw1_bias: bias("conv.pw1.bias", 2 * d_model)?,
-        conv_dw_weight: load_named::<E>(reader, &n("conv.dw.weight"))?,
+        attn_pos_weight: load_named::<E>(reader, guard, &n("attn.pos.weight"))?,
+        attn_pos_bias_u: load_named::<E>(reader, guard, &n("attn.pos_bias_u"))?,
+        attn_pos_bias_v: load_named::<E>(reader, guard, &n("attn.pos_bias_v"))?,
+        conv_norm_weight: load_named::<E>(reader, guard, &n("conv.norm.weight"))?,
+        conv_norm_bias: load_named::<E>(reader, guard, &n("conv.norm.bias"))?,
+        conv_pw1_weight: load_named::<E>(reader, guard, &n("conv.pw1.weight"))?,
+        conv_pw1_bias: bias("conv.pw1.bias", d_model.saturating_mul(2))?,
+        conv_dw_weight: load_named::<E>(reader, guard, &n("conv.dw.weight"))?,
         conv_dw_bias: bias("conv.dw.bias", d_model)?,
-        conv_pw2_weight: load_named::<E>(reader, &n("conv.pw2.weight"))?,
+        conv_pw2_weight: load_named::<E>(reader, guard, &n("conv.pw2.weight"))?,
         conv_pw2_bias: bias("conv.pw2.bias", d_model)?,
-        ff2_norm_weight: load_named::<E>(reader, &n("ff2.norm.weight"))?,
-        ff2_norm_bias: load_named::<E>(reader, &n("ff2.norm.bias"))?,
-        ff2_up_weight: load_named::<E>(reader, &n("ff2.up.weight"))?,
+        ff2_norm_weight: load_named::<E>(reader, guard, &n("ff2.norm.weight"))?,
+        ff2_norm_bias: load_named::<E>(reader, guard, &n("ff2.norm.bias"))?,
+        ff2_up_weight: load_named::<E>(reader, guard, &n("ff2.up.weight"))?,
         ff2_up_bias: bias("ff2.up.bias", ffn_dim)?,
-        ff2_down_weight: load_named::<E>(reader, &n("ff2.down.weight"))?,
+        ff2_down_weight: load_named::<E>(reader, guard, &n("ff2.down.weight"))?,
         ff2_down_bias: bias("ff2.down.bias", d_model)?,
-        out_norm_weight: load_named::<E>(reader, &n("out.norm.weight"))?,
-        out_norm_bias: load_named::<E>(reader, &n("out.norm.bias"))?,
+        out_norm_weight: load_named::<E>(reader, guard, &n("out.norm.weight"))?,
+        out_norm_bias: load_named::<E>(reader, guard, &n("out.norm.bias"))?,
     };
-    fold_batchnorm_into_depthwise::<E>(reader, layer, &mut weights)?;
+    fold_batchnorm_into_depthwise::<E>(reader, guard, layer, &mut weights)?;
     drop_bound_layer_linear_payloads(&mut weights);
     Ok(weights)
 }
@@ -184,14 +193,15 @@ pub(crate) fn load_fastconformer_layer<E: FastConformerWeightsError>(
 /// C-order = `channel*kernel + k`).
 pub(crate) fn fold_batchnorm_into_depthwise<E: FastConformerWeightsError>(
     reader: &GgufTensorDataReader,
+    guard: &TensorReadGuard,
     layer: usize,
     weights: &mut FastConformerLayerWeights,
 ) -> Result<(), E> {
     let n = |suffix: &str| format!("enc.blk.{layer}.{suffix}");
-    let gamma: NamedTensor = load_named::<E>(reader, &n("conv.bn.weight"))?;
-    let beta: NamedTensor = load_named::<E>(reader, &n("conv.bn.bias"))?;
-    let mean: NamedTensor = load_named::<E>(reader, &n("conv.bn.mean"))?;
-    let var: NamedTensor = load_named::<E>(reader, &n("conv.bn.var"))?;
+    let gamma: NamedTensor = load_named::<E>(reader, guard, &n("conv.bn.weight"))?;
+    let beta: NamedTensor = load_named::<E>(reader, guard, &n("conv.bn.bias"))?;
+    let mean: NamedTensor = load_named::<E>(reader, guard, &n("conv.bn.mean"))?;
+    let var: NamedTensor = load_named::<E>(reader, guard, &n("conv.bn.var"))?;
 
     let channels = weights.conv_dw_bias.element_count();
     if gamma.element_count() != channels
@@ -266,18 +276,19 @@ pub(crate) fn drop_bound_subsampling_payloads(subsampling: &mut [NamedTensor]) {
 /// linear weight's f32 host payload (bound zero-copy from the mmap'd pack).
 pub(crate) fn load_fastconformer_subsampling<E: FastConformerWeightsError>(
     reader: &GgufTensorDataReader,
+    guard: &TensorReadGuard,
 ) -> Result<Vec<NamedTensor>, E> {
     let mut subsampling = Vec::new();
     for sub_layer in [0usize, 2, 3, 5, 6] {
         for kind in ["weight", "bias"] {
             let name = format!("enc.sub.layers.{sub_layer}.{kind}");
             if reader.tensor_index().get(&name).is_some() {
-                subsampling.push(load_named::<E>(reader, &name)?);
+                subsampling.push(load_named::<E>(reader, guard, &name)?);
             }
         }
     }
-    subsampling.push(load_named::<E>(reader, "enc.sub.linear.weight")?);
-    subsampling.push(load_named::<E>(reader, "enc.sub.linear.bias")?);
+    subsampling.push(load_named::<E>(reader, guard, "enc.sub.linear.weight")?);
+    subsampling.push(load_named::<E>(reader, guard, "enc.sub.linear.bias")?);
     drop_bound_subsampling_payloads(&mut subsampling);
     Ok(subsampling)
 }
@@ -292,11 +303,16 @@ mod tests {
         Read(#[from] GgufTensorDataReadError),
         #[error("batchnorm fold: {0}")]
         BatchNormFold(String),
+        #[error("not in contract: {0}")]
+        NotInContract(String),
     }
 
     impl FastConformerWeightsError for TestError {
         fn batchnorm_fold(reason: String) -> Self {
             Self::BatchNormFold(reason)
+        }
+        fn not_in_contract(name: String) -> Self {
+            Self::NotInContract(name)
         }
     }
 
@@ -339,10 +355,13 @@ mod tests {
     // correctness against a real pack -- stays in each family's own test
     // module, which already asserts on real tensor values).
     #[allow(dead_code)]
-    fn _generic_signatures_compile(reader: &GgufTensorDataReader) {
-        let _: Result<NamedTensor, TestError> = load_named(reader, "x");
-        let _: Result<Vec<NamedTensor>, TestError> = load_fastconformer_subsampling(reader);
+    fn _generic_signatures_compile(
+        reader: &GgufTensorDataReader,
+        guard: &crate::models::tensor_binding::TensorReadGuard,
+    ) {
+        let _: Result<NamedTensor, TestError> = load_named(reader, guard, "x");
+        let _: Result<Vec<NamedTensor>, TestError> = load_fastconformer_subsampling(reader, guard);
         let _: Result<FastConformerLayerWeights, TestError> =
-            load_fastconformer_layer(reader, 0, 1024, 4096, true);
+            load_fastconformer_layer(reader, guard, 0, 1024, 4096, true);
     }
 }
