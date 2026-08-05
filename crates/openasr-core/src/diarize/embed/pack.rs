@@ -11,6 +11,13 @@ use std::path::PathBuf;
 
 const REDIMNET_PACK_ENV: &str = "OPENASR_REDIMNET_PACK";
 const REDIMNET_INSTALLED_MODEL_ID_HINT: &str = "redimnet2-b6-cn";
+const REDIMNET_PREFERRED_QUANT: &str = "fp16";
+pub(crate) const REDIMNET_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
+    crate::capability_pack::CapabilityPackPreference::new(
+        SPEAKER_EMBEDDER_PACK_ID,
+        REDIMNET_INSTALLED_MODEL_ID_HINT,
+        REDIMNET_PREFERRED_QUANT,
+    );
 
 /// Catalog / pull id of the only supported speaker-embedder pack.
 pub const SPEAKER_EMBEDDER_PACK_ID: &str = "redimnet2-b6-cn";
@@ -57,7 +64,7 @@ pub struct SpeakerEmbedderIdentity {
 }
 
 pub(crate) fn redimnet_pack_path() -> Option<PathBuf> {
-    crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_INSTALLED_MODEL_ID_HINT)
+    crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_PACK_PREFERENCE)
 }
 
 /// Whether the ReDimNet2-B6 embedder pack is resolvable right now (env override

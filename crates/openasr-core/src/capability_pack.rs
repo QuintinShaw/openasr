@@ -27,23 +27,50 @@
 
 use std::path::{Path, PathBuf};
 
-/// Resolve a capability-pack path.
+/// Catalog-owned preference for one optional capability pack.
 ///
-/// In priority order: the `env_var` override (if it points at a file), the
-/// content-addressed object of an installed pack whose model id matches
-/// `model_id_hint`, then the legacy per-quant directory layout.
-pub(crate) fn resolve_installed_capability_pack(
-    env_var: &str,
-    model_id_hint: &str,
-) -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var(env_var) {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
+/// `model_id_hint` preserves discovery of an older compatible family revision,
+/// while `model_id` and `preferred_quant` make the current production choice
+/// deterministic when several revisions or quantizations remain installed.
+/// Explicit environment overrides still win because they are an intentional
+/// operator choice and are verified by the capability's runtime ingress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapabilityPackPreference {
+    pub(crate) model_id: &'static str,
+    pub(crate) model_id_hint: &'static str,
+    pub(crate) preferred_quant: &'static str,
+}
+
+impl CapabilityPackPreference {
+    pub(crate) const fn new(
+        model_id: &'static str,
+        model_id_hint: &'static str,
+        preferred_quant: &'static str,
+    ) -> Self {
+        Self {
+            model_id,
+            model_id_hint,
+            preferred_quant,
         }
     }
+}
+
+/// Resolve a capability-pack path.
+///
+/// In priority order: a non-empty `env_var` override, the content-addressed
+/// object selected by `preference`, then the legacy per-quant directory layout.
+/// The explicit path is returned even when it is missing or not a regular file
+/// so the capability's verified runtime ingress fails closed instead of
+/// silently substituting a different installed pack.
+pub(crate) fn resolve_installed_capability_pack(
+    env_var: &str,
+    preference: CapabilityPackPreference,
+) -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(explicit));
+    }
     let home = crate::openasr_home().ok()?;
-    resolve_installed_capability_pack_in(&home, model_id_hint)
+    resolve_installed_capability_pack_in(&home, preference)
 }
 
 /// The layout half of [`resolve_installed_capability_pack`], against an explicit
@@ -53,13 +80,13 @@ pub(crate) fn resolve_installed_capability_pack(
 /// directories second (what an unconverted home still has).
 pub(crate) fn resolve_installed_capability_pack_in(
     home: &Path,
-    model_id_hint: &str,
+    preference: CapabilityPackPreference,
 ) -> Option<PathBuf> {
-    if let Some(path) = installed_capability_pack(home, model_id_hint) {
+    if let Some(path) = installed_capability_pack(home, preference) {
         return Some(path);
     }
     let config = crate::config::load_config(home).unwrap_or_default();
-    find_pack(&crate::config::models_dir(home, &config), model_id_hint)
+    find_pack(&crate::config::models_dir(home, &config), preference)
 }
 
 /// The object of an installed pack whose model id matches `model_id_hint`.
@@ -71,21 +98,39 @@ pub(crate) fn resolve_installed_capability_pack_in(
 /// present, size matching, no symlink in the path) instead of being "some pack
 /// file found inside some directory whose name looked right".
 ///
-/// It stays a substring rather than an exact id because capability-pack ids carry
-/// their model revision -- `redimnet2-b6-cn`, `qwen3-forced-aligner-0.6b` -- so
-/// pinning exact ids here would need a code change for every repack, which is
-/// what the catalog's own "callers should not hardcode its id" guidance warns
-/// against. Ties are broken deterministically by (model id, quant).
-fn installed_capability_pack(home: &Path, model_id_hint: &str) -> Option<PathBuf> {
+/// The family hint remains a substring so an older compatible revision can be
+/// used when the current catalog model is absent. Within those matches, the
+/// current model id wins, then its catalog-recommended quant, then stable
+/// `(model id, quant)` order. This prevents stale FP16/Q8 refs from silently
+/// beating a production Q4 pack merely because their quant tag sorts first.
+fn installed_capability_pack(home: &Path, preference: CapabilityPackPreference) -> Option<PathBuf> {
     let store = crate::InstalledModelStore::read(home).ok()?;
     let mut matches: Vec<&crate::InstalledPack> = store
         .packs()
         .iter()
-        .filter(|pack| pack.model_id.to_ascii_lowercase().contains(model_id_hint))
+        .filter(|pack| {
+            pack.model_id
+                .to_ascii_lowercase()
+                .contains(preference.model_id_hint)
+        })
         .collect();
-    matches
-        .sort_by(|left, right| (&left.model_id, &left.quant).cmp(&(&right.model_id, &right.quant)));
+    matches.sort_by(|left, right| {
+        capability_pack_rank(left, preference).cmp(&capability_pack_rank(right, preference))
+    });
     matches.first().map(|pack| pack.path.clone())
+}
+
+fn capability_pack_rank(
+    pack: &crate::InstalledPack,
+    preference: CapabilityPackPreference,
+) -> (bool, bool, &str, &str) {
+    (
+        pack.model_id != preference.model_id,
+        crate::canonical_quant_tag(&pack.quant)
+            != crate::canonical_quant_tag(preference.preferred_quant),
+        pack.model_id.as_str(),
+        pack.quant.as_str(),
+    )
 }
 
 /// Test-only format discriminator retained for converter parity fixtures.
@@ -112,7 +157,7 @@ pub(crate) fn is_gguf_capability_pack(path: &Path) -> bool {
 /// that; `openasr serve` and an embedding host do not. Deleting this before
 /// that gap closes would silently reintroduce the exact Voice-ID-goes-quiet
 /// failure mode this module's header doc describes, for those callers.
-fn find_pack(root: &Path, dir_substr: &str) -> Option<PathBuf> {
+fn find_pack(root: &Path, preference: CapabilityPackPreference) -> Option<PathBuf> {
     let mut model_dirs: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
         .flatten()
@@ -122,17 +167,51 @@ fn find_pack(root: &Path, dir_substr: &str) -> Option<PathBuf> {
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.to_ascii_lowercase().contains(dir_substr))
+                    .map(|name| name.to_ascii_lowercase().contains(preference.model_id_hint))
                     .unwrap_or(false)
         })
         .collect();
-    model_dirs.sort();
-    model_dirs.iter().find_map(|dir| first_pack_file(dir))
+    model_dirs.sort_by_key(|path| {
+        (
+            path.file_name().and_then(|name| name.to_str()) != Some(preference.model_id),
+            path.clone(),
+        )
+    });
+    model_dirs
+        .iter()
+        .find_map(|dir| preferred_pack_file(dir, preference.preferred_quant))
+}
+
+/// Resolve the preferred quant below a legacy model directory before any
+/// unqualified/direct or alternate-quant development copy.
+fn preferred_pack_file(dir: &Path, preferred_quant: &str) -> Option<PathBuf> {
+    let mut subdirs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    subdirs.sort_by_key(|path| {
+        (
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| {
+                    crate::canonical_quant_tag(name) != crate::canonical_quant_tag(preferred_quant)
+                }),
+            path.clone(),
+        )
+    });
+
+    if let Some(path) = subdirs.iter().find_map(|sub| best_pack_in_dir(sub)) {
+        return Some(path);
+    }
+    best_pack_in_dir(dir)
 }
 
 /// Find a pack file directly in `dir` or one quant subdirectory, preferring the
 /// `.oasr` catalog/pull format over a raw `.safetensors` (the dev fast path) when
 /// both are present -- so a pulled pack wins over a leftover dev safetensors.
+#[cfg(test)]
 fn first_pack_file(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = best_pack_in_dir(dir) {
         return Some(path);
@@ -180,7 +259,7 @@ fn best_pack_in_dir(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_pack_in_dir, first_pack_file, is_gguf_capability_pack,
+        CapabilityPackPreference, best_pack_in_dir, first_pack_file, is_gguf_capability_pack,
         resolve_installed_capability_pack, resolve_installed_capability_pack_in,
     };
     use crate::InstalledPack;
@@ -234,15 +313,17 @@ mod tests {
         path
     }
 
-    /// Every capability pack that ships today, with the hint its feature passes.
+    /// Every capability pack supported by this resolver, including staged packs,
+    /// with the hint its feature passes.
     /// A new capability pack must be added here: the whole class regressed at
     /// once when discovery only understood the legacy layout, so the coverage
     /// has to be per-feature rather than "redimnet works".
-    const SHIPPED_CAPABILITY_PACKS: &[(&str, &str)] = &[
-        ("redimnet", "redimnet2-b6-cn"),
-        ("pyannote", "pyannote-segmentation-3.0"),
-        ("forced-aligner", "qwen3-forced-aligner-0.6b"),
-        ("firered-punc", "firered-punc"),
+    const SUPPORTED_CAPABILITY_PACKS: &[CapabilityPackPreference] = &[
+        crate::diarize::embed::REDIMNET_PACK_PREFERENCE,
+        crate::diarize::segment::PYANNOTE_PACK_PREFERENCE,
+        crate::diarize::segment::DIARIZEN_PACK_PREFERENCE,
+        crate::models::qwen::forced_aligner_pack::FORCED_ALIGNER_PACK_PREFERENCE,
+        crate::models::firered_punc::pack::FIRERED_PUNC_PACK_PREFERENCE,
     ];
 
     #[test]
@@ -250,19 +331,30 @@ mod tests {
         // The regression: a content-addressed install produces no
         // `models/<name>/` directory at all, so a directory-name scan found
         // nothing and the feature silently turned itself off.
-        for (hint, model_id) in SHIPPED_CAPABILITY_PACKS {
+        for preference in SUPPORTED_CAPABILITY_PACKS {
             let home = tempfile::tempdir().unwrap();
-            let bytes = format!("GGUF{model_id}").into_bytes();
-            let object = install_content_addressed(home.path(), model_id, "fp16", &bytes);
+            let bytes = format!("GGUF{}", preference.model_id).into_bytes();
+            let object = install_content_addressed(
+                home.path(),
+                preference.model_id,
+                preference.preferred_quant,
+                &bytes,
+            );
 
             assert!(
-                !home.path().join("models").join(model_id).exists(),
+                !home
+                    .path()
+                    .join("models")
+                    .join(preference.model_id)
+                    .exists(),
                 "a content-addressed install must not create a per-model directory"
             );
             assert_eq!(
-                resolve_installed_capability_pack_in(home.path(), hint).as_deref(),
+                resolve_installed_capability_pack_in(home.path(), *preference).as_deref(),
                 Some(object.as_path()),
-                "capability pack '{model_id}' (hint '{hint}') must resolve"
+                "capability pack '{}' (hint '{}') must resolve",
+                preference.model_id,
+                preference.model_id_hint,
             );
         }
     }
@@ -272,15 +364,157 @@ mod tests {
         // Discovery must not die before `migrate_legacy_model_store` has run:
         // a server or embedding host can resolve capability packs without ever
         // having gone through CLI startup.
-        for (hint, model_id) in SHIPPED_CAPABILITY_PACKS {
+        for preference in SUPPORTED_CAPABILITY_PACKS {
             let home = tempfile::tempdir().unwrap();
-            let legacy = install_legacy(home.path(), model_id, "fp16", b"GGUFlegacy");
+            let legacy = install_legacy(
+                home.path(),
+                preference.model_id,
+                preference.preferred_quant,
+                b"GGUFlegacy",
+            );
             assert_eq!(
-                resolve_installed_capability_pack_in(home.path(), hint).as_deref(),
+                resolve_installed_capability_pack_in(home.path(), *preference).as_deref(),
                 Some(legacy.as_path()),
-                "legacy capability pack '{model_id}' must stay discoverable"
+                "legacy capability pack '{}' must stay discoverable",
+                preference.model_id,
             );
         }
+    }
+
+    #[test]
+    fn supported_preferences_match_the_catalog_authoring_source() {
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tooling/publish-model/models-core.toml");
+        let manifest: toml::Value =
+            toml::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+
+        for preference in SUPPORTED_CAPABILITY_PACKS {
+            let entry = manifest
+                .get(preference.model_id)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("missing capability pack '{}'", preference.model_id));
+            assert_eq!(
+                entry.get("recommended_quant").and_then(toml::Value::as_str),
+                Some(preference.preferred_quant),
+                "runtime preference for '{}' drifted from models-core.toml",
+                preference.model_id,
+            );
+            assert!(
+                entry
+                    .get("quants")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|quants| {
+                        quants.iter().any(|quant| {
+                            quant.as_str().is_some_and(|quant| {
+                                crate::canonical_quant_tag(quant)
+                                    == crate::canonical_quant_tag(preference.preferred_quant)
+                            })
+                        })
+                    }),
+                "preferred quant '{}' is not shipped for '{}'",
+                preference.preferred_quant,
+                preference.model_id,
+            );
+        }
+    }
+
+    #[test]
+    fn content_store_prefers_the_catalog_model_and_quant() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_fp16 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.6b",
+            "fp16",
+            b"GGUFstale-fp16",
+        );
+        let production_q4 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.6b",
+            "q4_k",
+            b"GGUFproduction-q4",
+        );
+        let older_family_q4 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.5b",
+            "q4_k",
+            b"GGUFolder-family-q4",
+        );
+        let preference =
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+
+        let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
+        assert_eq!(resolved, production_q4);
+        assert_ne!(resolved, stale_fp16);
+        assert_ne!(resolved, older_family_q4);
+    }
+
+    #[test]
+    fn content_store_canonicalizes_the_pull_suffix_quant() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_fp16 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.6b",
+            "fp16",
+            b"GGUFstale-fp16",
+        );
+        let production_q4 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.6b",
+            "q4",
+            b"GGUFproduction-q4-suffix",
+        );
+        let preference =
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+
+        let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
+        assert_eq!(resolved, production_q4);
+        assert_ne!(resolved, stale_fp16);
+    }
+
+    #[test]
+    fn compatible_older_revision_still_prefers_the_catalog_quant() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_fp16 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.5b",
+            "fp16",
+            b"GGUFolder-stale-fp16",
+        );
+        let compatible_q4 = install_content_addressed(
+            home.path(),
+            "qwen3-forced-aligner-0.5b",
+            "q4_k",
+            b"GGUFolder-compatible-q4",
+        );
+        let preference =
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+
+        let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
+        assert_eq!(resolved, compatible_q4);
+        assert_ne!(resolved, stale_fp16);
+    }
+
+    #[test]
+    fn legacy_store_prefers_the_catalog_quant() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_fp16 = install_legacy(
+            home.path(),
+            "qwen3-forced-aligner-0.6b",
+            "fp16",
+            b"GGUFstale-fp16",
+        );
+        let production_q4 = install_legacy(
+            home.path(),
+            "qwen3-forced-aligner-0.6b",
+            "q4_k",
+            b"GGUFproduction-q4",
+        );
+        let preference =
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+
+        let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
+        assert_eq!(resolved, production_q4);
+        assert_ne!(resolved, stale_fp16);
     }
 
     #[test]
@@ -294,7 +528,8 @@ mod tests {
         );
         let legacy = install_legacy(home.path(), "redimnet2-b6-cn", "fp16", b"GGUFstale-legacy");
 
-        let resolved = resolve_installed_capability_pack_in(home.path(), "redimnet").unwrap();
+        let preference = CapabilityPackPreference::new("redimnet2-b6-cn", "redimnet", "fp16");
+        let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
         assert_eq!(resolved, object);
         assert_ne!(resolved, legacy);
         assert_eq!(fs::read(&resolved).unwrap(), b"GGUFcontent-addressed");
@@ -313,7 +548,11 @@ mod tests {
             install_content_addressed(elsewhere.path(), "redimnet2-b6-cn", "fp16", b"GGUFx");
 
         assert_eq!(
-            resolve_installed_capability_pack_in(home.path(), "redimnet").as_deref(),
+            resolve_installed_capability_pack_in(
+                home.path(),
+                CapabilityPackPreference::new("redimnet2-b6-cn", "redimnet", "fp16"),
+            )
+            .as_deref(),
             Some(object.as_path())
         );
     }
@@ -323,7 +562,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         install_content_addressed(home.path(), "whisper-small", "q8_0", b"GGUFasr");
         assert_eq!(
-            resolve_installed_capability_pack_in(home.path(), "redimnet"),
+            resolve_installed_capability_pack_in(
+                home.path(),
+                CapabilityPackPreference::new("redimnet2-b6-cn", "redimnet", "fp16"),
+            ),
             None,
             "an unrelated installed ASR model must not satisfy a capability probe"
         );
@@ -331,10 +573,8 @@ mod tests {
 
     /// Direct A/B of the two resolution strategies against one real-layout home.
     ///
-    /// `find_pack` is the unchanged pre-fix implementation (it survives as the
-    /// legacy fallback), so running both over the same fixture is a faithful
-    /// before/after rather than a reconstruction. Printed with `--nocapture` as
-    /// the evidence that a content-addressed install was invisible.
+    /// `find_pack` is the legacy-layout-only strategy, so running both over the
+    /// same fixture demonstrates why a content-addressed install was invisible.
     #[test]
     fn before_after_content_addressed_capability_pack_discovery() {
         let home = tempfile::tempdir().unwrap();
@@ -342,8 +582,9 @@ mod tests {
             install_content_addressed(home.path(), "redimnet2-b6-cn", "fp16", b"GGUFredimnet");
         let models = home.path().join("models");
 
-        let legacy_only = super::find_pack(&models, "redimnet");
-        let fixed = resolve_installed_capability_pack_in(home.path(), "redimnet");
+        let preference = CapabilityPackPreference::new("redimnet2-b6-cn", "redimnet", "fp16");
+        let legacy_only = super::find_pack(&models, preference);
+        let fixed = resolve_installed_capability_pack_in(home.path(), preference);
 
         println!("layout on disk:");
         println!(
@@ -392,10 +633,35 @@ mod tests {
 
         let resolved = crate::test_process_env::with_test_process_env(
             [(ENV, Some(explicit.clone().into_os_string()))],
-            || resolve_installed_capability_pack(ENV, "redimnet"),
+            || {
+                resolve_installed_capability_pack(
+                    ENV,
+                    CapabilityPackPreference::new("redimnet2-b6-cn", "redimnet", "fp16"),
+                )
+            },
         );
 
         assert_eq!(resolved.as_deref(), Some(explicit.as_path()));
+    }
+
+    #[test]
+    fn invalid_explicit_override_does_not_silently_fall_back() {
+        const ENV: &str = "OPENASR_TEST_INVALID_CAPABILITY_PACK_OVERRIDE";
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.oasr");
+
+        let resolved = crate::test_process_env::with_test_process_env(
+            [(ENV, Some(missing.clone().into_os_string()))],
+            || {
+                resolve_installed_capability_pack(
+                    ENV,
+                    CapabilityPackPreference::new("redimnet2-b6-cn", "redimnet", "fp16"),
+                )
+            },
+        );
+
+        assert_eq!(resolved.as_deref(), Some(missing.as_path()));
+        assert!(!missing.exists(), "fixture must exercise a broken override");
     }
 
     #[test]

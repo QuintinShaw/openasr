@@ -9,10 +9,14 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Resolve a pack path: the `env_var` override (if it points at a file), else the
-/// installed pack whose model id contains `model_id_hint`.
-pub(super) fn resolve_pack(env_var: &str, model_id_hint: &str) -> Option<PathBuf> {
-    crate::capability_pack::resolve_installed_capability_pack(env_var, model_id_hint)
+/// Resolve a pack path: a non-empty explicit override first, otherwise the
+/// catalog-preferred installed pack. A broken override is deliberately returned
+/// to the verified runtime ingress so it fails closed instead of falling back.
+pub(super) fn resolve_pack(
+    env_var: &str,
+    preference: crate::capability_pack::CapabilityPackPreference,
+) -> Option<PathBuf> {
+    crate::capability_pack::resolve_installed_capability_pack(env_var, preference)
 }
 
 /// Test-only format discriminator for raw-source versus converted-pack parity.

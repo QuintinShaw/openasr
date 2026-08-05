@@ -10,6 +10,14 @@ use std::path::PathBuf;
 
 const FIRERED_PUNC_PACK_ENV: &str = "OPENASR_FIRERED_PUNC_PACK";
 const FIRERED_PUNC_INSTALLED_MODEL_ID_HINT: &str = "firered-punc";
+const FIRERED_PUNC_MODEL_ID: &str = "firered-punc";
+const FIRERED_PUNC_PREFERRED_QUANT: &str = "fp16";
+pub(crate) const FIRERED_PUNC_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
+    crate::capability_pack::CapabilityPackPreference::new(
+        FIRERED_PUNC_MODEL_ID,
+        FIRERED_PUNC_INSTALLED_MODEL_ID_HINT,
+        FIRERED_PUNC_PREFERRED_QUANT,
+    );
 
 /// The resolved path to the installed FireRedPunc pack, or `None` if no pack
 /// is installed. Callers must treat `None` as "punctuation stays off" -- this
@@ -17,6 +25,6 @@ const FIRERED_PUNC_INSTALLED_MODEL_ID_HINT: &str = "firered-punc";
 pub(crate) fn resolve_firered_punc_pack_path() -> Option<PathBuf> {
     crate::capability_pack::resolve_installed_capability_pack(
         FIRERED_PUNC_PACK_ENV,
-        FIRERED_PUNC_INSTALLED_MODEL_ID_HINT,
+        FIRERED_PUNC_PACK_PREFERENCE,
     )
 }

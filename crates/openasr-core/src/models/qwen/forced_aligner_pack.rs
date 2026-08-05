@@ -10,12 +10,20 @@ use std::path::PathBuf;
 
 const FORCED_ALIGNER_PACK_ENV: &str = "OPENASR_FORCED_ALIGNER_PACK";
 const FORCED_ALIGNER_INSTALLED_MODEL_ID_HINT: &str = "forced-aligner";
+const FORCED_ALIGNER_MODEL_ID: &str = "qwen3-forced-aligner-0.6b";
+const FORCED_ALIGNER_PREFERRED_QUANT: &str = "q4_k";
+pub(crate) const FORCED_ALIGNER_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
+    crate::capability_pack::CapabilityPackPreference::new(
+        FORCED_ALIGNER_MODEL_ID,
+        FORCED_ALIGNER_INSTALLED_MODEL_ID_HINT,
+        FORCED_ALIGNER_PREFERRED_QUANT,
+    );
 
 /// The resolved path to the installed Qwen3-ForcedAligner pack, or `None` if
 /// no pack is installed.
 pub(crate) fn resolve_forced_aligner_pack_path() -> Option<PathBuf> {
     crate::capability_pack::resolve_installed_capability_pack(
         FORCED_ALIGNER_PACK_ENV,
-        FORCED_ALIGNER_INSTALLED_MODEL_ID_HINT,
+        FORCED_ALIGNER_PACK_PREFERENCE,
     )
 }

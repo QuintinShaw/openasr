@@ -16,8 +16,15 @@ use super::{PyannoteSegmenter, SegmentError};
 
 const PYANNOTE_PACK_ENV: &str = "OPENASR_PYANNOTE_PACK";
 const PYANNOTE_MODEL_ID_HINT: &str = "pyannote-segmentation-3.0";
+const PYANNOTE_PREFERRED_QUANT: &str = "f32";
 pub const SEGMENTER_PACK_ID: &str = PYANNOTE_MODEL_ID_HINT;
 pub const DIARIZEN_PACK_ID: &str = super::diarizen::DIARIZEN_MODEL_ID;
+pub(crate) const PYANNOTE_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
+    crate::capability_pack::CapabilityPackPreference::new(
+        SEGMENTER_PACK_ID,
+        PYANNOTE_MODEL_ID_HINT,
+        PYANNOTE_PREFERRED_QUANT,
+    );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SegmenterProvider {
@@ -52,7 +59,7 @@ impl PreparedSegmenterSource {
 }
 
 pub(crate) fn pyannote_pack_path() -> Option<PathBuf> {
-    crate::diarize::pack::resolve_pack(PYANNOTE_PACK_ENV, PYANNOTE_MODEL_ID_HINT)
+    crate::diarize::pack::resolve_pack(PYANNOTE_PACK_ENV, PYANNOTE_PACK_PREFERENCE)
 }
 
 pub fn segmenter_pack_installed() -> bool {

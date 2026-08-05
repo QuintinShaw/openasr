@@ -7,9 +7,16 @@ use std::path::PathBuf;
 
 const PACK_ENV: &str = "OPENASR_DIARIZEN_PACK";
 const INSTALLED_MODEL_ID_HINT: &str = super::DIARIZEN_MODEL_ID;
+const PREFERRED_QUANT: &str = "fp16";
+pub(crate) const DIARIZEN_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
+    crate::capability_pack::CapabilityPackPreference::new(
+        super::DIARIZEN_MODEL_ID,
+        INSTALLED_MODEL_ID_HINT,
+        PREFERRED_QUANT,
+    );
 
 pub(crate) fn diarizen_pack_path() -> Option<PathBuf> {
-    crate::diarize::pack::resolve_pack(PACK_ENV, INSTALLED_MODEL_ID_HINT)
+    crate::diarize::pack::resolve_pack(PACK_ENV, DIARIZEN_PACK_PREFERENCE)
 }
 
 pub fn diarizen_pack_installed() -> bool {

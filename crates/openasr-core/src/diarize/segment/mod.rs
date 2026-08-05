@@ -18,11 +18,15 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 
+#[cfg(test)]
+pub(crate) use diarizen::DIARIZEN_PACK_PREFERENCE;
 pub(crate) use diarizen::DiariZenRuntime;
 pub use diarizen::{
     DIARIZEN_GGML_ARCHITECTURE_ID, DiariZenSegmenter, DiariZenSegmenterError, DiariZenWindowOutput,
     diarizen_pack_installed,
 };
+#[cfg(test)]
+pub(crate) use pack::PYANNOTE_PACK_PREFERENCE;
 pub use pack::{DIARIZEN_PACK_ID, SEGMENTER_PACK_ID, segmenter_pack_installed};
 pub(crate) use pack::{PreparedSelectedSegmenter, SegmenterProvider, prepare_segmenter};
 pub use policy_runtime::{PolicyResolvedPyannoteSegmenterRuntime, PolicyResolvedSegmenterRuntime};

@@ -11,9 +11,9 @@
 //! two simultaneous transcripts, so a word inside an overlap is linearized
 //! from the nearest clean speaker context on both sides: a transition switches
 //! at the overlap midpoint, while the same clean speaker on both sides keeps
-//! ownership throughout. Without word anchors the text
-//! cannot be split faithfully, so the segment keeps the dominant-overlap
-//! speaker attribution fails closed. The native pipeline first requests the
+//! ownership throughout. Without word anchors the text cannot be split
+//! faithfully, so multi-speaker attribution fails closed instead of keeping a
+//! single dominant-overlap speaker. The native pipeline first requests the
 //! family's own word anchors and automatically invokes the shared forced
 //! aligner when a coarse ASR segment still crosses speaker turns.
 

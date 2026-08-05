@@ -24,6 +24,8 @@ use crate::models::{
 
 pub use config::ARCHITECTURE_ID as DIARIZEN_GGML_ARCHITECTURE_ID;
 pub const DIARIZEN_MODEL_ID: &str = config::MODEL_ID;
+#[cfg(test)]
+pub(crate) use pack::DIARIZEN_PACK_PREFERENCE;
 pub use pack::diarizen_pack_installed;
 pub(crate) use pack::diarizen_pack_path;
 
