@@ -460,16 +460,18 @@ pub(crate) fn validate_runtime_pack_contract(
     // other `n_mels` can never run, so fail closed at admission rather than
     // mid-graph.
     if mel_metadata.n_mels != MIMO_AUDIOTOK_N_MELS {
-        return Err(crate::models::runtime_pack_contract::metadata_validation_error(
-            "mimo-asr",
-            MimoMetadataError::InvalidValue {
-                key: "mimo.mel.n_mels",
-                reason: format!(
-                    "n_mels {} is unsupported: the audio-tokenizer conv1 input is fixed at {MIMO_AUDIOTOK_N_MELS} mel bands",
-                    mel_metadata.n_mels
-                ),
-            },
-        ));
+        return Err(
+            crate::models::runtime_pack_contract::metadata_validation_error(
+                "mimo-asr",
+                MimoMetadataError::InvalidValue {
+                    key: "mimo.mel.n_mels",
+                    reason: format!(
+                        "n_mels {} is unsupported: the audio-tokenizer conv1 input is fixed at {MIMO_AUDIOTOK_N_MELS} mel bands",
+                        mel_metadata.n_mels
+                    ),
+                },
+            ),
+        );
     }
     let special_tokens = parse_mimo_special_tokens(metadata).map_err(|error| {
         crate::models::runtime_pack_contract::metadata_validation_error("mimo-asr", error)
@@ -944,16 +946,41 @@ pub(crate) fn validate_mimo_asr_runtime_tensors_with_index(
 }
 
 #[cfg(any(test, feature = "testing"))]
-fn tiny_metadata_values() -> std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue> {
+fn tiny_metadata_values()
+-> std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue> {
     let mut values = std::collections::BTreeMap::new();
-    let u = |values: &mut std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue>, k: &str, v: u32| {
-        values.insert(k.to_string(), crate::ggml_runtime::GgufMetadataValue::U32(v));
+    let u = |values: &mut std::collections::BTreeMap<
+        String,
+        crate::ggml_runtime::GgufMetadataValue,
+    >,
+             k: &str,
+             v: u32| {
+        values.insert(
+            k.to_string(),
+            crate::ggml_runtime::GgufMetadataValue::U32(v),
+        );
     };
-    let f = |values: &mut std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue>, k: &str, v: f32| {
-        values.insert(k.to_string(), crate::ggml_runtime::GgufMetadataValue::F32(v));
+    let f = |values: &mut std::collections::BTreeMap<
+        String,
+        crate::ggml_runtime::GgufMetadataValue,
+    >,
+             k: &str,
+             v: f32| {
+        values.insert(
+            k.to_string(),
+            crate::ggml_runtime::GgufMetadataValue::F32(v),
+        );
     };
-    let b = |values: &mut std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue>, k: &str, v: bool| {
-        values.insert(k.to_string(), crate::ggml_runtime::GgufMetadataValue::Bool(v));
+    let b = |values: &mut std::collections::BTreeMap<
+        String,
+        crate::ggml_runtime::GgufMetadataValue,
+    >,
+             k: &str,
+             v: bool| {
+        values.insert(
+            k.to_string(),
+            crate::ggml_runtime::GgufMetadataValue::Bool(v),
+        );
     };
     u(&mut values, "mimo.llm.block_count", 1);
     u(&mut values, "mimo.llm.embedding_length", 16);
@@ -1114,10 +1141,18 @@ pub(crate) fn mimo_asr_oasr_v1_runtime_ready() -> crate::testing::TinyGgufFixtur
         .with_string_array_metadata("tokenizer.ggml.merges", ["f i", "fix t", "fixt u"]);
     for (key, value) in tiny_metadata_values() {
         spec = match value {
-            crate::ggml_runtime::GgufMetadataValue::U32(value) => spec.with_u32_metadata(key, value),
-            crate::ggml_runtime::GgufMetadataValue::F32(value) => spec.with_f32_metadata(key, value),
-            crate::ggml_runtime::GgufMetadataValue::Bool(value) => spec.with_bool_metadata(key, value),
-            crate::ggml_runtime::GgufMetadataValue::U32Array(values) => spec.with_u32_array_metadata(key, values),
+            crate::ggml_runtime::GgufMetadataValue::U32(value) => {
+                spec.with_u32_metadata(key, value)
+            }
+            crate::ggml_runtime::GgufMetadataValue::F32(value) => {
+                spec.with_f32_metadata(key, value)
+            }
+            crate::ggml_runtime::GgufMetadataValue::Bool(value) => {
+                spec.with_bool_metadata(key, value)
+            }
+            crate::ggml_runtime::GgufMetadataValue::U32Array(values) => {
+                spec.with_u32_array_metadata(key, values)
+            }
             other => panic!("unexpected tiny metadata value for {key}: {other:?}"),
         };
     }
@@ -1384,11 +1419,9 @@ mod tests {
         parse_mimo_mel_metadata(&tiny_metadata()).expect("tiny mel metadata")
     }
 
-
     fn tiny_metadata() -> GgufMetadata {
         GgufMetadata::from_values_for_test(tiny_metadata_values())
     }
-
 
     fn tensor_index_from(names_and_dims: &[(String, Vec<u64>)]) -> crate::GgufTensorIndex {
         let snapshot = crate::ggml_runtime::GgufTensorIndexSnapshot {
@@ -1487,7 +1520,6 @@ mod tests {
     }
 
     // --- End-to-end: a tiny external-shaped pack through PackVerifier ----
-
 
     fn write_tiny_pack(spec: &crate::testing::TinyGgufFixtureSpec) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

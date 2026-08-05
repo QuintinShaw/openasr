@@ -89,9 +89,7 @@ fn main() -> Result<()> {
                 export_inventory(&workspace_root, output.as_deref(), check)
             }
         },
-        CommandGroup::VerifyInstalledPacks { home } => {
-            verify_installed_packs(home.as_deref())
-        }
+        CommandGroup::VerifyInstalledPacks { home } => verify_installed_packs(home.as_deref()),
     }
 }
 
@@ -133,16 +131,16 @@ fn verify_installed_packs(home_override: Option<&Path>) -> Result<()> {
         return Ok(());
     }
     let mut ref_files = Vec::new();
-    for model_entry in fs::read_dir(&refs_dir)
-        .with_context(|| format!("reading {}", refs_dir.display()))?
+    for model_entry in
+        fs::read_dir(&refs_dir).with_context(|| format!("reading {}", refs_dir.display()))?
     {
         let model_entry = model_entry?;
         let model_dir = model_entry.path();
         if !model_dir.is_dir() {
             continue;
         }
-        for ref_entry in fs::read_dir(&model_dir)
-            .with_context(|| format!("reading {}", model_dir.display()))?
+        for ref_entry in
+            fs::read_dir(&model_dir).with_context(|| format!("reading {}", model_dir.display()))?
         {
             let ref_entry = ref_entry?;
             let path = ref_entry.path();

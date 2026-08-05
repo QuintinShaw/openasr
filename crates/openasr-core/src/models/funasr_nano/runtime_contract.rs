@@ -246,10 +246,9 @@ pub(crate) fn parse_funasr_nano_decoder_metadata<M: ScalarMetadataView>(
 pub(crate) fn validate_runtime_pack_contract(
     preflight: &crate::GgufRuntimeSourcePreflight,
 ) -> Result<(), String> {
-    let encoder = parse_funasr_nano_encoder_metadata(preflight.metadata())
-        .map_err(|error| {
-            crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
-        })?;
+    let encoder = parse_funasr_nano_encoder_metadata(preflight.metadata()).map_err(|error| {
+        crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
+    })?;
     let adapter = parse_funasr_nano_adapter_metadata(preflight.metadata()).map_err(|error| {
         crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
     })?;
@@ -355,11 +354,7 @@ fn sanm_block_tensor_descriptors(
         ),
         descriptor(
             name("attn.fsmn.weight"),
-            TensorBindingDescriptorRequirement::ExactDims(vec![
-                encoder.fsmn_kernel,
-                1,
-                d_model,
-            ]),
+            TensorBindingDescriptorRequirement::ExactDims(vec![encoder.fsmn_kernel, 1, d_model]),
             "FSMN depthwise kernel must be [fsmn_kernel, 1, d_model] for the im2col conv path",
         ),
         descriptor(
@@ -565,7 +560,10 @@ pub(crate) fn funasr_nano_runtime_tensor_binding_descriptors(
     }
     for layer in 0..encoder.tp_blocks {
         descriptors.extend(sanm_block_tensor_descriptors(
-            encoder, "tp.blk", layer, encoder.d_model,
+            encoder,
+            "tp.blk",
+            layer,
+            encoder.d_model,
         ));
     }
     let d_model = encoder.d_model;
@@ -650,8 +648,7 @@ pub(crate) fn validate_funasr_nano_runtime_tensors_with_index(
     adapter: &FunasrNanoAdapterMetadata,
     decoder: &FunasrNanoDecoderMetadata,
 ) -> Result<(), FunasrNanoTensorContractError> {
-    let descriptors =
-        funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder);
+    let descriptors = funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder);
     validate_tensor_binding_descriptors(
         index,
         &descriptors,

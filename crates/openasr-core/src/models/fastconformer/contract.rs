@@ -13,9 +13,7 @@
 //! exact `[conv_kernel, 1, hidden]` ggml layout (the only tensor with a single
 //! valid orientation, matching the sensevoice FSMN precedent).
 
-use crate::models::tensor_binding::{
-    TensorBindingDescriptor, TensorBindingDescriptorRequirement,
-};
+use crate::models::tensor_binding::{TensorBindingDescriptor, TensorBindingDescriptorRequirement};
 
 /// The metadata-derived geometry one FastConformer encoder's tensor contract
 /// is shaped for.
@@ -232,10 +230,19 @@ fn fastconformer_layer_tensor_descriptors(
     // The BatchNorm fold reads all four running statistics unconditionally and
     // folds them into the depthwise weight/bias at load.
     for (suffix, reason) in [
-        ("conv.bn.weight", "conv BatchNorm gamma must span hidden_size"),
+        (
+            "conv.bn.weight",
+            "conv BatchNorm gamma must span hidden_size",
+        ),
         ("conv.bn.bias", "conv BatchNorm beta must span hidden_size"),
-        ("conv.bn.mean", "conv BatchNorm running mean must span hidden_size"),
-        ("conv.bn.var", "conv BatchNorm running variance must span hidden_size"),
+        (
+            "conv.bn.mean",
+            "conv BatchNorm running mean must span hidden_size",
+        ),
+        (
+            "conv.bn.var",
+            "conv BatchNorm running variance must span hidden_size",
+        ),
     ] {
         descriptors.push(descriptor(
             n(suffix),

@@ -6,7 +6,9 @@
 //! weight loader.
 
 use crate::GgufTensorIndex;
-use crate::models::fastconformer::{FastConformerContractGeometry, fastconformer_encoder_tensor_descriptors};
+use crate::models::fastconformer::{
+    FastConformerContractGeometry, fastconformer_encoder_tensor_descriptors,
+};
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_u64_scalar, u64_to_u32, u64_to_usize,
     validate_positive_usize,
@@ -110,9 +112,10 @@ pub(crate) fn parse_parakeet_ctc_execution_metadata<M: ScalarMetadataView>(
 pub(crate) fn validate_runtime_pack_contract(
     preflight: &crate::GgufRuntimeSourcePreflight,
 ) -> Result<(), String> {
-    let metadata = parse_parakeet_ctc_execution_metadata(preflight.metadata()).map_err(|error| {
-        crate::models::runtime_pack_contract::metadata_validation_error("parakeet-ctc", error)
-    })?;
+    let metadata =
+        parse_parakeet_ctc_execution_metadata(preflight.metadata()).map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("parakeet-ctc", error)
+        })?;
     validate_parakeet_ctc_runtime_tensors_with_index(preflight.tensor_index(), &metadata)
         .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
 }

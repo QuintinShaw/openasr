@@ -183,9 +183,10 @@ pub(crate) fn parse_parakeet_tdt_execution_metadata(
 pub(crate) fn validate_runtime_pack_contract(
     preflight: &crate::GgufRuntimeSourcePreflight,
 ) -> Result<(), String> {
-    let metadata = parse_parakeet_tdt_execution_metadata(preflight.metadata()).map_err(|error| {
-        crate::models::runtime_pack_contract::metadata_validation_error("parakeet-tdt", error)
-    })?;
+    let metadata =
+        parse_parakeet_tdt_execution_metadata(preflight.metadata()).map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error("parakeet-tdt", error)
+        })?;
     validate_parakeet_tdt_runtime_tensors_with_index(preflight.tensor_index(), &metadata)
         .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
 }
@@ -251,15 +252,14 @@ pub(crate) fn parakeet_tdt_runtime_tensor_binding_descriptors(
     let joint = metadata.joint_hidden;
     let pred = metadata.pred_hidden;
     let out_rows = metadata.vocab_size + metadata.n_durations;
-    let mut push = |tensor_name: &str,
-                    requirement: TensorBindingDescriptorRequirement,
-                    reason: &str| {
-        descriptors.push(TensorBindingDescriptor {
-            tensor_name: tensor_name.to_string(),
-            requirement,
-            reason: reason.to_string(),
-        });
-    };
+    let mut push =
+        |tensor_name: &str, requirement: TensorBindingDescriptorRequirement, reason: &str| {
+            descriptors.push(TensorBindingDescriptor {
+                tensor_name: tensor_name.to_string(),
+                requirement,
+                reason: reason.to_string(),
+            });
+        };
     push(
         "enc.proj.weight",
         TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, joint),

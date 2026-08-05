@@ -5,11 +5,11 @@
 
 use thiserror::Error;
 
+use crate::GgufTensorIndex;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
     u64_to_u32, u64_to_usize, validate_positive_usize,
 };
-use crate::GgufTensorIndex;
 
 use super::encoder_weights::layer_prefix;
 use super::package_import::compact_xasr_name;

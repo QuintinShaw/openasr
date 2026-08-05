@@ -332,11 +332,10 @@ pub(crate) fn load_moss_encoder_weights_from_reader(
                 name: names.ffn_up_weight,
                 values: Vec::new(),
             },
-            ffn_up_bias: reader
-                .host_tensor_f32_copy_dequantized_by_name(
-                    &names.ffn_up_bias,
-                    &[(MOSS_ENCODER_FFN_EXPANSION as u64) * d],
-                )?,
+            ffn_up_bias: reader.host_tensor_f32_copy_dequantized_by_name(
+                &names.ffn_up_bias,
+                &[(MOSS_ENCODER_FFN_EXPANSION as u64) * d],
+            )?,
             ffn_down_weight: MossProjectionTensor {
                 name: names.ffn_down_weight,
                 values: Vec::new(),

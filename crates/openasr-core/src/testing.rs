@@ -1212,7 +1212,10 @@ impl TinyGgufFixtureSpec {
             crate::PARAKEET_CTC_TOKENIZER_ID.to_string(),
         );
         for (key, value) in [
-            ("general.architecture", crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID),
+            (
+                "general.architecture",
+                crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+            ),
             ("parakeet.n_layers", "1"),
             ("parakeet.hidden_size", "16"),
             ("parakeet.n_heads", "2"),
@@ -1274,7 +1277,10 @@ impl TinyGgufFixtureSpec {
             crate::PARAKEET_TDT_TOKENIZER_ID.to_string(),
         );
         for (key, value) in [
-            ("general.architecture", crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID),
+            (
+                "general.architecture",
+                crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+            ),
             ("parakeet-tdt.n_layers", "1"),
             ("parakeet-tdt.hidden_size", "16"),
             ("parakeet-tdt.n_heads", "2"),
@@ -1407,9 +1413,11 @@ impl TinyGgufFixtureSpec {
                 &spec.metadata,
             )
             .expect("funasr-nano decoder fixture metadata must parse");
-        for (name, dims) in crate::models::funasr_nano::runtime_contract::funasr_nano_runtime_tensors(
-            &encoder, &adapter, &decoder,
-        ) {
+        for (name, dims) in
+            crate::models::funasr_nano::runtime_contract::funasr_nano_runtime_tensors(
+                &encoder, &adapter, &decoder,
+            )
+        {
             spec = spec.with_tensor_shape(name, dims);
         }
         spec
