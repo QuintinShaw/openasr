@@ -9,7 +9,7 @@ use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
     u64_to_u32, u64_to_usize, validate_positive_usize,
 };
-use crate::{GgufTensorIndex, GgufTensorMetadata};
+use crate::GgufTensorIndex;
 
 use super::encoder_weights::layer_prefix;
 use super::package_import::compact_xasr_name;
@@ -227,37 +227,131 @@ fn required_usize_list<M: ScalarMetadataView>(
     Ok(values)
 }
 
-/// Admission-time runtime tensor contract for xasr-zipformer. The runtime
-/// resolves every weight through `compact_xasr_name(upstream_name)` and
-/// validates exact dims while loading; this gate re-checks the same tensor set
-/// against the lightweight tensor index so a pack that is missing a required
-/// tensor (or carries a structurally wrong shape) fails closed at admission
-/// instead of mid-execution. Shapes fully determined by the parsed metadata are
-/// checked exactly; architecture-constant and data-derived dims fall back to a
-/// rank check (the loader still enforces the exact value at runtime).
+/// The shape contract a single required xasr-zipformer tensor must satisfy at
+/// admission. Shapes fully determined by the parsed metadata (or by an
+/// architecture constant the loader pins) are checked exactly or by a fixed
+/// input/output dim; data-derived dims the loader only learns by reading bytes
+/// fall back to a rank check (the loader still enforces the exact value at
+/// runtime).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum XasrTensorShape {
+    /// Dims must equal `expected` exactly.
+    Exact(Vec<usize>),
+    /// Rank-1 vector of exactly `len` elements.
+    Vector(usize),
+    /// Only the rank is pinned (data-derived / loader-enforced dims).
+    Rank(usize),
+    /// Rank-2 matrix whose input dim (`dims[0]`) is `input_dim`.
+    Rank2In { input_dim: usize },
+    /// Rank-2 matrix whose output dim (`dims[1]`) is `output_dim`.
+    Rank2Out { output_dim: usize },
+}
+
+/// One tensor the xasr-zipformer runtime loads, named by its upstream icefall
+/// name (resolved to the pack name through `compact_xasr_name`) plus the shape
+/// contract the admission validator enforces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XasrTensorRequirement {
+    pub upstream_name: String,
+    pub shape: XasrTensorShape,
+}
+
+fn requirement(upstream_name: String, shape: XasrTensorShape) -> XasrTensorRequirement {
+    XasrTensorRequirement {
+        upstream_name,
+        shape,
+    }
+}
+
+/// The single source of truth for the xasr-zipformer runtime tensor set: every
+/// tensor the weight loader reads (`encoder_weights` / `weights`), named exactly
+/// as the loader resolves it and shaped with the strictness the loader applies.
+/// The admission validator checks precisely this set against the tensor index,
+/// and the runtime-ready fixture projects it, so validator / loader / fixture
+/// cannot drift: a pack missing any entry (or carrying a structurally wrong
+/// shape) fails closed at admission instead of mid-execution.
+pub(crate) fn xasr_zipformer_runtime_tensor_requirements(
+    metadata: &XasrZipformerExecutionMetadata,
+) -> Vec<XasrTensorRequirement> {
+    let mut out = Vec::new();
+    embed_requirements(&mut out, metadata);
+    for stack in 0..metadata.num_stacks {
+        stack_requirements(&mut out, metadata, stack);
+    }
+    let output_downsampling_factor = metadata.downsampling_factors.last().copied().unwrap_or(2);
+    out.push(requirement(
+        "encoder.downsample_output.bias".to_string(),
+        XasrTensorShape::Vector(output_downsampling_factor),
+    ));
+    decoder_requirements(&mut out, metadata);
+    joiner_requirements(&mut out, metadata);
+    out
+}
+
+/// Admission-time runtime tensor contract for xasr-zipformer. Validates the
+/// pack tensor index against the single required-tensor enumeration
+/// ([`xasr_zipformer_runtime_tensor_requirements`]); a missing tensor or a shape
+/// the declared geometry cannot construct fails closed with the offending pack
+/// tensor named.
 pub(crate) fn validate_xasr_zipformer_runtime_tensors_with_index(
     index: &GgufTensorIndex,
     metadata: &XasrZipformerExecutionMetadata,
 ) -> Result<(), XasrTensorContractError> {
-    validate_embed_tensors(index, metadata)?;
-    for stack in 0..metadata.num_stacks {
-        validate_stack_tensors(index, metadata, stack)?;
+    for requirement in xasr_zipformer_runtime_tensor_requirements(metadata) {
+        check_requirement(index, &requirement)?;
     }
-    let output_downsampling_factor = metadata.downsampling_factors.last().copied().unwrap_or(2);
-    require_vector(
-        index,
-        "encoder.downsample_output.bias",
-        output_downsampling_factor,
-    )?;
-    validate_decoder_tensors(index, metadata)?;
-    validate_joiner_tensors(index, metadata)?;
     Ok(())
 }
 
-fn validate_embed_tensors(
+fn check_requirement(
     index: &GgufTensorIndex,
-    metadata: &XasrZipformerExecutionMetadata,
+    requirement: &XasrTensorRequirement,
 ) -> Result<(), XasrTensorContractError> {
+    let name = compact_xasr_name(&requirement.upstream_name);
+    let tensor = index
+        .get(&name)
+        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })?;
+    let valid = match &requirement.shape {
+        XasrTensorShape::Exact(expected) => {
+            tensor.dims.len() == expected.len()
+                && tensor
+                    .dims
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(actual, expected)| *actual == *expected as u64)
+        }
+        XasrTensorShape::Vector(len) => tensor.dims.len() == 1 && tensor.dims[0] == *len as u64,
+        XasrTensorShape::Rank(rank) => tensor.dims.len() == *rank,
+        XasrTensorShape::Rank2In { input_dim } => {
+            tensor.dims.len() == 2 && tensor.dims[0] == *input_dim as u64
+        }
+        XasrTensorShape::Rank2Out { output_dim } => {
+            tensor.dims.len() == 2 && tensor.dims[1] == *output_dim as u64
+        }
+    };
+    if valid {
+        return Ok(());
+    }
+    let reason = match &requirement.shape {
+        XasrTensorShape::Exact(expected) => format!("expected shape {expected:?}"),
+        XasrTensorShape::Vector(len) => {
+            format!("expected a rank-1 vector of length {len}")
+        }
+        XasrTensorShape::Rank(rank) => format!("expected rank {rank}"),
+        XasrTensorShape::Rank2In { input_dim } => {
+            format!("expected a rank-2 matrix with input dim {input_dim}")
+        }
+        XasrTensorShape::Rank2Out { output_dim } => {
+            format!("expected a rank-2 matrix with output dim {output_dim}")
+        }
+    };
+    Err(invalid_shape(&tensor.name, &tensor.dims, reason))
+}
+
+fn embed_requirements(
+    out: &mut Vec<XasrTensorRequirement>,
+    metadata: &XasrZipformerExecutionMetadata,
+) {
     let first_dim = metadata.encoder_dims[0];
     // Conv stem kernels are architecture constants; rank-check the weights and
     // exact-check the biases (their length equals the constant out-channel count
@@ -270,48 +364,64 @@ fn validate_embed_tensors(
         ("encoder_embed.convnext.pointwise_conv1", 384),
         ("encoder_embed.convnext.pointwise_conv2", 128),
     ] {
-        require_rank(index, weight, 4)?;
-        require_vector(index, &format!("{weight}.bias"), bias_len)?;
+        out.push(requirement(
+            format!("{weight}.weight"),
+            XasrTensorShape::Rank(4),
+        ));
+        out.push(requirement(
+            format!("{weight}.bias"),
+            XasrTensorShape::Vector(bias_len),
+        ));
     }
     // `encoder_embed.out` output width is `first_dim`; its input width is an
     // architecture constant the loader pins (rank-check only here).
-    require_rank2_out(index, "encoder_embed.out.weight", first_dim)?;
-    require_vector(index, "encoder_embed.out.bias", first_dim)?;
-    require_vector(index, "encoder_embed.out_norm.bias", first_dim)?;
-    require_vector(index, "encoder_embed.out_norm.log_scale", 1)?;
-    Ok(())
+    out.push(requirement(
+        "encoder_embed.out.weight".to_string(),
+        XasrTensorShape::Rank2Out {
+            output_dim: first_dim,
+        },
+    ));
+    out.push(requirement(
+        "encoder_embed.out.bias".to_string(),
+        XasrTensorShape::Vector(first_dim),
+    ));
+    out.push(requirement(
+        "encoder_embed.out_norm.bias".to_string(),
+        XasrTensorShape::Vector(first_dim),
+    ));
+    out.push(requirement(
+        "encoder_embed.out_norm.log_scale".to_string(),
+        XasrTensorShape::Vector(1),
+    ));
 }
 
-fn validate_stack_tensors(
-    index: &GgufTensorIndex,
+fn stack_requirements(
+    out: &mut Vec<XasrTensorRequirement>,
     metadata: &XasrZipformerExecutionMetadata,
     stack: usize,
-) -> Result<(), XasrTensorContractError> {
+) {
     let dim = metadata.encoder_dims[stack];
     if stack > 0 {
-        require_vector(
-            index,
-            &format!("encoder.encoders.{stack}.downsample.bias"),
-            metadata.downsampling_factors[stack],
-        )?;
-        require_vector(
-            index,
-            &format!("encoder.encoders.{stack}.out_combiner.bypass_scale"),
-            dim,
-        )?;
+        out.push(requirement(
+            format!("encoder.encoders.{stack}.downsample.bias"),
+            XasrTensorShape::Vector(metadata.downsampling_factors[stack]),
+        ));
+        out.push(requirement(
+            format!("encoder.encoders.{stack}.out_combiner.bypass_scale"),
+            XasrTensorShape::Vector(dim),
+        ));
     }
     for layer in 0..metadata.num_encoder_layers[stack] {
-        validate_layer_tensors(index, metadata, stack, layer)?;
+        layer_requirements(out, metadata, stack, layer);
     }
-    Ok(())
 }
 
-fn validate_layer_tensors(
-    index: &GgufTensorIndex,
+fn layer_requirements(
+    out: &mut Vec<XasrTensorRequirement>,
     metadata: &XasrZipformerExecutionMetadata,
     stack: usize,
     layer: usize,
-) -> Result<(), XasrTensorContractError> {
+) {
     let dim = metadata.encoder_dims[stack];
     let kernel = metadata.cnn_module_kernels[stack];
     let causal_kernel = kernel.div_ceil(2);
@@ -320,364 +430,218 @@ fn validate_layer_tensors(
     for name in ["feed_forward1", "feed_forward2", "feed_forward3"] {
         // Hidden width is data-derived; the loader pins it from the bias at
         // runtime. Here the input/output contract is the checkable surface.
-        require_rank2_in(index, &format!("{prefix}.{name}.in_proj.weight"), dim)?;
-        require_rank(index, &format!("{prefix}.{name}.in_proj.bias"), 1)?;
-        require_rank2_out(index, &format!("{prefix}.{name}.out_proj.weight"), dim)?;
-        require_vector(index, &format!("{prefix}.{name}.out_proj.bias"), dim)?;
+        out.push(requirement(
+            format!("{prefix}.{name}.in_proj.weight"),
+            XasrTensorShape::Rank2In { input_dim: dim },
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.in_proj.bias"),
+            XasrTensorShape::Rank(1),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.out_proj.weight"),
+            XasrTensorShape::Rank2Out { output_dim: dim },
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.out_proj.bias"),
+            XasrTensorShape::Vector(dim),
+        ));
     }
 
     // Self-attention qkv projection output width depends on the data-derived
     // `linear_pos` width; rank-check it and exact-check its input.
-    require_rank2_in(
-        index,
-        &format!("{prefix}.self_attn_weights.in_proj.weight"),
-        dim,
-    )?;
-    require_rank(
-        index,
-        &format!("{prefix}.self_attn_weights.in_proj.bias"),
-        1,
-    )?;
-    require_rank(
-        index,
-        &format!("{prefix}.self_attn_weights.linear_pos.weight"),
-        2,
-    )?;
+    out.push(requirement(
+        format!("{prefix}.self_attn_weights.in_proj.weight"),
+        XasrTensorShape::Rank2In { input_dim: dim },
+    ));
+    out.push(requirement(
+        format!("{prefix}.self_attn_weights.in_proj.bias"),
+        XasrTensorShape::Rank(1),
+    ));
+    out.push(requirement(
+        format!("{prefix}.self_attn_weights.linear_pos.weight"),
+        XasrTensorShape::Rank(2),
+    ));
 
     for name in ["self_attn1", "self_attn2"] {
-        require_rank2_in(index, &format!("{prefix}.{name}.in_proj.weight"), dim)?;
-        require_rank(index, &format!("{prefix}.{name}.in_proj.bias"), 1)?;
-        require_rank2_out(index, &format!("{prefix}.{name}.out_proj.weight"), dim)?;
-        require_vector(index, &format!("{prefix}.{name}.out_proj.bias"), dim)?;
+        out.push(requirement(
+            format!("{prefix}.{name}.in_proj.weight"),
+            XasrTensorShape::Rank2In { input_dim: dim },
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.in_proj.bias"),
+            XasrTensorShape::Rank(1),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.out_proj.weight"),
+            XasrTensorShape::Rank2Out { output_dim: dim },
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.out_proj.bias"),
+            XasrTensorShape::Vector(dim),
+        ));
     }
 
-    require_rank2_in(
-        index,
-        &format!("{prefix}.nonlin_attention.in_proj.weight"),
-        dim,
-    )?;
-    require_rank(index, &format!("{prefix}.nonlin_attention.in_proj.bias"), 1)?;
-    require_rank2_out(
-        index,
-        &format!("{prefix}.nonlin_attention.out_proj.weight"),
-        dim,
-    )?;
-    require_vector(
-        index,
-        &format!("{prefix}.nonlin_attention.out_proj.bias"),
-        dim,
-    )?;
+    out.push(requirement(
+        format!("{prefix}.nonlin_attention.in_proj.weight"),
+        XasrTensorShape::Rank2In { input_dim: dim },
+    ));
+    out.push(requirement(
+        format!("{prefix}.nonlin_attention.in_proj.bias"),
+        XasrTensorShape::Rank(1),
+    ));
+    out.push(requirement(
+        format!("{prefix}.nonlin_attention.out_proj.weight"),
+        XasrTensorShape::Rank2Out { output_dim: dim },
+    ));
+    out.push(requirement(
+        format!("{prefix}.nonlin_attention.out_proj.bias"),
+        XasrTensorShape::Vector(dim),
+    ));
 
     for name in ["conv_module1", "conv_module2"] {
-        require_exact(
-            index,
-            &format!("{prefix}.{name}.in_proj.weight"),
-            &[dim as u64, (2 * dim) as u64],
-        )?;
-        require_vector(index, &format!("{prefix}.{name}.in_proj.bias"), 2 * dim)?;
-        require_exact(
-            index,
-            &format!("{prefix}.{name}.depthwise_conv.causal_conv.weight"),
-            &[causal_kernel as u64, 1, dim as u64],
-        )?;
-        require_vector(
-            index,
-            &format!("{prefix}.{name}.depthwise_conv.causal_conv.bias"),
-            dim,
-        )?;
-        require_exact(
-            index,
-            &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.weight"),
-            &[kernel as u64, 1, dim as u64],
-        )?;
-        require_vector(
-            index,
-            &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.bias"),
-            dim,
-        )?;
-        require_exact(
-            index,
-            &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv_scale"),
-            &[2, dim as u64, kernel as u64],
-        )?;
-        require_exact(
-            index,
-            &format!("{prefix}.{name}.out_proj.weight"),
-            &[dim as u64, dim as u64],
-        )?;
-        require_vector(index, &format!("{prefix}.{name}.out_proj.bias"), dim)?;
+        out.push(requirement(
+            format!("{prefix}.{name}.in_proj.weight"),
+            XasrTensorShape::Exact(vec![dim, 2 * dim]),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.in_proj.bias"),
+            XasrTensorShape::Vector(2 * dim),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.depthwise_conv.causal_conv.weight"),
+            XasrTensorShape::Exact(vec![causal_kernel, 1, dim]),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.depthwise_conv.causal_conv.bias"),
+            XasrTensorShape::Vector(dim),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.weight"),
+            XasrTensorShape::Exact(vec![kernel, 1, dim]),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.bias"),
+            XasrTensorShape::Vector(dim),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.depthwise_conv.chunkwise_conv_scale"),
+            XasrTensorShape::Exact(vec![2, dim, kernel]),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.out_proj.weight"),
+            XasrTensorShape::Exact(vec![dim, dim]),
+        ));
+        out.push(requirement(
+            format!("{prefix}.{name}.out_proj.bias"),
+            XasrTensorShape::Vector(dim),
+        ));
     }
 
-    require_vector(index, &format!("{prefix}.norm.bias"), dim)?;
-    require_vector(index, &format!("{prefix}.norm.log_scale"), 1)?;
-    require_vector(index, &format!("{prefix}.bypass.bypass_scale"), dim)?;
-    require_vector(index, &format!("{prefix}.bypass_mid.bypass_scale"), dim)?;
-    Ok(())
+    out.push(requirement(
+        format!("{prefix}.norm.bias"),
+        XasrTensorShape::Vector(dim),
+    ));
+    out.push(requirement(
+        format!("{prefix}.norm.log_scale"),
+        XasrTensorShape::Vector(1),
+    ));
+    out.push(requirement(
+        format!("{prefix}.bypass.bypass_scale"),
+        XasrTensorShape::Vector(dim),
+    ));
+    out.push(requirement(
+        format!("{prefix}.bypass_mid.bypass_scale"),
+        XasrTensorShape::Vector(dim),
+    ));
 }
 
-fn validate_decoder_tensors(
-    index: &GgufTensorIndex,
+fn decoder_requirements(
+    out: &mut Vec<XasrTensorRequirement>,
     metadata: &XasrZipformerExecutionMetadata,
-) -> Result<(), XasrTensorContractError> {
+) {
     let decoder_dim = metadata.decoder_dim();
-    require_exact(
-        index,
-        "decoder.embedding.weight",
-        &[decoder_dim as u64, metadata.vocab_size as u64],
-    )?;
+    out.push(requirement(
+        "decoder.embedding.weight".to_string(),
+        XasrTensorShape::Exact(vec![decoder_dim, metadata.vocab_size]),
+    ));
     // The conv kernel's middle dim is `decoder_dim / 128` (grouped conv); the
     // loader enforces that exact shape at runtime. Rank-check here keeps tiny
     // admission fixtures (whose small joiner_dim would make the group count 0)
     // representable while still proving the tensor exists with the right rank.
-    require_rank(index, "decoder.conv.weight", 3)?;
-    Ok(())
+    out.push(requirement(
+        "decoder.conv.weight".to_string(),
+        XasrTensorShape::Rank(3),
+    ));
 }
 
-fn validate_joiner_tensors(
-    index: &GgufTensorIndex,
+fn joiner_requirements(
+    out: &mut Vec<XasrTensorRequirement>,
     metadata: &XasrZipformerExecutionMetadata,
-) -> Result<(), XasrTensorContractError> {
+) {
     let encoder_output_dim = metadata.encoder_output_dim();
     let joiner_dim = metadata.joiner_dim;
     let vocab_size = metadata.vocab_size;
-    require_exact(
-        index,
-        "joiner.encoder_proj.weight",
-        &[encoder_output_dim as u64, joiner_dim as u64],
-    )?;
-    require_vector(index, "joiner.encoder_proj.bias", joiner_dim)?;
-    require_exact(
-        index,
-        "joiner.decoder_proj.weight",
-        &[joiner_dim as u64, joiner_dim as u64],
-    )?;
-    require_vector(index, "joiner.decoder_proj.bias", joiner_dim)?;
-    require_exact(
-        index,
-        "joiner.output_linear.weight",
-        &[joiner_dim as u64, vocab_size as u64],
-    )?;
-    require_vector(index, "joiner.output_linear.bias", vocab_size)?;
-    Ok(())
+    out.push(requirement(
+        "joiner.encoder_proj.weight".to_string(),
+        XasrTensorShape::Exact(vec![encoder_output_dim, joiner_dim]),
+    ));
+    out.push(requirement(
+        "joiner.encoder_proj.bias".to_string(),
+        XasrTensorShape::Vector(joiner_dim),
+    ));
+    out.push(requirement(
+        "joiner.decoder_proj.weight".to_string(),
+        XasrTensorShape::Exact(vec![joiner_dim, joiner_dim]),
+    ));
+    out.push(requirement(
+        "joiner.decoder_proj.bias".to_string(),
+        XasrTensorShape::Vector(joiner_dim),
+    ));
+    out.push(requirement(
+        "joiner.output_linear.weight".to_string(),
+        XasrTensorShape::Exact(vec![joiner_dim, vocab_size]),
+    ));
+    out.push(requirement(
+        "joiner.output_linear.bias".to_string(),
+        XasrTensorShape::Vector(vocab_size),
+    ));
 }
 
-/// Generates the minimal runtime tensor set (compacted pack names plus valid
-/// dims) that satisfies the xasr-zipformer runtime tensor contract for
-/// `metadata`. Data-derived dims that the loader only learns by reading bytes
-/// are filled with a small valid placeholder. The runtime-ready test fixture
-/// stamps exactly this set, so the fixture and the admission validator agree on
-/// the required tensors through one enumeration.
+/// Projects the single runtime tensor contract
+/// ([`xasr_zipformer_runtime_tensor_requirements`]) into a minimal runtime-ready
+/// tensor set: compacted pack names plus one valid dims choice per shape
+/// contract. Data-derived dims the loader only learns by reading bytes get a
+/// small valid placeholder. The runtime-ready test fixture stamps exactly this
+/// set, so fixture and admission validator agree on the required tensors
+/// through one enumeration.
 pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
     metadata: &XasrZipformerExecutionMetadata,
 ) -> Vec<(String, Vec<u64>)> {
-    let mut out: Vec<(String, Vec<u64>)> = Vec::new();
-    fn push(out: &mut Vec<(String, Vec<u64>)>, name: &str, dims: Vec<u64>) {
-        out.push((compact_xasr_name(name), dims));
-    }
-
-    let first_dim = metadata.encoder_dims[0] as u64;
-    for (weight, bias_len) in [
-        ("encoder_embed.conv.0", 8u64),
-        ("encoder_embed.conv.4", 32),
-        ("encoder_embed.conv.7", 128),
-        ("encoder_embed.convnext.depthwise_conv", 128),
-        ("encoder_embed.convnext.pointwise_conv1", 384),
-        ("encoder_embed.convnext.pointwise_conv2", 128),
-    ] {
-        push(&mut out, weight, vec![3, 3, 1, bias_len]);
-        push(&mut out, &format!("{weight}.bias"), vec![bias_len]);
-    }
-    push(&mut out, "encoder_embed.out.weight", vec![32, first_dim]);
-    push(&mut out, "encoder_embed.out.bias", vec![first_dim]);
-    push(&mut out, "encoder_embed.out_norm.bias", vec![first_dim]);
-    push(&mut out, "encoder_embed.out_norm.log_scale", vec![1]);
-
-    for stack in 0..metadata.num_stacks {
-        let dim = metadata.encoder_dims[stack] as u64;
-        if stack > 0 {
-            push(
-                &mut out,
-                &format!("encoder.encoders.{stack}.downsample.bias"),
-                vec![metadata.downsampling_factors[stack] as u64],
-            );
-            push(
-                &mut out,
-                &format!("encoder.encoders.{stack}.out_combiner.bypass_scale"),
-                vec![dim],
-            );
-        }
-        let kernel = metadata.cnn_module_kernels[stack] as u64;
-        let causal_kernel = (kernel as usize).div_ceil(2) as u64;
-        for layer in 0..metadata.num_encoder_layers[stack] {
-            let prefix = layer_prefix(stack, layer);
-            for name in ["feed_forward1", "feed_forward2", "feed_forward3"] {
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.in_proj.weight"),
-                    vec![dim, 2 * dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.in_proj.bias"),
-                    vec![2 * dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.out_proj.weight"),
-                    vec![2 * dim, dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.out_proj.bias"),
-                    vec![dim],
-                );
-            }
-            push(
-                &mut out,
-                &format!("{prefix}.self_attn_weights.in_proj.weight"),
-                vec![dim, 20],
-            );
-            push(
-                &mut out,
-                &format!("{prefix}.self_attn_weights.in_proj.bias"),
-                vec![20],
-            );
-            push(
-                &mut out,
-                &format!("{prefix}.self_attn_weights.linear_pos.weight"),
-                vec![4, 4],
-            );
-            for name in ["self_attn1", "self_attn2"] {
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.in_proj.weight"),
-                    vec![dim, 4],
-                );
-                push(&mut out, &format!("{prefix}.{name}.in_proj.bias"), vec![4]);
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.out_proj.weight"),
-                    vec![4, dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.out_proj.bias"),
-                    vec![dim],
-                );
-            }
-            push(
-                &mut out,
-                &format!("{prefix}.nonlin_attention.in_proj.weight"),
-                vec![dim, 6],
-            );
-            push(
-                &mut out,
-                &format!("{prefix}.nonlin_attention.in_proj.bias"),
-                vec![6],
-            );
-            push(
-                &mut out,
-                &format!("{prefix}.nonlin_attention.out_proj.weight"),
-                vec![2, dim],
-            );
-            push(
-                &mut out,
-                &format!("{prefix}.nonlin_attention.out_proj.bias"),
-                vec![dim],
-            );
-            for name in ["conv_module1", "conv_module2"] {
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.in_proj.weight"),
-                    vec![dim, 2 * dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.in_proj.bias"),
-                    vec![2 * dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.depthwise_conv.causal_conv.weight"),
-                    vec![causal_kernel, 1, dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.depthwise_conv.causal_conv.bias"),
-                    vec![dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.weight"),
-                    vec![kernel, 1, dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.bias"),
-                    vec![dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv_scale"),
-                    vec![2, dim, kernel],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.out_proj.weight"),
-                    vec![dim, dim],
-                );
-                push(
-                    &mut out,
-                    &format!("{prefix}.{name}.out_proj.bias"),
-                    vec![dim],
-                );
-            }
-            push(&mut out, &format!("{prefix}.norm.bias"), vec![dim]);
-            push(&mut out, &format!("{prefix}.norm.log_scale"), vec![1]);
-            push(
-                &mut out,
-                &format!("{prefix}.bypass.bypass_scale"),
-                vec![dim],
-            );
-            push(
-                &mut out,
-                &format!("{prefix}.bypass_mid.bypass_scale"),
-                vec![dim],
-            );
-        }
-    }
-    push(
-        &mut out,
-        "encoder.downsample_output.bias",
-        vec![*metadata.downsampling_factors.last().unwrap_or(&2) as u64],
-    );
-
-    let decoder_dim = metadata.decoder_dim() as u64;
-    let vocab = metadata.vocab_size as u64;
-    push(
-        &mut out,
-        "decoder.embedding.weight",
-        vec![decoder_dim, vocab],
-    );
-    push(
-        &mut out,
-        "decoder.conv.weight",
-        vec![metadata.decoder_context_size as u64, 1, decoder_dim],
-    );
-
-    let joiner = metadata.joiner_dim as u64;
-    let enc_out = metadata.encoder_output_dim() as u64;
-    push(
-        &mut out,
-        "joiner.encoder_proj.weight",
-        vec![enc_out, joiner],
-    );
-    push(&mut out, "joiner.encoder_proj.bias", vec![joiner]);
-    push(&mut out, "joiner.decoder_proj.weight", vec![joiner, joiner]);
-    push(&mut out, "joiner.decoder_proj.bias", vec![joiner]);
-    push(&mut out, "joiner.output_linear.weight", vec![joiner, vocab]);
-    push(&mut out, "joiner.output_linear.bias", vec![vocab]);
-    out
+    xasr_zipformer_runtime_tensor_requirements(metadata)
+        .into_iter()
+        .map(|requirement| {
+            // Project one valid dims choice per shape contract. GGUF reads back
+            // a canonical rank trimmed of trailing ones, so every projection
+            // keeps its last dim > 1 (rank-1 `Vector(1)` is the lone `[1]`
+            // exception that survives trimming).
+            let dims = match &requirement.shape {
+                XasrTensorShape::Exact(expected) => {
+                    expected.iter().map(|dim| *dim as u64).collect()
+                }
+                XasrTensorShape::Vector(len) => vec![*len as u64],
+                XasrTensorShape::Rank(1) => vec![2],
+                XasrTensorShape::Rank(rank) => {
+                    let mut dims = vec![1_u64; *rank];
+                    *dims.last_mut().expect("rank > 0") = 2;
+                    dims
+                }
+                XasrTensorShape::Rank2In { input_dim } => vec![*input_dim as u64, 2],
+                XasrTensorShape::Rank2Out { output_dim } => vec![2, *output_dim as u64],
+            };
+            (compact_xasr_name(&requirement.upstream_name), dims)
+        })
+        .collect()
 }
 
 /// Typed tensor-contract failure for a single xasr-zipformer pack.
@@ -691,102 +655,6 @@ pub(crate) enum XasrTensorContractError {
         shape: String,
         reason: String,
     },
-}
-
-fn require_tensor<'a>(
-    index: &'a GgufTensorIndex,
-    upstream_name: &str,
-) -> Result<&'a GgufTensorMetadata, XasrTensorContractError> {
-    let name = compact_xasr_name(upstream_name);
-    index
-        .get(&name)
-        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })
-}
-
-fn require_vector(
-    index: &GgufTensorIndex,
-    upstream_name: &str,
-    len: usize,
-) -> Result<(), XasrTensorContractError> {
-    let name = compact_xasr_name(upstream_name);
-    let tensor = index
-        .get(&name)
-        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })?;
-    if tensor.dims.len() == 1 && tensor.dims[0] == len as u64 {
-        return Ok(());
-    }
-    Err(invalid_shape(
-        &tensor.name,
-        &tensor.dims,
-        format!("expected a rank-1 vector of length {len}"),
-    ))
-}
-
-fn require_exact(
-    index: &GgufTensorIndex,
-    upstream_name: &str,
-    expected: &[u64],
-) -> Result<(), XasrTensorContractError> {
-    let name = compact_xasr_name(upstream_name);
-    let tensor = index
-        .get(&name)
-        .ok_or(XasrTensorContractError::MissingRequiredTensor { name })?;
-    if tensor.dims.as_slice() == expected {
-        return Ok(());
-    }
-    Err(invalid_shape(
-        &tensor.name,
-        &tensor.dims,
-        format!("expected shape {expected:?}"),
-    ))
-}
-
-fn require_rank(
-    index: &GgufTensorIndex,
-    upstream_name: &str,
-    rank: usize,
-) -> Result<(), XasrTensorContractError> {
-    let tensor = require_tensor(index, upstream_name)?;
-    if tensor.dims.len() == rank {
-        return Ok(());
-    }
-    Err(invalid_shape(
-        &tensor.name,
-        &tensor.dims,
-        format!("expected rank {rank}"),
-    ))
-}
-
-fn require_rank2_in(
-    index: &GgufTensorIndex,
-    upstream_name: &str,
-    input_dim: usize,
-) -> Result<(), XasrTensorContractError> {
-    let tensor = require_tensor(index, upstream_name)?;
-    if tensor.dims.len() == 2 && tensor.dims[0] == input_dim as u64 {
-        return Ok(());
-    }
-    Err(invalid_shape(
-        &tensor.name,
-        &tensor.dims,
-        format!("expected a rank-2 matrix with input dim {input_dim}"),
-    ))
-}
-
-fn require_rank2_out(
-    index: &GgufTensorIndex,
-    upstream_name: &str,
-    output_dim: usize,
-) -> Result<(), XasrTensorContractError> {
-    let tensor = require_tensor(index, upstream_name)?;
-    if tensor.dims.len() == 2 && tensor.dims[1] == output_dim as u64 {
-        return Ok(());
-    }
-    Err(invalid_shape(
-        &tensor.name,
-        &tensor.dims,
-        format!("expected a rank-2 matrix with output dim {output_dim}"),
-    ))
 }
 
 fn invalid_shape(name: &str, shape: &[u64], reason: String) -> XasrTensorContractError {
@@ -816,6 +684,7 @@ pub(crate) fn validate_runtime_pack_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GgufTensorMetadata;
     use std::collections::BTreeMap;
 
     fn metadata() -> BTreeMap<String, String> {
@@ -889,209 +758,22 @@ mod tests {
         }
     }
 
-    fn tensor_entry(name: &str, dims: Vec<u64>) -> GgufTensorMetadata {
-        GgufTensorMetadata {
-            name: compact_xasr_name(name),
-            dims,
-            ggml_type: 0,
-            type_name: "f32".to_string(),
-            size_bytes: 0,
-            offset_bytes: 0,
-        }
-    }
-
-    /// Builds the full runtime tensor set for `metadata`, mirroring the names
-    /// the runtime loader resolves (through `compact_xasr_name` / `layer_prefix`).
+    /// Builds the full runtime tensor index set for `metadata` by projecting
+    /// the single runtime tensor contract (`xasr_zipformer_minimal_runtime_tensors`),
+    /// so the fixture index and the admission validator can never drift: both
+    /// are projections of one enumeration.
     fn required_tensors(metadata: &XasrZipformerExecutionMetadata) -> Vec<GgufTensorMetadata> {
-        let mut tensors = Vec::new();
-        let first_dim = metadata.encoder_dims[0] as u64;
-        for (weight, bias_len) in [
-            ("encoder_embed.conv.0", 8u64),
-            ("encoder_embed.conv.4", 32),
-            ("encoder_embed.conv.7", 128),
-            ("encoder_embed.convnext.depthwise_conv", 128),
-            ("encoder_embed.convnext.pointwise_conv1", 384),
-            ("encoder_embed.convnext.pointwise_conv2", 128),
-        ] {
-            tensors.push(tensor_entry(weight, vec![3, 3, 1, bias_len]));
-            tensors.push(tensor_entry(&format!("{weight}.bias"), vec![bias_len]));
-        }
-        tensors.push(tensor_entry(
-            "encoder_embed.out.weight",
-            vec![32, first_dim],
-        ));
-        tensors.push(tensor_entry("encoder_embed.out.bias", vec![first_dim]));
-        tensors.push(tensor_entry("encoder_embed.out_norm.bias", vec![first_dim]));
-        tensors.push(tensor_entry("encoder_embed.out_norm.log_scale", vec![1]));
-
-        for stack in 0..metadata.num_stacks {
-            let dim = metadata.encoder_dims[stack] as u64;
-            if stack > 0 {
-                tensors.push(tensor_entry(
-                    &format!("encoder.encoders.{stack}.downsample.bias"),
-                    vec![metadata.downsampling_factors[stack] as u64],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("encoder.encoders.{stack}.out_combiner.bypass_scale"),
-                    vec![dim],
-                ));
-            }
-            let kernel = metadata.cnn_module_kernels[stack] as u64;
-            let causal_kernel = (kernel as usize).div_ceil(2) as u64;
-            for layer in 0..metadata.num_encoder_layers[stack] {
-                let prefix = layer_prefix(stack, layer);
-                for name in ["feed_forward1", "feed_forward2", "feed_forward3"] {
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.in_proj.weight"),
-                        vec![dim, 2 * dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.in_proj.bias"),
-                        vec![2 * dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.out_proj.weight"),
-                        vec![2 * dim, dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.out_proj.bias"),
-                        vec![dim],
-                    ));
-                }
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.self_attn_weights.in_proj.weight"),
-                    vec![dim, 20],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.self_attn_weights.in_proj.bias"),
-                    vec![20],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.self_attn_weights.linear_pos.weight"),
-                    vec![4, 4],
-                ));
-                for name in ["self_attn1", "self_attn2"] {
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.in_proj.weight"),
-                        vec![dim, 4],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.in_proj.bias"),
-                        vec![4],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.out_proj.weight"),
-                        vec![4, dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.out_proj.bias"),
-                        vec![dim],
-                    ));
-                }
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.nonlin_attention.in_proj.weight"),
-                    vec![dim, 6],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.nonlin_attention.in_proj.bias"),
-                    vec![6],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.nonlin_attention.out_proj.weight"),
-                    vec![2, dim],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.nonlin_attention.out_proj.bias"),
-                    vec![dim],
-                ));
-                for name in ["conv_module1", "conv_module2"] {
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.in_proj.weight"),
-                        vec![dim, 2 * dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.in_proj.bias"),
-                        vec![2 * dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.depthwise_conv.causal_conv.weight"),
-                        vec![causal_kernel, 1, dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.depthwise_conv.causal_conv.bias"),
-                        vec![dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.weight"),
-                        vec![kernel, 1, dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv.bias"),
-                        vec![dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv_scale"),
-                        vec![2, dim, kernel],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.out_proj.weight"),
-                        vec![dim, dim],
-                    ));
-                    tensors.push(tensor_entry(
-                        &format!("{prefix}.{name}.out_proj.bias"),
-                        vec![dim],
-                    ));
-                }
-                tensors.push(tensor_entry(&format!("{prefix}.norm.bias"), vec![dim]));
-                tensors.push(tensor_entry(&format!("{prefix}.norm.log_scale"), vec![1]));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.bypass.bypass_scale"),
-                    vec![dim],
-                ));
-                tensors.push(tensor_entry(
-                    &format!("{prefix}.bypass_mid.bypass_scale"),
-                    vec![dim],
-                ));
-            }
-        }
-        tensors.push(tensor_entry(
-            "encoder.downsample_output.bias",
-            vec![*metadata.downsampling_factors.last().unwrap() as u64],
-        ));
-
-        let decoder_dim = metadata.decoder_dim() as u64;
-        let vocab = metadata.vocab_size as u64;
-        tensors.push(tensor_entry(
-            "decoder.embedding.weight",
-            vec![decoder_dim, vocab],
-        ));
-        tensors.push(tensor_entry(
-            "decoder.conv.weight",
-            vec![
-                metadata.decoder_context_size as u64,
-                decoder_dim / 128,
-                decoder_dim,
-            ],
-        ));
-
-        let joiner = metadata.joiner_dim as u64;
-        let enc_out = metadata.encoder_output_dim() as u64;
-        tensors.push(tensor_entry(
-            "joiner.encoder_proj.weight",
-            vec![enc_out, joiner],
-        ));
-        tensors.push(tensor_entry("joiner.encoder_proj.bias", vec![joiner]));
-        tensors.push(tensor_entry(
-            "joiner.decoder_proj.weight",
-            vec![joiner, joiner],
-        ));
-        tensors.push(tensor_entry("joiner.decoder_proj.bias", vec![joiner]));
-        tensors.push(tensor_entry(
-            "joiner.output_linear.weight",
-            vec![joiner, vocab],
-        ));
-        tensors.push(tensor_entry("joiner.output_linear.bias", vec![vocab]));
-        tensors
+        xasr_zipformer_minimal_runtime_tensors(metadata)
+            .into_iter()
+            .map(|(name, dims)| GgufTensorMetadata {
+                name,
+                dims,
+                ggml_type: 0,
+                type_name: "f32".to_string(),
+                size_bytes: 0,
+                offset_bytes: 0,
+            })
+            .collect()
     }
 
     fn tensor_index_from(tensors: Vec<GgufTensorMetadata>) -> GgufTensorIndex {
@@ -1150,5 +832,91 @@ mod tests {
             error,
             XasrTensorContractError::InvalidTensorShape { .. }
         ));
+    }
+
+    /// The requirement enumeration IS the loader's read set: pin it on the full
+    /// production geometry (the published X-ASR checkpoint's architecture). Any
+    /// drift between what the validator requires and what the loader resolves
+    /// shows up here as a name/count change. Regression anchor for the incident
+    /// where the admission validator demanded compacted names without the
+    /// `.weight` suffix (`EE.conv.0`) while the loader reads `EE.conv.0.weight`,
+    /// rejecting every published pack at preflight.
+    #[test]
+    fn requirement_set_matches_the_loader_read_set_on_production_geometry() {
+        let parsed = parse_xasr_zipformer_execution_metadata(&metadata()).expect("parse");
+        let requirements = xasr_zipformer_runtime_tensor_requirements(&parsed);
+        // The published X-ASR pack ships exactly 966 tensors and the loader
+        // reads every one of them (see the ONNX round-trip import test).
+        assert_eq!(
+            requirements.len(),
+            966,
+            "the requirement set must stay exactly the loader read set"
+        );
+        let names: std::collections::BTreeSet<String> = requirements
+            .iter()
+            .map(|requirement| compact_xasr_name(&requirement.upstream_name))
+            .collect();
+        assert_eq!(
+            names.len(),
+            requirements.len(),
+            "compacted requirement names must be unique"
+        );
+        // Embed conv weights carry the `.weight` suffix the loader reads.
+        for name in [
+            "EE.conv.0.weight",
+            "EE.conv.4.weight",
+            "EE.conv.7.weight",
+            "EE.CX.DW.weight",
+            "EE.CX.PW1.weight",
+            "EE.CX.PW2.weight",
+            "EE.out.weight",
+            "E0.L0.FF1.IP.weight",
+            "E5.L1.CM2.OP.bias",
+            "E3.DS.bias",
+            "E3.out_combiner.BY_scale",
+            "encoder.DS_output.bias",
+            "decoder.EMB.weight",
+            "decoder.conv.weight",
+            "joiner.encoder_proj.weight",
+            "joiner.OL.weight",
+            "joiner.OL.bias",
+        ] {
+            assert!(names.contains(name), "requirement set must contain {name}");
+        }
+    }
+
+    /// Ground-truth set equality against a host-local imported pack (skipped
+    /// when absent so weight-free CI stays green): the required set must equal
+    /// the stored tensor set of the real ONNX-derived X-ASR pack, which is
+    /// exactly the set the runtime loader reads.
+    #[test]
+    #[ignore = "host-local: validates against the imported ONNX X-ASR pack"]
+    fn requirement_set_equals_the_real_pack_tensor_set() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-fp16.oasr");
+        if !path.exists() {
+            eprintln!("skipping: xasr ONNX fp16 pack absent at {}", path.display());
+            return;
+        }
+        let index = crate::read_gguf_tensor_index(&path).expect("read pack tensor index");
+        let pack_metadata = crate::ggml_runtime::read_gguf_metadata(&path).expect("metadata");
+        let parsed = parse_xasr_zipformer_execution_metadata(&pack_metadata).expect("parse");
+        let required: std::collections::BTreeSet<String> =
+            xasr_zipformer_runtime_tensor_requirements(&parsed)
+                .iter()
+                .map(|requirement| compact_xasr_name(&requirement.upstream_name))
+                .collect();
+        let stored: std::collections::BTreeSet<String> = index
+            .tensors()
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect();
+        let missing: Vec<&String> = stored.difference(&required).collect();
+        let extra: Vec<&String> = required.difference(&stored).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "requirement set and pack tensor set must be equal; \
+             required-but-absent={missing:?} present-but-not-required={extra:?}"
+        );
     }
 }
