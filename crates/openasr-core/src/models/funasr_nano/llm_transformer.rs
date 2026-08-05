@@ -16,18 +16,14 @@ use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
-    QwenFamilyLlmLayerTensorNames, QwenWholeDecoderPlan,
-    load_llm_logits_head_from_reader_with_tensor_names,
+    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 
 use super::runtime_contract::{
     FUNASR_NANO_RMS_NORM_EPSILON, FUNASR_NANO_ROPE_THETA, FunasrNanoDecoderMetadata,
 };
-use super::tensor_names::{
-    LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT,
-    funasr_nano_llm_layer_tensor_names,
-};
+use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
 /// Exact Rust/system-memory quote for one resident FunASR-Nano decoder actor.
 /// Native ggml arenas account their own backend-domain allocations; this quote
@@ -44,25 +40,7 @@ pub(crate) fn quoted_funasr_nano_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        |layer_index| {
-            let names = funasr_nano_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                q_norm_name: Some(names.attn_q_norm_weight),
-                k_norm_name: Some(names.attn_k_norm_weight),
-                q_bias_name: None,
-                k_bias_name: None,
-                v_bias_name: None,
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
+        super::runtime_contract::funasr_nano_qwen_family_layer_names,
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -131,27 +109,7 @@ fn plan_whole_decoder(
         metadata.n_heads,
         metadata.n_kv_heads,
         metadata.head_dim,
-        |layer_index| {
-            let names = funasr_nano_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                // Qwen3 has QK-norm (unlike Qwen2).
-                q_norm_name: Some(names.attn_q_norm_weight),
-                k_norm_name: Some(names.attn_k_norm_weight),
-                // Qwen3 has no attention bias.
-                q_bias_name: None,
-                k_bias_name: None,
-                v_bias_name: None,
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
+        super::runtime_contract::funasr_nano_qwen_family_layer_names,
     )
     .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
         reason: error.to_string(),

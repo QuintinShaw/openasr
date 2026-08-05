@@ -586,84 +586,6 @@ fn adaptor_block_tensor_descriptors(
 /// name set. Derived extents use saturating arithmetic: parsing caps every
 /// input, so saturation is unreachable defense in depth that stays
 /// fail-closed at validation.
-fn llm_layer_tensor_descriptors(
-    decoder: &FunasrNanoDecoderMetadata,
-    layer: usize,
-) -> Vec<TensorBindingDescriptor> {
-    use super::tensor_names::funasr_nano_llm_layer_tensor_names;
-    let names = funasr_nano_llm_layer_tensor_names(layer);
-    let d_model = decoder.d_model;
-    let q_dim = decoder.n_heads.saturating_mul(decoder.head_dim);
-    let kv_dim = decoder.n_kv_heads.saturating_mul(decoder.head_dim);
-    let entries: [(String, TensorBindingDescriptorRequirement, &str); 11] = [
-        (
-            names.attn_norm_weight,
-            TensorBindingDescriptorRequirement::VectorLen(d_model),
-            "attention RMSNorm must span d_model",
-        ),
-        (
-            names.attn_q_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, q_dim),
-            "query projection must map d_model to n_heads*head_dim",
-        ),
-        (
-            names.attn_k_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, kv_dim),
-            "key projection must map d_model to n_kv_heads*head_dim",
-        ),
-        (
-            names.attn_v_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, kv_dim),
-            "value projection must map d_model to n_kv_heads*head_dim",
-        ),
-        (
-            names.attn_output_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(q_dim, d_model),
-            "attention output projection must map n_heads*head_dim to d_model",
-        ),
-        (
-            names.attn_q_norm_weight,
-            TensorBindingDescriptorRequirement::VectorLen(decoder.head_dim),
-            "QK-norm query RMSNorm must span head_dim",
-        ),
-        (
-            names.attn_k_norm_weight,
-            TensorBindingDescriptorRequirement::VectorLen(decoder.head_dim),
-            "QK-norm key RMSNorm must span head_dim",
-        ),
-        (
-            names.ffn_norm_weight,
-            TensorBindingDescriptorRequirement::VectorLen(d_model),
-            "FFN RMSNorm must span d_model",
-        ),
-        (
-            names.ffn_gate_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, decoder.ffn_dim),
-            "FFN gate projection must map d_model to ffn_dim",
-        ),
-        (
-            names.ffn_up_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, decoder.ffn_dim),
-            "FFN up projection must map d_model to ffn_dim",
-        ),
-        (
-            names.ffn_down_weight,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(decoder.ffn_dim, d_model),
-            "FFN down projection must map ffn_dim to d_model",
-        ),
-    ];
-    entries
-        .into_iter()
-        .map(
-            |(tensor_name, requirement, reason)| TensorBindingDescriptor {
-                tensor_name,
-                requirement,
-                reason: reason.to_string(),
-            },
-        )
-        .collect()
-}
-
 /// The SAN-M encoder half of the contract: every `enc.blk` / `tp.blk` block
 /// plus the four tail LayerNorms. The encoder weight loader reads exactly
 /// this set; the read guard below enforces it at load time.
@@ -755,41 +677,72 @@ pub(crate) fn funasr_nano_adapter_tensor_descriptors(
     descriptors
 }
 
+/// Map funasr-nano decoder metadata onto the shared Qwen-shaped geometry.
+fn funasr_nano_qwen_decoder_geometry(
+    decoder: &FunasrNanoDecoderMetadata,
+) -> crate::models::qwen::QwenDecoderContractGeometry {
+    crate::models::qwen::QwenDecoderContractGeometry {
+        n_layers: decoder.n_layers,
+        d_model: decoder.d_model,
+        n_heads: decoder.n_heads,
+        n_kv_heads: decoder.n_kv_heads,
+        head_dim: decoder.head_dim,
+        ffn_dim: decoder.ffn_dim,
+        vocab_size: decoder.vocab_size,
+    }
+}
+
+/// Layer name provider shared with [`super::llm_transformer::plan_whole_decoder`].
+pub(crate) fn funasr_nano_qwen_family_layer_names(
+    layer: usize,
+) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+    use super::tensor_names::funasr_nano_llm_layer_tensor_names;
+    let names = funasr_nano_llm_layer_tensor_names(layer);
+    crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+        attn_norm_name: names.attn_norm_weight,
+        attn_q_name: names.attn_q_weight,
+        attn_k_name: names.attn_k_weight,
+        attn_v_name: names.attn_v_weight,
+        attn_output_name: names.attn_output_weight,
+        q_norm_name: Some(names.attn_q_norm_weight),
+        k_norm_name: Some(names.attn_k_norm_weight),
+        q_bias_name: None,
+        k_bias_name: None,
+        v_bias_name: None,
+        ffn_norm_name: names.ffn_norm_weight,
+        ffn_gate_name: names.ffn_gate_weight,
+        ffn_up_name: names.ffn_up_weight,
+        ffn_down_name: names.ffn_down_weight,
+    }
+}
+
 /// The Qwen3 decoder half of the contract: every decoder layer (named by the
 /// loader's own name source) plus the final norm, logits head, and token
-/// embedding (named by the shared `tensor_names` constants the loader reads).
+/// embedding. Expanded from the shared Qwen decoder contract Module so the
+/// 11-tensor layer pattern cannot drift from MOSS / MiMo / FireRed2-LLM.
 pub(crate) fn funasr_nano_decoder_tensor_descriptors(
     decoder: &FunasrNanoDecoderMetadata,
 ) -> Vec<TensorBindingDescriptor> {
     use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
-    let mut descriptors = Vec::new();
-    for layer in 0..decoder.n_layers {
-        descriptors.extend(llm_layer_tensor_descriptors(decoder, layer));
-    }
-    descriptors.extend([
-        descriptor(
-            LLM_OUTPUT_NORM_WEIGHT.to_string(),
-            TensorBindingDescriptorRequirement::VectorLen(decoder.d_model),
-            "final RMSNorm before the logits head must span d_model",
-        ),
-        descriptor(
-            LLM_OUTPUT_WEIGHT.to_string(),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(
-                decoder.d_model,
-                decoder.vocab_size,
-            ),
-            "logits head must project d_model to the vocab",
-        ),
-        descriptor(
-            LLM_TOKEN_EMBD_WEIGHT.to_string(),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(
-                decoder.d_model,
-                decoder.vocab_size,
-            ),
-            "token embedding table must be d_model x vocab",
-        ),
-    ]);
-    descriptors
+    use crate::models::qwen::{
+        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
+        qwen_decoder_runtime_tensor_descriptors,
+    };
+    qwen_decoder_runtime_tensor_descriptors(
+        &funasr_nano_qwen_decoder_geometry(decoder),
+        QwenDecoderContractOptions::QWEN3,
+        funasr_nano_qwen_family_layer_names,
+        QwenDecoderTailTensorNames {
+            output_norm: LLM_OUTPUT_NORM_WEIGHT,
+            output_weight: Some(LLM_OUTPUT_WEIGHT),
+            token_embd: LLM_TOKEN_EMBD_WEIGHT,
+        },
+    )
+    .unwrap_or_else(|reason| {
+        // Metadata parse already enforces the geometry pins the shared Module
+        // re-checks; a failure here is a programming error, not pack input.
+        panic!("funasr-nano decoder geometry rejected by shared Qwen contract: {reason}")
+    })
 }
 
 /// The runtime tensor contract for one funasr-nano pack: every tensor the

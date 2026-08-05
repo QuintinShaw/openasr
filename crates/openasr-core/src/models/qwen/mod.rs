@@ -3,6 +3,7 @@ mod batched_decode;
 pub(crate) mod capacity;
 mod decode_budget;
 mod decode_prompt;
+pub(crate) mod decoder_contract;
 mod forced_aligner_align_text;
 mod forced_aligner_import;
 pub(crate) mod forced_aligner_pack;
@@ -28,6 +29,10 @@ pub(crate) use audio_encoder::{
     Qwen3AsrAudioEncoderWeights, load_qwen3_audio_encoder_weights_from_reader,
 };
 pub(crate) use decode_prompt::Qwen3AsrDecodePrompt;
+pub(crate) use decoder_contract::{
+    QwenDecoderContractGeometry, QwenDecoderContractOptions, QwenDecoderTailTensorNames,
+    qwen_decoder_runtime_tensor_descriptors,
+};
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
     Qwen3ForcedAlignerLocalSourceError, Qwen3ForcedAlignerLocalSourceImportRequest,
