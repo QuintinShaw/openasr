@@ -12,6 +12,7 @@
 
 use crate::adapter_pack::is_qwen3_asr_lora_target_tensor_name;
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
+use crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy;
 use crate::models::lora_adapter::{
     LoraResolveError, ResolvedLoraAdapter, ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle,
     adapter_cache_fingerprint, resolve_lora_adapter,
@@ -52,6 +53,11 @@ pub(crate) fn qwen_adapter_cache_fingerprint(adapter: Option<&QwenLoraAdapter>) 
 
 /// Resolve the active adapter for a qwen execution. Returns `Ok(None)` when no
 /// adapter is configured. Fail-closed on every mismatch class.
+///
+/// The cache contract id is the typed `GgmlAdapterBindingStrategy` label the
+/// inventory row declares for this family -- the executable binding facet is
+/// the single source of truth, so the resolution key can never drift from the
+/// descriptor.
 pub(crate) fn resolve_qwen_lora_adapter(
     cache: &ResolvedLoraAdapterCache,
     request_adapter_path: Option<&Path>,
@@ -61,7 +67,7 @@ pub(crate) fn resolve_qwen_lora_adapter(
         cache,
         request_adapter_path,
         preflight,
-        "qwen3-asr-lora-v1",
+        GgmlAdapterBindingStrategy::Qwen3AsrLoraV1.label(),
         is_qwen3_asr_lora_target_tensor_name,
         "qwen3-asr LLM",
         QWEN_LORA_ALLOWED_TARGETS,

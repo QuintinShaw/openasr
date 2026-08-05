@@ -2235,10 +2235,10 @@ mod tests {
         assert!(matches!(
             error,
             GgmlAsrExecutionError::AdapterBindingContractMismatch {
-                declared: "qwen3-asr-lora-v1",
+                declared,
                 provided: "unsupported",
                 ..
-            }
+            } if declared == GgmlAdapterBindingStrategy::Qwen3AsrLoraV1.label()
         ));
     }
 
