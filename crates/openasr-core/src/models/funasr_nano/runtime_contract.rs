@@ -823,9 +823,15 @@ pub(crate) fn funasr_nano_adapter_read_guard(
     TensorReadGuard::from_descriptors(&funasr_nano_adapter_tensor_descriptors(adapter))
 }
 
-/// Read guard for the decoder half: installed as an opt-in index allowlist
-/// around the shared Qwen planner/logits/embedding loaders so every by-name
-/// `get` fails closed on names outside this contract set.
+/// Read guard for the decoder half: built from the contract enumeration so
+/// local name-set checks (and tests) can fail closed on any tensor the
+/// decoder logic does not list. Production decoder load does not install this
+/// onto the shared tensor index -- FunASR packs are encoder+adapter+decoder
+/// combos, and the whole-decoder weight context must enumerate every pack
+/// tensor. Admission-time
+/// [`validate_funasr_nano_runtime_tensors_with_index`] plus known-name shape
+/// checks in the shared Qwen planner remain the fail-closed path.
+#[cfg(test)]
 pub(crate) fn funasr_nano_decoder_read_guard(
     decoder: &FunasrNanoDecoderMetadata,
 ) -> TensorReadGuard {
@@ -1010,8 +1016,8 @@ mod tests {
     /// 2x16 block tensors), and the 28-layer Qwen3 decoder (11 weights per
     /// layer + norm/logits/embedding)). Loader-equivalence evidence lives in
     /// the traced full-load tests: encoder half in `encoder_graph::trace_tests`,
-    /// decoder half in `llm_transformer::trace_tests` (index allowlist +
-    /// plan/logits/embedding access trace). Adaptor half still pins name-source
+    /// decoder half in `llm_transformer::trace_tests` (logical plan/logits/
+    /// embedding access trace plus combo-pack `new_from_preflight`). Adaptor half still pins name-source
     /// equality below; this test holds the enumeration's production shape stable.
     #[test]
     fn descriptor_set_stays_pinned_on_production_geometry() {
