@@ -7,23 +7,25 @@
 //! admission validator cannot drift from the shared loader/graph either way.
 //!
 //! Shape checks mirror the loader's strictness and the graph's fixed layout:
-//! norms and biases pin their exact metadata-derived length, 2-D projections
-//! pin their two extents in either stored orientation, the conformer depthwise
-//! kernel pins its exact `[conv_kernel, 1, hidden]` ggml layout, and the
-//! dw-striding subsampling prelude pins every conv kernel to the ExactDims the
-//! shared graph consumes (3x3 / depthwise / 1x1) plus the flatten width derived
+//! norms and biases pin their exact metadata-derived length, every 2-D
+//! projection that feeds `mul_mat` / a fixed graph layout pins its ordered
+//! ggml `[in, out]` extents via `ExactDims` (matching the importer's HF
+//! `[out, in]` -> ggml reverse), the conformer depthwise kernel pins its
+//! exact `[conv_kernel, 1, hidden]` ggml layout, and the dw-striding
+//! subsampling prelude pins every conv kernel to the ExactDims the shared
+//! graph consumes (3x3 / depthwise / 1x1) plus the flatten width derived
 //! from `n_mels` through the same `conv_out_dim` the graph uses.
 //!
 //! Overflow safety: the geometry arrives already bounded by each family's
 //! metadata parser (architecture ceilings checked fail-closed at parse time),
-//! so the few derived extents computed here use saturating arithmetic as
-//! defense in depth -- a hypothetical saturation produces a requirement no
-//! pack tensor can satisfy, which stays fail-closed at validation instead of
-//! wrapping into an admitting shape.
+//! so the few derived extents computed here use checked arithmetic and fall
+//! back to a saturated requirement no pack tensor can satisfy -- a
+//! hypothetical overflow stays fail-closed at validation instead of wrapping
+//! into an admitting shape.
 
 use crate::models::tensor_binding::{TensorBindingDescriptor, TensorBindingDescriptorRequirement};
 
-use super::graph::{SUBSAMPLING_KERNEL, conv_out_dim};
+use super::graph::{SUBSAMPLING_KERNEL, SUBSAMPLING_PADDING, SUBSAMPLING_STRIDE};
 
 /// The metadata-derived geometry one FastConformer encoder's tensor contract
 /// is shaped for.
@@ -49,14 +51,22 @@ pub(crate) struct FastConformerContractGeometry {
     pub bias_present: bool,
 }
 
+/// Checked form of the graph's three-stage dw-striding frequency shrink:
+/// `(input + 2*pad - kernel) / stride + 1` with pad=1, kernel=3, stride=2.
+/// Returns `None` when the intermediate add/sub would wrap.
+pub(crate) fn conv_out_dim_checked(input: usize) -> Option<usize> {
+    let padded = input.checked_add(2usize.checked_mul(SUBSAMPLING_PADDING)?)?;
+    let reduced = padded.checked_sub(SUBSAMPLING_KERNEL)?;
+    Some(reduced / SUBSAMPLING_STRIDE + 1)
+}
+
 /// Frequency extent after the three fixed stride-2 dw-striding stages the
 /// shared graph always runs. Same formula as `graph::build_conformer_stack`
 /// (`conv_out_dim` thrice); checked so a pathological `n_mels` cannot wrap.
 pub(crate) fn fastconformer_subsampled_freq(n_mels: usize) -> Option<usize> {
-    // conv_out_dim is pure integer arithmetic and cannot overflow usize for
-    // any representable input, but keep the Option chain so callers share one
-    // fail-closed style with the flatten-width product below.
-    Some(conv_out_dim(conv_out_dim(conv_out_dim(n_mels))))
+    let after0 = conv_out_dim_checked(n_mels)?;
+    let after1 = conv_out_dim_checked(after0)?;
+    conv_out_dim_checked(after1)
 }
 
 /// Flatten width the subsampling linear consumes: `channels * freq'` where
@@ -89,7 +99,7 @@ fn descriptor(
 /// - layer 0: ordinary 3×3, in=1 (mel), out=channels → `[3,3,1,channels]`
 /// - layers 2/5: depthwise 3×3 → `[3,3,1,channels]` (ggml `conv_2d_dw`)
 /// - layers 3/6: pointwise 1×1 → `[1,1,channels,channels]`
-/// - linear: either orientation of `[flatten, hidden]` where
+/// - linear: ordered ggml `[flatten, hidden]` (`mul_mat` weight layout) where
 ///   `flatten = channels * conv_out_dim³(n_mels)`
 ///
 /// The shared graph consumes every one of them unconditionally, so the
@@ -149,8 +159,8 @@ pub(crate) fn fastconformer_subsampling_tensor_descriptors(
     }
     descriptors.push(descriptor(
         "enc.sub.linear.weight".to_string(),
-        TensorBindingDescriptorRequirement::Rank2EitherDims(flatten, hidden),
-        "subsampling linear must map the exact flatten width (channels * freq') to hidden_size",
+        TensorBindingDescriptorRequirement::ExactDims(vec![flatten, hidden]),
+        "subsampling linear must be ggml [flatten, hidden] for mul_mat (channels * freq' -> hidden_size)",
     ));
     descriptors.push(descriptor(
         "enc.sub.linear.bias".to_string(),
@@ -170,6 +180,7 @@ fn fastconformer_layer_tensor_descriptors(
 ) -> Vec<TensorBindingDescriptor> {
     let hidden = geometry.hidden_size;
     let ffn = geometry.ffn_dim;
+    let pw1_out = hidden.saturating_mul(2);
     let n = |suffix: &str| format!("enc.blk.{layer}.{suffix}");
     let mut descriptors = vec![
         descriptor(
@@ -184,8 +195,8 @@ fn fastconformer_layer_tensor_descriptors(
         ),
         descriptor(
             n("ff1.up.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, ffn),
-            "first FFN up projection must map hidden_size to ffn_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![hidden, ffn]),
+            "first FFN up projection must be ggml [hidden, ffn] for mul_mat",
         ),
     ];
     if geometry.bias_present {
@@ -197,8 +208,8 @@ fn fastconformer_layer_tensor_descriptors(
     }
     descriptors.push(descriptor(
         n("ff1.down.weight"),
-        TensorBindingDescriptorRequirement::Rank2EitherDims(ffn, hidden),
-        "first FFN down projection must map ffn_dim to hidden_size",
+        TensorBindingDescriptorRequirement::ExactDims(vec![ffn, hidden]),
+        "first FFN down projection must be ggml [ffn, hidden] for mul_mat",
     ));
     if geometry.bias_present {
         descriptors.push(descriptor(
@@ -222,8 +233,8 @@ fn fastconformer_layer_tensor_descriptors(
     for projection in ["q", "k", "v"] {
         descriptors.push(descriptor(
             n(&format!("attn.{projection}.weight")),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, hidden),
-            "attention projection must be hidden_size x hidden_size",
+            TensorBindingDescriptorRequirement::ExactDims(vec![hidden, hidden]),
+            "attention projection must be ggml [hidden, hidden] for mul_mat",
         ));
         if geometry.bias_present {
             descriptors.push(descriptor(
@@ -235,8 +246,8 @@ fn fastconformer_layer_tensor_descriptors(
     }
     descriptors.push(descriptor(
         n("attn.out.weight"),
-        TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, hidden),
-        "attention output projection must be hidden_size x hidden_size",
+        TensorBindingDescriptorRequirement::ExactDims(vec![hidden, hidden]),
+        "attention output projection must be ggml [hidden, hidden] for mul_mat",
     ));
     if geometry.bias_present {
         descriptors.push(descriptor(
@@ -248,24 +259,24 @@ fn fastconformer_layer_tensor_descriptors(
     descriptors.extend([
         descriptor(
             n("attn.pos.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, hidden),
-            "relative position projection must be hidden_size x hidden_size",
+            TensorBindingDescriptorRequirement::ExactDims(vec![hidden, hidden]),
+            "relative position projection must be ggml [hidden, hidden] for mul_mat",
         ),
         descriptor(
             n("attn.pos_bias_u"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(
+            TensorBindingDescriptorRequirement::ExactDims(vec![
                 geometry.head_dim,
                 geometry.n_heads,
-            ),
-            "Transformer-XL pos_bias_u must be head_dim x n_heads",
+            ]),
+            "Transformer-XL pos_bias_u must be ggml [head_dim, n_heads] after importer reverse",
         ),
         descriptor(
             n("attn.pos_bias_v"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(
+            TensorBindingDescriptorRequirement::ExactDims(vec![
                 geometry.head_dim,
                 geometry.n_heads,
-            ),
-            "Transformer-XL pos_bias_v must be head_dim x n_heads",
+            ]),
+            "Transformer-XL pos_bias_v must be ggml [head_dim, n_heads] after importer reverse",
         ),
         descriptor(
             n("conv.norm.weight"),
@@ -279,14 +290,14 @@ fn fastconformer_layer_tensor_descriptors(
         ),
         descriptor(
             n("conv.pw1.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, hidden.saturating_mul(2)),
-            "conv pointwise1 must map hidden_size to 2*hidden_size (GLU)",
+            TensorBindingDescriptorRequirement::ExactDims(vec![hidden, pw1_out]),
+            "conv pointwise1 must be ggml [hidden, 2*hidden] for mul_mat (GLU)",
         ),
     ]);
     if geometry.bias_present {
         descriptors.push(descriptor(
             n("conv.pw1.bias"),
-            TensorBindingDescriptorRequirement::VectorLen(hidden.saturating_mul(2)),
+            TensorBindingDescriptorRequirement::VectorLen(pw1_out),
             "conv pointwise1 bias must span 2*hidden_size",
         ));
     }
@@ -327,8 +338,8 @@ fn fastconformer_layer_tensor_descriptors(
     }
     descriptors.push(descriptor(
         n("conv.pw2.weight"),
-        TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, hidden),
-        "conv pointwise2 must map hidden_size to hidden_size",
+        TensorBindingDescriptorRequirement::ExactDims(vec![hidden, hidden]),
+        "conv pointwise2 must be ggml [hidden, hidden] for mul_mat",
     ));
     if geometry.bias_present {
         descriptors.push(descriptor(
@@ -350,8 +361,8 @@ fn fastconformer_layer_tensor_descriptors(
         ),
         descriptor(
             n("ff2.up.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, ffn),
-            "second FFN up projection must map hidden_size to ffn_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![hidden, ffn]),
+            "second FFN up projection must be ggml [hidden, ffn] for mul_mat",
         ),
     ]);
     if geometry.bias_present {
@@ -363,8 +374,8 @@ fn fastconformer_layer_tensor_descriptors(
     }
     descriptors.push(descriptor(
         n("ff2.down.weight"),
-        TensorBindingDescriptorRequirement::Rank2EitherDims(ffn, hidden),
-        "second FFN down projection must map ffn_dim to hidden_size",
+        TensorBindingDescriptorRequirement::ExactDims(vec![ffn, hidden]),
+        "second FFN down projection must be ggml [ffn, hidden] for mul_mat",
     ));
     if geometry.bias_present {
         descriptors.push(descriptor(
@@ -495,7 +506,48 @@ mod tests {
         );
         assert_eq!(
             by_name["enc.sub.linear.weight"],
-            &TensorBindingDescriptorRequirement::Rank2EitherDims(flatten, g.hidden_size)
+            &TensorBindingDescriptorRequirement::ExactDims(vec![flatten, g.hidden_size])
+        );
+    }
+
+    #[test]
+    fn conv_out_dim_checked_rejects_overflowing_input() {
+        assert_eq!(conv_out_dim_checked(0), None);
+        assert_eq!(conv_out_dim_checked(usize::MAX), None);
+        assert_eq!(fastconformer_subsampled_freq(usize::MAX), None);
+    }
+
+    #[test]
+    fn layer_descriptors_pin_ordered_ggml_in_out_weight_dims() {
+        let g = geometry();
+        let descriptors = fastconformer_layer_tensor_descriptors(&g, 0);
+        let by_name: std::collections::BTreeMap<_, _> = descriptors
+            .iter()
+            .map(|d| (d.tensor_name.as_str(), &d.requirement))
+            .collect();
+        assert_eq!(
+            by_name["enc.blk.0.ff1.up.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![g.hidden_size, g.ffn_dim])
+        );
+        assert_eq!(
+            by_name["enc.blk.0.ff1.down.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![g.ffn_dim, g.hidden_size])
+        );
+        assert_eq!(
+            by_name["enc.blk.0.attn.q.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![g.hidden_size, g.hidden_size])
+        );
+        assert_eq!(
+            by_name["enc.blk.0.attn.pos_bias_u"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![g.head_dim, g.n_heads])
+        );
+        assert_eq!(
+            by_name["enc.blk.0.conv.pw1.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![g.hidden_size, g.hidden_size * 2])
+        );
+        assert_eq!(
+            by_name["enc.blk.0.conv.pw2.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![g.hidden_size, g.hidden_size])
         );
     }
 
