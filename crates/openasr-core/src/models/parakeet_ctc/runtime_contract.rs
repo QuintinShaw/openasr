@@ -174,6 +174,7 @@ pub(crate) fn parse_parakeet_ctc_execution_metadata<M: ScalarMetadataView>(
             conv_kernel,
             n_heads,
             head_dim,
+            n_mels,
             subsampling_channels,
             bias_present: true,
         })
@@ -256,6 +257,7 @@ fn parakeet_ctc_contract_geometry(
         conv_kernel: metadata.conv_kernel,
         n_heads: metadata.n_heads,
         head_dim: metadata.head_dim,
+        n_mels: metadata.n_mels,
         subsampling_channels: metadata.subsampling_channels,
         // The parakeet-ctc checkpoint ships every conformer bias tensor.
         bias_present: true,

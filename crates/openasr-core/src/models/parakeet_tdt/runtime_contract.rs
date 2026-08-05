@@ -278,6 +278,7 @@ pub(crate) fn parse_parakeet_tdt_execution_metadata(
             conv_kernel,
             n_heads,
             head_dim,
+            n_mels,
             subsampling_channels,
         ));
     let total_obligations =
@@ -366,6 +367,7 @@ fn parakeet_tdt_contract_geometry(
         metadata.conv_kernel,
         metadata.n_heads,
         metadata.head_dim,
+        metadata.n_mels,
         metadata.subsampling_channels,
     )
 }
@@ -377,6 +379,7 @@ fn parakeet_tdt_contract_geometry_fields(
     conv_kernel: usize,
     n_heads: usize,
     head_dim: usize,
+    n_mels: usize,
     subsampling_channels: usize,
 ) -> FastConformerContractGeometry {
     FastConformerContractGeometry {
@@ -386,6 +389,7 @@ fn parakeet_tdt_contract_geometry_fields(
         conv_kernel,
         n_heads,
         head_dim,
+        n_mels,
         subsampling_channels,
         // v3 ships no attn/conv/FFN bias tensors; the loader synthesizes zeros.
         bias_present: false,
