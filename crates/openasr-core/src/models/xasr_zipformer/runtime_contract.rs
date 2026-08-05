@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::GgufTensorIndex;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
-    u64_to_u32, u64_to_usize, validate_positive_usize,
+    u64_to_u32, u64_to_usize, validate_bounded_usize, validate_positive_usize,
 };
 
 use super::encoder_weights::layer_prefix;
@@ -29,6 +29,37 @@ pub(crate) const XASR_JOINER_DIM_KEY: &str = "xasr.joiner_dim";
 pub(crate) const XASR_DECODER_CONTEXT_SIZE_KEY: &str = "xasr.decoder_context_size";
 pub(crate) const XASR_VOCAB_SIZE_KEY: &str = "xasr.vocab_size";
 pub(crate) const XASR_BLANK_ID_KEY: &str = "xasr.blank_id";
+
+/// The decoder's causal conv runs as a grouped convolution with exactly 128
+/// groups: the loader and the graph hardcode the group count, so the stored
+/// kernel's middle extent is `decoder_dim / 128` and the runtime tensor
+/// contract pins the full `[context_size, decoder_dim / 128, decoder_dim]`
+/// shape. Parsing rejects a decoder dim that cannot form those 128 groups.
+pub(crate) const XASR_DECODER_CONV_GROUPS: usize = 128;
+
+/// Architecture-constant input width of the `encoder_embed.out` projection
+/// (the flattened conv-stem output the loader pins), carried by the runtime
+/// tensor contract instead of duplicated loader literals.
+pub(crate) const XASR_ENCODER_EMBED_INPUT_DIM: usize = 2432;
+
+/// Architecture ceilings for pack-supplied geometry, with generous headroom
+/// over the published checkpoint (6 stacks, 19 encoder layers, dims up to
+/// 768, joiner 512, vocab 5000). They bound every contract-derived
+/// arithmetic expression and the requirement count a malicious metadata set
+/// can construct, so contract building stays allocation-bounded and
+/// overflow-free on untrusted input; parse fails closed above them.
+pub(crate) const XASR_MAX_NUM_STACKS: usize = 64;
+pub(crate) const XASR_MAX_TOTAL_ENCODER_LAYERS: usize = 4096;
+pub(crate) const XASR_MAX_ENCODER_DIM: usize = 65_536;
+pub(crate) const XASR_MAX_HEAD_COUNT: usize = 1_024;
+pub(crate) const XASR_MAX_HEAD_DIM: usize = 65_536;
+pub(crate) const XASR_MAX_CNN_KERNEL: usize = 4_096;
+pub(crate) const XASR_MAX_LEFT_CONTEXT: usize = 65_536;
+pub(crate) const XASR_MAX_DOWNSAMPLING_FACTOR: usize = 1_024;
+pub(crate) const XASR_MAX_FEATURE_DIM: usize = 4_096;
+pub(crate) const XASR_MAX_DECODE_CHUNK_LEN: usize = 4_096;
+pub(crate) const XASR_MAX_JOINER_DIM: usize = 65_536;
+pub(crate) const XASR_MAX_VOCAB_SIZE: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct XasrZipformerExecutionMetadata {
@@ -134,6 +165,73 @@ pub(crate) fn parse_xasr_zipformer_execution_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
+    // Architecture ceilings: keep contract construction bounded and
+    // overflow-free on untrusted metadata (fail closed above them).
+    validate_bounded_usize(num_stacks, XASR_NUM_STACKS_KEY, XASR_MAX_NUM_STACKS)?;
+    for (key, values, max) in [
+        (
+            XASR_NUM_ENCODER_LAYERS_KEY,
+            &num_encoder_layers,
+            XASR_MAX_TOTAL_ENCODER_LAYERS,
+        ),
+        (XASR_ENCODER_DIMS_KEY, &encoder_dims, XASR_MAX_ENCODER_DIM),
+        (
+            XASR_QUERY_HEAD_DIMS_KEY,
+            &query_head_dims,
+            XASR_MAX_HEAD_DIM,
+        ),
+        (
+            XASR_VALUE_HEAD_DIMS_KEY,
+            &value_head_dims,
+            XASR_MAX_HEAD_DIM,
+        ),
+        (XASR_NUM_HEADS_KEY, &num_heads, XASR_MAX_HEAD_COUNT),
+        (
+            XASR_CNN_MODULE_KERNELS_KEY,
+            &cnn_module_kernels,
+            XASR_MAX_CNN_KERNEL,
+        ),
+        (
+            XASR_LEFT_CONTEXT_LEN_KEY,
+            &left_context_len,
+            XASR_MAX_LEFT_CONTEXT,
+        ),
+        (
+            XASR_DOWNSAMPLING_FACTORS_KEY,
+            &downsampling_factors,
+            XASR_MAX_DOWNSAMPLING_FACTOR,
+        ),
+    ] {
+        for value in values {
+            validate_bounded_usize(*value, key, max)?;
+        }
+    }
+    // Bound the total encoder layer count (and therefore the requirement
+    // enumeration size) with checked accumulation, fail-closed.
+    let total_layers = num_encoder_layers
+        .iter()
+        .try_fold(0usize, |total, layers| total.checked_add(*layers))
+        .ok_or_else(|| MetadataContractError::InvalidValue {
+            key: XASR_NUM_ENCODER_LAYERS_KEY,
+            reason: "total encoder layer count overflows".to_string(),
+        })?;
+    validate_bounded_usize(
+        total_layers,
+        XASR_NUM_ENCODER_LAYERS_KEY,
+        XASR_MAX_TOTAL_ENCODER_LAYERS,
+    )?;
+    for (key, value, max) in [
+        (XASR_FEATURE_DIM_KEY, feature_dim, XASR_MAX_FEATURE_DIM),
+        (
+            XASR_DECODE_CHUNK_LEN_KEY,
+            decode_chunk_len,
+            XASR_MAX_DECODE_CHUNK_LEN,
+        ),
+        (XASR_JOINER_DIM_KEY, joiner_dim, XASR_MAX_JOINER_DIM),
+        (XASR_VOCAB_SIZE_KEY, vocab_size, XASR_MAX_VOCAB_SIZE),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
     if blank_id as usize >= vocab_size {
         return Err(MetadataContractError::InvalidValue {
             key: XASR_BLANK_ID_KEY,
@@ -145,6 +243,18 @@ pub(crate) fn parse_xasr_zipformer_execution_metadata<M: ScalarMetadataView>(
             key: XASR_DECODER_CONTEXT_SIZE_KEY,
             reason: format!(
                 "stateless X-ASR predictor expects context_size=2, got {decoder_context_size}"
+            ),
+        });
+    }
+    // The decoder causal conv is a grouped convolution with a hardcoded group
+    // count; a decoder dim that cannot form those groups has no loadable
+    // kernel shape, so fail closed at parse time instead of mid-load.
+    if joiner_dim % XASR_DECODER_CONV_GROUPS != 0 {
+        return Err(MetadataContractError::InvalidValue {
+            key: XASR_JOINER_DIM_KEY,
+            reason: format!(
+                "joiner_dim {joiner_dim} must be a multiple of the decoder conv group count \
+                 {XASR_DECODER_CONV_GROUPS}"
             ),
         });
     }
@@ -228,11 +338,11 @@ fn required_usize_list<M: ScalarMetadataView>(
 }
 
 /// The shape contract a single required xasr-zipformer tensor must satisfy at
-/// admission. Shapes fully determined by the parsed metadata (or by an
-/// architecture constant the loader pins) are checked exactly or by a fixed
-/// input/output dim; data-derived dims the loader only learns by reading bytes
-/// fall back to a rank check (the loader still enforces the exact value at
-/// runtime).
+/// admission AND at load time: shapes fully determined by the parsed metadata
+/// (or by an architecture constant the loader pins) are carried as exact dims;
+/// data-derived dims the loader only learns by reading bytes keep the partial
+/// pin the loader applies (the loader still enforces its data-derived
+/// cross-checks at runtime).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum XasrTensorShape {
     /// Dims must equal `expected` exactly.
@@ -245,6 +355,46 @@ pub(crate) enum XasrTensorShape {
     Rank2In { input_dim: usize },
     /// Rank-2 matrix whose output dim (`dims[1]`) is `output_dim`.
     Rank2Out { output_dim: usize },
+}
+
+impl XasrTensorShape {
+    /// Check stored dims against this shape at the precision it declares.
+    pub(crate) fn matches(&self, dims: &[usize]) -> bool {
+        match self {
+            XasrTensorShape::Exact(expected) => dims == expected.as_slice(),
+            XasrTensorShape::Vector(len) => dims.len() == 1 && dims[0] == *len,
+            XasrTensorShape::Rank(rank) => dims.len() == *rank,
+            XasrTensorShape::Rank2In { input_dim } => dims.len() == 2 && dims[0] == *input_dim,
+            XasrTensorShape::Rank2Out { output_dim } => dims.len() == 2 && dims[1] == *output_dim,
+        }
+    }
+
+    /// Human-readable rendering of the expectation, for fail-closed errors.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            XasrTensorShape::Exact(expected) => format!("expected shape {expected:?}"),
+            XasrTensorShape::Vector(len) => {
+                format!("expected a rank-1 vector of length {len}")
+            }
+            XasrTensorShape::Rank(rank) => format!("expected rank {rank}"),
+            XasrTensorShape::Rank2In { input_dim } => {
+                format!("expected a rank-2 matrix with input dim {input_dim}")
+            }
+            XasrTensorShape::Rank2Out { output_dim } => {
+                format!("expected a rank-2 matrix with output dim {output_dim}")
+            }
+        }
+    }
+
+    /// The exact dims an `Exact` shape pins, when this shape is one. The
+    /// weight loader uses this to source its pinned-tensor expectations from
+    /// the contract instead of duplicating them.
+    pub(crate) fn exact_dims(&self) -> Option<&[usize]> {
+        match self {
+            XasrTensorShape::Exact(expected) => Some(expected),
+            _ => None,
+        }
+    }
 }
 
 /// One tensor the xasr-zipformer runtime loads, named by its upstream icefall
@@ -311,41 +461,69 @@ fn check_requirement(
     let tensor = index
         .get(&name)
         .ok_or(XasrTensorContractError::MissingRequiredTensor { name })?;
-    let valid = match &requirement.shape {
-        XasrTensorShape::Exact(expected) => {
-            tensor.dims.len() == expected.len()
-                && tensor
-                    .dims
-                    .iter()
-                    .zip(expected.iter())
-                    .all(|(actual, expected)| *actual == *expected as u64)
-        }
-        XasrTensorShape::Vector(len) => tensor.dims.len() == 1 && tensor.dims[0] == *len as u64,
-        XasrTensorShape::Rank(rank) => tensor.dims.len() == *rank,
-        XasrTensorShape::Rank2In { input_dim } => {
-            tensor.dims.len() == 2 && tensor.dims[0] == *input_dim as u64
-        }
-        XasrTensorShape::Rank2Out { output_dim } => {
-            tensor.dims.len() == 2 && tensor.dims[1] == *output_dim as u64
-        }
-    };
-    if valid {
+    let dims: Vec<usize> = tensor.dims.iter().map(|&dim| dim as usize).collect();
+    if requirement.shape.matches(&dims) {
         return Ok(());
     }
-    let reason = match &requirement.shape {
-        XasrTensorShape::Exact(expected) => format!("expected shape {expected:?}"),
-        XasrTensorShape::Vector(len) => {
-            format!("expected a rank-1 vector of length {len}")
+    Err(invalid_shape(
+        &tensor.name,
+        &tensor.dims,
+        requirement.shape.describe(),
+    ))
+}
+
+/// The resolved per-pack-name view of the single runtime tensor contract
+/// ([`xasr_zipformer_runtime_tensor_requirements`]). The weight loaders
+/// consume this table: every tensor they read must be present in it and must
+/// satisfy the shape it pins, so the requirement enumeration is the loader's
+/// authoritative read list instead of a parallel set of loader literals. A
+/// read the contract does not cover fails closed.
+#[derive(Debug, Clone)]
+pub(crate) struct XasrRuntimeTensorContract {
+    by_pack_name: std::collections::BTreeMap<String, XasrTensorShape>,
+}
+
+impl XasrRuntimeTensorContract {
+    pub(crate) fn for_metadata(metadata: &XasrZipformerExecutionMetadata) -> Self {
+        let mut by_pack_name = std::collections::BTreeMap::new();
+        for requirement in xasr_zipformer_runtime_tensor_requirements(metadata) {
+            let name = compact_xasr_name(&requirement.upstream_name);
+            if by_pack_name
+                .insert(name.clone(), requirement.shape)
+                .is_some()
+            {
+                unreachable!("requirement names are unique per the contract enumeration");
+            }
         }
-        XasrTensorShape::Rank(rank) => format!("expected rank {rank}"),
-        XasrTensorShape::Rank2In { input_dim } => {
-            format!("expected a rank-2 matrix with input dim {input_dim}")
-        }
-        XasrTensorShape::Rank2Out { output_dim } => {
-            format!("expected a rank-2 matrix with output dim {output_dim}")
-        }
-    };
-    Err(invalid_shape(&tensor.name, &tensor.dims, reason))
+        Self { by_pack_name }
+    }
+
+    /// The shape contract one pack tensor must satisfy, by its compacted pack
+    /// name. `None` means the tensor is not part of the runtime contract and
+    /// a loader reading it must fail closed.
+    pub(crate) fn shape(&self, pack_name: &str) -> Option<&XasrTensorShape> {
+        self.by_pack_name.get(pack_name)
+    }
+
+    /// The pinned exact dims for one tensor; loader expectations for
+    /// exact-pinned tensors are sourced here. Fails closed when the tensor is
+    /// absent from the contract or its shape is not `Exact`.
+    pub(crate) fn exact_dims(&self, pack_name: &str) -> Result<Vec<usize>, String> {
+        let shape = self.shape(pack_name).ok_or_else(|| {
+            format!("tensor '{pack_name}' is not part of the xasr-zipformer runtime contract")
+        })?;
+        shape.exact_dims().map(|dims| dims.to_vec()).ok_or_else(|| {
+            format!(
+                "tensor '{pack_name}' contract shape is not exact: {}",
+                shape.describe()
+            )
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn names(&self) -> impl Iterator<Item = &String> {
+        self.by_pack_name.keys()
+    }
 }
 
 fn embed_requirements(
@@ -353,33 +531,39 @@ fn embed_requirements(
     metadata: &XasrZipformerExecutionMetadata,
 ) {
     let first_dim = metadata.encoder_dims[0];
-    // Conv stem kernels are architecture constants; rank-check the weights and
-    // exact-check the biases (their length equals the constant out-channel count
-    // the loader pins). The loader enforces the exact kernel shapes at runtime.
-    for (weight, bias_len) in [
-        ("encoder_embed.conv.0", 8usize),
-        ("encoder_embed.conv.4", 32),
-        ("encoder_embed.conv.7", 128),
-        ("encoder_embed.convnext.depthwise_conv", 128),
-        ("encoder_embed.convnext.pointwise_conv1", 384),
-        ("encoder_embed.convnext.pointwise_conv2", 128),
+    // Conv stem kernels are architecture constants; the contract carries the
+    // loader's exact pinned shapes so admission and the loader enforce one
+    // geometry from one enumeration.
+    for (weight, dims, bias_len) in [
+        ("encoder_embed.conv.0", [3usize, 3, 1, 8], 8usize),
+        ("encoder_embed.conv.4", [3, 3, 8, 32], 32),
+        ("encoder_embed.conv.7", [3, 3, 32, 128], 128),
+        ("encoder_embed.convnext.depthwise_conv", [7, 7, 1, 128], 128),
+        (
+            "encoder_embed.convnext.pointwise_conv1",
+            [1, 1, 128, 384],
+            384,
+        ),
+        (
+            "encoder_embed.convnext.pointwise_conv2",
+            [1, 1, 384, 128],
+            128,
+        ),
     ] {
         out.push(requirement(
             format!("{weight}.weight"),
-            XasrTensorShape::Rank(4),
+            XasrTensorShape::Exact(dims.to_vec()),
         ));
         out.push(requirement(
             format!("{weight}.bias"),
             XasrTensorShape::Vector(bias_len),
         ));
     }
-    // `encoder_embed.out` output width is `first_dim`; its input width is an
-    // architecture constant the loader pins (rank-check only here).
+    // `encoder_embed.out` maps the flattened conv-stem output (an
+    // architecture constant) into `first_dim`; both extents are pinned.
     out.push(requirement(
         "encoder_embed.out.weight".to_string(),
-        XasrTensorShape::Rank2Out {
-            output_dim: first_dim,
-        },
+        XasrTensorShape::Exact(vec![XASR_ENCODER_EMBED_INPUT_DIM, first_dim]),
     ));
     out.push(requirement(
         "encoder_embed.out.bias".to_string(),
@@ -499,14 +683,18 @@ fn layer_requirements(
         XasrTensorShape::Vector(dim),
     ));
 
+    // GLU gate width; parsing caps `dim` well below overflow, so the
+    // saturating product is defense in depth that stays fail-closed at
+    // validation (no pack tensor can match a saturated extent).
+    let glu_dim = dim.saturating_mul(2);
     for name in ["conv_module1", "conv_module2"] {
         out.push(requirement(
             format!("{prefix}.{name}.in_proj.weight"),
-            XasrTensorShape::Exact(vec![dim, 2 * dim]),
+            XasrTensorShape::Exact(vec![dim, glu_dim]),
         ));
         out.push(requirement(
             format!("{prefix}.{name}.in_proj.bias"),
-            XasrTensorShape::Vector(2 * dim),
+            XasrTensorShape::Vector(glu_dim),
         ));
         out.push(requirement(
             format!("{prefix}.{name}.depthwise_conv.causal_conv.weight"),
@@ -565,13 +753,18 @@ fn decoder_requirements(
         "decoder.embedding.weight".to_string(),
         XasrTensorShape::Exact(vec![decoder_dim, metadata.vocab_size]),
     ));
-    // The conv kernel's middle dim is `decoder_dim / 128` (grouped conv); the
-    // loader enforces that exact shape at runtime. Rank-check here keeps tiny
-    // admission fixtures (whose small joiner_dim would make the group count 0)
-    // representable while still proving the tensor exists with the right rank.
+    // The conv kernel's middle dim is `decoder_dim / 128`: the grouped
+    // convolution's group count is an architecture constant the loader and
+    // the graph hardcode. Parsing already rejects a decoder dim that cannot
+    // form the groups, so the contract pins the exact loader-enforced shape
+    // (admission and the loader admit a pack on one geometry).
     out.push(requirement(
         "decoder.conv.weight".to_string(),
-        XasrTensorShape::Rank(3),
+        XasrTensorShape::Exact(vec![
+            metadata.decoder_context_size,
+            decoder_dim / XASR_DECODER_CONV_GROUPS,
+            decoder_dim,
+        ]),
     ));
 }
 
@@ -642,6 +835,109 @@ pub(crate) fn xasr_zipformer_minimal_runtime_tensors(
             (compact_xasr_name(&requirement.upstream_name), dims)
         })
         .collect()
+}
+
+/// Projects one loadable dims choice per requirement for a pack the runtime
+/// weight loaders can read end to end: exact-pinned tensors take their pinned
+/// dims, and data-derived tensors the loader learns from the pack get one
+/// self-consistent assignment per role (e.g. a feed-forward `in_proj.bias`
+/// length and the matching `out_proj.weight` input extent agree). The
+/// full-load access-trace equivalence test stamps a synthetic pack with
+/// exactly this set, runs the real loaders, and proves their read set equals
+/// the requirement set name for name and shape for shape.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn xasr_zipformer_loader_ready_runtime_tensors(
+    metadata: &XasrZipformerExecutionMetadata,
+) -> Vec<(String, Vec<u64>)> {
+    xasr_zipformer_runtime_tensor_requirements(metadata)
+        .iter()
+        .map(|requirement| {
+            let dims = loader_ready_dims(metadata, requirement);
+            (compact_xasr_name(&requirement.upstream_name), dims)
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn loader_ready_dims(
+    metadata: &XasrZipformerExecutionMetadata,
+    requirement: &XasrTensorRequirement,
+) -> Vec<u64> {
+    let upstream = requirement.upstream_name.as_str();
+    // Data-derived widths, one consistent assignment per tensor role. The
+    // stack dim / query width come from the requirement's own stack scope.
+    let stack_scope = upstream
+        .strip_prefix("encoder.encoders.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|stack| stack.parse::<usize>().ok())
+        .filter(|stack| *stack < metadata.num_stacks);
+    if let Some(stack) = stack_scope {
+        let dim = metadata.encoder_dims[stack] as u64;
+        let query_dim = (metadata.num_heads[stack] * metadata.query_head_dims[stack]) as u64;
+        // Feed-forward: the bias length IS the hidden width the loader
+        // derives; keep it 2 for every stack and match the projections.
+        if upstream.ends_with(".in_proj.bias") && upstream.contains(".feed_forward") {
+            return vec![2];
+        }
+        if upstream.contains(".feed_forward") {
+            if upstream.ends_with(".in_proj.weight") {
+                return vec![dim, 2];
+            }
+            if upstream.ends_with(".out_proj.weight") {
+                return vec![2, dim];
+            }
+        }
+        // Relative-position projection: the loader derives its output width
+        // from the pack; the qkv in_proj must then span 2*query_dim + that
+        // width, so the two roles share one choice (output width 2).
+        if upstream.ends_with(".self_attn_weights.linear_pos.weight") {
+            return vec![2, 2];
+        }
+        if upstream.ends_with(".self_attn_weights.in_proj.bias") {
+            return vec![2 * query_dim + 2];
+        }
+        if upstream.ends_with(".self_attn_weights.in_proj.weight") {
+            return vec![dim, 2 * query_dim + 2];
+        }
+        // Value projections: bias length = value width = 2 everywhere.
+        if upstream.contains(".self_attn") {
+            if upstream.ends_with(".in_proj.bias") {
+                return vec![2];
+            }
+            if upstream.ends_with(".in_proj.weight") {
+                return vec![dim, 2];
+            }
+            if upstream.ends_with(".out_proj.weight") {
+                return vec![2, dim];
+            }
+        }
+        // Nonlinear attention: in_proj output must be divisible by 3; the
+        // out_proj input is that quotient.
+        if upstream.contains(".nonlin_attention.") {
+            if upstream.ends_with(".in_proj.bias") {
+                return vec![3];
+            }
+            if upstream.ends_with(".in_proj.weight") {
+                return vec![dim, 3];
+            }
+            if upstream.ends_with(".out_proj.weight") {
+                return vec![1, dim];
+            }
+        }
+    }
+    // Everything else is pinned by its requirement shape.
+    match &requirement.shape {
+        XasrTensorShape::Exact(expected) => expected.iter().map(|dim| *dim as u64).collect(),
+        XasrTensorShape::Vector(len) => vec![*len as u64],
+        XasrTensorShape::Rank(1) => vec![2],
+        XasrTensorShape::Rank(rank) => {
+            let mut dims = vec![1_u64; *rank];
+            *dims.last_mut().expect("rank > 0") = 2;
+            dims
+        }
+        XasrTensorShape::Rank2In { input_dim } => vec![*input_dim as u64, 2],
+        XasrTensorShape::Rank2Out { output_dim } => vec![2, *output_dim as u64],
+    }
 }
 
 /// Typed tensor-contract failure for a single xasr-zipformer pack.
@@ -834,89 +1130,292 @@ mod tests {
         ));
     }
 
-    /// The requirement enumeration IS the loader's read set: pin it on the full
-    /// production geometry (the published X-ASR checkpoint's architecture). Any
-    /// drift between what the validator requires and what the loader resolves
-    /// shows up here as a name/count change. Regression anchor for the incident
-    /// where the admission validator demanded compacted names without the
-    /// `.weight` suffix (`EE.conv.0`) while the loader reads `EE.conv.0.weight`,
-    /// rejecting every published pack at preflight.
+    /// Shape pins the incident review found loose: on the full production
+    /// geometry the contract must carry the LOADER's exact shapes for the
+    /// tensors a rank check used to admit structurally wrong packs for --
+    /// the grouped decoder conv kernel (including its `decoder_dim / 128`
+    /// middle group extent), every conv-stem kernel, and the embed output
+    /// projection. The full-load access-trace test below proves the whole
+    /// enumeration equals the loader read set; this test holds the exact
+    /// production values that enumeration produces.
     #[test]
-    fn requirement_set_matches_the_loader_read_set_on_production_geometry() {
+    fn production_geometry_contract_pins_the_loader_enforced_shapes() {
         let parsed = parse_xasr_zipformer_execution_metadata(&metadata()).expect("parse");
-        let requirements = xasr_zipformer_runtime_tensor_requirements(&parsed);
-        // The published X-ASR pack ships exactly 966 tensors and the loader
-        // reads every one of them (see the ONNX round-trip import test).
+        let contract = XasrRuntimeTensorContract::for_metadata(&parsed);
+        // The published X-ASR pack ships exactly 966 tensors; the contract
+        // enumeration covers every one of them (see the ONNX round-trip
+        // import test and the ignored real-pack equality test).
         assert_eq!(
-            requirements.len(),
+            contract.names().count(),
             966,
-            "the requirement set must stay exactly the loader read set"
+            "the contract must stay exactly the loader read set on production geometry"
         );
-        let names: std::collections::BTreeSet<String> = requirements
-            .iter()
-            .map(|requirement| compact_xasr_name(&requirement.upstream_name))
-            .collect();
-        assert_eq!(
-            names.len(),
-            requirements.len(),
-            "compacted requirement names must be unique"
-        );
-        // Embed conv weights carry the `.weight` suffix the loader reads.
-        for name in [
-            "EE.conv.0.weight",
-            "EE.conv.4.weight",
-            "EE.conv.7.weight",
-            "EE.CX.DW.weight",
-            "EE.CX.PW1.weight",
-            "EE.CX.PW2.weight",
-            "EE.out.weight",
-            "E0.L0.FF1.IP.weight",
-            "E5.L1.CM2.OP.bias",
-            "E3.DS.bias",
-            "E3.out_combiner.BY_scale",
-            "encoder.DS_output.bias",
-            "decoder.EMB.weight",
-            "decoder.conv.weight",
-            "joiner.encoder_proj.weight",
-            "joiner.OL.weight",
-            "joiner.OL.bias",
+        let exact = |name: &str| -> Vec<usize> {
+            contract
+                .exact_dims(name)
+                .unwrap_or_else(|reason| panic!("{name} must be exact-pinned: {reason}"))
+        };
+        assert_eq!(exact("decoder.conv.weight"), vec![2, 512 / 128, 512]);
+        assert_eq!(exact("decoder.EMB.weight"), vec![512, 5000]);
+        assert_eq!(exact("EE.conv.0.weight"), vec![3, 3, 1, 8]);
+        assert_eq!(exact("EE.conv.4.weight"), vec![3, 3, 8, 32]);
+        assert_eq!(exact("EE.conv.7.weight"), vec![3, 3, 32, 128]);
+        assert_eq!(exact("EE.CX.DW.weight"), vec![7, 7, 1, 128]);
+        assert_eq!(exact("EE.CX.PW1.weight"), vec![1, 1, 128, 384]);
+        assert_eq!(exact("EE.CX.PW2.weight"), vec![1, 1, 384, 128]);
+        assert_eq!(exact("EE.out.weight"), vec![2432, 192]);
+        assert_eq!(exact("joiner.encoder_proj.weight"), vec![768, 512]);
+        assert_eq!(exact("joiner.OL.weight"), vec![512, 5000]);
+    }
+
+    /// A decoder dim that cannot form the conv's 128 groups has no loadable
+    /// kernel shape; parsing fails closed instead of loading a group count 0.
+    #[test]
+    fn rejects_decoder_dim_not_divisible_by_the_conv_group_count() {
+        let mut metadata = metadata();
+        metadata.insert(XASR_JOINER_DIM_KEY.to_string(), "100".to_string());
+        let error = parse_xasr_zipformer_execution_metadata(&metadata)
+            .expect_err("joiner_dim 100 cannot form 128 conv groups");
+        assert!(matches!(
+            error,
+            MetadataContractError::InvalidValue {
+                key: XASR_JOINER_DIM_KEY,
+                ..
+            }
+        ));
+    }
+
+    /// Architecture ceilings fail closed on untrusted metadata, keeping
+    /// contract construction allocation-bounded and overflow-free.
+    #[test]
+    fn rejects_geometry_above_architecture_ceilings() {
+        let base = metadata();
+        for (key, value) in [
+            (
+                XASR_FEATURE_DIM_KEY,
+                (XASR_MAX_FEATURE_DIM as u64 + 1).to_string(),
+            ),
+            (
+                XASR_DECODE_CHUNK_LEN_KEY,
+                (XASR_MAX_DECODE_CHUNK_LEN as u64 + 1).to_string(),
+            ),
+            (
+                XASR_JOINER_DIM_KEY,
+                (XASR_MAX_JOINER_DIM as u64 + 128).to_string(),
+            ),
+            (
+                XASR_VOCAB_SIZE_KEY,
+                (XASR_MAX_VOCAB_SIZE as u64 + 1).to_string(),
+            ),
         ] {
-            assert!(names.contains(name), "requirement set must contain {name}");
+            let mut metadata = base.clone();
+            metadata.insert(key.to_string(), value);
+            assert!(
+                parse_xasr_zipformer_execution_metadata(&metadata).is_err(),
+                "must reject {key} above its ceiling"
+            );
+        }
+        // List-valued ceilings.
+        let mut metadata = base.clone();
+        metadata.insert(
+            XASR_ENCODER_DIMS_KEY.to_string(),
+            "192,256,512,768,512,65537".to_string(),
+        );
+        assert!(parse_xasr_zipformer_execution_metadata(&metadata).is_err());
+        // Total encoder layer count ceiling.
+        let mut metadata = base.clone();
+        metadata.insert(
+            XASR_NUM_ENCODER_LAYERS_KEY.to_string(),
+            "2048,2047,1,1,1,1".to_string(),
+        );
+        assert!(parse_xasr_zipformer_execution_metadata(&metadata).is_err());
+    }
+
+    /// Boundary: geometry exactly at the ceilings stays admissible (the
+    /// ceilings bound, they do not shrink the production envelope).
+    #[test]
+    fn accepts_geometry_at_the_architecture_ceilings() {
+        let mut metadata = metadata();
+        metadata.insert(
+            XASR_FEATURE_DIM_KEY.to_string(),
+            XASR_MAX_FEATURE_DIM.to_string(),
+        );
+        metadata.insert(
+            XASR_DECODE_CHUNK_LEN_KEY.to_string(),
+            XASR_MAX_DECODE_CHUNK_LEN.to_string(),
+        );
+        metadata.insert(
+            XASR_VOCAB_SIZE_KEY.to_string(),
+            XASR_MAX_VOCAB_SIZE.to_string(),
+        );
+        assert!(parse_xasr_zipformer_execution_metadata(&metadata).is_ok());
+    }
+
+    /// The equivalence evidence the count-plus-sampling pin used to fake: run
+    /// the REAL weight loaders (encoder + decoder + joiner) over a synthetic
+    /// pack whose tensor set is projected from the requirement enumeration,
+    /// with the tensor index's access trace enabled, and assert the recorded
+    /// read set equals the requirement set name for name and shape for shape.
+    /// Any drift -- a loader reading a tensor the contract does not list, a
+    /// contract entry no loader reads, or a read whose shape violates the
+    /// contract's precision -- fails here.
+    #[test]
+    fn full_loader_read_trace_equals_the_requirement_set() {
+        use crate::ggml_runtime::GgufTensorDataReader;
+        use crate::models::xasr_zipformer::encoder_weights::load_xasr_encoder_weights;
+        use crate::models::xasr_zipformer::weights::{
+            load_xasr_decoder_weights, load_xasr_joiner_weights,
+        };
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+        let parsed =
+            parse_xasr_zipformer_execution_metadata(&trace_geometry_metadata()).expect("parse");
+        let tensors = xasr_zipformer_loader_ready_runtime_tensors(&parsed);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("xasr-loader-trace.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in tensors {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write trace pack");
+
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+        reader.tensor_index().enable_access_trace();
+        load_xasr_encoder_weights(&reader, &parsed).expect("full encoder load");
+        load_xasr_decoder_weights(&reader, &parsed).expect("full decoder load");
+        load_xasr_joiner_weights(&reader, &parsed).expect("full joiner load");
+
+        assert_trace_equals_the_requirement_set(&reader.tensor_index().access_trace(), &parsed);
+    }
+
+    /// Two stacks (covering the stack-0 vs stack-N layer-prefix split and the
+    /// per-stack downsample/combiner tensors), two layers in stack 0, and
+    /// distinct per-stack dims/kernels so every name template and every
+    /// metadata-derived shape branch runs in the traced full load.
+    fn trace_geometry_metadata() -> BTreeMap<String, String> {
+        [
+            (XASR_NUM_STACKS_KEY, "2"),
+            (XASR_NUM_ENCODER_LAYERS_KEY, "2,1"),
+            (XASR_ENCODER_DIMS_KEY, "16,24"),
+            (XASR_QUERY_HEAD_DIMS_KEY, "4,4"),
+            (XASR_VALUE_HEAD_DIMS_KEY, "4,4"),
+            (XASR_NUM_HEADS_KEY, "2,2"),
+            (XASR_CNN_MODULE_KERNELS_KEY, "3,5"),
+            (XASR_LEFT_CONTEXT_LEN_KEY, "4,4"),
+            (XASR_DOWNSAMPLING_FACTORS_KEY, "1,2"),
+            (XASR_FEATURE_DIM_KEY, "80"),
+            (XASR_DECODE_CHUNK_LEN_KEY, "4"),
+            (XASR_JOINER_DIM_KEY, "128"),
+            (XASR_DECODER_CONTEXT_SIZE_KEY, "2"),
+            (XASR_VOCAB_SIZE_KEY, "7"),
+            (XASR_BLANK_ID_KEY, "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// Compare a traced full load against the requirement enumeration:
+    /// exact name-set equality both directions, then each traced read's dims
+    /// must satisfy its requirement's shape at the precision it declares.
+    pub(crate) fn assert_trace_equals_the_requirement_set(
+        trace: &[crate::ggml_runtime::GgufTensorAccessRecord],
+        metadata: &XasrZipformerExecutionMetadata,
+    ) {
+        let requirements = xasr_zipformer_runtime_tensor_requirements(metadata);
+        let mut required: std::collections::BTreeMap<String, &XasrTensorShape> =
+            std::collections::BTreeMap::new();
+        for requirement in &requirements {
+            let name = compact_xasr_name(&requirement.upstream_name);
+            if required.insert(name.clone(), &requirement.shape).is_some() {
+                panic!("requirement names must be unique: {name}");
+            }
+        }
+        let mut traced: std::collections::BTreeMap<String, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for record in trace {
+            if let Some(previous) = traced.get(&record.name) {
+                assert_eq!(
+                    previous, &record.dims,
+                    "traced dims for '{}' must be stable across reads",
+                    record.name
+                );
+            } else {
+                traced.insert(record.name.clone(), record.dims.clone());
+            }
+        }
+        let missing: Vec<&String> = required
+            .keys()
+            .filter(|name| !traced.contains_key(name.as_str()))
+            .collect();
+        let extra: Vec<&String> = traced
+            .keys()
+            .filter(|name| !required.contains_key(name.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "loader read set and requirement set must be equal; \
+             required-but-never-read={missing:?} read-but-not-required={extra:?}"
+        );
+        for (name, shape) in &required {
+            let dims = &traced[name];
+            let dims_usize: Vec<usize> = dims.iter().map(|&dim| dim as usize).collect();
+            assert!(
+                shape.matches(&dims_usize),
+                "loader read '{name}' with dims {dims:?}, but the contract says {}",
+                shape.describe()
+            );
         }
     }
 
     /// Ground-truth set equality against a host-local imported pack (skipped
     /// when absent so weight-free CI stays green): the required set must equal
-    /// the stored tensor set of the real ONNX-derived X-ASR pack, which is
-    /// exactly the set the runtime loader reads.
+    /// the stored tensor set of a real X-ASR pack name for name, and every
+    /// stored tensor must satisfy its requirement's shape at the precision the
+    /// requirement declares -- the runtime loader reads exactly this set.
     #[test]
-    #[ignore = "host-local: validates against the imported ONNX X-ASR pack"]
+    #[ignore = "host-local: validates against an imported X-ASR pack"]
     fn requirement_set_equals_the_real_pack_tensor_set() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-fp16.oasr");
-        if !path.exists() {
-            eprintln!("skipping: xasr ONNX fp16 pack absent at {}", path.display());
+        let candidates = [
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tmp/family-migration-batch1/pack-regress/xasr-zh-en-q8.oasr"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-fp16.oasr"),
+        ];
+        let Some(path) = candidates.iter().find(|path| path.exists()) else {
+            eprintln!("skipping: no host-local xasr pack present at {candidates:?}");
             return;
-        }
-        let index = crate::read_gguf_tensor_index(&path).expect("read pack tensor index");
-        let pack_metadata = crate::ggml_runtime::read_gguf_metadata(&path).expect("metadata");
+        };
+        let index = crate::read_gguf_tensor_index(path).expect("read pack tensor index");
+        let pack_metadata = crate::ggml_runtime::read_gguf_metadata(path).expect("metadata");
         let parsed = parse_xasr_zipformer_execution_metadata(&pack_metadata).expect("parse");
-        let required: std::collections::BTreeSet<String> =
-            xasr_zipformer_runtime_tensor_requirements(&parsed)
-                .iter()
-                .map(|requirement| compact_xasr_name(&requirement.upstream_name))
-                .collect();
+        let requirements = xasr_zipformer_runtime_tensor_requirements(&parsed);
+        let required: std::collections::BTreeSet<String> = requirements
+            .iter()
+            .map(|requirement| compact_xasr_name(&requirement.upstream_name))
+            .collect();
         let stored: std::collections::BTreeSet<String> = index
             .tensors()
             .iter()
             .map(|tensor| tensor.name.clone())
             .collect();
-        let missing: Vec<&String> = stored.difference(&required).collect();
-        let extra: Vec<&String> = required.difference(&stored).collect();
+        let missing: Vec<&String> = required.difference(&stored).collect();
+        let extra: Vec<&String> = stored.difference(&required).collect();
         assert!(
             missing.is_empty() && extra.is_empty(),
             "requirement set and pack tensor set must be equal; \
              required-but-absent={missing:?} present-but-not-required={extra:?}"
         );
+        for requirement in &requirements {
+            let name = compact_xasr_name(&requirement.upstream_name);
+            let tensor = index.get(&name).expect("required tensor present");
+            let dims: Vec<usize> = tensor.dims.iter().map(|&dim| dim as usize).collect();
+            assert!(
+                requirement.shape.matches(&dims),
+                "pack tensor '{name}' has dims {:?}, but the contract says {}",
+                tensor.dims,
+                requirement.shape.describe()
+            );
+        }
     }
 }

@@ -24,7 +24,8 @@ pub(crate) mod graph;
 pub(crate) mod weights;
 
 pub(crate) use contract::{
-    FastConformerContractGeometry, fastconformer_encoder_tensor_descriptors,
+    FastConformerContractGeometry, fastconformer_encoder_descriptor_count,
+    fastconformer_encoder_tensor_descriptors,
 };
 pub(crate) use graph::{
     FastConformerEncoderCore, FastConformerStackConfig, alloc_static, bind_loaded,
@@ -52,4 +53,7 @@ pub(crate) trait FastConformerGraphError: Sized {
 /// already derive this via `#[error(...)] Read(#[from] GgufTensorDataReadError)`.
 pub(crate) trait FastConformerWeightsError: Sized + From<GgufTensorDataReadError> {
     fn batchnorm_fold(reason: String) -> Self;
+    /// A loader tried to read a tensor the family's runtime tensor contract
+    /// does not enumerate; fails closed instead of loading off-contract.
+    fn not_in_contract(name: String) -> Self;
 }

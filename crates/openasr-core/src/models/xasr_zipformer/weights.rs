@@ -5,7 +5,10 @@ use crate::ggml_runtime::{
 };
 
 use super::package_import::compact_xasr_name;
-use super::runtime_contract::XasrZipformerExecutionMetadata;
+use super::runtime_contract::{
+    XASR_DECODER_CONV_GROUPS, XasrRuntimeTensorContract, XasrTensorShape,
+    XasrZipformerExecutionMetadata,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum XasrWeightsError {
@@ -23,6 +26,20 @@ pub(crate) enum XasrWeightsError {
         dims: Vec<usize>,
         expected: Vec<usize>,
     },
+    #[error("xasr-zipformer tensor '{name}' is not part of the runtime tensor contract")]
+    NotInContract { name: String },
+    #[error(
+        "xasr-zipformer tensor '{name}' dims {dims:?} violate the runtime tensor contract: {reason}"
+    )]
+    ContractShape {
+        name: String,
+        dims: Vec<usize>,
+        reason: String,
+    },
+    #[error("xasr-zipformer runtime tensor contract does not pin '{name}' as required: {reason}")]
+    ContractNotExact { name: String, reason: String },
+    #[error("xasr-zipformer weight expectation overflowed: {reason}")]
+    ExpectationOverflow { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,30 +232,23 @@ pub(crate) fn load_xasr_decoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &XasrZipformerExecutionMetadata,
 ) -> Result<XasrDecoderWeights, XasrWeightsError> {
-    let embedding = load_linear(
-        reader,
-        "decoder.embedding.weight",
-        metadata.decoder_dim(),
-        metadata.vocab_size,
-    )?;
-    let conv_weight = load_named(reader, "decoder.conv.weight")?;
-    assert_rank(&conv_weight, 3)?;
-    let expected = vec![
-        metadata.decoder_context_size,
-        metadata.decoder_dim() / 128,
-        metadata.decoder_dim(),
-    ];
-    if conv_weight.dims != expected {
-        return Err(XasrWeightsError::Dims {
-            name: conv_weight.name,
-            dims: conv_weight.dims,
-            expected,
-        });
-    }
+    let contract = XasrRuntimeTensorContract::for_metadata(metadata);
+    load_xasr_decoder_weights_with_contract(reader, &contract)
+}
+
+pub(crate) fn load_xasr_decoder_weights_with_contract(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+) -> Result<XasrDecoderWeights, XasrWeightsError> {
+    let embedding = load_linear_from_contract(reader, contract, "decoder.embedding.weight")?;
+    // The contract pins the exact grouped-conv kernel shape
+    // `[context_size, decoder_dim / 128, decoder_dim]`; `load_named` enforces
+    // it at read time, so no separate dims assertion is left to drift.
+    let conv_weight = load_named(reader, contract, "decoder.conv.weight")?;
     Ok(XasrDecoderWeights {
         embedding,
         conv_weight,
-        groups: 128,
+        groups: XASR_DECODER_CONV_GROUPS,
     })
 }
 
@@ -246,39 +256,61 @@ pub(crate) fn load_xasr_joiner_weights(
     reader: &GgufTensorDataReader,
     metadata: &XasrZipformerExecutionMetadata,
 ) -> Result<XasrJoinerWeights, XasrWeightsError> {
-    let encoder_output_dim = metadata.encoder_output_dim();
-    let joiner_dim = metadata.joiner_dim;
-    let vocab_size = metadata.vocab_size;
+    let contract = XasrRuntimeTensorContract::for_metadata(metadata);
+    load_xasr_joiner_weights_with_contract(reader, &contract)
+}
+
+pub(crate) fn load_xasr_joiner_weights_with_contract(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+) -> Result<XasrJoinerWeights, XasrWeightsError> {
     Ok(XasrJoinerWeights {
-        encoder_proj_weight: load_linear(
+        encoder_proj_weight: load_linear_from_contract(
             reader,
+            contract,
             "joiner.encoder_proj.weight",
-            encoder_output_dim,
-            joiner_dim,
         )?,
-        encoder_proj_bias: load_vector(reader, "joiner.encoder_proj.bias", joiner_dim)?,
-        decoder_proj_weight: load_linear(
+        encoder_proj_bias: load_vector_from_contract(reader, contract, "joiner.encoder_proj.bias")?,
+        decoder_proj_weight: load_linear_from_contract(
             reader,
+            contract,
             "joiner.decoder_proj.weight",
-            joiner_dim,
-            joiner_dim,
         )?,
-        decoder_proj_bias: load_vector(reader, "joiner.decoder_proj.bias", joiner_dim)?,
-        output_linear_weight: load_linear(
+        decoder_proj_bias: load_vector_from_contract(reader, contract, "joiner.decoder_proj.bias")?,
+        output_linear_weight: load_linear_from_contract(
             reader,
+            contract,
             "joiner.output_linear.weight",
-            joiner_dim,
-            vocab_size,
         )?,
-        output_linear_bias: load_vector(reader, "joiner.output_linear.bias", vocab_size)?,
+        output_linear_bias: load_vector_from_contract(
+            reader,
+            contract,
+            "joiner.output_linear.bias",
+        )?,
     })
+}
+
+/// Resolve one tensor's contract shape by its upstream name; reads of tensors
+/// the runtime contract does not enumerate fail closed here, making the
+/// requirement set the loader's authoritative read list.
+fn contract_shape<'a>(
+    contract: &'a XasrRuntimeTensorContract,
+    pack_name: &str,
+) -> Result<&'a XasrTensorShape, XasrWeightsError> {
+    contract
+        .shape(pack_name)
+        .ok_or_else(|| XasrWeightsError::NotInContract {
+            name: pack_name.to_string(),
+        })
 }
 
 pub(crate) fn load_named(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     upstream_name: &str,
 ) -> Result<NamedTensor, XasrWeightsError> {
     let name = compact_xasr_name(upstream_name);
+    let shape = contract_shape(contract, &name)?;
     let tensor = reader.tensor_index().get(&name).ok_or_else(|| {
         XasrWeightsError::Read(GgufTensorDataReadError::TensorNotFound {
             path: reader.tensor_index().path().to_path_buf(),
@@ -286,6 +318,13 @@ pub(crate) fn load_named(
         })
     })?;
     let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
+    if !shape.matches(&dims) {
+        return Err(XasrWeightsError::ContractShape {
+            name,
+            dims,
+            reason: shape.describe(),
+        });
+    }
     let shape_u64 = tensor.dims.clone();
     let values = reader.host_tensor_f32_copy_dequantized_by_name(&name, &shape_u64)?;
     Ok(NamedTensor { name, dims, values })
@@ -293,10 +332,11 @@ pub(crate) fn load_named(
 
 pub(crate) fn load_vector(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     upstream_name: &str,
     len: usize,
 ) -> Result<Vec<f32>, XasrWeightsError> {
-    let tensor = load_named(reader, upstream_name)?;
+    let tensor = load_named(reader, contract, upstream_name)?;
     assert_rank(&tensor, 1)?;
     if tensor.dims != [len] {
         return Err(XasrWeightsError::Dims {
@@ -308,13 +348,35 @@ pub(crate) fn load_vector(
     Ok(tensor.values)
 }
 
+/// Load a rank-1 tensor whose exact length the contract pins (`Vector(len)`),
+/// sourcing the expectation from the contract instead of a loader literal.
+pub(crate) fn load_vector_from_contract(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+    upstream_name: &str,
+) -> Result<Vec<f32>, XasrWeightsError> {
+    let name = compact_xasr_name(upstream_name);
+    let shape = contract_shape(contract, &name)?;
+    let len = match shape {
+        XasrTensorShape::Vector(len) => *len,
+        _ => {
+            return Err(XasrWeightsError::ContractNotExact {
+                name,
+                reason: shape.describe(),
+            });
+        }
+    };
+    load_vector(reader, contract, upstream_name, len)
+}
+
 pub(crate) fn load_linear(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     upstream_name: &str,
     input_dim: usize,
     output_dim: usize,
 ) -> Result<StoredLinear, XasrWeightsError> {
-    let tensor = load_named(reader, upstream_name)?;
+    let tensor = load_named(reader, contract, upstream_name)?;
     assert_rank(&tensor, 2)?;
     let expected = vec![input_dim, output_dim];
     if tensor.dims != expected {
@@ -333,6 +395,29 @@ pub(crate) fn load_linear(
     })
 }
 
+/// Load a rank-2 projection whose exact `[input_dim, output_dim]` the
+/// contract pins, sourcing both extents from the contract instead of loader
+/// literals.
+pub(crate) fn load_linear_from_contract(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+    upstream_name: &str,
+) -> Result<StoredLinear, XasrWeightsError> {
+    let name = compact_xasr_name(upstream_name);
+    let expected = contract
+        .exact_dims(&name)
+        .map_err(|reason| XasrWeightsError::ContractNotExact { name, reason })?;
+    let [input_dim, output_dim]: [usize; 2] =
+        expected
+            .as_slice()
+            .try_into()
+            .map_err(|_| XasrWeightsError::ContractNotExact {
+                name: compact_xasr_name(upstream_name),
+                reason: format!("exact dims {expected:?} are not rank 2"),
+            })?;
+    load_linear(reader, contract, upstream_name, input_dim, output_dim)
+}
+
 /// Load a rank-2 `.weight` projection as its native (quantized / f16) ggml block
 /// payload for an encoder `mul_mat` weight operand, instead of dequantizing to
 /// f32. The payload carries the pack mmap (zero-copy) and its stored element type
@@ -343,11 +428,12 @@ pub(crate) fn load_linear(
 /// dequantized f32 `values` path via [`load_linear`].
 pub(crate) fn load_native_linear(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     upstream_name: &str,
     input_dim: usize,
     output_dim: usize,
 ) -> Result<StoredLinear, XasrWeightsError> {
-    let stored = load_native_linear_by_actual_dims(reader, upstream_name)?;
+    let stored = load_native_linear_by_actual_dims(reader, contract, upstream_name)?;
     if stored.input_dim != input_dim || stored.output_dim != output_dim {
         return Err(XasrWeightsError::Dims {
             name: stored.name,
@@ -358,14 +444,40 @@ pub(crate) fn load_native_linear(
     Ok(stored)
 }
 
-/// Like [`load_native_linear`] but takes the rank-2 dims from the stored tensor
-/// (`ne0` = input, `ne1` = output) rather than validating against expected dims --
-/// used for `linear_pos`, whose output width is derived from the pack.
-pub(crate) fn load_native_linear_by_actual_dims(
+/// Load a rank-2 native projection whose exact `[input_dim, output_dim]` the
+/// contract pins, sourcing both extents from the contract instead of loader
+/// literals.
+pub(crate) fn load_native_linear_from_contract(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     upstream_name: &str,
 ) -> Result<StoredLinear, XasrWeightsError> {
     let name = compact_xasr_name(upstream_name);
+    let expected = contract
+        .exact_dims(&name)
+        .map_err(|reason| XasrWeightsError::ContractNotExact { name, reason })?;
+    let [input_dim, output_dim]: [usize; 2] =
+        expected
+            .as_slice()
+            .try_into()
+            .map_err(|_| XasrWeightsError::ContractNotExact {
+                name: compact_xasr_name(upstream_name),
+                reason: format!("exact dims {expected:?} are not rank 2"),
+            })?;
+    load_native_linear(reader, contract, upstream_name, input_dim, output_dim)
+}
+
+/// Like [`load_native_linear`] but takes the rank-2 dims from the stored tensor
+/// (`ne0` = input, `ne1` = output) rather than validating against expected dims --
+/// used for `linear_pos`, whose output width is derived from the pack. The read
+/// still must satisfy the contract's shape pin.
+pub(crate) fn load_native_linear_by_actual_dims(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+    upstream_name: &str,
+) -> Result<StoredLinear, XasrWeightsError> {
+    let name = compact_xasr_name(upstream_name);
+    let shape = contract_shape(contract, &name)?;
     let payload = reader.owned_weight_tensor_payload_by_name(&name)?;
     let [input_dim, output_dim]: [usize; 2] =
         payload
@@ -377,6 +489,13 @@ pub(crate) fn load_native_linear_by_actual_dims(
                 rank: payload.dims.len(),
                 expected_rank: 2,
             })?;
+    if !shape.matches(&[input_dim, output_dim]) {
+        return Err(XasrWeightsError::ContractShape {
+            name,
+            dims: vec![input_dim, output_dim],
+            reason: shape.describe(),
+        });
+    }
     Ok(StoredLinear {
         name,
         input_dim,

@@ -32,11 +32,18 @@ pub(crate) enum ParakeetTdtWeightsError {
     },
     #[error("parakeet-tdt conv BatchNorm fold failed: {reason}")]
     BatchNormFold { reason: String },
+    #[error("parakeet-tdt tensor '{name}' is not part of the runtime tensor contract")]
+    NotInContract { name: String },
+    #[error("parakeet-tdt weight expectation overflowed: {reason}")]
+    ExpectationOverflow { reason: String },
 }
 
 impl FastConformerWeightsError for ParakeetTdtWeightsError {
     fn batchnorm_fold(reason: String) -> Self {
         Self::BatchNormFold { reason }
+    }
+    fn not_in_contract(name: String) -> Self {
+        Self::NotInContract { name }
     }
 }
 
@@ -157,12 +164,38 @@ fn expect_elements(
     Ok(tensor)
 }
 
+/// Metadata-derived element-count expectation, fail-closed on overflow. The
+/// parse-time architecture ceilings make overflow unreachable in practice;
+/// the checked path keeps untrusted metadata from ever wrapping an
+/// expectation into an admitting comparison.
+fn checked_expectation(
+    name: &str,
+    value: Option<usize>,
+    reason: &str,
+) -> Result<usize, ParakeetTdtWeightsError> {
+    value.ok_or_else(|| ParakeetTdtWeightsError::ExpectationOverflow {
+        reason: format!("{name}: {reason}"),
+    })
+}
+
+/// The read guard for one pack's full parakeet-tdt tensor contract (shared
+/// FastConformer encoder plus the TDT tail): every tensor the loaders read
+/// must be enumerated here.
+pub(crate) fn parakeet_tdt_read_guard(
+    metadata: &ParakeetTdtExecutionMetadata,
+) -> crate::models::tensor_binding::TensorReadGuard {
+    crate::models::tensor_binding::TensorReadGuard::from_descriptors(
+        &super::runtime_contract::parakeet_tdt_runtime_tensor_binding_descriptors(metadata),
+    )
+}
+
 pub(crate) fn load_parakeet_tdt_encoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetTdtExecutionMetadata,
 ) -> Result<ParakeetTdtEncoderWeights, ParakeetTdtWeightsError> {
+    let guard = parakeet_tdt_read_guard(metadata);
     let subsampling =
-        fastconformer::load_fastconformer_subsampling::<ParakeetTdtWeightsError>(reader)?;
+        fastconformer::load_fastconformer_subsampling::<ParakeetTdtWeightsError>(reader, &guard)?;
 
     let mut layers = Vec::with_capacity(metadata.n_layers);
     for layer in 0..metadata.n_layers {
@@ -172,6 +205,7 @@ pub(crate) fn load_parakeet_tdt_encoder_weights(
             ParakeetTdtWeightsError,
         >(
             reader,
+            &guard,
             layer,
             metadata.hidden_size,
             metadata.ffn_dim,
@@ -180,10 +214,14 @@ pub(crate) fn load_parakeet_tdt_encoder_weights(
     }
 
     let mut enc_proj_weight: NamedTensor =
-        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "enc.proj.weight")?;
+        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, "enc.proj.weight")?;
     let enc_proj_bias: NamedTensor =
-        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "enc.proj.bias")?;
-    let expected_proj = metadata.joint_hidden * metadata.hidden_size;
+        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, "enc.proj.bias")?;
+    let expected_proj = checked_expectation(
+        &enc_proj_weight.name,
+        metadata.joint_hidden.checked_mul(metadata.hidden_size),
+        "joint_hidden * hidden_size overflows",
+    )?;
     if enc_proj_weight.element_count() != expected_proj {
         return Err(ParakeetTdtWeightsError::ElementCount {
             name: enc_proj_weight.name.clone(),
@@ -212,30 +250,47 @@ pub(crate) fn load_parakeet_tdt_predictor_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetTdtExecutionMetadata,
 ) -> Result<ParakeetTdtPredictorWeights, ParakeetTdtWeightsError> {
+    let guard = parakeet_tdt_read_guard(metadata);
     let hidden = metadata.pred_hidden;
     let embedding = expect_elements(
-        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "dec.embed.weight")?,
-        metadata.vocab_size * hidden,
+        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, "dec.embed.weight")?,
+        checked_expectation(
+            "dec.embed.weight",
+            metadata.vocab_size.checked_mul(hidden),
+            "vocab_size * pred_hidden overflows",
+        )?,
+    )?;
+    let gate_weight_elems = checked_expectation(
+        "dec.lstm gate weight",
+        hidden
+            .checked_mul(hidden)
+            .and_then(|value| value.checked_mul(4)),
+        "4 * pred_hidden * pred_hidden overflows",
+    )?;
+    let gate_bias_elems = checked_expectation(
+        "dec.lstm gate bias",
+        hidden.checked_mul(4),
+        "4 * pred_hidden overflows",
     )?;
     let mut lstm_layers = Vec::with_capacity(metadata.pred_layers);
     for layer in 0..metadata.pred_layers {
         let n = |suffix: &str| format!("dec.lstm.{layer}.{suffix}");
         lstm_layers.push(ParakeetTdtLstmLayerWeights {
             w_ih: expect_elements(
-                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("w_ih"))?,
-                4 * hidden * hidden,
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, &n("w_ih"))?,
+                gate_weight_elems,
             )?,
             w_hh: expect_elements(
-                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("w_hh"))?,
-                4 * hidden * hidden,
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, &n("w_hh"))?,
+                gate_weight_elems,
             )?,
             b_ih: expect_elements(
-                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("b_ih"))?,
-                4 * hidden,
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, &n("b_ih"))?,
+                gate_bias_elems,
             )?,
             b_hh: expect_elements(
-                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("b_hh"))?,
-                4 * hidden,
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, &n("b_hh"))?,
+                gate_bias_elems,
             )?,
         });
     }
@@ -249,23 +304,48 @@ pub(crate) fn load_parakeet_tdt_joint_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetTdtExecutionMetadata,
 ) -> Result<ParakeetTdtJointWeights, ParakeetTdtWeightsError> {
+    let guard = parakeet_tdt_read_guard(metadata);
     let joint = metadata.joint_hidden;
-    let out_rows = metadata.vocab_size + metadata.n_durations;
+    let out_rows = checked_expectation(
+        "joint.out",
+        metadata.vocab_size.checked_add(metadata.n_durations),
+        "vocab_size + n_durations overflows",
+    )?;
     Ok(ParakeetTdtJointWeights {
         pred_weight: expect_elements(
-            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.pred.weight")?,
-            joint * metadata.pred_hidden,
+            fastconformer::load_named::<ParakeetTdtWeightsError>(
+                reader,
+                &guard,
+                "joint.pred.weight",
+            )?,
+            checked_expectation(
+                "joint.pred.weight",
+                joint.checked_mul(metadata.pred_hidden),
+                "joint_hidden * pred_hidden overflows",
+            )?,
         )?,
         pred_bias: expect_elements(
-            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.pred.bias")?,
+            fastconformer::load_named::<ParakeetTdtWeightsError>(
+                reader,
+                &guard,
+                "joint.pred.bias",
+            )?,
             joint,
         )?,
         out_weight: expect_elements(
-            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.out.weight")?,
-            out_rows * joint,
+            fastconformer::load_named::<ParakeetTdtWeightsError>(
+                reader,
+                &guard,
+                "joint.out.weight",
+            )?,
+            checked_expectation(
+                "joint.out.weight",
+                out_rows.checked_mul(joint),
+                "(vocab_size + n_durations) * joint_hidden overflows",
+            )?,
         )?,
         out_bias: expect_elements(
-            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.out.bias")?,
+            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &guard, "joint.out.bias")?,
             out_rows,
         )?,
     })
@@ -335,5 +415,94 @@ mod tests {
         let joint = load_parakeet_tdt_joint_weights(&reader, &metadata).expect("joint");
         assert_eq!(joint.out_bias.element_count(), 8193 + 5);
         assert_eq!(joint.out_weight.element_count(), (8193 + 5) * 640);
+    }
+
+    /// The equivalence evidence the count-plus-sampling pin used to fake: run
+    /// the REAL encoder + predictor + joint loaders over a synthetic pack
+    /// projected from the contract enumeration itself, with the tensor
+    /// index's access trace enabled, and assert the traced read set equals
+    /// the descriptor set name for name and shape for shape. Any drift -- a
+    /// loader reading a tensor the contract does not list, a descriptor no
+    /// loader reads, or a read violating the descriptor's shape -- fails
+    /// here. Also exercises the read guard: every read is contract-listed.
+    #[test]
+    fn full_loader_read_trace_equals_the_descriptor_set() {
+        use super::super::runtime_contract::{
+            parakeet_tdt_runtime_tensor_binding_descriptors, parakeet_tdt_runtime_tensors,
+        };
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+        let metadata = super::tests_support::tiny_execution_metadata();
+        let shapes = parakeet_tdt_runtime_tensors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("parakeet-tdt-trace.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in shapes {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write trace pack");
+
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+        reader.tensor_index().enable_access_trace();
+        load_parakeet_tdt_encoder_weights(&reader, &metadata).expect("full encoder load");
+        load_parakeet_tdt_predictor_weights(&reader, &metadata).expect("full predictor load");
+        load_parakeet_tdt_joint_weights(&reader, &metadata).expect("full joint load");
+
+        crate::models::tensor_binding::assert_trace_matches_descriptor_set(
+            &reader.tensor_index().access_trace(),
+            &parakeet_tdt_runtime_tensor_binding_descriptors(&metadata),
+        );
+    }
+
+    /// The read guard fails closed on any tensor the contract does not
+    /// enumerate, so a loader/name drift cannot read off-contract.
+    #[test]
+    fn read_guard_rejects_off_contract_tensors() {
+        use crate::models::fastconformer::load_named;
+
+        let metadata = super::tests_support::tiny_execution_metadata();
+        let guard = parakeet_tdt_read_guard(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("parakeet-tdt-guard.oasr");
+        let spec = crate::testing::TinyGgufFixtureSpec::new(std::collections::BTreeMap::new())
+            .with_tensor_shape("off.contract.weight", vec![2, 2]);
+        crate::testing::write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+
+        let error = load_named::<ParakeetTdtWeightsError>(&reader, &guard, "off.contract.weight")
+            .expect_err("off-contract reads must fail closed");
+        assert!(
+            matches!(error, ParakeetTdtWeightsError::NotInContract { ref name } if name == "off.contract.weight"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// Test-only geometry support shared by this module's tests and the runtime
+/// contract's tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::super::runtime_contract::ParakeetTdtExecutionMetadata;
+
+    pub(crate) fn tiny_execution_metadata() -> ParakeetTdtExecutionMetadata {
+        ParakeetTdtExecutionMetadata {
+            n_layers: 1,
+            hidden_size: 16,
+            n_heads: 2,
+            head_dim: 8,
+            ffn_dim: 32,
+            conv_kernel: 9,
+            n_mels: 128,
+            subsampling_factor: 8,
+            subsampling_channels: 24,
+            scale_input: false,
+            vocab_size: 12,
+            blank_token_id: 11,
+            pred_hidden: 20,
+            pred_layers: 2,
+            joint_hidden: 24,
+            n_durations: 5,
+            max_symbols_per_step: 10,
+        }
     }
 }

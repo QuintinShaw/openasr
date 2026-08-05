@@ -27,12 +27,23 @@ enum CommandGroup {
     /// Re-run the production model-pack preflight on every pack installed in
     /// the local model store. This is the shipped-pack regression gate: a
     /// contract change that would reject an already-released pack fails here
-    /// before it can ship. Skips explicitly when no packs are installed.
+    /// before it can ship. The store itself is verified through the product
+    /// read paths (refs parsed as their authoritative record type with
+    /// model id / quant / sha256 / size validated against the
+    /// content-addressed object, then every object re-hashed against its
+    /// digest), and the preflight runs as a subprocess of the workspace
+    /// `openasr` CLI -- the exact production path, sandbox included. Skips
+    /// with an explicit warning when no packs are installed, unless
+    /// `--require-store` turns that skip into a failure.
     VerifyInstalledPacks {
         /// Override the OpenASR home directory (defaults to `$OPENASR_HOME`,
         /// then `~/.openasr`).
         #[arg(long)]
         home: Option<PathBuf>,
+        /// Fail when no installed model store exists (release gates); the
+        /// default prints an explicit warning and skips.
+        #[arg(long)]
+        require_store: bool,
     },
 }
 
@@ -89,112 +100,198 @@ fn main() -> Result<()> {
                 export_inventory(&workspace_root, output.as_deref(), check)
             }
         },
-        CommandGroup::VerifyInstalledPacks { home } => verify_installed_packs(home.as_deref()),
+        CommandGroup::VerifyInstalledPacks {
+            home,
+            require_store,
+        } => verify_installed_packs(&workspace_root, home.as_deref(), require_store),
     }
 }
 
-/// Resolve the OpenASR home directory: `$OPENASR_HOME`, else `~/.openasr`.
-fn resolve_openasr_home() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("OPENASR_HOME") {
-        return Ok(PathBuf::from(home));
+/// Resolve the OpenASR home directory through the product's own rule
+/// (`$OPENASR_HOME`, then `~/.openasr`), unless the gate got an explicit
+/// `--home` override.
+fn resolve_openasr_home_dir(home_override: Option<&Path>) -> Result<PathBuf> {
+    match home_override {
+        Some(home) => Ok(home.to_path_buf()),
+        None => openasr_core::openasr_home().map_err(|error| anyhow::anyhow!("{error}")),
     }
-    let home = std::env::var_os("HOME")
-        .context("neither OPENASR_HOME nor HOME is set; cannot locate the model store")?;
-    Ok(PathBuf::from(home).join(".openasr"))
 }
 
-/// Scan `<home>/models/refs/*/*.json` and re-run the exact production preflight
-/// (`openasr_core::preflight_model_pack_with_receipt`, the same gate the CLI
-/// `model-pack preflight` and the client pull path apply) on each referenced
-/// pack. Returns a non-zero exit if any installed pack fails.
-fn verify_installed_packs(home_override: Option<&Path>) -> Result<()> {
-    // The sandboxed GGUF C parser re-execs the current binary with a hidden
-    // `__openasr-gguf-c-parser-probe` subcommand that only the `openasr` CLI
-    // implements. This xtask binary is not that helper, so its default `auto`
-    // mode would spawn `openasr-xtask <probe>` and fail. Use the bounded
-    // in-process parser instead: the installed packs this gate checks are
-    // already-trusted local artifacts, and the parse/validation result is
-    // identical -- only crash isolation differs.
-    // `set_var` is only sound single-threaded; this runs on the single main
-    // thread before any preflight work spawns helper threads.
-    unsafe { std::env::set_var("OPENASR_GGUF_C_PARSER_SANDBOX", "disabled") };
-    let home = match home_override {
-        Some(home) => home.to_path_buf(),
-        None => resolve_openasr_home()?,
-    };
-    let refs_dir = home.join("models").join("refs");
-    if !refs_dir.exists() {
-        println!(
-            "no installed model store at {}; skipping the shipped-pack regression gate",
-            refs_dir.display()
-        );
+/// Verify every pack installed in the local model store, fail-closed, then
+/// run the production CLI preflight on each. The models root is resolved
+/// exactly like the product resolves it (`OPENASR_MODELS_DIR` env, then
+/// `config.models_dir`, then `<home>/models`) because the store reader this
+/// gate delegates to applies that rule itself.
+fn verify_installed_packs(
+    workspace_root: &Path,
+    home_override: Option<&Path>,
+    require_store: bool,
+) -> Result<()> {
+    let home = resolve_openasr_home_dir(home_override)?;
+    let packs = check_installed_store(&home, require_store)?;
+    if packs.is_empty() {
         return Ok(());
     }
-    let mut ref_files = Vec::new();
-    for model_entry in
-        fs::read_dir(&refs_dir).with_context(|| format!("reading {}", refs_dir.display()))?
-    {
-        let model_entry = model_entry?;
-        let model_dir = model_entry.path();
-        if !model_dir.is_dir() {
-            continue;
-        }
-        for ref_entry in
-            fs::read_dir(&model_dir).with_context(|| format!("reading {}", model_dir.display()))?
-        {
-            let ref_entry = ref_entry?;
-            let path = ref_entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                ref_files.push(path);
-            }
-        }
-    }
-    ref_files.sort();
-    if ref_files.is_empty() {
-        println!(
-            "no installed model pack refs under {}; skipping the shipped-pack regression gate",
-            refs_dir.display()
-        );
-        return Ok(());
-    }
+    verify_store_object_bytes(&home)?;
+    let cli = resolve_openasr_cli(workspace_root)?;
     let mut failures = 0usize;
-    for ref_file in &ref_files {
-        let raw = fs::read_to_string(ref_file)
-            .with_context(|| format!("reading {}", ref_file.display()))?;
-        let value: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", ref_file.display()))?;
-        let model_id = value
-            .get("model_id")
-            .and_then(|field| field.as_str())
-            .unwrap_or("<unknown>");
-        let quant = value
-            .get("quant")
-            .and_then(|field| field.as_str())
-            .unwrap_or("<unknown>");
-        let Some(pack_path) = value.get("path").and_then(|field| field.as_str()) else {
-            println!("SKIP {model_id}:{quant} (ref has no pack path)");
-            continue;
-        };
-        let label = format!("{model_id}:{quant}");
-        match openasr_core::preflight_model_pack_with_receipt(Path::new(pack_path)) {
-            Ok(receipt) => {
-                println!("PASS {label} {pack_path} ({})", receipt.content_id);
-            }
+    for pack in &packs {
+        let label = format!("{}:{}", pack.model_id, pack.quant);
+        match run_cli_preflight(&cli, &pack.path) {
+            Ok(()) => println!("PASS {label} {}", pack.path.display()),
             Err(error) => {
-                println!("FAIL {label} {pack_path}: {error}");
+                println!("FAIL {label} {}: {error:#}", pack.path.display());
                 failures += 1;
             }
         }
     }
     println!(
-        "{} installed pack ref(s) checked, {} failed",
-        ref_files.len(),
-        failures
+        "{} installed pack(s) checked against the production CLI preflight, {failures} failed",
+        packs.len()
     );
     if failures > 0 {
         bail!("{failures} installed pack(s) failed the production preflight");
     }
     Ok(())
+}
+
+/// Validate the installed store through the product's own store reader:
+/// `openasr_core::InstalledModelStore` parses every ref as the authoritative
+/// installed-pack record and validates model id, quant, sha256, size, and
+/// the digest-derived object path (the ref's recorded path is never an
+/// authority, symlinked objects are rejected). Any diagnostic fails the gate
+/// -- a corrupt ref is not a SKIP. A missing or empty store skips with an
+/// explicit uppercase warning, or fails outright under `--require-store`.
+fn check_installed_store(
+    home: &Path,
+    require_store: bool,
+) -> Result<Vec<openasr_core::InstalledPack>> {
+    let config = openasr_core::load_config(home).unwrap_or_default();
+    let models_dir = openasr_core::models_dir(home, &config);
+    let refs_dir = models_dir.join("refs");
+    let store = openasr_core::InstalledModelStore::read(home)
+        .map_err(|error| anyhow::anyhow!("reading the installed model store failed: {error}"))?;
+    if !store.diagnostics().is_empty() {
+        for diagnostic in store.diagnostics() {
+            println!("FAIL {}: {}", diagnostic.path.display(), diagnostic.reason);
+        }
+        bail!(
+            "{} installed pack ref(s) failed store verification",
+            store.diagnostics().len()
+        );
+    }
+    let packs = store.into_packs();
+    if packs.is_empty() {
+        let models_dir_display = models_dir.display();
+        let warning = if refs_dir.is_dir() {
+            format!(
+                "WARNING: NO INSTALLED MODEL PACKS UNDER {models_dir_display} -- \
+                 SHIPPED-PACK REGRESSION GATE SKIPPED"
+            )
+        } else {
+            format!(
+                "WARNING: NO INSTALLED MODEL STORE AT {models_dir_display} -- \
+                 SHIPPED-PACK REGRESSION GATE SKIPPED"
+            )
+        };
+        if require_store {
+            bail!("{warning} (--require-store was set)");
+        }
+        println!("{warning}");
+    }
+    Ok(packs)
+}
+
+/// Re-hash every object a ref names through the product's store verifier
+/// (`openasr model-pack verify`'s engine), so the gate fails closed on a
+/// byte-level sha/size mismatch, not just on ref structure.
+fn verify_store_object_bytes(home: &Path) -> Result<()> {
+    let verification = openasr_core::verify_model_store(home)
+        .map_err(|error| anyhow::anyhow!("verifying installed store objects failed: {error}"))?;
+    let mut failures = 0usize;
+    for check in &verification.checked {
+        if let Some(reason) = &check.failure {
+            println!("FAIL {} ({}): {reason}", check.pull, check.digest);
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        bail!("{failures} installed object(s) failed sha256/size verification");
+    }
+    Ok(())
+}
+
+/// Locate the workspace `openasr` CLI, building it when missing. The gate
+/// must run the production binary (the sandboxed GGUF parser re-execs the
+/// CLI itself); if no binary can be produced the gate errors instead of
+/// degrading to any in-process path.
+fn resolve_openasr_cli(workspace_root: &Path) -> Result<PathBuf> {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target"));
+    if let Some(cli) = find_openasr_cli_binary(&target_dir) {
+        return Ok(cli);
+    }
+    println!(
+        "openasr CLI not found under {}; building it (cargo build -p openasr-cli)",
+        target_dir.display()
+    );
+    let status = Command::new("cargo")
+        .args(["build", "-p", "openasr-cli"])
+        .current_dir(workspace_root)
+        .stdin(Stdio::null())
+        .status()
+        .context("start cargo build -p openasr-cli")?;
+    if !status.success() {
+        bail!("cargo build -p openasr-cli failed ({status})");
+    }
+    find_openasr_cli_binary(&target_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "openasr CLI binary not found under {} after building; refusing to \
+             degrade the shipped-pack gate to a non-production preflight",
+            target_dir.display()
+        )
+    })
+}
+
+/// Prefer an existing release build, then a debug build.
+fn find_openasr_cli_binary(target_dir: &Path) -> Option<PathBuf> {
+    let binary = format!("openasr{}", std::env::consts::EXE_SUFFIX);
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target_dir.join(profile).join(&binary))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Run the exact production preflight (`openasr model-pack preflight`) as a
+/// subprocess of the workspace CLI. Non-zero exit fails the gate with the
+/// CLI's own diagnostic output.
+fn run_cli_preflight(cli: &Path, pack: &Path) -> Result<()> {
+    let output = Command::new(cli)
+        .args(["model-pack", "preflight"])
+        .arg(pack)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("start production preflight {}", cli.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "preflight exited with {}{}{}",
+        output.status,
+        if stdout.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{stdout}", stdout = stdout.trim())
+        },
+        if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{stderr}", stderr = stderr.trim())
+        },
+    );
 }
 
 fn workspace_root() -> PathBuf {
@@ -799,5 +896,266 @@ mod tests {
         export_inventory(root.path(), Some(&output), true).unwrap();
         fs::write(&output, b"{}\n").unwrap();
         assert!(export_inventory(root.path(), Some(&output), true).is_err());
+    }
+
+    // --- verify-installed-packs behavior tests ------------------------------
+    //
+    // Each test builds a temporary store fixture. nextest runs every test in
+    // its own process, so removing the models-dir env override inside a test
+    // is sound and keeps the product resolution (env > config > default)
+    // pointed at the fixture.
+
+    fn clear_models_dir_env() {
+        // SAFETY: nextest process isolation; single-threaded test setup.
+        unsafe { std::env::remove_var(openasr_core::OPENASR_MODELS_DIR_ENV) };
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Write a content-addressed object plus its InstalledPack ref, the way
+    /// the product store lays them out. Returns the ref path.
+    fn write_installed_pack(
+        home: &Path,
+        model_id: &str,
+        quant: &str,
+        object_bytes: &[u8],
+    ) -> PathBuf {
+        let digest = sha256_hex(object_bytes);
+        write_installed_pack_with_digest(home, model_id, quant, object_bytes, &digest)
+    }
+
+    fn write_installed_pack_with_digest(
+        home: &Path,
+        model_id: &str,
+        quant: &str,
+        object_bytes: &[u8],
+        digest: &str,
+    ) -> PathBuf {
+        let object = home
+            .join("models/objects/sha256")
+            .join(digest)
+            .join("content");
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(&object, object_bytes).unwrap();
+        let record = serde_json::json!({
+            "model_id": model_id,
+            "display_name": model_id,
+            "quant": quant,
+            "suffix": "q8",
+            "pull": format!("{model_id}:q8"),
+            "filename": format!("{model_id}-{quant}.oasr"),
+            "path": object.display().to_string(),
+            "url": "https://example.invalid/model.oasr",
+            "hf_revision": "test",
+            "sha256": digest,
+            "size_bytes": object_bytes.len(),
+            "installed_at_unix_seconds": 1_u64,
+        });
+        let ref_path = home
+            .join("models/refs")
+            .join(model_id)
+            .join(format!("{quant}.json"));
+        fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
+        fs::write(&ref_path, record.to_string()).unwrap();
+        ref_path
+    }
+
+    #[test]
+    fn check_installed_store_accepts_a_valid_ref_and_resolves_the_object_path() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        write_installed_pack(home.path(), "example-model", "q8_0", b"pack-bytes");
+
+        let packs = check_installed_store(home.path(), true).expect("valid store must pass");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].model_id, "example-model");
+        assert_eq!(packs[0].quant, "q8_0");
+        assert_eq!(
+            packs[0].path,
+            home.path()
+                .join("models/objects/sha256")
+                .join(sha256_hex(b"pack-bytes"))
+                .join("content"),
+            "the gate must resolve the object from the digest, never the recorded path"
+        );
+    }
+
+    #[test]
+    fn check_installed_store_fails_closed_on_a_corrupt_ref_json() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        let ref_path = write_installed_pack(home.path(), "example-model", "q8_0", b"pack-bytes");
+        fs::write(&ref_path, "{ not json").unwrap();
+
+        let error = check_installed_store(home.path(), false)
+            .expect_err("a corrupt ref must fail the gate, not skip");
+        assert!(
+            error.to_string().contains("failed store verification"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn check_installed_store_fails_closed_when_the_ref_has_no_path() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        let ref_path = write_installed_pack(home.path(), "example-model", "q8_0", b"pack-bytes");
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&ref_path).unwrap()).unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("path")
+            .expect("ref carries a path");
+        fs::write(&ref_path, record.to_string()).unwrap();
+
+        assert!(
+            check_installed_store(home.path(), false).is_err(),
+            "a ref without a pack path must fail the gate, not skip"
+        );
+    }
+
+    #[test]
+    fn check_installed_store_fails_closed_when_the_object_is_missing() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        write_installed_pack(home.path(), "example-model", "q8_0", b"pack-bytes");
+        let object = home
+            .path()
+            .join("models/objects/sha256")
+            .join(sha256_hex(b"pack-bytes"))
+            .join("content");
+        fs::remove_file(object).unwrap();
+
+        assert!(
+            check_installed_store(home.path(), false).is_err(),
+            "a ref whose object vanished must fail the gate"
+        );
+    }
+
+    #[test]
+    fn check_installed_store_fails_closed_on_a_size_mismatch() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        let ref_path = write_installed_pack(home.path(), "example-model", "q8_0", b"pack-bytes");
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&ref_path).unwrap()).unwrap();
+        record["size_bytes"] = serde_json::json!(999_u64);
+        fs::write(&ref_path, record.to_string()).unwrap();
+
+        assert!(
+            check_installed_store(home.path(), false).is_err(),
+            "a ref whose size disagrees with the object must fail the gate"
+        );
+    }
+
+    #[test]
+    fn verify_store_object_bytes_fails_closed_on_a_sha_mismatch() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        // A valid-format digest naming bytes that do not hash to it.
+        write_installed_pack_with_digest(
+            home.path(),
+            "example-model",
+            "q8_0",
+            b"tampered-bytes",
+            &sha256_hex(b"original-bytes"),
+        );
+
+        let error = verify_store_object_bytes(home.path())
+            .expect_err("a sha256 mismatch must fail the gate");
+        assert!(
+            error
+                .to_string()
+                .contains("failed sha256/size verification"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn verify_store_object_bytes_accepts_an_intact_object() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+        write_installed_pack(home.path(), "example-model", "q8_0", b"pack-bytes");
+
+        verify_store_object_bytes(home.path()).expect("intact object must verify");
+    }
+
+    #[test]
+    fn missing_store_skips_with_a_warning_by_default_and_fails_with_require_store() {
+        clear_models_dir_env();
+        let home = tempdir().unwrap();
+
+        let packs =
+            check_installed_store(home.path(), false).expect("an absent store skips by default");
+        assert!(packs.is_empty());
+
+        let error = check_installed_store(home.path(), true)
+            .expect_err("--require-store must fail on an absent store");
+        assert!(
+            error.to_string().contains("--require-store"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn find_openasr_cli_binary_prefers_release_then_debug() {
+        let target = tempdir().unwrap();
+        let binary = format!("openasr{}", std::env::consts::EXE_SUFFIX);
+        assert!(find_openasr_cli_binary(target.path()).is_none());
+
+        let debug = target.path().join("debug").join(&binary);
+        fs::create_dir_all(debug.parent().unwrap()).unwrap();
+        fs::write(&debug, b"").unwrap();
+        assert_eq!(
+            find_openasr_cli_binary(target.path()).unwrap(),
+            debug,
+            "a debug build is found when no release build exists"
+        );
+
+        let release = target.path().join("release").join(&binary);
+        fs::create_dir_all(release.parent().unwrap()).unwrap();
+        fs::write(&release, b"").unwrap();
+        assert_eq!(
+            find_openasr_cli_binary(target.path()).unwrap(),
+            release,
+            "a release build wins over a debug build"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cli_preflight_reports_the_subprocess_outcome() {
+        let dir = tempdir().unwrap();
+        let ok_stub = dir.path().join("preflight-ok.sh");
+        fs::write(&ok_stub, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&ok_stub).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        fs::set_permissions(&ok_stub, permissions).unwrap();
+        run_cli_preflight(&ok_stub, Path::new("/unused/pack.oasr"))
+            .expect("a zero exit reports success");
+
+        let fail_stub = dir.path().join("preflight-fail.sh");
+        fs::write(
+            &fail_stub,
+            "#!/bin/sh\necho 'pack failed the contract' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fail_stub).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fail_stub, permissions).unwrap();
+        let error = run_cli_preflight(&fail_stub, Path::new("/unused/pack.oasr"))
+            .expect_err("a non-zero exit must fail the gate");
+        assert!(
+            error.to_string().contains("pack failed the contract"),
+            "the CLI diagnostic must surface: {error:#}"
+        );
     }
 }

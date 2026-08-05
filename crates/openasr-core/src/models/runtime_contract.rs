@@ -169,6 +169,25 @@ pub(crate) fn validate_positive_usize(
     })
 }
 
+/// Fail-closed architecture ceiling check for pack-supplied geometry values.
+/// The ceilings carry generous headroom over every production geometry but
+/// bound all contract-derived arithmetic and the tensor-obligation count a
+/// malicious metadata set can construct, so contract building stays
+/// allocation-bounded and overflow-free on untrusted input.
+pub(crate) fn validate_bounded_usize(
+    value: usize,
+    key: &'static str,
+    max: usize,
+) -> Result<(), MetadataContractError> {
+    if value <= max {
+        return Ok(());
+    }
+    Err(MetadataContractError::InvalidValue {
+        key,
+        reason: format!("value {value} exceeds the architecture ceiling {max}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

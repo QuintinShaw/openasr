@@ -42,6 +42,8 @@ pub(crate) enum FunasrNanoAdapterError {
     },
     #[error("funasr-nano adapter is missing tensor '{name}'")]
     MissingTensor { name: String },
+    #[error("funasr-nano adapter tensor '{name}' is not part of the runtime tensor contract")]
+    NotInContract { name: String },
     #[error(
         "funasr-nano adapter encoder rows shape is invalid: frame_count={frame_count} \
          encoder_d_model={encoder_d_model} values_len={values_len}"
@@ -65,8 +67,14 @@ fn map_err(step: &'static str, source: GgmlCpuGraphError) -> FunasrNanoAdapterEr
 
 fn tensor(
     loaded: &GgmlLoadedWeightContext,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     name: &str,
 ) -> Result<GgmlLoadedTensor, FunasrNanoAdapterError> {
+    if !guard.contains(name) {
+        return Err(FunasrNanoAdapterError::NotInContract {
+            name: name.to_string(),
+        });
+    }
     loaded
         .tensor(name)
         .ok_or_else(|| FunasrNanoAdapterError::MissingTensor {
@@ -96,26 +104,34 @@ struct AdapterBlock {
 
 fn load_block(
     loaded: &GgmlLoadedWeightContext,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     index: usize,
 ) -> Result<AdapterBlock, FunasrNanoAdapterError> {
+    use super::tensor_names::{
+        ADAPTOR_ATTN_K_BIAS, ADAPTOR_ATTN_K_WEIGHT, ADAPTOR_ATTN_NORM_BIAS,
+        ADAPTOR_ATTN_NORM_WEIGHT, ADAPTOR_ATTN_OUT_BIAS, ADAPTOR_ATTN_OUT_WEIGHT,
+        ADAPTOR_ATTN_Q_BIAS, ADAPTOR_ATTN_Q_WEIGHT, ADAPTOR_ATTN_V_BIAS, ADAPTOR_ATTN_V_WEIGHT,
+        ADAPTOR_FFN_DOWN_BIAS, ADAPTOR_FFN_DOWN_WEIGHT, ADAPTOR_FFN_NORM_BIAS,
+        ADAPTOR_FFN_NORM_WEIGHT, ADAPTOR_FFN_UP_BIAS, ADAPTOR_FFN_UP_WEIGHT,
+    };
     let n = |suffix: &str| format!("adaptor.blk.{index}.{suffix}");
     Ok(AdapterBlock {
-        attn_norm_weight: tensor(loaded, &n("attn.norm.weight"))?,
-        attn_norm_bias: tensor(loaded, &n("attn.norm.bias"))?,
-        attn_q_weight: tensor(loaded, &n("attn.q.weight"))?,
-        attn_q_bias: tensor(loaded, &n("attn.q.bias"))?,
-        attn_k_weight: tensor(loaded, &n("attn.k.weight"))?,
-        attn_k_bias: tensor(loaded, &n("attn.k.bias"))?,
-        attn_v_weight: tensor(loaded, &n("attn.v.weight"))?,
-        attn_v_bias: tensor(loaded, &n("attn.v.bias"))?,
-        attn_out_weight: tensor(loaded, &n("attn.out.weight"))?,
-        attn_out_bias: tensor(loaded, &n("attn.out.bias"))?,
-        ffn_norm_weight: tensor(loaded, &n("ffn.norm.weight"))?,
-        ffn_norm_bias: tensor(loaded, &n("ffn.norm.bias"))?,
-        ffn_up_weight: tensor(loaded, &n("ffn.up.weight"))?,
-        ffn_up_bias: tensor(loaded, &n("ffn.up.bias"))?,
-        ffn_down_weight: tensor(loaded, &n("ffn.down.weight"))?,
-        ffn_down_bias: tensor(loaded, &n("ffn.down.bias"))?,
+        attn_norm_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_NORM_WEIGHT))?,
+        attn_norm_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_NORM_BIAS))?,
+        attn_q_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_Q_WEIGHT))?,
+        attn_q_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_Q_BIAS))?,
+        attn_k_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_K_WEIGHT))?,
+        attn_k_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_K_BIAS))?,
+        attn_v_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_V_WEIGHT))?,
+        attn_v_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_V_BIAS))?,
+        attn_out_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_OUT_WEIGHT))?,
+        attn_out_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_OUT_BIAS))?,
+        ffn_norm_weight: tensor(loaded, guard, &n(ADAPTOR_FFN_NORM_WEIGHT))?,
+        ffn_norm_bias: tensor(loaded, guard, &n(ADAPTOR_FFN_NORM_BIAS))?,
+        ffn_up_weight: tensor(loaded, guard, &n(ADAPTOR_FFN_UP_WEIGHT))?,
+        ffn_up_bias: tensor(loaded, guard, &n(ADAPTOR_FFN_UP_BIAS))?,
+        ffn_down_weight: tensor(loaded, guard, &n(ADAPTOR_FFN_DOWN_WEIGHT))?,
+        ffn_down_bias: tensor(loaded, guard, &n(ADAPTOR_FFN_DOWN_BIAS))?,
     })
 }
 
@@ -141,13 +157,14 @@ impl FunasrNanoAdapterGraph {
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
-        let linear1_weight = tensor(&loaded, ADAPTOR_LINEAR1_WEIGHT)?;
-        let linear1_bias = tensor(&loaded, ADAPTOR_LINEAR1_BIAS)?;
-        let linear2_weight = tensor(&loaded, ADAPTOR_LINEAR2_WEIGHT)?;
-        let linear2_bias = tensor(&loaded, ADAPTOR_LINEAR2_BIAS)?;
+        let guard = super::runtime_contract::funasr_nano_adapter_read_guard(&metadata);
+        let linear1_weight = tensor(&loaded, &guard, ADAPTOR_LINEAR1_WEIGHT)?;
+        let linear1_bias = tensor(&loaded, &guard, ADAPTOR_LINEAR1_BIAS)?;
+        let linear2_weight = tensor(&loaded, &guard, ADAPTOR_LINEAR2_WEIGHT)?;
+        let linear2_bias = tensor(&loaded, &guard, ADAPTOR_LINEAR2_BIAS)?;
         let mut blocks = Vec::with_capacity(metadata.n_layers);
         for index in 0..metadata.n_layers {
-            blocks.push(load_block(&loaded, index)?);
+            blocks.push(load_block(&loaded, &guard, index)?);
         }
         Ok(Self {
             runner,

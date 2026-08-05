@@ -7,10 +7,11 @@
 
 use crate::ggml_runtime::GgufTensorDataReader;
 
-use super::runtime_contract::XasrZipformerExecutionMetadata;
+use super::runtime_contract::{XasrRuntimeTensorContract, XasrZipformerExecutionMetadata};
 use super::weights::{
     NamedTensor, StoredLinear, XasrWeightsError, load_named, load_native_linear,
-    load_native_linear_by_actual_dims, load_vector,
+    load_native_linear_by_actual_dims, load_native_linear_from_contract, load_vector,
+    load_vector_from_contract,
 };
 
 #[derive(Debug, Clone)]
@@ -272,17 +273,22 @@ pub(crate) fn load_xasr_encoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &XasrZipformerExecutionMetadata,
 ) -> Result<XasrEncoderWeights, XasrWeightsError> {
-    let embed = load_embed_weights(reader, metadata)?;
+    let contract = XasrRuntimeTensorContract::for_metadata(metadata);
+    load_xasr_encoder_weights_with_contract(reader, &contract, metadata)
+}
+
+fn load_xasr_encoder_weights_with_contract(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+    metadata: &XasrZipformerExecutionMetadata,
+) -> Result<XasrEncoderWeights, XasrWeightsError> {
+    let embed = load_embed_weights(reader, contract)?;
     let mut stacks = Vec::with_capacity(metadata.num_stacks);
     for stack in 0..metadata.num_stacks {
-        stacks.push(load_stack_weights(reader, metadata, stack)?);
+        stacks.push(load_stack_weights(reader, contract, metadata, stack)?);
     }
-    let output_downsampling_factor = metadata.downsampling_factors.last().copied().unwrap_or(2);
-    let downsample_output_bias = load_vector(
-        reader,
-        "encoder.downsample_output.bias",
-        output_downsampling_factor,
-    )?;
+    let downsample_output_bias =
+        load_vector_from_contract(reader, contract, "encoder.downsample_output.bias")?;
     Ok(XasrEncoderWeights {
         embed,
         stacks,
@@ -292,57 +298,66 @@ pub(crate) fn load_xasr_encoder_weights(
 
 fn load_embed_weights(
     reader: &GgufTensorDataReader,
-    metadata: &XasrZipformerExecutionMetadata,
+    contract: &XasrRuntimeTensorContract,
 ) -> Result<XasrEncoderEmbedWeights, XasrWeightsError> {
-    let first_dim = metadata.encoder_dims[0];
+    // The conv stem's kernel shapes and the `out` projection's input width
+    // are architecture constants the contract pins exactly; the loader sources
+    // them from the contract instead of duplicating the literals.
     Ok(XasrEncoderEmbedWeights {
-        conv0: load_conv2d(reader, "encoder_embed.conv.0", &[3, 3, 1, 8])?,
-        conv4: load_conv2d(reader, "encoder_embed.conv.4", &[3, 3, 8, 32])?,
-        conv7: load_conv2d(reader, "encoder_embed.conv.7", &[3, 3, 32, 128])?,
-        convnext_depthwise: load_conv2d(
+        conv0: load_conv2d_from_contract(reader, contract, "encoder_embed.conv.0")?,
+        conv4: load_conv2d_from_contract(reader, contract, "encoder_embed.conv.4")?,
+        conv7: load_conv2d_from_contract(reader, contract, "encoder_embed.conv.7")?,
+        convnext_depthwise: load_conv2d_from_contract(
             reader,
+            contract,
             "encoder_embed.convnext.depthwise_conv",
-            &[7, 7, 1, 128],
         )?,
-        convnext_pointwise1: load_conv2d(
+        convnext_pointwise1: load_conv2d_from_contract(
             reader,
+            contract,
             "encoder_embed.convnext.pointwise_conv1",
-            &[1, 1, 128, 384],
         )?,
-        convnext_pointwise2: load_conv2d(
+        convnext_pointwise2: load_conv2d_from_contract(
             reader,
+            contract,
             "encoder_embed.convnext.pointwise_conv2",
-            &[1, 1, 384, 128],
         )?,
-        out: load_linear_with_bias(reader, "encoder_embed.out", 2432, first_dim)?,
-        out_norm_bias: load_vector(reader, "encoder_embed.out_norm.bias", first_dim)?,
-        out_norm_log_scale: load_vector(reader, "encoder_embed.out_norm.log_scale", 1)?,
+        out: load_linear_with_bias_from_contract(reader, contract, "encoder_embed.out")?,
+        out_norm_bias: load_vector_from_contract(reader, contract, "encoder_embed.out_norm.bias")?,
+        out_norm_log_scale: load_vector_from_contract(
+            reader,
+            contract,
+            "encoder_embed.out_norm.log_scale",
+        )?,
     })
 }
 
 fn load_stack_weights(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     metadata: &XasrZipformerExecutionMetadata,
     stack: usize,
 ) -> Result<XasrEncoderStackWeights, XasrWeightsError> {
     let dim = metadata.encoder_dims[stack];
     let mut layers = Vec::with_capacity(metadata.num_encoder_layers[stack]);
     for layer in 0..metadata.num_encoder_layers[stack] {
-        layers.push(load_layer_weights(reader, metadata, stack, layer)?);
+        layers.push(load_layer_weights(
+            reader, contract, metadata, stack, layer,
+        )?);
     }
     let (downsample_bias, out_combiner_bypass_scale) = if stack == 0 {
         (None, None)
     } else {
         (
-            Some(load_vector(
+            Some(load_vector_from_contract(
                 reader,
+                contract,
                 &format!("encoder.encoders.{stack}.downsample.bias"),
-                metadata.downsampling_factors[stack],
             )?),
-            Some(load_vector(
+            Some(load_vector_from_contract(
                 reader,
+                contract,
                 &format!("encoder.encoders.{stack}.out_combiner.bypass_scale"),
-                dim,
             )?),
         )
     };
@@ -358,6 +373,7 @@ fn load_stack_weights(
 
 fn load_layer_weights(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     metadata: &XasrZipformerExecutionMetadata,
     stack: usize,
     layer: usize,
@@ -365,46 +381,49 @@ fn load_layer_weights(
     let dim = metadata.encoder_dims[stack];
     let prefix = layer_prefix(stack, layer);
     Ok(XasrEncoderLayerWeights {
-        feed_forward1: load_feed_forward(reader, &prefix, "feed_forward1", dim)?,
-        feed_forward2: load_feed_forward(reader, &prefix, "feed_forward2", dim)?,
-        feed_forward3: load_feed_forward(reader, &prefix, "feed_forward3", dim)?,
-        self_attn_weights: load_self_attention_weights(reader, metadata, &prefix, stack, dim)?,
-        self_attn1: load_attention_value_projection(reader, &prefix, "self_attn1", dim)?,
-        self_attn2: load_attention_value_projection(reader, &prefix, "self_attn2", dim)?,
-        nonlin_attention: load_nonlin_attention(reader, &prefix, dim)?,
-        conv_module1: load_convolution_module(
-            reader,
-            metadata,
-            &prefix,
-            stack,
-            "conv_module1",
-            dim,
+        feed_forward1: load_feed_forward(reader, contract, &prefix, "feed_forward1", dim)?,
+        feed_forward2: load_feed_forward(reader, contract, &prefix, "feed_forward2", dim)?,
+        feed_forward3: load_feed_forward(reader, contract, &prefix, "feed_forward3", dim)?,
+        self_attn_weights: load_self_attention_weights(
+            reader, contract, metadata, &prefix, stack, dim,
         )?,
-        conv_module2: load_convolution_module(
+        self_attn1: load_attention_value_projection(reader, contract, &prefix, "self_attn1", dim)?,
+        self_attn2: load_attention_value_projection(reader, contract, &prefix, "self_attn2", dim)?,
+        nonlin_attention: load_nonlin_attention(reader, contract, &prefix, dim)?,
+        conv_module1: load_convolution_module(reader, contract, &prefix, "conv_module1")?,
+        conv_module2: load_convolution_module(reader, contract, &prefix, "conv_module2")?,
+        norm_bias: load_vector_from_contract(reader, contract, &format!("{prefix}.norm.bias"))?,
+        norm_log_scale: load_vector_from_contract(
             reader,
-            metadata,
-            &prefix,
-            stack,
-            "conv_module2",
-            dim,
+            contract,
+            &format!("{prefix}.norm.log_scale"),
         )?,
-        norm_bias: load_vector(reader, &format!("{prefix}.norm.bias"), dim)?,
-        norm_log_scale: load_vector(reader, &format!("{prefix}.norm.log_scale"), 1)?,
-        bypass_scale: load_vector(reader, &format!("{prefix}.bypass.bypass_scale"), dim)?,
-        bypass_mid_scale: load_vector(reader, &format!("{prefix}.bypass_mid.bypass_scale"), dim)?,
+        bypass_scale: load_vector_from_contract(
+            reader,
+            contract,
+            &format!("{prefix}.bypass.bypass_scale"),
+        )?,
+        bypass_mid_scale: load_vector_from_contract(
+            reader,
+            contract,
+            &format!("{prefix}.bypass_mid.bypass_scale"),
+        )?,
     })
 }
 
 fn load_feed_forward(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
     name: &str,
     dim: usize,
 ) -> Result<XasrLinearPairWeights, XasrWeightsError> {
-    let in_proj = load_dynamic_linear_with_bias(reader, &format!("{prefix}.{name}.in_proj"), dim)?;
+    let in_proj =
+        load_dynamic_linear_with_bias(reader, contract, &format!("{prefix}.{name}.in_proj"), dim)?;
     let hidden_dim = in_proj.weight.output_dim;
     let out_proj = load_linear_with_bias(
         reader,
+        contract,
         &format!("{prefix}.{name}.out_proj"),
         hidden_dim,
         dim,
@@ -414,19 +433,27 @@ fn load_feed_forward(
 
 fn load_attention_value_projection(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
     name: &str,
     dim: usize,
 ) -> Result<XasrLinearPairWeights, XasrWeightsError> {
-    let in_proj = load_dynamic_linear_with_bias(reader, &format!("{prefix}.{name}.in_proj"), dim)?;
+    let in_proj =
+        load_dynamic_linear_with_bias(reader, contract, &format!("{prefix}.{name}.in_proj"), dim)?;
     let value_dim = in_proj.weight.output_dim;
-    let out_proj =
-        load_linear_with_bias(reader, &format!("{prefix}.{name}.out_proj"), value_dim, dim)?;
+    let out_proj = load_linear_with_bias(
+        reader,
+        contract,
+        &format!("{prefix}.{name}.out_proj"),
+        value_dim,
+        dim,
+    )?;
     Ok(XasrLinearPairWeights { in_proj, out_proj })
 }
 
 fn load_self_attention_weights(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     metadata: &XasrZipformerExecutionMetadata,
     prefix: &str,
     stack: usize,
@@ -434,12 +461,22 @@ fn load_self_attention_weights(
 ) -> Result<XasrSelfAttentionWeightsWeights, XasrWeightsError> {
     let linear_pos = load_native_linear_by_actual_dims(
         reader,
+        contract,
         &format!("{prefix}.self_attn_weights.linear_pos.weight"),
     )?;
-    let query_dim = metadata.num_heads[stack] * metadata.query_head_dims[stack];
-    let expected_output = 2 * query_dim + linear_pos.output_dim;
+    // Checked arithmetic: `linear_pos.output_dim` is pack-derived, so the
+    // expectation must fail closed instead of wrapping into an admitting
+    // comparison (parse-time caps already bound the metadata factors).
+    let expected_output = metadata.num_heads[stack]
+        .checked_mul(metadata.query_head_dims[stack])
+        .and_then(|query_dim| query_dim.checked_mul(2))
+        .and_then(|value| value.checked_add(linear_pos.output_dim))
+        .ok_or_else(|| XasrWeightsError::ExpectationOverflow {
+            reason: format!("{prefix}.self_attn_weights.in_proj expected output width overflows"),
+        })?;
     let in_proj = load_linear_with_bias(
         reader,
+        contract,
         &format!("{prefix}.self_attn_weights.in_proj"),
         dim,
         expected_output,
@@ -452,14 +489,20 @@ fn load_self_attention_weights(
 
 fn load_nonlin_attention(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
     dim: usize,
 ) -> Result<XasrNonlinAttentionWeights, XasrWeightsError> {
-    let in_proj =
-        load_dynamic_linear_with_bias(reader, &format!("{prefix}.nonlin_attention.in_proj"), dim)?;
+    let in_proj = load_dynamic_linear_with_bias(
+        reader,
+        contract,
+        &format!("{prefix}.nonlin_attention.in_proj"),
+        dim,
+    )?;
     let out_input_dim = in_proj.weight.output_dim / 3;
     let out_proj = load_linear_with_bias(
         reader,
+        contract,
         &format!("{prefix}.nonlin_attention.out_proj"),
         out_input_dim,
         dim,
@@ -467,34 +510,41 @@ fn load_nonlin_attention(
     Ok(XasrNonlinAttentionWeights { in_proj, out_proj })
 }
 
+/// Every conv-module tensor's shape is fully pinned by the metadata-derived
+/// contract (kernel sizes, gate widths, scales), so the loader sources all of
+/// them from the contract instead of recomputing the literals.
 fn load_convolution_module(
     reader: &GgufTensorDataReader,
-    metadata: &XasrZipformerExecutionMetadata,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
-    stack: usize,
     name: &str,
-    dim: usize,
 ) -> Result<XasrConvolutionModuleWeights, XasrWeightsError> {
-    let kernel = metadata.cnn_module_kernels[stack];
-    let causal_kernel = kernel.div_ceil(2);
     Ok(XasrConvolutionModuleWeights {
-        in_proj: load_linear_with_bias(reader, &format!("{prefix}.{name}.in_proj"), dim, 2 * dim)?,
-        depthwise_causal_conv: load_conv1d(
+        in_proj: load_linear_with_bias_from_contract(
             reader,
+            contract,
+            &format!("{prefix}.{name}.in_proj"),
+        )?,
+        depthwise_causal_conv: load_conv1d_from_contract(
+            reader,
+            contract,
             &format!("{prefix}.{name}.depthwise_conv.causal_conv"),
-            &[causal_kernel, 1, dim],
         )?,
-        depthwise_chunkwise_conv: load_conv1d(
+        depthwise_chunkwise_conv: load_conv1d_from_contract(
             reader,
+            contract,
             &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv"),
-            &[kernel, 1, dim],
         )?,
-        chunkwise_conv_scale: load_named_with_dims(
+        chunkwise_conv_scale: load_named(
             reader,
+            contract,
             &format!("{prefix}.{name}.depthwise_conv.chunkwise_conv_scale"),
-            &[2, dim, kernel],
         )?,
-        out_proj: load_linear_with_bias(reader, &format!("{prefix}.{name}.out_proj"), dim, dim)?,
+        out_proj: load_linear_with_bias_from_contract(
+            reader,
+            contract,
+            &format!("{prefix}.{name}.out_proj"),
+        )?,
     })
 }
 
@@ -511,60 +561,79 @@ pub(super) fn layer_prefix(stack: usize, layer: usize) -> String {
 
 fn load_linear_with_bias(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
     input_dim: usize,
     output_dim: usize,
 ) -> Result<XasrLinearWithBias, XasrWeightsError> {
     Ok(XasrLinearWithBias {
-        weight: load_native_linear(reader, &format!("{prefix}.weight"), input_dim, output_dim)?,
-        bias: load_vector(reader, &format!("{prefix}.bias"), output_dim)?,
+        weight: load_native_linear(
+            reader,
+            contract,
+            &format!("{prefix}.weight"),
+            input_dim,
+            output_dim,
+        )?,
+        bias: load_vector(reader, contract, &format!("{prefix}.bias"), output_dim)?,
+    })
+}
+
+/// Load a rank-2 projection plus its bias with both weight extents sourced
+/// from the contract's `Exact` pin.
+fn load_linear_with_bias_from_contract(
+    reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
+    prefix: &str,
+) -> Result<XasrLinearWithBias, XasrWeightsError> {
+    Ok(XasrLinearWithBias {
+        weight: load_native_linear_from_contract(reader, contract, &format!("{prefix}.weight"))?,
+        bias: load_vector_from_contract(reader, contract, &format!("{prefix}.bias"))?,
     })
 }
 
 fn load_dynamic_linear_with_bias(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
     input_dim: usize,
 ) -> Result<XasrLinearWithBias, XasrWeightsError> {
-    let bias = load_named(reader, &format!("{prefix}.bias"))?;
+    let bias = load_named(reader, contract, &format!("{prefix}.bias"))?;
     ensure_dims(&bias, &[bias.values.len()])?;
     let output_dim = bias.values.len();
     Ok(XasrLinearWithBias {
-        weight: load_native_linear(reader, &format!("{prefix}.weight"), input_dim, output_dim)?,
+        weight: load_native_linear(
+            reader,
+            contract,
+            &format!("{prefix}.weight"),
+            input_dim,
+            output_dim,
+        )?,
         bias: bias.values,
     })
 }
 
-fn load_conv1d(
+/// Load a rank-1 depthwise conv kernel plus its bias; both shapes come from
+/// the contract's exact pins.
+fn load_conv1d_from_contract(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
-    expected_dims: &[usize],
 ) -> Result<XasrConv1dWeights, XasrWeightsError> {
-    Ok(XasrConv1dWeights {
-        weight: load_named_with_dims(reader, &format!("{prefix}.weight"), expected_dims)?,
-        bias: load_vector(reader, &format!("{prefix}.bias"), expected_dims[2])?,
-    })
+    let weight = load_named(reader, contract, &format!("{prefix}.weight"))?;
+    let bias = load_vector_from_contract(reader, contract, &format!("{prefix}.bias"))?;
+    Ok(XasrConv1dWeights { weight, bias })
 }
 
-fn load_conv2d(
+/// Load a conv-stem conv2d kernel plus its bias; both shapes come from the
+/// contract's exact pins.
+fn load_conv2d_from_contract(
     reader: &GgufTensorDataReader,
+    contract: &XasrRuntimeTensorContract,
     prefix: &str,
-    expected_dims: &[usize],
 ) -> Result<XasrConv2dWeights, XasrWeightsError> {
-    Ok(XasrConv2dWeights {
-        weight: load_named_with_dims(reader, &format!("{prefix}.weight"), expected_dims)?,
-        bias: load_vector(reader, &format!("{prefix}.bias"), expected_dims[3])?,
-    })
-}
-
-fn load_named_with_dims(
-    reader: &GgufTensorDataReader,
-    upstream_name: &str,
-    expected_dims: &[usize],
-) -> Result<NamedTensor, XasrWeightsError> {
-    let tensor = load_named(reader, upstream_name)?;
-    ensure_dims(&tensor, expected_dims)?;
-    Ok(tensor)
+    let weight = load_named(reader, contract, &format!("{prefix}.weight"))?;
+    let bias = load_vector_from_contract(reader, contract, &format!("{prefix}.bias"))?;
+    Ok(XasrConv2dWeights { weight, bias })
 }
 
 fn ensure_dims(tensor: &NamedTensor, expected_dims: &[usize]) -> Result<(), XasrWeightsError> {

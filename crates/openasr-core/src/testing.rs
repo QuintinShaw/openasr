@@ -1151,7 +1151,10 @@ impl TinyGgufFixtureSpec {
             ("xasr.downsampling_factors", "1"),
             ("xasr.feature_dim", "8"),
             ("xasr.decode_chunk_len", "4"),
-            ("xasr.joiner_dim", "16"),
+            // The decoder conv is a grouped convolution with 128 groups, so
+            // the contract requires a joiner dim divisible by 128; 128 is
+            // the smallest representable skeleton geometry.
+            ("xasr.joiner_dim", "128"),
             ("xasr.decoder_context_size", "2"),
             ("xasr.vocab_size", "32"),
             ("xasr.blank_id", "0"),
@@ -3297,6 +3300,68 @@ fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
     bytes
 }
 
+/// Resolves a skeleton fixture kind into a concrete fixture spec. Only the
+/// in-crate skeleton gate calls this; keep it off the cross-crate `testing`
+/// surface so `feature = "testing"` builds do not compile an unused method.
+#[cfg(test)]
+impl crate::arch::SkeletonFixtureKind {
+    /// Build the runtime-ready skeleton fixture this kind names. The fixture
+    /// ids stay the historical ones so the generated packs are byte-identical
+    /// to the pre-facet gate. Resolution lives here, next to the builders;
+    /// the skeleton gate itself only consumes the conformance facet.
+    pub(crate) fn build_runtime_ready_fixture(self) -> TinyGgufFixtureSpec {
+        match self {
+            crate::arch::SkeletonFixtureKind::CohereTranscribe => {
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Whisper => {
+                TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+                    "whisper-fixture",
+                )
+            }
+            crate::arch::SkeletonFixtureKind::Qwen3Asr => {
+                TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::ParakeetCtc => {
+                TinyGgufFixtureSpec::parakeet_ctc_oasr_v1_runtime_ready("parakeet-ctc-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::ParakeetTdt => {
+                TinyGgufFixtureSpec::parakeet_tdt_oasr_v1_runtime_ready("parakeet-tdt-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Wav2Vec2Ctc => {
+                TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready("wav2vec2-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::XasrZipformer => {
+                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Moonshine => {
+                TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::Dolphin => {
+                TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::SenseVoice => {
+                TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready("sensevoice-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::FireRedAed => {
+                TinyGgufFixtureSpec::firered_aed_oasr_v1_runtime_ready("firered-aed-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::FireRed2Llm => {
+                TinyGgufFixtureSpec::firered_llm_oasr_v1_runtime_ready("firered-llm-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::FunasrNano => {
+                TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready("funasr-nano-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::MimoAsr => {
+                TinyGgufFixtureSpec::mimo_asr_oasr_v1_runtime_ready("mimo-fixture")
+            }
+            crate::arch::SkeletonFixtureKind::MossTranscribeDiarize => {
+                TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-fixture")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3323,66 +3388,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         // Inventory-driven, fail-closed coverage: iterate the canonical
         // architecture inventory and require EVERY family to either supply a
-        // runtime-ready skeleton fixture here or carry an explicit
-        // `skeleton_exemption` in its conformance facet. A family added to the
-        // inventory with neither fails this gate, so the hand-written case list
-        // can never silently drop a family again.
+        // runtime-ready skeleton fixture through its conformance facet or
+        // carry an explicit `skeleton_exemption` there. The fixture supply
+        // lives on the descriptor itself (no family list exists at this
+        // gate), so a family added to the inventory with neither fails this
+        // gate and the supply can never silently drop a family again.
         let descriptors = OpenAsrArchitectureRegistry::with_builtins().descriptors();
         let mut covered = 0usize;
         let mut exempted: Vec<(&'static str, &'static str)> = Vec::new();
         for descriptor in descriptors {
             let model_family = descriptor.identity.model_family;
             let expected_catalog_family = descriptor.identity.catalog_family_id;
-            let spec = match model_family {
-                "whisper" => Some(
-                    TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
-                        "whisper-fixture",
-                    ),
-                ),
-                "moonshine" => Some(TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(
-                    "moonshine-fixture",
-                )),
-                "qwen3-asr" => Some(TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready(
-                    "qwen-fixture",
-                )),
-                "parakeet-ctc" => Some(TinyGgufFixtureSpec::parakeet_ctc_oasr_v1_runtime_ready(
-                    "parakeet-ctc-fixture",
-                )),
-                "parakeet-tdt" => Some(TinyGgufFixtureSpec::parakeet_tdt_oasr_v1_runtime_ready(
-                    "parakeet-tdt-fixture",
-                )),
-                "wav2vec2-ctc" => Some(TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready(
-                    "wav2vec2-fixture",
-                )),
-                "xasr-zipformer" => Some(
-                    TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture"),
-                ),
-                "dolphin" => Some(TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready(
-                    "dolphin-fixture",
-                )),
-                "sensevoice" => Some(TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready(
-                    "sensevoice-fixture",
-                )),
-                "cohere-transcribe" => Some(TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(
-                    "cohere-fixture",
-                )),
-                "firered-aed" => Some(TinyGgufFixtureSpec::firered_aed_oasr_v1_runtime_ready(
-                    "firered-aed-fixture",
-                )),
-                "firered2-llm" => Some(TinyGgufFixtureSpec::firered_llm_oasr_v1_runtime_ready(
-                    "firered-llm-fixture",
-                )),
-                "funasr-nano" => Some(TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready(
-                    "funasr-nano-fixture",
-                )),
-                "mimo-asr" => Some(TinyGgufFixtureSpec::mimo_asr_oasr_v1_runtime_ready(
-                    "mimo-fixture",
-                )),
-                "moss-transcribe-diarize" => Some(
-                    TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-fixture"),
-                ),
-                _ => None,
-            };
+            let spec = descriptor
+                .conformance_contract
+                .skeleton_fixture
+                .map(crate::arch::SkeletonFixtureKind::build_runtime_ready_fixture);
             match (spec, descriptor.conformance_contract.skeleton_exemption) {
                 (Some(spec), _) => {
                     let name = format!("{model_family}.oasr");
