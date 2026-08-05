@@ -3300,6 +3300,10 @@ fn deterministic_f16_payload(seed: u64, num_elements: u64) -> Vec<u8> {
     bytes
 }
 
+/// Resolves a skeleton fixture kind into a concrete fixture spec. Only the
+/// in-crate skeleton gate calls this; keep it off the cross-crate `testing`
+/// surface so `feature = "testing"` builds do not compile an unused method.
+#[cfg(test)]
 impl crate::arch::SkeletonFixtureKind {
     /// Build the runtime-ready skeleton fixture this kind names. The fixture
     /// ids stay the historical ones so the generated packs are byte-identical

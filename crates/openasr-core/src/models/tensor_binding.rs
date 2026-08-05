@@ -292,7 +292,9 @@ pub(crate) fn project_fixture_tensors(
 /// read's dims must satisfy its descriptor's requirement at the precision it
 /// declares. Shared by every family whose loaders read through the GGUF
 /// tensor index (parakeet-ctc, parakeet-tdt, funasr-nano encoder half).
-#[cfg(any(test, feature = "testing"))]
+///
+/// In-crate unit tests only; not part of the cross-crate `testing` surface.
+#[cfg(test)]
 pub(crate) fn assert_trace_matches_descriptor_set(
     trace: &[crate::ggml_runtime::GgufTensorAccessRecord],
     descriptors: &[TensorBindingDescriptor],
@@ -347,7 +349,9 @@ pub(crate) fn assert_trace_matches_descriptor_set(
 
 /// Check stored dims against one descriptor requirement at the precision
 /// it declares. Mirrors [`validate_tensor_binding`] for u64 dims.
-#[cfg(any(test, feature = "testing"))]
+///
+/// Helper for in-crate unit tests only.
+#[cfg(test)]
 fn requirement_matches_dims(
     requirement: &TensorBindingDescriptorRequirement,
     dims: &[u64],
