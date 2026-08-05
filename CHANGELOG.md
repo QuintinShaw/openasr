@@ -61,6 +61,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Voice ID: external diarization now treats the recording-wide speaker timeline
+  as the shared source of truth for both transcript attribution and enrolled
+  identity matching. Coarse ASR segments that cross speaker changes are split
+  on native word anchors or the shared forced aligner, and fail closed when
+  trustworthy word alignment is unavailable, instead of assigning the whole
+  segment to its dominant speaker.
 - Server: uploading a file whose extension this build did not (yet) recognize as decodable used to fail with "the file has no extension" -- a lie for any upload that plainly did have one. The server derived the upload's own temp-file suffix from the decodable-extension whitelist, silently stripping any other extension before the file ever reached audio preparation; that whitelist now only governs whether the format decodes, not whether the extension is safe to keep on disk, so the real extension always reaches preparation and an unsupported upload's error now names it correctly.
 - Server: `POST /v1/voice-id/persons/from-audio` (and the matching add-sample route) now converts non-WAV and non-conformant WAV `source_audio` uploads the same way every other native-backend audio input does. The route was missing the switch that turns on in-process decode/external conversion, so any upload that was not already a 16 kHz mono PCM WAV -- an mp3, an m4a, a 44.1 kHz stereo wav -- was rejected outright instead of being prepared.
 - Server: the voice-id from-audio routes' conversion path now follows the operator-configured ffmpeg binary (`media.ffmpeg_bin` / `OPENASR_FFMPEG_BIN` / `--ffmpeg-bin`) and the runtime's configured backend, the same as every other native-backend upload. It previously always assumed no ffmpeg was configured, so a non-macOS host with ffmpeg explicitly set up still hit the codec's unsupported-format failure for any format outside the in-process decoder's coverage. Decoding also now runs on a blocking-task worker instead of the async runtime's own thread, matching the transcription route, so a large or slow-converting upload can no longer stall other concurrent requests.

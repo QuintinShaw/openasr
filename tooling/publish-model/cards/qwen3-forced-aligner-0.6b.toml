@@ -4,10 +4,8 @@
 # state; re-verify against the upstream card when the upstream weights
 # change.
 #
-# STAGING NOTE (not public): this is a NEW capability-pack catalog entry --
-# there is no prior public listing for this model. Published to a PRIVATE HF
-# repo only; the catalog entry stays public:false until a deliberate later
-# --public flip.
+# Public release source for the Q4_K capability pack. The generated catalog is
+# still guarded by the anonymous HF listing and artifact-integrity checks.
 
 tagline = "Word-level forced alignment for OpenASR transcripts -- a non-autoregressive Qwen3 audio+text model that refines per-word timestamps"
 tagline_zh = "为 OpenASR 转写结果提供词级强制对齐 — 非自回归的 Qwen3 音频+文本模型，用于精修逐词时间戳"

@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
-  "catalog_sha256": "1e9fea206c1fde3a84323fb9ae7d7d54928b3277aee499d4351871a873c50815",
-  "catalog_epoch": 2026080403,
+  "catalog_sha256": "a63511ba79b292ffcc34afbc2fc46dd1f0012081f0649a76500c3876ca8108fb",
+  "catalog_epoch": 2026080604,
   "signature": {
     "algorithm": "ed25519",
     "key_id": "openasr-catalog-v1",
-    "value": "eb40befc26320b0d689c364e835356b7b9edf08686711a8dbbf898881095d5d39b2d44f000d18adf99c652e8417db921ba8b7a48a7ff7c86cec0668c3f66db08"
+    "value": "ae1415142ff100f6c4ea4257f99847b756658223891b21319c9b04c001a3d756acd81896c885bf9aa0fd2a2be8587abc03f7283ca968a13aa5dc18de4ed23c07"
   }
 }

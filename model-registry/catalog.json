@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-04T16:19:09+00:00",
+  "generated_at": "2026-08-05T19:32:35+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1886,7 +1886,7 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/qwen3-forced-aligner-0.6b",
       "hf_revision": "617539a0e1088bac6abb0df19b13f7727e6ce94a",
-      "public": false,
+      "public": true,
       "min_cli_version": "0.1.9",
       "recommended_quant": "q4_k",
       "pull_recommended": "qwen3-forced-aligner-0.6b:q4",
@@ -1914,7 +1914,7 @@
           "size_bytes": 529003104,
           "recommended": true,
           "perf": {
-            "rtf_cpu": null,
+            "rtf_cpu": 0.134652616,
             "rtf_metal": null,
             "peak_rss_bytes": null,
             "jfk_wer_vs_fp16": null
