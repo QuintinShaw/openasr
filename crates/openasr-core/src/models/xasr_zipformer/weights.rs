@@ -38,6 +38,8 @@ pub(crate) enum XasrWeightsError {
     },
     #[error("xasr-zipformer runtime tensor contract does not pin '{name}' as required: {reason}")]
     ContractNotExact { name: String, reason: String },
+    #[error("xasr-zipformer weight expectation overflowed: {reason}")]
+    ExpectationOverflow { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

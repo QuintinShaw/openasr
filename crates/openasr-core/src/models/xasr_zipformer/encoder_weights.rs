@@ -464,8 +464,16 @@ fn load_self_attention_weights(
         contract,
         &format!("{prefix}.self_attn_weights.linear_pos.weight"),
     )?;
-    let query_dim = metadata.num_heads[stack] * metadata.query_head_dims[stack];
-    let expected_output = 2 * query_dim + linear_pos.output_dim;
+    // Checked arithmetic: `linear_pos.output_dim` is pack-derived, so the
+    // expectation must fail closed instead of wrapping into an admitting
+    // comparison (parse-time caps already bound the metadata factors).
+    let expected_output = metadata.num_heads[stack]
+        .checked_mul(metadata.query_head_dims[stack])
+        .and_then(|query_dim| query_dim.checked_mul(2))
+        .and_then(|value| value.checked_add(linear_pos.output_dim))
+        .ok_or_else(|| XasrWeightsError::ExpectationOverflow {
+            reason: format!("{prefix}.self_attn_weights.in_proj expected output width overflows"),
+        })?;
     let in_proj = load_linear_with_bias(
         reader,
         contract,

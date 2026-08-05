@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::GgufTensorIndex;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
-    u64_to_u32, u64_to_usize, validate_positive_usize,
+    u64_to_u32, u64_to_usize, validate_bounded_usize, validate_positive_usize,
 };
 
 use super::encoder_weights::layer_prefix;
@@ -41,6 +41,25 @@ pub(crate) const XASR_DECODER_CONV_GROUPS: usize = 128;
 /// (the flattened conv-stem output the loader pins), carried by the runtime
 /// tensor contract instead of duplicated loader literals.
 pub(crate) const XASR_ENCODER_EMBED_INPUT_DIM: usize = 2432;
+
+/// Architecture ceilings for pack-supplied geometry, with generous headroom
+/// over the published checkpoint (6 stacks, 19 encoder layers, dims up to
+/// 768, joiner 512, vocab 5000). They bound every contract-derived
+/// arithmetic expression and the requirement count a malicious metadata set
+/// can construct, so contract building stays allocation-bounded and
+/// overflow-free on untrusted input; parse fails closed above them.
+pub(crate) const XASR_MAX_NUM_STACKS: usize = 64;
+pub(crate) const XASR_MAX_TOTAL_ENCODER_LAYERS: usize = 4096;
+pub(crate) const XASR_MAX_ENCODER_DIM: usize = 65_536;
+pub(crate) const XASR_MAX_HEAD_COUNT: usize = 1_024;
+pub(crate) const XASR_MAX_HEAD_DIM: usize = 65_536;
+pub(crate) const XASR_MAX_CNN_KERNEL: usize = 4_096;
+pub(crate) const XASR_MAX_LEFT_CONTEXT: usize = 65_536;
+pub(crate) const XASR_MAX_DOWNSAMPLING_FACTOR: usize = 1_024;
+pub(crate) const XASR_MAX_FEATURE_DIM: usize = 4_096;
+pub(crate) const XASR_MAX_DECODE_CHUNK_LEN: usize = 4_096;
+pub(crate) const XASR_MAX_JOINER_DIM: usize = 65_536;
+pub(crate) const XASR_MAX_VOCAB_SIZE: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct XasrZipformerExecutionMetadata {
@@ -145,6 +164,73 @@ pub(crate) fn parse_xasr_zipformer_execution_metadata<M: ScalarMetadataView>(
         (XASR_VOCAB_SIZE_KEY, vocab_size),
     ] {
         validate_positive_usize(value, key)?;
+    }
+    // Architecture ceilings: keep contract construction bounded and
+    // overflow-free on untrusted metadata (fail closed above them).
+    validate_bounded_usize(num_stacks, XASR_NUM_STACKS_KEY, XASR_MAX_NUM_STACKS)?;
+    for (key, values, max) in [
+        (
+            XASR_NUM_ENCODER_LAYERS_KEY,
+            &num_encoder_layers,
+            XASR_MAX_TOTAL_ENCODER_LAYERS,
+        ),
+        (XASR_ENCODER_DIMS_KEY, &encoder_dims, XASR_MAX_ENCODER_DIM),
+        (
+            XASR_QUERY_HEAD_DIMS_KEY,
+            &query_head_dims,
+            XASR_MAX_HEAD_DIM,
+        ),
+        (
+            XASR_VALUE_HEAD_DIMS_KEY,
+            &value_head_dims,
+            XASR_MAX_HEAD_DIM,
+        ),
+        (XASR_NUM_HEADS_KEY, &num_heads, XASR_MAX_HEAD_COUNT),
+        (
+            XASR_CNN_MODULE_KERNELS_KEY,
+            &cnn_module_kernels,
+            XASR_MAX_CNN_KERNEL,
+        ),
+        (
+            XASR_LEFT_CONTEXT_LEN_KEY,
+            &left_context_len,
+            XASR_MAX_LEFT_CONTEXT,
+        ),
+        (
+            XASR_DOWNSAMPLING_FACTORS_KEY,
+            &downsampling_factors,
+            XASR_MAX_DOWNSAMPLING_FACTOR,
+        ),
+    ] {
+        for value in values {
+            validate_bounded_usize(*value, key, max)?;
+        }
+    }
+    // Bound the total encoder layer count (and therefore the requirement
+    // enumeration size) with checked accumulation, fail-closed.
+    let total_layers = num_encoder_layers
+        .iter()
+        .try_fold(0usize, |total, layers| total.checked_add(*layers))
+        .ok_or_else(|| MetadataContractError::InvalidValue {
+            key: XASR_NUM_ENCODER_LAYERS_KEY,
+            reason: "total encoder layer count overflows".to_string(),
+        })?;
+    validate_bounded_usize(
+        total_layers,
+        XASR_NUM_ENCODER_LAYERS_KEY,
+        XASR_MAX_TOTAL_ENCODER_LAYERS,
+    )?;
+    for (key, value, max) in [
+        (XASR_FEATURE_DIM_KEY, feature_dim, XASR_MAX_FEATURE_DIM),
+        (
+            XASR_DECODE_CHUNK_LEN_KEY,
+            decode_chunk_len,
+            XASR_MAX_DECODE_CHUNK_LEN,
+        ),
+        (XASR_JOINER_DIM_KEY, joiner_dim, XASR_MAX_JOINER_DIM),
+        (XASR_VOCAB_SIZE_KEY, vocab_size, XASR_MAX_VOCAB_SIZE),
+    ] {
+        validate_bounded_usize(value, key, max)?;
     }
     if blank_id as usize >= vocab_size {
         return Err(MetadataContractError::InvalidValue {
@@ -597,14 +683,18 @@ fn layer_requirements(
         XasrTensorShape::Vector(dim),
     ));
 
+    // GLU gate width; parsing caps `dim` well below overflow, so the
+    // saturating product is defense in depth that stays fail-closed at
+    // validation (no pack tensor can match a saturated extent).
+    let glu_dim = dim.saturating_mul(2);
     for name in ["conv_module1", "conv_module2"] {
         out.push(requirement(
             format!("{prefix}.{name}.in_proj.weight"),
-            XasrTensorShape::Exact(vec![dim, 2 * dim]),
+            XasrTensorShape::Exact(vec![dim, glu_dim]),
         ));
         out.push(requirement(
             format!("{prefix}.{name}.in_proj.bias"),
-            XasrTensorShape::Vector(2 * dim),
+            XasrTensorShape::Vector(glu_dim),
         ));
         out.push(requirement(
             format!("{prefix}.{name}.depthwise_conv.causal_conv.weight"),
@@ -1093,6 +1183,72 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Architecture ceilings fail closed on untrusted metadata, keeping
+    /// contract construction allocation-bounded and overflow-free.
+    #[test]
+    fn rejects_geometry_above_architecture_ceilings() {
+        let base = metadata();
+        for (key, value) in [
+            (
+                XASR_FEATURE_DIM_KEY,
+                (XASR_MAX_FEATURE_DIM as u64 + 1).to_string(),
+            ),
+            (
+                XASR_DECODE_CHUNK_LEN_KEY,
+                (XASR_MAX_DECODE_CHUNK_LEN as u64 + 1).to_string(),
+            ),
+            (
+                XASR_JOINER_DIM_KEY,
+                (XASR_MAX_JOINER_DIM as u64 + 128).to_string(),
+            ),
+            (
+                XASR_VOCAB_SIZE_KEY,
+                (XASR_MAX_VOCAB_SIZE as u64 + 1).to_string(),
+            ),
+        ] {
+            let mut metadata = base.clone();
+            metadata.insert(key.to_string(), value);
+            assert!(
+                parse_xasr_zipformer_execution_metadata(&metadata).is_err(),
+                "must reject {key} above its ceiling"
+            );
+        }
+        // List-valued ceilings.
+        let mut metadata = base.clone();
+        metadata.insert(
+            XASR_ENCODER_DIMS_KEY.to_string(),
+            "192,256,512,768,512,65537".to_string(),
+        );
+        assert!(parse_xasr_zipformer_execution_metadata(&metadata).is_err());
+        // Total encoder layer count ceiling.
+        let mut metadata = base.clone();
+        metadata.insert(
+            XASR_NUM_ENCODER_LAYERS_KEY.to_string(),
+            "2048,2047,1,1,1,1".to_string(),
+        );
+        assert!(parse_xasr_zipformer_execution_metadata(&metadata).is_err());
+    }
+
+    /// Boundary: geometry exactly at the ceilings stays admissible (the
+    /// ceilings bound, they do not shrink the production envelope).
+    #[test]
+    fn accepts_geometry_at_the_architecture_ceilings() {
+        let mut metadata = metadata();
+        metadata.insert(
+            XASR_FEATURE_DIM_KEY.to_string(),
+            XASR_MAX_FEATURE_DIM.to_string(),
+        );
+        metadata.insert(
+            XASR_DECODE_CHUNK_LEN_KEY.to_string(),
+            XASR_MAX_DECODE_CHUNK_LEN.to_string(),
+        );
+        metadata.insert(
+            XASR_VOCAB_SIZE_KEY.to_string(),
+            XASR_MAX_VOCAB_SIZE.to_string(),
+        );
+        assert!(parse_xasr_zipformer_execution_metadata(&metadata).is_ok());
     }
 
     /// The equivalence evidence the count-plus-sampling pin used to fake: run
