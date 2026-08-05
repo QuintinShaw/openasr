@@ -4,10 +4,8 @@
 # state; re-verify against the upstream card when the upstream weights
 # change.
 #
-# STAGING NOTE (not public): this is a NEW capability-pack catalog entry --
-# there is no prior public listing for this model. Published to a PRIVATE HF
-# repo only; the catalog entry stays public:false until a deliberate later
-# --public flip.
+# Public release source for the Q4_K capability pack. The generated catalog is
+# still guarded by the anonymous HF listing and artifact-integrity checks.
 
 tagline = "Word-level forced alignment for OpenASR transcripts -- a non-autoregressive Qwen3 audio+text model that refines per-word timestamps"
 tagline_zh = "为 OpenASR 转写结果提供词级强制对齐 — 非自回归的 Qwen3 音频+文本模型，用于精修逐词时间戳"
@@ -16,16 +14,16 @@ highlights = [
   "🎯 **Refined word timestamps** — consumes a finished transcript's text plus the source audio and replaces a model family's own approximate per-word timestamps with aligner-refined spans (`--word-timestamps=aligned`)",
   "⚡ **Non-autoregressive** — a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
   "🧩 **Shares its backbone with Qwen3-ASR** — the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
-  "🔌 **Opt-in only** — a model family's own decode-time timestamps remain the default; this pack is only consulted when a transcribe call explicitly asks for `aligned` timestamps, and may auto-install under the same CLI consent flow as `--diarize`",
-  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+  "🔌 **Attribution-ready dependency** — used explicitly by `--word-timestamps=aligned` and can supply the word anchors a universal speaker-attribution pipeline needs to split coarse ASR segments at speaker changes",
+  "🦀 **Native Q4_K runtime** — the single production tier runs locally with no Python; Auto uses CPU on Apple Metal and retains supported discrete-GPU paths",
 ]
 
 highlights_zh = [
   "🎯 **精修词级时间戳** — 输入已完成的转写文本与原始音频，用对齐模型精修后的时间跨度替换模型自身的近似逐词时间戳（`--word-timestamps=aligned`）",
   "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
   "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
-  "🔌 **仅为可选项** — 模型自身的解码时时间戳仍是默认值；只有转写调用显式要求 `aligned` 时间戳时才会用到本模型包，且可与 `--diarize` 一样走同一套 CLI 同意安装流程",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "🔌 **为统一归属就绪** — 既支持显式 `--word-timestamps=aligned`，也能提供统一说话人归属管线把粗粒度 ASR 段切到换人边界所需的词锚点",
+  "🦀 **原生 Q4_K 运行时** — 唯一生产档完全本地运行且无需 Python；Auto 在 Apple Metal 上使用 CPU，并保留受支持的独立 GPU 路径",
 ]
 
 intro = """
@@ -38,17 +36,17 @@ source audio, it runs a single non-autoregressive forward pass and reads off wor
 timestamps at argmax `<timestamp>` positions -- refining a model family's own (typically
 decode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as
 `.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding
-local. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.
+local. OpenASR ships one production **q4_k** tier for this capability pack.
 
 **Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an
-opt-in refinement step consumed via `openasr transcribe <audio> --model <asr-model>
---word-timestamps=aligned`. The base model's own timestamps (`--word-timestamps` /
-`--word-timestamps=approximate`) remain the default -- nothing changes unless `aligned` is
-requested explicitly.
+alignment dependency consumed explicitly via `openasr transcribe <audio> --model <asr-model>
+--word-timestamps=aligned`. The same word anchors can support speaker-attribution pipelines
+that must split a coarse ASR segment at speaker changes.
 
 **Verification:** local verification covers a tensor-parity check against the real upstream
 checkpoint -- every source safetensors tensor maps 1:1 to a destination tensor, plus the two
-synthesized frontend tensors, across the fp16/q8_0/q4_k quants.
+synthesized frontend tensors. The production q4_k pack additionally passes the quant-floor
+audit and real Chinese meeting-audio attribution verification.
 """
 
 intro_zh = """
@@ -60,15 +58,14 @@ Qwen3-ForcedAligner-0.6B 是 **Qwen** 推出的**词级强制对齐**模型，�
 （通常是解码时的近似值）的逐词时间戳。
 
 这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
-云端。提供 `fp16`（最高保真，推荐）、`q8_0`、`q4_k` 三种量化版本。
+云端。当前仅提供经过真实中文会议音频验证的生产 `q4_k` 档。
 
 **不是独立的转写模型。** 本模型包本身无法转写音频；它是通过
-`openasr transcribe <audio> --model <asr-model> --word-timestamps=aligned` 调用的可选精修步骤。
-基础模型自身的时间戳（`--word-timestamps` / `--word-timestamps=approximate`）仍是默认值——除非
-显式要求 `aligned`，否则不会有任何变化。
+`openasr transcribe <audio> --model <asr-model> --word-timestamps=aligned` 显式调用；同一套词锚点
+也可供说话人归属管线把粗粒度 ASR 段准确切到换人边界。
 
 **验证情况:** 本地验证已覆盖对照真实上游检查点的张量对齐检查——每个源 safetensors 张量均一一
-映射至目标张量，外加两个合成前端张量，覆盖 fp16/q8_0/q4_k 三档量化。
+映射至目标张量，外加两个合成前端张量；生产 q4_k 包另通过量化下限审计与真实中文会议音频归属验证。
 """
 
 acknowledgement = """
@@ -93,8 +90,8 @@ highlights = [
   "🎯 **精修词级时间戳** — 输入已完成的转写文本与原始音频，用对齐模型精修后的时间跨度替换模型自身的近似逐词时间戳（`--word-timestamps=aligned`）",
   "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
   "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
-  "🔌 **仅为可选项** — 模型自身的解码时时间戳仍是默认值；只有转写调用显式要求 `aligned` 时间戳时才会用到本模型包，且可与 `--diarize` 一样走同一套 CLI 同意安装流程",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "🔌 **为统一归属就绪** — 既支持显式 `--word-timestamps=aligned`，也能提供统一说话人归属管线把粗粒度 ASR 段切到换人边界所需的词锚点",
+  "🦀 **原生 Q4_K 运行时** — 唯一生产档完全本地运行且无需 Python；Auto 在 Apple Metal 上使用 CPU，并保留受支持的独立 GPU 路径",
 ]
 
-source_sha256 = "688ff17f00adef4c4a997a658fbfdf056f5593d29763129849fc50503d7a0c7c"
+source_sha256 = "178ae1097b5c447340d5d4514812f7f531f18c92ff70e3d6aaae0204a542d8b4"

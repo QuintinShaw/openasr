@@ -56,11 +56,9 @@ openasr transcribe meeting.wav --model <asr-model> --word-timestamps=aligned
 ## ⚙️ How this pack was made
 
 Converted from [{{upstream_repo}}]({{upstream_link}}) with the OpenASR local-source
-converter (`convert_local_qwen_forced_aligner_source_to_runtime_pack`, not yet wired
-to a public `openasr model-pack import` subcommand -- the pack format and tensor
-mapping are stable, but CLI/family-registry wiring is a separate stage).
+importer (`openasr model-pack {{import_subcommand}} ...`).
 
-The `.oasr` container is GGUF-backed; packs use zero-copy mmap weight binding.
+{{pack_storage_note}}
 
 ## ⚖️ License
 

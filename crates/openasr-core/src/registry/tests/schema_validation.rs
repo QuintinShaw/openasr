@@ -327,6 +327,7 @@ fn bundled_catalog_public_ids_match_current_signed_release_projection() {
             "pyannote-segmentation-3.0",
             "qwen3-asr-0.6b",
             "qwen3-asr-1.7b",
+            "qwen3-forced-aligner-0.6b",
             "redimnet2-b6-cn",
             "sensevoice-small",
             "whisper-base",

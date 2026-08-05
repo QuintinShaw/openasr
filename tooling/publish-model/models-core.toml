@@ -722,13 +722,9 @@ min_cli_version = "0.1.17"
 # `<timestamp>` positions) decode policy is materially different from the
 # qwen3-asr autoregressive runtime -- see
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs.
-# release_public=true gates the eventual --public flip (explicit user
-# go-ahead for the 0.1.9 batch), but the catalog entry itself stays
-# public:false for now: the anonymous public-listing gate (public_gate.py)
-# probed OpenASR/qwen3-forced-aligner-0.6b on 2026-07-08 and got HTTP 401 --
-# the HF repo is still private, unlike the other four models in this batch.
-# The gate is fail-closed by design (same anonymous surface end users hit), so
-# --public correctly refuses until the repo is made public on HF.
+# release_public=true allows the public projection only after public_gate.py
+# verifies the same anonymous HF repository and pinned Q4_K artifact that end
+# users download. Repository visibility alone never bypasses that gate.
 ["qwen3-forced-aligner-0.6b"]
 kind = "capability-pack"
 family = "qwen3-forced-aligner"
@@ -754,15 +750,14 @@ languages = ["en", "zh"]
 # separately `model-pack import qwen-forced-aligner` did not exist yet -- so
 # that pass only dropped q4_k from `quants` below rather than rebuilding it.
 # Rebuilt after `openasr model-pack import qwen-forced-aligner` landed: the new
-# q4_k pack passes `model-pack audit-quant` (147/147 audio tensors now floored
-# at Q8_0) and is meaningfully smaller than q8_0 (653 MiB vs 940 MiB), so the
-# tier is worth keeping (unlike cohere/sensevoice/xasr, retired in the same
-# commit because requantization left them within a few percent of q8_0). The
-# rebuilt pack is staged but not published, so the tier stays out of `quants`
-# until it is uploaded -- declaring it here without a catalog entry is exactly
-# the drift the consistency gate rejects.
-quants = ["fp16", "q8_0"]
-recommended_quant = "fp16"
+# q4_k pack passes `model-pack audit-quant` (147/147 audio tensors floored at
+# Q8_0) and is 529,003,104 bytes. It is the production Voice ID dependency:
+# local real-audio verification covers segmented zh alignment and speaker-text
+# attribution, while keeping the download at roughly half the old q8_0 tier.
+# Only the verified Q4_K tier is advertised; older HF artifacts are not catalog
+# targets and are never selected by `openasr pull`.
+quants = ["q4_k"]
+recommended_quant = "q4_k"
 upstream_release_date = "2026-01-28"
 min_core_version = "0.1.9"
 min_cli_version = "0.1.9"

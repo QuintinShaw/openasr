@@ -118,6 +118,20 @@ class RenderCardTest(unittest.TestCase):
         self.assertIn("Speaker-diarization support pack", result.stdout)
         self.assertNotIn("pipeline_tag: automatic-speech-recognition", result.stdout)
 
+    def test_forced_aligner_card_uses_the_public_importer(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "qwen3-forced-aligner-0.6b"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "openasr model-pack import qwen-forced-aligner ...", result.stdout
+        )
+        self.assertNotIn("not yet wired", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
