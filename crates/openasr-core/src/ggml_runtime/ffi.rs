@@ -112,6 +112,7 @@ pub(crate) const GGML_STATUS_ABORTED: c_int = 1;
 pub(crate) const GGML_STATUS_EXECUTION_FAILED: c_int = 2;
 pub(crate) const GGML_STATUS_DEVICE_LOST: c_int = 3;
 pub(crate) const GGML_STATUS_BACKEND_POISONED: c_int = 4;
+pub(crate) const GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
@@ -443,8 +444,9 @@ unsafe extern "C" {
         index: u32,
         out_item: *mut GgmlBackendMemoryRequestV1,
     ) -> bool;
-    pub(crate) fn ggml_backend_sched_memory_plan_commit_v1(
+    pub(crate) fn ggml_backend_sched_memory_plan_commit_v2(
         plan: GgmlBackendSchedMemoryPlanRaw,
+        out_flags: *mut u32,
     ) -> c_int;
     pub(crate) fn ggml_backend_sched_memory_plan_free_v1(plan: GgmlBackendSchedMemoryPlanRaw);
     pub(crate) fn ggml_backend_sched_graph_compute(

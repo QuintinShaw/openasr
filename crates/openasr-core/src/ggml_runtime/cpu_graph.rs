@@ -25,8 +25,8 @@ use super::backend_memory::{BackendMemoryAbi, BackendMemoryAbiError, SchedulerMe
 use super::backend_memory_admission::{
     NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeMemoryAdmissionError,
     NativeMemoryAdmissionPlan, NativeMemoryAllocation, NativeMemoryAllocationError,
-    NativeMemoryClaimSemantics, NativeOwnerAttachedMemoryError, NativeOwnerAttachedMemoryLease,
-    NativeQuotedBackendGroup, NativeRequestClass,
+    NativeMemoryClaimSemantics, NativeOwnerAttachedCommitFailure, NativeOwnerAttachedMemoryError,
+    NativeOwnerAttachedMemoryLease, NativeQuotedBackendGroup, NativeRequestClass,
 };
 use super::ffi;
 use super::{
@@ -4535,8 +4535,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         else {
             #[cfg(test)]
             {
-                return plan.commit().map_err(|source| {
-                    self.scheduler_plan_error("scheduler-plan/test-direct-commit", source, true)
+                return plan.commit().map_err(|error| {
+                    let requires_quarantine = error.requires_quarantine();
+                    self.scheduler_plan_error(
+                        "scheduler-plan/test-direct-commit",
+                        error.into_source(),
+                        requires_quarantine,
+                    )
                 });
             }
             #[cfg(not(test))]
@@ -4674,7 +4679,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         // Exact CPU private reserve changes the backend generation. Refresh the
         // engine quote token after that mutation, but prove its new byte shape
         // still fits the already-admitted engine child before native commit.
-        let mut engine_native_started = false;
+        let mut engine_commit_requires_quarantine = false;
         let engine_commit = if let Some(transaction) = engine_transaction {
             let fresh_transaction = NativeMemoryAdmissionPlan::from_groups(quote_scheduler_groups(
                 "scheduler-engine-refresh",
@@ -4683,8 +4688,21 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             .and_then(|fresh| transaction.rebind_fresh_plan(fresh));
             match fresh_transaction {
                 Ok(transaction) => match transaction.commit_owner_attached_with(|| {
-                    engine_native_started = true;
-                    plan.commit()
+                    match plan.commit() {
+                        Ok(()) => {
+                            engine_commit_requires_quarantine = true;
+                            Ok(())
+                        }
+                        Err(error) => {
+                            engine_commit_requires_quarantine = error.requires_quarantine();
+                            let source = error.into_source();
+                            if engine_commit_requires_quarantine {
+                                Err(NativeOwnerAttachedCommitFailure::quarantine(source))
+                            } else {
+                                Err(NativeOwnerAttachedCommitFailure::reclaimable(source))
+                            }
+                        }
+                    }
                 }) {
                     Ok(lease) => {
                         memory_owner
@@ -4694,8 +4712,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                             .push(lease);
                         Ok(())
                     }
-                    Err(NativeOwnerAttachedMemoryError::NativeCommit { source }) => {
-                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, true))
+                    Err(NativeOwnerAttachedMemoryError::NativeCommit {
+                        source,
+                        quarantined,
+                    }) => {
+                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, quarantined))
                     }
                     Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
                         self.poison_scheduler_after_allocation_commit();
@@ -4725,20 +4746,33 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 Err(source) => Err(memory_admission_error("scheduler-engine/refresh", source)),
             }
         } else {
-            plan.commit()
-                .map_err(|source| self.scheduler_plan_error("scheduler-plan/commit", source, true))
+            match plan.commit() {
+                Ok(()) => {
+                    engine_commit_requires_quarantine = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    engine_commit_requires_quarantine = error.requires_quarantine();
+                    Err(self.scheduler_plan_error(
+                        "scheduler-plan/commit",
+                        error.into_source(),
+                        engine_commit_requires_quarantine,
+                    ))
+                }
+            }
         };
 
         if let Err(error) = engine_commit {
             // A provisional provider has not computed yet, but its gate must not
             // remain pinned in a cached backend after scheduler commit fails.
-            // Before native scheduler mutation, live private evidence can close
-            // it. Once mutation starts, quarantine both ownership children:
-            // their deltas can no longer be separated safely.
+            // After a recoverable pre-mutation failure, live private evidence
+            // can close the gate. If native allocation may have changed or the
+            // device is terminal, quarantine both ownership children: their
+            // deltas can no longer be separated safely.
             if let Some(lease) = &private_lease
                 && lease.is_pending()
             {
-                if engine_native_started {
+                if engine_commit_requires_quarantine {
                     // The enclosing scheduler may retain a partial arena and
                     // its engine child is already quarantined. Do not relabel
                     // that sibling growth as private or refund the private gate.
@@ -4767,9 +4801,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         operation: &'static str,
         source: BackendMemoryAbiError,
-        commit_started: bool,
+        requires_poison: bool,
     ) -> GgmlCpuGraphError {
-        if commit_started {
+        if requires_poison {
             self.poison_scheduler_after_allocation_commit();
         }
         match source {

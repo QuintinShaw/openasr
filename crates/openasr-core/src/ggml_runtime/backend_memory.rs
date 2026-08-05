@@ -370,6 +370,31 @@ pub(crate) struct SchedulerMemoryPlan<'scheduler> {
     _scheduler: PhantomData<&'scheduler mut c_void>,
 }
 
+#[derive(Debug, Error)]
+#[error("{source} (scheduler native allocation may_have_mutated={may_have_mutated})")]
+pub(crate) struct SchedulerMemoryPlanCommitError {
+    source: BackendMemoryAbiError,
+    may_have_mutated: bool,
+}
+
+impl SchedulerMemoryPlanCommitError {
+    pub(crate) fn requires_quarantine(&self) -> bool {
+        if self.may_have_mutated {
+            return true;
+        }
+        match &self.source {
+            BackendMemoryAbiError::Status { status, .. } => {
+                *status != ffi::GGML_STATUS_FAILED && *status != ffi::GGML_STATUS_ALLOC_FAILED
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn into_source(self) -> BackendMemoryAbiError {
+        self.source
+    }
+}
+
 impl<'scheduler> SchedulerMemoryPlan<'scheduler> {
     /// `scheduler`, `graph`, and every tensor reachable from `graph` must stay
     /// live and immutable until this plan is committed or dropped.
@@ -440,10 +465,22 @@ impl<'scheduler> SchedulerMemoryPlan<'scheduler> {
         Ok(batches)
     }
 
-    pub(crate) fn commit(mut self) -> Result<(), BackendMemoryAbiError> {
-        status("scheduler_plan/commit", unsafe {
-            ffi::ggml_backend_sched_memory_plan_commit_v1(self.raw)
-        })?;
+    pub(crate) fn commit(mut self) -> Result<(), SchedulerMemoryPlanCommitError> {
+        let mut flags = 0_u32;
+        if let Err(source) = status("scheduler_plan/commit", unsafe {
+            ffi::ggml_backend_sched_memory_plan_commit_v2(self.raw, &mut flags)
+        }) {
+            let known_mutation =
+                flags & ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED != 0;
+            let unknown_flags =
+                flags & !ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
+            return Err(SchedulerMemoryPlanCommitError {
+                source,
+                // Unknown future flags are conservative: only an exact zero
+                // proves that native scheduler allocation did not change.
+                may_have_mutated: known_mutation || unknown_flags != 0,
+            });
+        }
         unsafe { ffi::ggml_backend_sched_memory_plan_free_v1(self.raw) };
         self.raw = ptr::null_mut();
         Ok(())
@@ -470,5 +507,23 @@ mod tests {
         assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>(), 48);
         assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryStatsV1>(), 152);
         assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryApiV1>(), 64);
+    }
+
+    #[test]
+    fn scheduler_commit_quarantines_only_unrecoverable_failures() {
+        let error = |status, may_have_mutated| SchedulerMemoryPlanCommitError {
+            source: BackendMemoryAbiError::Status {
+                operation: "scheduler_plan/commit",
+                status,
+            },
+            may_have_mutated,
+        };
+
+        assert!(!error(ffi::GGML_STATUS_FAILED, false).requires_quarantine());
+        assert!(!error(ffi::GGML_STATUS_ALLOC_FAILED, false).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_FAILED, true).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_DEVICE_LOST, false).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_BACKEND_POISONED, false).requires_quarantine());
+        assert!(error(i32::MAX, false).requires_quarantine());
     }
 }

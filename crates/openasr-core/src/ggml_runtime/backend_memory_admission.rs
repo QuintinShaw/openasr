@@ -255,6 +255,46 @@ pub(crate) struct NativeMemoryAllocationTransaction {
     reservation: DeviceMemoryReservationBatch,
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeOwnerAttachedCommitFailure<E> {
+    Reclaimable(E),
+    Quarantine(E),
+}
+
+impl<E> NativeOwnerAttachedCommitFailure<E> {
+    pub(crate) fn reclaimable(source: E) -> Self {
+        Self::Reclaimable(source)
+    }
+
+    pub(crate) fn quarantine(source: E) -> Self {
+        Self::Quarantine(source)
+    }
+
+    fn requires_quarantine(&self) -> bool {
+        matches!(self, Self::Quarantine(_))
+    }
+
+    fn into_source(self) -> E {
+        match self {
+            Self::Reclaimable(source) | Self::Quarantine(source) => source,
+        }
+    }
+}
+
+fn owner_attached_native_commit_error<E>(
+    reservation: &mut DeviceMemoryReservationBatch,
+    failure: NativeOwnerAttachedCommitFailure<E>,
+) -> NativeOwnerAttachedMemoryError<E> {
+    let quarantined = failure.requires_quarantine();
+    if quarantined {
+        reservation.quarantine();
+    }
+    NativeOwnerAttachedMemoryError::NativeCommit {
+        source: failure.into_source(),
+        quarantined,
+    }
+}
+
 impl NativeMemoryAllocationTransaction {
     pub(crate) fn groups(&self) -> &[NativeQuotedBackendGroup] {
         &self.groups
@@ -431,18 +471,18 @@ impl NativeMemoryAllocationTransaction {
     /// the owner must release its native allocation before dropping the
     /// lease.
     ///
-    /// Unlike [`Self::commit_engine_owned_with`], a failed native commit or
-    /// post-commit reconciliation cannot locally destroy the allocation: the
-    /// enclosing owner may already have grown an internal high-water arena.
-    /// Therefore every failure after `native_commit` begins quarantines the
-    /// broker reservation. The caller must additionally poison or destroy the
-    /// enclosing native owner before it can be used again.
+    /// Unlike [`Self::commit_engine_owned_with`], a failure after native state
+    /// may have changed cannot locally destroy the allocation: the enclosing
+    /// owner may already have grown an internal high-water arena. The callback
+    /// must therefore classify its failure precisely. Pre-mutation validation
+    /// failures refund normally; potentially-mutating failures quarantine the
+    /// broker reservation and require poisoning or destroying the owner.
     pub(crate) fn commit_owner_attached_with<E, F>(
         mut self,
         native_commit: F,
     ) -> Result<NativeOwnerAttachedMemoryLease, NativeOwnerAttachedMemoryError<E>>
     where
-        F: FnOnce() -> Result<(), E>,
+        F: FnOnce() -> Result<(), NativeOwnerAttachedCommitFailure<E>>,
     {
         self.require_request_class(NativeRequestClass::EngineOwned)
             .map_err(NativeOwnerAttachedMemoryError::RequestKinds)?;
@@ -460,9 +500,11 @@ impl NativeMemoryAllocationTransaction {
             }
         }
 
-        if let Err(source) = native_commit() {
-            self.reservation.quarantine();
-            return Err(NativeOwnerAttachedMemoryError::NativeCommit { source });
+        if let Err(failure) = native_commit() {
+            return Err(owner_attached_native_commit_error(
+                &mut self.reservation,
+                failure,
+            ));
         }
 
         let groups = &self.groups;
@@ -888,6 +930,7 @@ pub(crate) enum NativeOwnerAttachedMemoryError<E> {
     },
     NativeCommit {
         source: E,
+        quarantined: bool,
     },
     PostAllocationStats {
         source: NativeMemoryAdmissionError,
@@ -909,9 +952,12 @@ impl<E: fmt::Display> fmt::Display for NativeOwnerAttachedMemoryError<E> {
                 formatter,
                 "native quote-token validation failed for owner group '{group_id}' (quarantined={quarantined}): {source}"
             ),
-            Self::NativeCommit { source } => write!(
+            Self::NativeCommit {
+                source,
+                quarantined,
+            } => write!(
                 formatter,
-                "native owner-attached allocation commit failed and was quarantined: {source}"
+                "native owner-attached allocation commit failed (quarantined={quarantined}): {source}"
             ),
             Self::PostAllocationStats { source } => write!(
                 formatter,
@@ -1646,6 +1692,48 @@ mod tests {
         PhysicalDeviceKey::new(value).unwrap()
     }
 
+    fn dedicated_request(
+        domain: MemoryDomainKey,
+        bytes: u64,
+        resource_id: &str,
+    ) -> DomainReservationRequest {
+        DomainReservationRequest {
+            domain,
+            snapshot: DeviceMemorySnapshot {
+                free_bytes: 8 * GIB,
+                total_bytes: 8 * GIB,
+                confidence: MemoryObservationConfidence::DeviceSnapshot,
+            },
+            peak_bytes: bytes,
+            retained_bytes: bytes,
+            requires_reconciliation: false,
+            resource_id: resource_id.to_owned(),
+            cohort_id: None,
+        }
+    }
+
+    fn owner_attached_dedicated_reservation(
+        physical_device: &str,
+        resource_id: &str,
+    ) -> (
+        Arc<DeviceMemoryBrokerSet>,
+        MemoryDomainKey,
+        DeviceMemoryReservationBatch,
+    ) {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let domain = MemoryDomainKey::DedicatedDevice {
+            physical_device: identity(physical_device),
+            heap_index: 0,
+        };
+        let reservation = broker
+            .try_reserve_batch(vec![dedicated_request(domain.clone(), GIB, resource_id)])
+            .unwrap();
+        (broker, domain, reservation)
+    }
+
     fn domain(kind: u32, heap_index: u32, uuid: [u8; 16]) -> ffi::GgmlBackendMemoryDomainIdV1 {
         ffi::GgmlBackendMemoryDomainIdV1 {
             physical_device_uuid: uuid,
@@ -2331,5 +2419,66 @@ mod tests {
             minimum_headroom_bytes: 256 * 1024 * 1024,
         });
         assert!(plan.require_opaque_driver_headroom(&protected).is_ok());
+    }
+
+    #[test]
+    fn owner_attached_failure_before_native_mutation_refunds_dedicated_domain() {
+        let (broker, dedicated, mut reservation) = owner_attached_dedicated_reservation(
+            "uuid:55555555555555555555555555555555",
+            "scheduler-validation",
+        );
+
+        let error = owner_attached_native_commit_error(
+            &mut reservation,
+            NativeOwnerAttachedCommitFailure::Reclaimable("stale graph"),
+        );
+        assert!(matches!(
+            error,
+            NativeOwnerAttachedMemoryError::NativeCommit {
+                source: "stale graph",
+                quarantined: false,
+            }
+        ));
+        drop(reservation);
+
+        let usage = broker.usage(&dedicated);
+        assert_eq!(usage.pending_bytes, 0);
+        assert_eq!(usage.unreclaimable_bytes, 0);
+        assert!(!usage.quarantined);
+        assert!(
+            broker
+                .try_reserve_batch(vec![dedicated_request(dedicated, GIB, "scheduler-retry")])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn owner_attached_failure_after_possible_native_mutation_quarantines_dedicated_domain() {
+        let (broker, dedicated, mut reservation) = owner_attached_dedicated_reservation(
+            "uuid:66666666666666666666666666666666",
+            "scheduler-mutation",
+        );
+
+        let error = owner_attached_native_commit_error(
+            &mut reservation,
+            NativeOwnerAttachedCommitFailure::Quarantine("allocation changed"),
+        );
+        assert!(matches!(
+            error,
+            NativeOwnerAttachedMemoryError::NativeCommit {
+                source: "allocation changed",
+                quarantined: true,
+            }
+        ));
+        drop(reservation);
+
+        let usage = broker.usage(&dedicated);
+        assert_eq!(usage.pending_bytes, 0);
+        assert_eq!(usage.unreclaimable_bytes, GIB);
+        assert!(usage.quarantined);
+        assert!(matches!(
+            broker.try_reserve_batch(vec![dedicated_request(dedicated, 1, "scheduler-blocked")]),
+            Err(MemoryPlanningError::DeviceQuarantined { .. })
+        ));
     }
 }
