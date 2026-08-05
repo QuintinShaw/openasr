@@ -670,6 +670,7 @@ mod tests {
         let first_builds = Arc::clone(&builds);
         let first_active = Arc::clone(&active_builders);
         let first_maximum = Arc::clone(&maximum_active_builders);
+        let (first_builder_entered_tx, first_builder_entered_rx) = mpsc::channel();
         let first = thread::spawn(move || {
             first_pool
                 .checkout_or_try_build(
@@ -679,6 +680,9 @@ mod tests {
                         first_builds.fetch_add(1, Ordering::SeqCst);
                         let active = first_active.fetch_add(1, Ordering::SeqCst) + 1;
                         first_maximum.fetch_max(active, Ordering::SeqCst);
+                        first_builder_entered_tx
+                            .send(())
+                            .expect("report first builder entry");
                         thread::sleep(Duration::from_millis(30));
                         first_active.fetch_sub(1, Ordering::SeqCst);
                         Ok(owner(1, 32))
@@ -687,7 +691,9 @@ mod tests {
                 )
                 .expect("first checkout")
         });
-        thread::sleep(Duration::from_millis(5));
+        first_builder_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first builder should enter before the second checkout starts");
         let second_pool = pool.clone();
         let second_builds = Arc::clone(&builds);
         let second_active = Arc::clone(&active_builders);
