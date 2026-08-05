@@ -551,6 +551,72 @@ fn validate_speech_channel_consistency(
 /// source framework; the loaders/native weight binding assert the final
 /// orientation at construction). Vectors, conv kernels, and the mel tables
 /// must match exactly, mirroring the loaders' own shape assertions.
+/// Map mimo-asr backbone LLM metadata onto the shared Qwen-shaped geometry.
+fn mimo_asr_qwen_decoder_geometry(
+    llm: &MimoLlmMetadata,
+) -> crate::models::qwen::QwenDecoderContractGeometry {
+    crate::models::qwen::QwenDecoderContractGeometry {
+        n_layers: llm.n_layers,
+        d_model: llm.d_model,
+        n_heads: llm.n_heads,
+        n_kv_heads: llm.n_kv_heads,
+        head_dim: llm.head_dim,
+        ffn_dim: llm.ffn_dim,
+        vocab_size: llm.vocab_size,
+    }
+}
+
+/// Layer name provider for the Qwen2 backbone (`blk.{i}.*`).
+pub(crate) fn mimo_asr_qwen_family_layer_names(
+    layer: usize,
+) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+    let names = mimo_llm_layer_tensor_names(layer);
+    crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+        attn_norm_name: names.attn_norm_weight,
+        attn_q_name: names.attn_q_weight,
+        attn_k_name: names.attn_k_weight,
+        attn_v_name: names.attn_v_weight,
+        attn_output_name: names.attn_output_weight,
+        q_norm_name: None,
+        k_norm_name: None,
+        q_bias_name: Some(names.attn_q_bias),
+        k_bias_name: Some(names.attn_k_bias),
+        v_bias_name: Some(names.attn_v_bias),
+        ffn_norm_name: names.ffn_norm_weight,
+        ffn_gate_name: names.ffn_gate_weight,
+        ffn_up_name: names.ffn_up_weight,
+        ffn_down_name: names.ffn_down_weight,
+    }
+}
+
+/// The Qwen2 backbone decoder half: every `blk.*` layer plus token embd /
+/// logits / final norm. Expanded from the shared Qwen decoder contract Module
+/// so the 11-tensor layer pattern cannot drift from FunASR-Nano / MOSS /
+/// FireRed2-LLM. Does not cover inlocal / audiotok / speech embd tensors.
+pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
+    llm: &MimoLlmMetadata,
+) -> Vec<TensorBindingDescriptor> {
+    use crate::models::qwen::{
+        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
+        qwen_decoder_runtime_tensor_descriptors,
+    };
+    qwen_decoder_runtime_tensor_descriptors(
+        &mimo_asr_qwen_decoder_geometry(llm),
+        QwenDecoderContractOptions::QWEN2,
+        mimo_asr_qwen_family_layer_names,
+        QwenDecoderTailTensorNames {
+            output_norm: OUTPUT_NORM_WEIGHT,
+            output_weight: Some(OUTPUT_WEIGHT),
+            token_embd: TOKEN_EMBD_WEIGHT,
+        },
+    )
+    .unwrap_or_else(|reason| {
+        // Metadata parse already enforces the geometry pins the shared Module
+        // re-checks; a failure here is a programming error, not pack input.
+        panic!("mimo-asr backbone decoder geometry rejected by shared Qwen contract: {reason}")
+    })
+}
+
 fn mimo_asr_runtime_tensor_bindings(
     llm: &MimoLlmMetadata,
     inlocal: &MimoInlocalMetadata,
@@ -570,95 +636,8 @@ fn mimo_asr_runtime_tensor_bindings(
         reason: reason.to_string(),
     };
 
-    // 36L Qwen2 backbone (qkv bias, no QK-norm).
-    let kv_dim = llm.n_kv_heads * llm.head_dim;
-    for layer_idx in 0..llm.n_layers {
-        let names = mimo_llm_layer_tensor_names(layer_idx);
-        bindings.push(vector(
-            names.attn_norm_weight,
-            llm.d_model,
-            "expected d_model attention norm vector",
-        ));
-        bindings.push(rank2(
-            names.attn_q_weight,
-            llm.d_model,
-            llm.d_model,
-            "expected d_model x d_model query projection",
-        ));
-        bindings.push(vector(
-            names.attn_q_bias,
-            llm.d_model,
-            "expected d_model query bias",
-        ));
-        bindings.push(rank2(
-            names.attn_k_weight,
-            llm.d_model,
-            kv_dim,
-            "expected d_model x kv_dim key projection",
-        ));
-        bindings.push(vector(
-            names.attn_k_bias,
-            kv_dim,
-            "expected kv_dim key bias",
-        ));
-        bindings.push(rank2(
-            names.attn_v_weight,
-            llm.d_model,
-            kv_dim,
-            "expected d_model x kv_dim value projection",
-        ));
-        bindings.push(vector(
-            names.attn_v_bias,
-            kv_dim,
-            "expected kv_dim value bias",
-        ));
-        bindings.push(rank2(
-            names.attn_output_weight,
-            llm.d_model,
-            llm.d_model,
-            "expected d_model x d_model output projection",
-        ));
-        bindings.push(vector(
-            names.ffn_norm_weight,
-            llm.d_model,
-            "expected d_model ffn norm vector",
-        ));
-        bindings.push(rank2(
-            names.ffn_gate_weight,
-            llm.d_model,
-            llm.ffn_dim,
-            "expected d_model x ffn_dim gate projection",
-        ));
-        bindings.push(rank2(
-            names.ffn_up_weight,
-            llm.d_model,
-            llm.ffn_dim,
-            "expected d_model x ffn_dim up projection",
-        ));
-        bindings.push(rank2(
-            names.ffn_down_weight,
-            llm.ffn_dim,
-            llm.d_model,
-            "expected ffn_dim x d_model down projection",
-        ));
-    }
-    bindings.push(rank2(
-        TOKEN_EMBD_WEIGHT.to_string(),
-        llm.d_model,
-        llm.vocab_size,
-        "expected d_model x vocab token embedding table",
-    ));
-    bindings.push(rank2(
-        OUTPUT_WEIGHT.to_string(),
-        llm.d_model,
-        llm.vocab_size,
-        "expected d_model x vocab output projection",
-    ));
-    bindings.push(vector(
-        OUTPUT_NORM_WEIGHT.to_string(),
-        llm.d_model,
-        "expected d_model final norm vector",
-    ));
+    // 36L Qwen2 backbone (qkv bias, no QK-norm) via the shared decoder contract.
+    bindings.extend(mimo_asr_backbone_decoder_tensor_descriptors(llm));
 
     // 6L input-local transformer + the speech embedding sum path.
     let d_in = inlocal.d_model;
