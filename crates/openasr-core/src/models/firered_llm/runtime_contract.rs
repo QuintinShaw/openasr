@@ -38,7 +38,7 @@ use crate::models::firered_aed::runtime_contract::{
 };
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_u64_scalar, u64_to_usize,
-    validate_positive_usize,
+    validate_bounded_usize, validate_positive_usize,
 };
 use crate::models::tensor_binding::{
     TensorBindingDescriptor, TensorBindingDescriptorRequirement, render_shape,
@@ -64,6 +64,8 @@ pub(crate) const FIRERED_LLM_LLM_HEAD_DIM_KEY: &str = "firered_llm.llm.head_dim"
 pub(crate) const FIRERED_LLM_LLM_FFN_DIM_KEY: &str = "firered_llm.llm.ffn_dim";
 pub(crate) const FIRERED_LLM_LLM_VOCAB_SIZE_KEY: &str = "firered_llm.llm.vocab_size";
 pub(crate) const FIRERED_LLM_LLM_MAX_POSITIONS_KEY: &str = "firered_llm.llm.max_positions";
+/// Local ceiling for RoPE position tables; generous over production 32768.
+pub(crate) const FIRERED_LLM_MAX_POSITIONS: usize = 1_048_576;
 pub(crate) const FIRERED_LLM_CHATML_IM_START_TOKEN_ID_KEY: &str =
     "firered_llm.llm.chatml_im_start_token_id";
 pub(crate) const FIRERED_LLM_CHATML_IM_END_TOKEN_ID_KEY: &str =
@@ -246,7 +248,55 @@ pub(crate) fn parse_firered_llm_decoder_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
-    if n_heads * head_dim != d_model {
+    use crate::models::qwen::{
+        QWEN_DECODER_MAX_D_MODEL, QWEN_DECODER_MAX_FFN_DIM, QWEN_DECODER_MAX_HEAD_DIM,
+        QWEN_DECODER_MAX_LAYERS, QWEN_DECODER_MAX_N_HEADS, QWEN_DECODER_MAX_VOCAB_SIZE,
+    };
+    for (key, value, max) in [
+        (
+            FIRERED_LLM_LLM_N_LAYERS_KEY,
+            n_layers,
+            QWEN_DECODER_MAX_LAYERS,
+        ),
+        (
+            FIRERED_LLM_LLM_D_MODEL_KEY,
+            d_model,
+            QWEN_DECODER_MAX_D_MODEL,
+        ),
+        (
+            FIRERED_LLM_LLM_N_HEADS_KEY,
+            n_heads,
+            QWEN_DECODER_MAX_N_HEADS,
+        ),
+        (
+            FIRERED_LLM_LLM_N_KV_HEADS_KEY,
+            n_kv_heads,
+            QWEN_DECODER_MAX_N_HEADS,
+        ),
+        (
+            FIRERED_LLM_LLM_HEAD_DIM_KEY,
+            head_dim,
+            QWEN_DECODER_MAX_HEAD_DIM,
+        ),
+        (
+            FIRERED_LLM_LLM_FFN_DIM_KEY,
+            ffn_dim,
+            QWEN_DECODER_MAX_FFN_DIM,
+        ),
+        (
+            FIRERED_LLM_LLM_VOCAB_SIZE_KEY,
+            vocab_size,
+            QWEN_DECODER_MAX_VOCAB_SIZE,
+        ),
+        (
+            FIRERED_LLM_LLM_MAX_POSITIONS_KEY,
+            max_positions,
+            FIRERED_LLM_MAX_POSITIONS,
+        ),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
+    if n_heads.checked_mul(head_dim) != Some(d_model) {
         return Err(MetadataContractError::InvalidValue {
             key: FIRERED_LLM_LLM_HEAD_DIM_KEY,
             reason: format!("n_heads {n_heads} * head_dim {head_dim} != d_model {d_model}"),
@@ -355,7 +405,7 @@ pub(crate) fn firered_llm_qwen_family_layer_names(
 /// FunASR-Nano / MOSS / MiMo.
 pub(crate) fn firered_llm_decoder_tensor_descriptors(
     decoder: &FireRedLlmDecoderMetadata,
-) -> Vec<TensorBindingDescriptor> {
+) -> Result<Vec<TensorBindingDescriptor>, FireRedLlmRuntimeTensorContractError> {
     use crate::models::qwen::{
         QwenDecoderContractOptions, QwenDecoderTailTensorNames,
         qwen_decoder_runtime_tensor_descriptors,
@@ -370,11 +420,7 @@ pub(crate) fn firered_llm_decoder_tensor_descriptors(
             token_embd: LLM_TOKEN_EMBD_WEIGHT,
         },
     )
-    .unwrap_or_else(|reason| {
-        // Metadata parse already enforces the geometry pins the shared Module
-        // re-checks; a failure here is a programming error, not pack input.
-        panic!("firered-llm decoder geometry rejected by shared Qwen contract: {reason}")
-    })
+    .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
 }
 
 /// The complete runtime-bound tensor set for one firered-llm pack, expressed
@@ -622,7 +668,7 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
     ]);
 
     // Qwen2 decoder half via the shared contract (ExactDims, not local EitherDims matrix).
-    descriptors.extend(firered_llm_decoder_tensor_descriptors(decoder));
+    descriptors.extend(firered_llm_decoder_tensor_descriptors(decoder)?);
     Ok(descriptors)
 }
 
@@ -848,8 +894,9 @@ mod tests {
         .collect()
     }
 
-    /// Every runtime-bound tensor of the fixture pack, hardcoded
-    /// independently from the descriptor builder under test.
+    /// Every runtime-bound tensor of the fixture pack. Encoder + adapter halves
+    /// stay hand-written; the decoder half is projected from the shared Qwen
+    /// descriptor set so positive fixtures cannot drift from admission.
     fn tensor_fixture_shapes() -> Vec<(String, Vec<u64>)> {
         let mut shapes: Vec<(String, Vec<u64>)> = vec![
             (FIRERED_LLM_CMVN_NEG_MEAN_TENSOR.to_string(), vec![8]),
@@ -905,26 +952,12 @@ mod tests {
             (ADAPTER_LINEAR1_BIAS.to_string(), vec![16]),
             (ADAPTER_LINEAR2_WEIGHT.to_string(), vec![16, 16]),
             (ADAPTER_LINEAR2_BIAS.to_string(), vec![16]),
-            (LLM_TOKEN_EMBD_WEIGHT.to_string(), vec![16, 64]),
-            (LLM_OUTPUT_WEIGHT.to_string(), vec![16, 64]),
-            (LLM_OUTPUT_NORM_WEIGHT.to_string(), vec![16]),
         ]);
-        let l = qwen2_llm_layer_tensor_names(0);
-        shapes.extend([
-            (l.attn_norm_weight.to_string(), vec![16]),
-            (l.attn_q_weight.to_string(), vec![16, 16]),
-            (l.attn_q_bias.to_string(), vec![16]),
-            // GQA: k/v project to n_kv_heads (2) x head_dim (4) = 8.
-            (l.attn_k_weight.to_string(), vec![16, 8]),
-            (l.attn_k_bias.to_string(), vec![8]),
-            (l.attn_v_weight.to_string(), vec![16, 8]),
-            (l.attn_v_bias.to_string(), vec![8]),
-            (l.attn_out_weight.to_string(), vec![16, 16]),
-            (l.ffn_norm_weight.to_string(), vec![16]),
-            (l.ffn_gate_weight.to_string(), vec![16, 32]),
-            (l.ffn_up_weight.to_string(), vec![16, 32]),
-            (l.ffn_down_weight.to_string(), vec![32, 16]),
-        ]);
+        let decoder =
+            parse_firered_llm_decoder_metadata(&tensor_fixture_metadata()).expect("tiny decoder");
+        shapes.extend(crate::models::tensor_binding::project_fixture_tensors(
+            &firered_llm_decoder_tensor_descriptors(&decoder).expect("decoder descriptors"),
+        ));
         shapes
     }
 

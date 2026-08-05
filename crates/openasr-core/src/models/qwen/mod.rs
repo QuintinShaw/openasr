@@ -30,6 +30,8 @@ pub(crate) use audio_encoder::{
 };
 pub(crate) use decode_prompt::Qwen3AsrDecodePrompt;
 pub(crate) use decoder_contract::{
+    QWEN_DECODER_MAX_D_MODEL, QWEN_DECODER_MAX_FFN_DIM, QWEN_DECODER_MAX_HEAD_DIM,
+    QWEN_DECODER_MAX_LAYERS, QWEN_DECODER_MAX_N_HEADS, QWEN_DECODER_MAX_VOCAB_SIZE,
     QwenDecoderContractGeometry, QwenDecoderContractOptions, QwenDecoderTailTensorNames,
     qwen_decoder_runtime_tensor_descriptors,
 };

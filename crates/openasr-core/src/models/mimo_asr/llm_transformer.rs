@@ -17,15 +17,13 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenFamilyLlmLayerTensorNames,
-    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenWholeDecoderPlan,
+    load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 
-use super::runtime_contract::MimoLlmMetadata;
-use super::tensor_names::{
-    OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT, mimo_llm_layer_tensor_names,
-};
+use super::runtime_contract::{MimoLlmMetadata, mimo_asr_qwen_family_layer_names};
+use super::tensor_names::{OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
 
 pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
     reader: &GgufTensorDataReader,
@@ -37,25 +35,7 @@ pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        |layer_index| {
-            let names = mimo_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                q_norm_name: None,
-                k_norm_name: None,
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
+        mimo_asr_qwen_family_layer_names,
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -117,29 +97,7 @@ fn plan_whole_decoder(
         metadata.n_heads,
         metadata.n_kv_heads,
         metadata.head_dim,
-        |layer_index| {
-            let names = mimo_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                // MiMo's backbone is Qwen2 (not Qwen3): no QK-norm.
-                q_norm_name: None,
-                k_norm_name: None,
-                // Qwen2 has attention bias on q/k/v; o_proj never has bias
-                // (verified against config.json's attention_bias=true and
-                // the safetensors index, P2.0 findings SS1.1).
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
+        mimo_asr_qwen_family_layer_names,
     )
     .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
         reason: error.to_string(),

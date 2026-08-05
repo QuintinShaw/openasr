@@ -33,6 +33,19 @@ pub(crate) struct QwenDecoderContractGeometry {
     pub vocab_size: usize,
 }
 
+/// Architecture ceilings for untrusted pack geometry. Generous headroom over
+/// published Qwen2/Qwen3 ASR checkpoints; parse paths should mirror these so
+/// descriptor construction cannot allocate without bound.
+pub(crate) const QWEN_DECODER_MAX_LAYERS: usize = 512;
+pub(crate) const QWEN_DECODER_MAX_D_MODEL: usize = 65_536;
+pub(crate) const QWEN_DECODER_MAX_N_HEADS: usize = 1_024;
+pub(crate) const QWEN_DECODER_MAX_HEAD_DIM: usize = 1_024;
+pub(crate) const QWEN_DECODER_MAX_FFN_DIM: usize = 262_144;
+pub(crate) const QWEN_DECODER_MAX_VOCAB_SIZE: usize = 1_000_000;
+/// Cap on total tensor obligations one decoder half may construct
+/// (layers * per-layer tensors + tail). Keeps malicious metadata fail-closed.
+pub(crate) const QWEN_DECODER_MAX_TENSOR_OBLIGATIONS: usize = 1_000_000;
+
 impl QwenDecoderContractGeometry {
     pub(crate) fn q_dim(self) -> Option<usize> {
         self.n_heads.checked_mul(self.head_dim)
@@ -42,7 +55,16 @@ impl QwenDecoderContractGeometry {
         self.n_kv_heads.checked_mul(self.head_dim)
     }
 
-    /// Structural pins shared by every Qwen-shaped decoder family.
+    /// Upper bound on descriptors one layer emits under `options`.
+    pub(crate) fn layer_tensor_count(options: QwenDecoderContractOptions) -> usize {
+        // attn_norm + q/k/v/out + ffn_norm + gate/up/down = 9
+        // + optional 2 qk-norm or 3 qkv-bias
+        9 + if options.qk_norm { 2 } else { 0 } + if options.qkv_bias { 3 } else { 0 }
+    }
+
+    /// Structural pins shared by every Qwen-shaped decoder family, including
+    /// architecture ceilings so untrusted metadata cannot build unbounded
+    /// descriptor sets.
     pub(crate) fn validate_basic(self) -> Result<(), String> {
         if self.n_layers == 0 {
             return Err("qwen decoder n_layers must be positive".to_string());
@@ -57,6 +79,21 @@ impl QwenDecoderContractGeometry {
         ] {
             if value == 0 {
                 return Err(format!("qwen decoder {label} must be positive"));
+            }
+        }
+        for (label, value, max) in [
+            ("n_layers", self.n_layers, QWEN_DECODER_MAX_LAYERS),
+            ("d_model", self.d_model, QWEN_DECODER_MAX_D_MODEL),
+            ("n_heads", self.n_heads, QWEN_DECODER_MAX_N_HEADS),
+            ("n_kv_heads", self.n_kv_heads, QWEN_DECODER_MAX_N_HEADS),
+            ("head_dim", self.head_dim, QWEN_DECODER_MAX_HEAD_DIM),
+            ("ffn_dim", self.ffn_dim, QWEN_DECODER_MAX_FFN_DIM),
+            ("vocab_size", self.vocab_size, QWEN_DECODER_MAX_VOCAB_SIZE),
+        ] {
+            if value > max {
+                return Err(format!(
+                    "qwen decoder {label} ({value}) exceeds architecture ceiling {max}"
+                ));
             }
         }
         if !self.n_heads.is_multiple_of(self.n_kv_heads) {
@@ -79,6 +116,30 @@ impl QwenDecoderContractGeometry {
         })?;
         if q_dim == 0 || kv_dim == 0 {
             return Err("qwen decoder q_dim/kv_dim must be positive".to_string());
+        }
+        Ok(())
+    }
+
+    /// Fail closed before allocating the full descriptor set when a geometry
+    /// would construct more obligations than the global ceiling.
+    pub(crate) fn validate_obligation_budget(
+        self,
+        options: QwenDecoderContractOptions,
+        tail_tensor_count: usize,
+    ) -> Result<(), String> {
+        self.validate_basic()?;
+        let per_layer = Self::layer_tensor_count(options);
+        let layer_total = self
+            .n_layers
+            .checked_mul(per_layer)
+            .ok_or_else(|| "qwen decoder layer obligation count overflows".to_string())?;
+        let total = layer_total
+            .checked_add(tail_tensor_count)
+            .ok_or_else(|| "qwen decoder total obligation count overflows".to_string())?;
+        if total > QWEN_DECODER_MAX_TENSOR_OBLIGATIONS {
+            return Err(format!(
+                "qwen decoder tensor obligations ({total}) exceed ceiling {QWEN_DECODER_MAX_TENSOR_OBLIGATIONS}"
+            ));
         }
         Ok(())
     }
@@ -306,7 +367,8 @@ pub(crate) fn qwen_decoder_runtime_tensor_descriptors(
     mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
     tail: QwenDecoderTailTensorNames<'_>,
 ) -> Result<Vec<TensorBindingDescriptor>, String> {
-    geometry.validate_basic()?;
+    let tail_count = 2 + usize::from(tail.output_weight.is_some());
+    geometry.validate_obligation_budget(options, tail_count)?;
     let mut descriptors = Vec::new();
     for layer in 0..geometry.n_layers {
         descriptors.extend(qwen_decoder_layer_tensor_descriptors(
@@ -634,5 +696,44 @@ mod tests {
             ..qwen3_geometry()
         };
         assert!(g.validate_basic().is_err());
+    }
+
+    #[test]
+    fn rejects_geometry_above_architecture_ceilings() {
+        let over_layers = QwenDecoderContractGeometry {
+            n_layers: QWEN_DECODER_MAX_LAYERS + 1,
+            ..qwen3_geometry()
+        };
+        let err = over_layers.validate_basic().expect_err("layers ceiling");
+        assert!(err.contains("n_layers") && err.contains("ceiling"), "{err}");
+
+        let over_vocab = QwenDecoderContractGeometry {
+            vocab_size: QWEN_DECODER_MAX_VOCAB_SIZE + 1,
+            ..qwen3_geometry()
+        };
+        assert!(over_vocab.validate_basic().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_obligation_count_before_allocating() {
+        // Even within per-field ceilings, refuse a combination that would
+        // construct more descriptors than the global obligation budget.
+        let g = QwenDecoderContractGeometry {
+            n_layers: QWEN_DECODER_MAX_LAYERS,
+            d_model: 16,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 4,
+            ffn_dim: 32,
+            vocab_size: 64,
+        };
+        // Force a tiny artificial budget by asking for an enormous tail count.
+        let err = g
+            .validate_obligation_budget(QwenDecoderContractOptions::QWEN3, usize::MAX / 2)
+            .expect_err("obligation budget must fail closed");
+        assert!(
+            err.contains("overflow") || err.contains("ceiling") || err.contains("obligations"),
+            "{err}"
+        );
     }
 }

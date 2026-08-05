@@ -74,6 +74,19 @@ fn positive(value: usize, key: &'static str) -> Result<usize, MimoMetadataError>
     Ok(value)
 }
 
+fn bounded(value: usize, key: &'static str, max: usize) -> Result<usize, MimoMetadataError> {
+    if value > max {
+        return Err(MimoMetadataError::InvalidValue {
+            key,
+            reason: format!("value {value} exceeds the architecture ceiling {max}"),
+        });
+    }
+    Ok(value)
+}
+
+/// Local ceiling for RoPE position tables; generous over production 8192.
+const MIMO_LLM_MAX_POSITIONS: usize = 1_048_576;
+
 /// The 36L Qwen2 backbone: qkv bias on, no QK-norm (the same shape
 /// `firered_llm`'s LLM branch already parameterizes into
 /// `qwen::llm_transformer`).
@@ -138,7 +151,47 @@ pub(crate) fn parse_mimo_llm_metadata(
             ),
         });
     }
-    if n_heads * head_dim != d_model {
+    use crate::models::qwen::{
+        QWEN_DECODER_MAX_D_MODEL, QWEN_DECODER_MAX_FFN_DIM, QWEN_DECODER_MAX_HEAD_DIM,
+        QWEN_DECODER_MAX_LAYERS, QWEN_DECODER_MAX_N_HEADS, QWEN_DECODER_MAX_VOCAB_SIZE,
+    };
+    bounded(n_layers, "mimo.llm.block_count", QWEN_DECODER_MAX_LAYERS)?;
+    bounded(
+        d_model,
+        "mimo.llm.embedding_length",
+        QWEN_DECODER_MAX_D_MODEL,
+    )?;
+    bounded(
+        n_heads,
+        "mimo.llm.attention.head_count",
+        QWEN_DECODER_MAX_N_HEADS,
+    )?;
+    bounded(
+        n_kv_heads,
+        "mimo.llm.attention.head_count_kv",
+        QWEN_DECODER_MAX_N_HEADS,
+    )?;
+    bounded(
+        head_dim,
+        "mimo.llm.attention.key_length",
+        QWEN_DECODER_MAX_HEAD_DIM,
+    )?;
+    bounded(
+        ffn_dim,
+        "mimo.llm.feed_forward_length",
+        QWEN_DECODER_MAX_FFN_DIM,
+    )?;
+    bounded(
+        vocab_size,
+        "mimo.llm.vocab_size",
+        QWEN_DECODER_MAX_VOCAB_SIZE,
+    )?;
+    bounded(
+        max_positions,
+        "mimo.llm.context_length",
+        MIMO_LLM_MAX_POSITIONS,
+    )?;
+    if n_heads.checked_mul(head_dim) != Some(d_model) {
         return Err(MimoMetadataError::InvalidValue {
             key: "mimo.llm.attention.key_length",
             reason: format!("n_heads {n_heads} * head_dim {head_dim} != d_model {d_model}"),
@@ -437,6 +490,8 @@ pub(crate) enum MimoRuntimeTensorError {
         shape: String,
         reason: String,
     },
+    #[error("mimo-asr backbone decoder geometry rejected by shared Qwen contract: {reason}")]
+    InvalidDecoderGeometry { reason: String },
 }
 
 pub(crate) fn validate_runtime_pack_contract(
@@ -595,7 +650,7 @@ pub(crate) fn mimo_asr_qwen_family_layer_names(
 /// FireRed2-LLM. Does not cover inlocal / audiotok / speech embd tensors.
 pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
     llm: &MimoLlmMetadata,
-) -> Vec<TensorBindingDescriptor> {
+) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
     use crate::models::qwen::{
         QwenDecoderContractOptions, QwenDecoderTailTensorNames,
         qwen_decoder_runtime_tensor_descriptors,
@@ -610,11 +665,7 @@ pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
             token_embd: TOKEN_EMBD_WEIGHT,
         },
     )
-    .unwrap_or_else(|reason| {
-        // Metadata parse already enforces the geometry pins the shared Module
-        // re-checks; a failure here is a programming error, not pack input.
-        panic!("mimo-asr backbone decoder geometry rejected by shared Qwen contract: {reason}")
-    })
+    .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
 }
 
 fn mimo_asr_runtime_tensor_bindings(
@@ -622,7 +673,7 @@ fn mimo_asr_runtime_tensor_bindings(
     inlocal: &MimoInlocalMetadata,
     audiotok: &MimoAudiotokMetadata,
     mel: &MimoMelMetadata,
-) -> Vec<TensorBindingDescriptor> {
+) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
     let mut bindings = Vec::new();
 
     let vector = |name: String, len: usize, reason: &str| TensorBindingDescriptor {
@@ -637,7 +688,7 @@ fn mimo_asr_runtime_tensor_bindings(
     };
 
     // 36L Qwen2 backbone (qkv bias, no QK-norm) via the shared decoder contract.
-    bindings.extend(mimo_asr_backbone_decoder_tensor_descriptors(llm));
+    bindings.extend(mimo_asr_backbone_decoder_tensor_descriptors(llm)?);
 
     // 6L input-local transformer + the speech embedding sum path.
     let d_in = inlocal.d_model;
@@ -899,7 +950,7 @@ fn mimo_asr_runtime_tensor_bindings(
         ));
     }
 
-    bindings
+    Ok(bindings)
 }
 
 pub(crate) fn validate_mimo_asr_runtime_tensors_with_index(
@@ -909,7 +960,7 @@ pub(crate) fn validate_mimo_asr_runtime_tensors_with_index(
     audiotok: &MimoAudiotokMetadata,
     mel: &MimoMelMetadata,
 ) -> Result<(), MimoRuntimeTensorError> {
-    let bindings = mimo_asr_runtime_tensor_bindings(llm, inlocal, audiotok, mel);
+    let bindings = mimo_asr_runtime_tensor_bindings(llm, inlocal, audiotok, mel)?;
     validate_tensor_binding_descriptors(
         index,
         &bindings,
@@ -1028,24 +1079,15 @@ fn tiny_metadata_values()
 #[cfg(any(test, feature = "testing"))]
 fn tiny_tensors() -> Vec<(String, Vec<u64>)> {
     let mut tensors = Vec::new();
-    // Backbone (1 layer, d=16, kv=8, ffn=32, vocab=32).
-    tensors.extend([
-        ("blk.0.attn_norm.weight".to_string(), vec![16]),
-        ("blk.0.attn_q.weight".to_string(), vec![16, 16]),
-        ("blk.0.attn_q.bias".to_string(), vec![16]),
-        ("blk.0.attn_k.weight".to_string(), vec![16, 8]),
-        ("blk.0.attn_k.bias".to_string(), vec![8]),
-        ("blk.0.attn_v.weight".to_string(), vec![16, 8]),
-        ("blk.0.attn_v.bias".to_string(), vec![8]),
-        ("blk.0.attn_output.weight".to_string(), vec![16, 16]),
-        ("blk.0.ffn_norm.weight".to_string(), vec![16]),
-        ("blk.0.ffn_gate.weight".to_string(), vec![16, 32]),
-        ("blk.0.ffn_up.weight".to_string(), vec![16, 32]),
-        ("blk.0.ffn_down.weight".to_string(), vec![32, 16]),
-        ("token_embd.weight".to_string(), vec![16, 32]),
-        ("output.weight".to_string(), vec![16, 32]),
-        ("output_norm.weight".to_string(), vec![16]),
-    ]);
+    // Backbone projected from the shared Qwen decoder descriptors so positive
+    // fixtures cannot drift from admission (blk.* + token_embd/output/output_norm).
+    let llm = parse_mimo_llm_metadata(&crate::GgufMetadata::from_values_for_test(
+        tiny_metadata_values(),
+    ))
+    .expect("tiny llm metadata");
+    tensors.extend(crate::models::tensor_binding::project_fixture_tensors(
+        &mimo_asr_backbone_decoder_tensor_descriptors(&llm).expect("backbone descriptors"),
+    ));
     // Input-local (1 layer, d=8, ffn=16) + speech path (group 4 x 8 -> 16).
     tensors.extend([
         ("inlocal.blk.0.attn_norm.weight".to_string(), vec![8]),
@@ -1447,7 +1489,8 @@ mod tests {
             &tiny_inlocal(),
             &tiny_audiotok(),
             &tiny_mel(),
-        );
+        )
+        .expect("tiny geometry must expand");
         let mut bound_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for binding in &bindings {
             assert!(

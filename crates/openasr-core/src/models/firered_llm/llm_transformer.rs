@@ -36,8 +36,8 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenFamilyLlmLayerTensorNames,
-    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenWholeDecoderPlan,
+    load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 #[cfg(test)]
@@ -47,10 +47,9 @@ use crate::models::qwen::{
 
 use super::runtime_contract::{
     FIRERED_LLM_RMS_NORM_EPSILON, FIRERED_LLM_ROPE_THETA, FireRedLlmDecoderMetadata,
+    firered_llm_qwen_family_layer_names,
 };
-use super::tensor_names::{
-    LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, qwen2_llm_layer_tensor_names,
-};
+use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
 /// Quotes the host-memory shape retained by one FireRed-LLM decoder actor.
 ///
@@ -77,25 +76,7 @@ pub(crate) fn quoted_firered_llm_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        |layer_index| {
-            let names = qwen2_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_out_weight,
-                q_norm_name: None,
-                k_norm_name: None,
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
+        firered_llm_qwen_family_layer_names,
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -161,29 +142,7 @@ fn plan_qwen2_whole_decoder(
         metadata.n_heads,
         metadata.n_kv_heads,
         metadata.head_dim,
-        |layer_index| {
-            let names = qwen2_llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_out_weight,
-                // Qwen2 has no QK-norm (unlike Qwen3-ASR).
-                q_norm_name: None,
-                k_norm_name: None,
-                // Qwen2 has attention bias on q/k/v (unlike Qwen3-ASR); o_proj
-                // never has bias (verified against the official Qwen2
-                // architecture -- see `package_import`'s remap comment).
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        },
+        firered_llm_qwen_family_layer_names,
     )
     .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
         reason: error.to_string(),
@@ -673,25 +632,9 @@ mod parity_tests {
         metadata: &FireRedLlmDecoderMetadata,
         layer_index: usize,
     ) -> Qwen3AsrLlmLayerAttentionProjection {
-        let names = qwen2_llm_layer_tensor_names(layer_index);
         let generic = load_qwen_family_llm_layer_attention_projection_generic(
             reader,
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_out_weight,
-                q_norm_name: None,
-                k_norm_name: None,
-                q_bias_name: Some(names.attn_q_bias),
-                k_bias_name: Some(names.attn_k_bias),
-                v_bias_name: Some(names.attn_v_bias),
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            },
+            firered_llm_qwen_family_layer_names(layer_index),
             metadata.d_model,
             metadata.n_heads,
             metadata.n_kv_heads,

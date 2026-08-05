@@ -51,7 +51,9 @@ pub(crate) const LLM_ENDOFTEXT_TOKEN_ID_KEY: &str = "funasr.llm.endoftext_token_
 pub(crate) const FUNASR_NANO_MAX_LAYERS: usize = 512;
 pub(crate) const FUNASR_NANO_MAX_D_MODEL: usize = 65_536;
 pub(crate) const FUNASR_NANO_MAX_N_HEADS: usize = 1_024;
-pub(crate) const FUNASR_NANO_MAX_HEAD_DIM: usize = 65_536;
+// Match the shared Qwen decoder ceiling (not looser) so descriptor construction
+// and family parse fail closed on the same geometry bounds.
+pub(crate) const FUNASR_NANO_MAX_HEAD_DIM: usize = 1_024;
 pub(crate) const FUNASR_NANO_MAX_FFN_DIM: usize = 262_144;
 pub(crate) const FUNASR_NANO_MAX_FSMN_KERNEL: usize = 4_096;
 pub(crate) const FUNASR_NANO_MAX_FEATURE_DIM: usize = 4_096;
@@ -345,6 +347,8 @@ pub(crate) enum FunasrNanoTensorContractError {
         "funasr-nano geometry constructs {count} tensor obligations, exceeding the ceiling {max}"
     )]
     TooManyTensorObligations { count: usize, max: usize },
+    #[error("funasr-nano decoder geometry rejected by shared Qwen contract: {reason}")]
+    InvalidDecoderGeometry { reason: String },
 }
 
 fn missing_required_tensor(name: &str) -> FunasrNanoTensorContractError {
@@ -722,7 +726,7 @@ pub(crate) fn funasr_nano_qwen_family_layer_names(
 /// 11-tensor layer pattern cannot drift from MOSS / MiMo / FireRed2-LLM.
 pub(crate) fn funasr_nano_decoder_tensor_descriptors(
     decoder: &FunasrNanoDecoderMetadata,
-) -> Vec<TensorBindingDescriptor> {
+) -> Result<Vec<TensorBindingDescriptor>, FunasrNanoTensorContractError> {
     use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
     use crate::models::qwen::{
         QwenDecoderContractOptions, QwenDecoderTailTensorNames,
@@ -738,11 +742,7 @@ pub(crate) fn funasr_nano_decoder_tensor_descriptors(
             token_embd: LLM_TOKEN_EMBD_WEIGHT,
         },
     )
-    .unwrap_or_else(|reason| {
-        // Metadata parse already enforces the geometry pins the shared Module
-        // re-checks; a failure here is a programming error, not pack input.
-        panic!("funasr-nano decoder geometry rejected by shared Qwen contract: {reason}")
-    })
+    .map_err(|reason| FunasrNanoTensorContractError::InvalidDecoderGeometry { reason })
 }
 
 /// The runtime tensor contract for one funasr-nano pack: every tensor the
@@ -753,11 +753,11 @@ pub(crate) fn funasr_nano_runtime_tensor_binding_descriptors(
     encoder: &FunasrNanoEncoderMetadata,
     adapter: &FunasrNanoAdapterMetadata,
     decoder: &FunasrNanoDecoderMetadata,
-) -> Vec<TensorBindingDescriptor> {
+) -> Result<Vec<TensorBindingDescriptor>, FunasrNanoTensorContractError> {
     let mut descriptors = funasr_nano_encoder_tensor_descriptors(encoder);
     descriptors.extend(funasr_nano_adapter_tensor_descriptors(adapter));
-    descriptors.extend(funasr_nano_decoder_tensor_descriptors(decoder));
-    descriptors
+    descriptors.extend(funasr_nano_decoder_tensor_descriptors(decoder)?);
+    Ok(descriptors)
 }
 
 /// Read guard for the encoder half: the encoder weight loader fails closed on
@@ -787,8 +787,10 @@ pub(crate) fn funasr_nano_adapter_read_guard(
 #[cfg(test)]
 pub(crate) fn funasr_nano_decoder_read_guard(
     decoder: &FunasrNanoDecoderMetadata,
-) -> TensorReadGuard {
-    TensorReadGuard::from_descriptors(&funasr_nano_decoder_tensor_descriptors(decoder))
+) -> Result<TensorReadGuard, FunasrNanoTensorContractError> {
+    Ok(TensorReadGuard::from_descriptors(
+        &funasr_nano_decoder_tensor_descriptors(decoder)?,
+    ))
 }
 
 /// Validate the full runtime tensor set against the pack's tensor index,
@@ -799,7 +801,7 @@ pub(crate) fn validate_funasr_nano_runtime_tensors_with_index(
     adapter: &FunasrNanoAdapterMetadata,
     decoder: &FunasrNanoDecoderMetadata,
 ) -> Result<(), FunasrNanoTensorContractError> {
-    let descriptors = funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder);
+    let descriptors = funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder)?;
     if descriptors.len() > FUNASR_NANO_MAX_TENSOR_OBLIGATIONS {
         return Err(FunasrNanoTensorContractError::TooManyTensorObligations {
             count: descriptors.len(),
@@ -822,10 +824,10 @@ pub(crate) fn funasr_nano_runtime_tensors(
     encoder: &FunasrNanoEncoderMetadata,
     adapter: &FunasrNanoAdapterMetadata,
     decoder: &FunasrNanoDecoderMetadata,
-) -> Vec<(String, Vec<u64>)> {
-    crate::models::tensor_binding::project_fixture_tensors(
-        &funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder),
-    )
+) -> Result<Vec<(String, Vec<u64>)>, FunasrNanoTensorContractError> {
+    Ok(crate::models::tensor_binding::project_fixture_tensors(
+        &funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder)?,
+    ))
 }
 
 #[cfg(test)]
@@ -978,7 +980,8 @@ mod tests {
         let adapter = parse_funasr_nano_adapter_metadata(&full_metadata()).expect("adp");
         let decoder = parse_funasr_nano_decoder_metadata(&full_metadata()).expect("llm");
         let descriptors =
-            funasr_nano_runtime_tensor_binding_descriptors(&encoder, &adapter, &decoder);
+            funasr_nano_runtime_tensor_binding_descriptors(&encoder, &adapter, &decoder)
+                .expect("production geometry must expand");
         assert_eq!(descriptors.len(), (50 + 20) * 13 + 4 + 36 + 28 * 11 + 3);
         let names: std::collections::BTreeSet<&str> = descriptors
             .iter()
@@ -1081,7 +1084,10 @@ mod tests {
             loader_decoder_names.insert(suffix.to_string());
         }
         assert_eq!(
-            descriptor_names(funasr_nano_decoder_tensor_descriptors(&decoder)),
+            descriptor_names(
+                funasr_nano_decoder_tensor_descriptors(&decoder)
+                    .expect("decoder geometry must expand")
+            ),
             loader_decoder_names,
             "decoder contract names must equal the loader's name sources"
         );
@@ -1194,7 +1200,8 @@ mod tests {
     #[test]
     fn validates_the_projected_tiny_tensor_set() {
         let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
-        let shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder);
+        let shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder)
+            .expect("tiny geometry must expand");
         let index = tensor_index_from_shapes(&shapes);
         validate_funasr_nano_runtime_tensors_with_index(&index, &encoder, &adapter, &decoder)
             .expect("projected tensor set must satisfy the contract");
@@ -1203,7 +1210,8 @@ mod tests {
     #[test]
     fn rejects_a_missing_required_tensor() {
         let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
-        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder);
+        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder)
+            .expect("tiny geometry must expand");
         shapes.retain(|(name, _)| name != "adaptor.linear2.weight");
         let index = tensor_index_from_shapes(&shapes);
         let error =
@@ -1218,7 +1226,8 @@ mod tests {
     #[test]
     fn rejects_a_wrong_shape() {
         let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
-        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder);
+        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder)
+            .expect("tiny geometry must expand");
         for (name, dims) in shapes.iter_mut() {
             if name == "enc.blk.0.attn.fsmn.weight" {
                 *dims = vec![1, 1];

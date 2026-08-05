@@ -19,7 +19,7 @@ use crate::arch::{GENERAL_ARCHITECTURE_KEY, MOSS_TD_GGML_ARCHITECTURE_ID};
 use crate::capacity::decode_schedule::greedy_self_kv_positions;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
-    u64_to_u32, u64_to_usize, validate_positive_usize,
+    u64_to_u32, u64_to_usize, validate_bounded_usize, validate_positive_usize,
 };
 use crate::models::tensor_binding::{
     TensorBindingDescriptor, TensorBindingDescriptorRequirement, render_shape,
@@ -51,6 +51,8 @@ pub(crate) const LLM_N_KV_HEADS_KEY: &str = "moss_td.llm.n_kv_heads";
 pub(crate) const LLM_HEAD_DIM_KEY: &str = "moss_td.llm.head_dim";
 pub(crate) const LLM_VOCAB_SIZE_KEY: &str = "moss_td.llm.vocab_size";
 pub(crate) const LLM_MAX_POSITIONS_KEY: &str = "moss_td.llm.max_positions";
+/// Local ceiling for RoPE position tables; generous over production 131072.
+pub(crate) const MOSS_TD_MAX_POSITIONS: usize = 1_048_576;
 pub(crate) const LLM_AUDIO_START_TOKEN_ID_KEY: &str = "moss_td.llm.audio_start_token_id";
 pub(crate) const LLM_AUDIO_END_TOKEN_ID_KEY: &str = "moss_td.llm.audio_end_token_id";
 pub(crate) const LLM_AUDIO_PAD_TOKEN_ID_KEY: &str = "moss_td.llm.audio_pad_token_id";
@@ -204,6 +206,8 @@ pub(crate) enum MossTdRuntimeContractError {
         shape: String,
         reason: String,
     },
+    #[error("moss-transcribe-diarize decoder geometry rejected by shared Qwen contract: {reason}")]
+    InvalidDecoderGeometry { reason: String },
 }
 
 pub(crate) fn parse_encoder_metadata<M: ScalarMetadataView>(
@@ -305,6 +309,22 @@ pub(crate) fn parse_decoder_metadata<M: ScalarMetadataView>(
         (LLM_MAX_POSITIONS_KEY, max_positions),
     ] {
         validate_positive_usize(value, key)?;
+    }
+    use crate::models::qwen::{
+        QWEN_DECODER_MAX_D_MODEL, QWEN_DECODER_MAX_FFN_DIM, QWEN_DECODER_MAX_HEAD_DIM,
+        QWEN_DECODER_MAX_LAYERS, QWEN_DECODER_MAX_N_HEADS, QWEN_DECODER_MAX_VOCAB_SIZE,
+    };
+    for (key, value, max) in [
+        (LLM_N_LAYERS_KEY, n_layers, QWEN_DECODER_MAX_LAYERS),
+        (LLM_D_MODEL_KEY, d_model, QWEN_DECODER_MAX_D_MODEL),
+        (LLM_N_HEADS_KEY, n_heads, QWEN_DECODER_MAX_N_HEADS),
+        (LLM_N_KV_HEADS_KEY, n_kv_heads, QWEN_DECODER_MAX_N_HEADS),
+        (LLM_HEAD_DIM_KEY, head_dim, QWEN_DECODER_MAX_HEAD_DIM),
+        (LLM_FFN_DIM_KEY, ffn_dim, QWEN_DECODER_MAX_FFN_DIM),
+        (LLM_VOCAB_SIZE_KEY, vocab_size, QWEN_DECODER_MAX_VOCAB_SIZE),
+        (LLM_MAX_POSITIONS_KEY, max_positions, MOSS_TD_MAX_POSITIONS),
+    ] {
+        validate_bounded_usize(value, key, max)?;
     }
     // Unlike Qwen2/firered-llm, Qwen3 decouples the per-head projection width
     // from `d_model / n_heads`: the real checkpoint's `head_dim` (128) times
@@ -447,7 +467,7 @@ pub(crate) fn moss_td_qwen_family_layer_names(
 /// cannot drift from FunASR-Nano / MiMo / FireRed2-LLM.
 pub(crate) fn moss_td_decoder_tensor_descriptors(
     decoder: &MossTdDecoderMetadata,
-) -> Vec<TensorBindingDescriptor> {
+) -> Result<Vec<TensorBindingDescriptor>, MossTdRuntimeContractError> {
     use crate::models::qwen::{
         QwenDecoderContractOptions, QwenDecoderTailTensorNames,
         qwen_decoder_runtime_tensor_descriptors,
@@ -463,13 +483,7 @@ pub(crate) fn moss_td_decoder_tensor_descriptors(
             token_embd: LLM_TOKEN_EMBD_WEIGHT,
         },
     )
-    .unwrap_or_else(|reason| {
-        // Metadata parse already enforces the geometry pins the shared Module
-        // re-checks; a failure here is a programming error, not pack input.
-        panic!(
-            "moss-transcribe-diarize decoder geometry rejected by shared Qwen contract: {reason}"
-        )
-    })
+    .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })
 }
 
 /// Metadata-derived tensor binding contract for the complete
@@ -686,7 +700,7 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     ]);
 
     // --- Qwen3 decoder (shared Qwen-shaped contract) ---------------------------
-    descriptors.extend(moss_td_decoder_tensor_descriptors(&decoder));
+    descriptors.extend(moss_td_decoder_tensor_descriptors(&decoder)?);
 
     Ok(descriptors)
 }
@@ -819,6 +833,8 @@ mod tests {
 
     /// Every tensor the tiny geometry declares, with the shapes the importer
     /// writes for them (the production contract's own reference orientation).
+    /// Encoder + adaptor halves stay hand-written; the decoder half is projected
+    /// from the shared Qwen descriptor set so positive fixtures cannot drift.
     fn tiny_tensor_shapes() -> Vec<(String, Vec<u64>)> {
         let mut tensors: Vec<(String, Vec<u64>)> = vec![
             (ENC_CONV1_WEIGHT.to_string(), vec![3, 8, 16]),
@@ -834,8 +850,6 @@ mod tests {
             (ADAPTOR_LINEAR2_BIAS.to_string(), vec![16]),
             (ADAPTOR_NORM_WEIGHT.to_string(), vec![16]),
             (ADAPTOR_NORM_BIAS.to_string(), vec![16]),
-            (LLM_TOKEN_EMBD_WEIGHT.to_string(), vec![16, 64]),
-            (LLM_OUTPUT_NORM_WEIGHT.to_string(), vec![16]),
         ];
         let enc = moss_encoder_layer_tensor_names(0);
         tensors.extend([
@@ -855,20 +869,10 @@ mod tests {
             (enc.ffn_down_weight, vec![64, 16]),
             (enc.ffn_down_bias, vec![16]),
         ]);
-        let llm = moss_llm_layer_tensor_names(0);
-        tensors.extend([
-            (llm.attn_norm_weight, vec![16]),
-            (llm.attn_q_weight, vec![16, 16]),
-            (llm.attn_k_weight, vec![16, 8]),
-            (llm.attn_v_weight, vec![16, 8]),
-            (llm.attn_output_weight, vec![16, 16]),
-            (llm.attn_q_norm_weight, vec![8]),
-            (llm.attn_k_norm_weight, vec![8]),
-            (llm.ffn_norm_weight, vec![16]),
-            (llm.ffn_gate_weight, vec![16, 32]),
-            (llm.ffn_up_weight, vec![16, 32]),
-            (llm.ffn_down_weight, vec![32, 16]),
-        ]);
+        let decoder = parse_decoder_metadata(&tiny_metadata()).expect("tiny decoder metadata");
+        tensors.extend(crate::models::tensor_binding::project_fixture_tensors(
+            &moss_td_decoder_tensor_descriptors(&decoder).expect("tiny decoder descriptors"),
+        ));
         tensors
     }
 

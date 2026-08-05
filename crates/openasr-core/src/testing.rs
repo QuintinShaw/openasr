@@ -1420,6 +1420,7 @@ impl TinyGgufFixtureSpec {
             crate::models::funasr_nano::runtime_contract::funasr_nano_runtime_tensors(
                 &encoder, &adapter, &decoder,
             )
+            .expect("funasr-nano fixture geometry must expand")
         {
             spec = spec.with_tensor_shape(name, dims);
         }

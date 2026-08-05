@@ -507,7 +507,8 @@ mod trace_tests {
     #[test]
     fn decoder_logical_loader_read_trace_equals_the_contract_descriptors() {
         let metadata = tiny_decoder_metadata();
-        let descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        let descriptors = funasr_nano_decoder_tensor_descriptors(&metadata)
+            .expect("tiny decoder geometry must expand");
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().join("funasr-nano-decoder-trace.oasr");
         let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
@@ -551,7 +552,7 @@ mod trace_tests {
     #[test]
     fn decoder_read_guard_lists_only_contract_names() {
         let metadata = tiny_decoder_metadata();
-        let guard = funasr_nano_decoder_read_guard(&metadata);
+        let guard = funasr_nano_decoder_read_guard(&metadata).expect("decoder guard");
         assert!(
             !guard.contains("off.contract.weight"),
             "off-contract names must not be in the decoder read set"
@@ -560,7 +561,9 @@ mod trace_tests {
             guard.contains(LLM_TOKEN_EMBD_WEIGHT),
             "required contract tensors must remain listed"
         );
-        for descriptor in funasr_nano_decoder_tensor_descriptors(&metadata) {
+        for descriptor in funasr_nano_decoder_tensor_descriptors(&metadata)
+            .expect("tiny decoder geometry must expand")
+        {
             assert!(
                 guard.contains(&descriptor.tensor_name),
                 "descriptor {} must be listed",
@@ -592,7 +595,8 @@ mod trace_tests {
     #[test]
     fn decoder_new_from_preflight_fails_closed_when_a_contract_tensor_is_absent() {
         let metadata = tiny_decoder_metadata();
-        let mut descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        let mut descriptors = funasr_nano_decoder_tensor_descriptors(&metadata)
+            .expect("tiny decoder geometry must expand");
         // Drop one required layer weight.
         descriptors.retain(|d| d.tensor_name != "blk.0.attn_q.weight");
         let temp = tempfile::tempdir().expect("temp dir");
