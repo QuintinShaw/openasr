@@ -943,6 +943,193 @@ pub(crate) fn validate_mimo_asr_runtime_tensors_with_index(
     )
 }
 
+#[cfg(any(test, feature = "testing"))]
+fn tiny_metadata_values() -> std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue> {
+    let mut values = std::collections::BTreeMap::new();
+    let u = |values: &mut std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue>, k: &str, v: u32| {
+        values.insert(k.to_string(), crate::ggml_runtime::GgufMetadataValue::U32(v));
+    };
+    let f = |values: &mut std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue>, k: &str, v: f32| {
+        values.insert(k.to_string(), crate::ggml_runtime::GgufMetadataValue::F32(v));
+    };
+    let b = |values: &mut std::collections::BTreeMap<String, crate::ggml_runtime::GgufMetadataValue>, k: &str, v: bool| {
+        values.insert(k.to_string(), crate::ggml_runtime::GgufMetadataValue::Bool(v));
+    };
+    u(&mut values, "mimo.llm.block_count", 1);
+    u(&mut values, "mimo.llm.embedding_length", 16);
+    u(&mut values, "mimo.llm.feed_forward_length", 32);
+    u(&mut values, "mimo.llm.attention.head_count", 2);
+    u(&mut values, "mimo.llm.attention.head_count_kv", 1);
+    u(&mut values, "mimo.llm.attention.key_length", 8);
+    f(
+        &mut values,
+        "mimo.llm.attention.layer_norm_rms_epsilon",
+        1e-6,
+    );
+    f(&mut values, "mimo.llm.rope.freq_base", 640000.0);
+    u(&mut values, "mimo.llm.vocab_size", 32);
+    u(&mut values, "mimo.llm.context_length", 64);
+    b(&mut values, "mimo.llm.attention.qkv_bias", true);
+    b(&mut values, "mimo.llm.attention.qk_norm", false);
+
+    u(&mut values, "mimo.audio.channels", 1);
+    u(&mut values, "mimo.audio.group_size", 4);
+    u(&mut values, "mimo.inlocal.block_count", 1);
+    u(&mut values, "mimo.inlocal.embedding_length", 8);
+    u(&mut values, "mimo.inlocal.attention.head_count", 2);
+    u(&mut values, "mimo.inlocal.attention.head_dim", 4);
+    u(&mut values, "mimo.inlocal.feed_forward_length", 16);
+    b(&mut values, "mimo.inlocal.full_attention", true);
+    f(&mut values, "mimo.inlocal.rope.freq_base", 640000.0);
+
+    u(&mut values, "mimo.tok.block_count", 1);
+    u(&mut values, "mimo.tok.embedding_length", 8);
+    u(&mut values, "mimo.tok.attention.head_count", 2);
+    u(&mut values, "mimo.tok.feed_forward_length", 16);
+    u(&mut values, "mimo.tok.encoder.skip_layer_id", 1);
+    u(&mut values, "mimo.tok.conv.kernel_size", 3);
+    u(&mut values, "mimo.tok.conv1.stride", 1);
+    u(&mut values, "mimo.tok.conv2.stride", 2);
+    u(&mut values, "mimo.tok.down_sample.stride", 2);
+    f(&mut values, "mimo.tok.rope.freq_base", 10000.0);
+    u(&mut values, "mimo.tok.rvq.num_quantizers_packed", 1);
+    values.insert(
+        "mimo.tok.rvq.codebook_sizes".to_string(),
+        crate::ggml_runtime::GgufMetadataValue::U32Array(vec![16]),
+    );
+
+    u(&mut values, "mimo.mel.sample_rate", 24000);
+    u(&mut values, "mimo.mel.n_fft", 8);
+    u(&mut values, "mimo.mel.hop_length", 2);
+    u(&mut values, "mimo.mel.win_length", 8);
+    // The audio-tokenizer conv1 input is fixed at 128 mel bands
+    // (`MIMO_AUDIOTOK_N_MELS`), so even the tiny skeleton must declare it.
+    u(&mut values, "mimo.mel.n_mels", 128);
+    f(&mut values, "mimo.mel.log_clip", 1e-7);
+
+    u(&mut values, "mimo.special.eos_id", 1);
+    u(&mut values, "mimo.special.im_start_id", 2);
+    u(&mut values, "mimo.special.im_end_id", 3);
+    u(&mut values, "mimo.special.sosp_id", 4);
+    u(&mut values, "mimo.special.eosp_id", 5);
+    u(&mut values, "mimo.special.empty_id", 6);
+    u(&mut values, "mimo.special.eot_id", 7);
+    u(&mut values, "mimo.special.eostm_id", 8);
+
+    values
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn tiny_tensors() -> Vec<(String, Vec<u64>)> {
+    let mut tensors = Vec::new();
+    // Backbone (1 layer, d=16, kv=8, ffn=32, vocab=32).
+    tensors.extend([
+        ("blk.0.attn_norm.weight".to_string(), vec![16]),
+        ("blk.0.attn_q.weight".to_string(), vec![16, 16]),
+        ("blk.0.attn_q.bias".to_string(), vec![16]),
+        ("blk.0.attn_k.weight".to_string(), vec![16, 8]),
+        ("blk.0.attn_k.bias".to_string(), vec![8]),
+        ("blk.0.attn_v.weight".to_string(), vec![16, 8]),
+        ("blk.0.attn_v.bias".to_string(), vec![8]),
+        ("blk.0.attn_output.weight".to_string(), vec![16, 16]),
+        ("blk.0.ffn_norm.weight".to_string(), vec![16]),
+        ("blk.0.ffn_gate.weight".to_string(), vec![16, 32]),
+        ("blk.0.ffn_up.weight".to_string(), vec![16, 32]),
+        ("blk.0.ffn_down.weight".to_string(), vec![32, 16]),
+        ("token_embd.weight".to_string(), vec![16, 32]),
+        ("output.weight".to_string(), vec![16, 32]),
+        ("output_norm.weight".to_string(), vec![16]),
+    ]);
+    // Input-local (1 layer, d=8, ffn=16) + speech path (group 4 x 8 -> 16).
+    tensors.extend([
+        ("inlocal.blk.0.attn_norm.weight".to_string(), vec![8]),
+        ("inlocal.blk.0.attn_q.weight".to_string(), vec![8, 8]),
+        ("inlocal.blk.0.attn_q.bias".to_string(), vec![8]),
+        ("inlocal.blk.0.attn_k.weight".to_string(), vec![8, 8]),
+        ("inlocal.blk.0.attn_k.bias".to_string(), vec![8]),
+        ("inlocal.blk.0.attn_v.weight".to_string(), vec![8, 8]),
+        ("inlocal.blk.0.attn_v.bias".to_string(), vec![8]),
+        ("inlocal.blk.0.attn_output.weight".to_string(), vec![8, 8]),
+        ("inlocal.blk.0.ffn_norm.weight".to_string(), vec![8]),
+        ("inlocal.blk.0.ffn_gate.weight".to_string(), vec![8, 16]),
+        ("inlocal.blk.0.ffn_up.weight".to_string(), vec![8, 16]),
+        ("inlocal.blk.0.ffn_down.weight".to_string(), vec![16, 8]),
+        ("inlocal.norm.weight".to_string(), vec![8]),
+        ("speech_group_proj.weight".to_string(), vec![32, 16]),
+        ("speech_embd.0.weight".to_string(), vec![8, 17]),
+    ]);
+    // Audio-tokenizer encoder (1 layer, d=8, ffn=16) + mel + 1 codebook.
+    tensors.extend([
+        ("audiotok.conv1.weight".to_string(), vec![3, 128, 8]),
+        ("audiotok.conv1.bias".to_string(), vec![8]),
+        ("audiotok.conv2.weight".to_string(), vec![3, 8, 8]),
+        ("audiotok.conv2.bias".to_string(), vec![8]),
+        ("audiotok.down_sample.weight".to_string(), vec![2, 8, 8]),
+        ("audiotok.down_sample_norm.weight".to_string(), vec![8]),
+        ("audiotok.down_sample_norm.bias".to_string(), vec![8]),
+        ("audiotok.norm.weight".to_string(), vec![8]),
+        ("audiotok.norm.bias".to_string(), vec![8]),
+        ("audiotok.mel_filters".to_string(), vec![128, 5]),
+        ("audiotok.mel_window".to_string(), vec![8]),
+        ("audiotok.quant.0.codebook".to_string(), vec![8, 16]),
+        ("audiotok.blk.0.attn_norm.weight".to_string(), vec![8]),
+        ("audiotok.blk.0.attn_norm.bias".to_string(), vec![8]),
+        ("audiotok.blk.0.attn_q.weight".to_string(), vec![8, 8]),
+        ("audiotok.blk.0.attn_q.bias".to_string(), vec![8]),
+        ("audiotok.blk.0.attn_k.weight".to_string(), vec![8, 8]),
+        ("audiotok.blk.0.attn_v.weight".to_string(), vec![8, 8]),
+        ("audiotok.blk.0.attn_v.bias".to_string(), vec![8]),
+        ("audiotok.blk.0.attn_out.weight".to_string(), vec![8, 8]),
+        ("audiotok.blk.0.attn_out.bias".to_string(), vec![8]),
+        ("audiotok.blk.0.ffn_norm.weight".to_string(), vec![8]),
+        ("audiotok.blk.0.ffn_norm.bias".to_string(), vec![8]),
+        ("audiotok.blk.0.ffn_up.weight".to_string(), vec![8, 16]),
+        ("audiotok.blk.0.ffn_up.bias".to_string(), vec![16]),
+        ("audiotok.blk.0.ffn_down.weight".to_string(), vec![16, 8]),
+        ("audiotok.blk.0.ffn_down.bias".to_string(), vec![8]),
+    ]);
+    tensors
+}
+
+#[cfg(any(test, feature = "testing"))]
+/// Runtime-ready `TinyGgufFixtureSpec` for the mimo-asr production
+/// PackVerifier skeleton gate: routing keys, the full tiny hparam set
+/// (native u32/f32/bool), a minimal gpt2 tokenizer, and the complete tiny
+/// tensor skeleton.
+pub(crate) fn mimo_asr_oasr_v1_runtime_ready() -> crate::testing::TinyGgufFixtureSpec {
+    let mut spec = crate::testing::TinyGgufFixtureSpec::new(std::collections::BTreeMap::new())
+        .with_metadata("openasr.package.version", "1")
+        .with_metadata("openasr.model.family", "mimo-asr")
+        .with_metadata("openasr.model.architecture", "mimo-asr")
+        .with_metadata("openasr.model.id", "mimo-tiny:q8")
+        .with_metadata("openasr.audio.frontend", "mimo-tokenizer-rvq-v0")
+        .with_metadata("openasr.decode.policy", "mimo-asr.greedy.seq2seq.v0")
+        .with_metadata("openasr.tokenizer.id", "mimo-asr.gpt2-bpe.v0")
+        .with_metadata("openasr.pack.quant", "q8_0")
+        .with_metadata("tokenizer.ggml.model", "gpt2")
+        .with_string_array_metadata(
+            "tokenizer.ggml.tokens",
+            (0..16).map(|index| format!("fixture{index}")),
+        )
+        .with_string_array_metadata("tokenizer.ggml.merges", ["f i", "fix t", "fixt u"]);
+    for (key, value) in tiny_metadata_values() {
+        spec = match value {
+            crate::ggml_runtime::GgufMetadataValue::U32(value) => spec.with_u32_metadata(key, value),
+            crate::ggml_runtime::GgufMetadataValue::F32(value) => spec.with_f32_metadata(key, value),
+            crate::ggml_runtime::GgufMetadataValue::Bool(value) => spec.with_bool_metadata(key, value),
+            crate::ggml_runtime::GgufMetadataValue::U32Array(values) => spec.with_u32_array_metadata(key, values),
+            other => panic!("unexpected tiny metadata value for {key}: {other:?}"),
+        };
+    }
+    // TinyGgufFixtureSpec always carries a placeholder tensor; drop it so
+    // the skeleton is exactly the runtime set.
+    let mut spec = spec.without_tensor("fixture.tensor");
+    for (name, dims) in tiny_tensors() {
+        spec = spec.with_tensor_shape(name, dims);
+    }
+    spec
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,157 +1384,11 @@ mod tests {
         parse_mimo_mel_metadata(&tiny_metadata()).expect("tiny mel metadata")
     }
 
-    fn tiny_metadata_values() -> BTreeMap<String, GgufMetadataValue> {
-        let mut values = BTreeMap::new();
-        let u = |values: &mut BTreeMap<String, GgufMetadataValue>, k: &str, v: u32| {
-            values.insert(k.to_string(), GgufMetadataValue::U32(v));
-        };
-        let f = |values: &mut BTreeMap<String, GgufMetadataValue>, k: &str, v: f32| {
-            values.insert(k.to_string(), GgufMetadataValue::F32(v));
-        };
-        let b = |values: &mut BTreeMap<String, GgufMetadataValue>, k: &str, v: bool| {
-            values.insert(k.to_string(), GgufMetadataValue::Bool(v));
-        };
-        u(&mut values, "mimo.llm.block_count", 1);
-        u(&mut values, "mimo.llm.embedding_length", 16);
-        u(&mut values, "mimo.llm.feed_forward_length", 32);
-        u(&mut values, "mimo.llm.attention.head_count", 2);
-        u(&mut values, "mimo.llm.attention.head_count_kv", 1);
-        u(&mut values, "mimo.llm.attention.key_length", 8);
-        f(
-            &mut values,
-            "mimo.llm.attention.layer_norm_rms_epsilon",
-            1e-6,
-        );
-        f(&mut values, "mimo.llm.rope.freq_base", 640000.0);
-        u(&mut values, "mimo.llm.vocab_size", 32);
-        u(&mut values, "mimo.llm.context_length", 64);
-        b(&mut values, "mimo.llm.attention.qkv_bias", true);
-        b(&mut values, "mimo.llm.attention.qk_norm", false);
-
-        u(&mut values, "mimo.audio.channels", 1);
-        u(&mut values, "mimo.audio.group_size", 4);
-        u(&mut values, "mimo.inlocal.block_count", 1);
-        u(&mut values, "mimo.inlocal.embedding_length", 8);
-        u(&mut values, "mimo.inlocal.attention.head_count", 2);
-        u(&mut values, "mimo.inlocal.attention.head_dim", 4);
-        u(&mut values, "mimo.inlocal.feed_forward_length", 16);
-        b(&mut values, "mimo.inlocal.full_attention", true);
-        f(&mut values, "mimo.inlocal.rope.freq_base", 640000.0);
-
-        u(&mut values, "mimo.tok.block_count", 1);
-        u(&mut values, "mimo.tok.embedding_length", 8);
-        u(&mut values, "mimo.tok.attention.head_count", 2);
-        u(&mut values, "mimo.tok.feed_forward_length", 16);
-        u(&mut values, "mimo.tok.encoder.skip_layer_id", 1);
-        u(&mut values, "mimo.tok.conv.kernel_size", 3);
-        u(&mut values, "mimo.tok.conv1.stride", 1);
-        u(&mut values, "mimo.tok.conv2.stride", 2);
-        u(&mut values, "mimo.tok.down_sample.stride", 2);
-        f(&mut values, "mimo.tok.rope.freq_base", 10000.0);
-        u(&mut values, "mimo.tok.rvq.num_quantizers_packed", 1);
-        values.insert(
-            "mimo.tok.rvq.codebook_sizes".to_string(),
-            GgufMetadataValue::U32Array(vec![16]),
-        );
-
-        u(&mut values, "mimo.mel.sample_rate", 24000);
-        u(&mut values, "mimo.mel.n_fft", 8);
-        u(&mut values, "mimo.mel.hop_length", 2);
-        u(&mut values, "mimo.mel.win_length", 8);
-        // The audio-tokenizer conv1 input is fixed at 128 mel bands
-        // (`MIMO_AUDIOTOK_N_MELS`), so even the tiny skeleton must declare it.
-        u(&mut values, "mimo.mel.n_mels", 128);
-        f(&mut values, "mimo.mel.log_clip", 1e-7);
-
-        u(&mut values, "mimo.special.eos_id", 1);
-        u(&mut values, "mimo.special.im_start_id", 2);
-        u(&mut values, "mimo.special.im_end_id", 3);
-        u(&mut values, "mimo.special.sosp_id", 4);
-        u(&mut values, "mimo.special.eosp_id", 5);
-        u(&mut values, "mimo.special.empty_id", 6);
-        u(&mut values, "mimo.special.eot_id", 7);
-        u(&mut values, "mimo.special.eostm_id", 8);
-
-        values
-    }
 
     fn tiny_metadata() -> GgufMetadata {
         GgufMetadata::from_values_for_test(tiny_metadata_values())
     }
 
-    /// The complete tiny tensor skeleton matching [`tiny_metadata_values`] --
-    /// every tensor the runtime binds, at the tiny geometry's shapes.
-    fn tiny_tensors() -> Vec<(String, Vec<u64>)> {
-        let mut tensors = Vec::new();
-        // Backbone (1 layer, d=16, kv=8, ffn=32, vocab=32).
-        tensors.extend([
-            ("blk.0.attn_norm.weight".to_string(), vec![16]),
-            ("blk.0.attn_q.weight".to_string(), vec![16, 16]),
-            ("blk.0.attn_q.bias".to_string(), vec![16]),
-            ("blk.0.attn_k.weight".to_string(), vec![16, 8]),
-            ("blk.0.attn_k.bias".to_string(), vec![8]),
-            ("blk.0.attn_v.weight".to_string(), vec![16, 8]),
-            ("blk.0.attn_v.bias".to_string(), vec![8]),
-            ("blk.0.attn_output.weight".to_string(), vec![16, 16]),
-            ("blk.0.ffn_norm.weight".to_string(), vec![16]),
-            ("blk.0.ffn_gate.weight".to_string(), vec![16, 32]),
-            ("blk.0.ffn_up.weight".to_string(), vec![16, 32]),
-            ("blk.0.ffn_down.weight".to_string(), vec![32, 16]),
-            ("token_embd.weight".to_string(), vec![16, 32]),
-            ("output.weight".to_string(), vec![16, 32]),
-            ("output_norm.weight".to_string(), vec![16]),
-        ]);
-        // Input-local (1 layer, d=8, ffn=16) + speech path (group 4 x 8 -> 16).
-        tensors.extend([
-            ("inlocal.blk.0.attn_norm.weight".to_string(), vec![8]),
-            ("inlocal.blk.0.attn_q.weight".to_string(), vec![8, 8]),
-            ("inlocal.blk.0.attn_q.bias".to_string(), vec![8]),
-            ("inlocal.blk.0.attn_k.weight".to_string(), vec![8, 8]),
-            ("inlocal.blk.0.attn_k.bias".to_string(), vec![8]),
-            ("inlocal.blk.0.attn_v.weight".to_string(), vec![8, 8]),
-            ("inlocal.blk.0.attn_v.bias".to_string(), vec![8]),
-            ("inlocal.blk.0.attn_output.weight".to_string(), vec![8, 8]),
-            ("inlocal.blk.0.ffn_norm.weight".to_string(), vec![8]),
-            ("inlocal.blk.0.ffn_gate.weight".to_string(), vec![8, 16]),
-            ("inlocal.blk.0.ffn_up.weight".to_string(), vec![8, 16]),
-            ("inlocal.blk.0.ffn_down.weight".to_string(), vec![16, 8]),
-            ("inlocal.norm.weight".to_string(), vec![8]),
-            ("speech_group_proj.weight".to_string(), vec![32, 16]),
-            ("speech_embd.0.weight".to_string(), vec![8, 17]),
-        ]);
-        // Audio-tokenizer encoder (1 layer, d=8, ffn=16) + mel + 1 codebook.
-        tensors.extend([
-            ("audiotok.conv1.weight".to_string(), vec![3, 128, 8]),
-            ("audiotok.conv1.bias".to_string(), vec![8]),
-            ("audiotok.conv2.weight".to_string(), vec![3, 8, 8]),
-            ("audiotok.conv2.bias".to_string(), vec![8]),
-            ("audiotok.down_sample.weight".to_string(), vec![2, 8, 8]),
-            ("audiotok.down_sample_norm.weight".to_string(), vec![8]),
-            ("audiotok.down_sample_norm.bias".to_string(), vec![8]),
-            ("audiotok.norm.weight".to_string(), vec![8]),
-            ("audiotok.norm.bias".to_string(), vec![8]),
-            ("audiotok.mel_filters".to_string(), vec![128, 5]),
-            ("audiotok.mel_window".to_string(), vec![8]),
-            ("audiotok.quant.0.codebook".to_string(), vec![8, 16]),
-            ("audiotok.blk.0.attn_norm.weight".to_string(), vec![8]),
-            ("audiotok.blk.0.attn_norm.bias".to_string(), vec![8]),
-            ("audiotok.blk.0.attn_q.weight".to_string(), vec![8, 8]),
-            ("audiotok.blk.0.attn_q.bias".to_string(), vec![8]),
-            ("audiotok.blk.0.attn_k.weight".to_string(), vec![8, 8]),
-            ("audiotok.blk.0.attn_v.weight".to_string(), vec![8, 8]),
-            ("audiotok.blk.0.attn_v.bias".to_string(), vec![8]),
-            ("audiotok.blk.0.attn_out.weight".to_string(), vec![8, 8]),
-            ("audiotok.blk.0.attn_out.bias".to_string(), vec![8]),
-            ("audiotok.blk.0.ffn_norm.weight".to_string(), vec![8]),
-            ("audiotok.blk.0.ffn_norm.bias".to_string(), vec![8]),
-            ("audiotok.blk.0.ffn_up.weight".to_string(), vec![8, 16]),
-            ("audiotok.blk.0.ffn_up.bias".to_string(), vec![16]),
-            ("audiotok.blk.0.ffn_down.weight".to_string(), vec![16, 8]),
-            ("audiotok.blk.0.ffn_down.bias".to_string(), vec![8]),
-        ]);
-        tensors
-    }
 
     fn tensor_index_from(names_and_dims: &[(String, Vec<u64>)]) -> crate::GgufTensorIndex {
         let snapshot = crate::ggml_runtime::GgufTensorIndexSnapshot {
@@ -1447,42 +1488,6 @@ mod tests {
 
     // --- End-to-end: a tiny external-shaped pack through PackVerifier ----
 
-    /// A `TinyGgufFixtureSpec` carrying mimo's routing keys, the full tiny
-    /// hparam set (native u32/f32/bool, as the external converter bakes them),
-    /// a minimal gpt2 tokenizer, and the complete tiny tensor skeleton.
-    fn runtime_ready_tiny_spec() -> crate::testing::TinyGgufFixtureSpec {
-        let mut spec = crate::testing::TinyGgufFixtureSpec::new(BTreeMap::new())
-            .with_metadata("openasr.package.version", "1")
-            .with_metadata("openasr.model.family", "mimo-asr")
-            .with_metadata("openasr.model.architecture", "mimo-asr")
-            .with_metadata("openasr.model.id", "mimo-tiny:q8")
-            .with_metadata("openasr.audio.frontend", "mimo-tokenizer-rvq-v0")
-            .with_metadata("openasr.decode.policy", "mimo-asr.greedy.seq2seq.v0")
-            .with_metadata("openasr.tokenizer.id", "mimo-asr.gpt2-bpe.v0")
-            .with_metadata("openasr.pack.quant", "q8_0")
-            .with_metadata("tokenizer.ggml.model", "gpt2")
-            .with_string_array_metadata(
-                "tokenizer.ggml.tokens",
-                (0..16).map(|index| format!("fixture{index}")),
-            )
-            .with_string_array_metadata("tokenizer.ggml.merges", ["f i", "fix t", "fixt u"]);
-        for (key, value) in tiny_metadata_values() {
-            spec = match value {
-                GgufMetadataValue::U32(value) => spec.with_u32_metadata(key, value),
-                GgufMetadataValue::F32(value) => spec.with_f32_metadata(key, value),
-                GgufMetadataValue::Bool(value) => spec.with_bool_metadata(key, value),
-                GgufMetadataValue::U32Array(values) => spec.with_u32_array_metadata(key, values),
-                other => panic!("unexpected tiny metadata value for {key}: {other:?}"),
-            };
-        }
-        // TinyGgufFixtureSpec always carries a placeholder tensor; drop it so
-        // the skeleton is exactly the runtime set.
-        let mut spec = spec.without_tensor("fixture.tensor");
-        for (name, dims) in tiny_tensors() {
-            spec = spec.with_tensor_shape(name, dims);
-        }
-        spec
-    }
 
     fn write_tiny_pack(spec: &crate::testing::TinyGgufFixtureSpec) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1493,7 +1498,7 @@ mod tests {
 
     #[test]
     fn tiny_pack_passes_the_production_verifier_end_to_end() {
-        let spec = runtime_ready_tiny_spec();
+        let spec = mimo_asr_oasr_v1_runtime_ready();
         let dir = write_tiny_pack(&spec);
         let verified = crate::models::pack_verifier::PackVerifier
             .verify_candidate(crate::models::pack_verifier::PackCandidate::new(
@@ -1509,7 +1514,7 @@ mod tests {
 
     #[test]
     fn tiny_pack_missing_a_runtime_tensor_fails_the_verifier_closed() {
-        let mut spec = runtime_ready_tiny_spec();
+        let mut spec = mimo_asr_oasr_v1_runtime_ready();
         spec = spec.without_tensor("audiotok.quant.0.codebook");
         let dir = write_tiny_pack(&spec);
         let error = crate::models::pack_verifier::PackVerifier

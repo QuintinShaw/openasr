@@ -1415,6 +1415,111 @@ impl TinyGgufFixtureSpec {
         spec
     }
 
+    /// Contract-complete firered2-llm fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (shared FireRed conformer encoder + adapter +
+    /// Qwen2 decoder), so the pack passes the production `PackVerifier`. The
+    /// tensor set is projected from the family's own runtime tensor descriptors.
+    pub fn firered_llm_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::arch::FIRERED_LLM_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::FIRERED_LLM_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::FIRERED_LLM_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::FIRERED_LLM_TOKENIZER_ID.to_string(),
+        );
+        // Tiny internally-consistent geometry: 1 conformer block (d_model 8 =
+        // 2 heads x 4), subsample 4 channels x (((8-1)/2 - 1)/2) = 4, odd conv
+        // kernel and odd rel-pos table; 1 Qwen2 decoder block (d_model 16), the
+        // adapter llm_dim matching the decoder width, every special token id
+        // inside the 64-token vocab.
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
+            ("firered.encoder.n_layers", "1"),
+            ("firered.encoder.d_model", "8"),
+            ("firered.encoder.n_heads", "2"),
+            ("firered.encoder.head_dim", "4"),
+            ("firered.encoder.ffn_dim", "16"),
+            ("firered.encoder.conv_kernel", "3"),
+            ("firered.encoder.subsample_channels", "4"),
+            ("firered.encoder.subsample_out_dim", "4"),
+            ("firered.encoder.feature_dim", "8"),
+            ("firered.encoder.pe_len", "5"),
+            ("firered_llm.adapter.downsample_rate", "2"),
+            ("firered_llm.adapter.llm_dim", "16"),
+            ("firered_llm.llm.n_layers", "1"),
+            ("firered_llm.llm.d_model", "16"),
+            ("firered_llm.llm.n_heads", "4"),
+            ("firered_llm.llm.n_kv_heads", "2"),
+            ("firered_llm.llm.head_dim", "4"),
+            ("firered_llm.llm.ffn_dim", "32"),
+            ("firered_llm.llm.vocab_size", "64"),
+            ("firered_llm.llm.max_positions", "128"),
+            ("firered_llm.llm.chatml_im_start_token_id", "1"),
+            ("firered_llm.llm.chatml_im_end_token_id", "2"),
+            ("firered_llm.llm.endoftext_token_id", "0"),
+            ("firered_llm.llm.speech_token_id", "3"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut spec = Self::new(metadata);
+        let encoder =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_encoder_metadata(
+                &spec.metadata,
+            )
+            .expect("firered-llm encoder fixture metadata must parse");
+        let adapter =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_adapter_metadata(
+                &spec.metadata,
+            )
+            .expect("firered-llm adapter fixture metadata must parse");
+        let decoder =
+            crate::models::firered_llm::runtime_contract::parse_firered_llm_decoder_metadata(
+                &spec.metadata,
+            )
+            .expect("firered-llm decoder fixture metadata must parse");
+        for descriptor in
+            crate::models::firered_llm::runtime_contract::firered_llm_runtime_tensor_binding_descriptors(
+                &encoder, &adapter, &decoder,
+            )
+            .expect("firered-llm fixture geometry must expand")
+        {
+            let dims = crate::models::tensor_binding::project_fixture_dims(&descriptor.requirement);
+            spec = spec.with_tensor_shape(descriptor.tensor_name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete mimo-asr fixture for the production `PackVerifier`
+    /// skeleton gate. Delegates to the family's own fixture builder (routing
+    /// keys + full tiny hparam set + minimal gpt2 tokenizer + the complete tiny
+    /// tensor skeleton), which mimo's end-to-end verifier tests share.
+    pub fn mimo_asr_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        crate::models::mimo_asr::runtime_contract::mimo_asr_oasr_v1_runtime_ready()
+            .with_metadata(OPENASR_MODEL_ID_KEY, model_id.into())
+    }
+
     /// Metadata-complete wav2vec2-ctc routing fixture with the same tiny
     /// internally-consistent geometry the runtime tensor-contract tests use
     /// (one transformer layer, hidden 16, vocab 4, blank 0, group-norm
@@ -3205,88 +3310,110 @@ mod tests {
 
     #[test]
     fn shared_runtime_ready_family_skeletons_pass_the_production_pack_verifier() {
+        use crate::arch::OpenAsrArchitectureRegistry;
+
         let temp = tempfile::tempdir().unwrap();
-        let cases = [
-            (
-                "whisper.oasr",
-                TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
-                    "whisper-fixture",
+        // Inventory-driven, fail-closed coverage: iterate the canonical
+        // architecture inventory and require EVERY family to either supply a
+        // runtime-ready skeleton fixture here or carry an explicit
+        // `skeleton_exemption` in its conformance facet. A family added to the
+        // inventory with neither fails this gate, so the hand-written case list
+        // can never silently drop a family again.
+        let descriptors = OpenAsrArchitectureRegistry::with_builtins().descriptors();
+        let mut covered = 0usize;
+        let mut exempted: Vec<(&'static str, &'static str)> = Vec::new();
+        for descriptor in descriptors {
+            let model_family = descriptor.identity.model_family;
+            let expected_catalog_family = descriptor.identity.catalog_family_id;
+            let spec = match model_family {
+                "whisper" => Some(
+                    TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+                        "whisper-fixture",
+                    ),
                 ),
-                "whisper",
-            ),
-            (
-                "moonshine.oasr",
-                TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-fixture"),
-                "moonshine",
-            ),
-            (
-                "qwen.oasr",
-                TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-fixture"),
-                "qwen",
-            ),
-            (
-                "firered-aed.oasr",
-                TinyGgufFixtureSpec::firered_aed_oasr_v1_runtime_ready("firered-aed-fixture"),
-                "firered-aed",
-            ),
-            (
-                "moss.oasr",
-                TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-fixture"),
-                "moss-transcribe-diarize",
-            ),
-            (
-                "cohere.oasr",
-                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture"),
-                "cohere",
-            ),
-            (
-                "xasr.oasr",
-                TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture"),
-                "xasr-zipformer",
-            ),
-            (
-                "dolphin.oasr",
-                TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready("dolphin-fixture"),
-                "dolphin",
-            ),
-            (
-                "wav2vec2.oasr",
-                TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready("wav2vec2-fixture"),
-                "wav2vec2",
-            ),
-            (
-                "sensevoice.oasr",
-                TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready("sensevoice-fixture"),
-                "sensevoice",
-            ),
-            (
-                "parakeet-ctc.oasr",
-                TinyGgufFixtureSpec::parakeet_ctc_oasr_v1_runtime_ready("parakeet-ctc-fixture"),
-                "parakeet",
-            ),
-            (
-                "parakeet-tdt.oasr",
-                TinyGgufFixtureSpec::parakeet_tdt_oasr_v1_runtime_ready("parakeet-tdt-fixture"),
-                "parakeet-tdt",
-            ),
-            (
-                "funasr-nano.oasr",
-                TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready("funasr-nano-fixture"),
-                "funasr-nano",
-            ),
-        ];
-        for (name, spec, expected_catalog_family) in cases {
-            let path = temp.path().join(name);
-            write_tiny_gguf_runtime_source(&path, &spec).unwrap();
-            let verified = PackVerifier
-                .verify_candidate(PackCandidate::new(&path))
-                .unwrap_or_else(|error| panic!("{name} must verify: {error}"));
-            assert_eq!(
-                verified.catalog_family_id(),
-                Some(expected_catalog_family),
-                "{name}"
-            );
+                "moonshine" => Some(TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(
+                    "moonshine-fixture",
+                )),
+                "qwen3-asr" => Some(TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready(
+                    "qwen-fixture",
+                )),
+                "parakeet-ctc" => Some(TinyGgufFixtureSpec::parakeet_ctc_oasr_v1_runtime_ready(
+                    "parakeet-ctc-fixture",
+                )),
+                "parakeet-tdt" => Some(TinyGgufFixtureSpec::parakeet_tdt_oasr_v1_runtime_ready(
+                    "parakeet-tdt-fixture",
+                )),
+                "wav2vec2-ctc" => Some(TinyGgufFixtureSpec::wav2vec2_ctc_oasr_v1_runtime_ready(
+                    "wav2vec2-fixture",
+                )),
+                "xasr-zipformer" => Some(
+                    TinyGgufFixtureSpec::xasr_zipformer_oasr_v1_runtime_ready("xasr-fixture"),
+                ),
+                "dolphin" => Some(TinyGgufFixtureSpec::dolphin_oasr_v1_runtime_ready(
+                    "dolphin-fixture",
+                )),
+                "sensevoice" => Some(TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready(
+                    "sensevoice-fixture",
+                )),
+                "cohere-transcribe" => Some(TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(
+                    "cohere-fixture",
+                )),
+                "firered-aed" => Some(TinyGgufFixtureSpec::firered_aed_oasr_v1_runtime_ready(
+                    "firered-aed-fixture",
+                )),
+                "firered2-llm" => Some(TinyGgufFixtureSpec::firered_llm_oasr_v1_runtime_ready(
+                    "firered-llm-fixture",
+                )),
+                "funasr-nano" => Some(TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready(
+                    "funasr-nano-fixture",
+                )),
+                "mimo-asr" => Some(TinyGgufFixtureSpec::mimo_asr_oasr_v1_runtime_ready(
+                    "mimo-fixture",
+                )),
+                "moss-transcribe-diarize" => Some(
+                    TinyGgufFixtureSpec::moss_td_oasr_v1_runtime_ready("moss-fixture"),
+                ),
+                _ => None,
+            };
+            match (spec, descriptor.conformance_contract.skeleton_exemption) {
+                (Some(spec), _) => {
+                    let name = format!("{model_family}.oasr");
+                    let path = temp.path().join(&name);
+                    write_tiny_gguf_runtime_source(&path, &spec).unwrap();
+                    let verified = PackVerifier
+                        .verify_candidate(PackCandidate::new(&path))
+                        .unwrap_or_else(|error| panic!("{name} must verify: {error}"));
+                    assert_eq!(
+                        verified.catalog_family_id(),
+                        Some(expected_catalog_family),
+                        "{name}"
+                    );
+                    covered += 1;
+                }
+                (None, Some(reason)) => {
+                    exempted.push((model_family, reason));
+                }
+                (None, None) => {
+                    panic!(
+                        "family '{model_family}' has neither a runtime-ready skeleton fixture \
+                         nor a conformance skeleton_exemption; add one so the production \
+                         PackVerifier gate stays fail-closed"
+                    );
+                }
+            }
         }
+        // Bookkeeping: exactly one family (granite-speech) is skeleton-exempt,
+        // and every descriptor was either covered or exempted.
+        assert_eq!(
+            exempted.len(),
+            1,
+            "exactly one family may be skeleton-exempt: {exempted:?}"
+        );
+        assert_eq!(
+            exempted[0].0, "granite-speech",
+            "only granite-speech is skeleton-exempt: {exempted:?}"
+        );
+        assert_eq!(covered + exempted.len(), descriptors.len());
     }
 
     #[test]
