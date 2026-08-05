@@ -63,6 +63,12 @@ const CONV1_STRIDE: usize = 1;
 const CONV2_STRIDE: usize = 2;
 const CONV_PADDING: usize = 1;
 const CONV_DILATION: usize = 1;
+/// The encoder FFN expansion factor: the resident-tensor builder bakes the FFN
+/// width as `MOSS_ENCODER_FFN_EXPANSION * d_model` (it loads `ffn_up_bias` as
+/// `[4 * d_model]` and binds the FFN projections at that width), so a pack
+/// whose declared `ffn_dim` disagrees can never run. The admission contract
+/// pins `moss_td.encoder.ffn_dim` to this relationship.
+pub(crate) const MOSS_ENCODER_FFN_EXPANSION: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MossEncoderConfig {
@@ -327,7 +333,10 @@ pub(crate) fn load_moss_encoder_weights_from_reader(
                 values: Vec::new(),
             },
             ffn_up_bias: reader
-                .host_tensor_f32_copy_dequantized_by_name(&names.ffn_up_bias, &[4 * d])?,
+                .host_tensor_f32_copy_dequantized_by_name(
+                    &names.ffn_up_bias,
+                    &[(MOSS_ENCODER_FFN_EXPANSION as u64) * d],
+                )?,
             ffn_down_weight: MossProjectionTensor {
                 name: names.ffn_down_weight,
                 values: Vec::new(),
@@ -986,7 +995,7 @@ fn build_moss_encoder_resident_weights<'a>(
     loaded: Option<&GgmlLoadedWeightContext>,
 ) -> Result<MossEncoderResidentTensors<'a>, MossEncoderError> {
     let mut builder = MossEncoderArenaBuilder::new();
-    let ffn_dim = 4 * config.d_model;
+    let ffn_dim = MOSS_ENCODER_FFN_EXPANSION * config.d_model;
 
     let conv1_weight = builder.arena_3d_f16(
         arena,

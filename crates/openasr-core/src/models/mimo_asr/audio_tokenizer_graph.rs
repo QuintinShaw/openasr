@@ -34,6 +34,17 @@ use super::tensor_names::{
 const LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 
+/// conv1's input channel count: the audio-tokenizer graph bakes a fixed 128
+/// mel-band extent into the conv1 kernel arena tensor, so a pack whose
+/// `mimo.mel.n_mels` disagrees can never run. The admission contract pins
+/// `n_mels` to this value (fail closed at preflight, not mid-graph).
+pub(crate) const MIMO_AUDIOTOK_N_MELS: usize = 128;
+/// The down-sample conv kernel extent: the graph bakes a fixed kernel-2
+/// downsample (`down_sample(k2, s)`), uploading the weight as
+/// `[2, d_model, d_model]`. The stride stays metadata-driven, but the kernel
+/// extent is a graph constant the admission contract pins.
+pub(crate) const MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL: usize = 2;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MimoAudiotokEncoderOutput {
     pub frame_count: usize,
@@ -191,7 +202,7 @@ impl MimoAudiotokEncoderRuntime {
             .map_err(|source| build_err("static_tensor_arena", source))?;
 
         let d_model = metadata.d_model;
-        let n_mels = 128usize; // fixed by the mel front-end (conv1's in-channel count)
+        let n_mels = MIMO_AUDIOTOK_N_MELS; // conv1's fixed in-channel count
         let conv1_weight = arena
             .new_tensor_3d_typed(
                 metadata.conv_kernel_size,
@@ -219,7 +230,13 @@ impl MimoAudiotokEncoderRuntime {
         let norm_weight = new_vector(&arena, d_model, "audiotok_norm_w")?;
         let norm_bias = new_vector(&arena, d_model, "audiotok_norm_b")?;
         let down_sample_weight = arena
-            .new_tensor_3d_typed(2, d_model, d_model, GGML_TYPE_F16, "audiotok_ds_w")
+            .new_tensor_3d_typed(
+                MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL,
+                d_model,
+                d_model,
+                GGML_TYPE_F16,
+                "audiotok_ds_w",
+            )
             .map_err(|source| build_err("audiotok_ds_w", source))?;
         // `down_sample_layer` has no bias (bias=False upstream); allocate a
         // dedicated always-zero vector rather than reuse another tensor
@@ -282,7 +299,7 @@ impl MimoAudiotokEncoderRuntime {
             down_sample_weight,
             &reader,
             AUDIOTOK_DOWN_SAMPLE_WEIGHT,
-            &[2, dm, dm],
+            &[MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL as u64, dm, dm],
         )?;
         arena
             .set_f32_slice(
@@ -576,7 +593,12 @@ impl MimoAudiotokEncoderRuntime {
             },
             build_err,
         )?;
-        let down_frame_count = conv_out_len(frame_count, 2, self.metadata.down_sample_stride, 0)?;
+        let down_frame_count = conv_out_len(
+            frame_count,
+            MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL,
+            self.metadata.down_sample_stride,
+            0,
+        )?;
         if down_frame_count == 0 {
             return Err(MimoAudiotokEncoderError::InvalidMelFeatures {
                 reason: "audio too short: produces 0 frames after down-sample".to_string(),

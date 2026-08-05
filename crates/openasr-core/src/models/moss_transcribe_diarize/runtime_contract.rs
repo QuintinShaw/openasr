@@ -26,6 +26,7 @@ use crate::models::tensor_binding::{
     validate_tensor_binding_descriptors,
 };
 
+use super::encoder_graph::MOSS_ENCODER_FFN_EXPANSION;
 use super::tensor_names::{
     ADAPTOR_LINEAR1_BIAS, ADAPTOR_LINEAR1_WEIGHT, ADAPTOR_LINEAR2_BIAS, ADAPTOR_LINEAR2_WEIGHT,
     ADAPTOR_NORM_BIAS, ADAPTOR_NORM_WEIGHT, ENC_CONV1_BIAS, ENC_CONV1_WEIGHT, ENC_CONV2_BIAS,
@@ -231,6 +232,19 @@ pub(crate) fn parse_encoder_metadata<M: ScalarMetadataView>(
         return Err(MetadataContractError::InvalidValue {
             key: ENCODER_N_HEADS_KEY,
             reason: format!("d_model {d_model} is not a multiple of n_heads {n_heads}"),
+        });
+    }
+    // The encoder graph bakes the FFN width as `MOSS_ENCODER_FFN_EXPANSION *
+    // d_model` (it loads `ffn_up_bias` and binds the FFN projections at that
+    // width), so a pack declaring any other `ffn_dim` can never run; fail
+    // closed at admission rather than mid-graph.
+    if ffn_dim != MOSS_ENCODER_FFN_EXPANSION * d_model {
+        return Err(MetadataContractError::InvalidValue {
+            key: ENCODER_FFN_DIM_KEY,
+            reason: format!(
+                "ffn_dim {ffn_dim} is unsupported: the encoder FFN width is fixed at {MOSS_ENCODER_FFN_EXPANSION} * d_model {}",
+                MOSS_ENCODER_FFN_EXPANSION * d_model
+            ),
         });
     }
     Ok(MossTdEncoderMetadata {
@@ -841,7 +855,9 @@ mod tests {
             (ENCODER_N_LAYERS_KEY, "1"),
             (ENCODER_D_MODEL_KEY, "16"),
             (ENCODER_N_HEADS_KEY, "2"),
-            (ENCODER_FFN_DIM_KEY, "32"),
+            // The encoder graph bakes the FFN width as 4 * d_model
+            // (`MOSS_ENCODER_FFN_EXPANSION`), so the tiny geometry declares 64.
+            (ENCODER_FFN_DIM_KEY, "64"),
             (ENCODER_N_MELS_KEY, "8"),
             (ENCODER_MAX_SOURCE_POSITIONS_KEY, "20"),
             (ADAPTOR_MERGE_SIZE_KEY, "2"),
@@ -896,9 +912,9 @@ mod tests {
             (enc.attn_out_bias, vec![16]),
             (enc.ffn_norm_weight, vec![16]),
             (enc.ffn_norm_bias, vec![16]),
-            (enc.ffn_up_weight, vec![16, 32]),
-            (enc.ffn_up_bias, vec![32]),
-            (enc.ffn_down_weight, vec![32, 16]),
+            (enc.ffn_up_weight, vec![16, 64]),
+            (enc.ffn_up_bias, vec![64]),
+            (enc.ffn_down_weight, vec![64, 16]),
             (enc.ffn_down_bias, vec![16]),
         ]);
         let llm = moss_llm_layer_tensor_names(0);

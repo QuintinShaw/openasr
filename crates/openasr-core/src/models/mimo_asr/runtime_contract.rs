@@ -24,6 +24,7 @@ use crate::models::tensor_binding::{
 };
 use crate::{GgufMetadata, GgufTensorIndex};
 
+use super::audio_tokenizer_graph::{MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL, MIMO_AUDIOTOK_N_MELS};
 use super::tensor_names::{
     AUDIOTOK_CONV1_BIAS, AUDIOTOK_CONV1_WEIGHT, AUDIOTOK_CONV2_BIAS, AUDIOTOK_CONV2_WEIGHT,
     AUDIOTOK_DOWN_SAMPLE_NORM_BIAS, AUDIOTOK_DOWN_SAMPLE_NORM_WEIGHT, AUDIOTOK_DOWN_SAMPLE_WEIGHT,
@@ -454,6 +455,22 @@ pub(crate) fn validate_runtime_pack_contract(
     let mel_metadata = parse_mimo_mel_metadata(metadata).map_err(|error| {
         crate::models::runtime_pack_contract::metadata_validation_error("mimo-asr", error)
     })?;
+    // The audio-tokenizer graph bakes a fixed 128 mel-band input channel count
+    // into the conv1 kernel (`MIMO_AUDIOTOK_N_MELS`); a pack declaring any
+    // other `n_mels` can never run, so fail closed at admission rather than
+    // mid-graph.
+    if mel_metadata.n_mels != MIMO_AUDIOTOK_N_MELS {
+        return Err(crate::models::runtime_pack_contract::metadata_validation_error(
+            "mimo-asr",
+            MimoMetadataError::InvalidValue {
+                key: "mimo.mel.n_mels",
+                reason: format!(
+                    "n_mels {} is unsupported: the audio-tokenizer conv1 input is fixed at {MIMO_AUDIOTOK_N_MELS} mel bands",
+                    mel_metadata.n_mels
+                ),
+            },
+        ));
+    }
     let special_tokens = parse_mimo_special_tokens(metadata).map_err(|error| {
         crate::models::runtime_pack_contract::metadata_validation_error("mimo-asr", error)
     })?;
@@ -740,7 +757,7 @@ fn mimo_asr_runtime_tensor_bindings(
         tensor_name: AUDIOTOK_CONV1_WEIGHT.to_string(),
         requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
             audiotok.conv_kernel_size,
-            mel.n_mels,
+            MIMO_AUDIOTOK_N_MELS,
             d_tok,
         ]),
         reason: "expected [kernel, n_mels, d_model] conv1 kernel".to_string(),
@@ -767,11 +784,13 @@ fn mimo_asr_runtime_tensor_bindings(
     bindings.push(TensorBindingDescriptor {
         tensor_name: AUDIOTOK_DOWN_SAMPLE_WEIGHT.to_string(),
         requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
-            audiotok.down_sample_stride,
+            MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL,
             d_tok,
             d_tok,
         ]),
-        reason: "expected [stride, d_model, d_model] down-sample kernel".to_string(),
+        reason:
+            "expected [2, d_model, d_model] down-sample kernel (the graph bakes a fixed kernel-2 downsample; only the stride is metadata-driven)"
+                .to_string(),
     });
     bindings.push(vector(
         AUDIOTOK_DOWN_SAMPLE_NORM_WEIGHT.to_string(),
@@ -1236,7 +1255,9 @@ mod tests {
         u(&mut values, "mimo.mel.n_fft", 8);
         u(&mut values, "mimo.mel.hop_length", 2);
         u(&mut values, "mimo.mel.win_length", 8);
-        u(&mut values, "mimo.mel.n_mels", 4);
+        // The audio-tokenizer conv1 input is fixed at 128 mel bands
+        // (`MIMO_AUDIOTOK_N_MELS`), so even the tiny skeleton must declare it.
+        u(&mut values, "mimo.mel.n_mels", 128);
         f(&mut values, "mimo.mel.log_clip", 1e-7);
 
         u(&mut values, "mimo.special.eos_id", 1);
@@ -1297,7 +1318,7 @@ mod tests {
         ]);
         // Audio-tokenizer encoder (1 layer, d=8, ffn=16) + mel + 1 codebook.
         tensors.extend([
-            ("audiotok.conv1.weight".to_string(), vec![3, 4, 8]),
+            ("audiotok.conv1.weight".to_string(), vec![3, 128, 8]),
             ("audiotok.conv1.bias".to_string(), vec![8]),
             ("audiotok.conv2.weight".to_string(), vec![3, 8, 8]),
             ("audiotok.conv2.bias".to_string(), vec![8]),
@@ -1306,7 +1327,7 @@ mod tests {
             ("audiotok.down_sample_norm.bias".to_string(), vec![8]),
             ("audiotok.norm.weight".to_string(), vec![8]),
             ("audiotok.norm.bias".to_string(), vec![8]),
-            ("audiotok.mel_filters".to_string(), vec![4, 5]),
+            ("audiotok.mel_filters".to_string(), vec![128, 5]),
             ("audiotok.mel_window".to_string(), vec![8]),
             ("audiotok.quant.0.codebook".to_string(), vec![8, 16]),
             ("audiotok.blk.0.attn_norm.weight".to_string(), vec![8]),

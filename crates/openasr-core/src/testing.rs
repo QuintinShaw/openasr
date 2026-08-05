@@ -911,7 +911,9 @@ impl TinyGgufFixtureSpec {
             ("moss_td.encoder.n_layers", "1"),
             ("moss_td.encoder.d_model", "16"),
             ("moss_td.encoder.n_heads", "2"),
-            ("moss_td.encoder.ffn_dim", "32"),
+            // The encoder graph bakes the FFN width as 4 * d_model, so the
+            // fixture geometry declares 64 (= 4 * 16).
+            ("moss_td.encoder.ffn_dim", "64"),
             ("moss_td.encoder.n_mels", "8"),
             ("moss_td.encoder.max_source_positions", "20"),
             ("moss_td.adaptor.merge_size", "2"),
