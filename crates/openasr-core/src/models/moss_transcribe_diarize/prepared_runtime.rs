@@ -15,8 +15,8 @@ use crate::models::prepared_runtime_cache::{
     SystemMemoryMaterialization,
 };
 use crate::models::qwen::{
-    Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable, QwenFamilyLlmLayerTensorNames,
-    QwenWholeDecoderPlan, load_llm_logits_head_from_reader_with_tensor_names,
+    Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable, QwenWholeDecoderPlan,
+    load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 use crate::models::system_memory_owner::{SystemMemoryAllocationQuote, SystemMemoryOwnerError};
@@ -27,12 +27,10 @@ use super::encoder_graph::{
 };
 use super::runtime_contract::{
     MOSS_TD_ADAPTOR_NORM_EPSILON, MOSS_TD_RMS_NORM_EPSILON, MossTdAdaptorMetadata,
-    MossTdDecoderMetadata, MossTdEncoderMetadata, parse_adaptor_metadata, parse_decoder_metadata,
-    parse_encoder_metadata,
+    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_family_layer_names,
+    parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
 };
-use super::tensor_names::{
-    LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, moss_llm_layer_tensor_names,
-};
+use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 use super::tokenizer::MossTdTokenizer;
 
 #[derive(Clone)]
@@ -59,26 +57,6 @@ impl MossTdPreparedRuntime {
         }
     }
 
-    fn decoder_names(layer_index: usize) -> QwenFamilyLlmLayerTensorNames {
-        let names = moss_llm_layer_tensor_names(layer_index);
-        QwenFamilyLlmLayerTensorNames {
-            attn_norm_name: names.attn_norm_weight,
-            attn_q_name: names.attn_q_weight,
-            attn_k_name: names.attn_k_weight,
-            attn_v_name: names.attn_v_weight,
-            attn_output_name: names.attn_output_weight,
-            q_norm_name: Some(names.attn_q_norm_weight),
-            k_norm_name: Some(names.attn_k_norm_weight),
-            q_bias_name: None,
-            k_bias_name: None,
-            v_bias_name: None,
-            ffn_norm_name: names.ffn_norm_weight,
-            ffn_gate_name: names.ffn_gate_weight,
-            ffn_up_name: names.ffn_up_weight,
-            ffn_down_name: names.ffn_down_weight,
-        }
-    }
-
     fn add_decoder_host_quote(
         quote: &mut PreparedRuntimeQuoteBuilder,
         context: PreparedRuntimeQuoteContext<'_>,
@@ -86,7 +64,7 @@ impl MossTdPreparedRuntime {
     ) -> Result<(), SystemMemoryOwnerError> {
         let plan_bytes = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
             decoder.n_layers,
-            Self::decoder_names,
+            moss_td_qwen_family_layer_names,
         )
         .map_err(|reason| {
             SystemMemoryOwnerError::capacity_failure("prepared_runtime_quote", reason)
@@ -277,7 +255,7 @@ pub(crate) fn build_moss_td_prepared_runtime(
         decoder_metadata.n_heads,
         decoder_metadata.n_kv_heads,
         decoder_metadata.head_dim,
-        MossTdPreparedRuntime::decoder_names,
+        moss_td_qwen_family_layer_names,
     )
     .map_err(|error| MossTdPreparedRuntimeError::DecoderPlan {
         reason: error.to_string(),

@@ -401,33 +401,75 @@ pub(crate) fn parse_moss_td_execution_metadata<M: ScalarMetadataView>(
     })
 }
 
-/// The decoder's attention projection widths. Qwen3's q/k/v project to
-/// `heads * head_dim` (NOT `d_model`) -- see `parse_decoder_metadata`'s
-/// divisibility note -- so these are derived products, checked for overflow.
-fn decoder_projection_widths(
-    decoder: MossTdDecoderMetadata,
-) -> Result<(usize, usize), MossTdRuntimeContractError> {
-    let q_width = decoder
-        .n_heads
-        .checked_mul(decoder.head_dim)
-        .ok_or_else(|| MossTdRuntimeContractError::InvalidMetadataValue {
-            key: LLM_HEAD_DIM_KEY,
-            reason: format!(
-                "n_heads {} * head_dim {} overflows while deriving the q projection width",
-                decoder.n_heads, decoder.head_dim
-            ),
-        })?;
-    let kv_width = decoder
-        .n_kv_heads
-        .checked_mul(decoder.head_dim)
-        .ok_or_else(|| MossTdRuntimeContractError::InvalidMetadataValue {
-            key: LLM_HEAD_DIM_KEY,
-            reason: format!(
-                "n_kv_heads {} * head_dim {} overflows while deriving the k/v projection width",
-                decoder.n_kv_heads, decoder.head_dim
-            ),
-        })?;
-    Ok((q_width, kv_width))
+/// Map moss-transcribe-diarize decoder metadata onto the shared Qwen-shaped
+/// geometry.
+fn moss_td_qwen_decoder_geometry(
+    decoder: &MossTdDecoderMetadata,
+) -> crate::models::qwen::QwenDecoderContractGeometry {
+    crate::models::qwen::QwenDecoderContractGeometry {
+        n_layers: decoder.n_layers,
+        d_model: decoder.d_model,
+        n_heads: decoder.n_heads,
+        n_kv_heads: decoder.n_kv_heads,
+        head_dim: decoder.head_dim,
+        ffn_dim: decoder.ffn_dim,
+        vocab_size: decoder.vocab_size,
+    }
+}
+
+/// Layer name provider shared with [`super::prepared_runtime`] and the
+/// Qwen whole-decoder plan path.
+pub(crate) fn moss_td_qwen_family_layer_names(
+    layer: usize,
+) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+    let names = moss_llm_layer_tensor_names(layer);
+    crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+        attn_norm_name: names.attn_norm_weight,
+        attn_q_name: names.attn_q_weight,
+        attn_k_name: names.attn_k_weight,
+        attn_v_name: names.attn_v_weight,
+        attn_output_name: names.attn_output_weight,
+        q_norm_name: Some(names.attn_q_norm_weight),
+        k_norm_name: Some(names.attn_k_norm_weight),
+        q_bias_name: None,
+        k_bias_name: None,
+        v_bias_name: None,
+        ffn_norm_name: names.ffn_norm_weight,
+        ffn_gate_name: names.ffn_gate_weight,
+        ffn_up_name: names.ffn_up_weight,
+        ffn_down_name: names.ffn_down_weight,
+    }
+}
+
+/// The Qwen3 decoder half of the contract: every `moss.llm.blk.*` layer plus
+/// the tied-embedding tail (`moss.llm.out_norm` / `moss.llm.tok_embd`). Expanded
+/// from the shared Qwen decoder contract Module so the 11-tensor layer pattern
+/// cannot drift from FunASR-Nano / MiMo / FireRed2-LLM.
+pub(crate) fn moss_td_decoder_tensor_descriptors(
+    decoder: &MossTdDecoderMetadata,
+) -> Vec<TensorBindingDescriptor> {
+    use crate::models::qwen::{
+        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
+        qwen_decoder_runtime_tensor_descriptors,
+    };
+    qwen_decoder_runtime_tensor_descriptors(
+        &moss_td_qwen_decoder_geometry(decoder),
+        QwenDecoderContractOptions::QWEN3,
+        moss_td_qwen_family_layer_names,
+        QwenDecoderTailTensorNames {
+            output_norm: LLM_OUTPUT_NORM_WEIGHT,
+            // MOSS ties the logits head to the token embedding table.
+            output_weight: None,
+            token_embd: LLM_TOKEN_EMBD_WEIGHT,
+        },
+    )
+    .unwrap_or_else(|reason| {
+        // Metadata parse already enforces the geometry pins the shared Module
+        // re-checks; a failure here is a programming error, not pack input.
+        panic!(
+            "moss-transcribe-diarize decoder geometry rejected by shared Qwen contract: {reason}"
+        )
+    })
 }
 
 /// Metadata-derived tensor binding contract for the complete
@@ -442,7 +484,6 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     let encoder = metadata.encoder;
     let adaptor = metadata.adaptor;
     let decoder = metadata.decoder;
-    let (q_width, kv_width) = decoder_projection_widths(decoder)?;
 
     let mut descriptors = Vec::new();
 
@@ -644,111 +685,8 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
         },
     ]);
 
-    // --- Qwen3 decoder ---------------------------------------------------------
-    descriptors.extend([
-        TensorBindingDescriptor {
-            tensor_name: LLM_TOKEN_EMBD_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                decoder.d_model,
-                decoder.vocab_size,
-            ),
-            reason: "expected token embedding matrix with decoder hidden size and vocab dimensions"
-                .to_string(),
-        },
-        TensorBindingDescriptor {
-            tensor_name: LLM_OUTPUT_NORM_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::VectorLen(decoder.d_model),
-            reason: "expected output norm vector with the decoder hidden size length".to_string(),
-        },
-    ]);
-    for layer_idx in 0..decoder.n_layers {
-        let names = moss_llm_layer_tensor_names(layer_idx);
-        descriptors.extend([
-            TensorBindingDescriptor {
-                tensor_name: names.attn_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::VectorLen(decoder.d_model),
-                reason: "expected decoder hidden-size vector".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_q_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    decoder.d_model,
-                    q_width,
-                ),
-                reason:
-                    "expected rank-2 decoder attn_q matrix between hidden size and n_heads*head_dim"
-                        .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_k_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    decoder.d_model,
-                    kv_width,
-                ),
-                reason: "expected rank-2 decoder attn_k matrix between hidden size and n_kv_heads*head_dim".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_v_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    decoder.d_model,
-                    kv_width,
-                ),
-                reason: "expected rank-2 decoder attn_v matrix between hidden size and n_kv_heads*head_dim".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_output_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    q_width,
-                    decoder.d_model,
-                ),
-                reason:
-                    "expected rank-2 decoder attn_output matrix between n_heads*head_dim and hidden size"
-                        .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_q_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::VectorLen(decoder.head_dim),
-                reason: "expected QK-norm q vector with the per-head dimension".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_k_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::VectorLen(decoder.head_dim),
-                reason: "expected QK-norm k vector with the per-head dimension".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::VectorLen(decoder.d_model),
-                reason: "expected decoder hidden-size vector".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_gate_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    decoder.d_model,
-                    decoder.ffn_dim,
-                ),
-                reason: "expected rank-2 decoder FFN gate matrix between hidden and FFN sizes"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_up_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    decoder.d_model,
-                    decoder.ffn_dim,
-                ),
-                reason: "expected rank-2 decoder FFN up matrix between hidden and FFN sizes"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_down_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
-                    decoder.ffn_dim,
-                    decoder.d_model,
-                ),
-                reason: "expected rank-2 decoder FFN down matrix between FFN and hidden sizes"
-                    .to_string(),
-            },
-        ]);
-    }
+    // --- Qwen3 decoder (shared Qwen-shaped contract) ---------------------------
+    descriptors.extend(moss_td_decoder_tensor_descriptors(&decoder));
 
     Ok(descriptors)
 }
