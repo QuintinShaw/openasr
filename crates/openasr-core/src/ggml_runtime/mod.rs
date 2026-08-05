@@ -85,8 +85,8 @@ pub(crate) use gguf_tensor_data::{dequantize_ggml_row_to_f32, ggml_row_size_byte
 pub(crate) use gguf_tensor_index::GgufTensorIndexSnapshot;
 pub(crate) use gguf_tensor_index::read_gguf_tensor_index_from_runtime_source_with_limits;
 pub use gguf_tensor_index::{
-    GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index,
-    read_gguf_tensor_index_from_runtime_source,
+    GgufTensorAccessRecord, GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata,
+    read_gguf_tensor_index, read_gguf_tensor_index_from_runtime_source,
 };
 pub use gguf_write::{BUILD_COMMIT_ENV, OASR_METADATA_KEY_BUILD_COMMIT};
 pub(crate) use gguf_write::{

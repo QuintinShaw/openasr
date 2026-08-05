@@ -2,6 +2,10 @@ use std::{
     collections::BTreeMap,
     ffi::CStr,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -42,12 +46,76 @@ impl GgufTensorMetadata {
     }
 }
 
+/// One successful by-name tensor lookup recorded by an index's opt-in access
+/// trace: the pack tensor name plus the stored dims the index served.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GgufTensorAccessRecord {
+    pub name: String,
+    pub dims: Vec<u64>,
+}
+
+/// Shared opt-in recorder behind [`GgufTensorIndex::enable_access_trace`].
+/// Cloned indexes share one recorder, so a reader built from an index and any
+/// clone of it trace into the same record list.
+#[derive(Default)]
+struct GgufTensorAccessTrace {
+    enabled: AtomicBool,
+    records: Mutex<Vec<GgufTensorAccessRecord>>,
+}
+
+impl GgufTensorAccessTrace {
+    fn record(&self, tensor: &GgufTensorMetadata) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.records
+            .lock()
+            .expect("tensor access trace mutex poisoned")
+            .push(GgufTensorAccessRecord {
+                name: tensor.name.clone(),
+                dims: tensor.dims.clone(),
+            });
+    }
+
+    fn snapshot(&self) -> Vec<GgufTensorAccessRecord> {
+        self.records
+            .lock()
+            .expect("tensor access trace mutex poisoned")
+            .clone()
+    }
+}
+
+#[derive(Clone)]
 pub struct GgufTensorIndex {
     path: PathBuf,
     data_section_offset_bytes: u64,
     tensors: Vec<GgufTensorMetadata>,
     tensor_index_by_name: BTreeMap<String, usize>,
+    /// Never part of equality or debug identity: two indexes over the same
+    /// pack are the same index no matter what has been traced.
+    access_trace: Arc<GgufTensorAccessTrace>,
+}
+
+impl PartialEq for GgufTensorIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.data_section_offset_bytes == other.data_section_offset_bytes
+            && self.tensors == other.tensors
+            && self.tensor_index_by_name == other.tensor_index_by_name
+    }
+}
+
+impl Eq for GgufTensorIndex {}
+
+impl std::fmt::Debug for GgufTensorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgufTensorIndex")
+            .field("path", &self.path)
+            .field("data_section_offset_bytes", &self.data_section_offset_bytes)
+            .field("tensors", &self.tensors)
+            .field("tensor_index_by_name", &self.tensor_index_by_name)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +137,7 @@ impl GgufTensorIndex {
             data_section_offset_bytes: 0,
             tensors: Vec::new(),
             tensor_index_by_name: BTreeMap::new(),
+            access_trace: Arc::new(GgufTensorAccessTrace::default()),
         }
     }
 
@@ -85,9 +154,28 @@ impl GgufTensorIndex {
     }
 
     pub fn get(&self, name: &str) -> Option<&GgufTensorMetadata> {
-        self.tensor_index_by_name
+        let tensor = self
+            .tensor_index_by_name
             .get(name)
-            .and_then(|index| self.tensors.get(*index))
+            .and_then(|index| self.tensors.get(*index))?;
+        self.access_trace.record(tensor);
+        Some(tensor)
+    }
+
+    /// Start recording every successful by-name lookup ([`Self::get`]) this
+    /// index serves, for equivalence tests that must prove a weight loader's
+    /// read set matches the family's declared runtime tensor contract name
+    /// for name and shape for shape. Recording is a testing affordance; it is
+    /// off until enabled and costs one relaxed load per lookup while off.
+    pub fn enable_access_trace(&self) {
+        self.access_trace.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// Snapshot of the lookups recorded since [`Self::enable_access_trace`]
+    /// (empty when tracing was never enabled). Entries keep lookup order; a
+    /// tensor looked up twice is recorded twice.
+    pub fn access_trace(&self) -> Vec<GgufTensorAccessRecord> {
+        self.access_trace.snapshot()
     }
 
     pub(crate) fn to_snapshot(&self) -> GgufTensorIndexSnapshot {
@@ -119,6 +207,7 @@ impl GgufTensorIndex {
             data_section_offset_bytes: snapshot.data_section_offset_bytes,
             tensors: snapshot.tensors,
             tensor_index_by_name,
+            access_trace: Arc::new(GgufTensorAccessTrace::default()),
         })
     }
 }
@@ -451,6 +540,7 @@ pub(crate) fn read_gguf_tensor_index_from_context(
         data_section_offset_bytes,
         tensors,
         tensor_index_by_name,
+        access_trace: Arc::new(GgufTensorAccessTrace::default()),
     })
 }
 
@@ -581,6 +671,59 @@ mod tests {
 
         let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
         assert!(index.get("missing.tensor").is_none());
+    }
+
+    #[test]
+    fn access_trace_is_off_until_enabled_and_records_only_hits() {
+        let file = NamedTempFile::new().expect("temp file");
+        write_single_tensor_gguf_fixture(file.path());
+
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        // Off by default: lookups before enabling are not recorded.
+        let _ = index.get("encoder.weight");
+        index.enable_access_trace();
+        let _ = index.get("missing.tensor");
+        let tensor = index.get("encoder.weight").expect("tensor exists");
+        assert_eq!(tensor.dims, vec![4, 2]);
+
+        assert_eq!(
+            index.access_trace(),
+            vec![super::GgufTensorAccessRecord {
+                name: "encoder.weight".to_string(),
+                dims: vec![4, 2],
+            }],
+            "only successful post-enable lookups may be traced"
+        );
+    }
+
+    #[test]
+    fn access_trace_is_shared_with_clones() {
+        let file = NamedTempFile::new().expect("temp file");
+        write_single_tensor_gguf_fixture(file.path());
+
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        index.enable_access_trace();
+        let cloned = index.clone();
+        let _ = cloned.get("encoder.weight");
+
+        assert_eq!(
+            index.access_trace().len(),
+            1,
+            "a clone traces into the same recorder as its source index"
+        );
+    }
+
+    #[test]
+    fn access_trace_does_not_change_index_equality() {
+        let file = NamedTempFile::new().expect("temp file");
+        write_single_tensor_gguf_fixture(file.path());
+
+        let left = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let right = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        left.enable_access_trace();
+        let _ = left.get("encoder.weight");
+
+        assert_eq!(left, right, "traced lookups are not part of index identity");
     }
 
     #[cfg(unix)]
