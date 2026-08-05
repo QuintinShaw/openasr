@@ -24,6 +24,16 @@ enum CommandGroup {
         #[command(subcommand)]
         command: FamilyCommand,
     },
+    /// Re-run the production model-pack preflight on every pack installed in
+    /// the local model store. This is the shipped-pack regression gate: a
+    /// contract change that would reject an already-released pack fails here
+    /// before it can ship. Skips explicitly when no packs are installed.
+    VerifyInstalledPacks {
+        /// Override the OpenASR home directory (defaults to `$OPENASR_HOME`,
+        /// then `~/.openasr`).
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,7 +89,114 @@ fn main() -> Result<()> {
                 export_inventory(&workspace_root, output.as_deref(), check)
             }
         },
+        CommandGroup::VerifyInstalledPacks { home } => {
+            verify_installed_packs(home.as_deref())
+        }
     }
+}
+
+/// Resolve the OpenASR home directory: `$OPENASR_HOME`, else `~/.openasr`.
+fn resolve_openasr_home() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("OPENASR_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    let home = std::env::var_os("HOME")
+        .context("neither OPENASR_HOME nor HOME is set; cannot locate the model store")?;
+    Ok(PathBuf::from(home).join(".openasr"))
+}
+
+/// Scan `<home>/models/refs/*/*.json` and re-run the exact production preflight
+/// (`openasr_core::preflight_model_pack_with_receipt`, the same gate the CLI
+/// `model-pack preflight` and the client pull path apply) on each referenced
+/// pack. Returns a non-zero exit if any installed pack fails.
+fn verify_installed_packs(home_override: Option<&Path>) -> Result<()> {
+    // The sandboxed GGUF C parser re-execs the current binary with a hidden
+    // `__openasr-gguf-c-parser-probe` subcommand that only the `openasr` CLI
+    // implements. This xtask binary is not that helper, so its default `auto`
+    // mode would spawn `openasr-xtask <probe>` and fail. Use the bounded
+    // in-process parser instead: the installed packs this gate checks are
+    // already-trusted local artifacts, and the parse/validation result is
+    // identical -- only crash isolation differs.
+    // `set_var` is only sound single-threaded; this runs on the single main
+    // thread before any preflight work spawns helper threads.
+    unsafe { std::env::set_var("OPENASR_GGUF_C_PARSER_SANDBOX", "disabled") };
+    let home = match home_override {
+        Some(home) => home.to_path_buf(),
+        None => resolve_openasr_home()?,
+    };
+    let refs_dir = home.join("models").join("refs");
+    if !refs_dir.exists() {
+        println!(
+            "no installed model store at {}; skipping the shipped-pack regression gate",
+            refs_dir.display()
+        );
+        return Ok(());
+    }
+    let mut ref_files = Vec::new();
+    for model_entry in fs::read_dir(&refs_dir)
+        .with_context(|| format!("reading {}", refs_dir.display()))?
+    {
+        let model_entry = model_entry?;
+        let model_dir = model_entry.path();
+        if !model_dir.is_dir() {
+            continue;
+        }
+        for ref_entry in fs::read_dir(&model_dir)
+            .with_context(|| format!("reading {}", model_dir.display()))?
+        {
+            let ref_entry = ref_entry?;
+            let path = ref_entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                ref_files.push(path);
+            }
+        }
+    }
+    ref_files.sort();
+    if ref_files.is_empty() {
+        println!(
+            "no installed model pack refs under {}; skipping the shipped-pack regression gate",
+            refs_dir.display()
+        );
+        return Ok(());
+    }
+    let mut failures = 0usize;
+    for ref_file in &ref_files {
+        let raw = fs::read_to_string(ref_file)
+            .with_context(|| format!("reading {}", ref_file.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", ref_file.display()))?;
+        let model_id = value
+            .get("model_id")
+            .and_then(|field| field.as_str())
+            .unwrap_or("<unknown>");
+        let quant = value
+            .get("quant")
+            .and_then(|field| field.as_str())
+            .unwrap_or("<unknown>");
+        let Some(pack_path) = value.get("path").and_then(|field| field.as_str()) else {
+            println!("SKIP {model_id}:{quant} (ref has no pack path)");
+            continue;
+        };
+        let label = format!("{model_id}:{quant}");
+        match openasr_core::preflight_model_pack_with_receipt(Path::new(pack_path)) {
+            Ok(receipt) => {
+                println!("PASS {label} {pack_path} ({})", receipt.content_id);
+            }
+            Err(error) => {
+                println!("FAIL {label} {pack_path}: {error}");
+                failures += 1;
+            }
+        }
+    }
+    println!(
+        "{} installed pack ref(s) checked, {} failed",
+        ref_files.len(),
+        failures
+    );
+    if failures > 0 {
+        bail!("{failures} installed pack(s) failed the production preflight");
+    }
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
