@@ -16,8 +16,9 @@ use crate::ggml_runtime::{
 };
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, SafetensorsHeader, SafetensorsTensorHeader,
-    decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32, encode_f16_bits_le,
-    read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
+    compose_model_id, decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32,
+    encode_f16_bits_le, read_source_json_file, tensor_element_count, validate_error,
+    validate_output_pack_extension,
 };
 use crate::models::{
     oasr_metadata::{
@@ -596,16 +597,6 @@ fn whisper_runtime_gguf_metadata(
     metadata
 }
 
-fn compose_model_id(package_id: &str, package_variant: Option<&str>) -> String {
-    match package_variant
-        .map(str::trim)
-        .filter(|variant| !variant.is_empty())
-    {
-        Some(variant) => format!("{}:{variant}", package_id.trim()),
-        None => package_id.trim().to_string(),
-    }
-}
-
 fn whisper_num_mels(config: &WhisperConfigJson) -> u32 {
     config.num_mel_bins.unwrap_or(80)
 }
@@ -784,18 +775,6 @@ mod tests {
             GgufWriteValue::String(value) => value,
             other => panic!("expected string metadata for '{key}', got {other:?}"),
         }
-    }
-
-    #[test]
-    fn compose_model_id_uses_variant_when_present() {
-        assert_eq!(
-            compose_model_id("whisper-tiny.en-local", Some("hf")),
-            "whisper-tiny.en-local:hf"
-        );
-        assert_eq!(
-            compose_model_id("whisper-tiny.en-local", Some("  ")),
-            "whisper-tiny.en-local"
-        );
     }
 
     #[test]

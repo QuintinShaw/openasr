@@ -9,7 +9,7 @@ use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
 use crate::models::local_source_import::{
-    LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32,
+    LocalSourceImportError, SafetensorsFile, compose_model_id, decode_safetensors_payload_as_f32,
     read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
 use crate::models::moonshine::runtime_contract;
@@ -605,16 +605,6 @@ fn split_layer_index(value: &str) -> Result<(usize, &str), LocalSourceImportErro
         ))
     })?;
     Ok((layer_idx, tail))
-}
-
-fn compose_model_id(package_id: &str, package_variant: Option<&str>) -> String {
-    match package_variant
-        .map(str::trim)
-        .filter(|variant| !variant.is_empty())
-    {
-        Some(variant) => format!("{}:{variant}", package_id.trim()),
-        None => package_id.trim().to_string(),
-    }
 }
 
 fn validate_request(

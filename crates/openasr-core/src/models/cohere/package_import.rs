@@ -10,9 +10,9 @@ use crate::ggml_runtime::{
 };
 use crate::models::cohere::runtime_contract;
 use crate::models::local_source_import::{
-    LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
-    decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_json_file,
-    tensor_element_count, validate_error, validate_output_pack_extension,
+    LocalSourceImportError, SafetensorsFile, compose_model_id,
+    decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32, encode_f16_bits_le,
+    read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{OasrMetadataBuilder, OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
@@ -798,16 +798,6 @@ fn split_layer_index(value: &str) -> Result<(usize, &str), LocalSourceImportErro
         ))
     })?;
     Ok((layer_idx, tail))
-}
-
-fn compose_model_id(package_id: &str, package_variant: Option<&str>) -> String {
-    match package_variant
-        .map(str::trim)
-        .filter(|variant| !variant.is_empty())
-    {
-        Some(variant) => format!("{}:{variant}", package_id.trim()),
-        None => package_id.trim().to_string(),
-    }
 }
 
 fn validate_request(

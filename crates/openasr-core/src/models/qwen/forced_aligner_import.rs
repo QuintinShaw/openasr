@@ -30,13 +30,13 @@ use serde::Deserialize;
 
 use crate::ggml_runtime::GgufWriteValue;
 use crate::models::local_source_import::{
-    LocalSourceImportError, SafetensorsFile, read_source_json_file, validate_error,
-    validate_output_pack_extension,
+    LocalSourceImportError, SafetensorsFile, compose_model_id, read_source_json_file,
+    validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 
 use super::package_import::{
-    Qwen3AsrRuntimeQuantizationMode, build_qwen_runtime_tensors, compose_model_id, insert_metadata,
+    Qwen3AsrRuntimeQuantizationMode, build_qwen_runtime_tensors, insert_metadata,
     insert_metadata_string_array, insert_metadata_u32, load_merges, load_vocab_tokens,
     patch_added_tokens,
 };

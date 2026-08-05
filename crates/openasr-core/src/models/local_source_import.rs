@@ -30,6 +30,21 @@ pub(crate) fn validate_error(message: impl Into<String>) -> LocalSourceImportErr
     LocalSourceImportError::Validate(message.into())
 }
 
+/// Compose the canonical model id used by local-source importers.
+///
+/// Trims `package_id`; when `package_variant` is present and non-empty after
+/// trim, returns `package_id:variant`. Empty/whitespace-only variants are
+/// ignored so the four ASR importers cannot drift on identity composition.
+pub(crate) fn compose_model_id(package_id: &str, package_variant: Option<&str>) -> String {
+    match package_variant
+        .map(str::trim)
+        .filter(|variant| !variant.is_empty())
+    {
+        Some(variant) => format!("{}:{variant}", package_id.trim()),
+        None => package_id.trim().to_string(),
+    }
+}
+
 /// Enforce the user-facing runtime-pack extension contract on a converter's
 /// output path. Every `convert_local_*_to_runtime_pack` entry point calls this so
 /// a direct library caller is held to the same `.oasr`-only rule as the CLI — the
@@ -1064,5 +1079,34 @@ mod tests {
         let file = SafetensorsFile::open(&path).expect("well-formed safetensors must open");
         assert_eq!(file.header().tensors.len(), 2);
         assert_eq!(file.header().data_length_bytes, 14);
+    }
+
+    #[test]
+    fn compose_model_id_table() {
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            ("pkg", None, "pkg"),
+            ("pkg", Some(""), "pkg"),
+            ("pkg", Some("   "), "pkg"),
+            ("pkg", Some("\t"), "pkg"),
+            ("pkg", Some("hf"), "pkg:hf"),
+            ("  pkg  ", Some("hf"), "pkg:hf"),
+            ("  pkg  ", None, "pkg"),
+            ("pkg", Some("  hf  "), "pkg:hf"),
+            (
+                "whisper-tiny.en-local",
+                Some("hf"),
+                "whisper-tiny.en-local:hf",
+            ),
+            ("whisper-tiny.en-local", Some("  "), "whisper-tiny.en-local"),
+            ("qwen3-asr-0.6b", Some("local"), "qwen3-asr-0.6b:local"),
+            ("moonshine-tiny", None, "moonshine-tiny"),
+        ];
+        for &(package_id, variant, expected) in cases {
+            assert_eq!(
+                super::compose_model_id(package_id, variant),
+                expected,
+                "compose_model_id({package_id:?}, {variant:?})"
+            );
+        }
     }
 }
