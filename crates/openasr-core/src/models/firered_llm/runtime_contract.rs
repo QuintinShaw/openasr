@@ -308,6 +308,75 @@ pub(crate) enum FireRedLlmRuntimeTensorContractError {
     GeometryOverflow { reason: String },
 }
 
+/// Map firered-llm decoder metadata onto the shared Qwen-shaped geometry.
+fn firered_llm_qwen_decoder_geometry(
+    decoder: &FireRedLlmDecoderMetadata,
+) -> crate::models::qwen::QwenDecoderContractGeometry {
+    crate::models::qwen::QwenDecoderContractGeometry {
+        n_layers: decoder.n_layers,
+        d_model: decoder.d_model,
+        n_heads: decoder.n_heads,
+        n_kv_heads: decoder.n_kv_heads,
+        head_dim: decoder.head_dim,
+        ffn_dim: decoder.ffn_dim,
+        vocab_size: decoder.vocab_size,
+    }
+}
+
+/// Layer name provider for the Qwen2 decoder (`llm.blk.{i}.*`).
+///
+/// FireRed spells the attention output projection `attn_out.weight`; the
+/// shared contract field is `attn_output_name`.
+pub(crate) fn firered_llm_qwen_family_layer_names(
+    layer: usize,
+) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+    let names = qwen2_llm_layer_tensor_names(layer);
+    crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+        attn_norm_name: names.attn_norm_weight,
+        attn_q_name: names.attn_q_weight,
+        attn_k_name: names.attn_k_weight,
+        attn_v_name: names.attn_v_weight,
+        attn_output_name: names.attn_out_weight,
+        q_norm_name: None,
+        k_norm_name: None,
+        q_bias_name: Some(names.attn_q_bias),
+        k_bias_name: Some(names.attn_k_bias),
+        v_bias_name: Some(names.attn_v_bias),
+        ffn_norm_name: names.ffn_norm_weight,
+        ffn_gate_name: names.ffn_gate_weight,
+        ffn_up_name: names.ffn_up_weight,
+        ffn_down_name: names.ffn_down_weight,
+    }
+}
+
+/// The Qwen2 decoder half: every `llm.blk.*` layer plus token embd / logits /
+/// final norm. Expanded from the shared Qwen decoder contract Module
+/// (ordered `ExactDims`) so the 11-tensor layer pattern cannot drift from
+/// FunASR-Nano / MOSS / MiMo.
+pub(crate) fn firered_llm_decoder_tensor_descriptors(
+    decoder: &FireRedLlmDecoderMetadata,
+) -> Vec<TensorBindingDescriptor> {
+    use crate::models::qwen::{
+        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
+        qwen_decoder_runtime_tensor_descriptors,
+    };
+    qwen_decoder_runtime_tensor_descriptors(
+        &firered_llm_qwen_decoder_geometry(decoder),
+        QwenDecoderContractOptions::QWEN2,
+        firered_llm_qwen_family_layer_names,
+        QwenDecoderTailTensorNames {
+            output_norm: LLM_OUTPUT_NORM_WEIGHT,
+            output_weight: Some(LLM_OUTPUT_WEIGHT),
+            token_embd: LLM_TOKEN_EMBD_WEIGHT,
+        },
+    )
+    .unwrap_or_else(|reason| {
+        // Metadata parse already enforces the geometry pins the shared Module
+        // re-checks; a failure here is a programming error, not pack input.
+        panic!("firered-llm decoder geometry rejected by shared Qwen contract: {reason}")
+    })
+}
+
 /// The complete runtime-bound tensor set for one firered-llm pack, expressed
 /// against the three parsed metadata segments: fbank/CMVN frontend vectors,
 /// the `enc.*` Conformer branch (reused from `firered_aed`'s encoder graph),
@@ -552,104 +621,8 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
         ),
     ]);
 
-    let kv_projection_width = decoder
-        .n_kv_heads
-        .checked_mul(decoder.head_dim)
-        .ok_or_else(|| geometry_overflow("llm n_kv_heads x head_dim"))?;
-    descriptors.extend([
-        matrix(
-            LLM_TOKEN_EMBD_WEIGHT.to_string(),
-            decoder.d_model,
-            decoder.vocab_size,
-            "token embedding",
-        ),
-        matrix(
-            LLM_OUTPUT_WEIGHT.to_string(),
-            decoder.d_model,
-            decoder.vocab_size,
-            "lm_head output projection",
-        ),
-        vector(
-            LLM_OUTPUT_NORM_WEIGHT.to_string(),
-            decoder.d_model,
-            "llm d_model-sized output norm",
-        ),
-    ]);
-    for layer_idx in 0..decoder.n_layers {
-        let names = qwen2_llm_layer_tensor_names(layer_idx);
-        // Qwen2: `n_heads * head_dim == d_model` is a metadata-proven
-        // invariant, so the q projection and its bias are d_model-wide; the
-        // GQA k/v projections are `n_kv_heads * head_dim`-wide.
-        descriptors.extend([
-            vector(
-                names.attn_norm_weight.to_string(),
-                decoder.d_model,
-                "llm d_model-sized attention norm",
-            ),
-            matrix(
-                names.attn_q_weight.to_string(),
-                decoder.d_model,
-                decoder.d_model,
-                "llm attention q projection",
-            ),
-            vector(
-                names.attn_q_bias.to_string(),
-                decoder.d_model,
-                "llm d_model-sized q bias",
-            ),
-            matrix(
-                names.attn_k_weight.to_string(),
-                decoder.d_model,
-                kv_projection_width,
-                "llm attention k projection",
-            ),
-            vector(
-                names.attn_k_bias.to_string(),
-                kv_projection_width,
-                "llm kv-width k bias",
-            ),
-            matrix(
-                names.attn_v_weight.to_string(),
-                decoder.d_model,
-                kv_projection_width,
-                "llm attention v projection",
-            ),
-            vector(
-                names.attn_v_bias.to_string(),
-                kv_projection_width,
-                "llm kv-width v bias",
-            ),
-            matrix(
-                names.attn_out_weight.to_string(),
-                decoder.d_model,
-                decoder.d_model,
-                "llm attention output projection",
-            ),
-            vector(
-                names.ffn_norm_weight.to_string(),
-                decoder.d_model,
-                "llm d_model-sized FFN norm",
-            ),
-            matrix(
-                names.ffn_gate_weight.to_string(),
-                decoder.d_model,
-                decoder.ffn_dim,
-                "llm FFN gate",
-            ),
-            matrix(
-                names.ffn_up_weight.to_string(),
-                decoder.d_model,
-                decoder.ffn_dim,
-                "llm FFN up",
-            ),
-            matrix(
-                names.ffn_down_weight.to_string(),
-                decoder.ffn_dim,
-                decoder.d_model,
-                "llm FFN down",
-            ),
-        ]);
-    }
+    // Qwen2 decoder half via the shared contract (ExactDims, not local EitherDims matrix).
+    descriptors.extend(firered_llm_decoder_tensor_descriptors(decoder));
     Ok(descriptors)
 }
 
