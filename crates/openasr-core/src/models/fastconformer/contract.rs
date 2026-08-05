@@ -6,12 +6,13 @@
 //! contract on this list plus their own tail, so the encoder half of the
 //! admission validator cannot drift from the shared loader/graph either way.
 //!
-//! Shape checks mirror the loader's strictness: the shared loader reads every
-//! tensor generically and the graph reshapes by element layout, so norms and
-//! biases pin their exact metadata-derived length, 2-D projections pin their
-//! two extents in either stored orientation, and the depthwise kernel pins its
-//! exact `[conv_kernel, 1, hidden]` ggml layout (the only tensor with a single
-//! valid orientation, matching the sensevoice FSMN precedent).
+//! Shape checks mirror the loader's strictness and the graph's fixed layout:
+//! norms and biases pin their exact metadata-derived length, 2-D projections
+//! pin their two extents in either stored orientation, the conformer depthwise
+//! kernel pins its exact `[conv_kernel, 1, hidden]` ggml layout, and the
+//! dw-striding subsampling prelude pins every conv kernel to the ExactDims the
+//! shared graph consumes (3x3 / depthwise / 1x1) plus the flatten width derived
+//! from `n_mels` through the same `conv_out_dim` the graph uses.
 //!
 //! Overflow safety: the geometry arrives already bounded by each family's
 //! metadata parser (architecture ceilings checked fail-closed at parse time),
@@ -21,6 +22,8 @@
 //! wrapping into an admitting shape.
 
 use crate::models::tensor_binding::{TensorBindingDescriptor, TensorBindingDescriptorRequirement};
+
+use super::graph::{SUBSAMPLING_KERNEL, conv_out_dim};
 
 /// The metadata-derived geometry one FastConformer encoder's tensor contract
 /// is shaped for.
@@ -32,6 +35,11 @@ pub(crate) struct FastConformerContractGeometry {
     pub conv_kernel: usize,
     pub n_heads: usize,
     pub head_dim: usize,
+    /// Mel bins feeding the first subsampling conv. Three stride-2 stages
+    /// shrink this to the flatten frequency the linear projects from; must
+    /// match the family's metadata `n_mels` so the contract pins the same
+    /// flatten width the graph builds.
+    pub n_mels: usize,
     /// Output channels of every dw-striding subsampling conv stage (the
     /// metadata's `subsampling_channels`).
     pub subsampling_channels: usize,
@@ -39,6 +47,27 @@ pub(crate) struct FastConformerContractGeometry {
     /// (parakeet-ctc); `false` when the loader synthesizes zero biases and the
     /// pack must NOT carry them (parakeet-tdt-0.6b-v3's bias-free conversion).
     pub bias_present: bool,
+}
+
+/// Frequency extent after the three fixed stride-2 dw-striding stages the
+/// shared graph always runs. Same formula as `graph::build_conformer_stack`
+/// (`conv_out_dim` thrice); checked so a pathological `n_mels` cannot wrap.
+pub(crate) fn fastconformer_subsampled_freq(n_mels: usize) -> Option<usize> {
+    // conv_out_dim is pure integer arithmetic and cannot overflow usize for
+    // any representable input, but keep the Option chain so callers share one
+    // fail-closed style with the flatten-width product below.
+    Some(conv_out_dim(conv_out_dim(conv_out_dim(n_mels))))
+}
+
+/// Flatten width the subsampling linear consumes: `channels * freq'` where
+/// `freq'` is [`fastconformer_subsampled_freq`]. Checked multiply so an
+/// oversize geometry fails closed at contract build rather than wrapping.
+pub(crate) fn fastconformer_subsampling_flatten_width(
+    channels: usize,
+    n_mels: usize,
+) -> Option<usize> {
+    let freq = fastconformer_subsampled_freq(n_mels)?;
+    channels.checked_mul(freq)
 }
 
 fn descriptor(
@@ -53,25 +82,64 @@ fn descriptor(
     }
 }
 
-/// The dw-striding subsampling prelude tensors (`enc.sub.*`): five strided
-/// conv stages (layers 0/2/3/5/6) + the flattening linear. The shared graph
-/// consumes every one of them unconditionally, so the contract requires the
-/// full set even though the weight loader probes per-tensor presence.
+/// The dw-striding subsampling prelude tensors (`enc.sub.*`): five conv
+/// stages (layers 0/2/3/5/6) + the flattening linear. Shapes are the exact
+/// ggml layouts the shared graph consumes after the importer reverses HF
+/// `[OC,IC,kh,kw]` → `[kw,kh,IC,OC]`:
+/// - layer 0: ordinary 3×3, in=1 (mel), out=channels → `[3,3,1,channels]`
+/// - layers 2/5: depthwise 3×3 → `[3,3,1,channels]` (ggml `conv_2d_dw`)
+/// - layers 3/6: pointwise 1×1 → `[1,1,channels,channels]`
+/// - linear: either orientation of `[flatten, hidden]` where
+///   `flatten = channels * conv_out_dim³(n_mels)`
+///
+/// The shared graph consumes every one of them unconditionally, so the
+/// contract requires the full set even though the weight loader probes
+/// per-tensor presence.
 pub(crate) fn fastconformer_subsampling_tensor_descriptors(
     geometry: &FastConformerContractGeometry,
 ) -> Vec<TensorBindingDescriptor> {
     let hidden = geometry.hidden_size;
     let channels = geometry.subsampling_channels;
+    // Saturating defense in depth: metadata parsers already bound n_mels and
+    // channels, so overflow is unreachable; a saturated requirement matches no
+    // pack tensor and stays fail-closed at validation.
+    let flatten =
+        fastconformer_subsampling_flatten_width(channels, geometry.n_mels).unwrap_or(usize::MAX);
+    let k = SUBSAMPLING_KERNEL;
+    let ordinary_or_dw = vec![k, k, 1, channels];
+    let pointwise = vec![1, 1, channels, channels];
     let mut descriptors = Vec::new();
-    for sub_layer in [0usize, 2, 3, 5, 6] {
+    for (sub_layer, weight_dims, weight_reason) in [
+        (
+            0usize,
+            ordinary_or_dw.clone(),
+            "subsampling conv0 must be the ordinary 3x3 [kw,kh,IC=1,OC=channels] kernel",
+        ),
+        (
+            2usize,
+            ordinary_or_dw.clone(),
+            "subsampling conv2 must be the depthwise 3x3 [kw,kh,1,channels] kernel",
+        ),
+        (
+            3usize,
+            pointwise.clone(),
+            "subsampling conv3 must be the pointwise 1x1 [1,1,channels,channels] kernel",
+        ),
+        (
+            5usize,
+            ordinary_or_dw.clone(),
+            "subsampling conv5 must be the depthwise 3x3 [kw,kh,1,channels] kernel",
+        ),
+        (
+            6usize,
+            pointwise,
+            "subsampling conv6 must be the pointwise 1x1 [1,1,channels,channels] kernel",
+        ),
+    ] {
         descriptors.push(descriptor(
             format!("enc.sub.layers.{sub_layer}.weight"),
-            TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
-                min_rank: 4,
-                axis: 3,
-                dim: channels,
-            },
-            "subsampling conv kernel must be rank 4 with the declared channel extent",
+            TensorBindingDescriptorRequirement::ExactDims(weight_dims),
+            weight_reason,
         ));
         descriptors.push(descriptor(
             format!("enc.sub.layers.{sub_layer}.bias"),
@@ -81,8 +149,8 @@ pub(crate) fn fastconformer_subsampling_tensor_descriptors(
     }
     descriptors.push(descriptor(
         "enc.sub.linear.weight".to_string(),
-        TensorBindingDescriptorRequirement::Rank2WithDim(hidden),
-        "subsampling linear must flatten the conv output into hidden_size",
+        TensorBindingDescriptorRequirement::Rank2EitherDims(flatten, hidden),
+        "subsampling linear must map the exact flatten width (channels * freq') to hidden_size",
     ));
     descriptors.push(descriptor(
         "enc.sub.linear.bias".to_string(),
@@ -343,4 +411,156 @@ pub(crate) fn fastconformer_encoder_descriptor_count(
     let subsampling = fastconformer_subsampling_tensor_descriptors(geometry).len();
     let per_layer = fastconformer_layer_tensor_descriptors(geometry, 0).len();
     subsampling.saturating_add(geometry.n_layers.saturating_mul(per_layer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::tensor_binding::validate_tensor_binding_descriptors;
+
+    fn geometry() -> FastConformerContractGeometry {
+        FastConformerContractGeometry {
+            n_layers: 1,
+            hidden_size: 16,
+            ffn_dim: 32,
+            conv_kernel: 3,
+            n_heads: 2,
+            head_dim: 8,
+            n_mels: 80,
+            subsampling_channels: 4,
+            bias_present: true,
+        }
+    }
+
+    fn tensor_index_from_shapes(shapes: &[(String, Vec<u64>)]) -> crate::GgufTensorIndex {
+        let tensors = shapes
+            .iter()
+            .enumerate()
+            .map(|(index, (name, dims))| crate::GgufTensorMetadata {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: 0,
+                type_name: "f32".to_string(),
+                size_bytes: 0,
+                offset_bytes: index as u64,
+            })
+            .collect();
+        crate::GgufTensorIndex::from_snapshot(crate::ggml_runtime::GgufTensorIndexSnapshot {
+            path: std::path::PathBuf::from("fastconformer-subsampling-contract-test.oasr"),
+            data_section_offset_bytes: 0,
+            tensors,
+        })
+        .expect("unique tensor names")
+    }
+
+    #[test]
+    fn subsampled_freq_and_flatten_match_three_stride2_stages() {
+        // n_mels=80 → 40 → 20 → 10; channels=256 → flatten=2560.
+        assert_eq!(fastconformer_subsampled_freq(80), Some(10));
+        assert_eq!(fastconformer_subsampling_flatten_width(256, 80), Some(2560));
+        // n_mels=128 → 64 → 32 → 16; channels=24 → flatten=384.
+        assert_eq!(fastconformer_subsampled_freq(128), Some(16));
+        assert_eq!(fastconformer_subsampling_flatten_width(24, 128), Some(384));
+    }
+
+    #[test]
+    fn subsampling_descriptors_pin_exact_graph_kernel_shapes() {
+        let g = geometry();
+        let descriptors = fastconformer_subsampling_tensor_descriptors(&g);
+        let by_name: std::collections::BTreeMap<_, _> = descriptors
+            .iter()
+            .map(|d| (d.tensor_name.as_str(), &d.requirement))
+            .collect();
+        let channels = g.subsampling_channels;
+        let flatten = fastconformer_subsampling_flatten_width(channels, g.n_mels).unwrap();
+        assert_eq!(
+            by_name["enc.sub.layers.0.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![3, 3, 1, channels])
+        );
+        assert_eq!(
+            by_name["enc.sub.layers.2.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![3, 3, 1, channels])
+        );
+        assert_eq!(
+            by_name["enc.sub.layers.3.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![1, 1, channels, channels])
+        );
+        assert_eq!(
+            by_name["enc.sub.layers.5.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![3, 3, 1, channels])
+        );
+        assert_eq!(
+            by_name["enc.sub.layers.6.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![1, 1, channels, channels])
+        );
+        assert_eq!(
+            by_name["enc.sub.linear.weight"],
+            &TensorBindingDescriptorRequirement::Rank2EitherDims(flatten, g.hidden_size)
+        );
+    }
+
+    #[test]
+    fn rejects_subsampling_kernel_with_wrong_spatial_extent() {
+        let g = geometry();
+        let mut shapes = crate::models::tensor_binding::project_fixture_tensors(
+            &fastconformer_subsampling_tensor_descriptors(&g),
+        );
+        // Corrupt only axis-3-matching but kh≠3: still channels on axis 3, rank 4,
+        // so the old RankAtLeastWithDimAt contract would have admitted it.
+        let corrupted = shapes
+            .iter_mut()
+            .find(|(name, _)| name == "enc.sub.layers.0.weight")
+            .expect("conv0 weight");
+        corrupted.1 = vec![5, 5, 1, g.subsampling_channels as u64];
+        let index = tensor_index_from_shapes(&shapes);
+        let err = validate_tensor_binding_descriptors(
+            &index,
+            &fastconformer_subsampling_tensor_descriptors(&g),
+            |name| format!("missing {name}"),
+            |name, shape, reason| format!("{name} {:?}: {reason}", shape),
+        )
+        .expect_err("wrong kh must fail ExactDims");
+        assert!(
+            err.contains("enc.sub.layers.0.weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn admits_exact_graph_aligned_subsampling_shapes() {
+        let g = geometry();
+        let descriptors = fastconformer_subsampling_tensor_descriptors(&g);
+        let shapes = crate::models::tensor_binding::project_fixture_tensors(&descriptors);
+        let index = tensor_index_from_shapes(&shapes);
+        validate_tensor_binding_descriptors(
+            &index,
+            &descriptors,
+            |name| format!("missing {name}"),
+            |name, shape, reason| format!("{name} {:?}: {reason}", shape),
+        )
+        .expect("ExactDims fixture projection must satisfy the contract");
+    }
+
+    #[test]
+    fn exact_dims_requirement_itself_rejects_wrong_kh() {
+        let descriptor = TensorBindingDescriptor {
+            tensor_name: "enc.sub.layers.0.weight".to_string(),
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![3, 3, 1, 4]),
+            reason: "pin".to_string(),
+        };
+        let bad = validate_tensor_binding_descriptors(
+            &tensor_index_from_shapes(&[("enc.sub.layers.0.weight".to_string(), vec![5, 5, 1, 4])]),
+            std::slice::from_ref(&descriptor),
+            |_| "missing".to_string(),
+            |_, _, reason| reason,
+        );
+        assert!(bad.is_err());
+        let good = validate_tensor_binding_descriptors(
+            &tensor_index_from_shapes(&[("enc.sub.layers.0.weight".to_string(), vec![3, 3, 1, 4])]),
+            std::slice::from_ref(&descriptor),
+            |_| "missing".to_string(),
+            |_, _, reason| reason,
+        );
+        assert!(good.is_ok());
+    }
 }

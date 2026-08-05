@@ -34,9 +34,11 @@ use super::weights::{FastConformerLayerWeights, NamedTensor};
 
 const ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const CONFORMER_MACARON_SCALE: f32 = 0.5;
-const SUBSAMPLING_KERNEL: usize = 3;
-const SUBSAMPLING_STRIDE: usize = 2;
-const SUBSAMPLING_PADDING: usize = 1;
+/// Shared with the admission contract so fixture/validator dims cannot drift
+/// from the dw-striding graph (kernel 3 / stride 2 / pad 1 on both axes).
+pub(crate) const SUBSAMPLING_KERNEL: usize = 3;
+pub(crate) const SUBSAMPLING_STRIDE: usize = 2;
+pub(crate) const SUBSAMPLING_PADDING: usize = 1;
 
 enum RuntimeWeightSource<'a> {
     Verified(&'a GgufRuntimeSourcePreflight),

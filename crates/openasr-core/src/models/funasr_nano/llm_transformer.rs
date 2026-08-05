@@ -23,6 +23,7 @@ use crate::models::qwen::{
 
 use super::runtime_contract::{
     FUNASR_NANO_RMS_NORM_EPSILON, FUNASR_NANO_ROPE_THETA, FunasrNanoDecoderMetadata,
+    funasr_nano_decoder_read_guard,
 };
 use super::tensor_names::{
     LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT,
@@ -183,6 +184,14 @@ impl FunasrNanoDecoderRuntime {
                 .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
+        // Close the decoder read set at the shared index: every by-name `get`
+        // the Qwen planner / logits head / embedding table / materialization
+        // path performs is allowlisted against the decoder contract. The
+        // preflight Arc is shared, so the same allowlist covers the second
+        // reader materialization builds. RAII drop clears it so a later
+        // encoder/adapter load on the same index is unrestricted at get().
+        let decoder_guard = funasr_nano_decoder_read_guard(&metadata);
+        let _allowlist = decoder_guard.enforce_on_index(reader.tensor_index());
         let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
@@ -496,4 +505,136 @@ fn write_layer_kv(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::ggml_runtime::GgmlCpuGraphBackend;
+    use crate::models::funasr_nano::runtime_contract::{
+        FunasrNanoDecoderMetadata, funasr_nano_decoder_read_guard,
+        funasr_nano_decoder_tensor_descriptors,
+    };
+    use crate::models::tensor_binding::{
+        assert_trace_matches_descriptor_set, project_fixture_tensors,
+    };
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+    fn tiny_decoder_metadata() -> FunasrNanoDecoderMetadata {
+        FunasrNanoDecoderMetadata {
+            n_layers: 1,
+            d_model: 16,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 4,
+            ffn_dim: 32,
+            vocab_size: 64,
+            max_positions: 128,
+            chatml_im_start_token_id: 1,
+            chatml_im_end_token_id: 2,
+            endoftext_token_id: 0,
+        }
+    }
+
+    /// Equivalence evidence for the decoder half: run the real plan, logits,
+    /// and embedding loaders over a synthetic pack projected from the decoder
+    /// contract itself, with the index access trace and the decoder read
+    /// allowlist both enabled, and assert the traced read set equals the
+    /// decoder descriptor set name for name and shape for shape.
+    #[test]
+    fn decoder_loader_read_trace_equals_the_contract_descriptors() {
+        let metadata = tiny_decoder_metadata();
+        let descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-decoder-trace.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write trace pack");
+
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
+        reader.tensor_index().enable_access_trace();
+        let guard = funasr_nano_decoder_read_guard(&metadata);
+        let _allowlist = guard.enforce_on_index(reader.tensor_index());
+
+        plan_whole_decoder(&reader, &metadata).expect("plan decoder");
+        let runtime_source =
+            crate::ggml_runtime::validate_ggml_runtime_source_path(&path).expect("runtime source");
+        load_llm_logits_head_from_reader_with_tensor_names(
+            &reader,
+            &runtime_source,
+            metadata.d_model,
+            metadata.vocab_size,
+            LLM_OUTPUT_NORM_WEIGHT,
+            LLM_OUTPUT_WEIGHT,
+            FUNASR_NANO_RMS_NORM_EPSILON,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("load logits head");
+        load_token_embedding_table_from_reader_with_tensor_name(
+            &reader,
+            LLM_TOKEN_EMBD_WEIGHT,
+            metadata.d_model,
+            metadata.vocab_size,
+        )
+        .expect("load token embedding");
+
+        assert_trace_matches_descriptor_set(&reader.tensor_index().access_trace(), &descriptors);
+    }
+
+    /// Off-contract names resolve as missing under the decoder allowlist, so a
+    /// shared loader cannot consume a tensor the contract does not list.
+    #[test]
+    fn decoder_read_allowlist_hides_off_contract_tensors() {
+        let metadata = tiny_decoder_metadata();
+        let descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-decoder-guard.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec = spec.with_tensor_shape("off.contract.weight".to_string(), vec![2, 2]);
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
+        // Without the allowlist the off-contract tensor is visible.
+        assert!(reader.tensor_index().get("off.contract.weight").is_some());
+        let guard = funasr_nano_decoder_read_guard(&metadata);
+        let _allowlist = guard.enforce_on_index(reader.tensor_index());
+        assert!(
+            reader.tensor_index().get("off.contract.weight").is_none(),
+            "decoder allowlist must hide off-contract names"
+        );
+        // A required contract tensor still resolves.
+        assert!(reader.tensor_index().get(LLM_TOKEN_EMBD_WEIGHT).is_some());
+    }
+
+    /// Missing a contract-required tensor fails the plan under the allowlist
+    /// the same way an unrestricted missing lookup does.
+    #[test]
+    fn decoder_plan_fails_closed_when_a_contract_tensor_is_absent() {
+        let metadata = tiny_decoder_metadata();
+        let mut descriptors = funasr_nano_decoder_tensor_descriptors(&metadata);
+        // Drop one required layer weight.
+        descriptors.retain(|d| d.tensor_name != "blk.0.attn_q.weight");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-decoder-missing.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
+        let guard = funasr_nano_decoder_read_guard(&metadata);
+        let _allowlist = guard.enforce_on_index(reader.tensor_index());
+        let error = plan_whole_decoder(&reader, &metadata).expect_err("missing q must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("attn_q") || message.contains("missing"),
+            "unexpected error: {message}"
+        );
+    }
 }

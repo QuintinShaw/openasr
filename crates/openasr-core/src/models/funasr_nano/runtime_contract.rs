@@ -823,6 +823,15 @@ pub(crate) fn funasr_nano_adapter_read_guard(
     TensorReadGuard::from_descriptors(&funasr_nano_adapter_tensor_descriptors(adapter))
 }
 
+/// Read guard for the decoder half: installed as an opt-in index allowlist
+/// around the shared Qwen planner/logits/embedding loaders so every by-name
+/// `get` fails closed on names outside this contract set.
+pub(crate) fn funasr_nano_decoder_read_guard(
+    decoder: &FunasrNanoDecoderMetadata,
+) -> TensorReadGuard {
+    TensorReadGuard::from_descriptors(&funasr_nano_decoder_tensor_descriptors(decoder))
+}
+
 /// Validate the full runtime tensor set against the pack's tensor index,
 /// fail-closed on a geometry whose obligation count exceeds the ceiling.
 pub(crate) fn validate_funasr_nano_runtime_tensors_with_index(
@@ -1000,9 +1009,10 @@ mod tests {
     /// blocks of 13 tensors, 4 tail norms, the 2-layer adaptor (4 linears +
     /// 2x16 block tensors), and the 28-layer Qwen3 decoder (11 weights per
     /// layer + norm/logits/embedding)). Loader-equivalence evidence lives in
-    /// the traced full-load test (encoder half, `encoder_graph::trace_tests`)
-    /// and the loader-name-source equality tests below (adaptor + decoder
-    /// halves); this test holds the enumeration's production shape stable.
+    /// the traced full-load tests: encoder half in `encoder_graph::trace_tests`,
+    /// decoder half in `llm_transformer::trace_tests` (index allowlist +
+    /// plan/logits/embedding access trace). Adaptor half still pins name-source
+    /// equality below; this test holds the enumeration's production shape stable.
     #[test]
     fn descriptor_set_stays_pinned_on_production_geometry() {
         let encoder = parse_funasr_nano_encoder_metadata(&full_metadata()).expect("enc");
