@@ -1178,6 +1178,241 @@ impl TinyGgufFixtureSpec {
         spec
     }
 
+    /// Contract-complete parakeet-ctc fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (shared FastConformer encoder + CTC head), so the
+    /// pack passes the production `PackVerifier`. The tensor set comes from the
+    /// same enumeration the admission validator checks.
+    pub fn parakeet_ctc_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "parakeet-ctc".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::PARAKEET_CTC_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::PARAKEET_CTC_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::PARAKEET_CTC_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID),
+            ("parakeet.n_layers", "1"),
+            ("parakeet.hidden_size", "16"),
+            ("parakeet.n_heads", "2"),
+            ("parakeet.head_dim", "8"),
+            ("parakeet.ffn_dim", "32"),
+            ("parakeet.conv_kernel", "9"),
+            ("parakeet.n_mels", "80"),
+            ("parakeet.subsampling_factor", "8"),
+            ("parakeet.subsampling_channels", "24"),
+            ("parakeet.vocab_size", "12"),
+            ("ctc.blank_token_id", "11"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut spec = Self::new(metadata);
+        let parsed =
+            crate::models::parakeet_ctc::runtime_contract::parse_parakeet_ctc_execution_metadata(
+                &spec.metadata,
+            )
+            .expect("parakeet-ctc fixture metadata must parse");
+        for (name, dims) in
+            crate::models::parakeet_ctc::runtime_contract::parakeet_ctc_runtime_tensors(&parsed)
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete parakeet-tdt fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (bias-free FastConformer encoder + joint encoder
+    /// projection + LSTM predictor + fused joint head), so the pack passes the
+    /// production `PackVerifier`. The tensor set comes from the same enumeration
+    /// the admission validator checks.
+    pub fn parakeet_tdt_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            "parakeet-tdt".to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::PARAKEET_TDT_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::PARAKEET_TDT_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::PARAKEET_TDT_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            ("general.architecture", crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID),
+            ("parakeet-tdt.n_layers", "1"),
+            ("parakeet-tdt.hidden_size", "16"),
+            ("parakeet-tdt.n_heads", "2"),
+            ("parakeet-tdt.head_dim", "8"),
+            ("parakeet-tdt.ffn_dim", "32"),
+            ("parakeet-tdt.conv_kernel", "9"),
+            ("parakeet-tdt.n_mels", "128"),
+            ("parakeet-tdt.subsampling_factor", "8"),
+            ("parakeet-tdt.subsampling_channels", "24"),
+            ("parakeet-tdt.scale_input", "0"),
+            ("parakeet-tdt.vocab_size", "12"),
+            ("parakeet-tdt.blank_token_id", "11"),
+            ("parakeet-tdt.pred_hidden", "20"),
+            ("parakeet-tdt.pred_layers", "2"),
+            ("parakeet-tdt.joint_hidden", "24"),
+            ("parakeet-tdt.n_durations", "5"),
+            ("parakeet-tdt.max_symbols_per_step", "10"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        // The TDT metadata parser reads the duration bins as a native GGUF u32
+        // array, so the fixture stamps them as such (contiguous 0..n).
+        let mut spec =
+            Self::new(metadata).with_u32_array_metadata("parakeet-tdt.durations", 0..5u32);
+        // The parser needs a full GgufMetadata (for the u32 durations array), so
+        // the tiny geometry is stated directly for the tensor projection; the
+        // metadata map above carries the identical values for the written pack.
+        let parsed = crate::models::parakeet_tdt::runtime_contract::ParakeetTdtExecutionMetadata {
+            n_layers: 1,
+            hidden_size: 16,
+            n_heads: 2,
+            head_dim: 8,
+            ffn_dim: 32,
+            conv_kernel: 9,
+            n_mels: 128,
+            subsampling_factor: 8,
+            subsampling_channels: 24,
+            scale_input: false,
+            vocab_size: 12,
+            blank_token_id: 11,
+            pred_hidden: 20,
+            pred_layers: 2,
+            joint_hidden: 24,
+            n_durations: 5,
+            max_symbols_per_step: 10,
+        };
+        for (name, dims) in
+            crate::models::parakeet_tdt::runtime_contract::parakeet_tdt_runtime_tensors(&parsed)
+        {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
+    /// Contract-complete funasr-nano fixture: the fail-closed metadata plus the
+    /// full runtime tensor set (SAN-M encoder + transformer adaptor + Qwen3
+    /// decoder), so the pack passes the production `PackVerifier`. The tensor
+    /// set comes from the same enumeration the admission validator checks.
+    pub fn funasr_nano_oasr_v1_runtime_ready(model_id: impl Into<String>) -> Self {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(OPENASR_MODEL_ID_KEY.to_string(), model_id.into());
+        metadata.insert(
+            OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+            OASR_PACKAGE_VERSION_V1.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+            crate::arch::FUNASR_NANO_MODEL_FAMILY.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+            crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+            crate::arch::FUNASR_NANO_AUDIO_FRONTEND_ID.to_string(),
+        );
+        metadata.insert(
+            OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+            crate::arch::FUNASR_NANO_DECODE_POLICY_ID.to_string(),
+        );
+        metadata.insert(
+            "openasr.tokenizer.id".to_string(),
+            crate::arch::FUNASR_NANO_TOKENIZER_ID.to_string(),
+        );
+        for (key, value) in [
+            (
+                "general.architecture",
+                crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+            ),
+            ("funasr.enc.n_layers", "1"),
+            ("funasr.enc.tp_blocks", "1"),
+            ("funasr.enc.d_model", "16"),
+            ("funasr.enc.n_heads", "2"),
+            ("funasr.enc.head_dim", "8"),
+            ("funasr.enc.ffn_dim", "32"),
+            ("funasr.enc.fsmn_kernel", "5"),
+            ("funasr.enc.feature_dim", "28"),
+            ("funasr.adp.n_layers", "1"),
+            ("funasr.adp.n_heads", "2"),
+            ("funasr.adp.encoder_dim", "16"),
+            ("funasr.adp.llm_dim", "24"),
+            ("funasr.llm.n_layers", "1"),
+            ("funasr.llm.d_model", "24"),
+            ("funasr.llm.n_heads", "2"),
+            ("funasr.llm.n_kv_heads", "1"),
+            ("funasr.llm.head_dim", "8"),
+            ("funasr.llm.ffn_dim", "48"),
+            ("funasr.llm.vocab_size", "32"),
+            ("funasr.llm.max_positions", "64"),
+            ("funasr.llm.chatml_im_start_token_id", "0"),
+            ("funasr.llm.chatml_im_end_token_id", "1"),
+            ("funasr.llm.endoftext_token_id", "2"),
+        ] {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+        let mut spec = Self::new(metadata);
+        let encoder =
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_encoder_metadata(
+                &spec.metadata,
+            )
+            .expect("funasr-nano encoder fixture metadata must parse");
+        let adapter =
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_adapter_metadata(
+                &spec.metadata,
+            )
+            .expect("funasr-nano adapter fixture metadata must parse");
+        let decoder =
+            crate::models::funasr_nano::runtime_contract::parse_funasr_nano_decoder_metadata(
+                &spec.metadata,
+            )
+            .expect("funasr-nano decoder fixture metadata must parse");
+        for (name, dims) in crate::models::funasr_nano::runtime_contract::funasr_nano_runtime_tensors(
+            &encoder, &adapter, &decoder,
+        ) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        spec
+    }
+
     /// Metadata-complete wav2vec2-ctc routing fixture with the same tiny
     /// internally-consistent geometry the runtime tensor-contract tests use
     /// (one transformer layer, hidden 16, vocab 4, blank 0, group-norm
@@ -3021,6 +3256,21 @@ mod tests {
                 "sensevoice.oasr",
                 TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready("sensevoice-fixture"),
                 "sensevoice",
+            ),
+            (
+                "parakeet-ctc.oasr",
+                TinyGgufFixtureSpec::parakeet_ctc_oasr_v1_runtime_ready("parakeet-ctc-fixture"),
+                "parakeet",
+            ),
+            (
+                "parakeet-tdt.oasr",
+                TinyGgufFixtureSpec::parakeet_tdt_oasr_v1_runtime_ready("parakeet-tdt-fixture"),
+                "parakeet-tdt",
+            ),
+            (
+                "funasr-nano.oasr",
+                TinyGgufFixtureSpec::funasr_nano_oasr_v1_runtime_ready("funasr-nano-fixture"),
+                "funasr-nano",
             ),
         ];
         for (name, spec, expected_catalog_family) in cases {

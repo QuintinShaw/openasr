@@ -19,9 +19,13 @@
 //! Numeric behavior is carried over byte-for-byte from the pre-refactor
 //! per-family copies -- nothing here changes the math, only where it lives.
 
+pub(crate) mod contract;
 pub(crate) mod graph;
 pub(crate) mod weights;
 
+pub(crate) use contract::{
+    FastConformerContractGeometry, fastconformer_encoder_tensor_descriptors,
+};
 pub(crate) use graph::{
     FastConformerEncoderCore, FastConformerStackConfig, alloc_static, bind_loaded,
     build_conformer_stack, upload_graph_f32, upload_static,

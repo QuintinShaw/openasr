@@ -200,6 +200,68 @@ pub(crate) fn render_shape(shape: &[u64]) -> String {
     format!("[{parts}]")
 }
 
+/// Projects one valid dims choice for a tensor-binding requirement, for
+/// runtime-ready test fixtures: every family's fixture tensors stamp through
+/// this single map, so a requirement kind can never disagree with the fixture
+/// dims it produces. GGUF reads a tensor index back with trailing-1 dims
+/// trimmed, so projections keep their last extent > 1 wherever the rank must
+/// survive (`VectorLen(1)` is the lone `[1]` that reads back as rank 1).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn project_fixture_dims(requirement: &TensorBindingDescriptorRequirement) -> Vec<u64> {
+    let mut dims = match requirement {
+        TensorBindingDescriptorRequirement::ExactDims(expected) => {
+            expected.iter().map(|dim| *dim as u64).collect()
+        }
+        TensorBindingDescriptorRequirement::VectorLen(len) => vec![*len as u64],
+        TensorBindingDescriptorRequirement::NonEmptyVector => vec![2],
+        TensorBindingDescriptorRequirement::Rank2WithDim(dim) => vec![2, *dim as u64],
+        TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs) => {
+            vec![*lhs as u64, *rhs as u64]
+        }
+        TensorBindingDescriptorRequirement::Rank2OrRank3WithDims(first, second) => {
+            vec![*first as u64, *second as u64]
+        }
+        TensorBindingDescriptorRequirement::RankAtLeastWithDimAt {
+            min_rank,
+            axis,
+            dim,
+        } => {
+            let mut dims = vec![2_u64; *min_rank];
+            dims[*axis] = *dim as u64;
+            dims
+        }
+    };
+    // A trailing 1 would read back as a lower rank. Swap a non-unit extent to
+    // the end when one exists (rank-2+ shapes only), preserving both extents;
+    // an all-unit shape keeps its rank by bumping the last extent.
+    if dims.len() >= 2 && *dims.last().expect("rank >= 2") == 1 {
+        let last = dims.len() - 1;
+        match dims.iter().position(|value| *value != 1) {
+            Some(non_unit) => dims.swap(non_unit, last),
+            None => dims[last] = 2,
+        }
+    }
+    dims
+}
+
+/// Projects the single tensor-binding enumeration into a runtime-ready fixture
+/// tensor set (tensor name + valid dims), so the fixture and the admission
+/// validator agree through one enumeration.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn project_fixture_tensors(
+    bindings: &[TensorBindingDescriptor],
+) -> Vec<(String, Vec<u64>)> {
+    bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.tensor_name.clone(),
+                project_fixture_dims(&binding.requirement),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

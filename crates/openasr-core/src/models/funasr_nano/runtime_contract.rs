@@ -1,10 +1,18 @@
-//! funasr-nano execution metadata parsed from the `.oasr` GGUF header. Key
-//! names match exactly what the pack importer writes (`funasr.enc.*` /
-//! `funasr.adp.*` / `funasr.llm.*`).
+//! funasr-nano execution metadata + runtime tensor contract parsed from the
+//! `.oasr` GGUF header. Key names match exactly what the pack importer writes
+//! (`funasr.enc.*` / `funasr.adp.*` / `funasr.llm.*`). The validator is
+//! depth-complete: a pack must satisfy all three metadata contracts AND the
+//! full runtime tensor binding (SAN-M encoder, transformer adaptor, Qwen3
+//! decoder) before it can be admitted.
 
+use crate::GgufTensorIndex;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_u64_scalar, u64_to_u32, u64_to_usize,
     validate_positive_usize,
+};
+use crate::models::tensor_binding::{
+    TensorBindingDescriptor, TensorBindingDescriptorRequirement, render_shape,
+    validate_tensor_binding_descriptors,
 };
 
 pub(crate) const ENC_N_LAYERS_KEY: &str = "funasr.enc.n_layers";
@@ -238,13 +246,432 @@ pub(crate) fn parse_funasr_nano_decoder_metadata<M: ScalarMetadataView>(
 pub(crate) fn validate_runtime_pack_contract(
     preflight: &crate::GgufRuntimeSourcePreflight,
 ) -> Result<(), String> {
-    parse_funasr_nano_encoder_metadata(preflight.metadata())
-        .map(|_| ())
-        .and_then(|()| parse_funasr_nano_adapter_metadata(preflight.metadata()).map(|_| ()))
-        .and_then(|()| parse_funasr_nano_decoder_metadata(preflight.metadata()).map(|_| ()))
+    let encoder = parse_funasr_nano_encoder_metadata(preflight.metadata())
         .map_err(|error| {
             crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
-        })
+        })?;
+    let adapter = parse_funasr_nano_adapter_metadata(preflight.metadata()).map_err(|error| {
+        crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
+    })?;
+    let decoder = parse_funasr_nano_decoder_metadata(preflight.metadata()).map_err(|error| {
+        crate::models::runtime_pack_contract::metadata_validation_error("funasr-nano", error)
+    })?;
+    validate_funasr_nano_runtime_tensors_with_index(
+        preflight.tensor_index(),
+        &encoder,
+        &adapter,
+        &decoder,
+    )
+    .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
+}
+
+/// Fail-closed tensor-contract errors, surfaced by the pack verifier before a
+/// funasr-nano pack can be admitted.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub(crate) enum FunasrNanoTensorContractError {
+    #[error("funasr-nano runtime tensor contract is missing required tensor '{name}'")]
+    MissingRequiredTensor { name: String },
+    #[error("funasr-nano runtime tensor '{name}' has shape {shape}: {reason}")]
+    InvalidTensorShape {
+        name: String,
+        shape: String,
+        reason: String,
+    },
+}
+
+fn missing_required_tensor(name: &str) -> FunasrNanoTensorContractError {
+    FunasrNanoTensorContractError::MissingRequiredTensor {
+        name: name.to_string(),
+    }
+}
+
+fn invalid_tensor_shape(
+    name: &str,
+    shape: &[u64],
+    reason: String,
+) -> FunasrNanoTensorContractError {
+    FunasrNanoTensorContractError::InvalidTensorShape {
+        name: name.to_string(),
+        shape: render_shape(shape),
+        reason,
+    }
+}
+
+fn descriptor(
+    tensor_name: String,
+    requirement: TensorBindingDescriptorRequirement,
+    reason: &str,
+) -> TensorBindingDescriptor {
+    TensorBindingDescriptor {
+        tensor_name,
+        requirement,
+        reason: reason.to_string(),
+    }
+}
+
+/// One SAN-M block's runtime tensor bindings: the 13 tensors
+/// `encoder_graph::load_layer` reads and `nn::encoder::sanm_fsmn_encoder_layer`
+/// consumes (the identical layout the sensevoice family contracts), shaped for
+/// the block's `input_dim`.
+fn sanm_block_tensor_descriptors(
+    encoder: &FunasrNanoEncoderMetadata,
+    scope: &str,
+    layer: usize,
+    input_dim: usize,
+) -> Vec<TensorBindingDescriptor> {
+    let d_model = encoder.d_model;
+    let qkv_dim = 3 * d_model;
+    let name = |suffix: &str| format!("{scope}.{layer}.{suffix}");
+    vec![
+        descriptor(
+            name("attn.norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(input_dim),
+            "pre-attention LayerNorm gamma must span the block input width",
+        ),
+        descriptor(
+            name("attn.norm.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(input_dim),
+            "pre-attention LayerNorm beta must span the block input width",
+        ),
+        descriptor(
+            name("attn.qkv.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(input_dim, qkv_dim),
+            "fused QKV projection must map the block input width to 3*d_model",
+        ),
+        descriptor(
+            name("attn.qkv.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(qkv_dim),
+            "fused QKV bias must span 3*d_model",
+        ),
+        descriptor(
+            name("attn.out.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, d_model),
+            "attention output projection must be d_model x d_model",
+        ),
+        descriptor(
+            name("attn.out.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "attention output bias must span d_model",
+        ),
+        descriptor(
+            name("attn.fsmn.weight"),
+            TensorBindingDescriptorRequirement::ExactDims(vec![
+                encoder.fsmn_kernel,
+                1,
+                d_model,
+            ]),
+            "FSMN depthwise kernel must be [fsmn_kernel, 1, d_model] for the im2col conv path",
+        ),
+        descriptor(
+            name("ffn.norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "pre-FFN LayerNorm gamma must span d_model",
+        ),
+        descriptor(
+            name("ffn.norm.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "pre-FFN LayerNorm beta must span d_model",
+        ),
+        descriptor(
+            name("ffn.up.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, encoder.ffn_dim),
+            "FFN up projection must map d_model to ffn_dim",
+        ),
+        descriptor(
+            name("ffn.up.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(encoder.ffn_dim),
+            "FFN up bias must span ffn_dim",
+        ),
+        descriptor(
+            name("ffn.down.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(encoder.ffn_dim, d_model),
+            "FFN down projection must map ffn_dim to d_model",
+        ),
+        descriptor(
+            name("ffn.down.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "FFN down bias must span d_model",
+        ),
+    ]
+}
+
+/// One adaptor transformer block's runtime tensor bindings: the 16 tensors
+/// `adapter_graph::load_block` binds (`attn.{norm,q,k,v,out}` +
+/// `ffn.{norm,up,down}`, each weight+bias), all llm_dim wide.
+fn adaptor_block_tensor_descriptors(
+    adapter: &FunasrNanoAdapterMetadata,
+    layer: usize,
+) -> Vec<TensorBindingDescriptor> {
+    let llm_dim = adapter.llm_dim;
+    let name = |suffix: &str| format!("adaptor.blk.{layer}.{suffix}");
+    let mut descriptors = vec![
+        descriptor(
+            name("attn.norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor attention pre-norm gamma must span llm_dim",
+        ),
+        descriptor(
+            name("attn.norm.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor attention pre-norm beta must span llm_dim",
+        ),
+    ];
+    for projection in ["q", "k", "v"] {
+        descriptors.push(descriptor(
+            name(&format!("attn.{projection}.weight")),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(llm_dim, llm_dim),
+            "adaptor attention projection must be llm_dim x llm_dim",
+        ));
+        descriptors.push(descriptor(
+            name(&format!("attn.{projection}.bias")),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor attention projection bias must span llm_dim",
+        ));
+    }
+    descriptors.extend([
+        descriptor(
+            name("attn.out.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(llm_dim, llm_dim),
+            "adaptor attention output projection must be llm_dim x llm_dim",
+        ),
+        descriptor(
+            name("attn.out.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor attention output bias must span llm_dim",
+        ),
+        descriptor(
+            name("ffn.norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor FFN pre-norm gamma must span llm_dim",
+        ),
+        descriptor(
+            name("ffn.norm.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor FFN pre-norm beta must span llm_dim",
+        ),
+        descriptor(
+            name("ffn.up.weight"),
+            TensorBindingDescriptorRequirement::Rank2WithDim(llm_dim),
+            "adaptor FFN up projection must consume llm_dim-wide rows",
+        ),
+        descriptor(
+            name("ffn.up.bias"),
+            TensorBindingDescriptorRequirement::NonEmptyVector,
+            "adaptor FFN up bias must be a non-empty vector",
+        ),
+        descriptor(
+            name("ffn.down.weight"),
+            TensorBindingDescriptorRequirement::Rank2WithDim(llm_dim),
+            "adaptor FFN down projection must produce llm_dim-wide rows",
+        ),
+        descriptor(
+            name("ffn.down.bias"),
+            TensorBindingDescriptorRequirement::VectorLen(llm_dim),
+            "adaptor FFN down bias must span llm_dim",
+        ),
+    ]);
+    descriptors
+}
+
+/// One Qwen3 decoder layer's runtime tensor bindings: the 11 weight-only
+/// tensors `funasr_nano_llm_layer_tensor_names` names (RMSNorm carries no
+/// bias, Qwen3 attention is bias-free).
+fn llm_layer_tensor_descriptors(
+    decoder: &FunasrNanoDecoderMetadata,
+    layer: usize,
+) -> Vec<TensorBindingDescriptor> {
+    let d_model = decoder.d_model;
+    let q_dim = decoder.n_heads * decoder.head_dim;
+    let kv_dim = decoder.n_kv_heads * decoder.head_dim;
+    let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+    vec![
+        descriptor(
+            name("attn_norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "attention RMSNorm must span d_model",
+        ),
+        descriptor(
+            name("attn_q.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, q_dim),
+            "query projection must map d_model to n_heads*head_dim",
+        ),
+        descriptor(
+            name("attn_k.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, kv_dim),
+            "key projection must map d_model to n_kv_heads*head_dim",
+        ),
+        descriptor(
+            name("attn_v.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, kv_dim),
+            "value projection must map d_model to n_kv_heads*head_dim",
+        ),
+        descriptor(
+            name("attn_output.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(q_dim, d_model),
+            "attention output projection must map n_heads*head_dim to d_model",
+        ),
+        descriptor(
+            name("attn_q_norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(decoder.head_dim),
+            "QK-norm query RMSNorm must span head_dim",
+        ),
+        descriptor(
+            name("attn_k_norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(decoder.head_dim),
+            "QK-norm key RMSNorm must span head_dim",
+        ),
+        descriptor(
+            name("ffn_norm.weight"),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "FFN RMSNorm must span d_model",
+        ),
+        descriptor(
+            name("ffn_gate.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, decoder.ffn_dim),
+            "FFN gate projection must map d_model to ffn_dim",
+        ),
+        descriptor(
+            name("ffn_up.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, decoder.ffn_dim),
+            "FFN up projection must map d_model to ffn_dim",
+        ),
+        descriptor(
+            name("ffn_down.weight"),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(decoder.ffn_dim, d_model),
+            "FFN down projection must map ffn_dim to d_model",
+        ),
+    ]
+}
+
+/// The runtime tensor contract for one funasr-nano pack: every tensor the
+/// SAN-M encoder, transformer adaptor, and Qwen3 decoder materialize, with the
+/// shapes the graphs consume. Derived from the parsed metadata, so a
+/// checkpoint with different layer counts validates its own geometry.
+pub(crate) fn funasr_nano_runtime_tensor_binding_descriptors(
+    encoder: &FunasrNanoEncoderMetadata,
+    adapter: &FunasrNanoAdapterMetadata,
+    decoder: &FunasrNanoDecoderMetadata,
+) -> Vec<TensorBindingDescriptor> {
+    let mut descriptors = Vec::new();
+    for layer in 0..encoder.n_layers {
+        let input_dim = if layer == 0 {
+            encoder.feature_dim
+        } else {
+            encoder.d_model
+        };
+        descriptors.extend(sanm_block_tensor_descriptors(
+            encoder, "enc.blk", layer, input_dim,
+        ));
+    }
+    for layer in 0..encoder.tp_blocks {
+        descriptors.extend(sanm_block_tensor_descriptors(
+            encoder, "tp.blk", layer, encoder.d_model,
+        ));
+    }
+    let d_model = encoder.d_model;
+    descriptors.extend([
+        descriptor(
+            "enc.after_norm.weight".to_string(),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "encoder tail LayerNorm gamma must span d_model",
+        ),
+        descriptor(
+            "enc.after_norm.bias".to_string(),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "encoder tail LayerNorm beta must span d_model",
+        ),
+        descriptor(
+            "tp.norm.weight".to_string(),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "two-pass tail LayerNorm gamma must span d_model",
+        ),
+        descriptor(
+            "tp.norm.bias".to_string(),
+            TensorBindingDescriptorRequirement::VectorLen(d_model),
+            "two-pass tail LayerNorm beta must span d_model",
+        ),
+        descriptor(
+            "adaptor.linear1.weight".to_string(),
+            TensorBindingDescriptorRequirement::Rank2WithDim(adapter.encoder_dim),
+            "adaptor linear1 must consume encoder_dim-wide rows",
+        ),
+        descriptor(
+            "adaptor.linear1.bias".to_string(),
+            TensorBindingDescriptorRequirement::NonEmptyVector,
+            "adaptor linear1 bias must be a non-empty vector",
+        ),
+        descriptor(
+            "adaptor.linear2.weight".to_string(),
+            TensorBindingDescriptorRequirement::Rank2WithDim(adapter.llm_dim),
+            "adaptor linear2 must produce llm_dim-wide rows",
+        ),
+        descriptor(
+            "adaptor.linear2.bias".to_string(),
+            TensorBindingDescriptorRequirement::VectorLen(adapter.llm_dim),
+            "adaptor linear2 bias must span llm_dim",
+        ),
+    ]);
+    for layer in 0..adapter.n_layers {
+        descriptors.extend(adaptor_block_tensor_descriptors(adapter, layer));
+    }
+    for layer in 0..decoder.n_layers {
+        descriptors.extend(llm_layer_tensor_descriptors(decoder, layer));
+    }
+    descriptors.extend([
+        descriptor(
+            "output_norm.weight".to_string(),
+            TensorBindingDescriptorRequirement::VectorLen(decoder.d_model),
+            "final RMSNorm before the logits head must span d_model",
+        ),
+        descriptor(
+            "output.weight".to_string(),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(
+                decoder.d_model,
+                decoder.vocab_size,
+            ),
+            "logits head must project d_model to the vocab",
+        ),
+        descriptor(
+            "token_embd.weight".to_string(),
+            TensorBindingDescriptorRequirement::Rank2EitherDims(
+                decoder.d_model,
+                decoder.vocab_size,
+            ),
+            "token embedding table must be d_model x vocab",
+        ),
+    ]);
+    descriptors
+}
+
+/// Validate the full runtime tensor set against the pack's tensor index.
+pub(crate) fn validate_funasr_nano_runtime_tensors_with_index(
+    index: &GgufTensorIndex,
+    encoder: &FunasrNanoEncoderMetadata,
+    adapter: &FunasrNanoAdapterMetadata,
+    decoder: &FunasrNanoDecoderMetadata,
+) -> Result<(), FunasrNanoTensorContractError> {
+    let descriptors =
+        funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder);
+    validate_tensor_binding_descriptors(
+        index,
+        &descriptors,
+        missing_required_tensor,
+        invalid_tensor_shape,
+    )
+}
+
+/// Projects the single tensor contract into a runtime-ready fixture tensor set
+/// (pack names plus valid dims); the runtime-ready test fixture stamps exactly
+/// this set, so fixture and validator agree through one enumeration.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn funasr_nano_runtime_tensors(
+    encoder: &FunasrNanoEncoderMetadata,
+    adapter: &FunasrNanoAdapterMetadata,
+    decoder: &FunasrNanoDecoderMetadata,
+) -> Vec<(String, Vec<u64>)> {
+    crate::models::tensor_binding::project_fixture_tensors(
+        &funasr_nano_runtime_tensor_binding_descriptors(encoder, adapter, decoder),
+    )
 }
 
 #[cfg(test)]
@@ -320,5 +747,143 @@ mod tests {
         let mut metadata = full_metadata();
         metadata.insert(ENC_FSMN_KERNEL_KEY.to_string(), "10".to_string());
         assert!(parse_funasr_nano_encoder_metadata(&metadata).is_err());
+    }
+
+    // --- Runtime tensor contract ---
+
+    fn tiny_encoder() -> FunasrNanoEncoderMetadata {
+        FunasrNanoEncoderMetadata {
+            n_layers: 1,
+            tp_blocks: 1,
+            d_model: 16,
+            n_heads: 2,
+            head_dim: 8,
+            ffn_dim: 32,
+            fsmn_kernel: 5,
+            feature_dim: 28,
+        }
+    }
+
+    fn tiny_adapter() -> FunasrNanoAdapterMetadata {
+        FunasrNanoAdapterMetadata {
+            n_layers: 1,
+            n_heads: 2,
+            encoder_dim: 16,
+            llm_dim: 24,
+        }
+    }
+
+    fn tiny_decoder() -> FunasrNanoDecoderMetadata {
+        FunasrNanoDecoderMetadata {
+            n_layers: 1,
+            d_model: 24,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 8,
+            ffn_dim: 48,
+            vocab_size: 32,
+            max_positions: 64,
+            chatml_im_start_token_id: 0,
+            chatml_im_end_token_id: 1,
+            endoftext_token_id: 2,
+        }
+    }
+
+    fn tensor_index_from_shapes(shapes: &[(String, Vec<u64>)]) -> crate::GgufTensorIndex {
+        let tensors = shapes
+            .iter()
+            .enumerate()
+            .map(|(index, (name, dims))| crate::GgufTensorMetadata {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: 0,
+                type_name: "f32".to_string(),
+                size_bytes: 0,
+                offset_bytes: index as u64,
+            })
+            .collect();
+        crate::GgufTensorIndex::from_snapshot(crate::ggml_runtime::GgufTensorIndexSnapshot {
+            path: std::path::PathBuf::from("funasr-nano-contract-test.oasr"),
+            data_section_offset_bytes: 0,
+            tensors,
+        })
+        .expect("unique tensor names")
+    }
+
+    /// The requirement enumeration IS the loader read set: pin it on the full
+    /// production geometry (50 enc + 20 tp SAN-M blocks of 13 tensors, 4 tail
+    /// norms, the 2-layer adaptor (4 linears + 2x16 block tensors), and the
+    /// 28-layer Qwen3 decoder (11 weights per layer + norm/logits/embedding)).
+    #[test]
+    fn descriptor_set_matches_the_loader_read_set_on_production_geometry() {
+        let encoder = parse_funasr_nano_encoder_metadata(&full_metadata()).expect("enc");
+        let adapter = parse_funasr_nano_adapter_metadata(&full_metadata()).expect("adp");
+        let decoder = parse_funasr_nano_decoder_metadata(&full_metadata()).expect("llm");
+        let descriptors =
+            funasr_nano_runtime_tensor_binding_descriptors(&encoder, &adapter, &decoder);
+        assert_eq!(descriptors.len(), (50 + 20) * 13 + 4 + 36 + 28 * 11 + 3);
+        let names: std::collections::BTreeSet<&str> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.tensor_name.as_str())
+            .collect();
+        assert_eq!(names.len(), descriptors.len(), "names must be unique");
+        for required in [
+            "enc.blk.0.attn.qkv.weight",
+            "enc.blk.49.ffn.down.bias",
+            "tp.blk.19.attn.fsmn.weight",
+            "enc.after_norm.weight",
+            "tp.norm.bias",
+            "adaptor.linear1.weight",
+            "adaptor.blk.1.ffn.down.bias",
+            "blk.27.ffn_down.weight",
+            "output_norm.weight",
+            "output.weight",
+            "token_embd.weight",
+        ] {
+            assert!(names.contains(required), "contract must cover {required}");
+        }
+    }
+
+    #[test]
+    fn validates_the_projected_tiny_tensor_set() {
+        let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
+        let shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder);
+        let index = tensor_index_from_shapes(&shapes);
+        validate_funasr_nano_runtime_tensors_with_index(&index, &encoder, &adapter, &decoder)
+            .expect("projected tensor set must satisfy the contract");
+    }
+
+    #[test]
+    fn rejects_a_missing_required_tensor() {
+        let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
+        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder);
+        shapes.retain(|(name, _)| name != "adaptor.linear2.weight");
+        let index = tensor_index_from_shapes(&shapes);
+        let error =
+            validate_funasr_nano_runtime_tensors_with_index(&index, &encoder, &adapter, &decoder)
+                .expect_err("missing adaptor linear2 must fail closed");
+        assert!(
+            matches!(error, FunasrNanoTensorContractError::MissingRequiredTensor { ref name } if name == "adaptor.linear2.weight"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_shape() {
+        let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
+        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder);
+        for (name, dims) in shapes.iter_mut() {
+            if name == "enc.blk.0.attn.fsmn.weight" {
+                *dims = vec![1, 1];
+            }
+        }
+        let index = tensor_index_from_shapes(&shapes);
+        let error =
+            validate_funasr_nano_runtime_tensors_with_index(&index, &encoder, &adapter, &decoder)
+                .expect_err("corrupted FSMN kernel must fail closed");
+        assert!(
+            matches!(error, FunasrNanoTensorContractError::InvalidTensorShape { ref name, .. } if name == "enc.blk.0.attn.fsmn.weight"),
+            "unexpected error: {error}"
+        );
     }
 }
