@@ -701,7 +701,9 @@ pub(crate) fn execute_whisper_encoder_graph_ggml_v0(
         )?;
 
         let attention_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let attn_context = if config.use_flash_attention {
+        let use_flash_attention =
+            config.use_flash_attention && graph.supports_flash_attn_ext_head_dim(head_dim);
+        let attn_context = if use_flash_attention {
             match graph.flash_attn_ext(k, q, v, None, attention_scale, 0.0, 0.0) {
                 Ok(flash) => flash,
                 Err(error) => {

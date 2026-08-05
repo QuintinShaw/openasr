@@ -3531,6 +3531,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.backend_kind == GgmlCpuGraphBackend::Cpu
     }
 
+    /// Reports whether `flash_attn_ext` can execute the requested head width
+    /// on this graph's backend. High-level attention builders use this before
+    /// choosing flash-specific tensor layouts so unsupported Metal widths can
+    /// take their existing naive attention path instead of failing at build.
+    pub(crate) fn supports_flash_attn_ext_head_dim(&self, head_dim: usize) -> bool {
+        flash_attn_ext_head_dim_supported_on_backend(self.backend_kind, head_dim)
+    }
+
     pub(crate) fn gelu(
         &self,
         input: GgmlCpuTensor<'a>,

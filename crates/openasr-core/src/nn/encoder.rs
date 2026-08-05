@@ -680,7 +680,9 @@ where
     // `reshape_encoder_projection_to_heads_for_flash` GPU/CPU split in
     // `models/whisper/ggml_executor.rs`. The naive path (and flash on CPU)
     // keeps the original `cont`'d heads unchanged.
-    let use_strided_views = config.use_flash_attention && graph.backend_kind().is_gpu_class();
+    let use_flash_attention =
+        config.use_flash_attention && graph.supports_flash_attn_ext_head_dim(config.head_dim);
+    let use_strided_views = use_flash_attention && graph.backend_kind().is_gpu_class();
     let heads_contiguous = !use_strided_views;
     let q = reshape_projection_to_attention_heads(
         graph,
@@ -722,7 +724,7 @@ where
         map_err,
     )?;
     let scale = 1.0 / (config.head_dim as f32).sqrt();
-    let context = if config.use_flash_attention {
+    let context = if use_flash_attention {
         // `flash_attn_ext` requires an F16 contiguous mask (unlike
         // `soft_max_ext`, which also accepts f32); cast the caller's additive
         // f32 padding mask once per layer. See `nn/decoder.rs`'s shared

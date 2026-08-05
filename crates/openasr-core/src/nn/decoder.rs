@@ -1908,7 +1908,9 @@ where
         map_err,
     )?;
     let scale = (head_dim as f32).sqrt().recip();
-    let attended = if config.use_flash_attention {
+    let use_flash_attention =
+        config.use_flash_attention && graph.supports_flash_attn_ext_head_dim(head_dim);
+    let attended = if use_flash_attention {
         graph
             .flash_attn_ext(q_flash, k_full, v_full, kv.attention_mask, scale, 0.0, 0.0)
             .map_err(|source| map_err("llm_flash_attn", source))?

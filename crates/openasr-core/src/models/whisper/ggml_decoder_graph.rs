@@ -4757,7 +4757,8 @@ fn apply_decoder_self_attention<'a>(
     };
 
     let scale = 1.0f32 / (head_dim as f32).sqrt();
-    let use_self_flash_attention = use_flash_attention && use_self_kv;
+    let use_self_flash_attention =
+        use_flash_attention && use_self_kv && graph.supports_flash_attn_ext_head_dim(head_dim);
     let output_columns = token_count.checked_mul(n_seq).ok_or_else(|| {
         WhisperDecoderGraphExecutionError::InvalidInput {
             reason: "decoder self-attention output shape overflows usize".to_string(),
@@ -5074,7 +5075,10 @@ fn apply_decoder_cross_attention<'a>(
             reason: "decoder cross-attention output shape overflows usize".to_string(),
         }
     })?;
-    let context = if use_flash_attention && !collect_attention_probs {
+    let use_cross_flash_attention = use_flash_attention
+        && !collect_attention_probs
+        && graph.supports_flash_attn_ext_head_dim(head_dim);
+    let context = if use_cross_flash_attention {
         let q = reshape_projected_hidden_sequence_to_heads_view_with_n_seq(
             graph,
             q,

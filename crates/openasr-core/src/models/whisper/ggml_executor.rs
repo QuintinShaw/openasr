@@ -1319,7 +1319,9 @@ fn run_encoder_graph_with_runner(
 
         let head_dim = plan.output_hidden_size / execution.encoder_attention_heads;
         let attention_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let attn_context = if whisper_encoder_flash_attention_enabled() {
+        let use_flash_attention = whisper_encoder_flash_attention_enabled()
+            && graph.supports_flash_attn_ext_head_dim(head_dim);
+        let attn_context = if use_flash_attention {
             let use_strided_views = graph_config.backend.is_gpu_class();
             let q = reshape_encoder_projection_to_heads_for_flash(
                 &mut graph,
