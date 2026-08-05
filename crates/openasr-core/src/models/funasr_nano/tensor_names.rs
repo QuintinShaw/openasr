@@ -22,12 +22,52 @@ pub(crate) const ENC_AFTER_NORM_BIAS: &str = "enc.after_norm.bias";
 pub(crate) const TP_NORM_WEIGHT: &str = "tp.norm.weight";
 pub(crate) const TP_NORM_BIAS: &str = "tp.norm.bias";
 
+/// Per-block SAN-M tensor-name suffixes, in the order the runtime contract
+/// enumerates them. The weight loader (`encoder_graph::load_layer`) and the
+/// admission contract (`runtime_contract::sanm_block_tensor_descriptors`)
+/// both resolve every block tensor through these constants, so the two read
+/// sets cannot drift on names.
+pub(crate) const SANM_ATTN_NORM_WEIGHT: &str = "attn.norm.weight";
+pub(crate) const SANM_ATTN_NORM_BIAS: &str = "attn.norm.bias";
+pub(crate) const SANM_ATTN_QKV_WEIGHT: &str = "attn.qkv.weight";
+pub(crate) const SANM_ATTN_QKV_BIAS: &str = "attn.qkv.bias";
+pub(crate) const SANM_ATTN_OUT_WEIGHT: &str = "attn.out.weight";
+pub(crate) const SANM_ATTN_OUT_BIAS: &str = "attn.out.bias";
+pub(crate) const SANM_ATTN_FSMN_WEIGHT: &str = "attn.fsmn.weight";
+pub(crate) const SANM_FFN_NORM_WEIGHT: &str = "ffn.norm.weight";
+pub(crate) const SANM_FFN_NORM_BIAS: &str = "ffn.norm.bias";
+pub(crate) const SANM_FFN_UP_WEIGHT: &str = "ffn.up.weight";
+pub(crate) const SANM_FFN_UP_BIAS: &str = "ffn.up.bias";
+pub(crate) const SANM_FFN_DOWN_WEIGHT: &str = "ffn.down.weight";
+pub(crate) const SANM_FFN_DOWN_BIAS: &str = "ffn.down.bias";
+
 // --- 2-layer transformer adaptor -------------------------------------------
 
 pub(crate) const ADAPTOR_LINEAR1_WEIGHT: &str = "adaptor.linear1.weight";
 pub(crate) const ADAPTOR_LINEAR1_BIAS: &str = "adaptor.linear1.bias";
 pub(crate) const ADAPTOR_LINEAR2_WEIGHT: &str = "adaptor.linear2.weight";
 pub(crate) const ADAPTOR_LINEAR2_BIAS: &str = "adaptor.linear2.bias";
+
+/// Per-block adaptor tensor-name suffixes, in the order the runtime contract
+/// enumerates them. The weight binder (`adapter_graph::load_block`) and the
+/// admission contract both resolve every block tensor through these
+/// constants, so the two read sets cannot drift on names.
+pub(crate) const ADAPTOR_ATTN_NORM_WEIGHT: &str = "attn.norm.weight";
+pub(crate) const ADAPTOR_ATTN_NORM_BIAS: &str = "attn.norm.bias";
+pub(crate) const ADAPTOR_ATTN_Q_WEIGHT: &str = "attn.q.weight";
+pub(crate) const ADAPTOR_ATTN_Q_BIAS: &str = "attn.q.bias";
+pub(crate) const ADAPTOR_ATTN_K_WEIGHT: &str = "attn.k.weight";
+pub(crate) const ADAPTOR_ATTN_K_BIAS: &str = "attn.k.bias";
+pub(crate) const ADAPTOR_ATTN_V_WEIGHT: &str = "attn.v.weight";
+pub(crate) const ADAPTOR_ATTN_V_BIAS: &str = "attn.v.bias";
+pub(crate) const ADAPTOR_ATTN_OUT_WEIGHT: &str = "attn.out.weight";
+pub(crate) const ADAPTOR_ATTN_OUT_BIAS: &str = "attn.out.bias";
+pub(crate) const ADAPTOR_FFN_NORM_WEIGHT: &str = "ffn.norm.weight";
+pub(crate) const ADAPTOR_FFN_NORM_BIAS: &str = "ffn.norm.bias";
+pub(crate) const ADAPTOR_FFN_UP_WEIGHT: &str = "ffn.up.weight";
+pub(crate) const ADAPTOR_FFN_UP_BIAS: &str = "ffn.up.bias";
+pub(crate) const ADAPTOR_FFN_DOWN_WEIGHT: &str = "ffn.down.weight";
+pub(crate) const ADAPTOR_FFN_DOWN_BIAS: &str = "ffn.down.bias";
 
 // --- Qwen3-0.6B decoder (tied embeddings + a materialized `output.weight`) --
 

@@ -25,9 +25,6 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::models::sensevoice::graph_config::sensevoice_encoder_graph_config;
 
 use super::runtime_contract::{FUNASR_NANO_ENCODER_LAYER_NORM_EPSILON, FunasrNanoEncoderMetadata};
-use super::tensor_names::{
-    ENC_AFTER_NORM_BIAS, ENC_AFTER_NORM_WEIGHT, TP_NORM_BIAS, TP_NORM_WEIGHT,
-};
 
 const FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
 
@@ -44,6 +41,8 @@ pub(crate) enum FunasrNanoEncoderError {
     WeightRead(#[from] GgufTensorDataReadError),
     #[error("funasr-nano encoder shape error: {reason}")]
     Shape { reason: String },
+    #[error("funasr-nano encoder tensor '{name}' is not part of the runtime tensor contract")]
+    NotInContract { name: String },
 }
 
 fn bf(step: &'static str) -> impl Fn(GgmlCpuGraphError) -> FunasrNanoEncoderError {
@@ -97,8 +96,14 @@ struct EncoderWeights {
 
 fn load_tensor_meta(
     reader: &GgufTensorDataReader,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     name: &str,
 ) -> Result<(String, Vec<usize>, Vec<u64>), FunasrNanoEncoderError> {
+    if !guard.contains(name) {
+        return Err(FunasrNanoEncoderError::NotInContract {
+            name: name.to_string(),
+        });
+    }
     let tensor = reader.tensor_index().get(name).ok_or_else(|| {
         FunasrNanoEncoderError::WeightRead(GgufTensorDataReadError::TensorNotFound {
             path: reader.tensor_index().path().to_path_buf(),
@@ -113,9 +118,10 @@ fn load_tensor_meta(
 /// keep-quantized contract: 1-D norms/biases and the FSMN conv kernel.
 fn load_named(
     reader: &GgufTensorDataReader,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     name: &str,
 ) -> Result<NamedTensor, FunasrNanoEncoderError> {
-    let (name, dims, shape_u64) = load_tensor_meta(reader, name)?;
+    let (name, dims, shape_u64) = load_tensor_meta(reader, guard, name)?;
     let values = reader.host_tensor_f32_copy_dequantized_by_name(&name, &shape_u64)?;
     Ok(NamedTensor { name, dims, values })
 }
@@ -125,9 +131,10 @@ fn load_named(
 /// pitfall K1 forbids for bulk weights.
 fn load_named_bound(
     reader: &GgufTensorDataReader,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     name: &str,
 ) -> Result<NamedTensor, FunasrNanoEncoderError> {
-    let (name, dims, _) = load_tensor_meta(reader, name)?;
+    let (name, dims, _) = load_tensor_meta(reader, guard, name)?;
     Ok(NamedTensor {
         name,
         dims,
@@ -137,46 +144,51 @@ fn load_named_bound(
 
 fn load_layer(
     reader: &GgufTensorDataReader,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     scope: &str,
     layer: usize,
 ) -> Result<LayerWeights, FunasrNanoEncoderError> {
     let n = |suffix: &str| format!("{scope}.{layer}.{suffix}");
     Ok(LayerWeights {
-        attn_norm_weight: load_named(reader, &n("attn.norm.weight"))?,
-        attn_norm_bias: load_named(reader, &n("attn.norm.bias"))?,
-        attn_qkv_weight: load_named_bound(reader, &n("attn.qkv.weight"))?,
-        attn_qkv_bias: load_named(reader, &n("attn.qkv.bias"))?,
-        attn_out_weight: load_named_bound(reader, &n("attn.out.weight"))?,
-        attn_out_bias: load_named(reader, &n("attn.out.bias"))?,
-        attn_fsmn_weight: load_named(reader, &n("attn.fsmn.weight"))?,
-        ffn_norm_weight: load_named(reader, &n("ffn.norm.weight"))?,
-        ffn_norm_bias: load_named(reader, &n("ffn.norm.bias"))?,
-        ffn_up_weight: load_named_bound(reader, &n("ffn.up.weight"))?,
-        ffn_up_bias: load_named(reader, &n("ffn.up.bias"))?,
-        ffn_down_weight: load_named_bound(reader, &n("ffn.down.weight"))?,
-        ffn_down_bias: load_named(reader, &n("ffn.down.bias"))?,
+        attn_norm_weight: load_named(reader, guard, &n("attn.norm.weight"))?,
+        attn_norm_bias: load_named(reader, guard, &n("attn.norm.bias"))?,
+        attn_qkv_weight: load_named_bound(reader, guard, &n("attn.qkv.weight"))?,
+        attn_qkv_bias: load_named(reader, guard, &n("attn.qkv.bias"))?,
+        attn_out_weight: load_named_bound(reader, guard, &n("attn.out.weight"))?,
+        attn_out_bias: load_named(reader, guard, &n("attn.out.bias"))?,
+        attn_fsmn_weight: load_named(reader, guard, &n("attn.fsmn.weight"))?,
+        ffn_norm_weight: load_named(reader, guard, &n("ffn.norm.weight"))?,
+        ffn_norm_bias: load_named(reader, guard, &n("ffn.norm.bias"))?,
+        ffn_up_weight: load_named_bound(reader, guard, &n("ffn.up.weight"))?,
+        ffn_up_bias: load_named(reader, guard, &n("ffn.up.bias"))?,
+        ffn_down_weight: load_named_bound(reader, guard, &n("ffn.down.weight"))?,
+        ffn_down_bias: load_named(reader, guard, &n("ffn.down.bias"))?,
     })
 }
 
 fn load_encoder_weights(
     reader: &GgufTensorDataReader,
+    guard: &crate::models::tensor_binding::TensorReadGuard,
     metadata: &FunasrNanoEncoderMetadata,
 ) -> Result<EncoderWeights, FunasrNanoEncoderError> {
+    use super::tensor_names::{
+        ENC_AFTER_NORM_BIAS, ENC_AFTER_NORM_WEIGHT, TP_NORM_BIAS, TP_NORM_WEIGHT,
+    };
     let mut enc_layers = Vec::with_capacity(metadata.n_layers);
     for layer in 0..metadata.n_layers {
-        enc_layers.push(load_layer(reader, "enc.blk", layer)?);
+        enc_layers.push(load_layer(reader, guard, "enc.blk", layer)?);
     }
     let mut tp_layers = Vec::with_capacity(metadata.tp_blocks);
     for layer in 0..metadata.tp_blocks {
-        tp_layers.push(load_layer(reader, "tp.blk", layer)?);
+        tp_layers.push(load_layer(reader, guard, "tp.blk", layer)?);
     }
     Ok(EncoderWeights {
         enc_layers,
         tp_layers,
-        enc_after_norm_weight: load_named(reader, ENC_AFTER_NORM_WEIGHT)?,
-        enc_after_norm_bias: load_named(reader, ENC_AFTER_NORM_BIAS)?,
-        tp_norm_weight: load_named(reader, TP_NORM_WEIGHT)?,
-        tp_norm_bias: load_named(reader, TP_NORM_BIAS)?,
+        enc_after_norm_weight: load_named(reader, guard, ENC_AFTER_NORM_WEIGHT)?,
+        enc_after_norm_bias: load_named(reader, guard, ENC_AFTER_NORM_BIAS)?,
+        tp_norm_weight: load_named(reader, guard, TP_NORM_WEIGHT)?,
+        tp_norm_bias: load_named(reader, guard, TP_NORM_BIAS)?,
     })
 }
 
@@ -282,7 +294,8 @@ impl FunasrNanoEncoderGraph {
                 .map_err(|error| FunasrNanoEncoderError::Shape {
                     reason: error.to_string(),
                 })?;
-        let weights = load_encoder_weights(&reader, &metadata)?;
+        let guard = super::runtime_contract::funasr_nano_encoder_read_guard(&metadata);
+        let weights = load_encoder_weights(&reader, &guard, &metadata)?;
 
         let mut config = sensevoice_encoder_graph_config(backend);
         config.context_bytes = FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES;
@@ -551,5 +564,80 @@ fn sanm_weights<'a>(arena: &'a GgmlStaticTensorArena, h: &LayerArena) -> SanMFsm
         ffn_up_bias: g(h.ffn_up_bias),
         ffn_down_weight: b(h.ffn_down_weight),
         ffn_down_bias: g(h.ffn_down_bias),
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::models::funasr_nano::runtime_contract::{
+        funasr_nano_encoder_read_guard, funasr_nano_encoder_tensor_descriptors,
+    };
+    use crate::models::tensor_binding::{
+        assert_trace_matches_descriptor_set, project_fixture_tensors,
+    };
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+    fn tiny_encoder_metadata() -> FunasrNanoEncoderMetadata {
+        FunasrNanoEncoderMetadata {
+            n_layers: 1,
+            tp_blocks: 1,
+            d_model: 16,
+            n_heads: 2,
+            head_dim: 8,
+            ffn_dim: 32,
+            fsmn_kernel: 5,
+            feature_dim: 28,
+        }
+    }
+
+    /// The equivalence evidence the count-plus-sampling pin used to fake: run
+    /// the REAL encoder weight loader (both SAN-M scopes plus the tail norms)
+    /// over a synthetic pack projected from the encoder-half contract itself,
+    /// with the tensor index's access trace enabled, and assert the traced
+    /// read set equals the encoder-half descriptor set name for name and
+    /// shape for shape. Any drift -- the loader reading a tensor the contract
+    /// does not list, a descriptor no loader reads, or a read violating the
+    /// descriptor's shape -- fails here. Also exercises the read guard: every
+    /// read is contract-listed.
+    #[test]
+    fn encoder_loader_read_trace_equals_the_contract_descriptors() {
+        let metadata = tiny_encoder_metadata();
+        let descriptors = funasr_nano_encoder_tensor_descriptors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-encoder-trace.oasr");
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write trace pack");
+
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+        reader.tensor_index().enable_access_trace();
+        let guard = funasr_nano_encoder_read_guard(&metadata);
+        load_encoder_weights(&reader, &guard, &metadata).expect("full encoder load");
+
+        assert_trace_matches_descriptor_set(&reader.tensor_index().access_trace(), &descriptors);
+    }
+
+    /// The read guard fails closed on any tensor the contract does not
+    /// enumerate, so a loader/name drift cannot read off-contract.
+    #[test]
+    fn encoder_read_guard_rejects_off_contract_tensors() {
+        let metadata = tiny_encoder_metadata();
+        let guard = funasr_nano_encoder_read_guard(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-encoder-guard.oasr");
+        let spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new())
+            .with_tensor_shape("off.contract.weight", vec![2, 2]);
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+        let reader = GgufTensorDataReader::from_path(&path).expect("reader");
+
+        let error = load_named(&reader, &guard, "off.contract.weight")
+            .expect_err("off-contract reads must fail closed");
+        assert!(
+            matches!(error, FunasrNanoEncoderError::NotInContract { ref name } if name == "off.contract.weight"),
+            "unexpected error: {error}"
+        );
     }
 }
