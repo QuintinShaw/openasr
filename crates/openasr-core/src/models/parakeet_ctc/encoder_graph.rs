@@ -136,6 +136,7 @@ impl ParakeetCtcEncoderGraph {
                 subsampling_channels: metadata.subsampling_channels,
                 scale_input: true,
             },
+            metadata.n_mels,
             mel.n_mels,
             mel.n_frames,
             "parakeet_mel",
@@ -261,5 +262,49 @@ mod tests {
             out.logits.iter().all(|v| v.is_finite()),
             "logits must be finite"
         );
+    }
+
+    #[test]
+    fn encode_rejects_mel_n_mels_that_drifts_from_metadata() {
+        let candidates = [Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/models/parakeet-ctc-0.6b/openasr/parakeet-ctc-0.6b-fp16.oasr")];
+        let Some(path) = candidates.into_iter().find(|p| p.exists()) else {
+            eprintln!("skipping: parakeet-ctc-0.6b pack not present");
+            return;
+        };
+        let preflight =
+            load_runtime_source_metadata_and_tensor_index(&path).expect("runtime preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+        let gguf_metadata = preflight.metadata.as_ref();
+        let metadata = parse_parakeet_ctc_execution_metadata(gguf_metadata).expect("metadata");
+        let weights = load_parakeet_ctc_encoder_weights(&reader, &metadata).expect("weights");
+
+        let mut graph = ParakeetCtcEncoderGraph::new(
+            &weights,
+            metadata,
+            &preflight,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
+        let n_frames = 128usize;
+        let wrong_n_mels = metadata.n_mels.saturating_add(1).max(1);
+        let mel = ParakeetMelFeatures {
+            data: vec![0.0; wrong_n_mels * n_frames],
+            n_frames,
+            n_mels: wrong_n_mels,
+        };
+        let err = graph
+            .encode(&mel)
+            .expect_err("encode must reject mel.n_mels that drifts from metadata");
+        match err {
+            ParakeetEncoderError::Shape { reason } => {
+                assert!(
+                    reason.contains(&wrong_n_mels.to_string())
+                        && reason.contains(&metadata.n_mels.to_string()),
+                    "shape error must report both values, got {reason:?}"
+                );
+            }
+            other => panic!("expected Shape error, got {other:?}"),
+        }
     }
 }

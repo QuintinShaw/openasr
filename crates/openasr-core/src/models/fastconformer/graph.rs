@@ -578,6 +578,21 @@ pub(crate) struct FastConformerStackOutput<'a> {
     pub subsampled_frames: usize,
 }
 
+/// Fail closed when runtime mel geometry drifts from the pack's declared
+/// `n_mels`. Shared by CTC/TDT through [`build_conformer_stack`] so the
+/// invariant has one source of truth.
+pub(crate) fn require_mel_n_mels_matches_metadata(
+    mel_n_mels: usize,
+    metadata_n_mels: usize,
+) -> Result<(), String> {
+    if mel_n_mels != metadata_n_mels {
+        return Err(format!(
+            "mel.n_mels ({mel_n_mels}) does not match metadata.n_mels ({metadata_n_mels})"
+        ));
+    }
+    Ok(())
+}
+
 /// Build the dw-striding subsampling prelude (verbatim cohere FastConformer
 /// clone: conv0+ReLU, dw conv2, pw conv3+ReLU, dw conv5, pw conv6+ReLU) +
 /// linear + optional `scale_input` + the conformer layer loop (the shared
@@ -586,6 +601,9 @@ pub(crate) struct FastConformerStackOutput<'a> {
 /// and upload `mel_t`/`pos_t` (via [`upload_graph_f32`] with
 /// `output.positional`) before computing -- mirroring the ordering the two
 /// families' `encode()` used before this was shared.
+///
+/// `expected_n_mels` is the pack metadata geometry; `n_mels` is the runtime
+/// mel tensor width used to size the graph. They must match.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
@@ -593,11 +611,13 @@ pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
     sub: &SubsamplingArena,
     layers: &[LayerArena],
     config: FastConformerStackConfig,
+    expected_n_mels: usize,
     n_mels: usize,
     n_frames: usize,
     mel_tensor_name: &'static str,
     pos_tensor_name: &'static str,
 ) -> Result<FastConformerStackOutput<'a>, E> {
+    require_mel_n_mels_matches_metadata(n_mels, expected_n_mels).map_err(E::shape)?;
     let d_model = config.hidden_size;
     let subsampled_frames = conv_out_dim(conv_out_dim(conv_out_dim(n_frames)));
     let subsampled_freq = conv_out_dim(conv_out_dim(conv_out_dim(n_mels)));
@@ -794,4 +814,29 @@ pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
         positional,
         subsampled_frames,
     })
+}
+
+#[cfg(test)]
+mod mel_n_mels_tests {
+    use super::require_mel_n_mels_matches_metadata;
+
+    #[test]
+    fn require_mel_n_mels_matches_metadata_accepts_equal_geometry() {
+        assert!(require_mel_n_mels_matches_metadata(80, 80).is_ok());
+        assert!(require_mel_n_mels_matches_metadata(128, 128).is_ok());
+    }
+
+    #[test]
+    fn require_mel_n_mels_matches_metadata_rejects_drift() {
+        let err = require_mel_n_mels_matches_metadata(80, 128)
+            .expect_err("mel geometry that drifts from metadata must fail closed");
+        assert!(
+            err.contains("80") && err.contains("128"),
+            "error must report both values, got {err:?}"
+        );
+        assert!(
+            err.contains("mel.n_mels") && err.contains("metadata.n_mels"),
+            "error must name both fields, got {err:?}"
+        );
+    }
 }
