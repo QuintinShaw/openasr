@@ -1151,7 +1151,10 @@ impl TinyGgufFixtureSpec {
             ("xasr.downsampling_factors", "1"),
             ("xasr.feature_dim", "8"),
             ("xasr.decode_chunk_len", "4"),
-            ("xasr.joiner_dim", "16"),
+            // The decoder conv is a grouped convolution with 128 groups, so
+            // the contract requires a joiner dim divisible by 128; 128 is
+            // the smallest representable skeleton geometry.
+            ("xasr.joiner_dim", "128"),
             ("xasr.decoder_context_size", "2"),
             ("xasr.vocab_size", "32"),
             ("xasr.blank_id", "0"),
