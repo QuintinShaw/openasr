@@ -26,7 +26,8 @@ pub use identity::{
     name_speakers_from_labeled_segments,
 };
 pub(crate) use identity::{
-    name_speakers_across_scopes_with_embedder, resolve_timeline_identities_with_embedder,
+    install_identity_batch_progress_sink, name_speakers_across_scopes_with_embedder,
+    resolve_timeline_identities_with_embedder,
 };
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
