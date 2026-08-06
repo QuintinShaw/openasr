@@ -292,7 +292,8 @@ impl ProgressPlan {
 
         // Identity stage order matches the real pipeline:
         // - external Voice ID: Identify runs on the speaker timeline before decode
-        // - in-decoder Voice ID: Identify runs after decode on assembled scopes
+        // - in-decoder Voice ID: Identify runs after Decode/Punctuate/Align on
+        //   assembled scopes (Decode -> Punctuate -> Align -> Identify -> Project)
         let identify_cost = if input.voice_id {
             let rtf = if accelerated { 0.04 } else { 0.08 };
             Some(0.10 + duration * rtf)
@@ -316,15 +317,6 @@ impl ProgressPlan {
             estimated_cost: 0.20 + duration * decode_rtf,
         });
 
-        if let Some(cost) = identify_cost
-            && !input.external_diarize
-        {
-            stages.push(PlannedStage {
-                stage: TranscriptionStage::IdentifySpeakers,
-                estimated_cost: cost,
-            });
-        }
-
         if input.punctuate {
             stages.push(PlannedStage {
                 stage: TranscriptionStage::Punctuate,
@@ -337,6 +329,17 @@ impl ProgressPlan {
             stages.push(PlannedStage {
                 stage: TranscriptionStage::Align,
                 estimated_cost: 0.20 + duration * align_rtf,
+            });
+        }
+
+        // InDecoder identity needs punctuated / aligned word anchors when those
+        // stages run, so it sits after them and before dual-view projection.
+        if let Some(cost) = identify_cost
+            && !input.external_diarize
+        {
+            stages.push(PlannedStage {
+                stage: TranscriptionStage::IdentifySpeakers,
+                estimated_cost: cost,
             });
         }
 
@@ -995,24 +998,36 @@ mod tests {
             voice_id: true,
             external_diarize: false,
             segmenter: ProgressSegmenterKind::Auto,
-            punctuate: false,
-            align: false,
+            punctuate: true,
+            align: true,
             backend: ProgressBackendClass::AutoOrCpu,
             persist: false,
         });
         let labels: Vec<_> = plan.stages().iter().map(|s| s.stage).collect();
         assert!(!plan.contains(TranscriptionStage::Diarize));
-        let identify = labels
-            .iter()
-            .position(|s| *s == TranscriptionStage::IdentifySpeakers)
-            .unwrap();
         let decode = labels
             .iter()
             .position(|s| *s == TranscriptionStage::Decode)
             .unwrap();
+        let punctuate = labels
+            .iter()
+            .position(|s| *s == TranscriptionStage::Punctuate)
+            .unwrap();
+        let align = labels
+            .iter()
+            .position(|s| *s == TranscriptionStage::Align)
+            .unwrap();
+        let identify = labels
+            .iter()
+            .position(|s| *s == TranscriptionStage::IdentifySpeakers)
+            .unwrap();
+        let project = labels
+            .iter()
+            .position(|s| *s == TranscriptionStage::Project)
+            .unwrap();
         assert!(
-            decode < identify,
-            "in-decoder identity must run after decode: {labels:?}"
+            decode < punctuate && punctuate < align && align < identify && identify < project,
+            "in-decoder plan must be Decode->Punctuate->Align->Identify->Project: {labels:?}"
         );
     }
 

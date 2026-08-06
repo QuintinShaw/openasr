@@ -48,24 +48,40 @@ const ORPHAN_MAX_WORDS: usize = 2;
 /// overwriting `transcription.segments`. Prefer
 /// [`resegment_segments_into_cues`] + reading projection for the dual-view
 /// pipeline; this helper remains for callers that only need cue segments.
+///
+/// Without a known audio duration the final cue is not CPS-stretched (no
+/// unbounded display end); pass a duration via
+/// [`resegment_segments_into_cues`] when available.
 pub fn resegment_transcription_cues(mut transcription: Transcription) -> Transcription {
     if transcription.segments.is_empty() {
         return transcription;
     }
     transcription.segments =
-        resegment_segments_into_cues(std::mem::take(&mut transcription.segments));
+        resegment_segments_into_cues(std::mem::take(&mut transcription.segments), None);
     transcription
 }
 
-/// Split attributed segments into short subtitle cues. Speaker identity on each
-/// input segment is copied onto every child cue; segments are never merged, so
-/// a speaker change is always a hard boundary.
-pub fn resegment_segments_into_cues(segments: Vec<Segment>) -> Vec<Segment> {
+/// Split attributed segments into short subtitle cues, then layout display ends
+/// with CPS stretch clamped to the next cue start or `audio_duration_s`.
+///
+/// Speaker identity on each input segment is copied onto every child cue;
+/// segments are never merged, so a speaker change is always a hard boundary.
+///
+/// Display-time priority (never rewrites text):
+/// 1. do not cross the next cue start or audio end
+/// 2. do not overlap neighbouring cues
+/// 3. stretch toward `content / max_cps` when that target fits inside the hard end
+/// 4. otherwise keep the acoustic end (clamped to the hard end) -- never
+///    fabricate an out-of-bounds display time just to meet CPS
+pub fn resegment_segments_into_cues(
+    segments: Vec<Segment>,
+    audio_duration_s: Option<f32>,
+) -> Vec<Segment> {
     let mut cues = Vec::with_capacity(segments.len());
     for segment in segments {
         cues.extend(segment_into_cues(segment));
     }
-    cues
+    layout_cue_display_ends(cues, audio_duration_s)
 }
 
 /// A word-sized unit the packer reasons over: its character span within the
@@ -80,16 +96,20 @@ struct CueToken {
 }
 
 /// Split one attributed segment into zero or more short subtitle cues.
+///
+/// Emit acoustic start/end only. Cross-cue CPS display stretch is applied
+/// later by [`layout_cue_display_ends`] so a dense cue cannot invent an end
+/// that overlaps the next speaker or runs past the audio.
 pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
     let chars: Vec<char> = segment.text.chars().collect();
     let (tokens, real_words) = build_tokens(&segment, &chars);
     let limits = cue_limits(&chars);
     if tokens.len() < 2 {
-        return vec![stretch_segment_display_for_cps(segment, &limits)];
+        return vec![segment];
     }
     let ranges = pack_tokens(&chars, &tokens, limits);
     if ranges.len() <= 1 {
-        return vec![stretch_segment_display_for_cps(segment, &limits)];
+        return vec![segment];
     }
     let mut cues = Vec::with_capacity(ranges.len());
     for (first, last) in ranges {
@@ -101,12 +121,9 @@ pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
             continue;
         }
         let start = tokens[first].start.max(segment.start);
-        // Acoustic end is clamped to the parent segment; CPS stretch below may
-        // extend display duration beyond the acoustic end so dense text stays
-        // readable. Text is never rewritten.
-        let acoustic_end = tokens[last].end.max(start).min(segment.end.max(start));
-        let content = content_char_count_in_range(&chars, &tokens, first, last);
-        let end = stretch_end_for_cps(start, acoustic_end, content, limits.max_cps);
+        // Acoustic end only; CPS stretch is a later layout step that sees the
+        // next cue / audio hard end and refuses to fabricate out-of-bounds times.
+        let end = tokens[last].end.max(start).min(segment.end.max(start));
         let words: Vec<WordTimestamp> = if real_words {
             segment.words[first..=last].to_vec()
         } else {
@@ -124,32 +141,69 @@ pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
         });
     }
     if cues.len() <= 1 {
-        return vec![stretch_segment_display_for_cps(segment, &limits)];
+        return vec![segment];
     }
     cues
 }
 
-/// Stretch a cue's display `end` so content reading speed stays at or under
-/// `max_cps`. Text is unchanged; multi-token packers still prefer splitting
-/// before this last-resort display stretch.
-fn stretch_end_for_cps(start: f32, end: f32, content_chars: usize, max_cps: f32) -> f32 {
-    if content_chars == 0 || max_cps <= 0.0 {
-        return end.max(start);
+/// Apply bounded CPS display stretch across packed cues.
+///
+/// `hard_end` for cue `i` is the next cue's start, or `audio_duration_s` for
+/// the last cue. Stretch only when the CPS target fits inside that bound;
+/// otherwise keep the acoustic end (clamped). Text is never rewritten.
+fn layout_cue_display_ends(mut cues: Vec<Segment>, audio_duration_s: Option<f32>) -> Vec<Segment> {
+    let n = cues.len();
+    if n == 0 {
+        return cues;
     }
-    let min_duration = content_chars as f32 / max_cps;
-    end.max(start).max(start + min_duration)
+    let audio_hard_end = audio_duration_s.filter(|d| d.is_finite() && *d >= 0.0);
+    for i in 0..n {
+        let hard_end = if i + 1 < n {
+            Some(cues[i + 1].start)
+        } else {
+            audio_hard_end
+        };
+        let start = cues[i].start;
+        let acoustic_end = cues[i].end.max(start);
+        let Some(hard_end) = hard_end else {
+            // No next cue and no audio bound: refuse unbounded stretch.
+            cues[i].end = acoustic_end;
+            continue;
+        };
+        let chars: Vec<char> = cues[i].text.chars().collect();
+        let limits = cue_limits(&chars);
+        let content = chars
+            .iter()
+            .copied()
+            .filter(|c| char_has_content(*c))
+            .count();
+        cues[i].end = display_end_for_cps(start, acoustic_end, hard_end, content, limits.max_cps);
+    }
+    cues
 }
 
-/// Apply CPS display stretch to a single unsplit segment (one token, or a
-/// pack that could not cut). Preserves text and speaker fields.
-fn stretch_segment_display_for_cps(mut segment: Segment, limits: &CueLimits) -> Segment {
-    let content = segment
-        .text
-        .chars()
-        .filter(|c| char_has_content(*c))
-        .count();
-    segment.end = stretch_end_for_cps(segment.start, segment.end, content, limits.max_cps);
-    segment
+/// Resolve a cue's display end under a hard bound.
+///
+/// When `start + content/max_cps` fits inside `hard_end`, stretch (or keep)
+/// to that target clamped by `hard_end`. When it does not, keep the acoustic
+/// end clamped to `hard_end` -- never invent a time past the hard bound.
+fn display_end_for_cps(
+    start: f32,
+    acoustic_end: f32,
+    hard_end: f32,
+    content_chars: usize,
+    max_cps: f32,
+) -> f32 {
+    let acoustic_end = acoustic_end.max(start);
+    if content_chars == 0 || max_cps <= 0.0 {
+        return acoustic_end.min(hard_end).max(start);
+    }
+    let target = start + content_chars as f32 / max_cps;
+    if target <= hard_end {
+        hard_end.min(acoustic_end.max(target)).max(start)
+    } else {
+        acoustic_end.min(hard_end).max(start)
+    }
 }
 
 /// Build the token stream for a segment. Returns `(tokens, real_words)` where
@@ -317,9 +371,9 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(u
 /// The grow loop already refuses to *add* a token that would overflow, but a
 /// subsequent natural cut (pause / clause / widest gap) can shrink duration
 /// faster than content and raise CPS above the cap. Shrink until the range
-/// fits. A single token that still fails is retained for emission; display
-/// duration is stretched later via [`stretch_end_for_cps`] so reading speed
-/// stays within `max_cps` without rewriting text.
+/// fits. A single token that still fails is retained for emission; later
+/// layout may stretch its display end only when a hard bound (next cue /
+/// audio end) has room -- never by inventing an unbounded end.
 fn enforce_range_fits(
     chars: &[char],
     tokens: &[CueToken],
@@ -331,7 +385,7 @@ fn enforce_range_fits(
         return end;
     }
     if start >= end {
-        // Physically unsplittable single token; keep it (CPS stretch at emit).
+        // Physically unsplittable single token; keep it (bounded layout later).
         return end;
     }
     // Prefer a natural cut inside the failing window when that sub-range fits.
@@ -356,7 +410,7 @@ fn enforce_range_fits(
         }
         break;
     }
-    // Last resort: single leading token; emit-time stretch enforces CPS.
+    // Last resort: single leading token; layout may stretch only inside bounds.
     start
 }
 
@@ -877,7 +931,8 @@ mod tests {
     #[test]
     fn never_crosses_speaker_turns() {
         // Two segments, distinct speakers: re-segmentation stays within each and
-        // never merges across the turn boundary.
+        // never merges across the turn boundary. Display ends also must not
+        // overlap the next speaker's start.
         let mut a = segment(
             "alpha bravo charlie. delta echo foxtrot.",
             vec![
@@ -895,10 +950,10 @@ mod tests {
             vec![word("golf", 2.5, 2.8), word("hotel.", 2.9, 3.2)],
         );
         b.speaker = Some("SPEAKER_01".to_string());
-        let out = resegment_transcription_cues(transcription(vec![a, b]));
+        let out = resegment_segments_into_cues(vec![a, b], Some(3.2));
         // Each cue carries exactly one speaker; the SPEAKER_01 content is never
         // fused with SPEAKER_00 content.
-        for cue in &out.segments {
+        for cue in &out {
             let speaker = cue.speaker.as_deref().unwrap();
             if cue.text.contains("golf") || cue.text.contains("hotel") {
                 assert_eq!(speaker, "SPEAKER_01");
@@ -907,9 +962,92 @@ mod tests {
             }
         }
         assert!(
-            out.segments
-                .iter()
+            out.iter()
                 .any(|c| c.speaker.as_deref() == Some("SPEAKER_01"))
+        );
+        // Time assertions: no fabricated overlap across the speaker turn.
+        for window in out.windows(2) {
+            assert!(
+                window[0].end <= window[1].start + 1e-4,
+                "cues must not overlap: {:?} then {:?}",
+                window[0],
+                window[1]
+            );
+        }
+        let speaker_00_end = out
+            .iter()
+            .filter(|c| c.speaker.as_deref() == Some("SPEAKER_00"))
+            .map(|c| c.end)
+            .fold(0.0f32, f32::max);
+        let speaker_01_start = out
+            .iter()
+            .filter(|c| c.speaker.as_deref() == Some("SPEAKER_01"))
+            .map(|c| c.start)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            speaker_00_end <= speaker_01_start + 1e-4,
+            "SPEAKER_00 display end {speaker_00_end} must not cross SPEAKER_01 start {speaker_01_start}"
+        );
+    }
+
+    #[test]
+    fn cps_stretch_clamps_to_next_cue_start() {
+        // Dense speaker-A cue abutting speaker B: CPS would want ~1.43s of
+        // display for 30 Latin chars, but must not cross B at 0.5s.
+        let text_a = "abcdefghijabcdefghijabcdefghij"; // 30 content chars
+        let mut a = segment(text_a, vec![word(text_a, 0.0, 0.5)]);
+        a.speaker = Some("SPEAKER_00".to_string());
+        let mut b = segment("ok", vec![word("ok", 0.5, 0.8)]);
+        b.speaker = Some("SPEAKER_01".to_string());
+        let cues = resegment_segments_into_cues(vec![a, b], Some(1.0));
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, text_a);
+        assert!(
+            cues[0].end <= 0.5 + 1e-4,
+            "A.end must not cross B.start: got {}",
+            cues[0].end
+        );
+        assert!(
+            cues[0].end <= cues[1].start + 1e-4,
+            "cues must not overlap: A.end={} B.start={}",
+            cues[0].end,
+            cues[1].start
+        );
+        // Text unchanged; time is acoustic (could not meet CPS inside hard end).
+        assert!((cues[0].end - 0.5).abs() < 1e-3 || cues[0].end <= 0.5);
+    }
+
+    #[test]
+    fn cps_stretch_clamps_to_audio_duration() {
+        // Lone dense cue: stretch toward CPS when room exists inside audio,
+        // but never past the recording end.
+        let text = "abcdefghijabcdefghijabcdefghij"; // 30 chars; target ~1.429s
+        let seg = segment(text, vec![word(text, 0.0, 0.5)]);
+        let cues = resegment_segments_into_cues(vec![seg], Some(1.0));
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, text);
+        assert!(
+            cues[0].end <= 1.0 + 1e-4,
+            "display end must clamp to audio duration: got {}",
+            cues[0].end
+        );
+        // 30/21 ≈ 1.429 > 1.0 hard end: refuse to fabricate past audio; keep
+        // acoustic end clamped to audio.
+        assert!(
+            (cues[0].end - 0.5).abs() < 1e-3,
+            "when CPS target exceeds audio end, keep acoustic: got {}",
+            cues[0].end
+        );
+
+        // With enough audio room the same dense cue does stretch to the CPS target.
+        let seg = segment(text, vec![word(text, 0.0, 0.5)]);
+        let cues = resegment_segments_into_cues(vec![seg], Some(3.0));
+        let content = text.chars().filter(|c| char_has_content(*c)).count();
+        let target = cues[0].start + content as f32 / LATIN_MAX_CPS;
+        assert!(
+            (cues[0].end - target).abs() < 1e-3,
+            "with room under audio end, stretch to CPS target {target}, got {}",
+            cues[0].end
         );
     }
 
@@ -980,9 +1118,9 @@ mod tests {
     #[test]
     fn splits_high_cps_multi_token_range() {
         // Dense multi-token burst: many content chars packed into a short
-        // window so the whole run exceeds LATIN_MAX_CPS. Each emitted cue must
-        // satisfy the CPS cap (multi-token breaches must not pass silently;
-        // there is no skip exemption after split + display stretch).
+        // window so the whole run exceeds LATIN_MAX_CPS. The packer must
+        // split; layout may only stretch inside the next-cue / audio hard end
+        // and must not invent unbounded display times.
         let tokens = [
             "abcdefghij", // 10 chars
             "klmnopqrst", // 10
@@ -1000,46 +1138,53 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let text = tokens.join(" ");
-        let cues = segment_into_cues(segment(&text, words));
+        let acoustic = segment_into_cues(segment(&text, words.clone()));
         assert!(
-            cues.len() >= 2,
-            "high-CPS multi-token run must split: {cues:?}"
+            acoustic.len() >= 2,
+            "high-CPS multi-token run must split: {acoustic:?}"
         );
-        for cue in &cues {
-            let duration = cue.end - cue.start;
+        // Multi-token acoustic ranges must not silently exceed the CPS cap;
+        // single-token leftovers may still be dense until layout stretches
+        // (and only when a hard end has room).
+        for cue in &acoustic {
+            if cue.words.len() > 1 {
+                let duration = (cue.end - cue.start).max(1e-6);
+                let content = cue.text.chars().filter(|c| char_has_content(*c)).count();
+                let cps = content as f32 / duration;
+                assert!(
+                    cps <= LATIN_MAX_CPS + 1e-3,
+                    "multi-token cue CPS {cps} exceeds cap: {cue:?}"
+                );
+            }
+        }
+        let laid_out = resegment_segments_into_cues(vec![segment(&text, words)], Some(2.0));
+        for window in laid_out.windows(2) {
             assert!(
-                duration > 1e-3,
-                "cue must have positive display duration: {cue:?}"
-            );
-            let content = cue.text.chars().filter(|c| char_has_content(*c)).count();
-            let cps = content as f32 / duration;
-            assert!(
-                cps <= LATIN_MAX_CPS + 1e-3,
-                "cue CPS {cps} exceeds cap (no skip exemption): {cue:?}"
+                window[0].end <= window[1].start + 1e-4,
+                "layout must not overlap cues: {:?} then {:?}",
+                window[0],
+                window[1]
             );
         }
+        assert!(
+            laid_out.last().unwrap().end <= 2.0 + 1e-4,
+            "layout must not pass audio end"
+        );
     }
 
     #[test]
-    fn stretches_single_token_high_cps_display_end() {
-        // One dense word on a short acoustic window: cannot split, so display
-        // end must stretch to content/max_cps while text stays identical.
+    fn segment_into_cues_keeps_acoustic_end_without_unbounded_stretch() {
+        // Packer emit path must not invent display time past the acoustic end;
+        // stretch is a later layout step that sees hard bounds.
         let text = "abcdefghijabcdefghijabcdefghij"; // 30 content chars
         let words = vec![word(text, 0.0, 0.5)]; // 30/0.5 = 60 CPS >> 21
         let cues = segment_into_cues(segment(text, words));
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].text, text);
-        let content = text.chars().filter(|c| char_has_content(*c)).count();
-        let min_end = cues[0].start + content as f32 / LATIN_MAX_CPS;
         assert!(
-            cues[0].end + 1e-4 >= min_end,
-            "single-token high CPS must stretch end >= {min_end}, got {}",
+            (cues[0].end - 0.5).abs() < 1e-4,
+            "segment_into_cues must keep acoustic end, got {}",
             cues[0].end
-        );
-        let cps = content as f32 / (cues[0].end - cues[0].start);
-        assert!(
-            cps <= LATIN_MAX_CPS + 1e-3,
-            "stretched single-token CPS {cps} still exceeds cap"
         );
     }
 

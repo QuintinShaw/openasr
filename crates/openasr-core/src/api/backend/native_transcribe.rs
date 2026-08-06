@@ -1539,6 +1539,7 @@ pub fn refine_existing_transcription_timeline(
             crate::subtitle::TimelineProjectOptions {
                 timeline_quality: quality,
                 strip_words: !keep_word_timestamps,
+                audio_duration_s: Some(audio_duration_s),
             },
         ));
     }
@@ -1574,6 +1575,7 @@ pub fn refine_existing_transcription_timeline(
         crate::subtitle::TimelineProjectOptions {
             timeline_quality: crate::subtitle::TimelineQuality::ForcedAligned,
             strip_words: !keep_word_timestamps,
+            audio_duration_s: Some(audio_duration_s),
         },
     ))
 }
@@ -2829,6 +2831,8 @@ fn prepare_native_transcription(
 /// timelines may require word anchors to project a coarse ASR segment without
 /// losing speaker turns. After identity, project the dual reading + subtitle
 /// views from the attributed word timeline.
+///
+/// InDecoder progress order: Decode -> Punctuate -> Align -> Identify -> Project.
 fn finalize_native_transcription(
     mut transcription: Transcription,
     speaker: &SpeakerFinalizationContext,
@@ -2847,8 +2851,9 @@ fn finalize_native_transcription(
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
             // acoustic evidence, stitches matching voices, and names enrolled
-            // people. Runs after decode (plan order places IdentifySpeakers
-            // post-decode for this path) with real batch sub-progress.
+            // people. Runs after punctuate/align (plan order:
+            // Decode -> Punctuate -> Align -> Identify -> Project) with real
+            // batch sub-progress.
             progress.enter_stage(TranscriptionStage::IdentifySpeakers);
             let identity_progress = progress.clone();
             let _identity_progress_guard =
@@ -2908,6 +2913,7 @@ fn finalize_native_transcription(
             crate::subtitle::TimelinePrecisionPolicy::Always
         );
     let strip_words = !keep_words;
+    let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
     progress.enter_stage(TranscriptionStage::Project);
     progress.report_fraction(0.0);
     let projected = crate::subtitle::project_transcription(
@@ -2915,6 +2921,7 @@ fn finalize_native_transcription(
         crate::subtitle::TimelineProjectOptions {
             timeline_quality,
             strip_words,
+            audio_duration_s: Some(audio_duration_s),
         },
     );
     progress.report_fraction(1.0);

@@ -134,7 +134,7 @@ pub fn decide_forced_alignment(
 
 /// Options for projecting a speaker-attributed transcription into reading +
 /// subtitle views.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimelineProjectOptions {
     /// Quality tag written onto the result.
     pub timeline_quality: TimelineQuality,
@@ -143,6 +143,9 @@ pub struct TimelineProjectOptions {
     /// forced on for internal Voice ID / cue packing and the caller did not
     /// request word timestamps.
     pub strip_words: bool,
+    /// Recording length in seconds. Used as the hard end for the last subtitle
+    /// cue's CPS display stretch so layout never fabricates time past the audio.
+    pub audio_duration_s: Option<f32>,
 }
 
 /// Project attributed segments into reading paragraphs + subtitle cues.
@@ -155,7 +158,7 @@ pub fn project_transcription(
     options: TimelineProjectOptions,
 ) -> Transcription {
     let attributed = std::mem::take(&mut transcription.segments);
-    let subtitle_cues = resegment_segments_into_cues(attributed.clone());
+    let subtitle_cues = resegment_segments_into_cues(attributed.clone(), options.audio_duration_s);
     let reading = merge_reading_segments(attributed);
     transcription.segments = reading;
     transcription.subtitle_cues = subtitle_cues;
@@ -350,6 +353,7 @@ mod tests {
             TimelineProjectOptions {
                 timeline_quality: TimelineQuality::NativeReliable,
                 strip_words: false,
+                audio_duration_s: Some(3.5),
             },
         );
         assert_eq!(out.timeline_quality, Some(TimelineQuality::NativeReliable));
@@ -373,6 +377,7 @@ mod tests {
             TimelineProjectOptions {
                 timeline_quality: TimelineQuality::ForcedAligned,
                 strip_words: true,
+                audio_duration_s: Some(3.5),
             },
         );
         assert!(out.segments.iter().all(|s| s.words.is_empty()));
