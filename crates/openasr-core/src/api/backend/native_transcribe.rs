@@ -2881,16 +2881,20 @@ fn finalize_native_transcription(
     // their decode-scope provenance. Cue splitting copies the resolved speaker
     // identity fields onto every child afterwards.
     //
-    // Strip top-level words when they were only forced on for internal Voice
-    // ID / cue packing and the caller did not request word timestamps. Cue
-    // start/end stay correct either way. Always / explicit refine keep words.
+    // Strip top-level words unless the caller asked to keep them. Words may
+    // have been produced by native decode, by Auto/subtitle forced alignment,
+    // or by Voice ID packing; cue start/end stay correct either way. Always /
+    // explicit refine / requested word timestamps keep words on the wire.
+    // Do not gate this on `strip_forced_word_timestamps` alone: that flag only
+    // tracks decode-time diarization forcing and would miss Whisper/Auto+SRT
+    // whole-document alignment, leaking unrequested per-word arrays.
     let keep_words = request_word_timestamps
         || explicit_refine
         || matches!(
             timeline_precision,
             crate::subtitle::TimelinePrecisionPolicy::Always
         );
-    let strip_words = speaker.strip_forced_word_timestamps && !keep_words;
+    let strip_words = !keep_words;
     Ok(crate::subtitle::project_transcription(
         transcription,
         crate::subtitle::TimelineProjectOptions {
