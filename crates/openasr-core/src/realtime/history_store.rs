@@ -514,6 +514,96 @@ impl DaemonHistoryStore {
         Ok(entry)
     }
 
+    /// Atomically replaces the stored transcript body (text + dual-view
+    /// segments envelope) under optimistic concurrency. Used by post-hoc
+    /// precise-timeline refine so History keeps the re-projected reading
+    /// segments and subtitle cues without rewriting model/source metadata.
+    pub fn replace_transcript(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        transcription: &crate::api::backend::Transcription,
+    ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
+        validate_history_id(id)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+        let row = tx
+            .query_row(
+                "SELECT model, source_name, revision FROM history_entries WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(DaemonHistoryStoreError::Query)?
+            .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
+        let (model, source_name, revision) = row;
+        let actual_revision = revision.max(0) as u64;
+        if actual_revision != expected_revision {
+            return Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+
+        let body = PersistedTranscriptBody {
+            segments: transcription.segments.clone(),
+            subtitle_cues: transcription.subtitle_cues.clone(),
+            timeline_quality: transcription.timeline_quality,
+        };
+        let has_timed = !body.segments.is_empty() || !body.subtitle_cues.is_empty();
+        let segments_json = if has_timed {
+            Some(serde_json::to_string(&body).map_err(|error| {
+                DaemonHistoryStoreError::InvalidRecord {
+                    field: "segments",
+                    reason: format!("transcript body cannot be serialized: {error}"),
+                }
+            })?)
+        } else {
+            None
+        };
+        // Match `row_to_entry`: export formats follow reading-segment presence.
+        let formats = formats_for_content(!body.segments.is_empty());
+        // formats column is write-only for schema compatibility; see ENTRY_COLUMNS.
+        let formats_json = serde_json::to_string(&formats).expect("Vec<String> always serializes");
+        let preview = preview_text(&transcription.text);
+        let search_text = format!(
+            "{model} {} {}",
+            source_name.as_deref().unwrap_or(""),
+            transcription.text
+        );
+        let new_revision = actual_revision.saturating_add(1);
+        tx.execute(
+            "UPDATE history_entries SET text = ?1, segments_json = ?2, preview = ?3, \
+             formats = ?4, revision = ?5 WHERE id = ?6",
+            params![
+                transcription.text,
+                segments_json,
+                preview,
+                formats_json,
+                new_revision as i64,
+                id
+            ],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        // FTS5 external table: replace the search row so text edits are findable.
+        tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
+            .map_err(DaemonHistoryStoreError::Query)?;
+        tx.execute(
+            "INSERT INTO history_entries_fts (id, search_text) VALUES (?1, ?2)",
+            params![id, search_text],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+        self.get(id)?
+            .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))
+    }
+
     pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
         validate_history_id(id)?;
         let mut conn = self.connection()?;
@@ -1735,6 +1825,107 @@ mod tests {
                 )]
             ),
             Err(DaemonHistoryStoreError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn history_replace_transcript_updates_body_and_rejects_stale_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper".into(),
+                source_name: Some("clip.wav".into()),
+                duration_seconds: Some(2.0),
+                output_format: Some(ResponseFormat::Json),
+                diarization_active: Some(true),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
+                text: "hello world".into(),
+                segments: vec![Segment {
+                    start: 0.0,
+                    end: 1.5,
+                    text: "hello world".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    speaker_label: Some("SPEAKER_00".into()),
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
+                    words: vec![WordTimestamp {
+                        word: "hello".into(),
+                        start: 0.0,
+                        end: 0.5,
+                        confidence: None,
+                    }],
+                }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: Some(TimelineQuality::NativeApproximate),
+            })
+            .unwrap();
+
+        let refined = crate::api::backend::Transcription {
+            text: "hello world".into(),
+            segments: vec![Segment {
+                start: 0.0,
+                end: 1.5,
+                text: "hello world".into(),
+                speaker: Some("Alice".into()),
+                speaker_label: Some("SPEAKER_00".into()),
+                speaker_person_id: Some("person-alice".into()),
+                speaker_snapshot_label: Some("Alice".into()),
+                words: vec![
+                    WordTimestamp {
+                        word: "hello".into(),
+                        start: 0.05,
+                        end: 0.45,
+                        confidence: None,
+                    },
+                    WordTimestamp {
+                        word: "world".into(),
+                        start: 0.5,
+                        end: 1.1,
+                        confidence: None,
+                    },
+                ],
+            }],
+            subtitle_cues: vec![Segment {
+                start: 0.05,
+                end: 1.1,
+                text: "hello world".into(),
+                speaker: Some("Alice".into()),
+                speaker_label: Some("SPEAKER_00".into()),
+                speaker_person_id: Some("person-alice".into()),
+                speaker_snapshot_label: Some("Alice".into()),
+                words: Vec::new(),
+            }],
+            timeline_quality: Some(TimelineQuality::ForcedAligned),
+            ..Default::default()
+        };
+
+        let updated = store
+            .replace_transcript(&entry.id, entry.revision, &refined)
+            .unwrap();
+        assert_eq!(updated.entry.revision, 1);
+        assert_eq!(
+            updated.timeline_quality,
+            Some(TimelineQuality::ForcedAligned)
+        );
+        assert_eq!(updated.segments[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(
+            updated.segments[0].speaker_person_id.as_deref(),
+            Some("person-alice")
+        );
+        assert_eq!(updated.subtitle_cues.len(), 1);
+        assert!(
+            updated.entry.formats.iter().any(|format| format == "srt"),
+            "refined dual-view rows must advertise subtitle formats"
+        );
+
+        assert!(matches!(
+            store.replace_transcript(&entry.id, 0, &refined),
+            Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
         ));
     }
 

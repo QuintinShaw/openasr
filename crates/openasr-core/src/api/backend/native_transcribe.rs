@@ -1649,13 +1649,84 @@ fn resolve_prepared_audio_samples(
     .map(PcmBuffer::from_vec)
 }
 
+/// Post-hoc precise timeline refine for a finished transcription.
+///
+/// Does **not** re-run ASR. Re-validates word anchors against `prepared_audio`
+/// (16 kHz mono f32). When the timeline is already precise and validates,
+/// re-projects reading + subtitle views and returns without loading the
+/// Forced Aligner. Otherwise runs the whole-document forced aligner, then
+/// projects dual views with [`TimelineQuality::ForcedAligned`].
+///
+/// Speaker labels / person attribution on segments are preserved; only word
+/// timestamps and the dual-view projection change. Missing Forced Aligner pack
+/// fails closed with [`BackendError::WordTimestampAlignmentPackMissing`] (no
+/// silent download).
+pub fn refine_existing_transcription_timeline(
+    transcription: Transcription,
+    prepared_audio_16khz_mono: &[f32],
+    execution_services: &NativeExecutionServices,
+    execution_target: crate::ExecutionTarget,
+    language_hint: Option<&str>,
+    keep_word_timestamps: bool,
+) -> Result<Transcription, BackendError> {
+    if prepared_audio_16khz_mono.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "audio is empty; cannot refine timeline without PCM samples".into(),
+        });
+    }
+    if transcription.segments.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "transcription has no timed segments to align".into(),
+        });
+    }
+    let audio_duration_s = prepared_audio_16khz_mono.len() as f32 / 16_000.0;
+    let validation = crate::subtitle::validate_word_anchors(&transcription, audio_duration_s);
+    let already_precise = matches!(
+        transcription.timeline_quality,
+        Some(crate::subtitle::TimelineQuality::NativeReliable)
+            | Some(crate::subtitle::TimelineQuality::ForcedAligned)
+    );
+    if already_precise && validation.is_reliable() {
+        let quality = transcription
+            .timeline_quality
+            .unwrap_or(crate::subtitle::TimelineQuality::NativeReliable);
+        return Ok(crate::subtitle::project_transcription(
+            transcription,
+            crate::subtitle::TimelineProjectOptions {
+                timeline_quality: quality,
+                strip_words: !keep_word_timestamps,
+            },
+        ));
+    }
+
+    let pcm = PcmBuffer::from_vec(prepared_audio_16khz_mono.to_vec());
+    let request_intent = ExecutionIntent::from(execution_target);
+    // Align is a separate heavyweight phase; drop idle primary ASR caches so
+    // the aligner can quote its graph against free headroom.
+    execution_services.unload_idle_native_model_runtime_caches();
+    let refined = refine_transcription_word_timestamps_with_forced_aligner_policy(
+        transcription,
+        pcm.full_slice(),
+        language_hint,
+        execution_services,
+        &request_intent,
+    )?;
+    Ok(crate::subtitle::project_transcription(
+        refined,
+        crate::subtitle::TimelineProjectOptions {
+            timeline_quality: crate::subtitle::TimelineQuality::ForcedAligned,
+            strip_words: !keep_word_timestamps,
+        },
+    ))
+}
+
 /// Reuses the exact normalized PCM backing decoded by the main request and
 /// loads the installed Qwen3-ForcedAligner pack once. Each already-bounded ASR
 /// segment is aligned independently, then its local spans are mapped back to
 /// the recording clock. This keeps graph memory bounded by the largest decode
 /// segment instead of growing with the whole meeting. Segment text and speaker
 /// attribution are left untouched; only `words` changes.
-fn refine_transcription_word_timestamps_with_forced_aligner_policy(
+pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     transcription: Transcription,
     prepared_audio: PcmSlice,
     language_hint: Option<&str>,

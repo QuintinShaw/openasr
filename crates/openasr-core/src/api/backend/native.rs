@@ -55,6 +55,7 @@ pub use native_transcribe::{
     LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
     describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
     native_transcription_progress, native_transcription_progress_for_id,
+    refine_existing_transcription_timeline,
 };
 pub use request_execution_context::RequestExecutionContext;
 pub use transcription_control::{

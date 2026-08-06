@@ -20,8 +20,9 @@ pub use native::{
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
-    native_transcription_progress_for_id, resolve_local_native_runtime_model_identity,
-    validate_local_native_model_pack_path, verify_native_runtime_model_pack_path,
+    native_transcription_progress_for_id, refine_existing_transcription_timeline,
+    resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
+    verify_native_runtime_model_pack_path,
 };
 pub use request_context::{
     FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,

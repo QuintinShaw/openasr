@@ -152,6 +152,10 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
             put(history_assign_speakers),
         )
         .route(
+            "/v1/history/{id}/transcript",
+            post(history_replace_transcript),
+        )
+        .route(
             "/v1/voice-id/persons",
             get(list_persons).post(enroll_person),
         )
@@ -215,6 +219,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
             delete(revoke_pairing_credential),
         )
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/audio/precise-timeline", post(precise_timeline))
         .route(
             "/v1/audio/transcriptions/progress",
             get(transcription_progress),

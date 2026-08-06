@@ -1,7 +1,12 @@
 //! HTTP transcription/translation handlers and all supporting helpers.
 //! Pure code-motion from `lib.rs`; shared crate-root items come via `use crate::*`.
 
-use std::{io::Write, path::Path, str::FromStr, sync::Arc};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 
 use axum::http::HeaderValue;
 
@@ -14,10 +19,11 @@ use openasr_core::{
     LongFormOptions, ModelResolutionError, NativeAsrError, NativeAsrExecutor,
     NativeAsrHardwareTarget, NativeAsrOfflineRequest, NativeAsrRequestOptions,
     NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig, ResponseFormat,
-    RuntimeModelResolutionError, TranscriptionRequest, TranscriptionTask,
-    add_segment_word_timestamps, config::MAX_INFERENCE_THREADS,
+    RuntimeModelResolutionError, Transcription, TranscriptionRequest, TranscriptionTask,
+    add_segment_word_timestamps, config::MAX_INFERENCE_THREADS, load_native_wav_16khz_mono_f32_v0,
     native_runtime_model_adapter_for_path, parse_model_ref, prepare_audio_input,
-    render_transcription, resolve_runtime_model_ref, runtime_registry,
+    refine_existing_transcription_timeline, render_transcription, resolve_runtime_model_ref,
+    runtime_registry,
 };
 
 use crate::*;
@@ -45,6 +51,200 @@ pub(crate) async fn transcriptions(
     }
 
     run_offline_transcription(runtime, headers, auth, distribution, multipart, None).await
+}
+
+/// `POST /v1/audio/precise-timeline`: re-align word timestamps on an existing
+/// finished transcript without re-running ASR.
+///
+/// Multipart fields:
+/// - `file` (required): source audio for forced alignment
+/// - `transcript_json` (required): verbose/json-style body with `text` + timed
+///   `segments` (and optional `subtitle_cues` / `timeline_quality` / `language`)
+/// - `word_timestamps` (optional, default true): keep per-word arrays on the
+///   refined dual-view result
+/// - `language` (optional): language hint when the transcript body omits one
+/// - `execution_target` (optional): `auto` / `cpu` / `accelerated`
+///
+/// Returns the refined [`Transcription`] as verbose JSON. History persistence
+/// is left to the caller (`POST /v1/history/{id}/transcript` with If-Match).
+pub(crate) async fn precise_timeline(
+    State(runtime): State<ServerRuntime>,
+    Extension(distribution): Extension<DistributionContext>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<Response, ApiError> {
+    let parsed = parse_precise_timeline_multipart(multipart).await?;
+    let execution_services = Arc::clone(&distribution.native_execution_services);
+    let backend = runtime.backend;
+    let ffmpeg_bin = runtime.ffmpeg_bin.clone();
+    let ffmpeg_bin_explicit = runtime.ffmpeg_bin_explicit;
+    let refined = tokio::task::spawn_blocking(move || {
+        let prepared = prepare_audio_input(
+            &parsed.audio_path,
+            &AudioPreparationOptions::new(backend)
+                .with_ffmpeg_bin(ffmpeg_bin)
+                .with_ffmpeg_bin_explicit(ffmpeg_bin_explicit)
+                .with_native_non_wav_conversion(true),
+        )
+        .map_err(ApiError::AudioPreparation)?;
+        let samples = if let Some(shared) = prepared.shared_samples() {
+            shared
+        } else {
+            Arc::new(
+                load_native_wav_16khz_mono_f32_v0(
+                    prepared.path(),
+                    "precise-timeline",
+                    "precise-timeline audio",
+                )
+                .map_err(|error| {
+                    ApiError::BadRequest(format!(
+                        "Could not load prepared audio for precise timeline: {error}"
+                    ))
+                })?,
+            )
+        };
+        if samples.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Uploaded audio decoded to zero samples; cannot refine timeline".into(),
+            ));
+        }
+        // Keep the activity guard so idle unload does not race the aligner.
+        let _activity_guard = NativeActivityGuard::enter();
+        // Keep the upload temp path alive across prepare + load.
+        let _audio_keepalive = parsed.audio_temp;
+        refine_existing_transcription_timeline(
+            parsed.transcription,
+            samples.as_slice(),
+            execution_services.as_ref(),
+            parsed.execution_target.unwrap_or_default(),
+            parsed.language_hint.as_deref(),
+            parsed.keep_word_timestamps,
+        )
+        .map_err(ApiError::Backend)
+    })
+    .await
+    .map_err(ApiError::BackendJoin)??;
+    let rendered =
+        render_transcription(&refined, ResponseFormat::VerboseJson).map_err(ApiError::Serialize)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(mime::APPLICATION_JSON.as_ref()),
+    );
+    Ok((response_headers, rendered).into_response())
+}
+
+#[derive(Debug)]
+struct PreciseTimelineUpload {
+    audio_path: PathBuf,
+    /// Keeps the uploaded temp file alive until prepare/load finish.
+    audio_temp: tempfile::TempPath,
+    transcription: Transcription,
+    language_hint: Option<String>,
+    keep_word_timestamps: bool,
+    execution_target: Option<ExecutionTarget>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PreciseTimelineTranscriptBody {
+    text: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    segments: Vec<openasr_core::Segment>,
+    #[serde(default)]
+    subtitle_cues: Vec<openasr_core::Segment>,
+    #[serde(default)]
+    timeline_quality: Option<openasr_core::TimelineQuality>,
+}
+
+impl PreciseTimelineTranscriptBody {
+    fn into_transcription(self) -> Transcription {
+        Transcription {
+            text: self.text,
+            language: self.language,
+            segments: self.segments,
+            subtitle_cues: self.subtitle_cues,
+            timeline_quality: self.timeline_quality,
+            ..Default::default()
+        }
+    }
+}
+
+async fn parse_precise_timeline_multipart(
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<PreciseTimelineUpload, ApiError> {
+    let mut multipart = multipart.map_err(ApiError::MultipartRejection)?;
+    let mut audio_temp: Option<tempfile::TempPath> = None;
+    let mut transcript_json: Option<String> = None;
+    let mut language_hint: Option<String> = None;
+    let mut keep_word_timestamps = true;
+    let mut execution_target: Option<ExecutionTarget> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" => {
+                let file_name = field.file_name().map(ToOwned::to_owned);
+                let suffix = file_name
+                    .as_deref()
+                    .and_then(safe_extension_suffix)
+                    .unwrap_or_default();
+                audio_temp = Some(write_upload_temp_file_streaming(field, &suffix).await?);
+            }
+            "transcript_json" => {
+                transcript_json = Some(field.text().await.map_err(ApiError::Multipart)?);
+            }
+            "language" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                let trimmed = value.trim();
+                language_hint = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            "word_timestamps" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                keep_word_timestamps = parse_bool_field("word_timestamps", &value)?;
+            }
+            "execution_target" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                execution_target = Some(parse_execution_target_field(&value)?);
+            }
+            _ => {
+                // Ignore unknown fields for forward compatibility.
+                let _ = field.bytes().await.map_err(ApiError::Multipart)?;
+            }
+        }
+    }
+
+    let audio_temp = audio_temp.ok_or_else(|| {
+        ApiError::BadRequest(
+            "Missing required form field: file (source audio for precise timeline refine)".into(),
+        )
+    })?;
+    let audio_path = audio_temp.to_path_buf();
+    let transcript_raw = transcript_json.ok_or_else(|| {
+        ApiError::BadRequest(
+            "Missing required form field: transcript_json (finished transcript body)".into(),
+        )
+    })?;
+    let body: PreciseTimelineTranscriptBody = serde_json::from_str(&transcript_raw)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
+    if body.segments.is_empty() {
+        return Err(ApiError::BadRequest(
+            "transcript_json.segments must contain at least one timed segment".into(),
+        ));
+    }
+    let mut transcription = body.into_transcription();
+    if transcription.language.is_none() {
+        transcription.language = language_hint.clone();
+    }
+
+    Ok(PreciseTimelineUpload {
+        audio_path,
+        audio_temp,
+        transcription,
+        language_hint,
+        keep_word_timestamps,
+        execution_target,
+    })
 }
 
 /// OpenAI-compatible `/v1/audio/translations`: always X->English translation.

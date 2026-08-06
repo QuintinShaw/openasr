@@ -114,6 +114,62 @@ pub(crate) async fn history_get(
     Ok(Json(detail).into_response())
 }
 
+/// `POST /v1/history/{id}/transcript`: replace the stored dual-view transcript
+/// body under optimistic concurrency (`If-Match` revision). Used after
+/// `POST /v1/audio/precise-timeline` so History keeps refined reading segments
+/// and subtitle cues without rewriting model/source metadata.
+pub(crate) async fn history_replace_transcript(
+    AxumPath(id): AxumPath<String>,
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryReplaceTranscriptRequest>,
+) -> Result<
+    (
+        HeaderMap,
+        Json<openasr_core::realtime::history::DaemonHistoryDetail>,
+    ),
+    ApiError,
+> {
+    let expected_revision = parse_required_quoted_if_match(&headers)?;
+    if request.segments.is_empty() && request.subtitle_cues.is_empty() {
+        return Err(ApiError::BadRequest(
+            "transcript body must include timed segments or subtitle_cues".into(),
+        ));
+    }
+    let transcription = openasr_core::Transcription {
+        text: request.text,
+        segments: request.segments,
+        subtitle_cues: request.subtitle_cues,
+        timeline_quality: request.timeline_quality,
+        language: request.language,
+        ..Default::default()
+    };
+    let home = distribution.openasr_home()?;
+    let detail = DaemonHistoryStore::open(&home)
+        .replace_transcript(&id, expected_revision, &transcription)
+        .map_err(history_assignment_error)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", detail.entry.revision))
+            .expect("history revision is a valid HTTP header"),
+    );
+    Ok((response_headers, Json(detail)))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HistoryReplaceTranscriptRequest {
+    pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) language: Option<String>,
+    #[serde(default)]
+    pub(crate) segments: Vec<openasr_core::Segment>,
+    #[serde(default)]
+    pub(crate) subtitle_cues: Vec<openasr_core::Segment>,
+    #[serde(default)]
+    pub(crate) timeline_quality: Option<openasr_core::TimelineQuality>,
+}
+
 pub(crate) async fn history_assign_speakers(
     AxumPath(id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
