@@ -288,6 +288,13 @@ pub(crate) fn validate_cohere_transcribe_runtime_tensors_with_index(
 pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
     metadata: CohereTranscribeExecutionMetadata,
 ) -> Vec<TensorBindingDescriptor> {
+    // Ordered ggml [in, out] for mul_mat projections (and the pack embedding
+    // layout the decoder get_rows path ships). Lifetime-bound ExactDims slices
+    // below are copied into owned descriptors before this frame returns.
+    let enc_proj_dims = [metadata.encoder_d_model, metadata.decoder_d_model];
+    let dec_emb_dims = [metadata.vocab_size, metadata.decoder_d_model];
+    let dec_pos_dims = [metadata.decoder_max_context, metadata.decoder_d_model];
+    let dec_head_dims = [metadata.decoder_d_model, metadata.vocab_size];
     let top_level_bindings = [
         TensorBindingSpec {
             tensor_name: FE_WINDOW,
@@ -306,11 +313,9 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
         },
         TensorBindingSpec {
             tensor_name: ENC_PROJ_WEIGHT,
-            requirement: TensorBindingRequirement::Rank2EitherDims(
-                metadata.encoder_d_model,
-                metadata.decoder_d_model,
-            ),
-            reason: "expected encoder->decoder projection matrix",
+            // mul_mat weight is ggml [enc_d_model, dec_d_model] = [in, out].
+            requirement: TensorBindingRequirement::ExactDims(&enc_proj_dims),
+            reason: "encoder->decoder projection must be ggml [encoder_d_model, decoder_d_model]",
         },
         TensorBindingSpec {
             tensor_name: ENC_PROJ_BIAS,
@@ -319,19 +324,15 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
         },
         TensorBindingSpec {
             tensor_name: DEC_EMB_WEIGHT,
-            requirement: TensorBindingRequirement::Rank2EitherDims(
-                metadata.vocab_size,
-                metadata.decoder_d_model,
-            ),
-            reason: "expected vocab/decoder embedding matrix",
+            // Pack ships RowsByColumns [vocab, d_model] (importer does not reverse
+            // embeddings); decoder get_rows materializes from that layout.
+            requirement: TensorBindingRequirement::ExactDims(&dec_emb_dims),
+            reason: "token embedding table must be [vocab_size, decoder_d_model]",
         },
         TensorBindingSpec {
             tensor_name: DEC_POS_WEIGHT,
-            requirement: TensorBindingRequirement::Rank2EitherDims(
-                metadata.decoder_max_context,
-                metadata.decoder_d_model,
-            ),
-            reason: "expected decoder positional embedding matrix",
+            requirement: TensorBindingRequirement::ExactDims(&dec_pos_dims),
+            reason: "positional embedding table must be [decoder_max_context, decoder_d_model]",
         },
         TensorBindingSpec {
             tensor_name: DEC_EMB_LN_WEIGHT,
@@ -355,11 +356,9 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
         },
         TensorBindingSpec {
             tensor_name: DEC_HEAD_WEIGHT,
-            requirement: TensorBindingRequirement::Rank2EitherDims(
-                metadata.vocab_size,
-                metadata.decoder_d_model,
-            ),
-            reason: "expected decoder vocab projection matrix",
+            // mul_mat weight is ggml [d_model, vocab] = [in, out].
+            requirement: TensorBindingRequirement::ExactDims(&dec_head_dims),
+            reason: "decoder vocab projection must be ggml [decoder_d_model, vocab_size]",
         },
         TensorBindingSpec {
             tensor_name: DEC_HEAD_BIAS,
@@ -370,6 +369,8 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
     let mut descriptors = tensor_binding_descriptors(&top_level_bindings);
     for layer_idx in 0..metadata.encoder_layers {
         let names = encoder_layer_tensor_names(layer_idx);
+        let enc_ffn_up_dims = [metadata.encoder_d_model, metadata.encoder_ffn_dim];
+        let enc_ffn_down_dims = [metadata.encoder_ffn_dim, metadata.encoder_d_model];
         let bindings = [
             TensorBindingSpec {
                 tensor_name: names.ff1_norm_weight.as_str(),
@@ -487,12 +488,17 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
                 reason: "expected encoder hidden-size bias",
             },
             TensorBindingSpec {
+                // pos_bias is graph-consumed as a row-major [heads, head_dim]
+                // matrix, but the importer still reverses HF dims for pos_bias
+                // while fixtures ship [heads, head_dim]. Loader accepts either
+                // and transposes on upload -- orientation is not uniquely
+                // determined yet, so keep Rank2EitherDims rather than guess.
                 tensor_name: names.attn_pos_bias_u.as_str(),
                 requirement: TensorBindingRequirement::Rank2EitherDims(
                     metadata.encoder_heads,
                     metadata.encoder_head_dim,
                 ),
-                reason: "expected [heads, head_dim] positional bias matrix",
+                reason: "expected [heads, head_dim] positional bias matrix (either orientation until importer/fixture align)",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_pos_bias_v.as_str(),
@@ -500,39 +506,29 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
                     metadata.encoder_heads,
                     metadata.encoder_head_dim,
                 ),
-                reason: "expected [heads, head_dim] positional bias matrix",
+                reason: "expected [heads, head_dim] positional bias matrix (either orientation until importer/fixture align)",
             },
             TensorBindingSpec {
                 tensor_name: names.ff1_up_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.encoder_ffn_dim,
-                    metadata.encoder_d_model,
-                ),
-                reason: "expected encoder FFN up matrix",
+                // mul_mat [in, out] = [d_model, ffn]
+                requirement: TensorBindingRequirement::ExactDims(&enc_ffn_up_dims),
+                reason: "encoder FFN up must be ggml [encoder_d_model, encoder_ffn_dim]",
             },
             TensorBindingSpec {
                 tensor_name: names.ff2_up_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.encoder_ffn_dim,
-                    metadata.encoder_d_model,
-                ),
-                reason: "expected encoder FFN up matrix",
+                requirement: TensorBindingRequirement::ExactDims(&enc_ffn_up_dims),
+                reason: "encoder FFN up must be ggml [encoder_d_model, encoder_ffn_dim]",
             },
             TensorBindingSpec {
                 tensor_name: names.ff1_down_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.encoder_d_model,
-                    metadata.encoder_ffn_dim,
-                ),
-                reason: "expected encoder FFN down matrix",
+                // mul_mat [in, out] = [ffn, d_model]
+                requirement: TensorBindingRequirement::ExactDims(&enc_ffn_down_dims),
+                reason: "encoder FFN down must be ggml [encoder_ffn_dim, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.ff2_down_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.encoder_d_model,
-                    metadata.encoder_ffn_dim,
-                ),
-                reason: "expected encoder FFN down matrix",
+                requirement: TensorBindingRequirement::ExactDims(&enc_ffn_down_dims),
+                reason: "encoder FFN down must be ggml [encoder_ffn_dim, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.ff1_up_bias.as_str(),
@@ -598,6 +594,8 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
     }
     for layer_idx in 0..metadata.decoder_layers {
         let names = decoder_layer_tensor_names(layer_idx);
+        let dec_ffn_up_dims = [metadata.decoder_d_model, metadata.decoder_ffn_dim];
+        let dec_ffn_down_dims = [metadata.decoder_ffn_dim, metadata.decoder_d_model];
         let bindings = [
             TensorBindingSpec {
                 tensor_name: names.attn_ln_weight.as_str(),
@@ -711,11 +709,9 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
             },
             TensorBindingSpec {
                 tensor_name: names.ffn_up_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.decoder_ffn_dim,
-                    metadata.decoder_d_model,
-                ),
-                reason: "expected decoder FFN up matrix",
+                // mul_mat [in, out] = [d_model, ffn]
+                requirement: TensorBindingRequirement::ExactDims(&dec_ffn_up_dims),
+                reason: "decoder FFN up must be ggml [decoder_d_model, decoder_ffn_dim]",
             },
             TensorBindingSpec {
                 tensor_name: names.ffn_up_bias.as_str(),
@@ -724,11 +720,9 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
             },
             TensorBindingSpec {
                 tensor_name: names.ffn_down_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.decoder_d_model,
-                    metadata.decoder_ffn_dim,
-                ),
-                reason: "expected decoder FFN down matrix",
+                // mul_mat [in, out] = [ffn, d_model]
+                requirement: TensorBindingRequirement::ExactDims(&dec_ffn_down_dims),
+                reason: "decoder FFN down must be ggml [decoder_ffn_dim, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.ffn_down_bias.as_str(),
@@ -990,6 +984,113 @@ mod tests {
             error,
             CohereTranscribeRuntimeContractError::InvalidTensorShape { ref name, .. }
                 if name == "fe.mel_fb"
+        ));
+    }
+
+    /// Ordered ExactDims must reject HF [out, in] that Rank2EitherDims admitted
+    /// for mul_mat projections (enc.proj / FFN / dec.head).
+    #[test]
+    fn rejects_transposed_encoder_projection_weight() {
+        let file = NamedTempFile::new().expect("temp file");
+        // Default fixture is square enc/dec d_model=16; use a non-square
+        // geometry so the HF [out, in] transpose is distinguishable.
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture")
+            .with_metadata("cohere_transcribe.decoder.d_model", "24")
+            .with_metadata("cohere_transcribe.decoder.head_dim", "12")
+            .with_metadata("cohere_transcribe.decoder.ffn_dim", "48")
+            .with_cohere_runtime_tensors_with_layers(2, 2);
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        assert_ne!(
+            metadata.encoder_d_model, metadata.decoder_d_model,
+            "test requires rectangular enc.proj"
+        );
+        // Canonical is [enc_d, dec_d]; force the HF [dec_d, enc_d] orientation.
+        let spec = base.with_tensor_shape(
+            ENC_PROJ_WEIGHT,
+            [
+                metadata.decoder_d_model as u64,
+                metadata.encoder_d_model as u64,
+            ],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed enc.proj.weight must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { ref name, .. }
+                if name == ENC_PROJ_WEIGHT
+        ));
+    }
+
+    #[test]
+    fn rejects_transposed_decoder_head_weight() {
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        // Canonical is [d_model, vocab]; force [vocab, d_model].
+        let spec = base.with_tensor_shape(
+            DEC_HEAD_WEIGHT,
+            [metadata.vocab_size as u64, metadata.decoder_d_model as u64],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed dec.head.weight must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { ref name, .. }
+                if name == DEC_HEAD_WEIGHT
+        ));
+    }
+
+    #[test]
+    fn rejects_transposed_encoder_ffn_up_weight() {
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        let names = encoder_layer_tensor_names(0);
+        // Canonical is [d_model, ffn]; force [ffn, d_model].
+        let spec = base.with_tensor_shape(
+            &names.ff1_up_weight,
+            [
+                metadata.encoder_ffn_dim as u64,
+                metadata.encoder_d_model as u64,
+            ],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed ff1.up.weight must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { ref name, .. }
+                if name.as_str() == names.ff1_up_weight
+        ));
+    }
+
+    #[test]
+    fn rejects_transposed_token_embedding_weight() {
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        // Canonical pack layout is [vocab, d_model]; force [d_model, vocab].
+        let spec = base.with_tensor_shape(
+            DEC_EMB_WEIGHT,
+            [metadata.decoder_d_model as u64, metadata.vocab_size as u64],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed dec.emb.weight must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { ref name, .. }
+                if name == DEC_EMB_WEIGHT
         ));
     }
 }

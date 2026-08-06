@@ -1937,7 +1937,8 @@ impl TinyGgufFixtureSpec {
             .with_tensor_shape("enc.pre.conv.6.bias", [256_u64])
             .with_tensor_shape("enc.pre.out.weight", [pre_out_width, encoder_d_model])
             .with_tensor_shape("enc.pre.out.bias", [encoder_d_model])
-            .with_tensor_shape("enc.proj.weight", [decoder_d_model, encoder_d_model])
+            // ggml mul_mat [in, out] = [encoder_d_model, decoder_d_model]
+            .with_tensor_shape("enc.proj.weight", [encoder_d_model, decoder_d_model])
             .with_tensor_shape("enc.proj.bias", [decoder_d_model])
             .with_tensor_shape("dec.emb.weight", [vocab_size, decoder_d_model])
             .with_tensor_shape("dec.pos.weight", [decoder_max_ctx, decoder_d_model])

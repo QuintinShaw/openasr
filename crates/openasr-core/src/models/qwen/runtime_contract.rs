@@ -365,24 +365,25 @@ pub(crate) fn validate_qwen3_runtime_tensors_with_index(
 pub(crate) fn qwen3_runtime_tensor_descriptors(
     metadata: Qwen3AsrExecutionMetadata,
 ) -> Vec<TensorBindingDescriptor> {
+    // Tail matrices share the decoder_contract ggml [d_model, vocab] pin so the
+    // registry path and the bound decoder tail cannot disagree on orientation.
+    // Graph/logits_head mul_mat and get_rows both consume [d_model, vocab].
     let mut descriptors = vec![
         TensorBindingDescriptor {
             tensor_name: TOKEN_EMBD_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                 metadata.llm_d_model,
                 metadata.vocab_size,
-            ),
-            reason: "expected token embedding matrix with llm hidden size and vocab dimensions"
-                .to_string(),
+            ]),
+            reason: "token embedding table must be ggml [d_model, vocab]".to_string(),
         },
         TensorBindingDescriptor {
             tensor_name: OUTPUT_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                 metadata.llm_d_model,
                 metadata.vocab_size,
-            ),
-            reason: "expected output projection matrix with llm hidden size and vocab dimensions"
-                .to_string(),
+            ]),
+            reason: "logits head must be ggml [d_model, vocab]".to_string(),
         },
         TensorBindingDescriptor {
             tensor_name: OUTPUT_NORM_WEIGHT.to_string(),
@@ -823,5 +824,58 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// Ordered ExactDims must reject HF [vocab, d_model] that Rank2EitherDims
+    /// admitted. Matches decoder_contract / logits_head ggml [d_model, vocab].
+    #[test]
+    fn rejects_transposed_token_embedding_and_output_weight() {
+        use crate::read_gguf_tensor_index;
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-rank2-neg");
+        let metadata = parse_qwen3_execution_metadata(&base.metadata).expect("metadata");
+        // Canonical fixture is already [d_model, vocab]; force the transpose
+        // Rank2EitherDims used to accept.
+        let spec = base
+            .with_tensor_shape(
+                TOKEN_EMBD_WEIGHT,
+                [metadata.vocab_size as u64, metadata.llm_d_model as u64],
+            )
+            .with_tensor_shape(
+                OUTPUT_WEIGHT,
+                [metadata.vocab_size as u64, metadata.llm_d_model as u64],
+            );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+
+        let error = validate_qwen3_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed embd/output must fail closed");
+        match error {
+            Qwen3AsrRuntimeContractError::InvalidTensorShape { name, .. } => {
+                assert!(
+                    name == TOKEN_EMBD_WEIGHT || name == OUTPUT_WEIGHT,
+                    "unexpected tensor: {name}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_ready_fixture_admits_ordered_tail_matrices() {
+        use crate::read_gguf_tensor_index;
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().expect("temp file");
+        let spec = TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-rank2-ok");
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let metadata = parse_qwen3_execution_metadata(&spec.metadata).expect("metadata");
+        validate_qwen3_runtime_tensors_with_index(&index, metadata)
+            .expect("descriptor-projected fixture must satisfy ExactDims tail");
     }
 }
