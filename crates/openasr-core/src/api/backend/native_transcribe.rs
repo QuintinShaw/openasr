@@ -7197,6 +7197,8 @@ mod tests {
 
     #[test]
     fn concurrent_pipeline_assembles_slices_in_order_and_reaches_progress_ceiling() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
         let id = "concurrent-pipeline-ordered";
         let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
         let (audio, slices) = concurrent_pipeline_slices(6);
