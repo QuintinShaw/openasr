@@ -17,15 +17,16 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings,
-    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
-    compile_qwen_whole_decoder_graph_from_prepared_plan,
-    load_llm_logits_head_from_reader_with_tensor_names,
-    load_token_embedding_table_from_reader_with_tensor_name,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
+    QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
 };
 
-use super::runtime_contract::{MimoLlmMetadata, mimo_asr_qwen_decoder_profile};
-use super::tensor_names::{OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
+use super::runtime_contract::{
+    MimoLlmMetadata, mimo_asr_qwen_decoder_geometry, mimo_asr_qwen_decoder_profile,
+    mimo_asr_qwen_decoder_tail_names,
+};
+use super::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
 
 pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
     reader: &GgufTensorDataReader,
@@ -58,17 +59,19 @@ pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
         .checked_add(logits_retained)
         .and_then(|bytes| bytes.checked_add(embedding_retained))
         .ok_or_else(|| "mimo-asr decoder retained quote overflowed".to_string())?;
+    // Construction order: plan + contract tail (logits then embd) + graph.
     let logits_phase = plan_transient
         .checked_add(logits_peak)
         .ok_or_else(|| "mimo-asr logits construction quote overflowed".to_string())?;
-    let graph_phase = plan_transient
+    let embedding_phase = plan_transient
         .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(graph_retained))
-        .ok_or_else(|| "mimo-asr decoder graph construction quote overflowed".to_string())?;
-    let embedding_phase = logits_retained
-        .checked_add(graph_retained)
         .and_then(|bytes| bytes.checked_add(embedding_peak))
         .ok_or_else(|| "mimo-asr token embedding construction quote overflowed".to_string())?;
+    let graph_phase = plan_transient
+        .checked_add(logits_retained)
+        .and_then(|bytes| bytes.checked_add(embedding_retained))
+        .and_then(|bytes| bytes.checked_add(graph_retained))
+        .ok_or_else(|| "mimo-asr decoder graph construction quote overflowed".to_string())?;
     Ok((logits_phase.max(graph_phase).max(embedding_phase), retained))
 }
 
@@ -105,6 +108,19 @@ fn plan_whole_decoder(
     })
 }
 
+fn map_tail_load_error(error: QwenDecoderTailLoadError) -> MimoLlmDecoderError {
+    match error {
+        QwenDecoderTailLoadError::TokenEmbedding(error) => {
+            MimoLlmDecoderError::TokenEmbeddingFailed {
+                reason: error.to_string(),
+            }
+        }
+        other => MimoLlmDecoderError::LogitsHeadFailed {
+            reason: other.to_string(),
+        },
+    }
+}
+
 pub(crate) struct MimoLlmDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
@@ -128,26 +144,23 @@ impl MimoLlmDecoderRuntime {
         metadata: MimoLlmMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoLlmDecoderError> {
-        let runtime_source = &preflight.runtime_source;
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
         let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
             &reader,
-            runtime_source,
-            metadata.d_model,
-            metadata.vocab_size,
-            OUTPUT_NORM_WEIGHT,
-            OUTPUT_WEIGHT,
+            &mimo_asr_qwen_decoder_geometry(&metadata),
+            mimo_asr_qwen_decoder_tail_names(),
             metadata.rms_norm_epsilon,
             backend,
         )
-        .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
-            reason: error.to_string(),
-        })?;
+        .map_err(map_tail_load_error)?;
         // Keep the output projection in the same static arena as the resident
         // decoder graph so Metal/GPU decode can return a device-side top-1
         // token per step instead of building a separate full-vocab logits
@@ -170,20 +183,14 @@ impl MimoLlmDecoderRuntime {
         // The graph constructor has copied/bound every planned tensor handle;
         // release the heap-heavy transient plan before materializing the token
         // embedding so construction peak follows the quoted phase topology.
+        // (Tail load already ran above so the peak topology is logits-then-graph;
+        // dropping the plan still frees layer-plan heap before the runtime is
+        // retained.)
         drop(decoder_plan);
         let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
             MimoLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             }
-        })?;
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
-            &reader,
-            TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )
-        .map_err(|error| MimoLlmDecoderError::TokenEmbeddingFailed {
-            reason: error.to_string(),
         })?;
         Ok(Self {
             whole_decoder,

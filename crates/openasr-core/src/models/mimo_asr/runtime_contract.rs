@@ -774,21 +774,26 @@ pub(crate) fn mimo_asr_qwen_decoder_profile() -> crate::models::qwen::QwenFamily
 pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
     llm: &MimoLlmMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
-    use crate::models::qwen::{
-        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
-    };
+    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
     let profile = mimo_asr_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &mimo_asr_qwen_decoder_geometry(llm),
         profile.options,
         profile.names_for_layer,
-        QwenDecoderTailTensorNames {
-            output_norm: OUTPUT_NORM_WEIGHT,
-            output_weight: Some(OUTPUT_WEIGHT),
-            token_embd: TOKEN_EMBD_WEIGHT,
-        },
+        mimo_asr_qwen_decoder_tail_names(),
     )
     .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
+}
+
+/// Static tail tensor names shared by admission descriptors and the contract-
+/// projected tail loader. Keep this the single spelling source for MiMo-ASR.
+pub(crate) fn mimo_asr_qwen_decoder_tail_names()
+-> crate::models::qwen::QwenDecoderTailTensorNames<'static> {
+    crate::models::qwen::QwenDecoderTailTensorNames {
+        output_norm: OUTPUT_NORM_WEIGHT,
+        output_weight: Some(OUTPUT_WEIGHT),
+        token_embd: TOKEN_EMBD_WEIGHT,
+    }
 }
 
 fn mimo_asr_runtime_tensor_bindings(

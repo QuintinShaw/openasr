@@ -812,22 +812,27 @@ pub(crate) fn funasr_nano_qwen_decoder_profile() -> crate::models::qwen::QwenFam
 pub(crate) fn funasr_nano_decoder_tensor_descriptors(
     decoder: &FunasrNanoDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FunasrNanoTensorContractError> {
-    use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
-    use crate::models::qwen::{
-        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
-    };
+    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
     let profile = funasr_nano_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &funasr_nano_qwen_decoder_geometry(decoder),
         profile.options,
         profile.names_for_layer,
-        QwenDecoderTailTensorNames {
-            output_norm: LLM_OUTPUT_NORM_WEIGHT,
-            output_weight: Some(LLM_OUTPUT_WEIGHT),
-            token_embd: LLM_TOKEN_EMBD_WEIGHT,
-        },
+        funasr_nano_qwen_decoder_tail_names(),
     )
     .map_err(|reason| FunasrNanoTensorContractError::InvalidDecoderGeometry { reason })
+}
+
+/// Static tail tensor names shared by admission descriptors and the contract-
+/// projected tail loader. Keep this the single spelling source for FunASR-Nano.
+pub(crate) fn funasr_nano_qwen_decoder_tail_names()
+-> crate::models::qwen::QwenDecoderTailTensorNames<'static> {
+    use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
+    crate::models::qwen::QwenDecoderTailTensorNames {
+        output_norm: LLM_OUTPUT_NORM_WEIGHT,
+        output_weight: Some(LLM_OUTPUT_WEIGHT),
+        token_embd: LLM_TOKEN_EMBD_WEIGHT,
+    }
 }
 
 /// The runtime tensor contract for one funasr-nano pack: every tensor the

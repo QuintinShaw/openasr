@@ -535,21 +535,26 @@ pub(crate) fn firered_llm_qwen_decoder_profile() -> crate::models::qwen::QwenFam
 pub(crate) fn firered_llm_decoder_tensor_descriptors(
     decoder: &FireRedLlmDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FireRedLlmRuntimeTensorContractError> {
-    use crate::models::qwen::{
-        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
-    };
+    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
     let profile = firered_llm_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &firered_llm_qwen_decoder_geometry(decoder),
         profile.options,
         profile.names_for_layer,
-        QwenDecoderTailTensorNames {
-            output_norm: LLM_OUTPUT_NORM_WEIGHT,
-            output_weight: Some(LLM_OUTPUT_WEIGHT),
-            token_embd: LLM_TOKEN_EMBD_WEIGHT,
-        },
+        firered_llm_qwen_decoder_tail_names(),
     )
     .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
+}
+
+/// Static tail tensor names shared by admission descriptors and the contract-
+/// projected tail loader. Keep this the single spelling source for FireRed2-LLM.
+pub(crate) fn firered_llm_qwen_decoder_tail_names()
+-> crate::models::qwen::QwenDecoderTailTensorNames<'static> {
+    crate::models::qwen::QwenDecoderTailTensorNames {
+        output_norm: LLM_OUTPUT_NORM_WEIGHT,
+        output_weight: Some(LLM_OUTPUT_WEIGHT),
+        token_embd: LLM_TOKEN_EMBD_WEIGHT,
+    }
 }
 
 /// The complete runtime-bound tensor set for one firered-llm pack, expressed

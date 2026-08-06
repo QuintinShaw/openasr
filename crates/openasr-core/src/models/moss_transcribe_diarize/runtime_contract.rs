@@ -543,22 +543,27 @@ pub(crate) fn moss_td_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyD
 pub(crate) fn moss_td_decoder_tensor_descriptors(
     decoder: &MossTdDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MossTdRuntimeContractError> {
-    use crate::models::qwen::{
-        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
-    };
+    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
     let profile = moss_td_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &moss_td_qwen_decoder_geometry(decoder),
         profile.options,
         profile.names_for_layer,
-        QwenDecoderTailTensorNames {
-            output_norm: LLM_OUTPUT_NORM_WEIGHT,
-            // MOSS ties the logits head to the token embedding table.
-            output_weight: None,
-            token_embd: LLM_TOKEN_EMBD_WEIGHT,
-        },
+        moss_td_qwen_decoder_tail_names(),
     )
     .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })
+}
+
+/// Static tail tensor names shared by admission descriptors and the contract-
+/// projected tail loader. `output_weight = None` encodes MOSS tied embeddings.
+pub(crate) fn moss_td_qwen_decoder_tail_names()
+-> crate::models::qwen::QwenDecoderTailTensorNames<'static> {
+    crate::models::qwen::QwenDecoderTailTensorNames {
+        output_norm: LLM_OUTPUT_NORM_WEIGHT,
+        // MOSS ties the logits head to the token embedding table.
+        output_weight: None,
+        token_embd: LLM_TOKEN_EMBD_WEIGHT,
+    }
 }
 
 /// Metadata-derived tensor binding contract for the complete

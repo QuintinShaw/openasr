@@ -36,11 +36,9 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings,
-    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
-    compile_qwen_whole_decoder_graph_from_prepared_plan,
-    load_llm_logits_head_from_reader_with_tensor_names,
-    load_token_embedding_table_from_reader_with_tensor_name,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
+    QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
 };
 #[cfg(test)]
 use crate::models::qwen::{
@@ -51,9 +49,10 @@ use crate::models::qwen::{
 use super::runtime_contract::firered_llm_qwen_family_layer_names;
 use super::runtime_contract::{
     FIRERED_LLM_RMS_NORM_EPSILON, FIRERED_LLM_ROPE_THETA, FireRedLlmDecoderMetadata,
-    firered_llm_qwen_decoder_profile,
+    firered_llm_qwen_decoder_geometry, firered_llm_qwen_decoder_profile,
+    firered_llm_qwen_decoder_tail_names,
 };
-use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
+use super::tensor_names::{LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
 /// Quotes the host-memory shape retained by one FireRed-LLM decoder actor.
 ///
@@ -139,9 +138,6 @@ fn plan_qwen2_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FireRedLlmDecoderMetadata,
 ) -> Result<QwenWholeDecoderPlan, FireRedLlmDecoderError> {
-    use super::runtime_contract::{
-        firered_llm_qwen_decoder_geometry, firered_llm_qwen_decoder_profile,
-    };
     let profile = firered_llm_qwen_decoder_profile();
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
@@ -152,6 +148,19 @@ fn plan_qwen2_whole_decoder(
     .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
         reason: error.to_string(),
     })
+}
+
+fn map_tail_load_error(error: QwenDecoderTailLoadError) -> FireRedLlmDecoderError {
+    match error {
+        QwenDecoderTailLoadError::TokenEmbedding(error) => {
+            FireRedLlmDecoderError::TokenEmbeddingFailed {
+                reason: error.to_string(),
+            }
+        }
+        other => FireRedLlmDecoderError::LogitsHeadFailed {
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// The Qwen2 decoder-only stack for one loaded pack: layer weights + logits
@@ -180,26 +189,23 @@ impl FireRedLlmDecoderRuntime {
         metadata: FireRedLlmDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedLlmDecoderError> {
-        let runtime_source = &preflight.runtime_source;
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
         let decoder_plan = plan_qwen2_whole_decoder(&reader, &metadata)?;
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
             &reader,
-            runtime_source,
-            metadata.d_model,
-            metadata.vocab_size,
-            LLM_OUTPUT_NORM_WEIGHT,
-            LLM_OUTPUT_WEIGHT,
+            &firered_llm_qwen_decoder_geometry(&metadata),
+            firered_llm_qwen_decoder_tail_names(),
             FIRERED_LLM_RMS_NORM_EPSILON,
             backend,
         )
-        .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
-            reason: error.to_string(),
-        })?;
+        .map_err(map_tail_load_error)?;
         let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
                 plan: &decoder_plan,
@@ -216,15 +222,6 @@ impl FireRedLlmDecoderRuntime {
             FireRedLlmDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             }
-        })?;
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
-            &reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )
-        .map_err(|error| FireRedLlmDecoderError::TokenEmbeddingFailed {
-            reason: error.to_string(),
         })?;
         Ok(Self {
             whole_decoder,
@@ -743,13 +740,17 @@ mod parity_tests {
                 .expect("open gguf tensor reader");
 
         // --- Segment: embedding gather ---
-        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
             &reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            decoder_metadata.d_model,
-            decoder_metadata.vocab_size,
+            &firered_llm_qwen_decoder_geometry(&decoder_metadata),
+            firered_llm_qwen_decoder_tail_names(),
+            FIRERED_LLM_RMS_NORM_EPSILON,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
-        .expect("load token embedding table");
+        .expect("load decoder tail");
         let embedding_token_ids: Vec<u32> = vec![0, 1000, 50_000, 100_000, 151_643, 151_646];
         let embedding_rows = token_embedding
             .gather_rows(&embedding_token_ids)
@@ -788,17 +789,6 @@ mod parity_tests {
         );
 
         // --- Segment: final_norm -> lm_head (fused; the only exposed API) ---
-        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
-            &reader,
-            &runtime_source,
-            decoder_metadata.d_model,
-            decoder_metadata.vocab_size,
-            LLM_OUTPUT_NORM_WEIGHT,
-            LLM_OUTPUT_WEIGHT,
-            FIRERED_LLM_RMS_NORM_EPSILON,
-            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-        )
-        .expect("load logits head");
         let mut logits_runtime = logits_head
             .new_runtime(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu)
             .expect("build logits runtime");

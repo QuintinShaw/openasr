@@ -15,9 +15,8 @@ use crate::models::prepared_runtime_cache::{
     SystemMemoryMaterialization,
 };
 use crate::models::qwen::{
-    Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable, QwenWholeDecoderPlan,
-    load_llm_logits_head_from_reader_with_tensor_names,
-    load_token_embedding_table_from_reader_with_tensor_name,
+    Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable, QwenDecoderTail, QwenDecoderTailLoadError,
+    QwenWholeDecoderPlan, load_qwen_decoder_tail_from_contract,
 };
 use crate::models::system_memory_owner::{SystemMemoryAllocationQuote, SystemMemoryOwnerError};
 
@@ -27,8 +26,9 @@ use super::encoder_graph::{
 };
 use super::runtime_contract::{
     MOSS_TD_ADAPTOR_NORM_EPSILON, MOSS_TD_RMS_NORM_EPSILON, MossTdAdaptorMetadata,
-    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_decoder_profile,
-    parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
+    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_decoder_geometry,
+    moss_td_qwen_decoder_profile, moss_td_qwen_decoder_tail_names, parse_adaptor_metadata,
+    parse_decoder_metadata, parse_encoder_metadata,
 };
 use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 use super::tokenizer::MossTdTokenizer;
@@ -258,27 +258,25 @@ pub(crate) fn build_moss_td_prepared_runtime(
     .map_err(|error| MossTdPreparedRuntimeError::DecoderPlan {
         reason: error.to_string(),
     })?;
-    let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
+    let QwenDecoderTail {
+        logits_head,
+        token_embedding,
+    } = load_qwen_decoder_tail_from_contract(
         &reader,
-        &preflight.runtime_source,
-        decoder_metadata.d_model,
-        decoder_metadata.vocab_size,
-        LLM_OUTPUT_NORM_WEIGHT,
-        LLM_TOKEN_EMBD_WEIGHT,
+        &moss_td_qwen_decoder_geometry(&decoder_metadata),
+        moss_td_qwen_decoder_tail_names(),
         MOSS_TD_RMS_NORM_EPSILON,
         backend,
     )
-    .map_err(|error| MossTdPreparedRuntimeError::LogitsHead {
-        reason: error.to_string(),
-    })?;
-    let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
-        &reader,
-        LLM_TOKEN_EMBD_WEIGHT,
-        decoder_metadata.d_model,
-        decoder_metadata.vocab_size,
-    )
-    .map_err(|error| MossTdPreparedRuntimeError::TokenEmbedding {
-        reason: error.to_string(),
+    .map_err(|error| match error {
+        QwenDecoderTailLoadError::TokenEmbedding(error) => {
+            MossTdPreparedRuntimeError::TokenEmbedding {
+                reason: error.to_string(),
+            }
+        }
+        other => MossTdPreparedRuntimeError::LogitsHead {
+            reason: other.to_string(),
+        },
     })?;
     Ok(MossTdPreparedRuntime {
         encoder_metadata,

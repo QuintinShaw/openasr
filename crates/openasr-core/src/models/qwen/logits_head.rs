@@ -406,13 +406,13 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
 
 pub(crate) fn load_qwen3_llm_logits_head_from_reader(
     reader: &GgufTensorDataReader,
-    runtime_source: &GgmlRuntimeSource,
+    _runtime_source: &GgmlRuntimeSource,
     metadata: Qwen3AsrExecutionMetadata,
     backend: GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     load_qwen3_llm_logits_head_from_reader_with_output_tensor(
         reader,
-        runtime_source,
+        _runtime_source,
         metadata,
         OUTPUT_WEIGHT_TENSOR_NAME,
         DEFAULT_RMS_NORM_EPSILON,
@@ -422,7 +422,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader(
 
 pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
     reader: &GgufTensorDataReader,
-    runtime_source: &GgmlRuntimeSource,
+    _runtime_source: &GgmlRuntimeSource,
     metadata: Qwen3AsrExecutionMetadata,
     output_weight_tensor_name: &'static str,
     rms_norm_epsilon: f32,
@@ -430,7 +430,6 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     load_llm_logits_head_from_reader_with_tensor_names(
         reader,
-        runtime_source,
         metadata.llm_d_model,
         metadata.vocab_size,
         OUTPUT_NORM_WEIGHT_TENSOR_NAME,
@@ -447,9 +446,12 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
 /// device top-1) logits-head machinery without any Qwen2/Qwen3-specific
 /// assumption -- this stage of the pipeline (final hidden -> logits/top-1) is
 /// identical across every qwen-family decoder-only LLM.
+///
+/// Prefer [`super::load_qwen_decoder_tail_from_contract`] at production family
+/// call sites so final-norm / logits / embedding shapes stay projected from the
+/// shared decoder-tail descriptors rather than a second hand-written geometry.
 pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
     reader: &GgufTensorDataReader,
-    _runtime_source: &GgmlRuntimeSource,
     d_model: usize,
     vocab_size: usize,
     output_norm_weight_tensor_name: &'static str,
@@ -872,7 +874,6 @@ mod tests {
                 .expect("mapped embedding");
                 let logits = load_llm_logits_head_from_reader_with_tensor_names(
                     &reader,
-                    &runtime_source,
                     2,
                     3,
                     output_norm_name,

@@ -4,6 +4,7 @@ pub(crate) mod capacity;
 mod decode_budget;
 mod decode_prompt;
 pub(crate) mod decoder_contract;
+mod decoder_tail;
 mod forced_aligner_align_text;
 mod forced_aligner_import;
 pub(crate) mod forced_aligner_pack;
@@ -35,6 +36,9 @@ pub(crate) use decoder_contract::{
     QwenDecoderContractGeometry, QwenDecoderContractOptions, QwenDecoderTailTensorNames,
     QwenFamilyDecoderProfile, qwen_decoder_runtime_tensor_descriptors,
 };
+pub(crate) use decoder_tail::{
+    QwenDecoderTail, QwenDecoderTailLoadError, load_qwen_decoder_tail_from_contract,
+};
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
     Qwen3ForcedAlignerLocalSourceError, Qwen3ForcedAlignerLocalSourceImportRequest,
@@ -64,7 +68,7 @@ pub(crate) use llm_transformer::{
 };
 pub(crate) use logits_head::{
     Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    load_llm_logits_head_from_reader_with_tensor_names, load_qwen3_llm_logits_head_from_reader,
+    load_qwen3_llm_logits_head_from_reader,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor, logits_head_ggml_enabled,
 };
 pub use package_import::{
@@ -81,7 +85,6 @@ pub(crate) use prompt_embedding::{
 };
 pub(crate) use token_embedding::{
     Qwen3AsrTokenEmbeddingTable, load_qwen3_token_embedding_table_from_reader,
-    load_token_embedding_table_from_reader_with_tensor_name,
 };
 pub(crate) use tokenizer::Qwen3AsrTokenizer;
 
