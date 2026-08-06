@@ -84,6 +84,7 @@ pub mod realtime;
 pub(crate) mod registry;
 pub(crate) mod remote_compute;
 pub(crate) mod safety;
+pub(crate) mod short_audio_receipt;
 pub mod stage_timing;
 pub mod subtitle;
 mod tensor;
@@ -161,6 +162,13 @@ pub use metrics::{
     WerCounts, cer_counts, normalize_text, peak_rss_bytes, wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
+pub use short_audio_receipt::{
+    SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio, ShortAudioReceiptError,
+    ShortAudioReceiptLoadError, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
+    ShortAudioReceiptRun, ShortAudioReceiptTranscript, median_f64, receipt_os_id,
+    resolve_core_commit, sha256_file, sha256_hex_bytes, validate_core_commit,
+};
 pub use subtitle::{
     TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,
     decide_forced_alignment, project_transcription, validate_word_anchors,

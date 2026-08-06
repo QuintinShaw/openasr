@@ -31,7 +31,7 @@ pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) word_timestamps_mode: Option<WordTimestampsMode>,
     pub(crate) model_pack: Option<&'a Path>,
     /// OADP Phase 0 `.oadp` adapter pack; plumbed through the transcription
-    /// request (never the process environment — workers are already running).
+    /// request (never the process environment  -  workers are already running).
     pub(crate) adapter: Option<&'a Path>,
     pub(crate) output: Option<&'a Path>,
     pub(crate) continue_on_error: bool,
@@ -604,6 +604,13 @@ pub(crate) enum Command {
         #[arg(long, hide = true)]
         parent_pid: Option<u32>,
     },
+    /// Emit a machine-readable short-audio audit receipt (tooling / C-class gate).
+    ///
+    /// Explicit subcommand  -  not part of the default `transcribe` user path.
+    BenchReceipt {
+        #[command(subcommand)]
+        command: BenchReceiptCommand,
+    },
     /// Manage local API keys for `openasr serve` (`Authorization: Bearer
     /// <key>`). Loopback callers need no key by default; creating one forces
     /// every loopback request to present it too. Only a key's hash is
@@ -611,6 +618,48 @@ pub(crate) enum Command {
     Apikey {
         #[command(subcommand)]
         command: ApiKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BenchReceiptCommand {
+    /// Run one short-audio transcription and write `openasr.short-audio-receipt.v0` JSON.
+    #[command(name = "short-audio")]
+    ShortAudio {
+        /// Model reference (`id` or `id:quant`), for example `funasr-nano:q4`.
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+        /// Short audio fixture path (WAV preferred).
+        #[arg(long)]
+        audio: PathBuf,
+        /// Transcription backend: `native` (default) or `mock` (plumbing only).
+        #[arg(long, default_value = "native", value_parser = parse_backend_kind)]
+        backend: BackendKind,
+        /// Device label recorded in the receipt and mapped to execution target:
+        /// `cpu`, `metal`, `cuda`, `accelerated`, or `auto`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        /// Explicit local `.oasr` pack (native only).
+        #[arg(long)]
+        model_pack: Option<PathBuf>,
+        /// Output receipt JSON path.
+        #[arg(long, short = 'o')]
+        out: PathBuf,
+        /// Timed runs that contribute RTF samples (after warmup).
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
+        /// Untimed warmup passes before RTF sampling (marks receipt warm/populated).
+        #[arg(long, default_value_t = 0)]
+        warmup_runs: usize,
+        /// 40-hex core commit. Defaults to OPENASR_BUILD_COMMIT or `git rev-parse HEAD`.
+        #[arg(long)]
+        core_commit: Option<String>,
+        /// Gate scope label.
+        #[arg(long, default_value = "short-audio-gate")]
+        scope: String,
+        /// Optional ffmpeg binary for non-WAV preparation.
+        #[arg(long)]
+        ffmpeg_bin: Option<PathBuf>,
     },
 }
 

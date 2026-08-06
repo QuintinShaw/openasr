@@ -30,6 +30,7 @@ use openasr_core::{
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
+mod bench_receipt_cli;
 mod bench_suite_cli;
 mod catalog_cli;
 mod cli_args;
@@ -148,6 +149,7 @@ fn command_reads_the_model_store(command: &Command) -> bool {
             | Command::ModelPack { .. }
             | Command::Transcribe { .. }
             | Command::BenchSuite { .. }
+            | Command::BenchReceipt { .. }
             | Command::Live { .. }
             | Command::Serve { .. }
     )
@@ -358,6 +360,40 @@ async fn run() -> Result<()> {
                 runtime_paths: RuntimePathOverrides { ffmpeg_bin },
             },
         ),
+        Command::BenchReceipt { command } => match command {
+            BenchReceiptCommand::ShortAudio {
+                model,
+                audio,
+                backend,
+                device,
+                model_pack,
+                out,
+                runs,
+                warmup_runs,
+                core_commit,
+                scope,
+                ffmpeg_bin,
+            } => {
+                let git_cwd = env::current_dir().ok();
+                bench_receipt_cli::bench_receipt_short_audio(
+                    &native_execution_services,
+                    bench_receipt_cli::ShortAudioReceiptOptions {
+                        model: model.as_deref(),
+                        audio: &audio,
+                        backend_kind: backend,
+                        device: &device,
+                        model_pack: model_pack.as_deref(),
+                        out: &out,
+                        runs,
+                        warmup_runs,
+                        core_commit: core_commit.as_deref(),
+                        scope: &scope,
+                        ffmpeg_bin,
+                        git_cwd: git_cwd.as_deref(),
+                    },
+                )
+            }
+        },
         Command::Live {
             source,
             list_devices,
