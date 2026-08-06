@@ -523,8 +523,9 @@ pub(crate) fn firered_llm_qwen_family_layer_names(
 /// Admission descriptors and whole-decoder planning both read this value.
 pub(crate) fn firered_llm_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
-        crate::models::qwen::QwenDecoderContractOptions::QWEN2,
+        crate::models::qwen::QwenDecoderVariant::Qwen2,
         firered_llm_qwen_family_layer_names,
+        firered_llm_qwen_decoder_tail_names(),
     )
 }
 
@@ -532,18 +533,22 @@ pub(crate) fn firered_llm_qwen_decoder_profile() -> crate::models::qwen::QwenFam
 /// final norm. Expanded from the shared Qwen decoder contract Module
 /// (ordered `ExactDims`) so the per-layer tensor set (base 9 + Qwen2 qkv-bias
 /// 3 = 12) cannot drift from FunASR-Nano / MOSS / MiMo.
+pub(crate) fn firered_llm_qwen_decoder_contract(
+    decoder: &FireRedLlmDecoderMetadata,
+) -> Result<crate::models::qwen::QwenDecoderContract, FireRedLlmRuntimeTensorContractError> {
+    crate::models::qwen::QwenDecoderContract::bind(
+        firered_llm_qwen_decoder_geometry(decoder),
+        firered_llm_qwen_decoder_profile(),
+    )
+    .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
+}
+
 pub(crate) fn firered_llm_decoder_tensor_descriptors(
     decoder: &FireRedLlmDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FireRedLlmRuntimeTensorContractError> {
-    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
-    let profile = firered_llm_qwen_decoder_profile();
-    qwen_decoder_runtime_tensor_descriptors(
-        &firered_llm_qwen_decoder_geometry(decoder),
-        profile.options,
-        profile.names_for_layer,
-        firered_llm_qwen_decoder_tail_names(),
-    )
-    .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
+    firered_llm_qwen_decoder_contract(decoder)?
+        .runtime_tensor_descriptors()
+        .map_err(|reason| FireRedLlmRuntimeTensorContractError::GeometryOverflow { reason })
 }
 
 /// Static tail tensor names shared by admission descriptors and the contract-

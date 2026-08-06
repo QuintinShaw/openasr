@@ -23,7 +23,7 @@ use crate::models::qwen::{
 
 use super::runtime_contract::{
     FUNASR_NANO_RMS_NORM_EPSILON, FUNASR_NANO_ROPE_THETA, FunasrNanoDecoderMetadata,
-    funasr_nano_qwen_decoder_geometry, funasr_nano_qwen_decoder_tail_names,
+    funasr_nano_qwen_decoder_geometry,
 };
 use super::tensor_names::{LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
@@ -108,7 +108,7 @@ fn plan_whole_decoder(
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
         super::runtime_contract::funasr_nano_qwen_decoder_geometry(metadata),
-        profile.options,
+        profile.options(),
         profile.names_for_layer,
     )
     .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
@@ -168,7 +168,7 @@ impl FunasrNanoDecoderRuntime {
         } = load_qwen_decoder_tail_from_contract(
             &reader,
             &funasr_nano_qwen_decoder_geometry(&metadata),
-            funasr_nano_qwen_decoder_tail_names(),
+            super::runtime_contract::funasr_nano_qwen_decoder_profile().tail,
             FUNASR_NANO_RMS_NORM_EPSILON,
             backend,
         )
@@ -475,7 +475,7 @@ mod trace_tests {
     use crate::models::funasr_nano::runtime_contract::{
         FunasrNanoDecoderMetadata, funasr_nano_decoder_read_guard,
         funasr_nano_decoder_tensor_descriptors, funasr_nano_qwen_decoder_geometry,
-        funasr_nano_qwen_decoder_tail_names, parse_funasr_nano_decoder_metadata,
+        funasr_nano_qwen_decoder_profile, parse_funasr_nano_decoder_metadata,
     };
     use crate::models::tensor_binding::{
         assert_trace_matches_descriptor_set, project_fixture_tensors,
@@ -532,7 +532,7 @@ mod trace_tests {
         load_qwen_decoder_tail_from_contract(
             &reader,
             &funasr_nano_qwen_decoder_geometry(&metadata),
-            funasr_nano_qwen_decoder_tail_names(),
+            funasr_nano_qwen_decoder_profile().tail,
             FUNASR_NANO_RMS_NORM_EPSILON,
             GgmlCpuGraphBackend::Cpu,
         )

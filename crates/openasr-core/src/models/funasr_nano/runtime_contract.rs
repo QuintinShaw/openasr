@@ -795,13 +795,25 @@ pub(crate) fn funasr_nano_qwen_family_layer_names(
     }
 }
 
-/// Single-source Qwen3 decoder profile for FunASR-Nano: options + layer names.
-/// Admission descriptors and whole-decoder planning both read this value.
+/// Single-source Qwen3 decoder profile for FunASR-Nano: variant + layer names + tail.
+/// Admission, plan, and tail load all read this value (or a geometry-bound contract).
 pub(crate) fn funasr_nano_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
-        crate::models::qwen::QwenDecoderContractOptions::QWEN3,
+        crate::models::qwen::QwenDecoderVariant::Qwen3,
         funasr_nano_qwen_family_layer_names,
+        funasr_nano_qwen_decoder_tail_names(),
     )
+}
+
+/// Bind pack geometry to the family profile into one contract value.
+pub(crate) fn funasr_nano_qwen_decoder_contract(
+    decoder: &FunasrNanoDecoderMetadata,
+) -> Result<crate::models::qwen::QwenDecoderContract, FunasrNanoTensorContractError> {
+    crate::models::qwen::QwenDecoderContract::bind(
+        funasr_nano_qwen_decoder_geometry(decoder),
+        funasr_nano_qwen_decoder_profile(),
+    )
+    .map_err(|reason| FunasrNanoTensorContractError::InvalidDecoderGeometry { reason })
 }
 
 /// The Qwen3 decoder half of the contract: every decoder layer (named by the
@@ -812,15 +824,9 @@ pub(crate) fn funasr_nano_qwen_decoder_profile() -> crate::models::qwen::QwenFam
 pub(crate) fn funasr_nano_decoder_tensor_descriptors(
     decoder: &FunasrNanoDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FunasrNanoTensorContractError> {
-    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
-    let profile = funasr_nano_qwen_decoder_profile();
-    qwen_decoder_runtime_tensor_descriptors(
-        &funasr_nano_qwen_decoder_geometry(decoder),
-        profile.options,
-        profile.names_for_layer,
-        funasr_nano_qwen_decoder_tail_names(),
-    )
-    .map_err(|reason| FunasrNanoTensorContractError::InvalidDecoderGeometry { reason })
+    funasr_nano_qwen_decoder_contract(decoder)?
+        .runtime_tensor_descriptors()
+        .map_err(|reason| FunasrNanoTensorContractError::InvalidDecoderGeometry { reason })
 }
 
 /// Static tail tensor names shared by admission descriptors and the contract-

@@ -24,7 +24,6 @@ use crate::models::qwen::{
 
 use super::runtime_contract::{
     MimoLlmMetadata, mimo_asr_qwen_decoder_geometry, mimo_asr_qwen_decoder_profile,
-    mimo_asr_qwen_decoder_tail_names,
 };
 use super::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
 
@@ -100,7 +99,7 @@ fn plan_whole_decoder(
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
         mimo_asr_qwen_decoder_geometry(metadata),
-        profile.options,
+        profile.options(),
         profile.names_for_layer,
     )
     .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
@@ -156,7 +155,7 @@ impl MimoLlmDecoderRuntime {
         } = load_qwen_decoder_tail_from_contract(
             &reader,
             &mimo_asr_qwen_decoder_geometry(&metadata),
-            mimo_asr_qwen_decoder_tail_names(),
+            mimo_asr_qwen_decoder_profile().tail,
             metadata.rms_norm_epsilon,
             backend,
         )

@@ -148,10 +148,42 @@ impl QwenDecoderContractGeometry {
     }
 }
 
-/// Typed variation between Qwen2- and Qwen3-class checkpoints.
+/// Closed set of Qwen-shaped decoder variants.
 ///
-/// This is not a second family registry: each adapter picks the option pair that
-/// matches its loader / [`QwenWholeDecoderPlan`] wiring.
+/// Prefer this over independent bool flags: only these two combinations are
+/// valid. Invalid pairs such as qk_norm+qkv_bias together cannot be expressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenDecoderVariant {
+    /// Qwen3-class: per-head Q/K RMSNorm, no QKV bias.
+    Qwen3,
+    /// Qwen2-class: QKV projection bias, no QK-norm (MiMo backbone / FireRed2-LLM).
+    Qwen2,
+}
+
+impl QwenDecoderVariant {
+    pub(crate) const fn qk_norm(self) -> bool {
+        matches!(self, Self::Qwen3)
+    }
+
+    pub(crate) const fn qkv_bias(self) -> bool {
+        matches!(self, Self::Qwen2)
+    }
+
+    /// Legacy options view for call sites still taking
+    /// [`QwenDecoderContractOptions`] (tests / transitional plan helpers).
+    pub(crate) const fn options(self) -> QwenDecoderContractOptions {
+        QwenDecoderContractOptions {
+            qk_norm: self.qk_norm(),
+            qkv_bias: self.qkv_bias(),
+        }
+    }
+}
+
+/// Typed option pair projected from [`QwenDecoderVariant`].
+///
+/// Prefer constructing this only via [`QwenDecoderVariant::options`]. The free
+/// struct remains so existing descriptor helpers can keep a small POD view
+/// without threading the enum through every leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwenDecoderContractOptions {
     /// Per-head Q/K RMSNorm tensors (`attn_q_norm` / `attn_k_norm`) are present.
@@ -161,43 +193,11 @@ pub(crate) struct QwenDecoderContractOptions {
 }
 
 impl QwenDecoderContractOptions {
-    pub(crate) const QWEN3: Self = Self {
-        qk_norm: true,
-        qkv_bias: false,
-    };
-
-    /// Qwen2-class option pair (MiMo backbone / FireRedASR2-LLM).
-    pub(crate) const QWEN2: Self = Self {
-        qk_norm: false,
-        qkv_bias: true,
-    };
-}
-
-/// Owned decoder profile for one Qwen-shaped family adapter.
-///
-/// Binds the Qwen2/Qwen3 option pair to that family's layer-name provider.
-/// Admission (`*_decoder_tensor_descriptors`) and loader planning
-/// (`plan_whole_decoder` / [`crate::models::qwen::QwenWholeDecoderPlan::for_qwen_family`])
-/// both read `options` and `names_for_layer` from the same profile value so the
-/// option pair cannot drift between sites. This is not a family registry or
-/// runtime schema interpreter: each adapter defines its own profile next to
-/// its geometry / name helpers.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct QwenFamilyDecoderProfile {
-    pub options: QwenDecoderContractOptions,
-    pub names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
-}
-
-impl QwenFamilyDecoderProfile {
-    pub(crate) const fn new(
-        options: QwenDecoderContractOptions,
-        names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
-    ) -> Self {
-        Self {
-            options,
-            names_for_layer,
-        }
-    }
+    /// Test / transitional POD constructors. Production sites use [`QwenDecoderVariant`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const QWEN3: Self = QwenDecoderVariant::Qwen3.options();
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const QWEN2: Self = QwenDecoderVariant::Qwen2.options();
 }
 
 /// Tail tensor names the family loader already uses.
@@ -208,6 +208,70 @@ pub(crate) struct QwenDecoderTailTensorNames<'a> {
     /// (e.g. MOSS-Transcribe-Diarize).
     pub output_weight: Option<&'a str>,
     pub token_embd: &'a str,
+}
+
+/// Owned decoder profile for one Qwen-shaped family adapter.
+///
+/// Binds variant, layer-name provider, and tail names in one value. Admission,
+/// whole-decoder planning, tail load, and host memory quotes all read from the
+/// same profile so those fields cannot drift. Not a family registry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QwenFamilyDecoderProfile {
+    pub variant: QwenDecoderVariant,
+    pub names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
+    pub tail: QwenDecoderTailTensorNames<'static>,
+}
+
+impl QwenFamilyDecoderProfile {
+    pub(crate) const fn new(
+        variant: QwenDecoderVariant,
+        names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
+        tail: QwenDecoderTailTensorNames<'static>,
+    ) -> Self {
+        Self {
+            variant,
+            names_for_layer,
+            tail,
+        }
+    }
+
+    pub(crate) const fn options(self) -> QwenDecoderContractOptions {
+        self.variant.options()
+    }
+}
+
+/// Geometry + profile bound into one contract value.
+///
+/// Descriptor expansion, plan materialization, and tail load should take this
+/// (or fields exclusively from it) rather than separately-threaded geometry /
+/// options / names / tail arguments that can be mismatched by a future caller.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QwenDecoderContract {
+    pub geometry: QwenDecoderContractGeometry,
+    pub profile: QwenFamilyDecoderProfile,
+}
+
+impl QwenDecoderContract {
+    pub(crate) fn bind(
+        geometry: QwenDecoderContractGeometry,
+        profile: QwenFamilyDecoderProfile,
+    ) -> Result<Self, String> {
+        geometry.validate_basic()?;
+        geometry.validate_obligation_budget(
+            profile.options(),
+            2 + usize::from(profile.tail.output_weight.is_some()),
+        )?;
+        Ok(Self { geometry, profile })
+    }
+
+    pub(crate) fn runtime_tensor_descriptors(self) -> Result<Vec<TensorBindingDescriptor>, String> {
+        qwen_decoder_runtime_tensor_descriptors(
+            &self.geometry,
+            self.profile.options(),
+            self.profile.names_for_layer,
+            self.profile.tail,
+        )
+    }
 }
 
 fn descriptor(
@@ -767,71 +831,59 @@ mod tests {
         );
     }
 
-    /// Prove options live on the profile once: admission descriptor expansion
-    /// and the shared layer-contract path used by whole-decoder planning both
-    /// read `profile.options`. Flipping only that field flips success/failure
-    /// at both call sites together.
+    /// Prove variant + names + tail live on one profile: admission via
+    /// [`QwenDecoderContract::runtime_tensor_descriptors`] and the layer contract
+    /// used by whole-decoder planning both read the same bound value. Flipping
+    /// only the variant flips success/failure at both sites together.
     #[test]
     fn family_decoder_profile_options_are_single_source_for_admission_and_plan() {
         let g = qwen3_geometry();
+        let tail = QwenDecoderTailTensorNames {
+            output_norm: "output_norm.weight",
+            output_weight: Some("output.weight"),
+            token_embd: "token_embd.weight",
+        };
         let matched =
-            QwenFamilyDecoderProfile::new(QwenDecoderContractOptions::QWEN3, qwen3_layer_names);
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen3, qwen3_layer_names, tail);
         let mismatched = QwenFamilyDecoderProfile::new(
-            // Qwen2 options demand bias name slots the Qwen3 name provider omits.
-            QwenDecoderContractOptions::QWEN2,
+            // Qwen2 variant demands bias name slots the Qwen3 name provider omits.
+            QwenDecoderVariant::Qwen2,
             qwen3_layer_names,
+            tail,
         );
 
-        // Admission path (runtime descriptors for the whole decoder half).
-        let admission_ok = qwen_decoder_runtime_tensor_descriptors(
-            &g,
-            matched.options,
-            matched.names_for_layer,
-            QwenDecoderTailTensorNames {
-                output_norm: "output_norm.weight",
-                output_weight: Some("output.weight"),
-                token_embd: "token_embd.weight",
-            },
-        );
+        let admission_ok =
+            QwenDecoderContract::bind(g, matched).and_then(|c| c.runtime_tensor_descriptors());
         assert!(admission_ok.is_ok(), "{admission_ok:?}");
 
-        let admission_err = qwen_decoder_runtime_tensor_descriptors(
-            &g,
-            mismatched.options,
-            mismatched.names_for_layer,
-            QwenDecoderTailTensorNames {
-                output_norm: "output_norm.weight",
-                output_weight: Some("output.weight"),
-                token_embd: "token_embd.weight",
-            },
-        )
-        .expect_err("mismatched profile options must fail admission");
+        let admission_err = QwenDecoderContract::bind(g, mismatched)
+            .and_then(|c| c.runtime_tensor_descriptors())
+            .expect_err("mismatched profile variant must fail admission");
         assert!(
             admission_err.contains("qkv_bias") || admission_err.contains("bias"),
             "{admission_err}"
         );
 
-        // Plan path projects the same layer contract (`qwen_decoder_layer_tensor_descriptors`)
-        // that `QwenWholeDecoderPlan::for_qwen_family` expands before materializing weights.
+        // Plan path projects the same layer contract that
+        // `QwenWholeDecoderPlan::for_qwen_family` expands before materializing.
         let plan_layer_ok = qwen_decoder_layer_tensor_descriptors(
             &g,
-            matched.options,
+            matched.options(),
             &(matched.names_for_layer)(0),
         );
         assert!(plan_layer_ok.is_ok(), "{plan_layer_ok:?}");
 
         let plan_layer_err = qwen_decoder_layer_tensor_descriptors(
             &g,
-            mismatched.options,
+            mismatched.options(),
             &(mismatched.names_for_layer)(0),
         )
-        .expect_err("mismatched profile options must fail plan-layer contract");
+        .expect_err("mismatched profile variant must fail plan-layer contract");
         assert!(
             plan_layer_err.contains("qkv_bias") || plan_layer_err.contains("bias"),
             "{plan_layer_err}"
         );
 
-        // Same failure class at both sites when options come from one profile field.
         assert_eq!(admission_err, plan_layer_err);
     }
 }

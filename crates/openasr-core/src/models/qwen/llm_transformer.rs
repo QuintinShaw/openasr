@@ -2119,8 +2119,14 @@ pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
 }
 
 /// Compile a prepared [`QwenWholeDecoderPlan`] into a monomorphic whole-decoder
-/// graph executor. Promotion gate for the Prepared Graph Plan prototype:
-/// callers must supply a plan that already passed prepare-time validation;
+/// graph executor.
+///
+/// **Structural adoption (not performance-promoted):** every Qwen-shaped
+/// production caller builds through this seam so assembly cannot fork. That is
+/// a code-structure choice. Cold/warm/RSS/VRAM non-regression vs the pre-seam
+/// path has **not** been proven on this branch; do not treat this as a
+/// Completed Prepared Graph Plan promotion under ARCHITECTURE-DEEPENING-PLAN.
+/// Callers must supply a plan that already passed prepare-time validation;
 /// this function never walks family metadata or tensor-name tables.
 pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
     request: QwenPreparedDecoderGraphCompileRequest<'_>,

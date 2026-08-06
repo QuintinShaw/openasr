@@ -144,10 +144,23 @@ impl DeviceMemoryBrokerSet {
             ));
         }
 
+        // Dead weak (last owner Drop in flight or finished without removing yet)
+        // or missing key: refund any stale reservation **before** quoting a new
+        // one. Otherwise last-drop/reacquire overlap double-counts policy peak
+        // and can fail-closed while physical residency is only one mapping.
+        if let Some(mut stale) = table.remove(&key) {
+            drop(stale.reservation.take());
+        }
+
         // First live owner (or re-acquire after last drop): reserve under the
         // ordinary domain ledger. Policy peak = full mapping size. Observed
         // peak = 0 because the mmap is already open at preflight and host-import
         // does not allocate a second anonymous copy of those bytes.
+        //
+        // Hold the residency table lock across reserve+insert so a concurrent
+        // last Drop cannot observe a half-published generation, and so the
+        // stale refund above is atomic with the new charge relative to other
+        // acquirers of this key.
         let mut request = super::execution_memory::DomainReservationRequest {
             domain: key.domain.clone(),
             snapshot,
@@ -448,5 +461,85 @@ mod tests {
             "all handles dropped"
         );
         assert_eq!(broker.pack_weight_residency_live_count(), 0);
+    }
+
+    #[test]
+    fn last_drop_reacquire_overlap_does_not_double_charge_policy() {
+        // Controllable barrier race:
+        // - total budget fits exactly one 4 GiB residency (not two).
+        // - Thread A holds the last live handle; Thread B waits to reacquire.
+        // - A drops while B acquires. Without dead-entry refund-before-reserve,
+        //   B can see a dead weak, reserve a second 4 GiB while A's Drop has not
+        //   refunded yet, and fail-closed even though only one mapping exists.
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            minimum_headroom_bytes: 0,
+            maximum_owned_basis_points: 10_000,
+            ..DeviceMemoryPolicy::default()
+        }));
+        // Exactly one 3 GiB residency fits; two would exceed. Use 3 not 4 so the
+        // arithmetic stays obvious under a full-ownership policy ceiling.
+        let snap = snapshot(3 * GIB, 3 * GIB);
+        let k = key(0xDEAD_E077);
+        let (h1, charged1) = broker
+            .acquire_pack_weight_residency(k.clone(), 3 * GIB, snap, None)
+            .expect("initial owner");
+        assert_eq!(charged1, 3 * GIB);
+
+        let start = Arc::new(Barrier::new(2));
+        let dropper = {
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                drop(h1);
+            })
+        };
+        let reacquirer = {
+            let broker = Arc::clone(&broker);
+            let start = Arc::clone(&start);
+            let k = k.clone();
+            thread::spawn(move || {
+                start.wait();
+                // Spin briefly so drop and reacquire truly overlap under load.
+                for _ in 0..64 {
+                    match broker.acquire_pack_weight_residency(k.clone(), 3 * GIB, snap, None) {
+                        Ok((h, charged)) => {
+                            assert!(
+                                charged == 0 || charged == 3 * GIB,
+                                "incremental charge must be share-or-full, got {charged}"
+                            );
+                            assert!(
+                                broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes
+                                    <= 3 * GIB,
+                                "policy must never double-count one mapping"
+                            );
+                            return Ok(h);
+                        }
+                        Err(MemoryPlanningError::DeviceBudgetExceeded { .. }) => {
+                            // Transient only if still racing; retry while drop completes.
+                            thread::yield_now();
+                        }
+                        Err(other) => return Err(other),
+                    }
+                }
+                broker
+                    .acquire_pack_weight_residency(k, 3 * GIB, snap, None)
+                    .map(|(h, _)| h)
+            })
+        };
+
+        dropper.join().expect("dropper");
+        let h2 = reacquirer
+            .join()
+            .expect("reacquirer thread")
+            .expect("reacquire must succeed without false budget exceed");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            3 * GIB
+        );
+        drop(h2);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            0
+        );
     }
 }

@@ -761,8 +761,9 @@ pub(crate) fn mimo_asr_qwen_family_layer_names(
 /// Admission descriptors and whole-decoder planning both read this value.
 pub(crate) fn mimo_asr_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
-        crate::models::qwen::QwenDecoderContractOptions::QWEN2,
+        crate::models::qwen::QwenDecoderVariant::Qwen2,
         mimo_asr_qwen_family_layer_names,
+        mimo_asr_qwen_decoder_tail_names(),
     )
 }
 
@@ -771,18 +772,22 @@ pub(crate) fn mimo_asr_qwen_decoder_profile() -> crate::models::qwen::QwenFamily
 /// so the per-layer tensor set (base 9 + Qwen2 qkv-bias 3 = 12) cannot drift
 /// from FunASR-Nano / MOSS / FireRed2-LLM. Does not cover inlocal / audiotok /
 /// speech embd tensors.
+pub(crate) fn mimo_asr_qwen_decoder_contract(
+    llm: &MimoLlmMetadata,
+) -> Result<crate::models::qwen::QwenDecoderContract, MimoRuntimeTensorError> {
+    crate::models::qwen::QwenDecoderContract::bind(
+        mimo_asr_qwen_decoder_geometry(llm),
+        mimo_asr_qwen_decoder_profile(),
+    )
+    .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
+}
+
 pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
     llm: &MimoLlmMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
-    use crate::models::qwen::qwen_decoder_runtime_tensor_descriptors;
-    let profile = mimo_asr_qwen_decoder_profile();
-    qwen_decoder_runtime_tensor_descriptors(
-        &mimo_asr_qwen_decoder_geometry(llm),
-        profile.options,
-        profile.names_for_layer,
-        mimo_asr_qwen_decoder_tail_names(),
-    )
-    .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
+    mimo_asr_qwen_decoder_contract(llm)?
+        .runtime_tensor_descriptors()
+        .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
 }
 
 /// Static tail tensor names shared by admission descriptors and the contract-
@@ -839,12 +844,12 @@ fn mimo_asr_runtime_tensor_bindings(
     let profile = mimo_asr_qwen_decoder_profile();
     let decoder_geometry = mimo_asr_qwen_decoder_geometry(llm);
     decoder_geometry
-        .validate_obligation_budget(profile.options, /*tail*/ 3)
+        .validate_obligation_budget(profile.options(), /*tail*/ 3)
         .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })?;
     let decoder_upper = decoder_geometry
         .n_layers
         .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
-            profile.options,
+            profile.options(),
         ))
         .and_then(|n| n.checked_add(3))
         .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {

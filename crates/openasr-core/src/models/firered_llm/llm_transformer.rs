@@ -50,7 +50,6 @@ use super::runtime_contract::firered_llm_qwen_family_layer_names;
 use super::runtime_contract::{
     FIRERED_LLM_RMS_NORM_EPSILON, FIRERED_LLM_ROPE_THETA, FireRedLlmDecoderMetadata,
     firered_llm_qwen_decoder_geometry, firered_llm_qwen_decoder_profile,
-    firered_llm_qwen_decoder_tail_names,
 };
 use super::tensor_names::{LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
@@ -142,7 +141,7 @@ fn plan_qwen2_whole_decoder(
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
         firered_llm_qwen_decoder_geometry(metadata),
-        profile.options,
+        profile.options(),
         profile.names_for_layer,
     )
     .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
@@ -201,7 +200,7 @@ impl FireRedLlmDecoderRuntime {
         } = load_qwen_decoder_tail_from_contract(
             &reader,
             &firered_llm_qwen_decoder_geometry(&metadata),
-            firered_llm_qwen_decoder_tail_names(),
+            firered_llm_qwen_decoder_profile().tail,
             FIRERED_LLM_RMS_NORM_EPSILON,
             backend,
         )
@@ -746,7 +745,7 @@ mod parity_tests {
         } = load_qwen_decoder_tail_from_contract(
             &reader,
             &firered_llm_qwen_decoder_geometry(&decoder_metadata),
-            firered_llm_qwen_decoder_tail_names(),
+            firered_llm_qwen_decoder_profile().tail,
             FIRERED_LLM_RMS_NORM_EPSILON,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
