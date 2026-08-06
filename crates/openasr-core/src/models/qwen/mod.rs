@@ -33,7 +33,7 @@ pub(crate) use decoder_contract::{
     QWEN_DECODER_MAX_D_MODEL, QWEN_DECODER_MAX_FFN_DIM, QWEN_DECODER_MAX_HEAD_DIM,
     QWEN_DECODER_MAX_LAYERS, QWEN_DECODER_MAX_N_HEADS, QWEN_DECODER_MAX_VOCAB_SIZE,
     QwenDecoderContractGeometry, QwenDecoderContractOptions, QwenDecoderTailTensorNames,
-    qwen_decoder_runtime_tensor_descriptors,
+    QwenFamilyDecoderProfile, qwen_decoder_runtime_tensor_descriptors,
 };
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,

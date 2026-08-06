@@ -47,9 +47,11 @@ use crate::models::qwen::{
     Qwen3AsrLlmLayerAttentionProjection, load_qwen_family_llm_layer_attention_projection_generic,
 };
 
+#[cfg(test)]
+use super::runtime_contract::firered_llm_qwen_family_layer_names;
 use super::runtime_contract::{
     FIRERED_LLM_RMS_NORM_EPSILON, FIRERED_LLM_ROPE_THETA, FireRedLlmDecoderMetadata,
-    firered_llm_qwen_family_layer_names,
+    firered_llm_qwen_decoder_profile,
 };
 use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
@@ -78,7 +80,7 @@ pub(crate) fn quoted_firered_llm_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        firered_llm_qwen_family_layer_names,
+        firered_llm_qwen_decoder_profile().names_for_layer,
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -137,13 +139,15 @@ fn plan_qwen2_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FireRedLlmDecoderMetadata,
 ) -> Result<QwenWholeDecoderPlan, FireRedLlmDecoderError> {
-    use super::runtime_contract::firered_llm_qwen_decoder_geometry;
-    use crate::models::qwen::QwenDecoderContractOptions;
+    use super::runtime_contract::{
+        firered_llm_qwen_decoder_geometry, firered_llm_qwen_decoder_profile,
+    };
+    let profile = firered_llm_qwen_decoder_profile();
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
         firered_llm_qwen_decoder_geometry(metadata),
-        QwenDecoderContractOptions::QWEN2,
-        firered_llm_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
     )
     .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
         reason: error.to_string(),

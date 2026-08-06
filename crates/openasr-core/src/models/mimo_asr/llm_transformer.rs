@@ -24,7 +24,7 @@ use crate::models::qwen::{
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 
-use super::runtime_contract::{MimoLlmMetadata, mimo_asr_qwen_family_layer_names};
+use super::runtime_contract::{MimoLlmMetadata, mimo_asr_qwen_decoder_profile};
 use super::tensor_names::{OUTPUT_NORM_WEIGHT, OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
 
 pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
@@ -37,7 +37,7 @@ pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        mimo_asr_qwen_family_layer_names,
+        mimo_asr_qwen_decoder_profile().names_for_layer,
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -92,13 +92,13 @@ fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &MimoLlmMetadata,
 ) -> Result<QwenWholeDecoderPlan, MimoLlmDecoderError> {
-    use super::runtime_contract::mimo_asr_qwen_decoder_geometry;
-    use crate::models::qwen::QwenDecoderContractOptions;
+    use super::runtime_contract::{mimo_asr_qwen_decoder_geometry, mimo_asr_qwen_decoder_profile};
+    let profile = mimo_asr_qwen_decoder_profile();
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
         mimo_asr_qwen_decoder_geometry(metadata),
-        QwenDecoderContractOptions::QWEN2,
-        mimo_asr_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
     )
     .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
         reason: error.to_string(),

@@ -519,6 +519,15 @@ pub(crate) fn firered_llm_qwen_family_layer_names(
     }
 }
 
+/// Single-source Qwen2 decoder profile for FireRedASR2-LLM: options + layer names.
+/// Admission descriptors and whole-decoder planning both read this value.
+pub(crate) fn firered_llm_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
+    crate::models::qwen::QwenFamilyDecoderProfile::new(
+        crate::models::qwen::QwenDecoderContractOptions::QWEN2,
+        firered_llm_qwen_family_layer_names,
+    )
+}
+
 /// The Qwen2 decoder half: every `llm.blk.*` layer plus token embd / logits /
 /// final norm. Expanded from the shared Qwen decoder contract Module
 /// (ordered `ExactDims`) so the per-layer tensor set (base 9 + Qwen2 qkv-bias
@@ -527,13 +536,13 @@ pub(crate) fn firered_llm_decoder_tensor_descriptors(
     decoder: &FireRedLlmDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FireRedLlmRuntimeTensorContractError> {
     use crate::models::qwen::{
-        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
-        qwen_decoder_runtime_tensor_descriptors,
+        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
     };
+    let profile = firered_llm_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &firered_llm_qwen_decoder_geometry(decoder),
-        QwenDecoderContractOptions::QWEN2,
-        firered_llm_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
         QwenDecoderTailTensorNames {
             output_norm: LLM_OUTPUT_NORM_WEIGHT,
             output_weight: Some(LLM_OUTPUT_WEIGHT),

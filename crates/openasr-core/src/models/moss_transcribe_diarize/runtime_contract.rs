@@ -525,6 +525,16 @@ pub(crate) fn moss_td_qwen_family_layer_names(
     }
 }
 
+/// Single-source Qwen3 decoder profile for MOSS-Transcribe-Diarize: options +
+/// layer names. Admission descriptors and whole-decoder planning both read
+/// this value.
+pub(crate) fn moss_td_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
+    crate::models::qwen::QwenFamilyDecoderProfile::new(
+        crate::models::qwen::QwenDecoderContractOptions::QWEN3,
+        moss_td_qwen_family_layer_names,
+    )
+}
+
 /// The Qwen3 decoder half of the contract: every `moss.llm.blk.*` layer plus
 /// the tied-embedding tail (`moss.llm.out_norm` / `moss.llm.tok_embd`). Expanded
 /// from the shared Qwen decoder contract Module so the per-layer tensor set
@@ -534,13 +544,13 @@ pub(crate) fn moss_td_decoder_tensor_descriptors(
     decoder: &MossTdDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MossTdRuntimeContractError> {
     use crate::models::qwen::{
-        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
-        qwen_decoder_runtime_tensor_descriptors,
+        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
     };
+    let profile = moss_td_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &moss_td_qwen_decoder_geometry(decoder),
-        QwenDecoderContractOptions::QWEN3,
-        moss_td_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
         QwenDecoderTailTensorNames {
             output_norm: LLM_OUTPUT_NORM_WEIGHT,
             // MOSS ties the logits head to the token embedding table.
@@ -584,15 +594,16 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     // Decoder half upper-bounds itself via shared Qwen obligation budget; pin a
     // conservative decoder contribution so the full-pack ceiling still applies
     // even if a future decoder option grows the per-layer count.
-    use crate::models::qwen::{QwenDecoderContractGeometry, QwenDecoderContractOptions};
+    use crate::models::qwen::QwenDecoderContractGeometry;
+    let profile = moss_td_qwen_decoder_profile();
     let decoder_geometry = moss_td_qwen_decoder_geometry(&decoder);
     decoder_geometry
-        .validate_obligation_budget(QwenDecoderContractOptions::QWEN3, /*tail*/ 2)
+        .validate_obligation_budget(profile.options, /*tail*/ 2)
         .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })?;
     let decoder_upper = decoder_geometry
         .n_layers
         .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
-            QwenDecoderContractOptions::QWEN3,
+            profile.options,
         ))
         .and_then(|n| n.checked_add(2))
         .ok_or(MossTdRuntimeContractError::TooManyTensorObligations {

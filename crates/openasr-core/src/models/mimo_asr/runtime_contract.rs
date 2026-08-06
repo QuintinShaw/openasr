@@ -757,6 +757,15 @@ pub(crate) fn mimo_asr_qwen_family_layer_names(
     }
 }
 
+/// Single-source Qwen2 backbone decoder profile for MiMo-ASR: options + layer names.
+/// Admission descriptors and whole-decoder planning both read this value.
+pub(crate) fn mimo_asr_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
+    crate::models::qwen::QwenFamilyDecoderProfile::new(
+        crate::models::qwen::QwenDecoderContractOptions::QWEN2,
+        mimo_asr_qwen_family_layer_names,
+    )
+}
+
 /// The Qwen2 backbone decoder half: every `blk.*` layer plus token embd /
 /// logits / final norm. Expanded from the shared Qwen decoder contract Module
 /// so the per-layer tensor set (base 9 + Qwen2 qkv-bias 3 = 12) cannot drift
@@ -766,13 +775,13 @@ pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
     llm: &MimoLlmMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
     use crate::models::qwen::{
-        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
-        qwen_decoder_runtime_tensor_descriptors,
+        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
     };
+    let profile = mimo_asr_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &mimo_asr_qwen_decoder_geometry(llm),
-        QwenDecoderContractOptions::QWEN2,
-        mimo_asr_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
         QwenDecoderTailTensorNames {
             output_norm: OUTPUT_NORM_WEIGHT,
             output_weight: Some(OUTPUT_WEIGHT),
@@ -821,15 +830,16 @@ fn mimo_asr_runtime_tensor_bindings(
             count: usize::MAX,
             max: MIMO_MAX_TENSOR_OBLIGATIONS,
         })?;
-    use crate::models::qwen::{QwenDecoderContractGeometry, QwenDecoderContractOptions};
+    use crate::models::qwen::QwenDecoderContractGeometry;
+    let profile = mimo_asr_qwen_decoder_profile();
     let decoder_geometry = mimo_asr_qwen_decoder_geometry(llm);
     decoder_geometry
-        .validate_obligation_budget(QwenDecoderContractOptions::QWEN2, /*tail*/ 3)
+        .validate_obligation_budget(profile.options, /*tail*/ 3)
         .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })?;
     let decoder_upper = decoder_geometry
         .n_layers
         .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
-            QwenDecoderContractOptions::QWEN2,
+            profile.options,
         ))
         .and_then(|n| n.checked_add(3))
         .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {

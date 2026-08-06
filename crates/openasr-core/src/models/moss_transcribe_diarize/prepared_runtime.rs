@@ -27,7 +27,7 @@ use super::encoder_graph::{
 };
 use super::runtime_contract::{
     MOSS_TD_ADAPTOR_NORM_EPSILON, MOSS_TD_RMS_NORM_EPSILON, MossTdAdaptorMetadata,
-    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_family_layer_names,
+    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_decoder_profile,
     parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
 };
 use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
@@ -64,7 +64,7 @@ impl MossTdPreparedRuntime {
     ) -> Result<(), SystemMemoryOwnerError> {
         let plan_bytes = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
             decoder.n_layers,
-            moss_td_qwen_family_layer_names,
+            moss_td_qwen_decoder_profile().names_for_layer,
         )
         .map_err(|reason| {
             SystemMemoryOwnerError::capacity_failure("prepared_runtime_quote", reason)
@@ -248,11 +248,12 @@ pub(crate) fn build_moss_td_prepared_runtime(
     .map_err(|error| MossTdPreparedRuntimeError::Encoder {
         reason: error.to_string(),
     })?;
+    let profile = super::runtime_contract::moss_td_qwen_decoder_profile();
     let decoder_plan = QwenWholeDecoderPlan::for_qwen_family(
         &reader,
         super::runtime_contract::moss_td_qwen_decoder_geometry(&decoder_metadata),
-        crate::models::qwen::QwenDecoderContractOptions::QWEN3,
-        moss_td_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
     )
     .map_err(|error| MossTdPreparedRuntimeError::DecoderPlan {
         reason: error.to_string(),

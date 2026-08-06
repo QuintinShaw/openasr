@@ -10,8 +10,9 @@
 //!
 //! Family adapters supply only:
 //! - [`QwenDecoderContractGeometry`] from pack metadata;
-//! - [`QwenDecoderContractOptions`] (Qwen3 qk-norm vs Qwen2 qkv-bias);
-//! - per-layer [`super::QwenFamilyLlmLayerTensorNames`] (prefix / field spelling);
+//! - a [`QwenFamilyDecoderProfile`] that binds [`QwenDecoderContractOptions`]
+//!   (Qwen3 qk-norm vs Qwen2 qkv-bias) to the family's layer-name provider so
+//!   admission and whole-decoder planning cannot pick different option pairs;
 //! - [`QwenDecoderTailTensorNames`] for norm / logits / embedding constants.
 //!
 //! Projection weights use ordered ggml `[in, out]` [`ExactDims`] so a transposed
@@ -170,6 +171,33 @@ impl QwenDecoderContractOptions {
         qk_norm: false,
         qkv_bias: true,
     };
+}
+
+/// Owned decoder profile for one Qwen-shaped family adapter.
+///
+/// Binds the Qwen2/Qwen3 option pair to that family's layer-name provider.
+/// Admission (`*_decoder_tensor_descriptors`) and loader planning
+/// (`plan_whole_decoder` / [`crate::models::qwen::QwenWholeDecoderPlan::for_qwen_family`])
+/// both read `options` and `names_for_layer` from the same profile value so the
+/// option pair cannot drift between sites. This is not a family registry or
+/// runtime schema interpreter: each adapter defines its own profile next to
+/// its geometry / name helpers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QwenFamilyDecoderProfile {
+    pub options: QwenDecoderContractOptions,
+    pub names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
+}
+
+impl QwenFamilyDecoderProfile {
+    pub(crate) const fn new(
+        options: QwenDecoderContractOptions,
+        names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
+    ) -> Self {
+        Self {
+            options,
+            names_for_layer,
+        }
+    }
 }
 
 /// Tail tensor names the family loader already uses.
@@ -737,5 +765,73 @@ mod tests {
             err.contains("overflow") || err.contains("ceiling") || err.contains("obligations"),
             "{err}"
         );
+    }
+
+    /// Prove options live on the profile once: admission descriptor expansion
+    /// and the shared layer-contract path used by whole-decoder planning both
+    /// read `profile.options`. Flipping only that field flips success/failure
+    /// at both call sites together.
+    #[test]
+    fn family_decoder_profile_options_are_single_source_for_admission_and_plan() {
+        let g = qwen3_geometry();
+        let matched =
+            QwenFamilyDecoderProfile::new(QwenDecoderContractOptions::QWEN3, qwen3_layer_names);
+        let mismatched = QwenFamilyDecoderProfile::new(
+            // Qwen2 options demand bias name slots the Qwen3 name provider omits.
+            QwenDecoderContractOptions::QWEN2,
+            qwen3_layer_names,
+        );
+
+        // Admission path (runtime descriptors for the whole decoder half).
+        let admission_ok = qwen_decoder_runtime_tensor_descriptors(
+            &g,
+            matched.options,
+            matched.names_for_layer,
+            QwenDecoderTailTensorNames {
+                output_norm: "output_norm.weight",
+                output_weight: Some("output.weight"),
+                token_embd: "token_embd.weight",
+            },
+        );
+        assert!(admission_ok.is_ok(), "{admission_ok:?}");
+
+        let admission_err = qwen_decoder_runtime_tensor_descriptors(
+            &g,
+            mismatched.options,
+            mismatched.names_for_layer,
+            QwenDecoderTailTensorNames {
+                output_norm: "output_norm.weight",
+                output_weight: Some("output.weight"),
+                token_embd: "token_embd.weight",
+            },
+        )
+        .expect_err("mismatched profile options must fail admission");
+        assert!(
+            admission_err.contains("qkv_bias") || admission_err.contains("bias"),
+            "{admission_err}"
+        );
+
+        // Plan path projects the same layer contract (`qwen_decoder_layer_tensor_descriptors`)
+        // that `QwenWholeDecoderPlan::for_qwen_family` expands before materializing weights.
+        let plan_layer_ok = qwen_decoder_layer_tensor_descriptors(
+            &g,
+            matched.options,
+            &(matched.names_for_layer)(0),
+        );
+        assert!(plan_layer_ok.is_ok(), "{plan_layer_ok:?}");
+
+        let plan_layer_err = qwen_decoder_layer_tensor_descriptors(
+            &g,
+            mismatched.options,
+            &(mismatched.names_for_layer)(0),
+        )
+        .expect_err("mismatched profile options must fail plan-layer contract");
+        assert!(
+            plan_layer_err.contains("qkv_bias") || plan_layer_err.contains("bias"),
+            "{plan_layer_err}"
+        );
+
+        // Same failure class at both sites when options come from one profile field.
+        assert_eq!(admission_err, plan_layer_err);
     }
 }

@@ -42,7 +42,7 @@ pub(crate) fn quoted_funasr_nano_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        super::runtime_contract::funasr_nano_qwen_family_layer_names,
+        super::runtime_contract::funasr_nano_qwen_decoder_profile().names_for_layer,
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -104,12 +104,12 @@ fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FunasrNanoDecoderMetadata,
 ) -> Result<QwenWholeDecoderPlan, FunasrNanoDecoderError> {
-    use crate::models::qwen::QwenDecoderContractOptions;
+    let profile = super::runtime_contract::funasr_nano_qwen_decoder_profile();
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
         super::runtime_contract::funasr_nano_qwen_decoder_geometry(metadata),
-        QwenDecoderContractOptions::QWEN3,
-        super::runtime_contract::funasr_nano_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
     )
     .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
         reason: error.to_string(),

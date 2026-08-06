@@ -795,6 +795,15 @@ pub(crate) fn funasr_nano_qwen_family_layer_names(
     }
 }
 
+/// Single-source Qwen3 decoder profile for FunASR-Nano: options + layer names.
+/// Admission descriptors and whole-decoder planning both read this value.
+pub(crate) fn funasr_nano_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
+    crate::models::qwen::QwenFamilyDecoderProfile::new(
+        crate::models::qwen::QwenDecoderContractOptions::QWEN3,
+        funasr_nano_qwen_family_layer_names,
+    )
+}
+
 /// The Qwen3 decoder half of the contract: every decoder layer (named by the
 /// loader's own name source) plus the final norm, logits head, and token
 /// embedding. Expanded from the shared Qwen decoder contract Module so the
@@ -805,13 +814,13 @@ pub(crate) fn funasr_nano_decoder_tensor_descriptors(
 ) -> Result<Vec<TensorBindingDescriptor>, FunasrNanoTensorContractError> {
     use super::tensor_names::{LLM_OUTPUT_NORM_WEIGHT, LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
     use crate::models::qwen::{
-        QwenDecoderContractOptions, QwenDecoderTailTensorNames,
-        qwen_decoder_runtime_tensor_descriptors,
+        QwenDecoderTailTensorNames, qwen_decoder_runtime_tensor_descriptors,
     };
+    let profile = funasr_nano_qwen_decoder_profile();
     qwen_decoder_runtime_tensor_descriptors(
         &funasr_nano_qwen_decoder_geometry(decoder),
-        QwenDecoderContractOptions::QWEN3,
-        funasr_nano_qwen_family_layer_names,
+        profile.options,
+        profile.names_for_layer,
         QwenDecoderTailTensorNames {
             output_norm: LLM_OUTPUT_NORM_WEIGHT,
             output_weight: Some(LLM_OUTPUT_WEIGHT),
