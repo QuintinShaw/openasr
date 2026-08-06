@@ -174,7 +174,10 @@ struct DecodeProgress {
 impl DecodeProgress {
     fn begin(reporter: ProgressReporter, total_samples: u64) -> Self {
         reporter.enter_stage(TranscriptionStage::Decode);
-        reporter.report_units(0, total_samples.max(1));
+        // Stage fraction only — never publish raw PCM sample counters as
+        // completed/total units (UI would show "0/957696", which is internal
+        // noise to users). Windows/segments stay on report_units elsewhere.
+        reporter.report_fraction(0.0);
         Self {
             reporter,
             total_samples,
@@ -189,8 +192,9 @@ impl DecodeProgress {
             .decoded_samples
             .fetch_add(slice_samples, Ordering::Relaxed)
             .saturating_add(slice_samples);
+        let total = self.total_samples.max(1);
         self.reporter
-            .report_units(decoded, self.total_samples.max(1));
+            .report_fraction((decoded as f32 / total as f32).clamp(0.0, 1.0));
     }
 
     /// The [start, start+span) sub-range of the decode **stage** fraction that
@@ -1978,6 +1982,12 @@ fn run_native_transcription_impl(
         persist: false,
     }));
 
+    // Voice ID auxiliary load (embedder / segmenter packs) is not "准备中".
+    // Re-enter LoadModel so the UI says "加载模型" until diarize/decode starts.
+    if speaker_plan != SpeakerPlan::Off {
+        progress.enter_stage_indeterminate(TranscriptionStage::LoadModel);
+    }
+
     // Resolve the dependencies shared by every Voice ID path before probing
     // the external-only segmenter. This keeps the failure deterministic when
     // both packs are absent, avoids constructing either runtime on a known
@@ -2015,6 +2025,11 @@ fn run_native_transcription_impl(
                 backend: backend_class,
                 persist: false,
             }));
+            // replace_plan restores the open stage; keep LoadModel visible
+            // while auxiliary packs are still materializing.
+            if speaker_plan != SpeakerPlan::Off {
+                progress.enter_stage_indeterminate(TranscriptionStage::LoadModel);
+            }
         }
     }
 
@@ -2050,6 +2065,10 @@ fn run_native_transcription_impl(
     } else {
         None
     };
+    if speaker_plan != SpeakerPlan::Off {
+        progress.report_fraction(1.0);
+        progress.complete_stage();
+    }
     let voice_id_embedder = speaker_runtime
         .as_ref()
         .map(|runtime| runtime.shared_embedder());

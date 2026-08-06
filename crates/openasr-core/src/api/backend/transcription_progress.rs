@@ -224,6 +224,10 @@ pub struct PlannedStage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgressPlan {
     stages: Vec<PlannedStage>,
+    /// When false, cost weights are provisional (audio duration still unknown).
+    /// Overall fraction stays at 0 until a duration-aware plan replaces it —
+    /// otherwise fixed early-stage costs dominate and the bar jumps to ~70%.
+    duration_known: bool,
 }
 
 impl ProgressPlan {
@@ -233,6 +237,11 @@ impl ProgressPlan {
 
     pub fn total_cost(&self) -> f64 {
         self.stages.iter().map(|s| s.estimated_cost).sum()
+    }
+
+    /// True once audio duration is known and stage costs are trustworthy.
+    pub fn duration_known(&self) -> bool {
+        self.duration_known
     }
 
     pub fn contains(&self, stage: TranscriptionStage) -> bool {
@@ -250,6 +259,9 @@ impl ProgressPlan {
     /// entirely so their weight never dilutes overall.
     pub fn build(input: ProgressPlanInput) -> Self {
         let duration = input.audio_duration_s.max(0.0) as f64;
+        // Duration is "known" only when the caller supplied a positive length.
+        // Zero means provisional (pre-prepare) and must not drive overall %.
+        let duration_known = input.audio_duration_s.is_finite() && input.audio_duration_s > 0.0;
         let accelerated = matches!(input.backend, ProgressBackendClass::Accelerated);
         let mut stages = Vec::with_capacity(9);
 
@@ -362,7 +374,10 @@ impl ProgressPlan {
             }
         }
 
-        Self { stages }
+        Self {
+            stages,
+            duration_known,
+        }
     }
 
     /// Post-hoc FA-only plan: align (+ project). No diarize/decode weight.
@@ -371,6 +386,7 @@ impl ProgressPlan {
         let duration = input.audio_duration_s.max(0.0) as f64;
         let accelerated = matches!(backend, ProgressBackendClass::Accelerated);
         let align_rtf = if accelerated { 0.10 } else { 0.20 };
+        let duration_known = audio_duration_s.is_finite() && audio_duration_s > 0.0;
         Self {
             stages: vec![
                 PlannedStage {
@@ -382,6 +398,9 @@ impl ProgressPlan {
                     estimated_cost: 0.02,
                 },
             ],
+            // Post-hoc refine always has a known recording length (or treats
+            // zero as unknown and keeps overall at 0 until duration is set).
+            duration_known,
         }
     }
 }
@@ -498,6 +517,14 @@ impl ProgressState {
     }
 
     fn recompute_overall(&mut self) {
+        // Provisional (duration-unknown) plans must not publish cost-weighted
+        // overall: fixed early-stage costs would dominate (e.g. 73% at decode
+        // start). Stage labels still advance; the bar stays at 0 until a
+        // duration-aware plan is installed.
+        if !self.plan.duration_known {
+            self.overall_fraction = 0.0;
+            return;
+        }
         // When the open stage is already fully complete it lives in
         // `completed_stages`; do not also multiply its cost by stage_fraction.
         let (completed, current_cost, stage_fraction) = if let Some(idx) = self.current_index {
@@ -515,7 +542,9 @@ impl ProgressState {
             (self.completed_stage_costs(), 0.0, Some(0.0))
         };
         let next = compute_overall_fraction(&self.plan, completed, current_cost, stage_fraction);
-        // Monotonic: a later report never moves the bar backward.
+        // Monotonic within a duration-known plan: a later report never moves
+        // the bar backward. Plan *replacement* rewrites overall honestly
+        // (see `replace_plan`) and may lower the floor.
         self.overall_fraction = self.overall_fraction.max(next);
     }
 
@@ -546,6 +575,12 @@ impl ProgressState {
             let prev_stage = self.plan.stages[prev].stage;
             self.mark_completed(prev_stage);
         }
+
+        // Re-opening a previously completed stage (e.g. LoadModel again for
+        // auxiliary Voice ID packs) must un-complete it so sub-progress can
+        // contribute honestly; the first visit's cost is not double-counted
+        // once this visit completes again.
+        self.completed_stages.retain(|s| *s != stage);
 
         self.current_index = Some(idx);
         self.stage_fraction = if indeterminate { None } else { Some(0.0) };
@@ -595,8 +630,12 @@ impl ProgressState {
 
     /// Replace the plan while preserving stages already finished (matched by
     /// name). Unentered stages are never force-completed just because they
-    /// appear before the open stage in the new order. Overall stays monotonic
-    /// via max in [`Self::recompute_overall`].
+    /// appear before the open stage in the new order.
+    ///
+    /// Overall is **recomputed honestly** from the new costs (may go down).
+    /// Monotonic max only applies within a stable plan after this rewrite —
+    /// otherwise a provisional duration=0 plan permanently floors the bar at
+    /// ~70% when real duration weights land.
     fn replace_plan(&mut self, plan: ProgressPlan) {
         let mut finished = self.completed_stages.clone();
         // Stages strictly before current were advanced past and are finished
@@ -613,7 +652,6 @@ impl ProgressState {
         let open_frac = self.stage_fraction;
         let units = (self.completed_units, self.total_units);
         let detail = self.detail.clone();
-        let prev_overall = self.overall_fraction;
         let open_was_complete = open.is_some_and(|stage| finished.contains(&stage))
             || matches!(open_frac, Some(f) if f >= 1.0 - 1e-6);
 
@@ -633,8 +671,10 @@ impl ProgressState {
         self.completed_units = None;
         self.total_units = None;
         self.detail = None;
-        // overall kept for monotonic floor
-        self.overall_fraction = prev_overall;
+        // Drop the previous floor so the new weights can correct a provisional
+        // (duration-unknown) overshoot. recompute_overall then sets the honest
+        // value (0 while still provisional, else completed/total + current).
+        self.overall_fraction = 0.0;
 
         if let Some(stage) = open
             && self.plan.contains(stage)
@@ -1151,6 +1191,84 @@ mod tests {
         // identify still in total so the skipped weight is honest remaining work
         // until the plan is revised or Identify is entered later.
         assert!(identify_cost > 0.0);
+    }
+
+    #[test]
+    fn provisional_duration_unknown_keeps_overall_at_zero() {
+        // Matches the pre-prepare install path (audio_duration_s: 0.0).
+        let provisional = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 0.0,
+            voice_id: false,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        assert!(!provisional.duration_known());
+        let mut state = ProgressState::new(provisional);
+        state.enter_stage(TranscriptionStage::LoadModel, true);
+        state.complete_current();
+        state.enter_stage(TranscriptionStage::Prepare, true);
+        state.complete_current();
+        state.enter_stage(TranscriptionStage::Decode, false);
+        state.set_fraction(0.0, None, None, None);
+        assert!(
+            state.overall_fraction.abs() < 1e-6,
+            "provisional plan must not publish inflated overall, got {}",
+            state.overall_fraction
+        );
+    }
+
+    #[test]
+    fn replace_plan_with_real_duration_corrects_overall_downward() {
+        // Simulate the QA bug: provisional d=0 would have been ~73% at decode
+        // start if overall were published; after duration-aware replace_plan
+        // the bar must sit near completed/total (~4%), not stick at 73%.
+        let provisional = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 0.0,
+            voice_id: false,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        let mut state = ProgressState::new(provisional);
+        state.enter_stage(TranscriptionStage::LoadModel, false);
+        state.complete_current();
+        state.enter_stage(TranscriptionStage::Prepare, false);
+        state.complete_current();
+        state.enter_stage(TranscriptionStage::Decode, false);
+        assert!(state.overall_fraction.abs() < 1e-6);
+
+        let real = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 59.0,
+            voice_id: false,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        let load = real.cost_of(TranscriptionStage::LoadModel).unwrap();
+        let prep = real.cost_of(TranscriptionStage::Prepare).unwrap();
+        let total = real.total_cost();
+        let expected = (load + prep) as f32 / total as f32;
+        state.replace_plan(real);
+        assert!(
+            (state.overall_fraction - expected).abs() < 1e-3,
+            "after replace_plan overall {} must be ~{} (not provisional overshoot)",
+            state.overall_fraction,
+            expected
+        );
+        assert!(
+            state.overall_fraction < 0.15,
+            "decode start for ~1min audio must stay well below the old 73% bug"
+        );
     }
 
     #[test]
