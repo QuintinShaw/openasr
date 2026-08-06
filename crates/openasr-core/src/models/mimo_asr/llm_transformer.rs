@@ -23,7 +23,7 @@ use crate::models::qwen::{
 };
 
 use super::runtime_contract::{
-    MimoLlmMetadata, mimo_asr_qwen_decoder_geometry, mimo_asr_qwen_decoder_profile,
+    MimoLlmMetadata, mimo_asr_qwen_decoder_contract, mimo_asr_qwen_decoder_profile,
 };
 use super::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
 
@@ -37,7 +37,7 @@ pub(crate) fn quoted_mimo_llm_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        mimo_asr_qwen_decoder_profile().names_for_layer,
+        mimo_asr_qwen_decoder_profile().names_for_layer(),
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -94,16 +94,16 @@ fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &MimoLlmMetadata,
 ) -> Result<QwenWholeDecoderPlan, MimoLlmDecoderError> {
-    use super::runtime_contract::{mimo_asr_qwen_decoder_geometry, mimo_asr_qwen_decoder_profile};
-    let profile = mimo_asr_qwen_decoder_profile();
-    QwenWholeDecoderPlan::for_qwen_family(
-        reader,
-        mimo_asr_qwen_decoder_geometry(metadata),
-        profile.options(),
-        profile.names_for_layer,
-    )
-    .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
-        reason: error.to_string(),
+    use super::runtime_contract::mimo_asr_qwen_decoder_contract;
+    let contract = mimo_asr_qwen_decoder_contract(metadata).map_err(|error| {
+        MimoLlmDecoderError::TensorReadFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    QwenWholeDecoderPlan::for_qwen_family(reader, contract).map_err(|error| {
+        MimoLlmDecoderError::TensorReadFailed {
+            reason: error.to_string(),
+        }
     })
 }
 
@@ -152,13 +152,19 @@ impl MimoLlmDecoderRuntime {
         let QwenDecoderTail {
             logits_head,
             token_embedding,
-        } = load_qwen_decoder_tail_from_contract(
-            &reader,
-            &mimo_asr_qwen_decoder_geometry(&metadata),
-            mimo_asr_qwen_decoder_profile().tail,
-            metadata.rms_norm_epsilon,
-            backend,
-        )
+        } = {
+            let contract = mimo_asr_qwen_decoder_contract(&metadata).map_err(|error| {
+                MimoLlmDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+            load_qwen_decoder_tail_from_contract(
+                &reader,
+                contract,
+                metadata.rms_norm_epsilon,
+                backend,
+            )
+        }
         .map_err(map_tail_load_error)?;
         // Keep the output projection in the same static arena as the resident
         // decoder graph so Metal/GPU decode can return a device-side top-1

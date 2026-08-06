@@ -179,24 +179,21 @@ impl QwenDecoderVariant {
     }
 }
 
-/// Typed option pair projected from [`QwenDecoderVariant`].
+/// Private POD projected from [`QwenDecoderVariant`] for descriptor helpers.
 ///
-/// Prefer constructing this only via [`QwenDecoderVariant::options`]. The free
-/// struct remains so existing descriptor helpers can keep a small POD view
-/// without threading the enum through every leaf.
+/// Fields are crate-private so callers cannot assemble illegal qk_norm/qkv_bias
+/// pairs. Construct only via [`QwenDecoderVariant::options`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwenDecoderContractOptions {
-    /// Per-head Q/K RMSNorm tensors (`attn_q_norm` / `attn_k_norm`) are present.
-    pub qk_norm: bool,
-    /// Q/K/V projection bias tensors are present.
-    pub qkv_bias: bool,
+    pub(crate) qk_norm: bool,
+    pub(crate) qkv_bias: bool,
 }
 
 impl QwenDecoderContractOptions {
-    /// Test / transitional POD constructors. Production sites use [`QwenDecoderVariant`].
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only named projections of the closed variant set.
+    #[cfg(test)]
     pub(crate) const QWEN3: Self = QwenDecoderVariant::Qwen3.options();
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) const QWEN2: Self = QwenDecoderVariant::Qwen2.options();
 }
 
@@ -212,14 +209,14 @@ pub(crate) struct QwenDecoderTailTensorNames<'a> {
 
 /// Owned decoder profile for one Qwen-shaped family adapter.
 ///
-/// Binds variant, layer-name provider, and tail names in one value. Admission,
-/// whole-decoder planning, tail load, and host memory quotes all read from the
-/// same profile so those fields cannot drift. Not a family registry.
+/// Binds variant, layer-name provider, and tail names in one value. Not a
+/// family registry. Production code should bind this with geometry into
+/// [`QwenDecoderContract`] once and pass that value downstream.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QwenFamilyDecoderProfile {
-    pub variant: QwenDecoderVariant,
-    pub names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
-    pub tail: QwenDecoderTailTensorNames<'static>,
+    variant: QwenDecoderVariant,
+    names_for_layer: fn(usize) -> QwenFamilyLlmLayerTensorNames,
+    tail: QwenDecoderTailTensorNames<'static>,
 }
 
 impl QwenFamilyDecoderProfile {
@@ -235,20 +232,42 @@ impl QwenFamilyDecoderProfile {
         }
     }
 
+    #[allow(dead_code)] // closed-set accessor; production paths use options()
+    pub(crate) const fn variant(self) -> QwenDecoderVariant {
+        self.variant
+    }
+
     pub(crate) const fn options(self) -> QwenDecoderContractOptions {
         self.variant.options()
+    }
+
+    pub(crate) const fn names_for_layer(self) -> fn(usize) -> QwenFamilyLlmLayerTensorNames {
+        self.names_for_layer
+    }
+
+    pub(crate) const fn tail(self) -> QwenDecoderTailTensorNames<'static> {
+        self.tail
+    }
+
+    /// Descriptor count for the tail half (norm + embd [+ optional logits]).
+    pub(crate) const fn tail_tensor_count(self) -> usize {
+        if self.tail.output_weight.is_some() {
+            3
+        } else {
+            2
+        }
     }
 }
 
 /// Geometry + profile bound into one contract value.
 ///
-/// Descriptor expansion, plan materialization, and tail load should take this
-/// (or fields exclusively from it) rather than separately-threaded geometry /
-/// options / names / tail arguments that can be mismatched by a future caller.
+/// Fields are private: construct only via [`Self::bind`]. Production planner,
+/// tail loader, admission descriptors, and host quotes must take this value
+/// (or accessors on it) — not separately-threaded geometry/options/names/tail.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QwenDecoderContract {
-    pub geometry: QwenDecoderContractGeometry,
-    pub profile: QwenFamilyDecoderProfile,
+    geometry: QwenDecoderContractGeometry,
+    profile: QwenFamilyDecoderProfile,
 }
 
 impl QwenDecoderContract {
@@ -257,20 +276,52 @@ impl QwenDecoderContract {
         profile: QwenFamilyDecoderProfile,
     ) -> Result<Self, String> {
         geometry.validate_basic()?;
-        geometry.validate_obligation_budget(
-            profile.options(),
-            2 + usize::from(profile.tail.output_weight.is_some()),
-        )?;
+        geometry.validate_obligation_budget(profile.options(), profile.tail_tensor_count())?;
         Ok(Self { geometry, profile })
+    }
+
+    pub(crate) const fn geometry(self) -> QwenDecoderContractGeometry {
+        self.geometry
+    }
+
+    #[allow(dead_code)] // kept for diagnostics / family adapters
+    pub(crate) const fn profile(self) -> QwenFamilyDecoderProfile {
+        self.profile
+    }
+
+    #[allow(dead_code)] // closed-set accessor; production paths use options()
+    pub(crate) const fn variant(self) -> QwenDecoderVariant {
+        self.profile.variant()
+    }
+
+    pub(crate) const fn options(self) -> QwenDecoderContractOptions {
+        self.profile.options()
+    }
+
+    pub(crate) const fn names_for_layer(self) -> fn(usize) -> QwenFamilyLlmLayerTensorNames {
+        self.profile.names_for_layer()
+    }
+
+    pub(crate) const fn tail(self) -> QwenDecoderTailTensorNames<'static> {
+        self.profile.tail()
     }
 
     pub(crate) fn runtime_tensor_descriptors(self) -> Result<Vec<TensorBindingDescriptor>, String> {
         qwen_decoder_runtime_tensor_descriptors(
             &self.geometry,
-            self.profile.options(),
-            self.profile.names_for_layer,
-            self.profile.tail,
+            self.options(),
+            self.names_for_layer(),
+            self.tail(),
         )
+    }
+
+    #[allow(dead_code)] // per-layer projection for admission/debug
+    pub(crate) fn layer_tensor_descriptors(
+        self,
+        layer_index: usize,
+    ) -> Result<Vec<TensorBindingDescriptor>, String> {
+        let names = (self.names_for_layer())(layer_index);
+        qwen_decoder_layer_tensor_descriptors(&self.geometry, self.options(), &names)
     }
 }
 
@@ -869,14 +920,14 @@ mod tests {
         let plan_layer_ok = qwen_decoder_layer_tensor_descriptors(
             &g,
             matched.options(),
-            &(matched.names_for_layer)(0),
+            &(matched.names_for_layer())(0),
         );
         assert!(plan_layer_ok.is_ok(), "{plan_layer_ok:?}");
 
         let plan_layer_err = qwen_decoder_layer_tensor_descriptors(
             &g,
             mismatched.options(),
-            &(mismatched.names_for_layer)(0),
+            &(mismatched.names_for_layer())(0),
         )
         .expect_err("mismatched profile variant must fail plan-layer contract");
         assert!(
@@ -885,5 +936,67 @@ mod tests {
         );
 
         assert_eq!(admission_err, plan_layer_err);
+    }
+
+    /// Production planner single-source gate: `QwenWholeDecoderPlan::for_qwen_family`
+    /// consumes only a bound [`QwenDecoderContract`]. A matched profile plans; a
+    /// mismatched variant fails at bind (before any pack I/O). This is the
+    /// production call shape FunASR/MOSS/MiMo/FireRed/Qwen3-ASR use — not a
+    /// parallel split-args path.
+    #[test]
+    fn production_planner_consumes_only_bound_contract() {
+        use crate::models::qwen::QwenWholeDecoderPlan;
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+        use std::collections::BTreeMap;
+
+        let g = qwen3_geometry();
+        let tail = QwenDecoderTailTensorNames {
+            output_norm: "output_norm.weight",
+            output_weight: Some("output.weight"),
+            token_embd: "token_embd.weight",
+        };
+        let matched =
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen3, qwen3_layer_names, tail);
+        let mismatched =
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen2, qwen3_layer_names, tail);
+
+        // Matched profile binds and expands; mismatched Qwen2 variant against
+        // Qwen3 names fails when production expands descriptors (same gate
+        // admission uses). Bind itself only checks geometry/obligation budget.
+        let contract = QwenDecoderContract::bind(g, matched).expect("matched bind");
+        assert_eq!(contract.variant(), QwenDecoderVariant::Qwen3);
+        assert_eq!(contract.profile().variant(), QwenDecoderVariant::Qwen3);
+        let descriptors = contract
+            .runtime_tensor_descriptors()
+            .expect("matched descriptors");
+        let mismatch_contract = QwenDecoderContract::bind(g, mismatched)
+            .expect("geometry bind does not inspect layer names");
+        let mismatch_err = mismatch_contract
+            .runtime_tensor_descriptors()
+            .expect_err("mismatched variant must fail descriptor expansion");
+        assert!(
+            mismatch_err.contains("qkv_bias") || mismatch_err.contains("bias"),
+            "unexpected mismatch error: {mismatch_err}"
+        );
+
+        // Minimal fixture covering the full decoder descriptor set so the
+        // production planner can expand every layer without missing-tensor noise.
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("planner-contract.oasr");
+        let shapes: BTreeMap<String, Vec<u64>> =
+            crate::models::tensor_binding::project_fixture_tensors(&descriptors)
+                .into_iter()
+                .collect();
+        // project_fixture_tensors already encodes ExactDims/VectorLen; just write.
+        let mut spec = TinyGgufFixtureSpec::new(BTreeMap::new());
+        for (name, dims) in shapes {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write fixture");
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
+
+        let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, contract)
+            .expect("production planner must accept bound matched contract");
+        assert_eq!(plan.layer_count(), g.n_layers);
     }
 }

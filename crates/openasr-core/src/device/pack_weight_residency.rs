@@ -251,6 +251,63 @@ impl DeviceMemoryBrokerSet {
             .unwrap_or_else(|e| e.into_inner());
         table.get(key).map(|entry| entry.generation)
     }
+
+    /// Test-only: install a **dead** table entry that still holds a live
+    /// SystemMemory reservation. Models the last-drop/reacquire window where
+    /// the previous owner's `Weak` is already dead but refund has not run (or
+    /// was skipped). Production `acquire_pack_weight_residency` must refund this
+    /// stale charge **before** quoting a new one; without that step a single
+    /// reacquire against a one-slot budget fails closed.
+    #[cfg(test)]
+    pub(crate) fn inject_dead_pack_weight_residency_with_live_reservation_for_test(
+        self: &Arc<Self>,
+        key: PackWeightResidencyKey,
+        bytes: u64,
+        snapshot: DeviceMemorySnapshot,
+    ) -> Result<(), MemoryPlanningError> {
+        if bytes == 0 {
+            return Err(MemoryPlanningError::EmptyResourceId);
+        }
+        let mut table = self
+            .pack_weight_residencies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if table.contains_key(&key) {
+            return Err(MemoryPlanningError::ReservationLedgerCorrupted {
+                domain: key.domain.clone(),
+            });
+        }
+        let mut request = super::execution_memory::DomainReservationRequest {
+            domain: key.domain.clone(),
+            snapshot,
+            peak_bytes: bytes,
+            retained_bytes: bytes,
+            observed_peak_bytes: Some(0),
+            requires_reconciliation: false,
+            resource_id: format!(
+                "pack-weight-residency-dead-inject:{}:{:#x}",
+                key.domain, key.mapping_identity
+            ),
+            cohort_id: None,
+        };
+        request.cohort_id = None;
+        let mut batch = self.try_reserve_batch(vec![request])?;
+        batch.commit_quoted()?;
+        let generation = self
+            .next_pack_weight_residency_generation
+            .fetch_add(1, Ordering::Relaxed);
+        table.insert(
+            key,
+            PackWeightResidencyEntry {
+                charged_bytes: bytes,
+                generation,
+                reservation: Some(batch),
+                // No live owner: upgrade() returns None, matching the race window.
+                live: Weak::new(),
+            },
+        );
+        Ok(())
+    }
 }
 
 pub(crate) fn empty_pack_weight_residency_table()
@@ -464,65 +521,123 @@ mod tests {
     }
 
     #[test]
-    fn last_drop_reacquire_overlap_does_not_double_charge_policy() {
-        // Controllable barrier race:
-        // - total budget fits exactly one 4 GiB residency (not two).
-        // - Thread A holds the last live handle; Thread B waits to reacquire.
-        // - A drops while B acquires. Without dead-entry refund-before-reserve,
-        //   B can see a dead weak, reserve a second 4 GiB while A's Drop has not
-        //   refunded yet, and fail-closed even though only one mapping exists.
+    fn dead_entry_with_live_reservation_is_refunded_before_first_reacquire() {
+        // Deterministic proof of refund-before-reserve (no retry loop):
+        //
+        // Budget fits exactly one 3 GiB residency. Inject a dead-weak table entry
+        // that still holds a live 3 GiB reservation -- the race window after the
+        // last owner's Arc died but before Drop refunded (or after a stale Drop
+        // left the entry). A single `acquire` call must:
+        //   1. observe the dead weak,
+        //   2. refund the stale reservation under the table lock,
+        //   3. reserve+commit the new generation,
+        //   4. return Ok on the first try.
+        // Without step 2 the same call fails closed with DeviceBudgetExceeded
+        // because the ledger still shows 3 GiB committed against a 3 GiB ceiling.
         let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
             minimum_headroom_bytes: 0,
             maximum_owned_basis_points: 10_000,
         }));
-        // Exactly one 3 GiB residency fits; two would exceed. Use 3 not 4 so the
-        // arithmetic stays obvious under a full-ownership policy ceiling.
         let snap = snapshot(3 * GIB, 3 * GIB);
         let k = key(0xDEAD_E077);
+
+        broker
+            .inject_dead_pack_weight_residency_with_live_reservation_for_test(
+                k.clone(),
+                3 * GIB,
+                snap,
+            )
+            .expect("inject dead entry with live reservation");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            3 * GIB,
+            "precondition: stale reservation still charges the policy ledger"
+        );
+        assert_eq!(
+            broker.pack_weight_residency_live_count(),
+            0,
+            "precondition: injected entry has no live owner"
+        );
+
+        // One call. No retry. Old code (reserve without refunding dead entry)
+        // fails here with DeviceBudgetExceeded.
+        let (h2, charged) = broker
+            .acquire_pack_weight_residency(k.clone(), 3 * GIB, snap, None)
+            .expect("first reacquire must succeed without retry when dead entry is refunded first");
+        assert_eq!(charged, 3 * GIB, "new generation takes the full charge");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            3 * GIB,
+            "policy must show exactly one residency, not double-count"
+        );
+        assert_eq!(broker.pack_weight_residency_live_count(), 1);
+        drop(h2);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            0
+        );
+        assert_eq!(broker.pack_weight_residency_live_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_last_drop_and_reacquire_never_exceeds_one_mapping_charge() {
+        // Stress companion to the deterministic inject test: drop the last owner
+        // while another thread reacquires. Policy committed bytes must never
+        // exceed one mapping; final state is exactly one live charge.
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            minimum_headroom_bytes: 0,
+            maximum_owned_basis_points: 10_000,
+        }));
+        let snap = snapshot(3 * GIB, 3 * GIB);
+        let k = key(0xC0_C12E);
         let (h1, charged1) = broker
             .acquire_pack_weight_residency(k.clone(), 3 * GIB, snap, None)
             .expect("initial owner");
         assert_eq!(charged1, 3 * GIB);
 
-        let start = Arc::new(Barrier::new(2));
+        // Dual barrier: both threads arm, then drop and reacquire overlap.
+        let armed = Arc::new(Barrier::new(2));
         let dropper = {
-            let start = Arc::clone(&start);
+            let armed = Arc::clone(&armed);
             thread::spawn(move || {
-                start.wait();
+                armed.wait();
                 drop(h1);
             })
         };
         let reacquirer = {
             let broker = Arc::clone(&broker);
-            let start = Arc::clone(&start);
+            let armed = Arc::clone(&armed);
             let k = k.clone();
             thread::spawn(move || {
-                start.wait();
-                // Spin briefly so drop and reacquire truly overlap under load.
-                for _ in 0..64 {
+                armed.wait();
+                // First successful acquire wins; DeviceBudgetExceeded is only
+                // tolerated while the dropper has not yet refunded. The
+                // deterministic inject test above proves the no-retry path; this
+                // stress only checks the ledger never overshoots one charge.
+                for _ in 0..256 {
                     match broker.acquire_pack_weight_residency(k.clone(), 3 * GIB, snap, None) {
                         Ok((h, charged)) => {
                             assert!(
                                 charged == 0 || charged == 3 * GIB,
                                 "incremental charge must be share-or-full, got {charged}"
                             );
+                            let committed =
+                                broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes;
                             assert!(
-                                broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes
-                                    <= 3 * GIB,
-                                "policy must never double-count one mapping"
+                                committed <= 3 * GIB,
+                                "policy must never double-count one mapping, committed={committed}"
                             );
                             return Ok(h);
                         }
                         Err(MemoryPlanningError::DeviceBudgetExceeded { .. }) => {
-                            // Transient only if still racing; retry while drop completes.
                             thread::yield_now();
                         }
                         Err(other) => return Err(other),
                     }
                 }
-                broker
-                    .acquire_pack_weight_residency(k, 3 * GIB, snap, None)
-                    .map(|(h, _)| h)
+                Err(MemoryPlanningError::ReservationLedgerCorrupted {
+                    domain: MemoryDomainKey::SystemMemory,
+                })
             })
         };
 
@@ -530,7 +645,7 @@ mod tests {
         let h2 = reacquirer
             .join()
             .expect("reacquirer thread")
-            .expect("reacquire must succeed without false budget exceed");
+            .expect("reacquire must eventually succeed under overlap");
         assert_eq!(
             broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
             3 * GIB

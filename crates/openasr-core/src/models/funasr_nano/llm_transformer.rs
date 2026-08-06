@@ -23,7 +23,6 @@ use crate::models::qwen::{
 
 use super::runtime_contract::{
     FUNASR_NANO_RMS_NORM_EPSILON, FUNASR_NANO_ROPE_THETA, FunasrNanoDecoderMetadata,
-    funasr_nano_qwen_decoder_geometry,
 };
 use super::tensor_names::{LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
 
@@ -42,7 +41,7 @@ pub(crate) fn quoted_funasr_nano_decoder_system_memory_bytes(
     )?;
     let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
         metadata.n_layers,
-        super::runtime_contract::funasr_nano_qwen_decoder_profile().names_for_layer,
+        super::runtime_contract::funasr_nano_qwen_decoder_profile().names_for_layer(),
     )?;
     let (logits_peak, logits_retained) =
         Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
@@ -104,15 +103,16 @@ fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FunasrNanoDecoderMetadata,
 ) -> Result<QwenWholeDecoderPlan, FunasrNanoDecoderError> {
-    let profile = super::runtime_contract::funasr_nano_qwen_decoder_profile();
-    QwenWholeDecoderPlan::for_qwen_family(
-        reader,
-        super::runtime_contract::funasr_nano_qwen_decoder_geometry(metadata),
-        profile.options(),
-        profile.names_for_layer,
-    )
-    .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
-        reason: error.to_string(),
+    let contract =
+        super::runtime_contract::funasr_nano_qwen_decoder_contract(metadata).map_err(|error| {
+            FunasrNanoDecoderError::TensorReadFailed {
+                reason: error.to_string(),
+            }
+        })?;
+    QwenWholeDecoderPlan::for_qwen_family(reader, contract).map_err(|error| {
+        FunasrNanoDecoderError::TensorReadFailed {
+            reason: error.to_string(),
+        }
     })
 }
 
@@ -165,13 +165,18 @@ impl FunasrNanoDecoderRuntime {
         let QwenDecoderTail {
             logits_head,
             token_embedding,
-        } = load_qwen_decoder_tail_from_contract(
-            &reader,
-            &funasr_nano_qwen_decoder_geometry(&metadata),
-            super::runtime_contract::funasr_nano_qwen_decoder_profile().tail,
-            FUNASR_NANO_RMS_NORM_EPSILON,
-            backend,
-        )
+        } = {
+            let contract = super::runtime_contract::funasr_nano_qwen_decoder_contract(&metadata)
+                .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                })?;
+            load_qwen_decoder_tail_from_contract(
+                &reader,
+                contract,
+                FUNASR_NANO_RMS_NORM_EPSILON,
+                backend,
+            )
+        }
         .map_err(map_tail_load_error)?;
         // Prepared Graph Plan prototype: plan is host-owned metadata built at
         // prepare; the shared compile seam is the only backend materialize path
@@ -474,8 +479,8 @@ mod trace_tests {
     use crate::ggml_runtime::GgmlCpuGraphBackend;
     use crate::models::funasr_nano::runtime_contract::{
         FunasrNanoDecoderMetadata, funasr_nano_decoder_read_guard,
-        funasr_nano_decoder_tensor_descriptors, funasr_nano_qwen_decoder_geometry,
-        funasr_nano_qwen_decoder_profile, parse_funasr_nano_decoder_metadata,
+        funasr_nano_decoder_tensor_descriptors, funasr_nano_qwen_decoder_contract,
+        parse_funasr_nano_decoder_metadata,
     };
     use crate::models::tensor_binding::{
         assert_trace_matches_descriptor_set, project_fixture_tensors,
@@ -531,8 +536,7 @@ mod trace_tests {
         plan_whole_decoder(&reader, &metadata).expect("plan decoder");
         load_qwen_decoder_tail_from_contract(
             &reader,
-            &funasr_nano_qwen_decoder_geometry(&metadata),
-            funasr_nano_qwen_decoder_profile().tail,
+            funasr_nano_qwen_decoder_contract(&metadata).expect("bind decoder contract"),
             FUNASR_NANO_RMS_NORM_EPSILON,
             GgmlCpuGraphBackend::Cpu,
         )

@@ -21,7 +21,8 @@ use crate::ggml_runtime::{
 };
 
 use super::decoder_contract::{
-    QwenDecoderContractGeometry, QwenDecoderContractOptions, qwen_decoder_layer_tensor_descriptors,
+    QwenDecoderContract, QwenDecoderContractGeometry, QwenDecoderContractOptions,
+    qwen_decoder_layer_tensor_descriptors,
 };
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
@@ -5750,51 +5751,62 @@ impl QwenWholeDecoderPlan {
             ffn_dim: gate0.output_width,
             vocab_size: metadata.vocab_size,
         };
-        Self::for_qwen_family(
-            reader,
-            geometry,
-            QwenDecoderContractOptions::QWEN3,
-            |layer_index| {
-                let names = llm_layer_tensor_names(layer_index);
-                QwenFamilyLlmLayerTensorNames {
-                    attn_norm_name: names.attn_norm_weight,
-                    attn_q_name: names.attn_q_weight,
-                    attn_k_name: names.attn_k_weight,
-                    attn_v_name: names.attn_v_weight,
-                    attn_output_name: names.attn_output_weight,
-                    q_norm_name: Some(names.attn_q_norm_weight),
-                    k_norm_name: Some(names.attn_k_norm_weight),
-                    q_bias_name: None,
-                    k_bias_name: None,
-                    v_bias_name: None,
-                    ffn_norm_name: names.ffn_norm_weight,
-                    ffn_gate_name: names.ffn_gate_weight,
-                    ffn_up_name: names.ffn_up_weight,
-                    ffn_down_name: names.ffn_down_weight,
-                }
+        // Qwen3-ASR uses the shared contract path: bind geometry to a Qwen3
+        // profile with the stock blk.N.* names, then plan from that value only.
+        fn qwen3_asr_layer_names(layer_index: usize) -> QwenFamilyLlmLayerTensorNames {
+            let names = llm_layer_tensor_names(layer_index);
+            QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_output_weight,
+                q_norm_name: Some(names.attn_q_norm_weight),
+                k_norm_name: Some(names.attn_k_norm_weight),
+                q_bias_name: None,
+                k_bias_name: None,
+                v_bias_name: None,
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            }
+        }
+        // Tail names are not needed for whole-decoder layer planning; provide a
+        // stock tied-or-untied placeholder that matches Qwen3-ASR packs.
+        let profile = super::decoder_contract::QwenFamilyDecoderProfile::new(
+            super::decoder_contract::QwenDecoderVariant::Qwen3,
+            qwen3_asr_layer_names,
+            super::decoder_contract::QwenDecoderTailTensorNames {
+                output_norm: "output_norm.weight",
+                output_weight: Some("output.weight"),
+                token_embd: "token_embd.weight",
             },
-        )
-    }
-
-    /// Build a whole-decoder plan from the shared contract geometry + options.
-    ///
-    /// Shape expectations come only from [`QwenDecoderContractGeometry`] /
-    /// [`QwenDecoderContractOptions`] (the same source admission descriptors
-    /// expand from). The pack supplies tensor bytes/types/offsets; it cannot
-    /// invent a second geometry. Transposed `[out, in]` projections fail closed.
-    pub(crate) fn for_qwen_family(
-        reader: &GgufTensorDataReader,
-        geometry: QwenDecoderContractGeometry,
-        options: QwenDecoderContractOptions,
-        mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
-    ) -> Result<Self, Qwen3AsrLlmTransformerError> {
-        geometry.validate_basic().map_err(|reason| {
+        );
+        let contract = QwenDecoderContract::bind(geometry, profile).map_err(|reason| {
             Qwen3AsrLlmTransformerError::InvalidTensorShape {
                 tensor_name: "<decoder geometry>".to_string(),
                 shape: format!("{geometry:?}"),
                 reason,
             }
         })?;
+        Self::for_qwen_family(reader, contract)
+    }
+
+    /// Build a whole-decoder plan from a **bound** [`QwenDecoderContract`].
+    ///
+    /// Production callers must bind geometry+profile once and pass that value
+    /// here — not reassemble geometry/options/names at the call site. Shape
+    /// expectations come only from the contract's descriptor expansion. The pack
+    /// supplies tensor bytes/types/offsets; it cannot invent a second geometry.
+    /// Transposed `[out, in]` projections fail closed.
+    pub(crate) fn for_qwen_family(
+        reader: &GgufTensorDataReader,
+        contract: QwenDecoderContract,
+    ) -> Result<Self, Qwen3AsrLlmTransformerError> {
+        let geometry = contract.geometry();
+        let options = contract.options();
+        let names_for_layer = contract.names_for_layer();
         let mut layers = Vec::with_capacity(geometry.n_layers);
         for layer_index in 0..geometry.n_layers {
             layers.push(plan_qwen_family_layer(

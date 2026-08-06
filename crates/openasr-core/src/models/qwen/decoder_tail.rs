@@ -16,9 +16,7 @@ use thiserror::Error;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
 use crate::models::tensor_binding::validate_tensor_binding_descriptors;
 
-use super::decoder_contract::{
-    QwenDecoderContractGeometry, QwenDecoderTailTensorNames, qwen_decoder_tail_tensor_descriptors,
-};
+use super::decoder_contract::{QwenDecoderContract, qwen_decoder_tail_tensor_descriptors};
 use super::logits_head::{
     Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError,
     load_llm_logits_head_from_reader_with_tensor_names,
@@ -57,12 +55,13 @@ pub(crate) enum QwenDecoderTailLoadError {
 /// tensor name for diagnostics and fused-graph binding.
 pub(crate) fn load_qwen_decoder_tail_from_contract(
     reader: &GgufTensorDataReader,
-    geometry: &QwenDecoderContractGeometry,
-    tail: QwenDecoderTailTensorNames<'static>,
+    contract: QwenDecoderContract,
     rms_norm_epsilon: f32,
     backend: GgmlCpuGraphBackend,
 ) -> Result<QwenDecoderTail, QwenDecoderTailLoadError> {
-    let descriptors = qwen_decoder_tail_tensor_descriptors(geometry, tail)
+    let geometry = contract.geometry();
+    let tail = contract.tail();
+    let descriptors = qwen_decoder_tail_tensor_descriptors(&geometry, tail)
         .map_err(|reason| QwenDecoderTailLoadError::Contract { reason })?;
     // Single shape gate: the same ExactDims/VectorLen admission validated.
     validate_tensor_binding_descriptors(
@@ -106,6 +105,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
+    use crate::models::qwen::decoder_contract::qwen_decoder_tail_tensor_descriptors;
+    use crate::models::qwen::{
+        QwenDecoderContractGeometry, QwenDecoderTailTensorNames, QwenDecoderVariant,
+        QwenFamilyDecoderProfile,
+    };
     use crate::models::tensor_binding::{
         TensorBindingDescriptorRequirement, assert_trace_matches_descriptor_set,
         project_fixture_tensors,
@@ -113,7 +117,21 @@ mod tests {
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
     use super::*;
-    use crate::models::qwen::decoder_contract::qwen_decoder_tail_tensor_descriptors;
+
+    /// Bind geometry+tail for tail-only loader tests. Layer names are unused.
+    fn bind_tail_only(
+        geometry: QwenDecoderContractGeometry,
+        tail: QwenDecoderTailTensorNames<'static>,
+    ) -> QwenDecoderContract {
+        fn stub_layer(_: usize) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
+            unreachable!("tail-only fixture does not expand layers")
+        }
+        QwenDecoderContract::bind(
+            geometry,
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen3, stub_layer, tail),
+        )
+        .expect("tail-only bind")
+    }
 
     fn tiny_geometry() -> QwenDecoderContractGeometry {
         QwenDecoderContractGeometry {
@@ -175,8 +193,7 @@ mod tests {
         reader.tensor_index().enable_access_trace();
         load_qwen_decoder_tail_from_contract(
             &reader,
-            &geometry,
-            tail,
+            bind_tail_only(geometry, tail),
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )
@@ -202,8 +219,7 @@ mod tests {
         reader.tensor_index().enable_access_trace();
         let loaded = load_qwen_decoder_tail_from_contract(
             &reader,
-            &geometry,
-            tail,
+            bind_tail_only(geometry, tail),
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )
@@ -238,8 +254,7 @@ mod tests {
         let reader = GgufTensorDataReader::from_path(&path).expect("reader");
         let err = load_qwen_decoder_tail_from_contract(
             &reader,
-            &geometry,
-            tail,
+            bind_tail_only(geometry, tail),
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )
@@ -263,8 +278,7 @@ mod tests {
         let reader = GgufTensorDataReader::from_path(&path).expect("reader");
         let err = load_qwen_decoder_tail_from_contract(
             &reader,
-            &geometry,
-            tail,
+            bind_tail_only(geometry, tail),
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )

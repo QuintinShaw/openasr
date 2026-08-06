@@ -26,9 +26,8 @@ use super::encoder_graph::{
 };
 use super::runtime_contract::{
     MOSS_TD_ADAPTOR_NORM_EPSILON, MOSS_TD_RMS_NORM_EPSILON, MossTdAdaptorMetadata,
-    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_decoder_geometry,
-    moss_td_qwen_decoder_profile, parse_adaptor_metadata, parse_decoder_metadata,
-    parse_encoder_metadata,
+    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_decoder_profile,
+    parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
 };
 use super::tokenizer::MossTdTokenizer;
 
@@ -65,7 +64,7 @@ impl MossTdPreparedRuntime {
         // (output_weight=None => logits share token_embd). Do not re-state MOSS
         // tensor spellings or tied-head shape here.
         let profile = moss_td_qwen_decoder_profile();
-        let tail = profile.tail;
+        let tail = profile.tail();
         let embd_name = tail.token_embd;
         let norm_name = tail.output_norm;
         debug_assert!(
@@ -75,7 +74,7 @@ impl MossTdPreparedRuntime {
 
         let plan_bytes = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
             decoder.n_layers,
-            profile.names_for_layer,
+            profile.names_for_layer(),
         )
         .map_err(|reason| {
             SystemMemoryOwnerError::capacity_failure("prepared_runtime_quote", reason)
@@ -257,36 +256,30 @@ pub(crate) fn build_moss_td_prepared_runtime(
     .map_err(|error| MossTdPreparedRuntimeError::Encoder {
         reason: error.to_string(),
     })?;
-    let profile = super::runtime_contract::moss_td_qwen_decoder_profile();
-    let decoder_plan = QwenWholeDecoderPlan::for_qwen_family(
-        &reader,
-        super::runtime_contract::moss_td_qwen_decoder_geometry(&decoder_metadata),
-        profile.options(),
-        profile.names_for_layer,
-    )
-    .map_err(|error| MossTdPreparedRuntimeError::DecoderPlan {
-        reason: error.to_string(),
-    })?;
+    let contract = super::runtime_contract::moss_td_qwen_decoder_contract(&decoder_metadata)
+        .map_err(|error| MossTdPreparedRuntimeError::DecoderPlan {
+            reason: error.to_string(),
+        })?;
+    let decoder_plan =
+        QwenWholeDecoderPlan::for_qwen_family(&reader, contract).map_err(|error| {
+            MossTdPreparedRuntimeError::DecoderPlan {
+                reason: error.to_string(),
+            }
+        })?;
     let QwenDecoderTail {
         logits_head,
         token_embedding,
-    } = load_qwen_decoder_tail_from_contract(
-        &reader,
-        &moss_td_qwen_decoder_geometry(&decoder_metadata),
-        moss_td_qwen_decoder_profile().tail,
-        MOSS_TD_RMS_NORM_EPSILON,
-        backend,
-    )
-    .map_err(|error| match error {
-        QwenDecoderTailLoadError::TokenEmbedding(error) => {
-            MossTdPreparedRuntimeError::TokenEmbedding {
-                reason: error.to_string(),
+    } = load_qwen_decoder_tail_from_contract(&reader, contract, MOSS_TD_RMS_NORM_EPSILON, backend)
+        .map_err(|error| match error {
+            QwenDecoderTailLoadError::TokenEmbedding(error) => {
+                MossTdPreparedRuntimeError::TokenEmbedding {
+                    reason: error.to_string(),
+                }
             }
-        }
-        other => MossTdPreparedRuntimeError::LogitsHead {
-            reason: other.to_string(),
-        },
-    })?;
+            other => MossTdPreparedRuntimeError::LogitsHead {
+                reason: other.to_string(),
+            },
+        })?;
     Ok(MossTdPreparedRuntime {
         encoder_metadata,
         adaptor_metadata,
