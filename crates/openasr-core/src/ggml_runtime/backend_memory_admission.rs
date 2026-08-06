@@ -1125,36 +1125,30 @@ fn build_from_views(
                     })?
             };
             let confidence = claim_confidence(native.flags, quote_requires_reconciliation)?;
-            // File-backed host imports re-export an mmap the engine already owns
-            // (pack bytes opened at preflight). Charging their page-rounded
-            // footprint into SystemMemory double-counts the same mapping once
-            // per stage that binds the pack (firered encoder+adapter+decoder
-            // each load the full .oasr), and the host free snapshot already
-            // treats clean file-backed pages as reclaimable. Keep the claim as
-            // a diagnostic resource row with zero incremental commitment.
-            let file_backed = native.flags & ffi::GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED != 0
-                || native.domain.kind == ffi::GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED;
-            let (incremental_peak, incremental_retained) = if file_backed {
-                (0, 0)
-            } else {
-                let incremental_retained = native
-                    .retained_after_use_upper_bytes
-                    .saturating_sub(native.committed_before_bytes);
-                (native.commit_peak_extra_upper_bytes, incremental_retained)
-            };
-            group_claim_peak_bytes = group_claim_peak_bytes.checked_add(incremental_peak).ok_or(
-                NativeMemoryAdmissionError::ArithmeticOverflow {
+            // FILE_BACKED host-import of a pack mapping is charged once per
+            // open mapping through `device::pack_weight_residency`, not here.
+            // Callers set `currently_allocated_bytes = requested_bytes` on the
+            // HOST_IMPORT quote so the backend reports reuse
+            // (`commit_peak_extra_upper_bytes = 0`). Blindly zeroing every
+            // FILE_BACKED claim would under-count distinct concurrent packs;
+            // blindly charging full size would double-count multi-stage binds
+            // of one mapping. Trust the native incremental numbers.
+            group_claim_peak_bytes = group_claim_peak_bytes
+                .checked_add(native.commit_peak_extra_upper_bytes)
+                .ok_or(NativeMemoryAdmissionError::ArithmeticOverflow {
                     operation: "native claim peak sum",
-                },
-            )?;
+                })?;
             if confidence == QuoteConfidence::Provisional {
                 provisional_domains.insert(domain.clone());
             }
+            let incremental_retained = native
+                .retained_after_use_upper_bytes
+                .saturating_sub(native.committed_before_bytes);
             claims.push(MemoryClaim {
                 resource_id: semantics.resource_id.clone(),
                 domain: domain.clone(),
                 requested_bytes: native.payload_requested_bytes,
-                incremental_peak_bytes: Some(incremental_peak),
+                incremental_peak_bytes: Some(native.commit_peak_extra_upper_bytes),
                 incremental_retained_bytes: Some(incremental_retained),
                 confidence,
                 lifetime: semantics.lifetime,
@@ -1957,26 +1951,26 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_host_import_does_not_inflate_system_memory_commitment() {
-        // Multi-stage combination packs (firered encoder+adapter+decoder,
-        // mimo audiotok+backbone) each bind the same pack mmap via host
-        // import. The native quote still reports the full page-rounded size
-        // for diagnostics, but incremental SystemMemory commitment must stay
-        // zero: the mapping already exists at preflight and host free pages
-        // already treat clean file-backed pages as reclaimable.
+    fn file_backed_reuse_quote_contributes_zero_incremental_system_memory() {
+        // After pack-weight residency acquires the mapping charge, the HOST_IMPORT
+        // quote sets currently_allocated_bytes = requested so the backend reports
+        // peak/retained incremental 0. This layer must honor those numbers rather
+        // than invent a blanket FILE_BACKED zeroing rule (distinct packs still
+        // charge via residency).
         let identity = identity("cpu:0");
         let file_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED, 0, [0; 16]);
         let host_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE, 0, [0; 16]);
         let pack_bytes = 5 * GIB;
         let native_claims = [
+            // peak=0, retained_after=before => incremental retained 0 (reuse)
             claim(
                 1,
                 file_domain,
                 ffi::GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER
                     | ffi::GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED,
                 pack_bytes,
-                0,
                 pack_bytes,
+                0,
                 pack_bytes,
             ),
             claim(
@@ -2018,21 +2012,62 @@ mod tests {
         assert_eq!(
             built.requests[0].peak_bytes,
             GIB / 4,
-            "file-backed pack import must not add to peak"
+            "reused file-backed import must not add to peak"
         );
         assert_eq!(
             built.requests[0].retained_bytes,
             GIB / 4,
-            "file-backed pack import must not add to retained"
+            "reused file-backed import must not add to retained"
         );
         let file_claim = built
             .claims
             .iter()
             .find(|claim| claim.resource_id == "pack-weight-host-import")
-            .expect("diagnostic file-backed claim retained");
+            .expect("file-backed claim retained");
         assert_eq!(file_claim.requested_bytes, pack_bytes);
         assert_eq!(file_claim.incremental_peak_bytes, Some(0));
         assert_eq!(file_claim.incremental_retained_bytes, Some(0));
+    }
+
+    #[test]
+    fn file_backed_first_bind_quote_still_charges_incremental_bytes() {
+        // Without residency reuse markers a first-bind FILE_BACKED quote that
+        // reports non-zero peak must still flow into SystemMemory. Distinct
+        // packs rely on this path when residency is not yet held.
+        let identity = identity("cpu:0");
+        let file_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED, 0, [0; 16]);
+        let pack_bytes = 3 * GIB;
+        let native_claims = [claim(
+            1,
+            file_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER
+                | ffi::GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED,
+            pack_bytes,
+            0,
+            pack_bytes,
+            pack_bytes,
+        )];
+        let native_stats = [stats(file_domain, 2, 12 * GIB, 16 * GIB)];
+        let quote = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            stats_generation: 2,
+            ..Default::default()
+        };
+        let metadata = BTreeMap::from([(1, semantics("pack-weight-host-import", PhaseSet::ALL))]);
+        let shared = semantics("context-buffer", PhaseSet::ALL);
+        let built = build_from_views(&[view(
+            "cpu-weight",
+            &identity,
+            &quote,
+            &native_claims,
+            &native_stats,
+            &metadata,
+            &shared,
+        )])
+        .unwrap();
+        assert_eq!(built.requests.len(), 1);
+        assert_eq!(built.requests[0].peak_bytes, pack_bytes);
+        assert_eq!(built.requests[0].retained_bytes, pack_bytes);
     }
 
     #[test]

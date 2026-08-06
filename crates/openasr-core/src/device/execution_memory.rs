@@ -513,6 +513,14 @@ pub struct DeviceMemoryBrokerSet {
     policy: DeviceMemoryPolicy,
     accounts: Mutex<HashMap<MemoryDomainKey, DomainAccount>>,
     next_anonymous_cohort: AtomicU64,
+    /// Shared FILE_BACKED pack-weight charges keyed by open mapping identity.
+    /// See [`super::pack_weight_residency`].
+    pub(crate) pack_weight_residencies: Mutex<
+        HashMap<
+            super::pack_weight_residency::PackWeightResidencyKey,
+            super::pack_weight_residency::PackWeightResidencyEntry,
+        >,
+    >,
 }
 
 impl DeviceMemoryBrokerSet {
@@ -521,6 +529,8 @@ impl DeviceMemoryBrokerSet {
             policy,
             accounts: Mutex::new(HashMap::new()),
             next_anonymous_cohort: AtomicU64::new(1),
+            pack_weight_residencies:
+                super::pack_weight_residency::empty_pack_weight_residency_table(),
         }
     }
 

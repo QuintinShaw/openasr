@@ -34,8 +34,12 @@ use super::{
     GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
 use crate::device::execution_policy::ExecutionCandidateFailure;
+use crate::device::pack_weight_residency::{PackWeightResidencyHandle, PackWeightResidencyKey};
 use crate::device::{
-    execution_memory::{AllocationLifetime, MemoryPlanningError, PhaseSet, PhysicalDeviceKey},
+    execution_memory::{
+        AllocationLifetime, DeviceMemorySnapshot, MemoryDomainKey, MemoryObservationConfidence,
+        MemoryPlanningError, PhaseSet, PhysicalDeviceKey,
+    },
     execution_route::{
         ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
         ResolvedExecutionRoute, enumerate_compute_devices_from_ggml,
@@ -1281,6 +1285,9 @@ struct GgmlLoadedWeightContextInner {
     _context: GgmlContextGuard,
     _buffer: GgmlBackendBufferGuard,
     _mmap: Option<std::sync::Arc<Mmap>>,
+    /// Shared SystemMemory charge for this open pack mapping (FILE_BACKED host
+    /// import path). Kept alive for every stage that binds the same mmap.
+    _pack_weight_residency: Option<PackWeightResidencyHandle>,
     tensors: HashMap<String, GgmlLoadedTensor>,
 }
 
@@ -1909,13 +1916,15 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let (buffer, mmap) = match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
-            Some((buffer, mmap)) => (buffer, Some(mmap)),
-            None => (
-                GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
-                None,
-            ),
-        };
+        let (buffer, mmap, pack_weight_residency) =
+            match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
+                Some((buffer, mmap, residency)) => (buffer, Some(mmap), residency),
+                None => (
+                    GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
+                    None,
+                    None,
+                ),
+            };
         let mut tensors = HashMap::new();
         let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
         while let Some(raw) = NonNull::new(tensor_raw) {
@@ -1959,6 +1968,7 @@ impl GgmlLoadedWeightContext {
                 _context: context,
                 _buffer: buffer,
                 _mmap: mmap,
+                _pack_weight_residency: pack_weight_residency,
                 tensors,
             }),
         })
@@ -8115,7 +8125,14 @@ fn allocate_native_buffers_with_admission(
 fn maybe_allocate_weight_buffer_from_host_ptr(
     backend: NonNull<c_void>,
     reader: &GgufTensorDataReader,
-) -> Result<Option<(GgmlBackendBufferGuard, std::sync::Arc<Mmap>)>, GgmlCpuGraphError> {
+) -> Result<
+    Option<(
+        GgmlBackendBufferGuard,
+        std::sync::Arc<Mmap>,
+        Option<PackWeightResidencyHandle>,
+    )>,
+    GgmlCpuGraphError,
+> {
     let device_raw = unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) };
     let Some(device_raw) = NonNull::new(device_raw) else {
         return Ok(None);
@@ -8156,6 +8173,75 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
             operation: "weight-host-import/describe",
             reason: "mapped weight bytes exceed u64".to_owned(),
         })?;
+
+    // Shared residency: charge SystemMemory once per open mapping identity.
+    // Subsequent stage binds of the same Arc<Mmap> join with zero incremental.
+    // The HOST_IMPORT quote below sets currently_allocated_bytes so the backend
+    // reports reuse (zero incremental claim); the residency lease is the sole
+    // SystemMemory charge for this mapping.
+    let residency =
+        match crate::models::native_execution_services::current_native_execution_memory_broker() {
+            Some(broker) => {
+                let total = crate::host::host_total_memory_bytes()
+                    .or_else(crate::host::host_available_memory_bytes)
+                    .unwrap_or(requested_bytes)
+                    .max(1);
+                // The pack mapping is already open at preflight. FILE_BACKED host
+                // import does not allocate a second anonymous copy. Live free/inactive
+                // pages already treat clean file-backed pages as reclaimable, so the
+                // observed-free side must not re-apply pack size + headroom against
+                // the same mapping. Use total as the observed free floor so the
+                // *policy* ledger (committed residencies of distinct packs) remains
+                // the binding multi-pack constraint; same-mapping shares still charge
+                // zero incremental via residency.
+                let candidate = DeviceMemorySnapshot {
+                    free_bytes: total,
+                    total_bytes: total,
+                    confidence: MemoryObservationConfidence::DeviceSnapshot,
+                };
+                let Ok(snapshot) = candidate.normalized() else {
+                    // Snapshot unusable: fall through to ordinary weight buffer.
+                    return Ok(None);
+                };
+                let key = PackWeightResidencyKey {
+                    domain: MemoryDomainKey::SystemMemory,
+                    mapping_identity: std::sync::Arc::as_ptr(&mmap) as usize,
+                };
+                match broker.acquire_pack_weight_residency(
+                    key,
+                    requested_bytes,
+                    snapshot,
+                    crate::models::native_execution_services::current_memory_reservation_cohort_id(
+                    ),
+                ) {
+                    Ok((handle, _incremental)) => Some(handle),
+                    Err(source) => {
+                        // Residency is the only SystemMemory-safe path for a large
+                        // pack host-import. Falling back to allocate_weights would
+                        // try to copy the full pack into a backend buffer and is
+                        // strictly more expensive — fail closed on budget errors.
+                        return Err(GgmlCpuGraphError::MemoryAdmission {
+                            operation: "weight-host-import/residency",
+                            reason: source.to_string(),
+                        });
+                    }
+                }
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    None
+                }
+                #[cfg(not(test))]
+                {
+                    // Production always installs the process broker; without it we
+                    // cannot prove residency accounting, so skip host-import.
+                    return Ok(None);
+                }
+            }
+        };
+
+    // Reuse quote: currently_allocated == requested => backend incremental 0.
     let request = ffi::GgmlBackendMemoryRequestV1 {
         kind: ffi::GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT,
         usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
@@ -8163,6 +8249,7 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
         backend: backend.as_ptr(),
         host_ptr,
         requested_bytes,
+        currently_allocated_bytes: requested_bytes,
         ..Default::default()
     };
     let semantics = NativeMemoryClaimSemantics {
@@ -8184,10 +8271,9 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
     );
 
     // Host import is a zero-copy optimization, not a semantic requirement.
-    // If its independently admitted footprint is infeasible or the backend
-    // declines the mapping, the caller immediately quotes the ordinary
-    // backend-owned weight buffer as a separate physical allocation choice.
-    Ok(attempt.ok().map(|buffer| (buffer, mmap)))
+    // If native import fails after residency was acquired, drop the handle
+    // (last owner refunds) and let the caller fall back to a backend buffer.
+    Ok(attempt.ok().map(|buffer| (buffer, mmap, residency)))
 }
 
 fn validate_direct_backend_matmul_weight_support(
