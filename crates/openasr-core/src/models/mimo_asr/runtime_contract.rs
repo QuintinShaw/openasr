@@ -1257,10 +1257,20 @@ fn tiny_tensors() -> Vec<(String, Vec<u64>)> {
     let mut tensors = Vec::new();
     // Backbone projected from the shared Qwen decoder descriptors so positive
     // fixtures cannot drift from admission (blk.* + token_embd/output/output_norm).
-    let llm = parse_mimo_llm_metadata(&crate::GgufMetadata::from_values_for_test(
-        tiny_metadata_values(),
-    ))
-    .expect("tiny llm metadata");
+    // Construct geometry directly: `GgufMetadata::from_values_for_test` is
+    // `cfg(test)`-only, while this helper also builds under `feature = "testing"`.
+    let llm = MimoLlmMetadata {
+        n_layers: 1,
+        d_model: 16,
+        n_heads: 2,
+        n_kv_heads: 1,
+        head_dim: 8,
+        ffn_dim: 32,
+        vocab_size: 32,
+        max_positions: 64,
+        rms_norm_epsilon: 1e-6,
+        rope_theta: 640_000.0,
+    };
     tensors.extend(crate::models::tensor_binding::project_fixture_tensors(
         &mimo_asr_backbone_decoder_tensor_descriptors(&llm).expect("backbone descriptors"),
     ));
