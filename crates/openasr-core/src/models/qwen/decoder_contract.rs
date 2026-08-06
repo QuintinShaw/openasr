@@ -512,7 +512,9 @@ pub(crate) fn qwen_decoder_runtime_tensor_descriptors(
     mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
     tail: QwenDecoderTailTensorNames<'_>,
 ) -> Result<Vec<TensorBindingDescriptor>, String> {
-    let tail_count = 2 + usize::from(tail.output_weight.is_some());
+    // Tail count comes only from the names' optional logits weight — same
+    // arithmetic profile.tail_tensor_count() uses. Do not hardcode `2 +`.
+    let tail_count = if tail.output_weight.is_some() { 3 } else { 2 };
     geometry.validate_obligation_budget(options, tail_count)?;
     let mut descriptors = Vec::new();
     for layer in 0..geometry.n_layers {
