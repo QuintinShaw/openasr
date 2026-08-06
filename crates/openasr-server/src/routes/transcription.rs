@@ -904,6 +904,8 @@ struct TranscriptionRequestBuilder {
     prompt: Option<String>,
     response_format: ResponseFormat,
     timestamp_granularities: Vec<String>,
+    /// Optional request-layer timeline precision (`auto` / `always` / `off`).
+    timeline_precision: Option<openasr_core::TimelinePrecisionPolicy>,
     diarize: bool,
     speakers: Option<u8>,
     punctuate: bool,
@@ -936,6 +938,7 @@ impl Default for TranscriptionRequestBuilder {
             prompt: None,
             response_format: ResponseFormat::Json,
             timestamp_granularities: Vec::new(),
+            timeline_precision: None,
             diarize: false,
             speakers: None,
             // Auto-on, mirroring `TranscriptionRequest::new`'s default: this
@@ -1026,6 +1029,14 @@ impl TranscriptionRequestBuilder {
                 self.timestamp_granularities
                     .push(field.text().await.map_err(ApiError::Multipart)?);
             }
+            "timeline_precision" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                self.timeline_precision = Some(
+                    value
+                        .parse::<openasr_core::TimelinePrecisionPolicy>()
+                        .map_err(ApiError::BadRequest)?,
+                );
+            }
             "segment_mode" => {
                 self.segment_mode = Some(field.text().await.map_err(ApiError::Multipart)?);
             }
@@ -1103,6 +1114,7 @@ impl TranscriptionRequestBuilder {
             prompt,
             response_format,
             timestamp_granularities,
+            timeline_precision,
             diarize,
             speakers,
             punctuate,
@@ -1196,7 +1208,7 @@ impl TranscriptionRequestBuilder {
         let uploaded_path: &Path = uploaded_file.as_ref();
         let needs_subtitle_export =
             matches!(response_format, ResponseFormat::Srt | ResponseFormat::Vtt);
-        let request = TranscriptionRequest::new(uploaded_path.to_path_buf(), model_id)
+        let mut request = TranscriptionRequest::new(uploaded_path.to_path_buf(), model_id)
             .with_language(language)
             .with_task(task)
             .with_prompt(prompt)
@@ -1211,6 +1223,9 @@ impl TranscriptionRequestBuilder {
             .with_voice_id(diarize)
             .with_diarize_speakers(speakers)
             .with_punctuation(punctuate);
+        if let Some(timeline_precision) = timeline_precision {
+            request = request.with_timeline_precision(timeline_precision);
+        }
 
         Ok(ParsedTranscriptionRequest {
             request,

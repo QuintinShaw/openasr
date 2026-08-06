@@ -1160,6 +1160,9 @@ struct SpeakerFinalizationContext {
     embedder: Option<Arc<dyn crate::diarize::embed::SpeakerEmbedder>>,
     plan: SpeakerPlan,
     scope_by_segment: Vec<Option<usize>>,
+    /// Retained for decode-path bookkeeping (`word_timestamps_forced_for_diarization`).
+    /// Word stripping after projection is decided from request keep-words policy.
+    #[allow(dead_code)]
     strip_forced_word_timestamps: bool,
 }
 
