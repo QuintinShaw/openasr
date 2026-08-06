@@ -275,11 +275,14 @@ pub(crate) fn parakeet_ctc_runtime_tensor_binding_descriptors(
     descriptors.extend([
         TensorBindingDescriptor {
             tensor_name: "ctc.head.weight".to_string(),
-            requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+            // Packer reverses HF [vocab, hidden] -> ggml [hidden, vocab]; the
+            // encoder graph reshape_2d + mul_mat consumes that ordered layout.
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                 metadata.hidden_size,
                 metadata.vocab_size,
-            ),
-            reason: "CTC head must project hidden_size to the vocab".to_string(),
+            ]),
+            reason: "CTC head must be ggml [hidden_size, vocab] for the ordered head matmul"
+                .to_string(),
         },
         TensorBindingDescriptor {
             tensor_name: "ctc.head.bias".to_string(),
@@ -598,6 +601,29 @@ mod tests {
                 error,
                 ParakeetCtcTensorContractError::InvalidTensorShape { ref name, .. }
                     if name == "enc.blk.0.ff1.up.weight"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_transposed_ctc_head_weight() {
+        let metadata = tiny_execution_metadata();
+        let mut shapes = parakeet_ctc_runtime_tensors(&metadata);
+        let head = shapes
+            .iter_mut()
+            .find(|(name, _)| name == "ctc.head.weight")
+            .expect("ctc head");
+        // Correct is ggml [hidden, vocab]; HF [vocab, hidden] must fail closed.
+        head.1 = vec![metadata.vocab_size as u64, metadata.hidden_size as u64];
+        let index = tensor_index_from_shapes(&shapes);
+        let error = validate_parakeet_ctc_runtime_tensors_with_index(&index, &metadata)
+            .expect_err("transposed ctc.head.weight must fail closed");
+        assert!(
+            matches!(
+                error,
+                ParakeetCtcTensorContractError::InvalidTensorShape { ref name, .. }
+                    if name == "ctc.head.weight"
             ),
             "unexpected error: {error}"
         );

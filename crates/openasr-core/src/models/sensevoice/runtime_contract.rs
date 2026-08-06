@@ -211,8 +211,9 @@ fn block_tensor_descriptors(
         ),
         descriptor(
             name("attn.qkv.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(input_dim, qkv_dim),
-            "fused QKV projection must map the block input width to 3*d_model",
+            // Packer reverses HF [3*d, input] -> ggml [input, 3*d] for mul_mat.
+            TensorBindingDescriptorRequirement::ExactDims(vec![input_dim, qkv_dim]),
+            "fused QKV projection must be ggml [input_dim, 3*d_model]",
         ),
         descriptor(
             name("attn.qkv.bias"),
@@ -221,8 +222,8 @@ fn block_tensor_descriptors(
         ),
         descriptor(
             name("attn.out.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, d_model),
-            "attention output projection must be d_model x d_model",
+            TensorBindingDescriptorRequirement::ExactDims(vec![d_model, d_model]),
+            "attention output projection must be ggml [d_model, d_model]",
         ),
         descriptor(
             name("attn.out.bias"),
@@ -246,8 +247,8 @@ fn block_tensor_descriptors(
         ),
         descriptor(
             name("ffn.up.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, metadata.ffn_dim),
-            "FFN up projection must map d_model to ffn_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![d_model, metadata.ffn_dim]),
+            "FFN up projection must be ggml [d_model, ffn_dim]",
         ),
         descriptor(
             name("ffn.up.bias"),
@@ -256,8 +257,8 @@ fn block_tensor_descriptors(
         ),
         descriptor(
             name("ffn.down.weight"),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(metadata.ffn_dim, d_model),
-            "FFN down projection must map ffn_dim to d_model",
+            TensorBindingDescriptorRequirement::ExactDims(vec![metadata.ffn_dim, d_model]),
+            "FFN down projection must be ggml [ffn_dim, d_model]",
         ),
         descriptor(
             name("ffn.down.bias"),
@@ -314,8 +315,10 @@ pub(crate) fn sensevoice_runtime_tensor_binding_descriptors(
         ),
         descriptor(
             "ctc.head.weight".to_string(),
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, metadata.vocab_size),
-            "CTC head must project d_model to the vocab",
+            // Packer reverses HF [vocab, d_model] -> ggml [d_model, vocab]; the
+            // encoder graph reshape_2d + mul_mat consumes that ordered layout.
+            TensorBindingDescriptorRequirement::ExactDims(vec![d_model, metadata.vocab_size]),
+            "CTC head must be ggml [d_model, vocab] for the ordered head matmul",
         ),
         descriptor(
             "ctc.head.bias".to_string(),
@@ -620,6 +623,49 @@ mod tests {
             .expect_err("shape mismatch must fail closed");
         assert!(
             matches!(error, SenseVoiceRuntimeContractError::InvalidTensorShape { ref name, .. } if name == "enc.blk.0.attn.qkv.weight"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_transposed_sanm_and_ctc_head_weights() {
+        // ExactDims must reject HF [out, in] that Rank2EitherDims used to admit.
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let base = crate::testing::TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready(
+            "sensevoice-runtime-fixture",
+        );
+        let metadata =
+            parse_sensevoice_execution_metadata(&base.metadata).expect("metadata must parse");
+        // Correct qkv is [feature_dim, 3*d_model]; swap to HF orientation.
+        let spec = base.with_tensor_shape(
+            "enc.blk.0.attn.qkv.weight",
+            [3 * metadata.d_model as u64, metadata.feature_dim as u64],
+        );
+        crate::testing::write_tiny_gguf_runtime_source(file.path(), &spec).expect("write");
+        let index = crate::read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_sensevoice_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed qkv must fail closed");
+        assert!(
+            matches!(error, SenseVoiceRuntimeContractError::InvalidTensorShape { ref name, .. } if name == "enc.blk.0.attn.qkv.weight"),
+            "unexpected error: {error}"
+        );
+
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let base = crate::testing::TinyGgufFixtureSpec::sensevoice_oasr_v1_runtime_ready(
+            "sensevoice-runtime-fixture",
+        );
+        let metadata =
+            parse_sensevoice_execution_metadata(&base.metadata).expect("metadata must parse");
+        let spec = base.with_tensor_shape(
+            "ctc.head.weight",
+            [metadata.vocab_size as u64, metadata.d_model as u64],
+        );
+        crate::testing::write_tiny_gguf_runtime_source(file.path(), &spec).expect("write");
+        let index = crate::read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_sensevoice_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed ctc head must fail closed");
+        assert!(
+            matches!(error, SenseVoiceRuntimeContractError::InvalidTensorShape { ref name, .. } if name == "ctc.head.weight"),
             "unexpected error: {error}"
         );
     }

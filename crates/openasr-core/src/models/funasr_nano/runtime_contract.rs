@@ -470,8 +470,9 @@ fn sanm_block_tensor_descriptors(
         ),
         (
             SANM_ATTN_QKV_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(input_dim, qkv_dim),
-            "fused QKV projection must map the block input width to 3*d_model",
+            // Packer reverses HF [3*d, input] -> ggml [input, 3*d] for mul_mat.
+            TensorBindingDescriptorRequirement::ExactDims(vec![input_dim, qkv_dim]),
+            "fused QKV projection must be ggml [input_dim, 3*d_model]",
         ),
         (
             SANM_ATTN_QKV_BIAS,
@@ -480,8 +481,8 @@ fn sanm_block_tensor_descriptors(
         ),
         (
             SANM_ATTN_OUT_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, d_model),
-            "attention output projection must be d_model x d_model",
+            TensorBindingDescriptorRequirement::ExactDims(vec![d_model, d_model]),
+            "attention output projection must be ggml [d_model, d_model]",
         ),
         (
             SANM_ATTN_OUT_BIAS,
@@ -505,8 +506,8 @@ fn sanm_block_tensor_descriptors(
         ),
         (
             SANM_FFN_UP_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(d_model, encoder.ffn_dim),
-            "FFN up projection must map d_model to ffn_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![d_model, encoder.ffn_dim]),
+            "FFN up projection must be ggml [d_model, ffn_dim]",
         ),
         (
             SANM_FFN_UP_BIAS,
@@ -515,8 +516,8 @@ fn sanm_block_tensor_descriptors(
         ),
         (
             SANM_FFN_DOWN_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(encoder.ffn_dim, d_model),
-            "FFN down projection must map ffn_dim to d_model",
+            TensorBindingDescriptorRequirement::ExactDims(vec![encoder.ffn_dim, d_model]),
+            "FFN down projection must be ggml [ffn_dim, d_model]",
         ),
         (
             SANM_FFN_DOWN_BIAS,

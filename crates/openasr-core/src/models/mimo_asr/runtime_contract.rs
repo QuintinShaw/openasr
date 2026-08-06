@@ -716,10 +716,9 @@ fn validate_speech_channel_consistency(
 }
 
 /// Every tensor the runtime binds, derived from the parsed metadata. Rank-2
-/// matmul weights accept either stored orientation (GGUF dims reverse vs the
-/// source framework; the loaders/native weight binding assert the final
-/// orientation at construction). Vectors, conv kernels, and the mel tables
-/// must match exactly, mirroring the loaders' own shape assertions.
+/// matmul weights use ordered ggml `[in, out]` ExactDims (GGUF stores torch
+/// shapes reversed). Vectors, conv kernels, and the mel tables must match
+/// exactly, mirroring the loaders' own shape assertions.
 /// Map mimo-asr backbone LLM metadata onto the shared Qwen-shaped geometry.
 fn mimo_asr_qwen_decoder_geometry(
     llm: &MimoLlmMetadata,
@@ -857,11 +856,12 @@ fn mimo_asr_runtime_tensor_bindings(
         requirement: TensorBindingDescriptorRequirement::VectorLen(len),
         reason: reason.to_string(),
     };
-    let rank2 = |name: String, lhs: usize, rhs: usize, reason: &str| TensorBindingDescriptor {
-        tensor_name: name,
-        requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs),
-        reason: reason.to_string(),
-    };
+    let rank2 =
+        |name: String, rows_in: usize, cols_out: usize, reason: &str| TensorBindingDescriptor {
+            tensor_name: name,
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![rows_in, cols_out]),
+            reason: reason.to_string(),
+        };
 
     // 36L Qwen2 backbone (qkv bias, no QK-norm) via the shared decoder contract.
     bindings.extend(mimo_asr_backbone_decoder_tensor_descriptors(llm)?);
@@ -1754,6 +1754,39 @@ mod tests {
             MimoRuntimeTensorError::InvalidTensorShape { ref name, .. }
                 if name == "blk.0.attn_k.bias"
         ));
+    }
+
+    #[test]
+    fn rejects_transposed_inlocal_and_audiotok_projections() {
+        for (tensor_name, transposed) in [
+            ("inlocal.blk.0.ffn_gate.weight", vec![16_u64, 8]),
+            ("inlocal.blk.0.ffn_down.weight", vec![8_u64, 16]),
+            ("speech_group_proj.weight", vec![16_u64, 32]),
+            ("speech_embd.0.weight", vec![17_u64, 8]),
+            ("audiotok.blk.0.ffn_up.weight", vec![16_u64, 8]),
+            ("audiotok.quant.0.codebook", vec![16_u64, 8]),
+        ] {
+            let tensors = tiny_tensors()
+                .into_iter()
+                .map(|(name, dims)| {
+                    if name == tensor_name {
+                        (name, transposed.clone())
+                    } else {
+                        (name, dims)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let error =
+                validate_tiny_tensors(&tensors).expect_err("transposed weight must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    MimoRuntimeTensorError::InvalidTensorShape { ref name, .. }
+                        if name == tensor_name
+                ),
+                "unexpected error for {tensor_name}: {error}"
+            );
+        }
     }
 
     // --- End-to-end: a tiny external-shaped pack through PackVerifier ----

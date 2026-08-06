@@ -1220,4 +1220,34 @@ mod tests {
         );
         assert_eq!(descriptors.len(), 61);
     }
+
+    #[test]
+    fn rejects_transposed_encoder_and_adapter_projections() {
+        // Ordered ExactDims must reject HF [out, in] that Rank2EitherDims admitted.
+        for (tensor_name, transposed) in [
+            ("enc.blk.0.ffn1.up.weight", vec![16_u64, 8]),
+            ("enc.blk.0.conv.pw1.weight", vec![32_u64, 8]),
+            ("enc.subsample.out.weight", vec![8_u64, 4]),
+            // Tiny adapter linear1 is square [16,16]; pin a wrong ordered pair.
+            (ADAPTER_LINEAR1_WEIGHT, vec![8_u64, 16]),
+        ] {
+            let shapes: Vec<(String, Vec<u64>)> = tensor_fixture_shapes()
+                .into_iter()
+                .map(|(name, dims)| {
+                    if name == tensor_name {
+                        (name, transposed.clone())
+                    } else {
+                        (name, dims)
+                    }
+                })
+                .collect();
+            let file = write_tensor_fixture(&shapes, tensor_fixture_metadata());
+            let error =
+                run_admission_validator(&file).expect_err("transposed weight must fail closed");
+            assert!(
+                error.contains(tensor_name),
+                "error must name {tensor_name}: {error}"
+            );
+        }
+    }
 }

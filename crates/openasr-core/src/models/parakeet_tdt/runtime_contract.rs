@@ -421,10 +421,14 @@ pub(crate) fn parakeet_tdt_runtime_tensor_binding_descriptors(
                 reason: reason.to_string(),
             });
         };
+    // TDT tail storage matches the packer reverse of HF [out, in] -> ggml
+    // [in, out]. Graph mul_mat (enc.proj) and host matvecs (joint.*) both pin
+    // that ordered layout; embed/LSTM keep the reversed GGUF dims even though
+    // the flat host buffer is still HF row-major.
     push(
         "enc.proj.weight",
-        TensorBindingDescriptorRequirement::Rank2EitherDims(hidden, joint),
-        "joint encoder projection must map hidden_size to joint_hidden",
+        TensorBindingDescriptorRequirement::ExactDims(vec![hidden, joint]),
+        "joint encoder projection must be ggml [hidden_size, joint_hidden]",
     );
     push(
         "enc.proj.bias",
@@ -433,15 +437,15 @@ pub(crate) fn parakeet_tdt_runtime_tensor_binding_descriptors(
     );
     push(
         "dec.embed.weight",
-        TensorBindingDescriptorRequirement::Rank2EitherDims(metadata.vocab_size, pred),
-        "predictor embedding must be vocab_size x pred_hidden",
+        TensorBindingDescriptorRequirement::ExactDims(vec![pred, metadata.vocab_size]),
+        "predictor embedding must be ggml [pred_hidden, vocab_size]",
     );
     for layer in 0..metadata.pred_layers {
         for suffix in ["w_ih", "w_hh"] {
             push(
                 &format!("dec.lstm.{layer}.{suffix}"),
-                TensorBindingDescriptorRequirement::Rank2EitherDims(gate_dim, pred),
-                "LSTM gate weight must be 4*pred_hidden x pred_hidden",
+                TensorBindingDescriptorRequirement::ExactDims(vec![pred, gate_dim]),
+                "LSTM gate weight must be ggml [pred_hidden, 4*pred_hidden]",
             );
         }
         for suffix in ["b_ih", "b_hh"] {
@@ -454,8 +458,8 @@ pub(crate) fn parakeet_tdt_runtime_tensor_binding_descriptors(
     }
     push(
         "joint.pred.weight",
-        TensorBindingDescriptorRequirement::Rank2EitherDims(pred, joint),
-        "predictor projection must map pred_hidden to joint_hidden",
+        TensorBindingDescriptorRequirement::ExactDims(vec![pred, joint]),
+        "predictor projection must be ggml [pred_hidden, joint_hidden]",
     );
     push(
         "joint.pred.bias",
@@ -464,8 +468,8 @@ pub(crate) fn parakeet_tdt_runtime_tensor_binding_descriptors(
     );
     push(
         "joint.out.weight",
-        TensorBindingDescriptorRequirement::Rank2EitherDims(joint, out_rows),
-        "fused joint head must map joint_hidden to vocab + durations",
+        TensorBindingDescriptorRequirement::ExactDims(vec![joint, out_rows]),
+        "fused joint head must be ggml [joint_hidden, vocab + durations]",
     );
     push(
         "joint.out.bias",
@@ -784,5 +788,55 @@ mod tests {
             matches!(error, ParakeetTdtTensorContractError::InvalidTensorShape { ref name, .. } if name == "dec.lstm.0.w_ih"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Ordered ExactDims must reject HF [out, in] orientation that Rank2EitherDims
+    /// used to admit. Covers graph (enc.proj) and host-consumed (joint.out / LSTM)
+    /// tails so a pack cannot ship the wrong dim order.
+    #[test]
+    fn rejects_transposed_tdt_tail_weights() {
+        let metadata = tiny_execution_metadata();
+        let gate_dim = metadata.pred_hidden * 4;
+        let out_rows = metadata.vocab_size + metadata.n_durations;
+        for (tensor_name, transposed) in [
+            (
+                "enc.proj.weight",
+                vec![metadata.joint_hidden as u64, metadata.hidden_size as u64],
+            ),
+            (
+                "dec.embed.weight",
+                vec![metadata.vocab_size as u64, metadata.pred_hidden as u64],
+            ),
+            (
+                "dec.lstm.0.w_ih",
+                vec![gate_dim as u64, metadata.pred_hidden as u64],
+            ),
+            (
+                "joint.pred.weight",
+                vec![metadata.joint_hidden as u64, metadata.pred_hidden as u64],
+            ),
+            (
+                "joint.out.weight",
+                vec![out_rows as u64, metadata.joint_hidden as u64],
+            ),
+        ] {
+            let mut shapes = parakeet_tdt_runtime_tensors(&metadata);
+            let tensor = shapes
+                .iter_mut()
+                .find(|(name, _)| name == tensor_name)
+                .unwrap_or_else(|| panic!("missing {tensor_name}"));
+            tensor.1 = transposed;
+            let index = tensor_index_from_shapes(&shapes);
+            let error = validate_parakeet_tdt_runtime_tensors_with_index(&index, &metadata)
+                .expect_err("transposed weight must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    ParakeetTdtTensorContractError::InvalidTensorShape { ref name, .. }
+                        if name == tensor_name
+                ),
+                "unexpected error for {tensor_name}: {error}"
+            );
+        }
     }
 }

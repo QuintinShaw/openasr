@@ -180,9 +180,7 @@ pub(crate) fn validate_tensor_binding<E>(
     invalid: impl FnOnce(&str, &[u64], String) -> E,
 ) -> Result<(), E> {
     let valid = match spec.requirement {
-        TensorBindingRequirement::ExactDims(expected) => {
-            exact_dims_match(dims, expected)
-        }
+        TensorBindingRequirement::ExactDims(expected) => exact_dims_match(dims, expected),
         TensorBindingRequirement::VectorLen(expected_len) => dims == [expected_len as u64],
         TensorBindingRequirement::NonEmptyVector => dims.len() == 1 && dims[0] > 0,
         TensorBindingRequirement::Rank2WithDim(expected_dim) => {
@@ -233,9 +231,8 @@ pub(crate) fn exact_dims_match(dims: &[u64], expected: &[usize]) -> bool {
     if got == expected {
         return true;
     }
-    let strip = |values: &[usize]| -> Vec<usize> {
-        values.iter().copied().filter(|v| *v != 1).collect()
-    };
+    let strip =
+        |values: &[usize]| -> Vec<usize> { values.iter().copied().filter(|v| *v != 1).collect() };
     let got_core = strip(&got);
     let exp_core = strip(expected);
     !got_core.is_empty() && got_core == exp_core

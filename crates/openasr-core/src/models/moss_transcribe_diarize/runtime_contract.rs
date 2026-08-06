@@ -682,12 +682,11 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
             },
             TensorBindingDescriptor {
                 tensor_name: names.attn_q_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+                requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                     encoder.d_model,
                     encoder.d_model,
-                ),
-                reason: "expected rank-2 encoder attention q matrix over the hidden size"
-                    .to_string(),
+                ]),
+                reason: "expected ggml [d_model, d_model] encoder attention q matrix".to_string(),
             },
             TensorBindingDescriptor {
                 tensor_name: names.attn_q_bias,
@@ -696,21 +695,19 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
             },
             TensorBindingDescriptor {
                 tensor_name: names.attn_k_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+                requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                     encoder.d_model,
                     encoder.d_model,
-                ),
-                reason: "expected rank-2 encoder attention k matrix over the hidden size"
-                    .to_string(),
+                ]),
+                reason: "expected ggml [d_model, d_model] encoder attention k matrix".to_string(),
             },
             TensorBindingDescriptor {
                 tensor_name: names.attn_v_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+                requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                     encoder.d_model,
                     encoder.d_model,
-                ),
-                reason: "expected rank-2 encoder attention v matrix over the hidden size"
-                    .to_string(),
+                ]),
+                reason: "expected ggml [d_model, d_model] encoder attention v matrix".to_string(),
             },
             TensorBindingDescriptor {
                 tensor_name: names.attn_v_bias,
@@ -719,11 +716,11 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
             },
             TensorBindingDescriptor {
                 tensor_name: names.attn_out_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+                requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                     encoder.d_model,
                     encoder.d_model,
-                ),
-                reason: "expected rank-2 encoder attention output matrix over the hidden size"
+                ]),
+                reason: "expected ggml [d_model, d_model] encoder attention output matrix"
                     .to_string(),
             },
             TensorBindingDescriptor {
@@ -743,12 +740,12 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
             },
             TensorBindingDescriptor {
                 tensor_name: names.ffn_up_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+                // Packer reverses HF [ffn, d] -> ggml [d, ffn] for mul_mat.
+                requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                     encoder.d_model,
                     encoder.ffn_dim,
-                ),
-                reason: "expected rank-2 encoder FFN up matrix between hidden and FFN sizes"
-                    .to_string(),
+                ]),
+                reason: "expected ggml [d_model, ffn_dim] encoder FFN up matrix".to_string(),
             },
             TensorBindingDescriptor {
                 tensor_name: names.ffn_up_bias,
@@ -757,12 +754,11 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
             },
             TensorBindingDescriptor {
                 tensor_name: names.ffn_down_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+                requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                     encoder.ffn_dim,
                     encoder.d_model,
-                ),
-                reason: "expected rank-2 encoder FFN down matrix between FFN and hidden sizes"
-                    .to_string(),
+                ]),
+                reason: "expected ggml [ffn_dim, d_model] encoder FFN down matrix".to_string(),
             },
             TensorBindingDescriptor {
                 tensor_name: names.ffn_down_bias,
@@ -776,11 +772,14 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     descriptors.extend([
         TensorBindingDescriptor {
             tensor_name: ADAPTOR_LINEAR1_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+            // Packer reverses HF [llm, stacked_in] -> ggml [stacked_in, llm];
+            // host matmul indexes the flat buffer as HF row-major but admits the
+            // ordered GGUF dims.
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                 adaptor.input_dim,
                 decoder.d_model,
-            ),
-            reason: "expected rank-2 adaptor linear1 between the merged encoder width and the decoder hidden size".to_string(),
+            ]),
+            reason: "expected ggml [input_dim, decoder d_model] adaptor linear1".to_string(),
         },
         TensorBindingDescriptor {
             tensor_name: ADAPTOR_LINEAR1_BIAS.to_string(),
@@ -789,11 +788,11 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
         },
         TensorBindingDescriptor {
             tensor_name: ADAPTOR_LINEAR2_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(
+            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
                 decoder.d_model,
                 decoder.d_model,
-            ),
-            reason: "expected rank-2 adaptor linear2 over the decoder hidden size".to_string(),
+            ]),
+            reason: "expected ggml [decoder d_model, decoder d_model] adaptor linear2".to_string(),
         },
         TensorBindingDescriptor {
             tensor_name: ADAPTOR_LINEAR2_BIAS.to_string(),
@@ -1200,6 +1199,33 @@ mod tests {
                 assert_eq!(name, llm.attn_k_weight);
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_transposed_encoder_and_adaptor_weights() {
+        let metadata = parse_moss_td_execution_metadata(&tiny_metadata()).expect("parse");
+        let enc = moss_encoder_layer_tensor_names(0);
+        for (tensor_name, transposed) in [
+            (enc.ffn_up_weight.as_str(), vec![64_u64, 16]),
+            (enc.ffn_down_weight.as_str(), vec![16_u64, 64]),
+            (ADAPTOR_LINEAR1_WEIGHT, vec![16_u64, 32]),
+        ] {
+            let mut shapes = tiny_tensor_shapes();
+            let tensor = shapes
+                .iter_mut()
+                .find(|(name, _)| name == tensor_name)
+                .unwrap_or_else(|| panic!("missing {tensor_name}"));
+            tensor.1 = transposed;
+            let index = tensor_index_from_shapes(&shapes);
+            let error = validate_moss_td_runtime_tensors_with_index(&index, metadata)
+                .expect_err("transposed weight must fail closed");
+            match error {
+                MossTdRuntimeContractError::InvalidTensorShape { name, .. } => {
+                    assert_eq!(name, tensor_name);
+                }
+                other => panic!("unexpected error for {tensor_name}: {other:?}"),
+            }
         }
     }
 
