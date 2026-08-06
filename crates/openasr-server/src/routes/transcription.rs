@@ -347,15 +347,34 @@ pub(crate) struct TranscriptionProgressBody {
     /// `"align"`), or `null` when no native run is in flight. The UI may show this
     /// as phase text (e.g. "Refining word timestamps") next to the bar.
     phase: Option<&'static str>,
-    /// Monotonic overall progress in `0.0..=1.0`; `0.0` when idle. The UI progress
-    /// bar reads this directly -- it already spans decode, assembly, and the
-    /// forced-align refine, so it no longer stalls near the end.
+    /// Monotonic overall progress in `0.0..=1.0`; `0.0` when idle. Equals
+    /// `overall_fraction` when stage-weighted progress is published.
     fraction: f32,
     /// Backward-compatible ratio for clients that predate `fraction`: `done/total`
     /// equals `fraction`. `total` is `0` when idle, so legacy clients still fall
     /// back to a time-based estimate exactly as before.
     done: u32,
     total: u32,
+    /// Current pipeline stage (`prepare`, `load_model`, `diarize`,
+    /// `identify_speakers`, `decode`, `punctuate`, `align`, `project`,
+    /// `persist`), or null when idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'static str>,
+    /// Real completion of the current stage in `0.0..=1.0`, or null when
+    /// indeterminate (no honest sub-progress yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_fraction: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_units: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_units: Option<u64>,
+    /// Cost-weighted overall completion (`= fraction` when present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overall_fraction: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indeterminate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 impl TranscriptionProgressBody {
@@ -369,16 +388,30 @@ impl TranscriptionProgressBody {
             fraction: 0.0,
             done: 0,
             total: 0,
+            stage: None,
+            stage_fraction: None,
+            completed_units: None,
+            total_units: None,
+            overall_fraction: None,
+            indeterminate: None,
+            detail: None,
         }
     }
 
     fn from_progress(progress: openasr_core::api::backend::NativeTranscriptionProgress) -> Self {
-        let fraction = progress.fraction.clamp(0.0, 1.0);
+        let fraction = progress.overall_fraction.clamp(0.0, 1.0);
         Self {
             phase: Some(progress.phase.label()),
             fraction,
             done: (fraction * PROGRESS_LEGACY_SCALE as f32).round() as u32,
             total: PROGRESS_LEGACY_SCALE,
+            stage: Some(progress.stage.label()),
+            stage_fraction: progress.stage_fraction,
+            completed_units: progress.completed_units,
+            total_units: progress.total_units,
+            overall_fraction: Some(fraction),
+            indeterminate: Some(progress.indeterminate),
+            detail: progress.detail,
         }
     }
 }
@@ -2589,15 +2622,18 @@ mod native_runtime_tests {
     #[test]
     fn legacy_progress_response_reports_the_single_active_run_body() {
         use openasr_core::api::backend::{
-            LegacyNativeTranscriptionProgress, NativeTranscriptionPhase,
-            NativeTranscriptionProgress,
+            LegacyNativeTranscriptionProgress, NativeTranscriptionProgress, TranscriptionStage,
         };
 
         let response = super::legacy_progress_response(LegacyNativeTranscriptionProgress::Single(
-            NativeTranscriptionProgress {
-                phase: NativeTranscriptionPhase::Decode,
-                fraction: 0.5,
-            },
+            NativeTranscriptionProgress::new(
+                TranscriptionStage::Decode,
+                Some(0.5),
+                0.5,
+                None,
+                None,
+                None,
+            ),
         ))
         .expect("a single active run must not error");
         assert_eq!(response.status(), StatusCode::OK);

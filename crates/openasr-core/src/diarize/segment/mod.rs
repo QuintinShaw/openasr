@@ -14,9 +14,49 @@ mod pyannet;
 #[cfg(test)]
 mod tests;
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use rayon::prelude::*;
+
+thread_local! {
+    /// Optional window-progress observer for the in-flight segmenter on this
+    /// thread. Native transcription installs a sink that reports
+    /// `(completed_windows, total_windows)` so diarize stage_fraction tracks
+    /// real window completion rather than a fixed percentage.
+    static WINDOW_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII handle restoring the previous window-progress sink on drop.
+pub(crate) struct WindowProgressGuard {
+    previous: Option<Box<dyn FnMut(usize, usize)>>,
+}
+
+impl Drop for WindowProgressGuard {
+    fn drop(&mut self) {
+        WINDOW_PROGRESS_SINK.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install `sink` as the active segmenter window-progress callback for this
+/// thread. `sink(done, total)` is invoked after each completed batch/window.
+pub(crate) fn install_window_progress_sink(
+    sink: impl FnMut(usize, usize) + 'static,
+) -> WindowProgressGuard {
+    let previous = WINDOW_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
+    WindowProgressGuard { previous }
+}
+
+fn report_window_progress(done: usize, total: usize) {
+    WINDOW_PROGRESS_SINK.with(|cell| {
+        if let Some(sink) = cell.borrow_mut().as_mut() {
+            sink(done, total);
+        }
+    });
+}
 
 #[cfg(test)]
 pub(crate) use diarizen::DIARIZEN_PACK_PREFERENCE;
@@ -173,7 +213,9 @@ where
             "could not create bounded segmentation-3.0 window pool: {error}"
         ))
     })?;
-    let mut output = Vec::with_capacity(starts.len());
+    let total = starts.len();
+    let mut output = Vec::with_capacity(total);
+    report_window_progress(0, total.max(1));
     for starts_batch in starts.chunks(pool.current_num_threads().max(1)) {
         if canceled() {
             return Err(SegmentError::Canceled);
@@ -183,6 +225,7 @@ where
         for item in batch {
             output.push(item?);
         }
+        report_window_progress(output.len(), total.max(1));
     }
     Ok(output)
 }
@@ -525,7 +568,9 @@ pub(super) fn segment_diarizen_local_activity(
         DIARIZEN_WINDOW_SAMPLES,
         DIARIZEN_WINDOW_STEP_SAMPLES,
     );
-    let mut windows = Vec::with_capacity(starts.len());
+    let total_windows = starts.len();
+    let mut windows = Vec::with_capacity(total_windows);
+    report_window_progress(0, total_windows.max(1));
     for start in starts {
         if canceled() {
             return Err(SegmentError::Canceled);
@@ -564,6 +609,7 @@ pub(super) fn segment_diarizen_local_activity(
             start_sample: start,
             frame_activity,
         });
+        report_window_progress(windows.len(), total_windows.max(1));
     }
 
     for window in &mut windows {

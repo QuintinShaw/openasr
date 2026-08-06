@@ -61,6 +61,45 @@
 //! Reporting the reason is explicitly **not** a licence to lower a gate so the
 //! name appears instead.
 
+use std::cell::RefCell;
+
+thread_local! {
+    /// Optional batch-progress observer for identity embedding windows.
+    /// Installed by native transcription as `(completed_windows, total)`.
+    static IDENTITY_BATCH_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII handle restoring the previous identity batch-progress sink on drop.
+pub(crate) struct IdentityBatchProgressGuard {
+    previous: Option<Box<dyn FnMut(usize, usize)>>,
+}
+
+impl Drop for IdentityBatchProgressGuard {
+    fn drop(&mut self) {
+        IDENTITY_BATCH_PROGRESS_SINK.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install `sink` as the active identity batch-progress callback for this thread.
+pub(crate) fn install_identity_batch_progress_sink(
+    sink: impl FnMut(usize, usize) + 'static,
+) -> IdentityBatchProgressGuard {
+    let previous =
+        IDENTITY_BATCH_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
+    IdentityBatchProgressGuard { previous }
+}
+
+fn report_identity_batch_progress(done: usize, total: usize) {
+    IDENTITY_BATCH_PROGRESS_SINK.with(|cell| {
+        if let Some(sink) = cell.borrow_mut().as_mut() {
+            sink(done, total);
+        }
+    });
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
@@ -494,6 +533,9 @@ fn collect_label_evidence(
     // idle final actor wave for every short speaker. Keep the same bounded
     // batch as recording-level diarization so a many-speaker meeting cannot
     // materialize every frontend feature tensor at once.
+    let total_windows = pending.len();
+    let mut completed_windows = 0usize;
+    report_identity_batch_progress(0, total_windows.max(1));
     for batch in pending.chunks(crate::diarize::embed::REDIMNET_BOUNDED_BATCH_SIZE) {
         let clips = batch.iter().map(|window| window.clip).collect::<Vec<_>>();
         let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
@@ -526,6 +568,8 @@ fn collect_label_evidence(
                 }
             }
         }
+        completed_windows = completed_windows.saturating_add(batch.len());
+        report_identity_batch_progress(completed_windows, total_windows.max(1));
     }
 
     let mut evidence = BTreeMap::new();

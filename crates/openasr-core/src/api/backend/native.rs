@@ -48,18 +48,24 @@ mod native_transcribe;
 mod request_execution_context;
 #[path = "transcription_control.rs"]
 mod transcription_control;
+#[path = "transcription_progress.rs"]
+mod transcription_progress;
 pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
-    LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
     describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
-    native_transcription_progress, native_transcription_progress_for_id,
     refine_existing_transcription_timeline,
 };
 pub use request_execution_context::RequestExecutionContext;
 pub use transcription_control::{
     GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
+};
+pub use transcription_progress::{
+    LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
+    ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter, ProgressSegmenterKind,
+    TranscriptionStage, duration_weighted_fraction, native_transcription_progress,
+    native_transcription_progress_for_id,
 };
 
 #[derive(Debug, Clone)]
