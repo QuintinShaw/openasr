@@ -3,8 +3,10 @@
 //! FunASR-Nano, MOSS-Transcribe-Diarize, MiMo-ASR (backbone), and FireRedASR2-LLM
 //! all materialize the same decoder math through [`QwenWholeDecoderPlan`]. Their
 //! admission descriptors, fixtures, and access-trace expectations must expand
-//! from one semantic description so the 11-tensor layer pattern cannot drift
-//! per family.
+//! from one semantic description so the per-layer tensor set cannot drift
+//! per family. Each layer always emits the base 9 tensors (attn norm, q/k/v/out,
+//! ffn norm, gate/up/down); Qwen3 adds 2 qk-norm tensors (11 total) and Qwen2
+//! adds 3 qkv-bias tensors (12 total).
 //!
 //! Family adapters supply only:
 //! - [`QwenDecoderContractGeometry`] from pack metadata;

@@ -87,6 +87,37 @@ fn bounded(value: usize, key: &'static str, max: usize) -> Result<usize, MimoMet
 /// Local ceiling for RoPE position tables; generous over production 8192.
 const MIMO_LLM_MAX_POSITIONS: usize = 1_048_576;
 
+/// Architecture ceilings for non-decoder geometry (inlocal / audiotok / mel).
+/// Production MiMo-ASR is 6L inlocal d1024, 32L audiotok, 8 codebooks, mel
+/// n_fft=640; ceilings match FunASR/Qwen headroom so malicious metadata cannot
+/// force unbounded descriptor loops before tensor validation.
+const MIMO_MAX_LAYERS: usize = 512;
+const MIMO_MAX_D_MODEL: usize = 65_536;
+const MIMO_MAX_N_HEADS: usize = 1_024;
+const MIMO_MAX_HEAD_DIM: usize = 1_024;
+const MIMO_MAX_FFN_DIM: usize = 262_144;
+const MIMO_MAX_GROUP_SIZE: usize = 64;
+const MIMO_MAX_AUDIO_CHANNELS: usize = 64;
+const MIMO_MAX_CODEBOOKS: usize = 64;
+const MIMO_MAX_CODEBOOK_SIZE: u32 = 1_048_576;
+const MIMO_MAX_CONV_KERNEL: usize = 4_096;
+const MIMO_MAX_CONV_STRIDE: usize = 1_024;
+const MIMO_MAX_SAMPLE_RATE_HZ: usize = 384_000;
+const MIMO_MAX_N_FFT: usize = 65_536;
+const MIMO_MAX_HOP_LENGTH: usize = 65_536;
+const MIMO_MAX_WIN_LENGTH: usize = 65_536;
+const MIMO_MAX_N_MELS: usize = 4_096;
+/// Global ceiling on tensor obligations one pack contract may construct.
+const MIMO_MAX_TENSOR_OBLIGATIONS: usize = 1_000_000;
+/// Per-inlocal-layer descriptors (attn norm, q/k/v w+b, out, ffn norm, gate/up/down).
+const MIMO_INLOCAL_TENSORS_PER_LAYER: usize = 12;
+/// Fixed inlocal tail (final norm + group proj) before speech embd channels.
+const MIMO_INLOCAL_FIXED_TAIL: usize = 2;
+/// Audiotok stem + fixed tables excluding per-layer and codebooks.
+const MIMO_AUDIOTOK_FIXED_TENSOR_COUNT: usize = 12;
+/// Per-audiotok-layer descriptors.
+const MIMO_AUDIOTOK_TENSORS_PER_LAYER: usize = 12;
+
 /// The 36L Qwen2 backbone: qkv bias on, no QK-norm (the same shape
 /// `firered_llm`'s LLM branch already parameterizes into
 /// `qwen::llm_transformer`).
@@ -271,7 +302,30 @@ pub(crate) fn parse_mimo_inlocal_metadata(
         required_usize(metadata, "mimo.audio.channels")?,
         "mimo.audio.channels",
     )?;
-    if n_heads * head_dim != d_model {
+    bounded(n_layers, "mimo.inlocal.block_count", MIMO_MAX_LAYERS)?;
+    bounded(d_model, "mimo.inlocal.embedding_length", MIMO_MAX_D_MODEL)?;
+    bounded(
+        n_heads,
+        "mimo.inlocal.attention.head_count",
+        MIMO_MAX_N_HEADS,
+    )?;
+    bounded(
+        head_dim,
+        "mimo.inlocal.attention.head_dim",
+        MIMO_MAX_HEAD_DIM,
+    )?;
+    bounded(
+        ffn_dim,
+        "mimo.inlocal.feed_forward_length",
+        MIMO_MAX_FFN_DIM,
+    )?;
+    bounded(group_size, "mimo.audio.group_size", MIMO_MAX_GROUP_SIZE)?;
+    bounded(
+        audio_channels,
+        "mimo.audio.channels",
+        MIMO_MAX_AUDIO_CHANNELS,
+    )?;
+    if n_heads.checked_mul(head_dim) != Some(d_model) {
         return Err(MimoMetadataError::InvalidValue {
             key: "mimo.inlocal.attention.head_dim",
             reason: format!("n_heads {n_heads} * head_dim {head_dim} != d_model {d_model}"),
@@ -335,6 +389,9 @@ pub(crate) fn parse_mimo_audiotok_metadata(
         required_usize(metadata, "mimo.tok.attention.head_count")?,
         "mimo.tok.attention.head_count",
     )?;
+    bounded(n_layers, "mimo.tok.block_count", MIMO_MAX_LAYERS)?;
+    bounded(d_model, "mimo.tok.embedding_length", MIMO_MAX_D_MODEL)?;
+    bounded(n_heads, "mimo.tok.attention.head_count", MIMO_MAX_N_HEADS)?;
     if !d_model.is_multiple_of(n_heads) {
         return Err(MimoMetadataError::InvalidValue {
             key: "mimo.tok.attention.head_count",
@@ -342,10 +399,12 @@ pub(crate) fn parse_mimo_audiotok_metadata(
         });
     }
     let head_dim = d_model / n_heads;
+    bounded(head_dim, "mimo.tok.attention.head_dim", MIMO_MAX_HEAD_DIM)?;
     let ffn_dim = positive(
         required_usize(metadata, "mimo.tok.feed_forward_length")?,
         "mimo.tok.feed_forward_length",
     )?;
+    bounded(ffn_dim, "mimo.tok.feed_forward_length", MIMO_MAX_FFN_DIM)?;
     let skip_layer_id = required_usize(metadata, "mimo.tok.encoder.skip_layer_id")?;
     if skip_layer_id == 0 || skip_layer_id > n_layers {
         return Err(MimoMetadataError::InvalidValue {
@@ -369,10 +428,27 @@ pub(crate) fn parse_mimo_audiotok_metadata(
         required_usize(metadata, "mimo.tok.down_sample.stride")?,
         "mimo.tok.down_sample.stride",
     )?;
+    bounded(
+        conv_kernel_size,
+        "mimo.tok.conv.kernel_size",
+        MIMO_MAX_CONV_KERNEL,
+    )?;
+    bounded(conv1_stride, "mimo.tok.conv1.stride", MIMO_MAX_CONV_STRIDE)?;
+    bounded(conv2_stride, "mimo.tok.conv2.stride", MIMO_MAX_CONV_STRIDE)?;
+    bounded(
+        down_sample_stride,
+        "mimo.tok.down_sample.stride",
+        MIMO_MAX_CONV_STRIDE,
+    )?;
     let rope_theta = required_f32(metadata, "mimo.tok.rope.freq_base")?;
     let rvq_packed = positive(
         required_usize(metadata, "mimo.tok.rvq.num_quantizers_packed")?,
         "mimo.tok.rvq.num_quantizers_packed",
+    )?;
+    bounded(
+        rvq_packed,
+        "mimo.tok.rvq.num_quantizers_packed",
+        MIMO_MAX_CODEBOOKS,
     )?;
     let codebook_sizes =
         required_metadata_u32_array(metadata, "mimo.tok.rvq.codebook_sizes", "mimo-asr")
@@ -388,6 +464,16 @@ pub(crate) fn parse_mimo_audiotok_metadata(
                 codebook_sizes.len()
             ),
         });
+    }
+    for (idx, &size) in codebook_sizes.iter().enumerate() {
+        if size == 0 || size > MIMO_MAX_CODEBOOK_SIZE {
+            return Err(MimoMetadataError::InvalidValue {
+                key: "mimo.tok.rvq.codebook_sizes",
+                reason: format!(
+                    "codebook_sizes[{idx}]={size} must be in 1..={MIMO_MAX_CODEBOOK_SIZE}"
+                ),
+            });
+        }
     }
     Ok(MimoAudiotokMetadata {
         n_layers,
@@ -422,27 +508,53 @@ pub(crate) struct MimoMelMetadata {
 pub(crate) fn parse_mimo_mel_metadata(
     metadata: &GgufMetadata,
 ) -> Result<MimoMelMetadata, MimoMetadataError> {
+    let sample_rate_hz = positive(
+        required_usize(metadata, "mimo.mel.sample_rate")?,
+        "mimo.mel.sample_rate",
+    )?;
+    let n_fft = positive(
+        required_usize(metadata, "mimo.mel.n_fft")?,
+        "mimo.mel.n_fft",
+    )?;
+    let hop_length = positive(
+        required_usize(metadata, "mimo.mel.hop_length")?,
+        "mimo.mel.hop_length",
+    )?;
+    let win_length = positive(
+        required_usize(metadata, "mimo.mel.win_length")?,
+        "mimo.mel.win_length",
+    )?;
+    let n_mels = positive(
+        required_usize(metadata, "mimo.mel.n_mels")?,
+        "mimo.mel.n_mels",
+    )?;
+    bounded(
+        sample_rate_hz,
+        "mimo.mel.sample_rate",
+        MIMO_MAX_SAMPLE_RATE_HZ,
+    )?;
+    bounded(n_fft, "mimo.mel.n_fft", MIMO_MAX_N_FFT)?;
+    bounded(hop_length, "mimo.mel.hop_length", MIMO_MAX_HOP_LENGTH)?;
+    bounded(win_length, "mimo.mel.win_length", MIMO_MAX_WIN_LENGTH)?;
+    bounded(n_mels, "mimo.mel.n_mels", MIMO_MAX_N_MELS)?;
+    if win_length > n_fft {
+        return Err(MimoMetadataError::InvalidValue {
+            key: "mimo.mel.win_length",
+            reason: format!("win_length {win_length} must be <= n_fft {n_fft}"),
+        });
+    }
+    if hop_length > n_fft {
+        return Err(MimoMetadataError::InvalidValue {
+            key: "mimo.mel.hop_length",
+            reason: format!("hop_length {hop_length} must be <= n_fft {n_fft}"),
+        });
+    }
     Ok(MimoMelMetadata {
-        sample_rate_hz: positive(
-            required_usize(metadata, "mimo.mel.sample_rate")?,
-            "mimo.mel.sample_rate",
-        )?,
-        n_fft: positive(
-            required_usize(metadata, "mimo.mel.n_fft")?,
-            "mimo.mel.n_fft",
-        )?,
-        hop_length: positive(
-            required_usize(metadata, "mimo.mel.hop_length")?,
-            "mimo.mel.hop_length",
-        )?,
-        win_length: positive(
-            required_usize(metadata, "mimo.mel.win_length")?,
-            "mimo.mel.win_length",
-        )?,
-        n_mels: positive(
-            required_usize(metadata, "mimo.mel.n_mels")?,
-            "mimo.mel.n_mels",
-        )?,
+        sample_rate_hz,
+        n_fft,
+        hop_length,
+        win_length,
+        n_mels,
         log_clip: required_f32(metadata, "mimo.mel.log_clip")?,
     })
 }
@@ -492,6 +604,8 @@ pub(crate) enum MimoRuntimeTensorError {
     },
     #[error("mimo-asr backbone decoder geometry rejected by shared Qwen contract: {reason}")]
     InvalidDecoderGeometry { reason: String },
+    #[error("mimo-asr geometry constructs {count} tensor obligations, exceeding the ceiling {max}")]
+    TooManyTensorObligations { count: usize, max: usize },
 }
 
 pub(crate) fn validate_runtime_pack_contract(
@@ -646,8 +760,9 @@ pub(crate) fn mimo_asr_qwen_family_layer_names(
 
 /// The Qwen2 backbone decoder half: every `blk.*` layer plus token embd /
 /// logits / final norm. Expanded from the shared Qwen decoder contract Module
-/// so the 11-tensor layer pattern cannot drift from FunASR-Nano / MOSS /
-/// FireRed2-LLM. Does not cover inlocal / audiotok / speech embd tensors.
+/// so the per-layer tensor set (base 9 + Qwen2 qkv-bias 3 = 12) cannot drift
+/// from FunASR-Nano / MOSS / FireRed2-LLM. Does not cover inlocal / audiotok /
+/// speech embd tensors.
 pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
     llm: &MimoLlmMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
@@ -674,6 +789,67 @@ fn mimo_asr_runtime_tensor_bindings(
     audiotok: &MimoAudiotokMetadata,
     mel: &MimoMelMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
+    // Obligation budget before expanding per-layer descriptor loops.
+    let inlocal_layers = inlocal
+        .n_layers
+        .checked_mul(MIMO_INLOCAL_TENSORS_PER_LAYER)
+        .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    let audiotok_layers = audiotok
+        .n_layers
+        .checked_mul(MIMO_AUDIOTOK_TENSORS_PER_LAYER)
+        .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    // speech embd one matrix per codebook + one RVQ codebook tensor each.
+    let codebook_tensors = audiotok.rvq_packed.checked_mul(2).ok_or(
+        MimoRuntimeTensorError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        },
+    )?;
+    let non_decoder = inlocal_layers
+        .checked_add(MIMO_INLOCAL_FIXED_TAIL)
+        .and_then(|n| n.checked_add(audiotok_layers))
+        .and_then(|n| n.checked_add(MIMO_AUDIOTOK_FIXED_TENSOR_COUNT))
+        .and_then(|n| n.checked_add(codebook_tensors))
+        // mel filters + window
+        .and_then(|n| n.checked_add(2))
+        .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    use crate::models::qwen::{QwenDecoderContractGeometry, QwenDecoderContractOptions};
+    let decoder_geometry = mimo_asr_qwen_decoder_geometry(llm);
+    decoder_geometry
+        .validate_obligation_budget(QwenDecoderContractOptions::QWEN2, /*tail*/ 3)
+        .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })?;
+    let decoder_upper = decoder_geometry
+        .n_layers
+        .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
+            QwenDecoderContractOptions::QWEN2,
+        ))
+        .and_then(|n| n.checked_add(3))
+        .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    let total_upper = non_decoder.checked_add(decoder_upper).ok_or(
+        MimoRuntimeTensorError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        },
+    )?;
+    if total_upper > MIMO_MAX_TENSOR_OBLIGATIONS {
+        return Err(MimoRuntimeTensorError::TooManyTensorObligations {
+            count: total_upper,
+            max: MIMO_MAX_TENSOR_OBLIGATIONS,
+        });
+    }
+
     let mut bindings = Vec::new();
 
     let vector = |name: String, len: usize, reason: &str| TensorBindingDescriptor {
@@ -1157,7 +1333,8 @@ pub(crate) fn mimo_asr_oasr_v1_runtime_ready() -> crate::testing::TinyGgufFixtur
         .with_metadata("tokenizer.ggml.model", "gpt2")
         .with_string_array_metadata(
             "tokenizer.ggml.tokens",
-            (0..16).map(|index| format!("fixture{index}")),
+            // Must equal `mimo.llm.vocab_size` (32) from `tiny_metadata_values`.
+            (0..32).map(|index| format!("fixture{index}")),
         )
         .with_string_array_metadata("tokenizer.ggml.merges", ["f i", "fix t", "fixt u"]);
     for (key, value) in tiny_metadata_values() {
@@ -1271,6 +1448,34 @@ mod tests {
         assert_eq!(parsed.n_layers, 36);
         assert_eq!(parsed.n_kv_heads, 8);
         assert_eq!(parsed.rope_theta, 640000.0);
+    }
+
+    #[test]
+    fn rejects_inlocal_block_count_above_architecture_ceiling() {
+        let mut values = full_metadata().values().clone();
+        values.insert(
+            "mimo.inlocal.block_count".to_string(),
+            GgufMetadataValue::U32((MIMO_MAX_LAYERS as u32).saturating_add(1)),
+        );
+        let metadata = GgufMetadata::from_values_for_test(values);
+        assert!(parse_mimo_inlocal_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn rejects_audiotok_block_count_above_architecture_ceiling() {
+        let mut values = full_metadata().values().clone();
+        values.insert(
+            "mimo.tok.block_count".to_string(),
+            GgufMetadataValue::U32((MIMO_MAX_LAYERS as u32).saturating_add(1)),
+        );
+        // skip_layer_id must stay in range of the inflated layer count or the
+        // ceiling check is shadowed by the skip-layer range gate.
+        values.insert(
+            "mimo.tok.encoder.skip_layer_id".to_string(),
+            GgufMetadataValue::U32(1),
+        );
+        let metadata = GgufMetadata::from_values_for_test(values);
+        assert!(parse_mimo_audiotok_metadata(&metadata).is_err());
     }
 
     /// Capacity regression anchor: the shared KV byte derivation on this

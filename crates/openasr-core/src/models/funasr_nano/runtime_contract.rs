@@ -51,9 +51,14 @@ pub(crate) const LLM_ENDOFTEXT_TOKEN_ID_KEY: &str = "funasr.llm.endoftext_token_
 pub(crate) const FUNASR_NANO_MAX_LAYERS: usize = 512;
 pub(crate) const FUNASR_NANO_MAX_D_MODEL: usize = 65_536;
 pub(crate) const FUNASR_NANO_MAX_N_HEADS: usize = 1_024;
-// Match the shared Qwen decoder ceiling (not looser) so descriptor construction
-// and family parse fail closed on the same geometry bounds.
-pub(crate) const FUNASR_NANO_MAX_HEAD_DIM: usize = 1_024;
+/// Encoder SAN-M head_dim ceiling. Kept independent of the decoder ceiling so
+/// tightening the Qwen-shaped decoder path cannot false-reject a legitimate
+/// encoder geometry (and an encoder-side relaxation cannot leak into decoder
+/// parse). Production SAN-M uses head_dim = d_model / n_heads (= 64).
+pub(crate) const FUNASR_NANO_MAX_ENC_HEAD_DIM: usize = 8_192;
+/// Decoder head_dim ceiling mirrors the shared Qwen decoder contract.
+pub(crate) const FUNASR_NANO_MAX_LLM_HEAD_DIM: usize =
+    crate::models::qwen::QWEN_DECODER_MAX_HEAD_DIM;
 pub(crate) const FUNASR_NANO_MAX_FFN_DIM: usize = 262_144;
 pub(crate) const FUNASR_NANO_MAX_FSMN_KERNEL: usize = 4_096;
 pub(crate) const FUNASR_NANO_MAX_FEATURE_DIM: usize = 4_096;
@@ -145,7 +150,7 @@ pub(crate) fn parse_funasr_nano_encoder_metadata<M: ScalarMetadataView>(
         (ENC_TP_BLOCKS_KEY, tp_blocks, FUNASR_NANO_MAX_LAYERS),
         (ENC_D_MODEL_KEY, d_model, FUNASR_NANO_MAX_D_MODEL),
         (ENC_N_HEADS_KEY, n_heads, FUNASR_NANO_MAX_N_HEADS),
-        (ENC_HEAD_DIM_KEY, head_dim, FUNASR_NANO_MAX_HEAD_DIM),
+        (ENC_HEAD_DIM_KEY, head_dim, FUNASR_NANO_MAX_ENC_HEAD_DIM),
         (ENC_FFN_DIM_KEY, ffn_dim, FUNASR_NANO_MAX_FFN_DIM),
         (
             ENC_FSMN_KERNEL_KEY,
@@ -262,7 +267,7 @@ pub(crate) fn parse_funasr_nano_decoder_metadata<M: ScalarMetadataView>(
         (LLM_D_MODEL_KEY, d_model, FUNASR_NANO_MAX_D_MODEL),
         (LLM_N_HEADS_KEY, n_heads, FUNASR_NANO_MAX_N_HEADS),
         (LLM_N_KV_HEADS_KEY, n_kv_heads, FUNASR_NANO_MAX_N_HEADS),
-        (LLM_HEAD_DIM_KEY, head_dim, FUNASR_NANO_MAX_HEAD_DIM),
+        (LLM_HEAD_DIM_KEY, head_dim, FUNASR_NANO_MAX_LLM_HEAD_DIM),
         (LLM_FFN_DIM_KEY, ffn_dim, FUNASR_NANO_MAX_FFN_DIM),
         (LLM_VOCAB_SIZE_KEY, vocab_size, FUNASR_NANO_MAX_VOCAB_SIZE),
         (
@@ -723,7 +728,8 @@ pub(crate) fn funasr_nano_qwen_family_layer_names(
 /// The Qwen3 decoder half of the contract: every decoder layer (named by the
 /// loader's own name source) plus the final norm, logits head, and token
 /// embedding. Expanded from the shared Qwen decoder contract Module so the
-/// 11-tensor layer pattern cannot drift from MOSS / MiMo / FireRed2-LLM.
+/// per-layer tensor set (base 9 + Qwen3 qk-norm 2 = 11) cannot drift from MOSS
+/// / MiMo / FireRed2-LLM.
 pub(crate) fn funasr_nano_decoder_tensor_descriptors(
     decoder: &FunasrNanoDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FunasrNanoTensorContractError> {

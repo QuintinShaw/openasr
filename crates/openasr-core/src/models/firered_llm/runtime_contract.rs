@@ -66,6 +66,24 @@ pub(crate) const FIRERED_LLM_LLM_VOCAB_SIZE_KEY: &str = "firered_llm.llm.vocab_s
 pub(crate) const FIRERED_LLM_LLM_MAX_POSITIONS_KEY: &str = "firered_llm.llm.max_positions";
 /// Local ceiling for RoPE position tables; generous over production 32768.
 pub(crate) const FIRERED_LLM_MAX_POSITIONS: usize = 1_048_576;
+
+/// Architecture ceilings for the Conformer encoder / adapter admitted from
+/// untrusted pack metadata. Production FireRed2-LLM encoder is 16L / d1280 /
+/// 20 heads / ffn 5120 / feature_dim 80; ceilings match FunASR/Qwen headroom.
+pub(crate) const FIRERED_LLM_MAX_ENCODER_LAYERS: usize = 512;
+pub(crate) const FIRERED_LLM_MAX_D_MODEL: usize = 65_536;
+pub(crate) const FIRERED_LLM_MAX_N_HEADS: usize = 1_024;
+pub(crate) const FIRERED_LLM_MAX_HEAD_DIM: usize = 1_024;
+pub(crate) const FIRERED_LLM_MAX_FFN_DIM: usize = 262_144;
+pub(crate) const FIRERED_LLM_MAX_CONV_KERNEL: usize = 4_096;
+pub(crate) const FIRERED_LLM_MAX_SUBSAMPLE_CHANNELS: usize = 4_096;
+pub(crate) const FIRERED_LLM_MAX_FEATURE_DIM: usize = 4_096;
+pub(crate) const FIRERED_LLM_MAX_PE_LEN: usize = 1_048_576;
+pub(crate) const FIRERED_LLM_MAX_ADAPTER_DOWNSAMPLE: usize = 64;
+/// Two stride-2 convs need feature_dim large enough that
+/// `(((feature_dim - 1) / 2) - 1) / 2` stays non-negative; the minimum odd width
+/// that survives both halvings with a positive residual is 5.
+const FIRERED_LLM_MIN_FEATURE_DIM_FOR_SUBSAMPLE: usize = 5;
 pub(crate) const FIRERED_LLM_CHATML_IM_START_TOKEN_ID_KEY: &str =
     "firered_llm.llm.chatml_im_start_token_id";
 pub(crate) const FIRERED_LLM_CHATML_IM_END_TOKEN_ID_KEY: &str =
@@ -142,7 +160,62 @@ pub(crate) fn parse_firered_llm_encoder_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
-    if n_heads * head_dim != d_model {
+    for (key, value, max) in [
+        (
+            FIRERED_ENCODER_N_LAYERS_KEY,
+            encoder_n_layers,
+            FIRERED_LLM_MAX_ENCODER_LAYERS,
+        ),
+        (
+            FIRERED_ENCODER_D_MODEL_KEY,
+            d_model,
+            FIRERED_LLM_MAX_D_MODEL,
+        ),
+        (
+            FIRERED_ENCODER_N_HEADS_KEY,
+            n_heads,
+            FIRERED_LLM_MAX_N_HEADS,
+        ),
+        (
+            FIRERED_ENCODER_HEAD_DIM_KEY,
+            head_dim,
+            FIRERED_LLM_MAX_HEAD_DIM,
+        ),
+        (
+            FIRERED_ENCODER_FFN_DIM_KEY,
+            encoder_ffn_dim,
+            FIRERED_LLM_MAX_FFN_DIM,
+        ),
+        (
+            FIRERED_ENCODER_CONV_KERNEL_KEY,
+            conv_kernel,
+            FIRERED_LLM_MAX_CONV_KERNEL,
+        ),
+        (
+            FIRERED_ENCODER_SUBSAMPLE_CHANNELS_KEY,
+            subsample_channels,
+            FIRERED_LLM_MAX_SUBSAMPLE_CHANNELS,
+        ),
+        (
+            FIRERED_ENCODER_FEATURE_DIM_KEY,
+            feature_dim,
+            FIRERED_LLM_MAX_FEATURE_DIM,
+        ),
+        (
+            FIRERED_ENCODER_PE_LEN_KEY,
+            encoder_pe_len,
+            FIRERED_LLM_MAX_PE_LEN,
+        ),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
+    // Bound subsample_out_dim by the product of the two source ceilings.
+    validate_bounded_usize(
+        subsample_out_dim,
+        FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY,
+        FIRERED_LLM_MAX_SUBSAMPLE_CHANNELS.saturating_mul(FIRERED_LLM_MAX_FEATURE_DIM),
+    )?;
+    if n_heads.checked_mul(head_dim) != Some(d_model) {
         return Err(MetadataContractError::InvalidValue {
             key: FIRERED_ENCODER_HEAD_DIM_KEY,
             reason: format!("n_heads {n_heads} * head_dim {head_dim} != d_model {d_model}"),
@@ -160,7 +233,44 @@ pub(crate) fn parse_firered_llm_encoder_metadata<M: ScalarMetadataView>(
             reason: format!("rel-pos table length {encoder_pe_len} must be odd (2*max-1)"),
         });
     }
-    let expected_subsample = subsample_channels * (((feature_dim - 1) / 2 - 1) / 2);
+    // Two successive stride-2 convs compute
+    // `channels * (((feature_dim - 1) / 2 - 1) / 2)`. feature_dim must be large
+    // enough that neither half underflows into a wrapping usize, and the
+    // channel * width product must not overflow.
+    if feature_dim < FIRERED_LLM_MIN_FEATURE_DIM_FOR_SUBSAMPLE {
+        return Err(MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_FEATURE_DIM_KEY,
+            reason: format!(
+                "feature_dim {feature_dim} is too small for two stride-2 subsampling stages (need >= {FIRERED_LLM_MIN_FEATURE_DIM_FOR_SUBSAMPLE})"
+            ),
+        });
+    }
+    let after_first = (feature_dim - 1) / 2;
+    if after_first < 1 {
+        return Err(MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_FEATURE_DIM_KEY,
+            reason: format!(
+                "feature_dim {feature_dim} underflows the first stride-2 subsample stage"
+            ),
+        });
+    }
+    let subsampled_width = (after_first - 1) / 2;
+    if subsampled_width == 0 {
+        return Err(MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_FEATURE_DIM_KEY,
+            reason: format!(
+                "feature_dim {feature_dim} underflows the second stride-2 subsample stage"
+            ),
+        });
+    }
+    let expected_subsample = subsample_channels
+        .checked_mul(subsampled_width)
+        .ok_or_else(|| MetadataContractError::InvalidValue {
+            key: FIRERED_ENCODER_SUBSAMPLE_CHANNELS_KEY,
+            reason: format!(
+                "subsample_channels {subsample_channels} * subsampled_width {subsampled_width} overflows"
+            ),
+        })?;
     if subsample_out_dim != expected_subsample {
         return Err(MetadataContractError::InvalidValue {
             key: FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY,
@@ -208,6 +318,16 @@ pub(crate) fn parse_firered_llm_adapter_metadata<M: ScalarMetadataView>(
     let llm_dim = usize_key(FIRERED_LLM_ADAPTER_LLM_DIM_KEY)?;
     validate_positive_usize(downsample_rate, FIRERED_LLM_ADAPTER_DOWNSAMPLE_RATE_KEY)?;
     validate_positive_usize(llm_dim, FIRERED_LLM_ADAPTER_LLM_DIM_KEY)?;
+    validate_bounded_usize(
+        downsample_rate,
+        FIRERED_LLM_ADAPTER_DOWNSAMPLE_RATE_KEY,
+        FIRERED_LLM_MAX_ADAPTER_DOWNSAMPLE,
+    )?;
+    validate_bounded_usize(
+        llm_dim,
+        FIRERED_LLM_ADAPTER_LLM_DIM_KEY,
+        FIRERED_LLM_MAX_D_MODEL,
+    )?;
     Ok(FireRedLlmAdapterMetadata {
         downsample_rate,
         llm_dim,
@@ -401,8 +521,8 @@ pub(crate) fn firered_llm_qwen_family_layer_names(
 
 /// The Qwen2 decoder half: every `llm.blk.*` layer plus token embd / logits /
 /// final norm. Expanded from the shared Qwen decoder contract Module
-/// (ordered `ExactDims`) so the 11-tensor layer pattern cannot drift from
-/// FunASR-Nano / MOSS / MiMo.
+/// (ordered `ExactDims`) so the per-layer tensor set (base 9 + Qwen2 qkv-bias
+/// 3 = 12) cannot drift from FunASR-Nano / MOSS / MiMo.
 pub(crate) fn firered_llm_decoder_tensor_descriptors(
     decoder: &FireRedLlmDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, FireRedLlmRuntimeTensorContractError> {
@@ -841,6 +961,29 @@ mod tests {
         let mut metadata = full_metadata();
         metadata.insert(FIRERED_LLM_LLM_N_KV_HEADS_KEY.to_string(), "3".to_string());
         assert!(parse_firered_llm_decoder_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn rejects_encoder_n_layers_above_architecture_ceiling() {
+        let mut metadata = full_metadata();
+        metadata.insert(
+            FIRERED_ENCODER_N_LAYERS_KEY.to_string(),
+            (FIRERED_LLM_MAX_ENCODER_LAYERS as u64 + 1).to_string(),
+        );
+        assert!(parse_firered_llm_encoder_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn rejects_feature_dim_too_small_for_subsample() {
+        let mut metadata = full_metadata();
+        metadata.insert(FIRERED_ENCODER_FEATURE_DIM_KEY.to_string(), "1".to_string());
+        // Keep subsample_out_dim consistent with the broken formula so the
+        // failure is the feature_dim underflow gate, not the out_dim mismatch.
+        metadata.insert(
+            FIRERED_ENCODER_SUBSAMPLE_OUT_DIM_KEY.to_string(),
+            "0".to_string(),
+        );
+        assert!(parse_firered_llm_encoder_metadata(&metadata).is_err());
     }
 
     #[test]

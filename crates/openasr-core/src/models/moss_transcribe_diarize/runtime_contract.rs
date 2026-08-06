@@ -57,6 +57,34 @@ pub(crate) const LLM_AUDIO_START_TOKEN_ID_KEY: &str = "moss_td.llm.audio_start_t
 pub(crate) const LLM_AUDIO_END_TOKEN_ID_KEY: &str = "moss_td.llm.audio_end_token_id";
 pub(crate) const LLM_AUDIO_PAD_TOKEN_ID_KEY: &str = "moss_td.llm.audio_pad_token_id";
 
+/// Architecture ceilings for non-decoder geometry admitted from untrusted pack
+/// metadata. Production MOSS-TD encoder is 24L / d1024 / 16 heads / ffn 4096 /
+/// 80 mels / 1500 source positions; ceilings mirror FunASR/Qwen headroom so a
+/// malicious header cannot force unbounded descriptor loops before tensor
+/// validation.
+pub(crate) const MOSS_TD_MAX_ENCODER_LAYERS: usize = 512;
+pub(crate) const MOSS_TD_MAX_D_MODEL: usize = 65_536;
+pub(crate) const MOSS_TD_MAX_N_HEADS: usize = 1_024;
+pub(crate) const MOSS_TD_MAX_FFN_DIM: usize = 262_144;
+pub(crate) const MOSS_TD_MAX_N_MELS: usize = 4_096;
+pub(crate) const MOSS_TD_MAX_SOURCE_POSITIONS: usize = 1_048_576;
+/// Adaptor merge window is a small spatial downsample factor (production = 4).
+pub(crate) const MOSS_TD_MAX_ADAPTOR_MERGE_SIZE: usize = 64;
+/// `input_dim = d_model * merge_size`; bound by the product of the two ceilings.
+pub(crate) const MOSS_TD_MAX_ADAPTOR_INPUT_DIM: usize =
+    MOSS_TD_MAX_D_MODEL * MOSS_TD_MAX_ADAPTOR_MERGE_SIZE;
+/// Global ceiling on tensor obligations one pack contract may construct
+/// (encoder + adaptor + decoder). Far above production (~400), far below
+/// anything that could exhaust the verifier.
+pub(crate) const MOSS_TD_MAX_TENSOR_OBLIGATIONS: usize = 1_000_000;
+/// Encoder stem + out-norm fixed descriptors (conv1 w/b, conv2 w/b, pos embd,
+/// out norm w/b).
+const MOSS_TD_ENCODER_FIXED_TENSOR_COUNT: usize = 7;
+/// Per-encoder-layer descriptors emitted by [`moss_td_runtime_tensor_descriptors`].
+const MOSS_TD_ENCODER_TENSORS_PER_LAYER: usize = 15;
+/// VQAdaptor bridge descriptors (linear1/2 w/b + norm w/b).
+const MOSS_TD_ADAPTOR_TENSOR_COUNT: usize = 6;
+
 /// The Whisper conv stem's kernel size. Both conv layers are kernel-3 (conv1
 /// stride 1, conv2 stride 2), verified against upstream
 /// `transformers.models.whisper.modeling_whisper.WhisperEncoder`; the importer
@@ -208,6 +236,10 @@ pub(crate) enum MossTdRuntimeContractError {
     },
     #[error("moss-transcribe-diarize decoder geometry rejected by shared Qwen contract: {reason}")]
     InvalidDecoderGeometry { reason: String },
+    #[error(
+        "moss-transcribe-diarize geometry constructs {count} tensor obligations, exceeding the ceiling {max}"
+    )]
+    TooManyTensorObligations { count: usize, max: usize },
 }
 
 pub(crate) fn parse_encoder_metadata<M: ScalarMetadataView>(
@@ -232,6 +264,20 @@ pub(crate) fn parse_encoder_metadata<M: ScalarMetadataView>(
     ] {
         validate_positive_usize(value, key)?;
     }
+    for (key, value, max) in [
+        (ENCODER_N_LAYERS_KEY, n_layers, MOSS_TD_MAX_ENCODER_LAYERS),
+        (ENCODER_D_MODEL_KEY, d_model, MOSS_TD_MAX_D_MODEL),
+        (ENCODER_N_HEADS_KEY, n_heads, MOSS_TD_MAX_N_HEADS),
+        (ENCODER_FFN_DIM_KEY, ffn_dim, MOSS_TD_MAX_FFN_DIM),
+        (ENCODER_N_MELS_KEY, n_mels, MOSS_TD_MAX_N_MELS),
+        (
+            ENCODER_MAX_SOURCE_POSITIONS_KEY,
+            max_source_positions,
+            MOSS_TD_MAX_SOURCE_POSITIONS,
+        ),
+    ] {
+        validate_bounded_usize(value, key, max)?;
+    }
     if n_heads == 0 || !d_model.is_multiple_of(n_heads) {
         return Err(MetadataContractError::InvalidValue {
             key: ENCODER_N_HEADS_KEY,
@@ -241,13 +287,21 @@ pub(crate) fn parse_encoder_metadata<M: ScalarMetadataView>(
     // The encoder graph bakes the FFN width as `MOSS_ENCODER_FFN_EXPANSION *
     // d_model` (it loads `ffn_up_bias` and binds the FFN projections at that
     // width), so a pack declaring any other `ffn_dim` can never run; fail
-    // closed at admission rather than mid-graph.
-    if ffn_dim != MOSS_ENCODER_FFN_EXPANSION * d_model {
+    // closed at admission rather than mid-graph. Use checked arithmetic so a
+    // hostile d_model near usize::MAX cannot wrap the expected width.
+    let expected_ffn = MOSS_ENCODER_FFN_EXPANSION
+        .checked_mul(d_model)
+        .ok_or_else(|| MetadataContractError::InvalidValue {
+            key: ENCODER_D_MODEL_KEY,
+            reason: format!(
+                "d_model {d_model} overflows when multiplied by FFN expansion {MOSS_ENCODER_FFN_EXPANSION}"
+            ),
+        })?;
+    if ffn_dim != expected_ffn {
         return Err(MetadataContractError::InvalidValue {
             key: ENCODER_FFN_DIM_KEY,
             reason: format!(
-                "ffn_dim {ffn_dim} is unsupported: the encoder FFN width is fixed at {MOSS_ENCODER_FFN_EXPANSION} * d_model {}",
-                MOSS_ENCODER_FFN_EXPANSION * d_model
+                "ffn_dim {ffn_dim} is unsupported: the encoder FFN width is fixed at {MOSS_ENCODER_FFN_EXPANSION} * d_model {expected_ffn}"
             ),
         });
     }
@@ -271,6 +325,16 @@ pub(crate) fn parse_adaptor_metadata<M: ScalarMetadataView>(
     let input_dim = usize_key(ADAPTOR_INPUT_DIM_KEY)?;
     validate_positive_usize(merge_size, ADAPTOR_MERGE_SIZE_KEY)?;
     validate_positive_usize(input_dim, ADAPTOR_INPUT_DIM_KEY)?;
+    validate_bounded_usize(
+        merge_size,
+        ADAPTOR_MERGE_SIZE_KEY,
+        MOSS_TD_MAX_ADAPTOR_MERGE_SIZE,
+    )?;
+    validate_bounded_usize(
+        input_dim,
+        ADAPTOR_INPUT_DIM_KEY,
+        MOSS_TD_MAX_ADAPTOR_INPUT_DIM,
+    )?;
     Ok(MossTdAdaptorMetadata {
         merge_size,
         input_dim,
@@ -463,8 +527,9 @@ pub(crate) fn moss_td_qwen_family_layer_names(
 
 /// The Qwen3 decoder half of the contract: every `moss.llm.blk.*` layer plus
 /// the tied-embedding tail (`moss.llm.out_norm` / `moss.llm.tok_embd`). Expanded
-/// from the shared Qwen decoder contract Module so the 11-tensor layer pattern
-/// cannot drift from FunASR-Nano / MiMo / FireRed2-LLM.
+/// from the shared Qwen decoder contract Module so the per-layer tensor set
+/// (base 9 + Qwen3 qk-norm 2 = 11) cannot drift from FunASR-Nano / MiMo /
+/// FireRed2-LLM.
 pub(crate) fn moss_td_decoder_tensor_descriptors(
     decoder: &MossTdDecoderMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MossTdRuntimeContractError> {
@@ -498,6 +563,54 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     let encoder = metadata.encoder;
     let adaptor = metadata.adaptor;
     let decoder = metadata.decoder;
+
+    // Obligation budget before any per-layer allocation: encoder fixed +
+    // encoder layers + adaptor + decoder half (shared contract already bounds
+    // the decoder half itself).
+    let encoder_layer_tensors = encoder
+        .n_layers
+        .checked_mul(MOSS_TD_ENCODER_TENSORS_PER_LAYER)
+        .ok_or(MossTdRuntimeContractError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    let non_decoder = MOSS_TD_ENCODER_FIXED_TENSOR_COUNT
+        .checked_add(encoder_layer_tensors)
+        .and_then(|n| n.checked_add(MOSS_TD_ADAPTOR_TENSOR_COUNT))
+        .ok_or(MossTdRuntimeContractError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    // Decoder half upper-bounds itself via shared Qwen obligation budget; pin a
+    // conservative decoder contribution so the full-pack ceiling still applies
+    // even if a future decoder option grows the per-layer count.
+    use crate::models::qwen::{QwenDecoderContractGeometry, QwenDecoderContractOptions};
+    let decoder_geometry = moss_td_qwen_decoder_geometry(&decoder);
+    decoder_geometry
+        .validate_obligation_budget(QwenDecoderContractOptions::QWEN3, /*tail*/ 2)
+        .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })?;
+    let decoder_upper = decoder_geometry
+        .n_layers
+        .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
+            QwenDecoderContractOptions::QWEN3,
+        ))
+        .and_then(|n| n.checked_add(2))
+        .ok_or(MossTdRuntimeContractError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
+        })?;
+    let total_upper = non_decoder.checked_add(decoder_upper).ok_or(
+        MossTdRuntimeContractError::TooManyTensorObligations {
+            count: usize::MAX,
+            max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
+        },
+    )?;
+    if total_upper > MOSS_TD_MAX_TENSOR_OBLIGATIONS {
+        return Err(MossTdRuntimeContractError::TooManyTensorObligations {
+            count: total_upper,
+            max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
+        });
+    }
 
     let mut descriptors = Vec::new();
 
@@ -970,6 +1083,34 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_encoder_geometry_above_architecture_ceilings() {
+        for (key, value) in [
+            (ENCODER_N_LAYERS_KEY, MOSS_TD_MAX_ENCODER_LAYERS as u64 + 1),
+            (ENCODER_D_MODEL_KEY, MOSS_TD_MAX_D_MODEL as u64 + 1),
+            (ENCODER_N_HEADS_KEY, MOSS_TD_MAX_N_HEADS as u64 + 1),
+            (ENCODER_FFN_DIM_KEY, MOSS_TD_MAX_FFN_DIM as u64 + 1),
+            (ENCODER_N_MELS_KEY, MOSS_TD_MAX_N_MELS as u64 + 1),
+            (
+                ENCODER_MAX_SOURCE_POSITIONS_KEY,
+                MOSS_TD_MAX_SOURCE_POSITIONS as u64 + 1,
+            ),
+        ] {
+            let mut metadata = full_metadata();
+            metadata.insert(key.to_string(), value.to_string());
+            assert!(
+                parse_encoder_metadata(&metadata).is_err(),
+                "must reject {key}={value} above its ceiling"
+            );
+        }
+        let mut metadata = full_metadata();
+        metadata.insert(
+            ADAPTOR_MERGE_SIZE_KEY.to_string(),
+            (MOSS_TD_MAX_ADAPTOR_MERGE_SIZE as u64 + 1).to_string(),
+        );
+        assert!(parse_adaptor_metadata(&metadata).is_err());
     }
 
     #[test]
