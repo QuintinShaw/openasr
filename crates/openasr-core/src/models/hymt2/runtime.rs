@@ -30,8 +30,10 @@ use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
     Qwen3AsrLlmLogitsHeadRuntime, Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
-    Qwen3AsrLlmWholeStepTop1Output, Qwen3AsrTokenEmbeddingTable, QwenWholeDecoderPlan,
-    even_prefill_chunk_len, load_qwen3_llm_logits_head_from_reader_with_output_tensor,
+    Qwen3AsrLlmWholeStepTop1Output, Qwen3AsrTokenEmbeddingTable,
+    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, even_prefill_chunk_len,
+    load_qwen3_llm_logits_head_from_reader_with_output_tensor,
     load_qwen3_token_embedding_table_from_reader, logits_head_ggml_enabled,
     resolve_qwen_family_production_kv_cache_policy,
 };
@@ -317,15 +319,16 @@ impl Hymt2RuntimeSession {
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Hymt2RuntimeError> {
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-                decoder_plan,
+        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: decoder_plan,
                 preflight,
-                metadata.rms_norm_epsilon,
+                rms_norm_epsilon: metadata.rms_norm_epsilon,
                 fused_logits_head,
                 backend,
-            )
-            .map_err(|source| Hymt2RuntimeError::Graph { source })?;
+            },
+        )
+        .map_err(|source| Hymt2RuntimeError::Graph { source })?;
         Ok(Self {
             whole_decoder,
             logits_runtime: logits_head.new_runtime(backend).map_err(|error| {

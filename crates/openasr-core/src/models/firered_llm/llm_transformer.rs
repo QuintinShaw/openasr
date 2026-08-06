@@ -36,7 +36,9 @@ use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenWholeDecoderPlan,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings,
+    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan,
     load_llm_logits_head_from_reader_with_tensor_names,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
@@ -195,12 +197,14 @@ impl FireRedLlmDecoderRuntime {
         .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
             reason: error.to_string(),
         })?;
-        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-            &decoder_plan,
-            preflight,
-            FIRERED_LLM_RMS_NORM_EPSILON,
-            logits_head.fused_top1_spec(),
-            backend,
+        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &decoder_plan,
+                preflight,
+                rms_norm_epsilon: FIRERED_LLM_RMS_NORM_EPSILON,
+                fused_logits_head: logits_head.fused_top1_spec(),
+                backend,
+            },
         )
         .map_err(|error| FireRedLlmDecoderError::GraphFailed {
             reason: error.to_string(),

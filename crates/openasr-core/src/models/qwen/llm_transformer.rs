@@ -2210,37 +2210,20 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
-        Self::new_from_plan_with_adapter(
-            plan,
-            DEFAULT_RMS_NORM_EPSILON,
-            None,
-            None,
-            preflight,
-            backend,
-        )
-    }
-
-    pub(crate) fn new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-        plan: &QwenWholeDecoderPlan,
-        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
-        rms_norm_epsilon: f32,
-        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
-        backend: GgmlCpuGraphBackend,
-    ) -> Result<Self, GgmlCpuGraphError> {
-        // Single prepare-time compile seam for every Qwen-shaped adapter.
-        // Callers must already own a validated [`QwenWholeDecoderPlan`]; this
-        // entry never re-derives geometry from metadata or tensor-name tables.
         compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
                 plan,
                 preflight,
-                rms_norm_epsilon,
-                fused_logits_head,
+                rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                fused_logits_head: None,
                 backend,
             },
         )
     }
 
+    /// Private materializer used by the prepare-time compile seam and the
+    /// LoRA-bearing production path. External adapters must not call this;
+    /// they go through [`compile_qwen_whole_decoder_graph_from_prepared_plan`].
     #[allow(clippy::too_many_arguments)]
     fn new_from_plan_with_adapter(
         plan: &QwenWholeDecoderPlan,
