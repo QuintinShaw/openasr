@@ -1636,6 +1636,7 @@ mod tests {
                 segments: Vec::new(),
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             true,
         ));
@@ -1669,6 +1670,7 @@ mod tests {
             }],
             longform: None,
             language: Some("en".to_string()),
+            ..Default::default()
         };
         let result = Box::into_raw(Box::new(build_result(transcription, true)));
 

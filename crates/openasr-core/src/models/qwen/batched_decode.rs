@@ -2324,6 +2324,7 @@ impl Qwen3AsrBatchSlot {
                 segments,
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             carry_context: None,
             // Same reasoning as the single-utterance executor: no

@@ -702,6 +702,7 @@ impl GraniteSpeechGgmlExecutor {
                 }],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             carry_context: None,
             // No intra-decode timestamps -- the single segment spans the whole

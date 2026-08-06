@@ -518,6 +518,7 @@ impl FireRedAedGgmlExecutor {
             text,
             longform: None,
             language: None,
+            ..Default::default()
         };
         Ok(GgmlAsrExecutionResult {
             transcription,

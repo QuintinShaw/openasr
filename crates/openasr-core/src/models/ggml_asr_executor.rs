@@ -2198,6 +2198,7 @@ mod tests {
                 segments: Vec::new(),
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             carry_context: None,
             decode_truncation: None,
@@ -2554,6 +2555,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -2600,6 +2602,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -2679,6 +2682,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -2812,6 +2816,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -3158,6 +3163,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -3258,6 +3264,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,

@@ -571,6 +571,7 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
                 segments,
                 longform: None,
                 language: output.language,
+                ..Default::default()
             },
             carry_context: None,
             decode_truncation: None,

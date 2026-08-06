@@ -543,6 +543,7 @@ impl GgmlAsrViewExecutor for ParakeetCtcGgmlExecutor {
                 segments,
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             carry_context: None,
             decode_truncation: None,

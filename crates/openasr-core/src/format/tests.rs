@@ -21,6 +21,7 @@ fn sample() -> Transcription {
         }],
         longform: None,
         language: None,
+        ..Default::default()
     }
 }
 
@@ -53,6 +54,7 @@ fn speaker_sample() -> Transcription {
         ],
         longform: None,
         language: None,
+        ..Default::default()
     }
 }
 
@@ -85,6 +87,7 @@ fn matched_profile_sample() -> Transcription {
         ],
         longform: None,
         language: None,
+        ..Default::default()
     }
 }
 
@@ -118,6 +121,7 @@ fn word_sample() -> Transcription {
         }],
         longform: None,
         language: None,
+        ..Default::default()
     }
 }
 
@@ -231,6 +235,7 @@ fn renders_verbose_json_with_longform_metadata() {
             provenance: vec!["core.longform.plan:auto".to_string()],
         }),
         language: None,
+        ..Default::default()
     };
     let rendered = render_transcription(&transcription, ResponseFormat::VerboseJson).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -272,10 +277,67 @@ fn renders_vtt_speaker_prefix_only_when_present() {
 }
 
 #[test]
-fn renders_word_level_vtt_when_word_timestamps_are_present() {
+fn renders_word_level_vtt_only_for_legacy_rows_without_subtitle_cues() {
+    // Legacy path: no subtitle_cues, words present -> word-level VTT.
     assert_eq!(
         render_transcription(&word_sample(), ResponseFormat::Vtt).unwrap(),
         "WEBVTT\n\n00:00:00.000 --> 00:00:00.400\nhello\n\n00:00:00.400 --> 00:00:01.000\nworld\n"
+    );
+}
+
+#[test]
+fn renders_srt_from_subtitle_cues_when_present() {
+    let mut transcription = sample();
+    transcription.segments = vec![Segment {
+        start: 0.0,
+        end: 10.0,
+        text: "reading paragraph spanning many cues".to_string(),
+        speaker: None,
+        speaker_label: None,
+        speaker_person_id: None,
+        speaker_snapshot_label: None,
+        words: Vec::new(),
+    }];
+    transcription.subtitle_cues = vec![
+        Segment {
+            start: 0.0,
+            end: 1.5,
+            text: "reading paragraph".to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        },
+        Segment {
+            start: 1.5,
+            end: 3.0,
+            text: "spanning many cues".to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        },
+    ];
+    let srt = render_transcription(&transcription, ResponseFormat::Srt).unwrap();
+    assert_eq!(
+        srt,
+        "1\n00:00:00,000 --> 00:00:01,500\nreading paragraph\n\n2\n00:00:01,500 --> 00:00:03,000\nspanning many cues\n"
+    );
+    // Default VTT is also cue-level when subtitle_cues is present.
+    let vtt = render_transcription(&transcription, ResponseFormat::Vtt).unwrap();
+    assert!(vtt.contains("reading paragraph"));
+    assert!(vtt.contains("spanning many cues"));
+    assert!(!vtt.contains("reading paragraph spanning many cues"));
+}
+
+#[test]
+fn renders_srt_falls_back_to_segments_when_subtitle_cues_empty() {
+    // Legacy rows: only segments, no subtitle_cues.
+    assert_eq!(
+        render_transcription(&sample(), ResponseFormat::Srt).unwrap(),
+        "1\n00:00:00,000 --> 00:00:02,500\nhello world\n"
     );
 }
 
@@ -338,6 +400,7 @@ fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
         ],
         longform: None,
         language: None,
+        ..Default::default()
     };
     assert_eq!(
         render_transcription(&transcription, ResponseFormat::Markdown).unwrap(),

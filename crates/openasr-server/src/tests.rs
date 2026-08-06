@@ -1691,6 +1691,7 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
         }],
         longform: None,
         language: None,
+        ..Default::default()
     };
 
     record_file_transcription_history(&distribution, &request, &transcription, ResponseFormat::Vtt)
@@ -1738,6 +1739,7 @@ fn record_file_transcription_history_skips_write_when_retention_off() {
         segments: Vec::new(),
         longform: None,
         language: None,
+        ..Default::default()
     };
 
     record_file_transcription_history(
@@ -1767,6 +1769,8 @@ fn history_retention_last5_prunes_store() {
                 diarization_active: Some(false),
                 provenance: Some(DaemonHistoryProvenance::Recorded),
                 segments: Vec::new(),
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1806,6 +1810,8 @@ fn history_retention_off_prunes_store_empty() {
                 diarization_active: Some(false),
                 provenance: Some(DaemonHistoryProvenance::Recorded),
                 segments: Vec::new(),
+                subtitle_cues: Vec::new(),
+                timeline_quality: None,
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1830,6 +1836,8 @@ fn history_retention_off_prunes_store_empty() {
             diarization_active: Some(false),
             provenance: Some(DaemonHistoryProvenance::Recorded),
             segments: Vec::new(),
+            subtitle_cues: Vec::new(),
+            timeline_quality: None,
             text: "keep me".to_string(),
         })
         .unwrap();

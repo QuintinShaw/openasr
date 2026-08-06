@@ -575,6 +575,7 @@ impl MoonshineBatchSlot {
                 segments,
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             generated_tokens: self.generated_tokens,
             stop_reason: slot_stop_reason,

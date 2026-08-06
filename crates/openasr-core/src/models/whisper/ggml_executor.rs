@@ -3656,6 +3656,7 @@ impl WhisperGgmlExecutor {
                 segments: output.segments,
                 longform: None,
                 language: output.detected_language,
+                ..Default::default()
             },
             carry_context: output.carry_prompt_token_ids.map(|prompt_token_ids| {
                 GgmlAsrCarryContext {

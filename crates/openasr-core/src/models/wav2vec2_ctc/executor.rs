@@ -528,6 +528,7 @@ impl GgmlAsrViewExecutor for Wav2Vec2CtcGgmlExecutor {
                 segments,
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             carry_context: None,
             decode_truncation: None,

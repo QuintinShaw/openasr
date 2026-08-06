@@ -262,6 +262,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 segments,
                 longform: None,
                 language: None,
+                ..Default::default()
             }
         }
     } else {
@@ -334,6 +335,7 @@ fn cohere_plain_transcription_from_generated_tokens(
         segments,
         longform: None,
         language: None,
+        ..Default::default()
     })
 }
 

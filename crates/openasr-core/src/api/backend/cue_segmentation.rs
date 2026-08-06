@@ -1,435 +1,15 @@
-//! Family-agnostic re-segmentation of an assembled transcription into
-//! subtitle-grade cues.
+//! Compatibility shim: subtitle cue packing lives in [`crate::subtitle::cues`].
 //!
-//! Model families differ wildly in how coarsely they segment: whisper emits
-//! sentence-ish segments, but X-ASR / qwen / cohere / moonshine each emit one
-//! monolithic segment per decode (per long-form slice), which renders as a
-//! single 30-60s subtitle cue. This pass runs after speaker attribution and
-//! rebalances every segment into short cues, splitting at sentence-final
-//! punctuation first, then clause punctuation, then word gaps, while honouring
-//! duration and line-length caps.
-//!
-//! Invariants:
-//! - It never reorders or rewrites words, so the joined transcript text is
-//!   unchanged (streaming==batch parity and `transcription.text` stay intact).
-//! - It splits *within* the segments it is given and never merges across them,
-//!   so speaker turns are preserved (a cue never spans two speakers).
-//! - Word timestamps drive the boundaries when present; otherwise a segment's
-//!   words are synthesised proportionally from its character span so the same
-//!   packer applies.
-
-use crate::{Segment, Transcription, WordTimestamp};
-
-/// Preferred cue duration. Cues are grown up to this bound before a cut is
-/// forced, so most cues land at or under it.
-const TARGET_CUE_SECONDS: f32 = 6.0;
-/// Hard ceiling used only when merging a dangling orphan tail back into its
-/// neighbour; a normal cue is already bounded by [`TARGET_CUE_SECONDS`].
-const MAX_CUE_SECONDS: f32 = 8.0;
-/// ~42 characters x 2 lines for Latin-script cues.
-const LATIN_MAX_CHARS: usize = 84;
-/// ~18 fullwidth characters x 2 lines for CJK-script cues.
-const CJK_MAX_CHARS: usize = 36;
-/// A trailing piece of this many words or fewer is treated as an orphan and
-/// merged back into the previous cue when it fits within the hard caps.
-const ORPHAN_MAX_WORDS: usize = 2;
-
-/// Re-segment every segment of `transcription` into subtitle-grade cues. The
-/// segment order, speaker attribution, and word sequence are preserved.
-pub(crate) fn resegment_transcription_cues(mut transcription: Transcription) -> Transcription {
-    if transcription.segments.is_empty() {
-        return transcription;
-    }
-    let mut cues = Vec::with_capacity(transcription.segments.len());
-    for segment in std::mem::take(&mut transcription.segments) {
-        cues.extend(segment_into_cues(segment));
-    }
-    transcription.segments = cues;
-    transcription
-}
-
-/// A word-sized unit the packer reasons over: its character span within the
-/// parent segment text plus its time span. Real word timestamps are used when
-/// they align to the segment text; otherwise units are synthesised from
-/// whitespace tokens with times interpolated proportionally.
-struct CueToken {
-    char_start: usize,
-    char_end: usize,
-    start: f32,
-    end: f32,
-}
-
-fn segment_into_cues(segment: Segment) -> Vec<Segment> {
-    let chars: Vec<char> = segment.text.chars().collect();
-    let (tokens, real_words) = build_tokens(&segment, &chars);
-    if tokens.len() < 2 {
-        return vec![segment];
-    }
-    let budget = char_budget(&chars);
-    let ranges = pack_tokens(&chars, &tokens, budget);
-    if ranges.len() <= 1 {
-        return vec![segment];
-    }
-    let mut cues = Vec::with_capacity(ranges.len());
-    for (first, last) in ranges {
-        let text: String = chars[tokens[first].char_start..tokens[last].char_end]
-            .iter()
-            .collect();
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        let start = tokens[first].start.max(segment.start);
-        let end = tokens[last].end.max(start).min(segment.end.max(start));
-        let words: Vec<WordTimestamp> = if real_words {
-            segment.words[first..=last].to_vec()
-        } else {
-            Vec::new()
-        };
-        cues.push(Segment {
-            start,
-            end,
-            text,
-            speaker: segment.speaker.clone(),
-            speaker_label: segment.speaker_label.clone(),
-            speaker_person_id: segment.speaker_person_id.clone(),
-            speaker_snapshot_label: segment.speaker_snapshot_label.clone(),
-            words,
-        });
-    }
-    if cues.len() <= 1 {
-        return vec![segment];
-    }
-    cues
-}
-
-/// Build the token stream for a segment. Returns `(tokens, real_words)` where
-/// `real_words` is true when the tokens map 1:1 onto `segment.words` (so the
-/// caller can slice the original word timestamps into each cue).
-fn build_tokens(segment: &Segment, chars: &[char]) -> (Vec<CueToken>, bool) {
-    if segment.words.len() >= 2
-        && let Some(spans) = word_char_spans(chars, &segment.words)
-    {
-        let tokens = segment
-            .words
-            .iter()
-            .zip(spans)
-            .map(|(word, (char_start, char_end))| CueToken {
-                char_start,
-                char_end,
-                start: word.start,
-                end: word.end.max(word.start),
-            })
-            .collect();
-        return (tokens, true);
-    }
-    (synthesize_tokens(segment, chars), false)
-}
-
-/// Synthesise word-sized tokens from whitespace runs, interpolating times
-/// proportionally across `[segment.start, segment.end]` by character position.
-fn synthesize_tokens(segment: &Segment, chars: &[char]) -> Vec<CueToken> {
-    let total = chars.len();
-    if total == 0 {
-        return Vec::new();
-    }
-    let span_start = segment.start;
-    let span = (segment.end - segment.start).max(0.0);
-    let at = |char_index: usize| span_start + span * (char_index as f32 / total as f32);
-    let mut tokens = Vec::new();
-    let mut index = 0usize;
-    while index < total {
-        while index < total && chars[index].is_whitespace() {
-            index += 1;
-        }
-        if index >= total {
-            break;
-        }
-        let char_start = index;
-        while index < total && !chars[index].is_whitespace() {
-            index += 1;
-        }
-        tokens.push(CueToken {
-            char_start,
-            char_end: index,
-            start: at(char_start),
-            end: at(index),
-        });
-    }
-    tokens
-}
-
-/// Greedily pack tokens into cue ranges (inclusive `(first, last)` token
-/// indices). Cues grow up to the target caps and break at the first sentence
-/// boundary, preferring clause punctuation and then the widest word gap when a
-/// long sentence must be split.
-fn pack_tokens(chars: &[char], tokens: &[CueToken], budget: usize) -> Vec<(usize, usize)> {
-    let n = tokens.len();
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    while start < n {
-        let mut end = start;
-        // Grow the cue until it hits a content-bearing sentence boundary, runs
-        // out of tokens, or the next token would overflow the target caps.
-        while !(ends_sentence(chars, &tokens[end]) && range_has_content(chars, tokens, start, end))
-            && end + 1 < n
-            && fits(tokens, start, end + 1, budget, TARGET_CUE_SECONDS)
-        {
-            end += 1;
-        }
-        let cut = if (ends_sentence(chars, &tokens[end])
-            && range_has_content(chars, tokens, start, end))
-            || end == n - 1
-        {
-            end
-        } else {
-            choose_cut(chars, tokens, start, end)
-        };
-        ranges.push((start, cut));
-        start = cut + 1;
-    }
-    merge_orphan_tails(chars, tokens, ranges, budget)
-}
-
-/// Pick the split point within `[start, end]` for a sentence that is too long
-/// to keep whole: the latest clause boundary if any, else the token before the
-/// widest inter-word gap, else pack to `end`.
-fn choose_cut(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> usize {
-    for k in (start..=end).rev() {
-        if ends_clause(chars, &tokens[k]) && range_has_content(chars, tokens, start, k) {
-            return k;
-        }
-    }
-    let mut best_k = end;
-    let mut best_gap = 0.0f32;
-    for k in start..end {
-        let gap = tokens[k + 1].start - tokens[k].end;
-        if gap > best_gap {
-            best_gap = gap;
-            best_k = k;
-        }
-    }
-    best_k
-}
-
-/// Merge a trailing 1-2 word cue back into its predecessor when they belong to
-/// the same sentence (the predecessor did not end one) and the union still fits
-/// the hard caps -- avoids leaving a dangling orphan word on its own line.
-///
-/// The forced aligner's reference timestamp repair can legitimately collapse a
-/// trailing anomaly to the preceding timestamp. Such a zero-duration range is
-/// never useful as a standalone subtitle cue, so merge it even when the prior
-/// token ended a sentence. The original word timestamp remains untouched.
-fn merge_orphan_tails(
-    chars: &[char],
-    tokens: &[CueToken],
-    ranges: Vec<(usize, usize)>,
-    budget: usize,
-) -> Vec<(usize, usize)> {
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (first, last) in ranges {
-        if let Some(&(prev_first, prev_last)) = merged.last() {
-            let word_count = last - first + 1;
-            let prev_ends_sentence = ends_sentence(chars, &tokens[prev_last]);
-            let zero_duration = tokens[last].end <= tokens[first].start;
-            if word_count <= ORPHAN_MAX_WORDS
-                && (zero_duration || !prev_ends_sentence)
-                && fits(tokens, prev_first, last, budget, MAX_CUE_SECONDS)
-            {
-                *merged.last_mut().unwrap() = (prev_first, last);
-                continue;
-            }
-        }
-        merged.push((first, last));
-    }
-    merged
-}
-
-/// Whether `tokens[start..=end]` fits both the character budget and `max_seconds`.
-fn fits(tokens: &[CueToken], start: usize, end: usize, budget: usize, max_seconds: f32) -> bool {
-    let chars = tokens[end]
-        .char_end
-        .saturating_sub(tokens[start].char_start);
-    if chars > budget {
-        return false;
-    }
-    let duration = tokens[end].end - tokens[start].start;
-    duration <= max_seconds
-}
-
-/// Character budget for the segment's dominant script: CJK cues carry far fewer
-/// (wider) characters per line than Latin cues.
-fn char_budget(chars: &[char]) -> usize {
-    let mut wide = 0usize;
-    let mut total = 0usize;
-    for &ch in chars {
-        if ch.is_whitespace() {
-            continue;
-        }
-        total += 1;
-        if is_wide_script(ch) {
-            wide += 1;
-        }
-    }
-    if total > 0 && wide * 2 >= total {
-        CJK_MAX_CHARS
-    } else {
-        LATIN_MAX_CHARS
-    }
-}
-
-fn is_wide_script(ch: char) -> bool {
-    matches!(
-        u32::from(ch),
-        0x1100..=0x115F      // Hangul Jamo
-        | 0x2E80..=0x2EFF    // CJK radicals
-        | 0x3000..=0x303F    // CJK symbols and punctuation
-        | 0x3040..=0x30FF    // Hiragana + Katakana
-        | 0x3400..=0x4DBF    // CJK Ext A
-        | 0x4E00..=0x9FFF    // CJK Unified
-        | 0xAC00..=0xD7A3    // Hangul syllables
-        | 0xF900..=0xFAFF    // CJK compatibility ideographs
-        | 0xFF00..=0xFF60    // Fullwidth forms
-        | 0x20000..=0x3134F  // CJK Ext B..H
-    )
-}
-
-/// Whether the token ends a sentence: its last non-closing character is
-/// sentence-final punctuation. The mark may be its own token (`" . "`) or glued
-/// to the last word (`"country."`).
-fn ends_sentence(chars: &[char], token: &CueToken) -> bool {
-    last_significant_char(chars, token).is_some_and(is_sentence_terminal_char)
-}
-
-/// Whether the token ends a clause: its last non-closing character is clause
-/// punctuation (comma / semicolon / colon, ASCII or fullwidth).
-fn ends_clause(chars: &[char], token: &CueToken) -> bool {
-    last_significant_char(chars, token).is_some_and(is_clause_punct)
-}
-
-/// The token's last character, skipping trailing closing punctuation and
-/// whitespace.
-fn last_significant_char(chars: &[char], token: &CueToken) -> Option<char> {
-    chars[token.char_start..token.char_end]
-        .iter()
-        .copied()
-        .rev()
-        .find(|c| !is_segment_closing_punct(*c) && !c.is_whitespace())
-}
-
-/// Whether `tokens[start..=end]` carries any non-punctuation content, so a cue
-/// never consists solely of a stray punctuation token.
-fn range_has_content(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> bool {
-    tokens[start..=end]
-        .iter()
-        .flat_map(|token| chars[token.char_start..token.char_end].iter().copied())
-        .any(char_has_content)
-}
-
-fn is_sentence_terminal_char(c: char) -> bool {
-    matches!(
-        c,
-        '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' | '\u{2026}'
-    )
-}
-
-fn is_clause_punct(c: char) -> bool {
-    matches!(
-        c,
-        ',' | ';' | ':' | '\u{ff0c}' | '\u{3001}' | '\u{ff1b}' | '\u{ff1a}'
-    )
-}
-
-fn is_segment_closing_punct(c: char) -> bool {
-    matches!(
-        c,
-        '"' | '\''
-            | ')'
-            | ']'
-            | '}'
-            | '\u{201d}'
-            | '\u{2019}'
-            | '\u{ff09}'
-            | '\u{3011}'
-            | '\u{300d}'
-            | '\u{300f}'
-    )
-}
-
-fn char_has_content(c: char) -> bool {
-    !is_sentence_terminal_char(c)
-        && !is_clause_punct(c)
-        && !is_segment_closing_punct(c)
-        && !c.is_whitespace()
-}
-
-/// Map each word token to its `[start, end)` char span in the segment `chars`
-/// by greedy forward matching. Native word timestamps may retain punctuation,
-/// while forced aligners commonly strip it (`hello, world` -> `hello`,
-/// `world`; `你好，今天` -> one timestamp per ideograph). Try the exact form
-/// first, then allow only punctuation/whitespace to be skipped while matching
-/// an alphanumeric/apostrophe-only token. Separator text is attached to the
-/// preceding span so cue slicing preserves the original transcript verbatim.
-/// Returns `None` if content characters disagree, so the caller falls back to
-/// synthesised tokens rather than mis-slicing text.
-fn word_char_spans(chars: &[char], words: &[WordTimestamp]) -> Option<Vec<(usize, usize)>> {
-    let mut spans = Vec::with_capacity(words.len());
-    let mut idx = 0usize;
-    for word in words {
-        while idx < chars.len() && chars[idx].is_whitespace() {
-            idx += 1;
-        }
-        let token: Vec<char> = word.word.trim().chars().collect();
-        if token.is_empty() {
-            spans.push((idx, idx));
-            continue;
-        }
-        let (start, end) = match_word_span(chars, idx, &token)?;
-        spans.push((start, end));
-        idx = end;
-    }
-    if let Some(first) = spans.first_mut() {
-        first.0 = 0;
-    }
-    for index in 0..spans.len().saturating_sub(1) {
-        spans[index].1 = spans[index + 1].0;
-    }
-    if let Some(last) = spans.last_mut() {
-        last.1 = chars.len();
-    }
-    Some(spans)
-}
-
-fn match_word_span(chars: &[char], start: usize, token: &[char]) -> Option<(usize, usize)> {
-    if start + token.len() <= chars.len() && chars[start..start + token.len()] == token[..] {
-        return Some((start, start + token.len()));
-    }
-    if !token.iter().copied().all(is_forced_alignment_char) {
-        return None;
-    }
-
-    let mut cursor = start;
-    let mut first = None;
-    for &expected in token {
-        while cursor < chars.len() && !is_forced_alignment_char(chars[cursor]) {
-            cursor += 1;
-        }
-        if chars.get(cursor).copied() != Some(expected) {
-            return None;
-        }
-        first.get_or_insert(cursor);
-        cursor += 1;
-    }
-    Some((first?, cursor))
-}
-
-fn is_forced_alignment_char(ch: char) -> bool {
-    ch == '\'' || ch.is_alphanumeric()
-}
+//! The historical module path is kept so existing `cargo test --lib
+//! cue_segmentation` filters and `super::cue_segmentation` call sites keep
+//! resolving. New code should import from `crate::subtitle`.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Re-export the subtitle cue tests under this module path so the historical
+    // filter `cue_segmentation` still exercises the packer.
+    use crate::api::backend::{Segment, Transcription, WordTimestamp};
+    use crate::subtitle::cues::{resegment_transcription_cues, segment_into_cues};
 
     fn word(text: &str, start: f32, end: f32) -> WordTimestamp {
         WordTimestamp {
@@ -457,22 +37,22 @@ mod tests {
 
     fn transcription(segments: Vec<Segment>) -> Transcription {
         Transcription {
-            truncated_decodes: Vec::new(),
-            unnamed_speakers: Vec::new(),
             text: segments
                 .iter()
                 .map(|s| s.text.trim())
                 .collect::<Vec<_>>()
                 .join(" "),
             segments,
-            longform: None,
-            language: None,
+            ..Default::default()
         }
     }
 
+    const MAX_CUE_SECONDS: f32 = 8.0;
+    const LATIN_MAX_CHARS: usize = 84;
+    const ORPHAN_MAX_WORDS: usize = 2;
+
     #[test]
     fn splits_latin_monolithic_segment_at_sentence_punctuation() {
-        // Real X-ASR jfk output (detok already glued `.` to the prior word).
         let text = "And so my fellow americans ask not what your country can do for you. Ask what you can do for your country";
         let words = vec![
             word("And", 0.96, 1.00),
@@ -499,10 +79,7 @@ mod tests {
             word("country", 10.80, 10.84),
         ];
         let cues = segment_into_cues(segment(text, words));
-        // First sentence is >6s, so it splits at a clause/gap boundary too; the
-        // whole thing must be at least the two sentences, none over the caps.
         assert!(cues.len() >= 2, "cues: {cues:?}");
-        // Every cue is <= the hard duration cap.
         for cue in &cues {
             assert!(
                 cue.end - cue.start <= MAX_CUE_SECONDS + 1e-3,
@@ -510,7 +87,6 @@ mod tests {
             );
             assert!(cue.text.chars().count() <= LATIN_MAX_CHARS);
         }
-        // Words are preserved in order across all cues.
         let joined: Vec<&str> = cues
             .iter()
             .flat_map(|c| c.words.iter().map(|w| w.word.as_str()))
@@ -518,7 +94,6 @@ mod tests {
         assert_eq!(joined.len(), 22);
         assert_eq!(joined[0], "And");
         assert_eq!(joined[21], "country");
-        // A cue boundary lands on the sentence end.
         assert!(cues.iter().any(|c| c.text.ends_with("you.")));
     }
 
@@ -539,7 +114,6 @@ mod tests {
 
     #[test]
     fn splits_cjk_segment_at_ideographic_period() {
-        // Unspaced CJK with a fullwidth period; each ideograph is its own word.
         let text = "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{3002}\u{4eca}\u{5929}\u{5929}\u{6c14}\u{5f88}\u{597d}";
         let words = vec![
             word("\u{4f60}", 0.0, 0.3),
@@ -640,8 +214,6 @@ mod tests {
 
     #[test]
     fn splits_long_unpunctuated_segment_by_duration() {
-        // Raw X-ASR zh-en without punctuation: a >6s run must still break by
-        // duration / word gap rather than render one long cue.
         let words: Vec<WordTimestamp> = (0..10)
             .map(|i| {
                 let start = i as f32 * 1.0;
@@ -658,8 +230,6 @@ mod tests {
 
     #[test]
     fn never_crosses_speaker_turns() {
-        // Two segments, distinct speakers: re-segmentation stays within each and
-        // never merges across the turn boundary.
         let mut a = segment(
             "alpha bravo charlie. delta echo foxtrot.",
             vec![
@@ -678,8 +248,6 @@ mod tests {
         );
         b.speaker = Some("SPEAKER_01".to_string());
         let out = resegment_transcription_cues(transcription(vec![a, b]));
-        // Each cue carries exactly one speaker; the SPEAKER_01 content is never
-        // fused with SPEAKER_00 content.
         for cue in &out.segments {
             let speaker = cue.speaker.as_deref().unwrap();
             if cue.text.contains("golf") || cue.text.contains("hotel") {
@@ -697,8 +265,6 @@ mod tests {
 
     #[test]
     fn merges_trailing_orphan_into_previous_cue() {
-        // A long clause followed by a dangling two-word tail of the same
-        // sentence: the tail must not become its own cue.
         let words = vec![
             word("the", 0.0, 0.3),
             word("quick", 0.5, 0.9),
@@ -710,8 +276,6 @@ mod tests {
         ];
         let text = "the quick brown fox jumps, over it";
         let cues = segment_into_cues(segment(text, words));
-        // "over it" (2 words) would orphan after the clause cut; it is merged
-        // back so no cue is a lone 1-2 word tail.
         assert!(
             cues.last().map(|c| c.words.len()).unwrap_or(0) > ORPHAN_MAX_WORDS || cues.len() == 1,
             "orphan tail was not merged: {cues:?}"
@@ -737,5 +301,23 @@ mod tests {
         let out = resegment_transcription_cues(original);
         assert_eq!(out.text, text_before, "joined text must be untouched");
         assert!(out.segments.len() >= 3);
+    }
+
+    #[test]
+    fn mixed_cjk_latin_splits_on_sentence_boundary() {
+        let text = "Hello 世界。Next line starts here";
+        let words = vec![
+            word("Hello", 0.0, 0.4),
+            word("世", 0.5, 0.7),
+            word("界。", 0.7, 1.0),
+            word("Next", 1.2, 1.5),
+            word("line", 1.6, 1.9),
+            word("starts", 2.0, 2.4),
+            word("here", 2.5, 2.9),
+        ];
+        let cues = segment_into_cues(segment(text, words));
+        assert!(cues.len() >= 2, "mixed CJK/Latin must split: {cues:?}");
+        assert!(cues.iter().any(|c| c.text.contains("世界")));
+        assert!(cues.iter().any(|c| c.text.contains("Next")));
     }
 }

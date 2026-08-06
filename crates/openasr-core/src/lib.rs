@@ -85,6 +85,7 @@ pub(crate) mod registry;
 pub(crate) mod remote_compute;
 pub(crate) mod safety;
 pub mod stage_timing;
+pub mod subtitle;
 mod tensor;
 #[cfg(test)]
 mod test_process_env;
@@ -160,6 +161,10 @@ pub use metrics::{
     WerCounts, cer_counts, normalize_text, peak_rss_bytes, wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
+pub use subtitle::{
+    TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,
+    decide_forced_alignment, project_transcription, validate_word_anchors,
+};
 
 pub use config::{
     ConfigError, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID,

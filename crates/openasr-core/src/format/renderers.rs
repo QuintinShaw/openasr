@@ -1,4 +1,5 @@
-use crate::api::backend::Transcription;
+use crate::api::backend::{Segment, Transcription};
+use crate::subtitle::timed_cues_for_export;
 
 use super::{
     ResponseFormat,
@@ -55,17 +56,23 @@ impl TimedCueFormat {
 }
 
 fn render_timed_cues(transcription: &Transcription, spec: TimedCueFormat) -> String {
-    let cues = render_segments(transcription, spec.separator, |index, start, end, text| {
-        render_timed_cue_row(index, start, end, text, spec)
-    });
+    let cues = render_cue_list(
+        timed_cues_for_export(transcription),
+        spec.separator,
+        |index, start, end, text| render_timed_cue_row(index, start, end, text, spec),
+    );
     format!("{}{cues}{}", spec.prefix, spec.suffix)
 }
 
 fn render_vtt(transcription: &Transcription) -> String {
-    if transcription
-        .segments
-        .iter()
-        .any(|segment| !segment.words.is_empty())
+    // Default VTT is cue-level so UI and export share one presentation unit.
+    // Word-level VTT is only used for legacy rows that lack `subtitle_cues`
+    // and still carry per-word timestamps on reading segments.
+    if transcription.subtitle_cues.is_empty()
+        && transcription
+            .segments
+            .iter()
+            .any(|segment| !segment.words.is_empty())
     {
         return render_word_timed_vtt(transcription);
     }
@@ -128,14 +135,12 @@ fn render_timed_cue_row(
     }
 }
 
-fn render_segments(
-    transcription: &Transcription,
+fn render_cue_list(
+    cues: &[Segment],
     separator: &str,
     mut render: impl FnMut(usize, f32, f32, String) -> String,
 ) -> String {
-    transcription
-        .segments
-        .iter()
+    cues.iter()
         .enumerate()
         .map(|(index, segment)| {
             let text = render_segment_text(&segment.text, segment.speaker.as_deref());
@@ -145,10 +150,9 @@ fn render_segments(
         .join(separator)
 }
 
-/// Render segments as prose paragraphs, coalescing consecutive same-speaker
-/// cues into a single paragraph. The cue re-segmentation pass produces many
-/// short subtitle cues per speaker turn; timed formats (SRT/VTT/JSON) want that
-/// granularity, but markdown reads as one paragraph per turn.
+/// Render reading segments as prose paragraphs. New results already carry
+/// speaker-merged reading paragraphs; for legacy cue-sized rows, consecutive
+/// same-speaker pieces are still coalesced so markdown stays readable.
 fn render_segments_body(transcription: &Transcription, separator: &str) -> String {
     let mut paragraphs: Vec<String> = Vec::new();
     let mut group_speaker: Option<Option<&str>> = None;

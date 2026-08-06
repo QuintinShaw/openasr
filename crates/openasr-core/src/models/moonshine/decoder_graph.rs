@@ -222,6 +222,7 @@ pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
             segments,
             longform: None,
             language: None,
+            ..Default::default()
         },
         generated_tokens: decode.generated_tokens,
         stop_reason: decode.stop_reason,

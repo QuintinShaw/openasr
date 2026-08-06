@@ -188,6 +188,7 @@ impl TranscriptAssembler {
             segments: self.segments,
             longform: None,
             language: None,
+            ..Default::default()
         };
         debug_assert_eq!(
             transcription.segments.len(),

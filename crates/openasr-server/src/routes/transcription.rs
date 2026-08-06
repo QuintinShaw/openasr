@@ -547,6 +547,7 @@ mod truncated_header_tests {
                 })
                 .collect(),
             unnamed_speakers: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -645,6 +646,8 @@ pub(crate) fn record_file_transcription_history(
             // later; the store derives the advertised `formats` from these so we
             // never claim a format the stored transcript cannot render.
             segments: transcription.segments.clone(),
+            subtitle_cues: transcription.subtitle_cues.clone(),
+            timeline_quality: transcription.timeline_quality,
             text: transcription.text.clone(),
         })
         .map_err(ApiError::History)?;
@@ -991,6 +994,8 @@ impl TranscriptionRequestBuilder {
                 .iter()
                 .any(|value| value.as_str() == "word");
         let uploaded_path: &Path = uploaded_file.as_ref();
+        let needs_subtitle_export =
+            matches!(response_format, ResponseFormat::Srt | ResponseFormat::Vtt);
         let request = TranscriptionRequest::new(uploaded_path.to_path_buf(), model_id)
             .with_language(language)
             .with_task(task)
@@ -1001,6 +1006,7 @@ impl TranscriptionRequestBuilder {
             .with_execution_target(execution_target)
             .with_word_timestamps(word_timestamps)
             .with_word_timestamps_refine(word_timestamps_refine)
+            .with_needs_subtitle_export(needs_subtitle_export)
             .with_display_file_name(file_name)
             .with_voice_id(diarize)
             .with_diarize_speakers(speakers)

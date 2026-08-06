@@ -1183,12 +1183,17 @@ fn transcribe(
     // Passing --word-timestamps=aligned is itself the consent to install the
     // Qwen3-ForcedAligner-0.6B capability pack, mirroring --diarize's ReDimNet2-B6
     // auto-install above; approximate (or omitted) never touches the network.
+    let needs_subtitle_export = options
+        .formats
+        .iter()
+        .any(|format| matches!(format, ResponseFormat::Srt | ResponseFormat::Vtt));
     ensure_cli_word_timestamps_pack_installed(
         native_execution_services,
         prepared_run.backend_kind,
         prepared_run.model_source.model_pack_path.as_deref(),
         options.diarize,
         options.word_timestamps_mode,
+        needs_subtitle_export,
         &options.consent,
     )?;
     ensure_word_timestamps_alignment_supported(
@@ -1320,6 +1325,12 @@ fn transcribe(
             options.word_timestamps_mode,
             Some(WordTimestampsMode::Aligned)
         ))
+        .with_needs_subtitle_export(
+            options
+                .formats
+                .iter()
+                .any(|format| matches!(format, ResponseFormat::Srt | ResponseFormat::Vtt)),
+        )
         .with_prepared_samples(prepared.shared_samples());
     let transcription = transcribe_with_backend(
         native_execution_services,

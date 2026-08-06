@@ -1099,6 +1099,7 @@ impl MossTdGgmlExecutor {
             text: normalized.text,
             longform: None,
             language: None,
+            ..Default::default()
         };
         Ok(GgmlAsrExecutionResult {
             transcription,

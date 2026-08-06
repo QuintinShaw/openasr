@@ -527,6 +527,7 @@ impl StreamingSession {
             segments,
             longform: None,
             language,
+            ..Default::default()
         }
     }
 }

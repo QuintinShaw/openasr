@@ -1336,6 +1336,9 @@ fn run_native_transcription_fallible_with_input(
     let language_hint = request.language.clone();
     let punctuate = request.punctuate;
     let explicit_refine = request.word_timestamps_refine;
+    let timeline_precision = request.timeline_precision;
+    let needs_subtitle_export = request.needs_subtitle_export;
+    let request_word_timestamps = request.word_timestamps;
     // Every independent native model stage resolves from this same immutable
     // product intent. Each stage still owns its own capability matrix and
     // candidate transaction; no auxiliary model inherits a coarse backend or
@@ -1380,8 +1383,23 @@ fn run_native_transcription_fallible_with_input(
         execution_services,
         &request_execution_intent,
     )?;
-    let refine = explicit_refine || speaker_finalization.requires_word_alignment(&transcription);
-    let transcription = if refine {
+    let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
+    let voice_id_needs_align = speaker_finalization.requires_word_alignment(&transcription);
+    let native_validation =
+        crate::subtitle::validate_word_anchors(&transcription, audio_duration_s);
+    let align_decision = crate::subtitle::decide_forced_alignment(
+        timeline_precision,
+        explicit_refine,
+        voice_id_needs_align,
+        needs_subtitle_export,
+        &native_validation,
+    );
+    let mut timeline_quality = if align_decision.native_reliable {
+        crate::subtitle::TimelineQuality::NativeReliable
+    } else {
+        crate::subtitle::TimelineQuality::NativeApproximate
+    };
+    let transcription = if align_decision.need_align {
         // Forced alignment is a separate heavyweight model phase. The
         // finished transcript and normalized PCM are the complete boundary
         // contract, so primary-ASR and earlier auxiliary runtimes are idle and
@@ -1390,16 +1408,21 @@ fn run_native_transcription_fallible_with_input(
         // memory machines, where otherwise two independently valid models can
         // never coexist inside the physical headroom even though their phases
         // are strictly sequential.
+        //
+        // V1 realigns the whole transcript when validation fails and policy
+        // demands a precise axis (no partial native+aligner splice).
         execution_services.unload_idle_native_model_runtime_caches();
         publish_align_progress(execution_context.request_id.as_deref());
-        refine_transcription_word_timestamps_with_forced_aligner_policy(
+        let refined = refine_transcription_word_timestamps_with_forced_aligner_policy(
             transcription,
-            forced_aligner_audio_view(&prepared_audio, refine)
+            forced_aligner_audio_view(&prepared_audio, true)
                 .expect("enabled forced alignment retains the normalized PCM view"),
             language_hint.as_deref(),
             execution_services,
             &request_execution_intent,
-        )?
+        )?;
+        timeline_quality = crate::subtitle::TimelineQuality::ForcedAligned;
+        refined
     } else {
         transcription
     };
@@ -1407,6 +1430,10 @@ fn run_native_transcription_fallible_with_input(
         transcription,
         &speaker_finalization,
         prepared_audio.as_slice(),
+        timeline_quality,
+        request_word_timestamps,
+        explicit_refine,
+        timeline_precision,
     );
     crate::stage_timing::log_stage(
         "native_transcribe",
@@ -2248,6 +2275,7 @@ fn run_native_transcription_impl(
                         resolved_runtime_for_request.backend(),
                     )),
                     language: reported_language.clone(),
+                    ..Default::default()
                 },
                 prepared_audio,
                 emits_punctuation,
@@ -2285,6 +2313,11 @@ fn run_native_transcription_impl(
             // request's registry entry on any exit. `word_timestamps_refine`
             // reserves headroom for that phase.
             let with_align = request.word_timestamps_refine
+                || matches!(
+                    request.timeline_precision,
+                    crate::subtitle::TimelinePrecisionPolicy::Always
+                )
+                || request.needs_subtitle_export
                 || (external_speakers
                     && selected_family.word_timestamp_source
                         == crate::arch::WordTimestampSource::ForcedAligner);
@@ -2655,6 +2688,11 @@ fn run_native_transcription_impl(
         execution_context.request_id.clone(),
         single_pass_total_samples,
         request.word_timestamps_refine
+            || matches!(
+                request.timeline_precision,
+                crate::subtitle::TimelinePrecisionPolicy::Always
+            )
+            || request.needs_subtitle_export
             || (external_speakers
                 && selected_family.word_timestamp_source
                     == crate::arch::WordTimestampSource::ForcedAligner),
@@ -2787,11 +2825,16 @@ fn prepare_native_transcription(
 /// Complete speaker attribution and identity only after punctuation and any
 /// required word alignment have run. This ordering is the contract: external
 /// timelines may require word anchors to project a coarse ASR segment without
-/// losing speaker turns.
+/// losing speaker turns. After identity, project the dual reading + subtitle
+/// views from the attributed word timeline.
 fn finalize_native_transcription(
     mut transcription: Transcription,
     speaker: &SpeakerFinalizationContext,
     prepared_audio: &[f32],
+    timeline_quality: crate::subtitle::TimelineQuality,
+    request_word_timestamps: bool,
+    explicit_refine: bool,
+    timeline_precision: crate::subtitle::TimelinePrecisionPolicy,
 ) -> Result<Transcription, BackendError> {
     if speaker.plan == SpeakerPlan::External {
         transcription = apply_speaker_attribution(transcription, &speaker.attribution)?;
@@ -2832,18 +2875,29 @@ fn finalize_native_transcription(
             transcription.unnamed_speakers.clear();
         }
     }
-    // Identity runs before cue re-segmentation. Besides avoiding redundant
+    // Identity runs before reading/cue projection. Besides avoiding redundant
     // embedding work over presentation-only cue fragments, this preserves the
     // exact one-to-one alignment between assembled in-decoder segments and
     // their decode-scope provenance. Cue splitting copies the resolved speaker
     // identity fields onto every child afterwards.
-    transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
-    if speaker.strip_forced_word_timestamps {
-        for segment in &mut transcription.segments {
-            segment.words.clear();
-        }
-    }
-    Ok(transcription)
+    //
+    // Strip top-level words when they were only forced on for internal Voice
+    // ID / cue packing and the caller did not request word timestamps. Cue
+    // start/end stay correct either way. Always / explicit refine keep words.
+    let keep_words = request_word_timestamps
+        || explicit_refine
+        || matches!(
+            timeline_precision,
+            crate::subtitle::TimelinePrecisionPolicy::Always
+        );
+    let strip_words = speaker.strip_forced_word_timestamps && !keep_words;
+    Ok(crate::subtitle::project_transcription(
+        transcription,
+        crate::subtitle::TimelineProjectOptions {
+            timeline_quality,
+            strip_words,
+        },
+    ))
 }
 
 /// Cut time-ordered segments into the exact decode scopes that produced them.
@@ -5979,6 +6033,7 @@ mod tests {
                 segments: Vec::new(),
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             2.0,
@@ -6020,6 +6075,7 @@ mod tests {
                 ],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             2.0,
@@ -6048,6 +6104,7 @@ mod tests {
                 }],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             120.0,
@@ -6075,6 +6132,7 @@ mod tests {
                 }],
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             0.0,
             12.0,
@@ -6457,6 +6515,7 @@ mod tests {
             }],
             longform: None,
             language: None,
+            ..Default::default()
         };
         let unchanged = apply_punctuation_stage_if_applicable(
             transcription.clone(),
@@ -6569,6 +6628,7 @@ mod tests {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,
@@ -6649,6 +6709,7 @@ mod tests {
             segments: Vec::new(),
             longform: None,
             language: None,
+            ..Default::default()
         }
     }
 
@@ -7024,6 +7085,7 @@ mod tests {
                     segments: Vec::new(),
                     longform: None,
                     language: None,
+                    ..Default::default()
                 },
                 carry_context: None,
                 decode_truncation: None,
@@ -7283,6 +7345,7 @@ mod tests {
                     segments: vec![segment(0.10, 0.20, &format!("w{marker}"))],
                     longform: None,
                     language: None,
+                    ..Default::default()
                 },
                 carry_context: None,
                 decode_truncation: None,
@@ -7477,6 +7540,7 @@ mod tests {
                     segments: Vec::new(),
                     longform: None,
                     language: None,
+                    ..Default::default()
                 },
                 carry_context: None,
                 decode_truncation: None,

@@ -43,6 +43,7 @@ impl TranscriptionBackend for MockBackend {
             }],
             longform: None,
             language: None,
+            ..Default::default()
         })
     }
 }

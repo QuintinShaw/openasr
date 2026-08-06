@@ -2,11 +2,19 @@ use serde::Serialize;
 
 use crate::api::backend::{Transcription, TranscriptionLongFormMetadata, TruncatedDecode};
 use crate::diarize::voice_id::SpeakerNamingRefusal;
+use crate::subtitle::TimelineQuality;
 
 #[derive(Serialize)]
 pub(super) struct JsonTranscription<'a> {
     text: &'a str,
     segments: Vec<JsonSegment<'a>>,
+    /// Short subtitle cues for SRT/VTT and on-screen display. Omitted when
+    /// empty (legacy rows and paths that have not projected dual views).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subtitle_cues: Vec<JsonSegment<'a>>,
+    /// Provenance of the word timeline. Omitted on legacy data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline_quality: Option<TimelineQuality>,
     /// Decodes behind this transcript that stopped before covering their audio.
     ///
     /// Present in the plain `json` format, not only `verbose_json`: "this text
@@ -40,9 +48,16 @@ pub(super) struct VerboseJsonTranscription<'a> {
     duration: Option<f32>,
     text: &'a str,
     segments: Vec<JsonSegment<'a>>,
+    /// Short subtitle cues for SRT/VTT. Always present on new dual-view
+    /// results; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subtitle_cues: Vec<JsonSegment<'a>>,
+    /// Provenance of the word timeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline_quality: Option<TimelineQuality>,
     /// OpenAI verbose_json top-level `words` array: per-word timing flattened
-    /// across all segments. Present only when word timestamps were produced;
-    /// the per-segment `words` arrays stay for existing clients.
+    /// across all reading segments. Present only when word timestamps were
+    /// produced; the per-segment `words` arrays stay for existing clients.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     words: Vec<JsonWord<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,8 +227,18 @@ struct VerboseLongFormMetadata<'a> {
 }
 
 fn json_segments(transcription: &Transcription, with_ids: bool) -> Vec<JsonSegment<'_>> {
-    transcription
-        .segments
+    map_json_segments(&transcription.segments, with_ids)
+}
+
+fn json_subtitle_cues(transcription: &Transcription, with_ids: bool) -> Vec<JsonSegment<'_>> {
+    map_json_segments(&transcription.subtitle_cues, with_ids)
+}
+
+fn map_json_segments(
+    segments: &[crate::api::backend::Segment],
+    with_ids: bool,
+) -> Vec<JsonSegment<'_>> {
+    segments
         .iter()
         .enumerate()
         .map(|(index, segment)| JsonSegment {
@@ -267,6 +292,8 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
         Self {
             text: &transcription.text,
             segments: json_segments(transcription, false),
+            subtitle_cues: json_subtitle_cues(transcription, false),
+            timeline_quality: transcription.timeline_quality,
             truncated: json_truncated_decodes(transcription),
             unnamed_speakers: json_unnamed_speakers(transcription),
         }
@@ -283,6 +310,8 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
             duration: transcribed_duration_seconds(transcription),
             text: &transcription.text,
             segments: json_segments(transcription, true),
+            subtitle_cues: json_subtitle_cues(transcription, true),
+            timeline_quality: transcription.timeline_quality,
             words: flattened_words(transcription),
             longform: transcription
                 .longform

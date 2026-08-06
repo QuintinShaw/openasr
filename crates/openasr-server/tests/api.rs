@@ -3989,6 +3989,8 @@ async fn history_list_supports_search_pagination_and_kind_filter() {
         diarization_active: Some(false),
         provenance: None,
         segments: Vec::new(),
+        subtitle_cues: Vec::new(),
+        timeline_quality: None,
         text: text.to_string(),
     };
     let oldest = store

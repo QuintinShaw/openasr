@@ -1012,6 +1012,7 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
     model_pack_path: Option<&Path>,
     diarize: bool,
     word_timestamps_mode: Option<WordTimestampsMode>,
+    needs_subtitle_export: bool,
     consent: &crate::consent::PullConsent,
 ) -> Result<()> {
     let explicit_alignment = matches!(word_timestamps_mode, Some(WordTimestampsMode::Aligned));
@@ -1019,7 +1020,12 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
         && model_pack_path
             .and_then(openasr_core::native_runtime_model_adapter_for_path)
             .is_some_and(|adapter| adapter.requires_forced_aligner_for_voice_id());
-    if (!explicit_alignment && !voice_id_alignment) || backend != BackendKind::Native {
+    // Auto + SRT/VTT may need the aligner when native anchors fail runtime
+    // validation. Preflight the pack so a missing capability is a clear error
+    // (or a consent install) rather than a mid-run surprise.
+    if (!explicit_alignment && !voice_id_alignment && !needs_subtitle_export)
+        || backend != BackendKind::Native
+    {
         return Ok(());
     }
     if openasr_core::word_timestamp_forced_aligner_available() {
@@ -1869,6 +1875,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             &crate::consent::PullConsent::default(),
         )
         .expect("no word-timestamps request never installs a pack");
@@ -1878,6 +1885,7 @@ mod tests {
             None,
             false,
             Some(WordTimestampsMode::Approximate),
+            false,
             &crate::consent::PullConsent::default(),
         )
         .expect("approximate word timestamps never install the forced-aligner pack");
@@ -1887,6 +1895,7 @@ mod tests {
             None,
             false,
             Some(WordTimestampsMode::Aligned),
+            false,
             &crate::consent::PullConsent::default(),
         )
         .expect("the mock backend never needs the native-only forced-aligner pack");
@@ -1942,6 +1951,7 @@ mod tests {
             None,
             false,
             Some(WordTimestampsMode::Aligned),
+            false,
             &consent,
         )
         .expect_err("offline aligned timestamps must fail before constructing a downloader");

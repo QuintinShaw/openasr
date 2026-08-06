@@ -627,6 +627,7 @@ pub(crate) mod source_tree_audit {
                         segments: Vec::new(),
                         longform: None,
                         language: None,
+                        ..Default::default()
                     },
                     carry_context: None,
                     decode_truncation: None,

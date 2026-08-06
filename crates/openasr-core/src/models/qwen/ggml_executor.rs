@@ -914,6 +914,7 @@ impl Qwen3AsrGgmlExecutor {
                 segments,
                 longform: None,
                 language: None,
+                ..Default::default()
             },
             carry_context: None,
             // qwen3-asr emits no intra-decode timestamps -- its one segment

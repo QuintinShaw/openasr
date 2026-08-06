@@ -2111,6 +2111,7 @@ fn realtime_words_from_transcription_maps_seconds_to_milliseconds() {
         }],
         longform: None,
         language: None,
+        ..Default::default()
     };
 
     let words = realtime_words_from_transcription(&transcription);

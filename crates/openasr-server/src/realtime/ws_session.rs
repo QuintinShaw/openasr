@@ -3671,6 +3671,8 @@ impl WsSession {
             // per-segment timing lives in the realtime transcript history. No
             // segments here means the store advertises text-shaped exports only.
             segments: Vec::new(),
+            subtitle_cues: Vec::new(),
+            timeline_quality: None,
             text,
         }) {
             self.emit_error(

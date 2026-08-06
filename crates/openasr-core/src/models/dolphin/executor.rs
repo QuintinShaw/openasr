@@ -947,6 +947,7 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
                 // model does not detect it, but the selection is a genuine input);
                 // the transcribe layer prefers this per the SpecifyOnly mode.
                 language: Some(output.resolved_language),
+                ..Default::default()
             },
             carry_context: None,
             decode_truncation: None,
