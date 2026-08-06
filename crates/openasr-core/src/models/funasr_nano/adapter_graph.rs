@@ -11,11 +11,28 @@
 //! `.oasr` mmap via [`GgmlLoadedWeightContext`], and the per-block transformer
 //! math reuses the shared `nn::encoder::transformer_layer` primitive with a
 //! zero (bidirectional) attention mask.
+//!
+//! # Read-set evidence boundary (three funasr-nano halves)
+//!
+//! Fun-ASR-Nano's runtime tensor contract is three halves. Loader-equivalence
+//! evidence is also three half-family certificates -- this module owns the
+//! **adaptor half** only:
+//!
+//! - encoder half: `encoder_graph::trace_tests` (selective encoder weight load)
+//! - adaptor half: `adapter_graph::trace_tests` (production
+//!   [`FunasrNanoAdapterGraph::new_from_preflight`] binder read-set access
+//!   trace against `funasr_nano_adapter_tensor_descriptors`)
+//! - decoder half: `llm_transformer::trace_tests` (logical plan/logits/
+//!   embedding loaders + combo-pack `new_from_preflight`)
+//!
+//! Do not claim a single whole-family access-trace certificate from any one of
+//! these modules; each half is proven on its own path.
 
 use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgufTensorIndex,
 };
 use crate::nn::encoder::{
     TransformerEncoderConfig, TransformerEncoderLayerWeights, transformer_layer,
@@ -65,13 +82,27 @@ fn map_err(step: &'static str, source: GgmlCpuGraphError) -> FunasrNanoAdapterEr
     FunasrNanoAdapterError::GraphBuildFailed { step, source }
 }
 
+/// Bind one contract-listed weight from the already-materialized weight
+/// context. Touches [`GgufTensorIndex::get`] so an opt-in access trace records
+/// the **binder's** logical read set (not only the whole-pack weight-context
+/// materialization walk), matching the encoder/decoder half-family trace
+/// discipline.
 fn tensor(
     loaded: &GgmlLoadedWeightContext,
     guard: &crate::models::tensor_binding::TensorReadGuard,
+    index: &GgufTensorIndex,
     name: &str,
 ) -> Result<GgmlLoadedTensor, FunasrNanoAdapterError> {
     if !guard.contains(name) {
         return Err(FunasrNanoAdapterError::NotInContract {
+            name: name.to_string(),
+        });
+    }
+    // Record the binder read through the shared index. Production admission
+    // already proved the name exists with the right shape; this lookup is the
+    // access-trace seam and a defense-in-depth existence check.
+    if index.get(name).is_none() {
+        return Err(FunasrNanoAdapterError::MissingTensor {
             name: name.to_string(),
         });
     }
@@ -105,7 +136,8 @@ struct AdapterBlock {
 fn load_block(
     loaded: &GgmlLoadedWeightContext,
     guard: &crate::models::tensor_binding::TensorReadGuard,
-    index: usize,
+    index: &GgufTensorIndex,
+    layer_index: usize,
 ) -> Result<AdapterBlock, FunasrNanoAdapterError> {
     use super::tensor_names::{
         ADAPTOR_ATTN_K_BIAS, ADAPTOR_ATTN_K_WEIGHT, ADAPTOR_ATTN_NORM_BIAS,
@@ -114,24 +146,24 @@ fn load_block(
         ADAPTOR_FFN_DOWN_BIAS, ADAPTOR_FFN_DOWN_WEIGHT, ADAPTOR_FFN_NORM_BIAS,
         ADAPTOR_FFN_NORM_WEIGHT, ADAPTOR_FFN_UP_BIAS, ADAPTOR_FFN_UP_WEIGHT,
     };
-    let n = |suffix: &str| format!("adaptor.blk.{index}.{suffix}");
+    let n = |suffix: &str| format!("adaptor.blk.{layer_index}.{suffix}");
     Ok(AdapterBlock {
-        attn_norm_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_NORM_WEIGHT))?,
-        attn_norm_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_NORM_BIAS))?,
-        attn_q_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_Q_WEIGHT))?,
-        attn_q_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_Q_BIAS))?,
-        attn_k_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_K_WEIGHT))?,
-        attn_k_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_K_BIAS))?,
-        attn_v_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_V_WEIGHT))?,
-        attn_v_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_V_BIAS))?,
-        attn_out_weight: tensor(loaded, guard, &n(ADAPTOR_ATTN_OUT_WEIGHT))?,
-        attn_out_bias: tensor(loaded, guard, &n(ADAPTOR_ATTN_OUT_BIAS))?,
-        ffn_norm_weight: tensor(loaded, guard, &n(ADAPTOR_FFN_NORM_WEIGHT))?,
-        ffn_norm_bias: tensor(loaded, guard, &n(ADAPTOR_FFN_NORM_BIAS))?,
-        ffn_up_weight: tensor(loaded, guard, &n(ADAPTOR_FFN_UP_WEIGHT))?,
-        ffn_up_bias: tensor(loaded, guard, &n(ADAPTOR_FFN_UP_BIAS))?,
-        ffn_down_weight: tensor(loaded, guard, &n(ADAPTOR_FFN_DOWN_WEIGHT))?,
-        ffn_down_bias: tensor(loaded, guard, &n(ADAPTOR_FFN_DOWN_BIAS))?,
+        attn_norm_weight: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_NORM_WEIGHT))?,
+        attn_norm_bias: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_NORM_BIAS))?,
+        attn_q_weight: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_Q_WEIGHT))?,
+        attn_q_bias: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_Q_BIAS))?,
+        attn_k_weight: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_K_WEIGHT))?,
+        attn_k_bias: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_K_BIAS))?,
+        attn_v_weight: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_V_WEIGHT))?,
+        attn_v_bias: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_V_BIAS))?,
+        attn_out_weight: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_OUT_WEIGHT))?,
+        attn_out_bias: tensor(loaded, guard, index, &n(ADAPTOR_ATTN_OUT_BIAS))?,
+        ffn_norm_weight: tensor(loaded, guard, index, &n(ADAPTOR_FFN_NORM_WEIGHT))?,
+        ffn_norm_bias: tensor(loaded, guard, index, &n(ADAPTOR_FFN_NORM_BIAS))?,
+        ffn_up_weight: tensor(loaded, guard, index, &n(ADAPTOR_FFN_UP_WEIGHT))?,
+        ffn_up_bias: tensor(loaded, guard, index, &n(ADAPTOR_FFN_UP_BIAS))?,
+        ffn_down_weight: tensor(loaded, guard, index, &n(ADAPTOR_FFN_DOWN_WEIGHT))?,
+        ffn_down_bias: tensor(loaded, guard, index, &n(ADAPTOR_FFN_DOWN_BIAS))?,
     })
 }
 
@@ -157,14 +189,27 @@ impl FunasrNanoAdapterGraph {
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
+        Self::bind_loaded(runner, loaded, metadata, preflight.tensor_index())
+    }
+
+    /// Bind every adaptor-contract weight from an already-materialized weight
+    /// context. Separated from weight-context materialization so access-trace
+    /// tests can enable the index recorder after the whole-pack load walk and
+    /// assert the **binder** read set alone.
+    fn bind_loaded(
+        runner: GgmlCpuGraphRunner,
+        loaded: GgmlLoadedWeightContext,
+        metadata: FunasrNanoAdapterMetadata,
+        index: &GgufTensorIndex,
+    ) -> Result<Self, FunasrNanoAdapterError> {
         let guard = super::runtime_contract::funasr_nano_adapter_read_guard(&metadata);
-        let linear1_weight = tensor(&loaded, &guard, ADAPTOR_LINEAR1_WEIGHT)?;
-        let linear1_bias = tensor(&loaded, &guard, ADAPTOR_LINEAR1_BIAS)?;
-        let linear2_weight = tensor(&loaded, &guard, ADAPTOR_LINEAR2_WEIGHT)?;
-        let linear2_bias = tensor(&loaded, &guard, ADAPTOR_LINEAR2_BIAS)?;
+        let linear1_weight = tensor(&loaded, &guard, index, ADAPTOR_LINEAR1_WEIGHT)?;
+        let linear1_bias = tensor(&loaded, &guard, index, ADAPTOR_LINEAR1_BIAS)?;
+        let linear2_weight = tensor(&loaded, &guard, index, ADAPTOR_LINEAR2_WEIGHT)?;
+        let linear2_bias = tensor(&loaded, &guard, index, ADAPTOR_LINEAR2_BIAS)?;
         let mut blocks = Vec::with_capacity(metadata.n_layers);
-        for index in 0..metadata.n_layers {
-            blocks.push(load_block(&loaded, &guard, index)?);
+        for layer_index in 0..metadata.n_layers {
+            blocks.push(load_block(&loaded, &guard, index, layer_index)?);
         }
         Ok(Self {
             runner,
@@ -314,5 +359,173 @@ impl FunasrNanoAdapterGraph {
         self.runner
             .release_transient_scheduler_working_set()
             .map_err(|source| map_err("release_transient_scheduler_working_set", source))
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::ggml_runtime::GgmlCpuGraphBackend;
+    use crate::models::funasr_nano::runtime_contract::{
+        FunasrNanoAdapterMetadata, funasr_nano_adapter_read_guard,
+        funasr_nano_adapter_tensor_descriptors,
+    };
+    use crate::models::tensor_binding::{
+        assert_trace_matches_descriptor_set, project_fixture_tensors,
+    };
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+
+    fn tiny_adapter_metadata() -> FunasrNanoAdapterMetadata {
+        FunasrNanoAdapterMetadata {
+            n_layers: 1,
+            n_heads: 2,
+            encoder_dim: 16,
+            llm_dim: 24,
+        }
+    }
+
+    fn write_adapter_pack(
+        path: &std::path::Path,
+        descriptors: &[crate::models::tensor_binding::TensorBindingDescriptor],
+    ) {
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        write_tiny_gguf_runtime_source(path, &spec).expect("write adapter pack");
+    }
+
+    /// Production-path read-set evidence for the adaptor half: materialize the
+    /// weight context from a synthetic pack projected from the adaptor
+    /// contract itself, enable the tensor-index access trace, then run the
+    /// real binder (`bind_loaded`, the second half of
+    /// [`FunasrNanoAdapterGraph::new_from_preflight`]) and assert the traced
+    /// binder read set equals the adaptor-half descriptor set name for name
+    /// and shape for shape.
+    ///
+    /// Trace is enabled **after** whole-pack weight-context materialization so
+    /// the recorded set is the binder's logical reads (via `index.get`), not
+    /// the weight-context walk over every pack tensor. A forgotten binder
+    /// lookup therefore fails the equality even when the tensor is present in
+    /// the pack. This is the adaptor half only -- see the module-level
+    /// three-half boundary note.
+    #[test]
+    fn adapter_binder_read_trace_equals_the_contract_descriptors() {
+        let metadata = tiny_adapter_metadata();
+        let descriptors = funasr_nano_adapter_tensor_descriptors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-adapter-trace.oasr");
+        write_adapter_pack(&path, &descriptors);
+
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("preflight");
+        let runner =
+            GgmlCpuGraphRunner::new(sensevoice_encoder_graph_config(GgmlCpuGraphBackend::Cpu))
+                .expect("runner");
+        let loaded = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("weight context");
+
+        // Binder-only window: production new_from_preflight is weight-context
+        // load then bind_loaded; tracing the bind half is the selective
+        // read-set certificate.
+        preflight.tensor_index().enable_access_trace();
+        let _graph =
+            FunasrNanoAdapterGraph::bind_loaded(runner, loaded, metadata, preflight.tensor_index())
+                .expect("full adapter bind");
+
+        assert_trace_matches_descriptor_set(&preflight.tensor_index().access_trace(), &descriptors);
+    }
+
+    /// End-to-end production constructor over the same projected pack must
+    /// succeed (weight-context materialization + binder). Complements the
+    /// binder-only access-trace test above.
+    #[test]
+    fn adapter_new_from_preflight_succeeds_on_projected_contract_pack() {
+        let metadata = tiny_adapter_metadata();
+        let descriptors = funasr_nano_adapter_tensor_descriptors(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-adapter-preflight.oasr");
+        write_adapter_pack(&path, &descriptors);
+
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("preflight");
+        FunasrNanoAdapterGraph::new_from_preflight(&preflight, metadata, GgmlCpuGraphBackend::Cpu)
+            .expect("projected adapter pack must load through production constructor");
+    }
+
+    /// Missing a contract tensor fails closed through the real production
+    /// constructor (binder MissingTensor after weight-context materialization).
+    #[test]
+    fn adapter_new_from_preflight_fails_closed_when_a_contract_tensor_is_absent() {
+        let metadata = tiny_adapter_metadata();
+        let mut descriptors = funasr_nano_adapter_tensor_descriptors(&metadata);
+        descriptors.retain(|d| d.tensor_name != "adaptor.linear2.weight");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-adapter-missing.oasr");
+        write_adapter_pack(&path, &descriptors);
+
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("preflight");
+        let result = FunasrNanoAdapterGraph::new_from_preflight(
+            &preflight,
+            metadata,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let error = match result {
+            Ok(_) => panic!("missing adaptor.linear2.weight must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                FunasrNanoAdapterError::MissingTensor { ref name }
+                    if name == "adaptor.linear2.weight"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The read guard fails closed on any tensor the contract does not
+    /// enumerate, so a binder/name drift cannot read off-contract.
+    #[test]
+    fn adapter_read_guard_rejects_off_contract_tensors() {
+        let metadata = tiny_adapter_metadata();
+        let guard = funasr_nano_adapter_read_guard(&metadata);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("funasr-nano-adapter-guard.oasr");
+        let descriptors = funasr_nano_adapter_tensor_descriptors(&metadata);
+        let mut spec = TinyGgufFixtureSpec::new(std::collections::BTreeMap::new());
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        // Extra off-contract tensor present in the pack.
+        spec = spec.with_tensor_shape("off.contract.weight", vec![2, 2]);
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write pack");
+
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("preflight");
+        let runner =
+            GgmlCpuGraphRunner::new(sensevoice_encoder_graph_config(GgmlCpuGraphBackend::Cpu))
+                .expect("runner");
+        let loaded = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("weight context loads the whole pack");
+
+        let error = tensor(
+            &loaded,
+            &guard,
+            preflight.tensor_index(),
+            "off.contract.weight",
+        )
+        .expect_err("off-contract reads must fail closed");
+        assert!(
+            matches!(
+                error,
+                FunasrNanoAdapterError::NotInContract { ref name }
+                    if name == "off.contract.weight"
+            ),
+            "unexpected error: {error}"
+        );
     }
 }

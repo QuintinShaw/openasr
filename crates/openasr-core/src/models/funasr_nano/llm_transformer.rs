@@ -503,7 +503,10 @@ mod trace_tests {
     /// whole-decoder weight-context enumeration
     /// (`load_gguf_weight_context_from_preflight`), which walks every pack
     /// tensor -- that path is covered by
-    /// `combo_pack_decoder_new_from_preflight_succeeds`.
+    /// `combo_pack_decoder_new_from_preflight_succeeds`. Encoder and adaptor
+    /// halves have their own trace certificates
+    /// (`encoder_graph::trace_tests`, `adapter_graph::trace_tests`); this is
+    /// not a whole-family access-trace claim.
     #[test]
     fn decoder_logical_loader_read_trace_equals_the_contract_descriptors() {
         let metadata = tiny_decoder_metadata();

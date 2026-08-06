@@ -83,6 +83,15 @@ pub(crate) const FUNASR_NANO_RMS_NORM_EPSILON: f32 = 1e-6;
 /// encoder is retrained with the llama.cpp-standard 1e-5.
 pub(crate) const FUNASR_NANO_ENCODER_LAYER_NORM_EPSILON: f32 = 1e-5;
 pub(crate) const FUNASR_NANO_ADAPTOR_LAYER_NORM_EPSILON: f32 = 1e-5;
+/// Adaptor MLP bridge expansion: `linear1` maps `encoder_dim -> encoder_dim *
+/// this` (production 512 -> 2048). Checkpoint fact, not a pack metadata key;
+/// the runtime contract pins ordered `ExactDims` from it so a transposed
+/// rectangular weight fails closed at admission.
+pub(crate) const FUNASR_NANO_ADAPTOR_MLP_EXPANSION: usize = 4;
+/// Adaptor block FFN reduction: inner width is `llm_dim / this` (production
+/// 1024 -> 256). Taken from the checkpoint `w_1` weight shape (not the stale
+/// config.yaml `ffn_dim=2048` note in the converter).
+pub(crate) const FUNASR_NANO_ADAPTOR_FFN_REDUCTION: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FunasrNanoEncoderMetadata {
@@ -221,12 +230,51 @@ pub(crate) fn parse_funasr_nano_adapter_metadata<M: ScalarMetadataView>(
             reason: format!("llm_dim {llm_dim} is not a multiple of n_heads {n_heads}"),
         });
     }
+    // The ordered adaptor matrix contract derives intermediate widths from
+    // family-constant expansion / reduction ratios. Fail closed here so a
+    // geometry that cannot form those ExactDims never reaches descriptor build.
+    if encoder_dim
+        .checked_mul(FUNASR_NANO_ADAPTOR_MLP_EXPANSION)
+        .is_none()
+    {
+        return Err(MetadataContractError::InvalidValue {
+            key: ADP_ENCODER_DIM_KEY,
+            reason: format!(
+                "encoder_dim {encoder_dim} * adaptor MLP expansion {} overflows",
+                FUNASR_NANO_ADAPTOR_MLP_EXPANSION
+            ),
+        });
+    }
+    if !llm_dim.is_multiple_of(FUNASR_NANO_ADAPTOR_FFN_REDUCTION) {
+        return Err(MetadataContractError::InvalidValue {
+            key: ADP_LLM_DIM_KEY,
+            reason: format!(
+                "llm_dim {llm_dim} is not a multiple of adaptor FFN reduction {}",
+                FUNASR_NANO_ADAPTOR_FFN_REDUCTION
+            ),
+        });
+    }
     Ok(FunasrNanoAdapterMetadata {
         n_layers,
         n_heads,
         encoder_dim,
         llm_dim,
     })
+}
+
+/// ggml `[in, out]` intermediate width of the adaptor MLP bridge
+/// (`encoder_dim -> intermediate -> llm_dim`).
+pub(crate) fn funasr_nano_adaptor_mlp_intermediate(encoder_dim: usize) -> Option<usize> {
+    encoder_dim.checked_mul(FUNASR_NANO_ADAPTOR_MLP_EXPANSION)
+}
+
+/// ggml `[in, out]` inner width of each adaptor transformer-block FFN
+/// (`llm_dim -> inner -> llm_dim`).
+pub(crate) fn funasr_nano_adaptor_ffn_intermediate(llm_dim: usize) -> Option<usize> {
+    if !llm_dim.is_multiple_of(FUNASR_NANO_ADAPTOR_FFN_REDUCTION) {
+        return None;
+    }
+    Some(llm_dim / FUNASR_NANO_ADAPTOR_FFN_REDUCTION)
 }
 
 pub(crate) fn parse_funasr_nano_decoder_metadata<M: ScalarMetadataView>(
@@ -484,12 +532,15 @@ fn sanm_block_tensor_descriptors(
 
 /// One adaptor transformer block's runtime tensor bindings: the 16 tensors
 /// `adapter_graph::load_block` binds (`attn.{norm,q,k,v,out}` +
-/// `ffn.{norm,up,down}`, each weight+bias), all llm_dim wide. Suffixes come
-/// from the shared `tensor_names` constants the binder resolves, so contract
-/// and loader enumerate one name set.
+/// `ffn.{norm,up,down}`, each weight+bias). Rank-2 weights use ordered ggml
+/// `ExactDims([in, out])` matching `adapter_graph` `mul_mat` and the pack
+/// importer's reversed torch `[out, in]` layout. Suffixes come from the shared
+/// `tensor_names` constants the binder resolves, so contract and loader
+/// enumerate one name set.
 fn adaptor_block_tensor_descriptors(
     adapter: &FunasrNanoAdapterMetadata,
     layer: usize,
+    ffn_intermediate: usize,
 ) -> Vec<TensorBindingDescriptor> {
     use super::tensor_names::{
         ADAPTOR_ATTN_K_BIAS, ADAPTOR_ATTN_K_WEIGHT, ADAPTOR_ATTN_NORM_BIAS,
@@ -513,8 +564,8 @@ fn adaptor_block_tensor_descriptors(
         ),
         (
             ADAPTOR_ATTN_Q_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(llm_dim, llm_dim),
-            "adaptor attention projection must be llm_dim x llm_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![llm_dim, llm_dim]),
+            "adaptor attention Q projection must be ggml [llm_dim, llm_dim] for mul_mat",
         ),
         (
             ADAPTOR_ATTN_Q_BIAS,
@@ -523,8 +574,8 @@ fn adaptor_block_tensor_descriptors(
         ),
         (
             ADAPTOR_ATTN_K_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(llm_dim, llm_dim),
-            "adaptor attention projection must be llm_dim x llm_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![llm_dim, llm_dim]),
+            "adaptor attention K projection must be ggml [llm_dim, llm_dim] for mul_mat",
         ),
         (
             ADAPTOR_ATTN_K_BIAS,
@@ -533,8 +584,8 @@ fn adaptor_block_tensor_descriptors(
         ),
         (
             ADAPTOR_ATTN_V_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(llm_dim, llm_dim),
-            "adaptor attention projection must be llm_dim x llm_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![llm_dim, llm_dim]),
+            "adaptor attention V projection must be ggml [llm_dim, llm_dim] for mul_mat",
         ),
         (
             ADAPTOR_ATTN_V_BIAS,
@@ -543,8 +594,8 @@ fn adaptor_block_tensor_descriptors(
         ),
         (
             ADAPTOR_ATTN_OUT_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2EitherDims(llm_dim, llm_dim),
-            "adaptor attention output projection must be llm_dim x llm_dim",
+            TensorBindingDescriptorRequirement::ExactDims(vec![llm_dim, llm_dim]),
+            "adaptor attention output projection must be ggml [llm_dim, llm_dim] for mul_mat",
         ),
         (
             ADAPTOR_ATTN_OUT_BIAS,
@@ -563,18 +614,18 @@ fn adaptor_block_tensor_descriptors(
         ),
         (
             ADAPTOR_FFN_UP_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2WithDim(llm_dim),
-            "adaptor FFN up projection must consume llm_dim-wide rows",
+            TensorBindingDescriptorRequirement::ExactDims(vec![llm_dim, ffn_intermediate]),
+            "adaptor FFN up projection must be ggml [llm_dim, ffn_intermediate] for mul_mat",
         ),
         (
             ADAPTOR_FFN_UP_BIAS,
-            TensorBindingDescriptorRequirement::NonEmptyVector,
-            "adaptor FFN up bias must be a non-empty vector",
+            TensorBindingDescriptorRequirement::VectorLen(ffn_intermediate),
+            "adaptor FFN up bias must span ffn_intermediate",
         ),
         (
             ADAPTOR_FFN_DOWN_WEIGHT,
-            TensorBindingDescriptorRequirement::Rank2WithDim(llm_dim),
-            "adaptor FFN down projection must produce llm_dim-wide rows",
+            TensorBindingDescriptorRequirement::ExactDims(vec![ffn_intermediate, llm_dim]),
+            "adaptor FFN down projection must be ggml [ffn_intermediate, llm_dim] for mul_mat",
         ),
         (
             ADAPTOR_FFN_DOWN_BIAS,
@@ -650,29 +701,43 @@ pub(crate) fn funasr_nano_encoder_tensor_descriptors(
 }
 
 /// The adaptor half of the contract: the two flattening/projecting linears
-/// plus every transformer block. The adapter binder resolves exactly this
-/// set; the read guard below enforces it at bind time.
+/// plus every transformer block. Rank-2 weights are ordered ggml
+/// `ExactDims([in, out])` aligned with `adapter_graph` `mul_mat` and
+/// `package_import`'s torch `[out, in]` -> ggml reverse. The adapter binder
+/// resolves exactly this set; the read guard below enforces it at bind time.
+///
+/// Intermediate widths are family-constant ratios of the declared geometry
+/// (see [`FUNASR_NANO_ADAPTOR_MLP_EXPANSION`] / [`FUNASR_NANO_ADAPTOR_FFN_REDUCTION`]),
+/// matching the shipped Fun-ASR-Nano-2512 pack (`linear1` 512x2048, block FFN
+/// 1024x256). Parse already fails closed when those ratios cannot form.
 pub(crate) fn funasr_nano_adapter_tensor_descriptors(
     adapter: &FunasrNanoAdapterMetadata,
 ) -> Vec<TensorBindingDescriptor> {
     use super::tensor_names::{
         ADAPTOR_LINEAR1_BIAS, ADAPTOR_LINEAR1_WEIGHT, ADAPTOR_LINEAR2_BIAS, ADAPTOR_LINEAR2_WEIGHT,
     };
+    let mlp_intermediate = funasr_nano_adaptor_mlp_intermediate(adapter.encoder_dim)
+        .expect("adapter parse admits only non-overflowing MLP intermediate");
+    let ffn_intermediate = funasr_nano_adaptor_ffn_intermediate(adapter.llm_dim)
+        .expect("adapter parse admits only FFN-reducible llm_dim");
     let mut descriptors = vec![
         descriptor(
             ADAPTOR_LINEAR1_WEIGHT.to_string(),
-            TensorBindingDescriptorRequirement::Rank2WithDim(adapter.encoder_dim),
-            "adaptor linear1 must consume encoder_dim-wide rows",
+            TensorBindingDescriptorRequirement::ExactDims(vec![
+                adapter.encoder_dim,
+                mlp_intermediate,
+            ]),
+            "adaptor linear1 must be ggml [encoder_dim, mlp_intermediate] for mul_mat",
         ),
         descriptor(
             ADAPTOR_LINEAR1_BIAS.to_string(),
-            TensorBindingDescriptorRequirement::NonEmptyVector,
-            "adaptor linear1 bias must be a non-empty vector",
+            TensorBindingDescriptorRequirement::VectorLen(mlp_intermediate),
+            "adaptor linear1 bias must span mlp_intermediate",
         ),
         descriptor(
             ADAPTOR_LINEAR2_WEIGHT.to_string(),
-            TensorBindingDescriptorRequirement::Rank2WithDim(adapter.llm_dim),
-            "adaptor linear2 must produce llm_dim-wide rows",
+            TensorBindingDescriptorRequirement::ExactDims(vec![mlp_intermediate, adapter.llm_dim]),
+            "adaptor linear2 must be ggml [mlp_intermediate, llm_dim] for mul_mat",
         ),
         descriptor(
             ADAPTOR_LINEAR2_BIAS.to_string(),
@@ -681,7 +746,11 @@ pub(crate) fn funasr_nano_adapter_tensor_descriptors(
         ),
     ];
     for layer in 0..adapter.n_layers {
-        descriptors.extend(adaptor_block_tensor_descriptors(adapter, layer));
+        descriptors.extend(adaptor_block_tensor_descriptors(
+            adapter,
+            layer,
+            ffn_intermediate,
+        ));
     }
     descriptors
 }
@@ -975,11 +1044,14 @@ mod tests {
     /// Structural pins on the production geometry (50 enc + 20 tp SAN-M
     /// blocks of 13 tensors, 4 tail norms, the 2-layer adaptor (4 linears +
     /// 2x16 block tensors), and the 28-layer Qwen3 decoder (11 weights per
-    /// layer + norm/logits/embedding)). Loader-equivalence evidence lives in
-    /// the traced full-load tests: encoder half in `encoder_graph::trace_tests`,
-    /// decoder half in `llm_transformer::trace_tests` (logical plan/logits/
-    /// embedding access trace plus combo-pack `new_from_preflight`). Adaptor half still pins name-source
-    /// equality below; this test holds the enumeration's production shape stable.
+    /// layer + norm/logits/embedding)). Loader-equivalence evidence is split
+    /// across the three half-family traced full-load tests -- encoder half in
+    /// `encoder_graph::trace_tests`, adaptor half in `adapter_graph::trace_tests`
+    /// (production `new_from_preflight` + binder read-set access trace), decoder
+    /// half in `llm_transformer::trace_tests` (logical plan/logits/embedding
+    /// access trace plus combo-pack `new_from_preflight`). Each half is proven
+    /// on its own; this test holds the enumeration's production shape stable
+    /// and must not be read as a single whole-family access-trace certificate.
     #[test]
     fn descriptor_set_stays_pinned_on_production_geometry() {
         let encoder = parse_funasr_nano_encoder_metadata(&full_metadata()).expect("enc");
@@ -1245,6 +1317,115 @@ mod tests {
                 .expect_err("corrupted FSMN kernel must fail closed");
         assert!(
             matches!(error, FunasrNanoTensorContractError::InvalidTensorShape { ref name, .. } if name == "enc.blk.0.attn.fsmn.weight"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Ordered adaptor ExactDims reject a transposed rectangular weight that
+    /// the old Rank2WithDim / Rank2EitherDims contract would have admitted.
+    /// Orientation is ggml `[in, out]` as proven against the shipped pack
+    /// (`adaptor.linear1.weight` = [512, 2048]) and `adapter_graph` mul_mat.
+    #[test]
+    fn rejects_a_transposed_adaptor_linear1_weight() {
+        let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
+        let mlp_intermediate = funasr_nano_adaptor_mlp_intermediate(adapter.encoder_dim)
+            .expect("tiny adapter MLP intermediate");
+        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder)
+            .expect("tiny geometry must expand");
+        for (name, dims) in shapes.iter_mut() {
+            if name == "adaptor.linear1.weight" {
+                // Correct ggml layout is [encoder_dim, mlp_intermediate].
+                *dims = vec![mlp_intermediate as u64, adapter.encoder_dim as u64];
+            }
+        }
+        let index = tensor_index_from_shapes(&shapes);
+        let error =
+            validate_funasr_nano_runtime_tensors_with_index(&index, &encoder, &adapter, &decoder)
+                .expect_err("transposed adaptor linear1 must fail closed");
+        assert!(
+            matches!(error, FunasrNanoTensorContractError::InvalidTensorShape { ref name, .. } if name == "adaptor.linear1.weight"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Same orientation pin for the adaptor block FFN up projection
+    /// (shipped pack: `adaptor.blk.0.ffn.up.weight` = [1024, 256]).
+    #[test]
+    fn rejects_a_transposed_adaptor_ffn_up_weight() {
+        let (encoder, adapter, decoder) = (tiny_encoder(), tiny_adapter(), tiny_decoder());
+        let ffn_intermediate = funasr_nano_adaptor_ffn_intermediate(adapter.llm_dim)
+            .expect("tiny adapter FFN intermediate");
+        let mut shapes = funasr_nano_runtime_tensors(&encoder, &adapter, &decoder)
+            .expect("tiny geometry must expand");
+        for (name, dims) in shapes.iter_mut() {
+            if name == "adaptor.blk.0.ffn.up.weight" {
+                *dims = vec![ffn_intermediate as u64, adapter.llm_dim as u64];
+            }
+        }
+        let index = tensor_index_from_shapes(&shapes);
+        let error =
+            validate_funasr_nano_runtime_tensors_with_index(&index, &encoder, &adapter, &decoder)
+                .expect_err("transposed adaptor ffn.up must fail closed");
+        assert!(
+            matches!(error, FunasrNanoTensorContractError::InvalidTensorShape { ref name, .. } if name == "adaptor.blk.0.ffn.up.weight"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Production adaptor geometry pins the family-constant intermediate
+    /// widths (MLP 4x encoder_dim, FFN llm_dim/4) so ExactDims cannot drift
+    /// from the shipped pack without a deliberate constant change.
+    #[test]
+    fn production_adaptor_exact_dims_match_shipped_pack_orientation() {
+        let adapter = parse_funasr_nano_adapter_metadata(&full_metadata()).expect("adp");
+        assert_eq!(adapter.encoder_dim, 512);
+        assert_eq!(adapter.llm_dim, 1024);
+        assert_eq!(
+            funasr_nano_adaptor_mlp_intermediate(adapter.encoder_dim),
+            Some(2048)
+        );
+        assert_eq!(
+            funasr_nano_adaptor_ffn_intermediate(adapter.llm_dim),
+            Some(256)
+        );
+        let descriptors = funasr_nano_adapter_tensor_descriptors(&adapter);
+        let by_name: std::collections::BTreeMap<&str, _> = descriptors
+            .iter()
+            .map(|d| (d.tensor_name.as_str(), &d.requirement))
+            .collect();
+        assert_eq!(
+            by_name["adaptor.linear1.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![512, 2048])
+        );
+        assert_eq!(
+            by_name["adaptor.linear2.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![2048, 1024])
+        );
+        assert_eq!(
+            by_name["adaptor.blk.0.ffn.up.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![1024, 256])
+        );
+        assert_eq!(
+            by_name["adaptor.blk.0.ffn.down.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![256, 1024])
+        );
+        assert_eq!(
+            by_name["adaptor.blk.0.attn.q.weight"],
+            &TensorBindingDescriptorRequirement::ExactDims(vec![1024, 1024])
+        );
+    }
+
+    /// llm_dim that cannot form the ordered FFN intermediate fails at parse.
+    #[test]
+    fn rejects_adaptor_llm_dim_not_divisible_by_ffn_reduction() {
+        let mut metadata = full_metadata();
+        // Keep n_heads dividing llm_dim so the heads check is not the first failure.
+        metadata.insert(ADP_N_HEADS_KEY.to_string(), "1".to_string());
+        metadata.insert(ADP_LLM_DIM_KEY.to_string(), "6".to_string());
+        let error = parse_funasr_nano_adapter_metadata(&metadata)
+            .expect_err("llm_dim=6 is not divisible by FFN reduction 4");
+        assert!(
+            matches!(error, MetadataContractError::InvalidValue { key, .. } if key == ADP_LLM_DIM_KEY),
             "unexpected error: {error}"
         );
     }

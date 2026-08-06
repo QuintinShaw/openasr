@@ -611,6 +611,10 @@ mod trace_tests {
     /// does not list, a descriptor no loader reads, or a read violating the
     /// descriptor's shape -- fails here. Also exercises the read guard: every
     /// read is contract-listed.
+    ///
+    /// Encoder half only. Adaptor and decoder halves have their own certificates
+    /// (`adapter_graph::trace_tests`, `llm_transformer::trace_tests`); do not
+    /// read this as a whole-family access-trace claim.
     #[test]
     fn encoder_loader_read_trace_equals_the_contract_descriptors() {
         let metadata = tiny_encoder_metadata();
