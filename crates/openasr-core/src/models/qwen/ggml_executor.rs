@@ -2004,9 +2004,10 @@ mod tests {
             .with_tensor_shape(names.attn_q_norm_weight, [8_u64])
             .with_tensor_shape(names.attn_k_norm_weight, [8_u64])
             .with_tensor_shape(names.ffn_norm_weight, [16_u64])
-            .with_tensor_shape(names.ffn_gate_weight, [32_u64, 16_u64])
-            .with_tensor_shape(names.ffn_up_weight, [32_u64, 16_u64])
-            .with_tensor_shape(names.ffn_down_weight, [16_u64, 32_u64])
+            // ggml [in, out]: gate/up = [d_model, ffn_dim], down = [ffn_dim, d_model]
+            .with_tensor_shape(names.ffn_gate_weight, [16_u64, 32_u64])
+            .with_tensor_shape(names.ffn_up_weight, [16_u64, 32_u64])
+            .with_tensor_shape(names.ffn_down_weight, [32_u64, 16_u64])
     }
 
     fn qwen_tensor_ready_fixture_spec_with_llm_layers(llm_layers: usize) -> TinyGgufFixtureSpec {
