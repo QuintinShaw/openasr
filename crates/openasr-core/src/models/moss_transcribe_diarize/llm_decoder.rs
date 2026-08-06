@@ -19,7 +19,8 @@ use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
-    QwenWholeDecoderPlan,
+    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan,
 };
 
 use super::runtime_contract::{
@@ -84,12 +85,16 @@ impl MossTdDecoderRuntime {
         token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
-        let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_rms_norm_epsilon_and_fused_logits_head(
-            &decoder_plan,
-            preflight,
-            MOSS_TD_RMS_NORM_EPSILON,
-            logits_head.fused_top1_spec(),
-            backend,
+        // Prepared Graph Plan prototype: host prepare already owns the typed
+        // plan; compile through the shared seam (same entry FunASR-Nano uses).
+        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &decoder_plan,
+                preflight,
+                rms_norm_epsilon: MOSS_TD_RMS_NORM_EPSILON,
+                fused_logits_head: logits_head.fused_top1_spec(),
+                backend,
+            },
         )
         .map_err(|error| MossTdDecoderError::GraphFailed {
             reason: error.to_string(),

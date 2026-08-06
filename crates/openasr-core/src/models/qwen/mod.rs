@@ -57,8 +57,10 @@ pub(crate) use llm_transformer::{
 };
 pub(crate) use llm_transformer::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
-    Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames, QwenWholeDecoderPlan,
-    even_prefill_chunk_len, resolve_qwen_family_production_kv_cache_policy,
+    Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames,
+    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, even_prefill_chunk_len,
+    resolve_qwen_family_production_kv_cache_policy,
 };
 pub(crate) use logits_head::{
     Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,

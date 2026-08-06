@@ -2097,6 +2097,38 @@ fn upload_decode_layer_weights(
     Ok(())
 }
 
+/// Prepare-time compile input for every Qwen-shaped whole-decoder adapter.
+///
+/// The owned typed plan is built once at prepare (host-neutral metadata only).
+/// This request is the sole backend materialize seam: FunASR-Nano and
+/// MOSS-Transcribe-Diarize (and every other Qwen-shaped consumer) pass the same
+/// prepared plan through here rather than re-deriving layer geometry at first
+/// decode checkout.
+pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
+    pub plan: &'a QwenWholeDecoderPlan,
+    pub preflight: &'a crate::ggml_runtime::GgufRuntimeSourcePreflight,
+    pub rms_norm_epsilon: f32,
+    pub fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'a>>,
+    pub backend: GgmlCpuGraphBackend,
+}
+
+/// Compile a prepared [`QwenWholeDecoderPlan`] into a monomorphic whole-decoder
+/// graph executor. Promotion gate for the Prepared Graph Plan prototype:
+/// callers must supply a plan that already passed prepare-time validation;
+/// this function never walks family metadata or tensor-name tables.
+pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
+    request: QwenPreparedDecoderGraphCompileRequest<'_>,
+) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
+    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_adapter(
+        request.plan,
+        request.rms_norm_epsilon,
+        request.fused_logits_head,
+        None,
+        request.preflight,
+        request.backend,
+    )
+}
+
 /// Builds the entire decode step (all layers) into ONE ggml graph per token,
 /// mirroring whisper's whole-decoder graph, to collapse N graph builds + N
 /// dispatches per token to 1+1. One runner, one arena holding all layers'
@@ -2195,13 +2227,17 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
-        Self::new_from_plan_with_adapter(
-            plan,
-            rms_norm_epsilon,
-            fused_logits_head,
-            None,
-            preflight,
-            backend,
+        // Single prepare-time compile seam for every Qwen-shaped adapter.
+        // Callers must already own a validated [`QwenWholeDecoderPlan`]; this
+        // entry never re-derives geometry from metadata or tensor-name tables.
+        compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan,
+                preflight,
+                rms_norm_epsilon,
+                fused_logits_head,
+                backend,
+            },
         )
     }
 
@@ -6840,6 +6876,34 @@ mod tests {
         assert_eq!(stateless.hidden, full.hidden);
         assert!(stateless.layer_kv.is_empty());
         assert_eq!(full.layer_kv.len(), metadata.llm_layers);
+    }
+
+    #[test]
+    fn prepared_plan_compile_seam_is_the_sole_backend_materialize_entry() {
+        // Promotion-gate unit for the Prepared Graph Plan prototype: the
+        // shared compile request is the only way two Qwen-shaped adapters
+        // (FunASR / MOSS) turn a host-owned plan into a monomorphic executor.
+        // Geometry is not re-derived from metadata here.
+        let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
+        let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
+        let plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata).expect("decoder plan");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+                &source,
+            )
+            .expect("decoder fixture preflight");
+        let executor = compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &plan,
+                preflight: &preflight,
+                rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                fused_logits_head: None,
+                backend: GgmlCpuGraphBackend::Cpu,
+            },
+        )
+        .expect("prepare-time compile from owned plan");
+        assert_eq!(executor.dims.d_model, metadata.llm_d_model);
+        assert_eq!(executor.layers.len(), plan.layer_count());
     }
 
     #[test]
