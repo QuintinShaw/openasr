@@ -235,20 +235,31 @@ struct CueLimits {
 
 /// Greedily pack tokens into cue ranges (inclusive `(first, last)` token
 /// indices). Cues grow up to the target caps and break at the first sentence
-/// boundary, preferring deliberate pauses, then clause punctuation, then the
-/// widest word gap when a long sentence must be split.
+/// boundary or a deliberate inter-word pause, preferring deliberate pauses,
+/// then clause punctuation, then the widest word gap when a long sentence must
+/// be split. Every emitted range is re-checked against the target caps so a
+/// forced natural cut cannot silently leave a multi-token CPS/duration breach.
 fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(usize, usize)> {
     let n = tokens.len();
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < n {
         let mut end = start;
-        // Grow the cue until it hits a content-bearing sentence boundary, runs
-        // out of tokens, or the next token would overflow the target caps.
+        // Grow the cue until it hits a content-bearing sentence boundary, a
+        // deliberate pause before the next token, runs out of tokens, or the
+        // next token would overflow the target caps.
         while !(ends_sentence(chars, &tokens[end]) && range_has_content(chars, tokens, start, end))
             && end + 1 < n
             && fits(chars, tokens, start, end + 1, limits, TARGET_CUE_SECONDS)
         {
+            let gap = tokens[end + 1].start - tokens[end].end;
+            // Active pause cut: end the cue at a real breath even when the
+            // running total is still under char/duration/CPS caps. The
+            // MIN_PAUSE_GAP_S floor (0.35s) avoids chopping after the first
+            // word on ordinary short inter-word gaps.
+            if gap >= MIN_PAUSE_GAP_S && range_has_content(chars, tokens, start, end) {
+                break;
+            }
             end += 1;
         }
         let cut = if (ends_sentence(chars, &tokens[end])
@@ -256,13 +267,69 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(u
             || end == n - 1
         {
             end
+        } else if end + 1 < n
+            && (tokens[end + 1].start - tokens[end].end) >= MIN_PAUSE_GAP_S
+            && range_has_content(chars, tokens, start, end)
+        {
+            // Grow stopped on a deliberate pause; keep the cut there rather
+            // than re-running choose_cut (which would pick the same pause).
+            end
         } else {
             choose_cut(chars, tokens, start, end)
         };
+        let cut = enforce_range_fits(chars, tokens, start, cut, limits);
         ranges.push((start, cut));
         start = cut + 1;
     }
     merge_orphan_tails(chars, tokens, ranges, limits)
+}
+
+/// Final CPS / duration / char-budget gate before a range is committed.
+///
+/// The grow loop already refuses to *add* a token that would overflow, but a
+/// subsequent natural cut (pause / clause / widest gap) can shrink duration
+/// faster than content and raise CPS above the cap. Shrink until the range
+/// fits. A single token that still fails is retained: real-word tokens are
+/// not character-split here, and synthesised CJK is already one character per
+/// token so a lone ideograph is almost always within budget.
+fn enforce_range_fits(
+    chars: &[char],
+    tokens: &[CueToken],
+    start: usize,
+    mut end: usize,
+    limits: CueLimits,
+) -> usize {
+    if fits(chars, tokens, start, end, limits, TARGET_CUE_SECONDS) {
+        return end;
+    }
+    if start >= end {
+        // Physically unsplittable single token; keep it rather than drop text.
+        return end;
+    }
+    // Prefer a natural cut inside the failing window when that sub-range fits.
+    let preferred = choose_cut(chars, tokens, start, end);
+    if preferred < end && fits(chars, tokens, start, preferred, limits, TARGET_CUE_SECONDS) {
+        return preferred;
+    }
+    // Walk end backward until the prefix fits, keeping at least one token
+    // (and preferring to leave content when the tail is pure punctuation).
+    while end > start {
+        let candidate = end - 1;
+        if fits(chars, tokens, start, candidate, limits, TARGET_CUE_SECONDS)
+            && range_has_content(chars, tokens, start, candidate)
+        {
+            return candidate;
+        }
+        // Still failing, or candidate is punctuation-only: keep shrinking as
+        // long as a content-bearing shorter prefix remains.
+        if candidate > start && range_has_content(chars, tokens, start, candidate) {
+            end = candidate;
+            continue;
+        }
+        break;
+    }
+    // Last resort: single leading token, even if it still breaches CPS.
+    start
 }
 
 /// Pick the split point within `[start, end]` for a sentence that is too long
@@ -313,8 +380,14 @@ fn merge_orphan_tails(
             let word_count = last - first + 1;
             let prev_ends_sentence = ends_sentence(chars, &tokens[prev_last]);
             let zero_duration = tokens[last].end <= tokens[first].start;
+            // Do not re-glue cues the packer split on a deliberate pause:
+            // that cut is intentional speech rhythm, not an accidental orphan.
+            // Zero-duration forced-aligner repairs still merge (gap <= 0).
+            let pause_between =
+                !zero_duration && (tokens[first].start - tokens[prev_last].end) >= MIN_PAUSE_GAP_S;
             if word_count <= ORPHAN_MAX_WORDS
                 && (zero_duration || !prev_ends_sentence)
+                && !pause_between
                 && fits(chars, tokens, prev_first, last, limits, MAX_CUE_SECONDS)
             {
                 *merged.last_mut().unwrap() = (prev_first, last);
@@ -814,25 +887,132 @@ mod tests {
 
     #[test]
     fn merges_trailing_orphan_into_previous_cue() {
-        // A long clause followed by a dangling two-word tail of the same
-        // sentence: the tail must not become its own cue.
+        // Duration forces a cut that leaves a dangling two-word tail of the
+        // same sentence. Inter-word gaps stay below MIN_PAUSE_GAP_S so the
+        // orphan merge is allowed (pause-split cues must not be re-glued).
         let words = vec![
-            word("the", 0.0, 0.3),
-            word("quick", 0.5, 0.9),
-            word("brown", 1.2, 1.6),
-            word("fox", 2.0, 2.4),
-            word("jumps,", 3.0, 3.4),
-            word("over", 5.6, 5.9),
-            word("it", 6.0, 6.2),
+            word("alpha", 0.0, 0.5),
+            word("bravo", 0.6, 1.1),
+            word("charlie", 1.2, 1.7),
+            word("delta", 1.8, 2.3),
+            word("echo", 2.4, 2.9),
+            word("foxtrot", 3.0, 3.5),
+            word("golf", 3.6, 4.1),
+            word("hotel", 4.2, 4.7),
+            word("india", 4.8, 5.3),
+            word("juliet", 5.4, 5.9),
+            // 0.30s gap (< MIN_PAUSE_GAP_S) is the widest, so choose_cut lands
+            // here; the remaining two words are an orphan tail.
+            word("kilo", 6.2, 6.5),
+            word("lima", 6.55, 6.8),
         ];
-        let text = "the quick brown fox jumps, over it";
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
         let cues = segment_into_cues(segment(text, words));
-        // "over it" (2 words) would orphan after the clause cut; it is merged
-        // back so no cue is a lone 1-2 word tail.
         assert!(
             cues.last().map(|c| c.words.len()).unwrap_or(0) > ORPHAN_MAX_WORDS || cues.len() == 1,
             "orphan tail was not merged: {cues:?}"
         );
+    }
+
+    #[test]
+    fn splits_on_mid_segment_pause_even_when_under_caps() {
+        // Deliberate 0.5s+ pause in the middle of a short, under-budget run:
+        // the packer must cut there even though total duration < TARGET and
+        // the char budget is nowhere near full.
+        let text = "hello there friend today";
+        let words = vec![
+            word("hello", 0.0, 0.3),
+            word("there", 0.4, 0.7),
+            // 0.55s pause (>= MIN_PAUSE_GAP_S) between "there" and "friend".
+            word("friend", 1.25, 1.55),
+            word("today", 1.65, 1.95),
+        ];
+        let cues = segment_into_cues(segment(text, words));
+        assert!(
+            cues.len() >= 2,
+            "mid-segment pause must produce >=2 cues: {cues:?}"
+        );
+        assert!(
+            cues[0].text.contains("there"),
+            "first cue should end at or before the pause: {cues:?}"
+        );
+        assert!(
+            cues.iter().any(|c| c.text.contains("friend")),
+            "post-pause words must remain: {cues:?}"
+        );
+        // The cut lands on the pause: first cue ends at "there", second starts
+        // at "friend" (no re-merge across the deliberate gap).
+        assert!(
+            cues[0].text.ends_with("there")
+                || cues[0].words.last().map(|w| w.word.as_str()) == Some("there"),
+            "pause cut should end the first cue at 'there': {cues:?}"
+        );
+    }
+
+    #[test]
+    fn splits_high_cps_multi_token_range() {
+        // Dense multi-token burst: many content chars packed into a short
+        // window so the whole run exceeds LATIN_MAX_CPS. Each emitted cue must
+        // satisfy the CPS cap (multi-token breaches must not pass silently).
+        let tokens = [
+            "abcdefghij", // 10 chars
+            "klmnopqrst", // 10
+            "uvwxyzabcd", // 10
+            "efghijklmn", // 10
+            "opqrstuvwx", // 10
+        ];
+        // Five 10-char words over 1.0s total -> 50 chars / 1.0s = 50 CPS >> 21.
+        let words = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let start = i as f32 * 0.2;
+                word(t, start, start + 0.15)
+            })
+            .collect::<Vec<_>>();
+        let text = tokens.join(" ");
+        let cues = segment_into_cues(segment(&text, words));
+        assert!(
+            cues.len() >= 2,
+            "high-CPS multi-token run must split: {cues:?}"
+        );
+        for cue in &cues {
+            let duration = cue.end - cue.start;
+            if duration <= 1e-3 {
+                continue;
+            }
+            let content = cue.text.chars().filter(|c| char_has_content(*c)).count();
+            let cps = content as f32 / duration;
+            // Multi-token cues must honour the CPS cap. A single unsplittable
+            // word token may still exceed it; those are accepted with the
+            // enforce_range_fits single-token escape.
+            if cue.words.len() > 1 {
+                assert!(
+                    cps <= LATIN_MAX_CPS + 1e-3,
+                    "multi-token cue CPS {cps} exceeds cap: {cue:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn does_not_merge_orphan_across_deliberate_pause() {
+        // Pause-split cues of orphan length must stay split; merge_orphan_tails
+        // must not glue them back across gap >= MIN_PAUSE_GAP_S.
+        let text = "hello world";
+        let words = vec![
+            word("hello", 0.0, 0.3),
+            // 0.5s pause.
+            word("world", 0.8, 1.1),
+        ];
+        let cues = segment_into_cues(segment(text, words));
+        assert_eq!(
+            cues.len(),
+            2,
+            "pause between two words must keep two cues: {cues:?}"
+        );
+        assert_eq!(cues[0].text, "hello");
+        assert_eq!(cues[1].text, "world");
     }
 
     #[test]
