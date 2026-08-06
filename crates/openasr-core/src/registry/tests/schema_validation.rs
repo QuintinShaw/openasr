@@ -219,6 +219,7 @@ fn bundled_registry_ordering_is_deterministic() {
         vec![
             "qwen3-asr-0.6b",
             "cohere-transcribe-03-2026",
+            "diarizen-large-s80-v2",
             "dolphin-base",
             "dolphin-cn-dialect-base",
             "dolphin-cn-dialect-small",
@@ -310,6 +311,7 @@ fn bundled_catalog_public_ids_match_current_signed_release_projection() {
         public_ids,
         vec![
             "cohere-transcribe-03-2026",
+            "diarizen-large-s80-v2",
             "dolphin-base",
             "dolphin-cn-dialect-base",
             "dolphin-cn-dialect-small",
@@ -409,6 +411,10 @@ fn bundled_catalog_declares_speaker_diarization_capability_packs() {
     assert_eq!(
         pack_roles,
         vec![
+            (
+                "diarizen-large-s80-v2",
+                CatalogCapabilityRole::SpeakerSegmenter
+            ),
             (
                 "pyannote-segmentation-3.0",
                 CatalogCapabilityRole::SpeakerSegmenter
