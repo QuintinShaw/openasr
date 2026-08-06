@@ -19,11 +19,9 @@ use super::contract::{
     SpeakerTurn, TimeRange,
 };
 use super::embed::{EmbedError, SpeakerEmbedder};
-#[cfg(test)]
-use super::segment::SegmenterProvider;
 use super::segment::{
     ActivityFrameClock, LocalActivity, LocalActivityWindow, PolicyResolvedSegmenterRuntime,
-    PreparedSelectedSegmenter, SegmentError, SegmenterWorkingSetGeometry,
+    PreparedSelectedSegmenter, SegmentError, SegmenterProvider, SegmenterWorkingSetGeometry,
     segmenter_working_set_geometry,
 };
 use crate::NativeExecutionServices;
@@ -375,6 +373,12 @@ impl PreparedExternalDiarizer {
     ) -> Result<Self, ExternalDiarizationError> {
         let segmenter = super::segment::prepare_segmenter(preference)?;
         Ok(Self { segmenter })
+    }
+
+    /// Provider selected by prepare (DiariZen vs Segmentation3_0). Used for
+    /// honest progress-plan weights after Auto resolution.
+    pub(crate) fn segmenter_provider(&self) -> SegmenterProvider {
+        self.segmenter.provider
     }
 
     #[cfg(test)]

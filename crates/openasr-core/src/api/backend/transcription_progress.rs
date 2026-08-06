@@ -266,6 +266,8 @@ impl ProgressPlan {
         });
 
         if input.external_diarize {
+            // Prefer the resolved segmenter weight. `Auto` is only a provisional
+            // stand-in until prepare pins DiariZen vs Segmentation3_0.
             let rtf = match input.segmenter {
                 ProgressSegmenterKind::DiariZen => {
                     if accelerated {
@@ -288,16 +290,21 @@ impl ProgressPlan {
             });
         }
 
-        if input.voice_id {
-            // ReDimNet identity windows / batches after (or instead of) external
-            // diarize -- in-decoder identity still pays this after decode, but
-            // the plan places it pre-decode for the external path where it
-            // actually runs; for in-decoder the same weight is kept as a
-            // post-decode identify stage via the same flag.
+        // Identity stage order matches the real pipeline:
+        // - external Voice ID: Identify runs on the speaker timeline before decode
+        // - in-decoder Voice ID: Identify runs after decode on assembled scopes
+        let identify_cost = if input.voice_id {
             let rtf = if accelerated { 0.04 } else { 0.08 };
+            Some(0.10 + duration * rtf)
+        } else {
+            None
+        };
+        if let Some(cost) = identify_cost
+            && input.external_diarize
+        {
             stages.push(PlannedStage {
                 stage: TranscriptionStage::IdentifySpeakers,
-                estimated_cost: 0.10 + duration * rtf,
+                estimated_cost: cost,
             });
         }
 
@@ -308,6 +315,15 @@ impl ProgressPlan {
             stage: TranscriptionStage::Decode,
             estimated_cost: 0.20 + duration * decode_rtf,
         });
+
+        if let Some(cost) = identify_cost
+            && !input.external_diarize
+        {
+            stages.push(PlannedStage {
+                stage: TranscriptionStage::IdentifySpeakers,
+                estimated_cost: cost,
+            });
+        }
 
         if input.punctuate {
             stages.push(PlannedStage {
@@ -410,8 +426,10 @@ pub fn duration_weighted_fraction(completed_duration_s: f64, total_duration_s: f
 
 struct ProgressState {
     plan: ProgressPlan,
-    /// Costs of stages fully completed (strict prefix of the plan).
-    completed_stage_costs: f64,
+    /// Stages that were entered and fully completed. Never includes a stage
+    /// the pipeline has not actually run -- `enter_stage` must not invent
+    /// completion for an unentered plan prefix.
+    completed_stages: Vec<TranscriptionStage>,
     /// Index of the current stage in `plan.stages`, if any has been entered.
     current_index: Option<usize>,
     stage_fraction: Option<f32>,
@@ -426,7 +444,7 @@ impl ProgressState {
     fn new(plan: ProgressPlan) -> Self {
         Self {
             plan,
-            completed_stage_costs: 0.0,
+            completed_stages: Vec::new(),
             current_index: None,
             stage_fraction: None,
             completed_units: None,
@@ -449,6 +467,21 @@ impl ProgressState {
             .unwrap_or(0.0)
     }
 
+    /// Sum of planned costs for stages that actually completed. Stages that
+    /// left the plan (or were never in it) contribute zero.
+    fn completed_stage_costs(&self) -> f64 {
+        self.completed_stages
+            .iter()
+            .filter_map(|stage| self.plan.cost_of(*stage))
+            .sum()
+    }
+
+    fn mark_completed(&mut self, stage: TranscriptionStage) {
+        if !self.completed_stages.contains(&stage) {
+            self.completed_stages.push(stage);
+        }
+    }
+
     fn snapshot(&self) -> NativeTranscriptionProgress {
         let stage = self.current_stage();
         NativeTranscriptionProgress::new(
@@ -462,19 +495,30 @@ impl ProgressState {
     }
 
     fn recompute_overall(&mut self) {
-        let next = compute_overall_fraction(
-            &self.plan,
-            self.completed_stage_costs,
-            self.current_stage_cost(),
-            self.stage_fraction,
-        );
+        // When the open stage is already fully complete it lives in
+        // `completed_stages`; do not also multiply its cost by stage_fraction.
+        let (completed, current_cost, stage_fraction) = if let Some(idx) = self.current_index {
+            let stage = self.plan.stages[idx].stage;
+            if self.completed_stages.contains(&stage) {
+                (self.completed_stage_costs(), 0.0, Some(0.0))
+            } else {
+                (
+                    self.completed_stage_costs(),
+                    self.current_stage_cost(),
+                    self.stage_fraction,
+                )
+            }
+        } else {
+            (self.completed_stage_costs(), 0.0, Some(0.0))
+        };
+        let next = compute_overall_fraction(&self.plan, completed, current_cost, stage_fraction);
         // Monotonic: a later report never moves the bar backward.
         self.overall_fraction = self.overall_fraction.max(next);
     }
 
-    /// Enter `stage` (must be in the plan). Completes any prior open stage and
-    /// treats skipped intermediate planned stages as completed so overall does
-    /// not stall on stages the pipeline jumped past.
+    /// Enter `stage` (must be in the plan). Completes the previously open stage
+    /// only -- never marks unentered plan-prefix stages as done (that would
+    /// fake overall progress when the pipeline order differs from a stale plan).
     fn enter_stage(&mut self, stage: TranscriptionStage, indeterminate: bool) {
         let Some(idx) = self.plan.stages.iter().position(|s| s.stage == stage) else {
             // Stage not in plan: ignore (caller bug); do not invent weight.
@@ -492,14 +536,14 @@ impl ProgressState {
             return;
         }
 
-        // Strict plan prefix before `idx` is completed work.
-        self.completed_stage_costs = self
-            .plan
-            .stages
-            .iter()
-            .take(idx)
-            .map(|s| s.estimated_cost)
-            .sum();
+        // Fold only the previously open stage into completed work.
+        if let Some(prev) = self.current_index
+            && prev != idx
+        {
+            let prev_stage = self.plan.stages[prev].stage;
+            self.mark_completed(prev_stage);
+        }
+
         self.current_index = Some(idx);
         self.stage_fraction = if indeterminate { None } else { Some(0.0) };
         self.indeterminate = indeterminate;
@@ -537,41 +581,50 @@ impl ProgressState {
     }
 
     fn complete_current(&mut self) {
-        if self.current_index.is_some() {
+        if let Some(idx) = self.current_index {
+            let stage = self.plan.stages[idx].stage;
             self.stage_fraction = Some(1.0);
             self.indeterminate = false;
+            self.mark_completed(stage);
             self.recompute_overall();
-            // Fold into completed and leave stage at full for snapshot.
-            if let Some(idx) = self.current_index {
-                self.completed_stage_costs = self
-                    .plan
-                    .stages
-                    .iter()
-                    .take(idx + 1)
-                    .map(|s| s.estimated_cost)
-                    .sum();
-            }
         }
     }
 
-    /// Replace the plan while preserving completed-prefix semantics for stages
-    /// already finished (matched by stage name). Used when audio duration or
-    /// late FA decision revises weights; overall stays monotonic via max.
+    /// Replace the plan while preserving stages already finished (matched by
+    /// name). Unentered stages are never force-completed just because they
+    /// appear before the open stage in the new order. Overall stays monotonic
+    /// via max in [`Self::recompute_overall`].
     fn replace_plan(&mut self, plan: ProgressPlan) {
-        let finished: Vec<TranscriptionStage> = if let Some(idx) = self.current_index {
-            // Stages strictly before current are finished; current is open.
-            self.plan.stages.iter().take(idx).map(|s| s.stage).collect()
-        } else {
-            Vec::new()
-        };
-        let open = self.current_stage();
+        let mut finished = self.completed_stages.clone();
+        // Stages strictly before current were advanced past and are finished
+        // even if complete_current was not called (enter of the next stage
+        // folds them). Reconstruct from the old plan index for safety.
+        if let Some(idx) = self.current_index {
+            for planned in self.plan.stages.iter().take(idx) {
+                if !finished.contains(&planned.stage) {
+                    finished.push(planned.stage);
+                }
+            }
+        }
+        let open = self.current_index.map(|i| self.plan.stages[i].stage);
         let open_frac = self.stage_fraction;
         let units = (self.completed_units, self.total_units);
         let detail = self.detail.clone();
         let prev_overall = self.overall_fraction;
+        let open_was_complete = open.is_some_and(|stage| finished.contains(&stage))
+            || matches!(open_frac, Some(f) if f >= 1.0 - 1e-6);
 
         self.plan = plan;
-        self.completed_stage_costs = 0.0;
+        self.completed_stages = finished
+            .into_iter()
+            .filter(|stage| self.plan.contains(*stage))
+            .collect();
+        if open_was_complete
+            && let Some(stage) = open
+            && self.plan.contains(stage)
+        {
+            self.mark_completed(stage);
+        }
         self.current_index = None;
         self.stage_fraction = None;
         self.completed_units = None;
@@ -580,37 +633,23 @@ impl ProgressState {
         // overall kept for monotonic floor
         self.overall_fraction = prev_overall;
 
-        for stage in finished {
-            if let Some(idx) = self.plan.stages.iter().position(|s| s.stage == stage) {
-                // Count as completed even if order differs.
-                self.completed_stage_costs += self.plan.stages[idx].estimated_cost;
-            }
-        }
-        if self.plan.contains(open) {
+        if let Some(stage) = open
+            && self.plan.contains(stage)
+        {
             let idx = self
                 .plan
                 .stages
                 .iter()
-                .position(|s| s.stage == open)
+                .position(|s| s.stage == stage)
                 .expect("contains");
-            // completed should be sum of stages before open in new plan that
-            // were in finished, already accumulated; also add any new-plan
-            // stages before open that were finished by name... already done.
-            // Stages before open in new plan not in finished still need to be
-            // treated carefully: leave their cost out of completed (not yet
-            // run) OR if they appear before open, force-prefix complete.
-            // Force-prefix: anything before open index is considered done when
-            // re-entering open mid-run.
-            self.completed_stage_costs = self
-                .plan
-                .stages
-                .iter()
-                .take(idx)
-                .map(|s| s.estimated_cost)
-                .sum();
             self.current_index = Some(idx);
-            self.stage_fraction = open_frac;
-            self.indeterminate = open_frac.is_none();
+            if open_was_complete {
+                self.stage_fraction = Some(1.0);
+                self.indeterminate = false;
+            } else {
+                self.stage_fraction = open_frac;
+                self.indeterminate = open_frac.is_none();
+            }
             self.completed_units = units.0;
             self.total_units = units.1;
             self.detail = detail;
@@ -950,6 +989,91 @@ mod tests {
     }
 
     #[test]
+    fn plan_places_identity_after_decode_for_in_decoder_voice_id() {
+        let plan = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 60.0,
+            voice_id: true,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        let labels: Vec<_> = plan.stages().iter().map(|s| s.stage).collect();
+        assert!(!plan.contains(TranscriptionStage::Diarize));
+        let identify = labels
+            .iter()
+            .position(|s| *s == TranscriptionStage::IdentifySpeakers)
+            .unwrap();
+        let decode = labels
+            .iter()
+            .position(|s| *s == TranscriptionStage::Decode)
+            .unwrap();
+        assert!(
+            decode < identify,
+            "in-decoder identity must run after decode: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn plan_diarize_weight_uses_resolved_diarizen_segmenter() {
+        let auto = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 100.0,
+            voice_id: true,
+            external_diarize: true,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        let diarizen = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 100.0,
+            voice_id: true,
+            external_diarize: true,
+            segmenter: ProgressSegmenterKind::DiariZen,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        assert!(
+            diarizen.cost_of(TranscriptionStage::Diarize).unwrap()
+                > auto.cost_of(TranscriptionStage::Diarize).unwrap(),
+            "resolved DiariZen must weigh heavier than provisional Auto"
+        );
+    }
+
+    #[test]
+    fn plan_accelerated_backend_reduces_decode_cost() {
+        let cpu = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 100.0,
+            voice_id: false,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        let accel = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 100.0,
+            voice_id: false,
+            external_diarize: false,
+            segmenter: ProgressSegmenterKind::Auto,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::Accelerated,
+            persist: false,
+        });
+        assert!(
+            accel.cost_of(TranscriptionStage::Decode).unwrap()
+                < cpu.cost_of(TranscriptionStage::Decode).unwrap()
+        );
+    }
+
+    #[test]
     fn post_hoc_align_plan_has_no_decode_weight() {
         let plan = ProgressPlan::post_hoc_align(45.0, ProgressBackendClass::Accelerated);
         assert!(plan.contains(TranscriptionStage::Align));
@@ -959,7 +1083,64 @@ mod tests {
     }
 
     #[test]
+    fn enter_stage_does_not_complete_unentered_plan_prefix() {
+        // Stale plan with Identify before Decode (external-style). Jumping to
+        // Decode must not mark Identify complete -- that stage never ran.
+        let plan = ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s: 30.0,
+            voice_id: true,
+            external_diarize: true,
+            segmenter: ProgressSegmenterKind::Segmentation3_0,
+            punctuate: false,
+            align: false,
+            backend: ProgressBackendClass::AutoOrCpu,
+            persist: false,
+        });
+        let identify_cost = plan.cost_of(TranscriptionStage::IdentifySpeakers).unwrap();
+        let load_cost = plan.cost_of(TranscriptionStage::LoadModel).unwrap();
+        let prepare_cost = plan.cost_of(TranscriptionStage::Prepare).unwrap();
+        let diarize_cost = plan.cost_of(TranscriptionStage::Diarize).unwrap();
+        let total = plan.total_cost();
+
+        let mut state = ProgressState::new(plan);
+        state.enter_stage(TranscriptionStage::LoadModel, false);
+        state.complete_current();
+        state.enter_stage(TranscriptionStage::Prepare, false);
+        state.complete_current();
+        state.enter_stage(TranscriptionStage::Diarize, false);
+        state.complete_current();
+        // Skip IdentifySpeakers -- jump straight to Decode (the InDecoder bug).
+        state.enter_stage(TranscriptionStage::Decode, false);
+        state.recompute_overall();
+
+        let completed = state.completed_stage_costs();
+        assert!(
+            !state
+                .completed_stages
+                .contains(&TranscriptionStage::IdentifySpeakers),
+            "unentered IdentifySpeakers must not be marked complete"
+        );
+        assert!(
+            (completed - (load_cost + prepare_cost + diarize_cost)).abs() < 1e-9,
+            "completed costs must exclude skipped Identify: got {completed}"
+        );
+        // Overall must not include identify weight.
+        let expected_at_decode_start =
+            (load_cost + prepare_cost + diarize_cost) as f32 / total as f32;
+        assert!(
+            (state.overall_fraction - expected_at_decode_start).abs() < 1e-4,
+            "overall {} must not include unentered identify (expected ~{})",
+            state.overall_fraction,
+            expected_at_decode_start
+        );
+        // identify still in total so the skipped weight is honest remaining work
+        // until the plan is revised or Identify is entered later.
+        assert!(identify_cost > 0.0);
+    }
+
+    #[test]
     fn reporter_is_monotonic_and_clears_on_drop() {
+        let _serial = progress_registry_test_lock();
         let id = "progress-reporter-monotonic";
         assert_eq!(native_transcription_progress_for_id(id), None);
         {
@@ -1014,6 +1195,7 @@ mod tests {
 
     #[test]
     fn detached_reporter_never_publishes() {
+        let _serial = progress_registry_test_lock();
         let _handle = ProgressRegistryHandle::new(None);
         let reporter = ProgressReporter::install(None, plain_plan(10.0, false));
         reporter.enter_stage(TranscriptionStage::Decode);
@@ -1057,6 +1239,8 @@ mod tests {
 
     #[test]
     fn registry_evicts_oldest_at_capacity() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
         let ids: Vec<String> = (0..=PROGRESS_REGISTRY_CAPACITY)
             .map(|i| format!("cap-progress-{i}"))
             .collect();

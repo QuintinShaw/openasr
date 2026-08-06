@@ -83,13 +83,13 @@ struct CueToken {
 pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
     let chars: Vec<char> = segment.text.chars().collect();
     let (tokens, real_words) = build_tokens(&segment, &chars);
-    if tokens.len() < 2 {
-        return vec![segment];
-    }
     let limits = cue_limits(&chars);
+    if tokens.len() < 2 {
+        return vec![stretch_segment_display_for_cps(segment, &limits)];
+    }
     let ranges = pack_tokens(&chars, &tokens, limits);
     if ranges.len() <= 1 {
-        return vec![segment];
+        return vec![stretch_segment_display_for_cps(segment, &limits)];
     }
     let mut cues = Vec::with_capacity(ranges.len());
     for (first, last) in ranges {
@@ -101,7 +101,12 @@ pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
             continue;
         }
         let start = tokens[first].start.max(segment.start);
-        let end = tokens[last].end.max(start).min(segment.end.max(start));
+        // Acoustic end is clamped to the parent segment; CPS stretch below may
+        // extend display duration beyond the acoustic end so dense text stays
+        // readable. Text is never rewritten.
+        let acoustic_end = tokens[last].end.max(start).min(segment.end.max(start));
+        let content = content_char_count_in_range(&chars, &tokens, first, last);
+        let end = stretch_end_for_cps(start, acoustic_end, content, limits.max_cps);
         let words: Vec<WordTimestamp> = if real_words {
             segment.words[first..=last].to_vec()
         } else {
@@ -119,9 +124,32 @@ pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
         });
     }
     if cues.len() <= 1 {
-        return vec![segment];
+        return vec![stretch_segment_display_for_cps(segment, &limits)];
     }
     cues
+}
+
+/// Stretch a cue's display `end` so content reading speed stays at or under
+/// `max_cps`. Text is unchanged; multi-token packers still prefer splitting
+/// before this last-resort display stretch.
+fn stretch_end_for_cps(start: f32, end: f32, content_chars: usize, max_cps: f32) -> f32 {
+    if content_chars == 0 || max_cps <= 0.0 {
+        return end.max(start);
+    }
+    let min_duration = content_chars as f32 / max_cps;
+    end.max(start).max(start + min_duration)
+}
+
+/// Apply CPS display stretch to a single unsplit segment (one token, or a
+/// pack that could not cut). Preserves text and speaker fields.
+fn stretch_segment_display_for_cps(mut segment: Segment, limits: &CueLimits) -> Segment {
+    let content = segment
+        .text
+        .chars()
+        .filter(|c| char_has_content(*c))
+        .count();
+    segment.end = stretch_end_for_cps(segment.start, segment.end, content, limits.max_cps);
+    segment
 }
 
 /// Build the token stream for a segment. Returns `(tokens, real_words)` where
@@ -289,9 +317,9 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(u
 /// The grow loop already refuses to *add* a token that would overflow, but a
 /// subsequent natural cut (pause / clause / widest gap) can shrink duration
 /// faster than content and raise CPS above the cap. Shrink until the range
-/// fits. A single token that still fails is retained: real-word tokens are
-/// not character-split here, and synthesised CJK is already one character per
-/// token so a lone ideograph is almost always within budget.
+/// fits. A single token that still fails is retained for emission; display
+/// duration is stretched later via [`stretch_end_for_cps`] so reading speed
+/// stays within `max_cps` without rewriting text.
 fn enforce_range_fits(
     chars: &[char],
     tokens: &[CueToken],
@@ -303,7 +331,7 @@ fn enforce_range_fits(
         return end;
     }
     if start >= end {
-        // Physically unsplittable single token; keep it rather than drop text.
+        // Physically unsplittable single token; keep it (CPS stretch at emit).
         return end;
     }
     // Prefer a natural cut inside the failing window when that sub-range fits.
@@ -328,7 +356,7 @@ fn enforce_range_fits(
         }
         break;
     }
-    // Last resort: single leading token, even if it still breaches CPS.
+    // Last resort: single leading token; emit-time stretch enforces CPS.
     start
 }
 
@@ -953,7 +981,8 @@ mod tests {
     fn splits_high_cps_multi_token_range() {
         // Dense multi-token burst: many content chars packed into a short
         // window so the whole run exceeds LATIN_MAX_CPS. Each emitted cue must
-        // satisfy the CPS cap (multi-token breaches must not pass silently).
+        // satisfy the CPS cap (multi-token breaches must not pass silently;
+        // there is no skip exemption after split + display stretch).
         let tokens = [
             "abcdefghij", // 10 chars
             "klmnopqrst", // 10
@@ -978,21 +1007,40 @@ mod tests {
         );
         for cue in &cues {
             let duration = cue.end - cue.start;
-            if duration <= 1e-3 {
-                continue;
-            }
+            assert!(
+                duration > 1e-3,
+                "cue must have positive display duration: {cue:?}"
+            );
             let content = cue.text.chars().filter(|c| char_has_content(*c)).count();
             let cps = content as f32 / duration;
-            // Multi-token cues must honour the CPS cap. A single unsplittable
-            // word token may still exceed it; those are accepted with the
-            // enforce_range_fits single-token escape.
-            if cue.words.len() > 1 {
-                assert!(
-                    cps <= LATIN_MAX_CPS + 1e-3,
-                    "multi-token cue CPS {cps} exceeds cap: {cue:?}"
-                );
-            }
+            assert!(
+                cps <= LATIN_MAX_CPS + 1e-3,
+                "cue CPS {cps} exceeds cap (no skip exemption): {cue:?}"
+            );
         }
+    }
+
+    #[test]
+    fn stretches_single_token_high_cps_display_end() {
+        // One dense word on a short acoustic window: cannot split, so display
+        // end must stretch to content/max_cps while text stays identical.
+        let text = "abcdefghijabcdefghijabcdefghij"; // 30 content chars
+        let words = vec![word(text, 0.0, 0.5)]; // 30/0.5 = 60 CPS >> 21
+        let cues = segment_into_cues(segment(text, words));
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, text);
+        let content = text.chars().filter(|c| char_has_content(*c)).count();
+        let min_end = cues[0].start + content as f32 / LATIN_MAX_CPS;
+        assert!(
+            cues[0].end + 1e-4 >= min_end,
+            "single-token high CPS must stretch end >= {min_end}, got {}",
+            cues[0].end
+        );
+        let cps = content as f32 / (cues[0].end - cues[0].start);
+        assert!(
+            cps <= LATIN_MAX_CPS + 1e-3,
+            "stretched single-token CPS {cps} still exceeds cap"
+        );
     }
 
     #[test]

@@ -264,6 +264,29 @@ fn progress_backend_class(intent: &ExecutionIntent) -> ProgressBackendClass {
     }
 }
 
+/// Map the resolved ggml backend (after candidate selection) onto progress
+/// weight class. Prefer this over intent-only classification once the runtime
+/// is known so Auto->Metal/GPU pays accelerated decode weights.
+fn progress_backend_class_for_resolved(backend: GgmlCpuGraphBackend) -> ProgressBackendClass {
+    match backend {
+        GgmlCpuGraphBackend::Cpu => ProgressBackendClass::AutoOrCpu,
+        GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => ProgressBackendClass::Accelerated,
+    }
+}
+
+/// Map the prepared external segmenter provider onto plan weights. Provisional
+/// `Auto` preference is replaced once prepare pins DiariZen vs Segmentation3_0.
+fn progress_segmenter_kind_for_provider(
+    provider: crate::diarize::segment::SegmenterProvider,
+) -> ProgressSegmenterKind {
+    match provider {
+        crate::diarize::segment::SegmenterProvider::DiariZen => ProgressSegmenterKind::DiariZen,
+        crate::diarize::segment::SegmenterProvider::Segmentation3_0 => {
+            ProgressSegmenterKind::Segmentation3_0
+        }
+    }
+}
+
 /// Run one `run_dispatch_once` with a per-token progress sink wired to the
 /// decode stage window for `slice_samples`, then `complete_slice` on success.
 #[allow(clippy::too_many_arguments)]
@@ -897,6 +920,9 @@ struct NativeTranscriptionOutcome {
     prepared_audio: PcmBuffer,
     emits_punctuation: Option<bool>,
     speaker_finalization: SpeakerFinalizationContext,
+    /// Resolved progress weights (actual backend + segmenter after prepare).
+    progress_backend: ProgressBackendClass,
+    progress_segmenter: ProgressSegmenterKind,
 }
 
 struct SpeakerFinalizationContext {
@@ -1127,6 +1153,8 @@ fn run_native_transcription_fallible_with_input(
         prepared_audio,
         emits_punctuation,
         speaker_finalization,
+        progress_backend: backend_class,
+        progress_segmenter: segmenter_kind,
     } = run_native_transcription_impl(
         request,
         execution_services,
@@ -1148,8 +1176,12 @@ fn run_native_transcription_fallible_with_input(
     // overall weights match the stages that will actually run. Align weight
     // stays if `may_align`; if the decision later skips align, project simply
     // finishes the remaining bar without inventing intermediate ticks.
+    // Backend class and segmenter kind are the values resolved inside impl
+    // (actual accelerated device + prepared DiariZen/pyannote), not the
+    // provisional request preference / intent-only Auto mapping.
     let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
     let external_diarize = speaker_finalization.plan == SpeakerPlan::External;
+    let voice_id = speaker_finalization.plan != SpeakerPlan::Off;
     progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
         audio_duration_s,
         voice_id,
@@ -1927,11 +1959,12 @@ fn run_native_transcription_impl(
         speaker_plan
     };
     // Rebuild plan with known duration / speaker path so overall weights match
-    // the remaining real stages (diarize before decode when external).
+    // the remaining real stages (external: diarize+identify before decode;
+    // in-decoder: identify after decode).
     let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
-    let backend_class = progress_backend_class(&request_execution_intent);
+    let mut backend_class = progress_backend_class(&request_execution_intent);
     let external_diarize = speaker_plan == SpeakerPlan::External;
-    let segmenter_kind = ProgressSegmenterKind::from_preference(request.voice_id_segmenter);
+    let mut segmenter_kind = ProgressSegmenterKind::from_preference(request.voice_id_segmenter);
     progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
         audio_duration_s,
         voice_id: speaker_plan != SpeakerPlan::Off,
@@ -1964,6 +1997,24 @@ fn run_native_transcription_impl(
     } else {
         None
     };
+    // Once prepare pins the real segmenter, rebuild weights (Auto may have
+    // selected DiariZen, which is heavier than the provisional Auto profile).
+    if let Some(ref prepared) = external_diarizer_plan {
+        let resolved = progress_segmenter_kind_for_provider(prepared.segmenter_provider());
+        if resolved != segmenter_kind {
+            segmenter_kind = resolved;
+            progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+                audio_duration_s,
+                voice_id: speaker_plan != SpeakerPlan::Off,
+                external_diarize,
+                segmenter: segmenter_kind,
+                punctuate: false,
+                align: request_may_need_align(&request),
+                backend: backend_class,
+                persist: false,
+            }));
+        }
+    }
 
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
     let speaker_runtime = if speaker_plan == SpeakerPlan::Off {
@@ -2109,6 +2160,23 @@ fn run_native_transcription_impl(
         .expect("execution policy plans are non-empty");
     let resolved_runtime_for_request =
         resolved_runtime_for_candidate(primary_candidate, auto_gpu_policy);
+    // Actual device class after candidate selection: Auto may land on Metal/GPU
+    // even though the intent-only provisional plan used AutoOrCpu weights.
+    let resolved_backend_class =
+        progress_backend_class_for_resolved(resolved_runtime_for_request.backend());
+    if resolved_backend_class != backend_class {
+        backend_class = resolved_backend_class;
+        progress.replace_plan(ProgressPlan::build(ProgressPlanInput {
+            audio_duration_s,
+            voice_id: speaker_plan != SpeakerPlan::Off,
+            external_diarize,
+            segmenter: segmenter_kind,
+            punctuate: false,
+            align: request_may_need_align(&request),
+            backend: backend_class,
+            persist: false,
+        }));
+    }
     // Per-request diagnostics line (source/model/quant/backend/audio shape) --
     // logged once here, after model resolution and audio prep have both
     // succeeded and the backend label is resolvable, and before decode
@@ -2235,6 +2303,8 @@ fn run_native_transcription_impl(
                     scope_by_segment: Vec::new(),
                     strip_forced_word_timestamps,
                 },
+                progress_backend: backend_class,
+                progress_segmenter: segmenter_kind,
             });
         }
         if has_processed_audio || plan.slices.len() > 1 {
@@ -2578,6 +2648,8 @@ fn run_native_transcription_impl(
                         scope_by_segment: Vec::new(),
                         strip_forced_word_timestamps,
                     },
+                    progress_backend: backend_class,
+                    progress_segmenter: segmenter_kind,
                 });
             }
             let transcription = prepare_native_transcription(
@@ -2598,6 +2670,8 @@ fn run_native_transcription_impl(
                     scope_by_segment: speaker_scope_by_segment,
                     strip_forced_word_timestamps,
                 },
+                progress_backend: backend_class,
+                progress_segmenter: segmenter_kind,
             });
         }
         longform_metadata = Some(build_longform_metadata(
@@ -2680,6 +2754,8 @@ fn run_native_transcription_impl(
             scope_by_segment: Vec::new(),
             strip_forced_word_timestamps,
         },
+        progress_backend: backend_class,
+        progress_segmenter: segmenter_kind,
     })
 }
 
@@ -2771,7 +2847,16 @@ fn finalize_native_transcription(
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
             // acoustic evidence, stitches matching voices, and names enrolled
-            // people.
+            // people. Runs after decode (plan order places IdentifySpeakers
+            // post-decode for this path) with real batch sub-progress.
+            progress.enter_stage(TranscriptionStage::IdentifySpeakers);
+            let identity_progress = progress.clone();
+            let _identity_progress_guard =
+                crate::diarize::voice_id::install_identity_batch_progress_sink(
+                    move |done, total| {
+                        identity_progress.report_units(done as u64, total.max(1) as u64);
+                    },
+                );
             let mut scopes = speaker_scopes_by_provenance(
                 &mut transcription.segments,
                 &speaker.scope_by_segment,
@@ -2790,6 +2875,7 @@ fn finalize_native_transcription(
                     &mut scopes,
                 )
                 .map_err(speaker_identity_error_to_backend)?;
+            progress.complete_stage();
         }
         SpeakerPlan::External => {
             // External identity was resolved directly from the canonical
@@ -4624,6 +4710,7 @@ mod tests {
 
     #[test]
     fn native_progress_is_monotonic_across_stages_and_clears() {
+        let _serial = progress_registry_test_lock();
         let id = "monotonic-phases";
         assert_eq!(native_transcription_progress_for_id(id), None);
         {
@@ -4645,20 +4732,25 @@ mod tests {
             assert!(decoded.overall_fraction >= mid.overall_fraction);
             assert!((decoded.stage_fraction.unwrap() - 1.0).abs() < 1e-5);
 
-            reporter.complete_stage_brief(TranscriptionStage::Project);
-            let projected = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(projected.phase, NativeTranscriptionPhase::Assemble);
-            assert!(projected.overall_fraction >= decoded.overall_fraction);
-
+            // Real pipeline order: Align before Project.
             reporter.enter_stage(TranscriptionStage::Align);
             let aligning = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(aligning.phase, NativeTranscriptionPhase::Align);
-            assert!(aligning.overall_fraction >= projected.overall_fraction);
+            assert!(aligning.overall_fraction >= decoded.overall_fraction);
+
+            reporter.report_fraction(0.5);
+            let align_mid = native_transcription_progress_for_id(id).unwrap();
+            assert!(align_mid.overall_fraction >= aligning.overall_fraction);
 
             // Lower stage report must not regress overall.
             reporter.report_fraction(0.1);
             let after = native_transcription_progress_for_id(id).unwrap();
-            assert_eq!(after.overall_fraction, aligning.overall_fraction);
+            assert_eq!(after.overall_fraction, align_mid.overall_fraction);
+
+            reporter.complete_stage_brief(TranscriptionStage::Project);
+            let projected = native_transcription_progress_for_id(id).unwrap();
+            assert_eq!(projected.phase, NativeTranscriptionPhase::Assemble);
+            assert!(projected.overall_fraction >= after.overall_fraction);
         }
         assert_eq!(native_transcription_progress_for_id(id), None);
     }
@@ -4666,6 +4758,7 @@ mod tests {
     #[test]
     fn native_progress_two_concurrent_requests_stay_independent_and_a_finishing_does_not_affect_b()
     {
+        let _serial = progress_registry_test_lock();
         let id_a = "concurrent-a";
         let id_b = "concurrent-b";
         assert_eq!(native_transcription_progress_for_id(id_a), None);
@@ -4710,6 +4803,7 @@ mod tests {
 
     #[test]
     fn native_progress_detached_request_never_publishes() {
+        let _serial = progress_registry_test_lock();
         let _handle = ProgressRegistryHandle::new(None);
         let reporter = ProgressReporter::install(None, test_plan(false));
         let decode = DecodeProgress::begin(reporter.clone(), 1000);
@@ -4723,6 +4817,7 @@ mod tests {
 
     #[test]
     fn native_progress_sequential_runs_reset_start_and_clear() {
+        let _serial = progress_registry_test_lock();
         let id = "sequential-runs";
         assert_eq!(native_transcription_progress_for_id(id), None);
 
@@ -4887,6 +4982,7 @@ mod tests {
     #[test]
     fn slice_progress_window_places_slices_back_to_back_within_decode_stage() {
         // Windows are in stage-fraction space (0..=1 of decode), not overall.
+        let _serial = progress_registry_test_lock();
         let id = "slice-window-back-to-back";
         let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
         let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(false));
@@ -4904,6 +5000,7 @@ mod tests {
 
     #[test]
     fn slice_progress_window_is_the_full_decode_stage_for_a_single_slice_run() {
+        let _serial = progress_registry_test_lock();
         let id = "slice-window-single-slice";
         let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
         let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(true));
@@ -4930,6 +5027,7 @@ mod tests {
     /// installed slice window, monotonically.
     #[test]
     fn token_step_progress_sink_reports_monotonically_inside_its_window() {
+        let _serial = progress_registry_test_lock();
         let id = "token-step-sink-window";
         assert_eq!(native_transcription_progress_for_id(id), None);
 
