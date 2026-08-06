@@ -131,7 +131,7 @@ mod tests {
         }
         values.insert(
             "tokenizer.ggml.tokens".to_string(),
-            GgufMetadataValue::StringArray(tokens),
+            GgufMetadataValue::StringArray(tokens.clone()),
         );
         values.insert(
             "tokenizer.ggml.merges".to_string(),
@@ -139,6 +139,10 @@ mod tests {
             // appears anywhere in it): byte-level BPE then emits one token
             // per input byte, which is exactly what this fixture wants.
             GgufMetadataValue::StringArray(vec!["z z".to_string()]),
+        );
+        values.insert(
+            "mimo.llm.vocab_size".to_string(),
+            GgufMetadataValue::U32(tokens.len() as u32),
         );
         let metadata = GgufMetadata::from_values_for_test(values);
         let special = MimoSpecialTokens {

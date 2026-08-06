@@ -11,6 +11,7 @@ use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
+    validate_gpt2_bpe_table_admission,
 };
 use crate::models::oasr_metadata::{
     TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
@@ -57,45 +58,19 @@ impl FunasrNanoTokenizer {
             TOKENIZER_GGML_TOKENS_KEY,
             FUNASR_NANO_TOKENIZER_FAMILY,
         )?;
-        if tokens.is_empty() {
-            return Err(NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "Fun-ASR-Nano GGUF tokenizer key '{}' cannot be empty",
-                    TOKENIZER_GGML_TOKENS_KEY
-                ),
-            });
-        }
         let merges = required_metadata_string_array(
             metadata,
             TOKENIZER_GGML_MERGES_KEY,
             FUNASR_NANO_TOKENIZER_FAMILY,
         )?;
-        if merges.is_empty() {
-            return Err(NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "Fun-ASR-Nano GGUF tokenizer key '{}' cannot be empty",
-                    TOKENIZER_GGML_MERGES_KEY
-                ),
-            });
-        }
-
         let vocab_size =
             required_metadata_u32(metadata, LLM_VOCAB_SIZE_KEY, FUNASR_NANO_TOKENIZER_FAMILY)?;
-        let token_count =
-            u32::try_from(tokens.len()).map_err(|_| NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "Fun-ASR-Nano GGUF tokenizer token count {} exceeds u32",
-                    tokens.len()
-                ),
-            })?;
-        if token_count != vocab_size {
-            return Err(NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "Fun-ASR-Nano GGUF tokenizer token count {} does not match '{}'={}",
-                    token_count, LLM_VOCAB_SIZE_KEY, vocab_size
-                ),
-            });
-        }
+        validate_gpt2_bpe_table_admission(
+            tokens,
+            merges,
+            Some(vocab_size),
+            FUNASR_NANO_TOKENIZER_FAMILY,
+        )?;
 
         let chatml_im_start_token_id = required_metadata_u32(
             metadata,

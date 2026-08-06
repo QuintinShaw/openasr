@@ -2,6 +2,70 @@ use std::collections::BTreeMap;
 
 use crate::NativeAsrError;
 
+/// Hard ceilings for GPT-2 BPE tables admitted from untrusted pack metadata.
+/// Production Qwen-family vocabs sit near 150k tokens / ~150k merges; these
+/// bounds keep malicious packs from allocating unbounded token/merge tables
+/// before any model graph runs.
+pub(crate) const GPT2_BPE_MAX_VOCAB_TOKENS: usize = 1_000_000;
+/// Merges are typically slightly under the vocab size for byte-level BPE, but
+/// allow headroom without approaching allocator exhaustion.
+pub(crate) const GPT2_BPE_MAX_MERGES: usize = 2_000_000;
+
+/// Fail-closed admission for GPT-2 BPE `tokens`/`merges` arrays baked into a
+/// pack. Empty tables, counts above the architecture ceilings, and (when
+/// `declared_vocab_size` is supplied) a token-count / vocab mismatch all reject
+/// before the caller builds reverse maps or merge ranks.
+pub(crate) fn validate_gpt2_bpe_table_admission(
+    tokens: &[String],
+    merges: &[String],
+    declared_vocab_size: Option<u32>,
+    family: &str,
+) -> Result<(), NativeAsrError> {
+    if tokens.is_empty() {
+        return Err(NativeAsrError::UnsupportedModelPack {
+            reason: format!("{family} GGUF tokenizer tokens cannot be empty"),
+        });
+    }
+    if merges.is_empty() {
+        return Err(NativeAsrError::UnsupportedModelPack {
+            reason: format!("{family} GGUF tokenizer merges cannot be empty"),
+        });
+    }
+    if tokens.len() > GPT2_BPE_MAX_VOCAB_TOKENS {
+        return Err(NativeAsrError::UnsupportedModelPack {
+            reason: format!(
+                "{family} GGUF tokenizer token count {} exceeds ceiling {GPT2_BPE_MAX_VOCAB_TOKENS}",
+                tokens.len()
+            ),
+        });
+    }
+    if merges.len() > GPT2_BPE_MAX_MERGES {
+        return Err(NativeAsrError::UnsupportedModelPack {
+            reason: format!(
+                "{family} GGUF tokenizer merge count {} exceeds ceiling {GPT2_BPE_MAX_MERGES}",
+                merges.len()
+            ),
+        });
+    }
+    if let Some(vocab_size) = declared_vocab_size {
+        let token_count =
+            u32::try_from(tokens.len()).map_err(|_| NativeAsrError::UnsupportedModelPack {
+                reason: format!(
+                    "{family} GGUF tokenizer token count {} exceeds u32",
+                    tokens.len()
+                ),
+            })?;
+        if token_count != vocab_size {
+            return Err(NativeAsrError::UnsupportedModelPack {
+                reason: format!(
+                    "{family} GGUF tokenizer token count {token_count} does not match declared vocab_size {vocab_size}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_merge_rank(merges: &[String]) -> BTreeMap<String, usize> {
     merges
         .iter()

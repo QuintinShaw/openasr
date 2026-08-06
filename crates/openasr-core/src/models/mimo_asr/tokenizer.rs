@@ -13,10 +13,11 @@ use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
+    validate_gpt2_bpe_table_admission,
 };
 use crate::models::oasr_metadata::{
     TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
-    required_metadata_string, required_metadata_string_array,
+    required_metadata_string, required_metadata_string_array, required_metadata_u32,
 };
 use crate::models::phrase_bias_decode::{PhraseBiasTokenEncoder, encode_bpe_phrase_bias_variants};
 
@@ -139,25 +140,19 @@ impl MimoAsrTokenizer {
             TOKENIZER_GGML_TOKENS_KEY,
             MIMO_ASR_TOKENIZER_FAMILY,
         )?;
-        if tokens.is_empty() {
-            return Err(NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "mimo-asr GGUF tokenizer key '{TOKENIZER_GGML_TOKENS_KEY}' cannot be empty"
-                ),
-            });
-        }
         let merges = required_metadata_string_array(
             metadata,
             TOKENIZER_GGML_MERGES_KEY,
             MIMO_ASR_TOKENIZER_FAMILY,
         )?;
-        if merges.is_empty() {
-            return Err(NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "mimo-asr GGUF tokenizer key '{TOKENIZER_GGML_MERGES_KEY}' cannot be empty"
-                ),
-            });
-        }
+        let vocab_size =
+            required_metadata_u32(metadata, "mimo.llm.vocab_size", MIMO_ASR_TOKENIZER_FAMILY)?;
+        validate_gpt2_bpe_table_admission(
+            tokens,
+            merges,
+            Some(vocab_size),
+            MIMO_ASR_TOKENIZER_FAMILY,
+        )?;
 
         let id_to_token = tokens
             .iter()
@@ -314,6 +309,10 @@ mod tests {
                 "us e".to_string(),
                 "use r".to_string(),
             ]),
+        );
+        values.insert(
+            "mimo.llm.vocab_size".to_string(),
+            GgufMetadataValue::U32(14),
         );
         GgufMetadata::from_values_for_test(values)
     }
