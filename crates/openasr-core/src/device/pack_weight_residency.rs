@@ -474,7 +474,6 @@ mod tests {
         let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
             minimum_headroom_bytes: 0,
             maximum_owned_basis_points: 10_000,
-            ..DeviceMemoryPolicy::default()
         }));
         // Exactly one 3 GiB residency fits; two would exceed. Use 3 not 4 so the
         // arithmetic stays obvious under a full-ownership policy ceiling.
