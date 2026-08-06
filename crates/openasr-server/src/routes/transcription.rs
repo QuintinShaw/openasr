@@ -214,24 +214,9 @@ async fn parse_precise_timeline_multipart(
         }
     }
 
-    let audio_temp = audio_temp.ok_or_else(|| {
-        ApiError::BadRequest(
-            "Missing required form field: file (source audio for precise timeline refine)".into(),
-        )
-    })?;
+    let (audio_temp, body) =
+        finalize_precise_timeline_fields(audio_temp, transcript_json.as_deref())?;
     let audio_path = audio_temp.to_path_buf();
-    let transcript_raw = transcript_json.ok_or_else(|| {
-        ApiError::BadRequest(
-            "Missing required form field: transcript_json (finished transcript body)".into(),
-        )
-    })?;
-    let body: PreciseTimelineTranscriptBody = serde_json::from_str(&transcript_raw)
-        .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
-    if body.segments.is_empty() {
-        return Err(ApiError::BadRequest(
-            "transcript_json.segments must contain at least one timed segment".into(),
-        ));
-    }
     let mut transcription = body.into_transcription();
     if transcription.language.is_none() {
         transcription.language = language_hint.clone();
@@ -245,6 +230,88 @@ async fn parse_precise_timeline_multipart(
         keep_word_timestamps,
         execution_target,
     })
+}
+
+/// Validate required precise-timeline multipart fields after streaming them.
+/// Split out so missing-file / empty-segments paths are unit-testable without
+/// standing up a full axum Multipart request.
+fn finalize_precise_timeline_fields(
+    audio_temp: Option<tempfile::TempPath>,
+    transcript_json: Option<&str>,
+) -> Result<(tempfile::TempPath, PreciseTimelineTranscriptBody), ApiError> {
+    let audio_temp = audio_temp.ok_or_else(|| {
+        ApiError::BadRequest(
+            "Missing required form field: file (source audio for precise timeline refine)".into(),
+        )
+    })?;
+    let transcript_raw = transcript_json.ok_or_else(|| {
+        ApiError::BadRequest(
+            "Missing required form field: transcript_json (finished transcript body)".into(),
+        )
+    })?;
+    let body: PreciseTimelineTranscriptBody = serde_json::from_str(transcript_raw)
+        .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
+    if body.segments.is_empty() {
+        return Err(ApiError::BadRequest(
+            "transcript_json.segments must contain at least one timed segment".into(),
+        ));
+    }
+    Ok((audio_temp, body))
+}
+
+#[cfg(test)]
+mod precise_timeline_parse_tests {
+    use super::{ApiError, finalize_precise_timeline_fields};
+
+    fn sample_transcript_json() -> String {
+        serde_json::json!({
+            "text": "hello",
+            "segments": [{
+                "start": 0.0,
+                "end": 1.0,
+                "text": "hello",
+                "words": []
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn missing_file_is_bad_request() {
+        let err = finalize_precise_timeline_fields(None, Some(&sample_transcript_json()))
+            .expect_err("file is required");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("file")));
+    }
+
+    #[test]
+    fn missing_transcript_json_is_bad_request() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let err = finalize_precise_timeline_fields(Some(audio), None)
+            .expect_err("transcript_json is required");
+        assert!(
+            matches!(err, ApiError::BadRequest(message) if message.contains("transcript_json"))
+        );
+    }
+
+    #[test]
+    fn empty_segments_is_bad_request() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let body = r#"{"text":"","segments":[]}"#;
+        let err = finalize_precise_timeline_fields(Some(audio), Some(body))
+            .expect_err("empty segments must fail closed");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("segments")));
+    }
+
+    #[test]
+    fn valid_fields_parse() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let (temp, body) =
+            finalize_precise_timeline_fields(Some(audio), Some(&sample_transcript_json()))
+                .expect("valid multipart fields");
+        assert_eq!(body.text, "hello");
+        assert_eq!(body.segments.len(), 1);
+        assert!(temp.to_path_buf().exists() || !temp.to_path_buf().as_os_str().is_empty());
+    }
 }
 
 /// OpenAI-compatible `/v1/audio/translations`: always X->English translation.

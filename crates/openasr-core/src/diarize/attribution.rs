@@ -60,12 +60,30 @@ pub(crate) fn assign_speakers(
 }
 
 /// Whether projecting this transcript onto the timeline requires an independent
-/// word aligner. A coarse segment that intersects several speakers cannot be
-/// split faithfully from segment timestamps alone.
-pub(crate) fn requires_word_alignment(turns: &[SpeakerTurn], segments: &[Segment]) -> bool {
-    segments
-        .iter()
-        .any(|segment| segment.words.is_empty() && overlap_by_speaker(segment, turns).len() > 1)
+/// word aligner for External Voice ID multi-speaker text ownership.
+///
+/// A coarse segment that intersects several speakers cannot be split
+/// faithfully from segment timestamps alone. Non-empty but unreliable (sparse
+/// / wrong) word anchors are equally unsafe: `assign_speakers` would still
+/// split on bad midpoints. Single-speaker segments never force alignment for
+/// identity alone (identity is turn-timeline based); only multi-speaker text
+/// attribution needs reliable word anchors.
+///
+/// `word_anchors_reliable` is the result of
+/// [`crate::subtitle::validate_word_anchors`]; pass `true` only when the whole
+/// transcript already validates.
+pub(crate) fn requires_word_alignment(
+    turns: &[SpeakerTurn],
+    segments: &[Segment],
+    word_anchors_reliable: bool,
+) -> bool {
+    segments.iter().any(|segment| {
+        if overlap_by_speaker(segment, turns).len() <= 1 {
+            return false;
+        }
+        // empty_words_multi || (multi_speaker_overlap && unreliable anchors)
+        segment.words.is_empty() || !word_anchors_reliable
+    })
 }
 
 fn attribute_segment(
@@ -594,17 +612,50 @@ mod tests {
                 end_s: 2.4,
             }
         );
-        assert!(requires_word_alignment(&turns, &[seg(1.8, 2.4)]));
+        assert!(requires_word_alignment(&turns, &[seg(1.8, 2.4)], true));
+        assert!(requires_word_alignment(&turns, &[seg(1.8, 2.4)], false));
     }
 
     #[test]
     fn single_speaker_segments_do_not_require_alignment() {
         let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 4.0, 1)];
         let segments = vec![seg(0.0, 1.5), seg(2.5, 4.0)];
-        assert!(!requires_word_alignment(&turns, &segments));
+        // Even with unreliable global anchors, single-speaker coarse segments
+        // do not force FA for Voice ID identity (identity uses the turn timeline).
+        assert!(!requires_word_alignment(&turns, &segments, false));
+        assert!(!requires_word_alignment(&turns, &segments, true));
         let assigned = assign(&turns, segments, &BTreeMap::new());
         assert_eq!(assigned[0].speaker.as_deref(), Some("SPEAKER_00"));
         assert_eq!(assigned[1].speaker.as_deref(), Some("SPEAKER_01"));
+    }
+
+    #[test]
+    fn multi_speaker_with_unreliable_non_empty_words_requires_alignment() {
+        // Sparse / wrong anchors that still pass "non-empty" must not be used
+        // to split multi-speaker text ownership.
+        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 5.0, 1)];
+        let segment = worded_seg(
+            1.0,
+            3.0,
+            "hello there general kenobi",
+            vec![word("hello", 1.0, 1.3), word("kenobi", 2.7, 3.0)],
+        );
+        assert!(
+            requires_word_alignment(&turns, &[segment], false),
+            "unreliable anchors on multi-speaker overlap must force FA / fail-closed"
+        );
+    }
+
+    #[test]
+    fn multi_speaker_with_reliable_words_does_not_require_aligner() {
+        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 5.0, 1)];
+        let segment = worded_seg(
+            1.0,
+            3.0,
+            "hello there",
+            vec![word("hello", 1.0, 1.5), word("there", 2.2, 2.8)],
+        );
+        assert!(!requires_word_alignment(&turns, &[segment], true));
     }
 
     #[test]

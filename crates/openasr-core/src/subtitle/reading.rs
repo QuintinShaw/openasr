@@ -6,30 +6,83 @@
 //! single ASCII space between non-empty pieces (CJK segments that already
 //! abut without a space keep their original text, and the join only inserts a
 //! space when both sides carry content).
+//!
+//! ## V1 merge caps (tunable)
+//!
+//! Same-speaker merges stop when any of these soft limits would be exceeded,
+//! so a long monologue still breaks into readable manuscript paragraphs:
+//! - [`MAX_PARAGRAPH_SECONDS`]: wall-clock span of the merged paragraph
+//! - [`MAX_PARAGRAPH_CHARS`]: content characters in the merged text
+//! - [`MAX_PARAGRAPH_PIECES`]: number of original segments fused into one
+//!   paragraph (a rough sentence/clause count when the upstream ASR already
+//!   segmented at natural boundaries)
 
 use crate::api::backend::{Segment, WordTimestamp};
+
+/// Soft ceiling on merged paragraph duration (seconds). Tunable V1 constant.
+pub const MAX_PARAGRAPH_SECONDS: f32 = 45.0;
+/// Soft ceiling on merged paragraph content characters. Tunable V1 constant.
+pub const MAX_PARAGRAPH_CHARS: usize = 400;
+/// Soft ceiling on how many source segments fuse into one paragraph.
+pub const MAX_PARAGRAPH_PIECES: usize = 8;
 
 /// Merge consecutive same-speaker attributed segments into reading paragraphs.
 ///
 /// Speaker identity is compared on the resolved display label (`speaker`),
 /// falling back to `speaker_label` when `speaker` is absent, so anonymous and
 /// named turns do not accidentally fuse. Segments with no speaker identity
-/// only merge with adjacent segments that are also unattributed.
+/// only merge with adjacent segments that are also unattributed. Merges also
+/// stop when a V1 paragraph cap would be exceeded (see module docs).
 pub fn merge_reading_segments(segments: Vec<Segment>) -> Vec<Segment> {
     let mut paragraphs: Vec<Segment> = Vec::with_capacity(segments.len());
+    let mut piece_counts: Vec<usize> = Vec::with_capacity(segments.len());
     for segment in segments {
         if segment.text.trim().is_empty() && segment.words.is_empty() {
             continue;
         }
-        if let Some(last) = paragraphs.last_mut()
-            && same_speaker(last, &segment)
-        {
-            merge_into(last, segment);
-            continue;
+        if let Some(last) = paragraphs.last_mut() {
+            let pieces = *piece_counts.last().unwrap_or(&1);
+            if same_speaker(last, &segment) && can_merge(last, &segment, pieces) {
+                merge_into(last, segment);
+                *piece_counts.last_mut().unwrap() = pieces + 1;
+                continue;
+            }
         }
         paragraphs.push(segment);
+        piece_counts.push(1);
     }
     paragraphs
+}
+
+/// Whether fusing `next` into `target` would stay within the V1 paragraph caps.
+fn can_merge(target: &Segment, next: &Segment, pieces_in_target: usize) -> bool {
+    if pieces_in_target >= MAX_PARAGRAPH_PIECES {
+        return false;
+    }
+    let start = target.start.min(next.start);
+    let end = target.end.max(next.end);
+    if end - start > MAX_PARAGRAPH_SECONDS {
+        return false;
+    }
+    let merged_chars = estimate_merged_content_chars(&target.text, &next.text);
+    merged_chars <= MAX_PARAGRAPH_CHARS
+}
+
+fn estimate_merged_content_chars(left: &str, right: &str) -> usize {
+    let left = left.trim_end();
+    let right = right.trim_start();
+    if left.is_empty() {
+        return content_char_count(right);
+    }
+    if right.is_empty() {
+        return content_char_count(left);
+    }
+    // Join space is whitespace and does not count as content.
+    content_char_count(left) + content_char_count(right)
+}
+
+fn content_char_count(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
 }
 
 fn same_speaker(left: &Segment, right: &Segment) -> bool {
@@ -181,5 +234,42 @@ mod tests {
         ]);
         assert_eq!(paragraphs.len(), 1);
         assert_eq!(paragraphs[0].text, "你好世界");
+    }
+
+    #[test]
+    fn stops_merging_when_piece_cap_is_reached() {
+        let mut segments = Vec::new();
+        for i in 0..(MAX_PARAGRAPH_PIECES + 2) {
+            let start = i as f32 * 0.5;
+            segments.push(seg(&format!("piece{i}"), start, start + 0.4, Some("A")));
+        }
+        let paragraphs = merge_reading_segments(segments);
+        assert!(
+            paragraphs.len() >= 2,
+            "piece cap must open a new paragraph: {paragraphs:?}"
+        );
+        // First paragraph absorbs exactly MAX_PARAGRAPH_PIECES source segments.
+        let first_words = paragraphs[0].words.len();
+        assert_eq!(first_words, MAX_PARAGRAPH_PIECES);
+    }
+
+    #[test]
+    fn stops_merging_when_duration_cap_is_reached() {
+        let paragraphs = merge_reading_segments(vec![
+            seg("start", 0.0, 1.0, Some("A")),
+            seg("middle", 20.0, 21.0, Some("A")),
+            // Spanning from 0 to > MAX_PARAGRAPH_SECONDS must open a new paragraph.
+            seg(
+                "late",
+                MAX_PARAGRAPH_SECONDS + 1.0,
+                MAX_PARAGRAPH_SECONDS + 2.0,
+                Some("A"),
+            ),
+        ]);
+        assert!(
+            paragraphs.len() >= 2,
+            "duration cap must open a new paragraph: {paragraphs:?}"
+        );
+        assert!(paragraphs.last().unwrap().text.contains("late"));
     }
 }

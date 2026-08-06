@@ -131,11 +131,7 @@ pub(crate) async fn history_replace_transcript(
     ApiError,
 > {
     let expected_revision = parse_required_quoted_if_match(&headers)?;
-    if request.segments.is_empty() && request.subtitle_cues.is_empty() {
-        return Err(ApiError::BadRequest(
-            "transcript body must include timed segments or subtitle_cues".into(),
-        ));
-    }
+    validate_history_replace_body(&request.segments, &request.subtitle_cues)?;
     let transcription = openasr_core::Transcription {
         text: request.text,
         segments: request.segments,
@@ -238,6 +234,12 @@ fn parse_required_quoted_if_match(headers: &HeaderMap) -> Result<u64, ApiError> 
         .ok_or_else(|| ApiError::BadRequest("If-Match is required".into()))?
         .to_str()
         .map_err(|_| ApiError::BadRequest("Invalid If-Match header".into()))?;
+    parse_quoted_revision(raw)
+}
+
+/// Parse a quoted optimistic-concurrency revision (`"12"`). Shared by history
+/// replace/assign so the If-Match contract stays unit-testable.
+fn parse_quoted_revision(raw: &str) -> Result<u64, ApiError> {
     let Some(raw) = raw
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
@@ -248,6 +250,19 @@ fn parse_required_quoted_if_match(headers: &HeaderMap) -> Result<u64, ApiError> 
     };
     raw.parse::<u64>()
         .map_err(|_| ApiError::BadRequest("Invalid If-Match revision".into()))
+}
+
+/// Reject an empty dual-view replace body before touching the store.
+fn validate_history_replace_body(
+    segments: &[openasr_core::Segment],
+    subtitle_cues: &[openasr_core::Segment],
+) -> Result<(), ApiError> {
+    if segments.is_empty() && subtitle_cues.is_empty() {
+        return Err(ApiError::BadRequest(
+            "transcript body must include timed segments or subtitle_cues".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn history_assignment_error(
@@ -303,4 +318,52 @@ pub(crate) fn prune_history_store(
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn if_match_requires_quoted_revision() {
+        assert!(parse_quoted_revision("\"0\"").is_ok_and(|v| v == 0));
+        assert!(parse_quoted_revision("\"12\"").is_ok_and(|v| v == 12));
+        assert!(parse_quoted_revision("12").is_err());
+        assert!(parse_quoted_revision("\"abc\"").is_err());
+        assert!(parse_quoted_revision("").is_err());
+
+        let mut headers = HeaderMap::new();
+        assert!(parse_required_quoted_if_match(&headers).is_err());
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"3\""));
+        assert_eq!(parse_required_quoted_if_match(&headers).unwrap(), 3);
+    }
+
+    #[test]
+    fn history_replace_body_requires_timed_content() {
+        assert!(validate_history_replace_body(&[], &[]).is_err());
+        let segment = openasr_core::Segment {
+            start: 0.0,
+            end: 1.0,
+            text: "hello".into(),
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        };
+        assert!(validate_history_replace_body(std::slice::from_ref(&segment), &[]).is_ok());
+        assert!(validate_history_replace_body(&[], std::slice::from_ref(&segment)).is_ok());
+    }
+
+    #[test]
+    fn revision_conflict_maps_to_conflict_status() {
+        let err = history_assignment_error(
+            openasr_core::realtime::history::DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1,
+            },
+        );
+        assert!(matches!(err, ApiError::Conflict(_)));
+    }
 }

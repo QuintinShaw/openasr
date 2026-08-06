@@ -74,8 +74,13 @@ pub enum WordAnchorIssue {
         segment_index: usize,
         word_index: usize,
     },
-    /// Word starts were not non-decreasing inside a segment.
+    /// Word starts or ends were not non-decreasing inside a segment.
     NonMonotonic {
+        segment_index: usize,
+        word_index: usize,
+    },
+    /// A word's end was before its start (beyond float epsilon).
+    InvertedInterval {
         segment_index: usize,
         word_index: usize,
     },
@@ -165,6 +170,7 @@ fn validate_segment_words(
     issues: &mut Vec<WordAnchorIssue>,
 ) {
     let mut prev_start = f32::NEG_INFINITY;
+    let mut prev_end = f32::NEG_INFINITY;
     for (word_index, word) in segment.words.iter().enumerate() {
         if !word.start.is_finite() || !word.end.is_finite() {
             issues.push(WordAnchorIssue::NonFiniteTime {
@@ -179,13 +185,21 @@ fn validate_segment_words(
                 word_index,
             });
         }
-        if word.start + 1e-3 < prev_start {
+        // end must be >= start within float noise (zero-duration is allowed).
+        if word.end + 1e-3 < word.start {
+            issues.push(WordAnchorIssue::InvertedInterval {
+                segment_index,
+                word_index,
+            });
+        }
+        if word.start + 1e-3 < prev_start || word.end + 1e-3 < prev_end {
             issues.push(WordAnchorIssue::NonMonotonic {
                 segment_index,
                 word_index,
             });
         }
         prev_start = word.start;
+        prev_end = word.end;
         if audio_duration_s.is_finite()
             && audio_duration_s > 0.0
             && word.end > audio_duration_s + AUDIO_DURATION_TOLERANCE_S
@@ -404,5 +418,53 @@ mod tests {
     fn empty_transcript_is_reliable() {
         let t = transcription(Vec::new());
         assert!(validate_word_anchors(&t, 0.0).is_reliable());
+    }
+
+    #[test]
+    fn inverted_word_interval_is_unreliable() {
+        let t = transcription(vec![segment(
+            "hello world",
+            vec![word("hello", 0.5, 0.2), word("world", 0.6, 1.0)],
+        )]);
+        let result = validate_word_anchors(&t, 1.0);
+        assert!(!result.is_reliable());
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, WordAnchorIssue::InvertedInterval { .. }))
+        );
+    }
+
+    #[test]
+    fn non_monotonic_word_ends_are_unreliable() {
+        // Starts are non-decreasing, but ends go backwards (e.g. mis-aligned
+        // sparse anchors that would poison multi-speaker split midpoints).
+        let t = transcription(vec![segment(
+            "hello world",
+            vec![word("hello", 0.0, 0.9), word("world", 0.2, 0.4)],
+        )]);
+        let result = validate_word_anchors(&t, 1.0);
+        assert!(!result.is_reliable());
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, WordAnchorIssue::NonMonotonic { .. }))
+        );
+    }
+
+    #[test]
+    fn zero_duration_word_is_allowed() {
+        let t = transcription(vec![segment(
+            "hello world",
+            vec![word("hello", 0.0, 0.4), word("world", 0.5, 0.5)],
+        )]);
+        let result = validate_word_anchors(&t, 1.0);
+        assert!(
+            result.is_reliable(),
+            "zero-duration trailing word is valid: {:?}",
+            result.issues
+        );
     }
 }

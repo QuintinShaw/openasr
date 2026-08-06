@@ -31,6 +31,15 @@ const MAX_CUE_SECONDS: f32 = 8.0;
 const LATIN_MAX_CHARS: usize = 84;
 /// ~18 fullwidth characters x 2 lines for CJK-script cues.
 const CJK_MAX_CHARS: usize = 36;
+/// Upper reading-speed bound (content characters per second) for Latin cues.
+/// Calibrated to common subtitle guidelines (~17-21 CPS); V1 uses the top of
+/// that range so well-paced speech is not over-split.
+const LATIN_MAX_CPS: f32 = 21.0;
+/// Upper reading-speed bound for CJK cues (fullwidth characters per second).
+/// Common Chinese subtitle guidance is roughly 4-9 CPS; V1 uses 9.
+const CJK_MAX_CPS: f32 = 9.0;
+/// Inter-word gap treated as a deliberate pause when choosing a forced cut.
+const MIN_PAUSE_GAP_S: f32 = 0.35;
 /// A trailing piece of this many words or fewer is treated as an orphan and
 /// merged back into the previous cue when it fits within the hard caps.
 const ORPHAN_MAX_WORDS: usize = 2;
@@ -77,8 +86,8 @@ pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
     if tokens.len() < 2 {
         return vec![segment];
     }
-    let budget = char_budget(&chars);
-    let ranges = pack_tokens(&chars, &tokens, budget);
+    let limits = cue_limits(&chars);
+    let ranges = pack_tokens(&chars, &tokens, limits);
     if ranges.len() <= 1 {
         return vec![segment];
     }
@@ -138,8 +147,18 @@ fn build_tokens(segment: &Segment, chars: &[char]) -> (Vec<CueToken>, bool) {
     (synthesize_tokens(segment, chars), false)
 }
 
-/// Synthesise word-sized tokens from whitespace runs, interpolating times
-/// proportionally across `[segment.start, segment.end]` by character position.
+/// Synthesise word-sized tokens when real `words[]` are missing or cannot be
+/// aligned to the segment text.
+///
+/// - Latin / space-delimited runs keep whitespace tokenisation (one token per
+///   orthographic word, punctuation glued as emitted).
+/// - CJK / wide-script continuous text has no spaces: split at character
+///   boundaries with sentence/clause punctuation as its own token so the
+///   packer can still cut long unpunctuated runs into short cues under the
+///   char-budget and CPS caps.
+///
+/// Times are interpolated proportionally across
+/// `[segment.start, segment.end]` by character position.
 fn synthesize_tokens(segment: &Segment, chars: &[char]) -> Vec<CueToken> {
     let total = chars.len();
     if total == 0 {
@@ -158,8 +177,21 @@ fn synthesize_tokens(segment: &Segment, chars: &[char]) -> Vec<CueToken> {
             break;
         }
         let char_start = index;
-        while index < total && !chars[index].is_whitespace() {
+        if is_wide_script(chars[index]) || is_cjk_or_fullwidth_punct(chars[index]) {
+            // One wide-script character (or a standalone CJK punctuation mark)
+            // per token. The packer groups them under char budget / CPS / pauses.
             index += 1;
+        } else {
+            // Latin (or other non-wide) orthographic word until whitespace or
+            // a wide-script / CJK-punct boundary.
+            index += 1;
+            while index < total
+                && !chars[index].is_whitespace()
+                && !is_wide_script(chars[index])
+                && !is_cjk_or_fullwidth_punct(chars[index])
+            {
+                index += 1;
+            }
         }
         tokens.push(CueToken {
             char_start,
@@ -171,11 +203,41 @@ fn synthesize_tokens(segment: &Segment, chars: &[char]) -> Vec<CueToken> {
     tokens
 }
 
+fn is_cjk_or_fullwidth_punct(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3002}'
+            | '\u{ff01}'
+            | '\u{ff1f}'
+            | '\u{ff0c}'
+            | '\u{3001}'
+            | '\u{ff1b}'
+            | '\u{ff1a}'
+            | '\u{2026}'
+            | '\u{300c}'
+            | '\u{300d}'
+            | '\u{300e}'
+            | '\u{300f}'
+            | '\u{3010}'
+            | '\u{3011}'
+            | '\u{ff08}'
+            | '\u{ff09}'
+    )
+}
+
+/// Script-aware presentation caps applied by the packer (two-line char budget
+/// + max reading speed + hard duration).
+#[derive(Debug, Clone, Copy)]
+struct CueLimits {
+    char_budget: usize,
+    max_cps: f32,
+}
+
 /// Greedily pack tokens into cue ranges (inclusive `(first, last)` token
 /// indices). Cues grow up to the target caps and break at the first sentence
-/// boundary, preferring clause punctuation and then the widest word gap when a
-/// long sentence must be split.
-fn pack_tokens(chars: &[char], tokens: &[CueToken], budget: usize) -> Vec<(usize, usize)> {
+/// boundary, preferring deliberate pauses, then clause punctuation, then the
+/// widest word gap when a long sentence must be split.
+fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(usize, usize)> {
     let n = tokens.len();
     let mut ranges = Vec::new();
     let mut start = 0usize;
@@ -185,7 +247,7 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], budget: usize) -> Vec<(usize
         // out of tokens, or the next token would overflow the target caps.
         while !(ends_sentence(chars, &tokens[end]) && range_has_content(chars, tokens, start, end))
             && end + 1 < n
-            && fits(tokens, start, end + 1, budget, TARGET_CUE_SECONDS)
+            && fits(chars, tokens, start, end + 1, limits, TARGET_CUE_SECONDS)
         {
             end += 1;
         }
@@ -200,13 +262,20 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], budget: usize) -> Vec<(usize
         ranges.push((start, cut));
         start = cut + 1;
     }
-    merge_orphan_tails(chars, tokens, ranges, budget)
+    merge_orphan_tails(chars, tokens, ranges, limits)
 }
 
 /// Pick the split point within `[start, end]` for a sentence that is too long
-/// to keep whole: the latest clause boundary if any, else the token before the
-/// widest inter-word gap, else pack to `end`.
+/// to keep whole: latest deliberate pause, else latest clause boundary, else
+/// the token before the widest inter-word gap, else pack to `end`.
 fn choose_cut(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> usize {
+    // Prefer a real pause so cues breathe with speech rhythm.
+    for k in (start..end).rev() {
+        let gap = tokens[k + 1].start - tokens[k].end;
+        if gap >= MIN_PAUSE_GAP_S && range_has_content(chars, tokens, start, k) {
+            return k;
+        }
+    }
     for k in (start..=end).rev() {
         if ends_clause(chars, &tokens[k]) && range_has_content(chars, tokens, start, k) {
             return k;
@@ -236,7 +305,7 @@ fn merge_orphan_tails(
     chars: &[char],
     tokens: &[CueToken],
     ranges: Vec<(usize, usize)>,
-    budget: usize,
+    limits: CueLimits,
 ) -> Vec<(usize, usize)> {
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (first, last) in ranges {
@@ -246,7 +315,7 @@ fn merge_orphan_tails(
             let zero_duration = tokens[last].end <= tokens[first].start;
             if word_count <= ORPHAN_MAX_WORDS
                 && (zero_duration || !prev_ends_sentence)
-                && fits(tokens, prev_first, last, budget, MAX_CUE_SECONDS)
+                && fits(chars, tokens, prev_first, last, limits, MAX_CUE_SECONDS)
             {
                 *merged.last_mut().unwrap() = (prev_first, last);
                 continue;
@@ -257,21 +326,54 @@ fn merge_orphan_tails(
     merged
 }
 
-/// Whether `tokens[start..=end]` fits both the character budget and `max_seconds`.
-fn fits(tokens: &[CueToken], start: usize, end: usize, budget: usize, max_seconds: f32) -> bool {
-    let chars = tokens[end]
+/// Whether `tokens[start..=end]` fits the two-line char budget, max reading
+/// speed (CPS), and `max_seconds` hard duration.
+fn fits(
+    chars: &[char],
+    tokens: &[CueToken],
+    start: usize,
+    end: usize,
+    limits: CueLimits,
+    max_seconds: f32,
+) -> bool {
+    let span_chars = tokens[end]
         .char_end
         .saturating_sub(tokens[start].char_start);
-    if chars > budget {
+    if span_chars > limits.char_budget {
         return false;
     }
     let duration = tokens[end].end - tokens[start].start;
-    duration <= max_seconds
+    if duration > max_seconds {
+        return false;
+    }
+    // Reading-speed gate: dense text on a short cue is unreadable. Tiny /
+    // zero-duration ranges skip the CPS check so zero-duration FA repairs can
+    // still merge as orphans.
+    if duration > 1e-3 {
+        let content = content_char_count_in_range(chars, tokens, start, end);
+        if content as f32 / duration > limits.max_cps {
+            return false;
+        }
+    }
+    true
 }
 
-/// Character budget for the segment's dominant script: CJK cues carry far fewer
-/// (wider) characters per line than Latin cues.
-fn char_budget(chars: &[char]) -> usize {
+fn content_char_count_in_range(
+    chars: &[char],
+    tokens: &[CueToken],
+    start: usize,
+    end: usize,
+) -> usize {
+    tokens[start..=end]
+        .iter()
+        .flat_map(|token| chars[token.char_start..token.char_end].iter().copied())
+        .filter(|c| char_has_content(*c))
+        .count()
+}
+
+/// Presentation caps for the segment's dominant script: CJK cues carry far
+/// fewer (wider) characters per line and a lower CPS ceiling than Latin cues.
+fn cue_limits(chars: &[char]) -> CueLimits {
     let mut wide = 0usize;
     let mut total = 0usize;
     for &ch in chars {
@@ -284,9 +386,15 @@ fn char_budget(chars: &[char]) -> usize {
         }
     }
     if total > 0 && wide * 2 >= total {
-        CJK_MAX_CHARS
+        CueLimits {
+            char_budget: CJK_MAX_CHARS,
+            max_cps: CJK_MAX_CPS,
+        }
     } else {
-        LATIN_MAX_CHARS
+        CueLimits {
+            char_budget: LATIN_MAX_CHARS,
+            max_cps: LATIN_MAX_CPS,
+        }
     }
 }
 
@@ -746,5 +854,58 @@ mod tests {
         let out = resegment_transcription_cues(original);
         assert_eq!(out.text, text_before, "joined text must be untouched");
         assert!(out.segments.len() >= 3);
+    }
+
+    #[test]
+    fn synthesizes_cjk_char_tokens_without_whitespace() {
+        // Unspaced CJK with no real word anchors: must still pack into short
+        // cues under the CJK two-line budget (not one monolithic cue).
+        let text = "你好世界今天天气很好我们一起去公园散步看花然后回家吃饭";
+        let segment = Segment {
+            start: 0.0,
+            end: 12.0,
+            text: text.to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        };
+        let cues = segment_into_cues(segment);
+        assert!(
+            cues.len() >= 2,
+            "unspaced CJK without words must split: {cues:?}"
+        );
+        for cue in &cues {
+            assert!(
+                cue.text.chars().count() <= CJK_MAX_CHARS,
+                "cue exceeds CJK two-line budget: {cue:?}"
+            );
+            assert!(
+                cue.end - cue.start <= MAX_CUE_SECONDS + 1e-3,
+                "cue exceeds hard duration: {cue:?}"
+            );
+        }
+        let joined: String = cues.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, text, "synthesised path must not rewrite text");
+    }
+
+    #[test]
+    fn synthesizes_cjk_splits_at_ideographic_period() {
+        let text = "你好世界。今天天气很好";
+        let segment = Segment {
+            start: 0.0,
+            end: 4.0,
+            text: text.to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        };
+        let cues = segment_into_cues(segment);
+        assert_eq!(cues.len(), 2, "cues: {cues:?}");
+        assert_eq!(cues[0].text, "你好世界。");
+        assert_eq!(cues[1].text, "今天天气很好");
     }
 }

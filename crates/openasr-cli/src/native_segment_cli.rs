@@ -169,6 +169,14 @@ fn batch_item_transcription_request(
         )
         .with_voice_id(context.diarize)
         .with_diarize_speakers(context.speakers)
+        // Match single-file `transcribe`: SRT/VTT export requests a precise
+        // timeline under TimelinePrecisionPolicy::Auto.
+        .with_needs_subtitle_export(
+            context
+                .formats
+                .iter()
+                .any(|format| matches!(format, ResponseFormat::Srt | ResponseFormat::Vtt)),
+        )
         .with_prepared_samples(prepared.shared_samples())
 }
 
@@ -1439,6 +1447,38 @@ mod tests {
         let request =
             batch_item_transcription_request(&sample_wav_fixture_path(), &context, &prepared);
         assert_eq!(request.source, openasr_core::RequestSource::CliTranscribe);
+        assert!(
+            !request.needs_subtitle_export,
+            "text-only batch must not force subtitle-precision timeline"
+        );
+    }
+
+    #[test]
+    fn batch_item_transcription_request_sets_subtitle_export_for_srt_vtt() {
+        let prepared = sample_prepared_audio();
+        let output_dir = PathBuf::from("/tmp/openasr-test-output");
+        for format in [ResponseFormat::Srt, ResponseFormat::Vtt] {
+            let context = BatchRunContext {
+                output_dir: &output_dir,
+                formats: &[format],
+                model_id: "whisper-small",
+                model_pack_path: None,
+                backend_kind: BackendKind::Native,
+                ffmpeg_bin: None,
+                ffmpeg_bin_explicit: false,
+                longform: None,
+                diarize: false,
+                speakers: None,
+                language: None,
+                task: None,
+            };
+            let request =
+                batch_item_transcription_request(&sample_wav_fixture_path(), &context, &prepared);
+            assert!(
+                request.needs_subtitle_export,
+                "{format:?} batch must match single-file needs_subtitle_export"
+            );
+        }
     }
 
     // Regression guard for `transcribe --benchmark`: it must log

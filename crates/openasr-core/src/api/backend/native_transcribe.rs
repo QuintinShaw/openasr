@@ -1167,11 +1167,19 @@ struct SpeakerFinalizationContext {
 }
 
 impl SpeakerFinalizationContext {
-    fn requires_word_alignment(&self, transcription: &Transcription) -> bool {
+    /// External Voice ID needs word anchors when a multi-speaker segment must
+    /// be split for text ownership. Empty words or present-but-unreliable
+    /// anchors both force FA / fail-closed; single-speaker identity alone does not.
+    fn requires_word_alignment(
+        &self,
+        transcription: &Transcription,
+        word_anchors_reliable: bool,
+    ) -> bool {
         self.plan == SpeakerPlan::External
             && crate::diarize::attribution::requires_word_alignment(
                 &self.attribution.timeline.turns,
                 &transcription.segments,
+                word_anchors_reliable,
             )
     }
 }
@@ -1387,9 +1395,11 @@ fn run_native_transcription_fallible_with_input(
         &request_execution_intent,
     )?;
     let audio_duration_s = prepared_audio.len() as f32 / 16_000.0;
-    let voice_id_needs_align = speaker_finalization.requires_word_alignment(&transcription);
     let native_validation =
         crate::subtitle::validate_word_anchors(&transcription, audio_duration_s);
+    // empty_words_multi || (multi_speaker_overlap && !native_validation.is_reliable())
+    let voice_id_needs_align = speaker_finalization
+        .requires_word_alignment(&transcription, native_validation.is_reliable());
     let align_decision = crate::subtitle::decide_forced_alignment(
         timeline_precision,
         explicit_refine,
