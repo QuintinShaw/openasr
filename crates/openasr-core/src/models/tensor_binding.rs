@@ -181,12 +181,7 @@ pub(crate) fn validate_tensor_binding<E>(
 ) -> Result<(), E> {
     let valid = match spec.requirement {
         TensorBindingRequirement::ExactDims(expected) => {
-            dims.len() == expected.len()
-                && dims
-                    .iter()
-                    .copied()
-                    .map(|value| value as usize)
-                    .eq(expected.iter().copied())
+            exact_dims_match(dims, expected)
         }
         TensorBindingRequirement::VectorLen(expected_len) => dims == [expected_len as u64],
         TensorBindingRequirement::NonEmptyVector => dims.len() == 1 && dims[0] > 0,
@@ -223,6 +218,27 @@ pub(crate) fn render_shape(shape: &[u64]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{parts}]")
+}
+
+/// Ordered extent match for graph-consumed matrices.
+///
+/// Accepts an exact rank/extent match, or the same non-unit subsequence after
+/// stripping unit axes. Shipped packs sometimes keep a squeezed kernel/channel
+/// axis as a leading or trailing `1` (for example FastConformer
+/// `conv.pw1.weight` as `[1, hidden, 2*hidden]` vs contract `[hidden, 2*hidden]`);
+/// those layouts are equivalent for `mul_mat` after the loader binds the tensor.
+/// Transposed non-unit extents still fail closed.
+pub(crate) fn exact_dims_match(dims: &[u64], expected: &[usize]) -> bool {
+    let got: Vec<usize> = dims.iter().map(|d| *d as usize).collect();
+    if got == expected {
+        return true;
+    }
+    let strip = |values: &[usize]| -> Vec<usize> {
+        values.iter().copied().filter(|v| *v != 1).collect()
+    };
+    let got_core = strip(&got);
+    let exp_core = strip(expected);
+    !got_core.is_empty() && got_core == exp_core
 }
 
 /// Projects one valid dims choice for a tensor-binding requirement, for
@@ -390,6 +406,22 @@ mod tests {
         };
         validate_tensor_binding(&[16, 32], spec, binding_error).expect("canonical dims");
         validate_tensor_binding(&[32, 16], spec, binding_error).expect("transposed dims");
+    }
+
+    #[test]
+    fn exact_dims_accepts_unit_axis_padding_but_rejects_transpose() {
+        let spec = TensorBindingSpec {
+            tensor_name: "enc.blk.0.conv.pw1.weight",
+            requirement: TensorBindingRequirement::ExactDims(&[1024, 2048]),
+            reason: "pw1 GLU",
+        };
+        validate_tensor_binding(&[1024, 2048], spec, binding_error).expect("exact");
+        validate_tensor_binding(&[1, 1024, 2048], spec, binding_error)
+            .expect("leading unit axis is layout-equivalent");
+        validate_tensor_binding(&[1024, 2048, 1], spec, binding_error)
+            .expect("trailing unit axis is layout-equivalent");
+        validate_tensor_binding(&[2048, 1024], spec, binding_error)
+            .expect_err("transposed non-unit extents must fail");
     }
 
     #[test]

@@ -561,9 +561,15 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
     let conv_kernel = encoder.conv_kernel;
     let subsample_channels = encoder.subsample_channels;
     let subsample_out_dim = encoder.subsample_out_dim;
+    // FireRed AED/LLM encoder conv-module GLU: pw1 expands d_model -> 4*d_model,
+    // depthwise/ln stay on 2*d_model after the GLU split (same geometry as
+    // `firered_aed::runtime_contract` / `encoder_graph`).
     let double_d_model = d_model
         .checked_mul(2)
         .ok_or_else(|| geometry_overflow("2 x encoder d_model"))?;
+    let quad_d_model = d_model
+        .checked_mul(4)
+        .ok_or_else(|| geometry_overflow("4 x encoder d_model"))?;
 
     let vector = |name: String, len: usize, what: &str| TensorBindingDescriptor {
         tensor_name: name,
@@ -572,7 +578,8 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
     };
     let matrix = |name: String, lhs: usize, rhs: usize, what: &str| TensorBindingDescriptor {
         tensor_name: name,
-        requirement: TensorBindingDescriptorRequirement::Rank2EitherDims(lhs, rhs),
+        // Ordered ggml [in, out] — same rule as firered_aed encoder admission.
+        requirement: TensorBindingDescriptorRequirement::ExactDims(vec![lhs, rhs]),
         reason: format!("expected {what} matrix"),
     };
 
@@ -718,8 +725,8 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
             matrix(
                 format!("{prefix}conv.pw1.weight"),
                 d_model,
-                double_d_model,
-                "pointwise conv1 squeeze",
+                quad_d_model,
+                "GLU pointwise conv1 (kernel-1 squeezed) d_model x 4*d_model",
             ),
             TensorBindingDescriptor {
                 tensor_name: format!("{prefix}conv.dw.weight"),
@@ -732,19 +739,19 @@ pub(crate) fn firered_llm_runtime_tensor_binding_descriptors(
             },
             vector(
                 format!("{prefix}conv.ln.weight"),
-                d_model,
-                "d_model-sized conv layer norm",
+                double_d_model,
+                "2*d_model-sized conv mid-block layer norm",
             ),
             vector(
                 format!("{prefix}conv.ln.bias"),
-                d_model,
-                "d_model-sized conv layer norm",
+                double_d_model,
+                "2*d_model-sized conv mid-block layer norm",
             ),
             matrix(
                 format!("{prefix}conv.pw2.weight"),
                 double_d_model,
                 d_model,
-                "pointwise conv2 restore",
+                "pointwise conv2 restore 2*d_model x d_model",
             ),
             vector(
                 format!("{prefix}out_norm.weight"),
@@ -1074,10 +1081,11 @@ mod tests {
             ("attn.pos_bias_v", vec![8]),
             ("conv.norm.weight", vec![8]),
             ("conv.norm.bias", vec![8]),
-            ("conv.pw1.weight", vec![8, 16]),
+            // GLU: pw1 is d x 4d; dw/ln stay on 2d after the split (matches firered_aed).
+            ("conv.pw1.weight", vec![8, 32]),
             ("conv.dw.weight", vec![3, 1, 16]),
-            ("conv.ln.weight", vec![8]),
-            ("conv.ln.bias", vec![8]),
+            ("conv.ln.weight", vec![16]),
+            ("conv.ln.bias", vec![16]),
             ("conv.pw2.weight", vec![16, 8]),
             ("ffn2.norm.weight", vec![8]),
             ("ffn2.norm.bias", vec![8]),
