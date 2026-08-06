@@ -20,7 +20,9 @@ use crate::ggml_runtime::{
     GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
 };
 
-use super::decoder_contract::{QwenDecoderContractGeometry, QwenDecoderContractOptions};
+use super::decoder_contract::{
+    QwenDecoderContractGeometry, QwenDecoderContractOptions, qwen_decoder_layer_tensor_descriptors,
+};
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
 use super::logits_head::{
@@ -30,6 +32,7 @@ use super::logits_head::{
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::llm_layer_tensor_names;
+use crate::models::tensor_binding::{TensorBindingDescriptor, TensorBindingDescriptorRequirement};
 use crate::nn::decoder::{
     LlmDecoderStackConfig, LlmDecoderStackInputs, LlmKvCachePolicy, LlmKvCacheSpec,
     LlmLayerWeights, LlmQkvWeights, LlmResidentKvArena, LlmReusableDecodeGraph,
@@ -5913,125 +5916,109 @@ fn plan_qwen_family_layer(
     geometry: QwenDecoderContractGeometry,
     options: QwenDecoderContractOptions,
 ) -> Result<QwenWholeDecoderLayerPlan, Qwen3AsrLlmTransformerError> {
-    // Geometry is the sole shape authority (same source as admission descriptors).
-    // Fail closed on transposed [out, in] packs; do not re-derive widths from
-    // tensor dims beyond verifying ExactDims match.
-    let d_model = geometry.d_model;
-    let head_dim = geometry.head_dim;
-    let q_dim =
-        geometry
-            .q_dim()
-            .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                tensor_name: "<decoder geometry>".to_string(),
+    // Single semantic source: expand the same admission descriptors the pack
+    // validator uses, then project each descriptor into a weight plan. Shape
+    // authority is the descriptor requirement — not a second hand-expanded
+    // q_dim/kv_dim/ffn table in this loader.
+    let descriptors =
+        qwen_decoder_layer_tensor_descriptors(&geometry, options, &names).map_err(|reason| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<decoder layer contract>".to_string(),
                 shape: format!("{geometry:?}"),
-                reason: "qwen decoder q_dim overflow".to_string(),
-            })?;
-    let kv_dim =
-        geometry
-            .kv_dim()
-            .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                tensor_name: "<decoder geometry>".to_string(),
-                shape: format!("{geometry:?}"),
-                reason: "qwen decoder kv_dim overflow".to_string(),
-            })?;
-    let ffn_dim = geometry.ffn_dim;
-    let require_out_by_in =
-        |plan: &ProjectionWeightPlan| -> Result<(), Qwen3AsrLlmTransformerError> {
-            if plan.layout != DenseProjectionLayout::OutputByInput {
-                return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                    tensor_name: plan.tensor_name.clone(),
-                    shape: format!("{:?}", plan.storage_dims),
-                    reason:
-                        "qwen-family projection weights must use the ggml [in, out] dim order; \
-                             this pack stores them as [out, in], which indicates it was built by \
-                             an older importer - re-pack from source with the current build"
-                            .to_string(),
-                });
+                reason,
             }
-            Ok(())
-        };
+        })?;
 
-    let attn_norm = plan_vector_weight(reader, names.attn_norm_name, d_model)?;
-    let q = plan_projection_weight_with_input_output(reader, names.attn_q_name, d_model, q_dim)?;
-    require_out_by_in(&q)?;
-    let k = plan_projection_weight_with_input_output(reader, names.attn_k_name, d_model, kv_dim)?;
-    require_out_by_in(&k)?;
-    let v = plan_projection_weight_with_input_output(reader, names.attn_v_name, d_model, kv_dim)?;
-    require_out_by_in(&v)?;
+    let mut vectors = std::collections::HashMap::<String, VectorWeightPlan>::new();
+    let mut projections = std::collections::HashMap::<String, ProjectionWeightPlan>::new();
+    for descriptor in &descriptors {
+        match plan_weight_from_contract_descriptor(reader, descriptor)? {
+            PlannedContractWeight::Vector(plan) => {
+                vectors.insert(plan.tensor_name.clone(), plan);
+            }
+            PlannedContractWeight::Projection(plan) => {
+                projections.insert(plan.tensor_name.clone(), plan);
+            }
+        }
+    }
 
-    let (q_bias, k_bias, v_bias) =
-        if options.qkv_bias {
-            let q_bias_name = names.q_bias_name.ok_or_else(|| {
-                Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                    tensor_name: "<q_bias>".to_string(),
-                    shape: "[]".to_string(),
-                    reason: "qwen decoder options.qkv_bias requires q_bias_name".to_string(),
-                }
-            })?;
-            let k_bias_name = names.k_bias_name.ok_or_else(|| {
-                Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                    tensor_name: "<k_bias>".to_string(),
-                    shape: "[]".to_string(),
-                    reason: "qwen decoder options.qkv_bias requires k_bias_name".to_string(),
-                }
-            })?;
-            let v_bias_name = names.v_bias_name.ok_or_else(|| {
-                Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                    tensor_name: "<v_bias>".to_string(),
-                    shape: "[]".to_string(),
-                    reason: "qwen decoder options.qkv_bias requires v_bias_name".to_string(),
-                }
-            })?;
-            (
-                Some(plan_vector_weight(reader, q_bias_name, q_dim)?),
-                Some(plan_vector_weight(reader, k_bias_name, kv_dim)?),
-                Some(plan_vector_weight(reader, v_bias_name, kv_dim)?),
-            )
-        } else {
-            (None, None, None)
-        };
+    let attn_norm = take_planned_vector(&mut vectors, &names.attn_norm_name)?;
+    let q = take_planned_projection(&mut projections, &names.attn_q_name)?;
+    let k = take_planned_projection(&mut projections, &names.attn_k_name)?;
+    let v = take_planned_projection(&mut projections, &names.attn_v_name)?;
+    let output = take_planned_projection(&mut projections, &names.attn_output_name)?;
+    let ffn_norm = take_planned_vector(&mut vectors, &names.ffn_norm_name)?;
+    let gate = take_planned_projection(&mut projections, &names.ffn_gate_name)?;
+    let up = take_planned_projection(&mut projections, &names.ffn_up_name)?;
+    let down = take_planned_projection(&mut projections, &names.ffn_down_name)?;
 
-    let output =
-        plan_projection_weight_with_input_output(reader, names.attn_output_name, q_dim, d_model)?;
-    require_out_by_in(&output)?;
+    let (q_bias, k_bias, v_bias) = if options.qkv_bias {
+        let q_bias_name = names.q_bias_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<q_bias>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qkv_bias requires q_bias_name".to_string(),
+            }
+        })?;
+        let k_bias_name = names.k_bias_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<k_bias>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qkv_bias requires k_bias_name".to_string(),
+            }
+        })?;
+        let v_bias_name = names.v_bias_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<v_bias>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qkv_bias requires v_bias_name".to_string(),
+            }
+        })?;
+        (
+            Some(take_planned_vector(&mut vectors, q_bias_name)?),
+            Some(take_planned_vector(&mut vectors, k_bias_name)?),
+            Some(take_planned_vector(&mut vectors, v_bias_name)?),
+        )
+    } else {
+        (None, None, None)
+    };
 
-    let (q_norm, k_norm) =
-        if options.qk_norm {
-            let q_norm_name = names.q_norm_name.ok_or_else(|| {
-                Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                    tensor_name: "<q_norm>".to_string(),
-                    shape: "[]".to_string(),
-                    reason: "qwen decoder options.qk_norm requires q_norm_name".to_string(),
-                }
-            })?;
-            let k_norm_name = names.k_norm_name.ok_or_else(|| {
-                Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                    tensor_name: "<k_norm>".to_string(),
-                    shape: "[]".to_string(),
-                    reason: "qwen decoder options.qk_norm requires k_norm_name".to_string(),
-                }
-            })?;
-            (
-                Some(plan_vector_weight(reader, q_norm_name, head_dim)?),
-                Some(plan_vector_weight(reader, k_norm_name, head_dim)?),
-            )
-        } else {
-            (None, None)
-        };
+    let (q_norm, k_norm) = if options.qk_norm {
+        let q_norm_name = names.q_norm_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<q_norm>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qk_norm requires q_norm_name".to_string(),
+            }
+        })?;
+        let k_norm_name = names.k_norm_name.as_deref().ok_or_else(|| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<k_norm>".to_string(),
+                shape: "[]".to_string(),
+                reason: "qwen decoder options.qk_norm requires k_norm_name".to_string(),
+            }
+        })?;
+        (
+            Some(take_planned_vector(&mut vectors, q_norm_name)?),
+            Some(take_planned_vector(&mut vectors, k_norm_name)?),
+        )
+    } else {
+        (None, None)
+    };
 
-    let ffn_norm = plan_vector_weight(reader, names.ffn_norm_name, d_model)?;
-    let gate =
-        plan_projection_weight_with_input_output(reader, names.ffn_gate_name, d_model, ffn_dim)?;
-    require_out_by_in(&gate)?;
-    let up = plan_projection_weight_with_input_output(reader, names.ffn_up_name, d_model, ffn_dim)?;
-    require_out_by_in(&up)?;
-    let down =
-        plan_projection_weight_with_input_output(reader, names.ffn_down_name, ffn_dim, d_model)?;
-    require_out_by_in(&down)?;
+    if !vectors.is_empty() || !projections.is_empty() {
+        let leftover: Vec<_> = vectors.keys().chain(projections.keys()).cloned().collect();
+        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: leftover.join(","),
+            shape: "[]".to_string(),
+            reason: "contract descriptors projected weights that the layer plan could not bind"
+                .to_string(),
+        });
+    }
 
     Ok(QwenWholeDecoderLayerPlan {
-        d_model,
-        head_dim,
+        d_model: geometry.d_model,
+        head_dim: geometry.head_dim,
         attn_norm,
         q,
         k,
@@ -6049,6 +6036,113 @@ fn plan_qwen_family_layer(
     })
 }
 
+fn take_planned_vector(
+    vectors: &mut std::collections::HashMap<String, VectorWeightPlan>,
+    name: &str,
+) -> Result<VectorWeightPlan, Qwen3AsrLlmTransformerError> {
+    vectors
+        .remove(name)
+        .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: name.to_string(),
+            shape: "[]".to_string(),
+            reason: "contract descriptor did not project a vector weight for this name".to_string(),
+        })
+}
+
+fn take_planned_projection(
+    projections: &mut std::collections::HashMap<String, ProjectionWeightPlan>,
+    name: &str,
+) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
+    projections
+        .remove(name)
+        .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: name.to_string(),
+            shape: "[]".to_string(),
+            reason: "contract descriptor did not project a projection weight for this name"
+                .to_string(),
+        })
+}
+
+enum PlannedContractWeight {
+    Vector(VectorWeightPlan),
+    Projection(ProjectionWeightPlan),
+}
+
+/// Project one admission descriptor into a loader weight plan. Shape authority
+/// is the descriptor requirement (same expansion admission validates against).
+fn plan_weight_from_contract_descriptor(
+    reader: &GgufTensorDataReader,
+    descriptor: &TensorBindingDescriptor,
+) -> Result<PlannedContractWeight, Qwen3AsrLlmTransformerError> {
+    let tensor = required_tensor_metadata(reader, &descriptor.tensor_name)?;
+    match &descriptor.requirement {
+        TensorBindingDescriptorRequirement::VectorLen(expected_len) => {
+            if tensor.dims.as_slice() != [*expected_len as u64] {
+                return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: descriptor.tensor_name.clone(),
+                    shape: render_shape(&tensor.dims),
+                    reason: format!(
+                        "contract requires vector len {expected_len} ({})",
+                        descriptor.reason
+                    ),
+                });
+            }
+            Ok(PlannedContractWeight::Vector(VectorWeightPlan {
+                tensor_name: descriptor.tensor_name.clone(),
+                len: *expected_len,
+                ggml_type: tensor.ggml_type,
+                size_bytes: tensor.size_bytes,
+                offset_bytes: tensor.offset_bytes,
+            }))
+        }
+        TensorBindingDescriptorRequirement::ExactDims(expected) if expected.len() == 2 => {
+            let input_width = expected[0];
+            let output_width = expected[1];
+            let canonical = [input_width as u64, output_width as u64];
+            let transposed = [output_width as u64, input_width as u64];
+            if tensor.dims.as_slice() == canonical {
+                Ok(PlannedContractWeight::Projection(
+                    projection_plan_from_metadata(
+                        descriptor.tensor_name.clone(),
+                        tensor,
+                        input_width,
+                        output_width,
+                        DenseProjectionLayout::OutputByInput,
+                    )?,
+                ))
+            } else if tensor.dims.as_slice() == transposed {
+                Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: descriptor.tensor_name.clone(),
+                    shape: render_shape(&tensor.dims),
+                    reason: format!(
+                        "qwen-family projection weights must use the ggml [in, out] dim order \
+                         (contract ExactDims {:?}); this pack stores them as [out, in], which \
+                         indicates it was built by an older importer - re-pack from source with \
+                         the current build ({})",
+                        expected, descriptor.reason
+                    ),
+                })
+            } else {
+                Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: descriptor.tensor_name.clone(),
+                    shape: render_shape(&tensor.dims),
+                    reason: format!(
+                        "contract ExactDims {:?} not matched ({})",
+                        expected, descriptor.reason
+                    ),
+                })
+            }
+        }
+        other => Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+            tensor_name: descriptor.tensor_name.clone(),
+            shape: render_shape(&tensor.dims),
+            reason: format!(
+                "qwen decoder contract descriptor uses unsupported requirement {other:?}"
+            ),
+        }),
+    }
+}
+
 fn required_tensor_metadata<'a>(
     reader: &'a GgufTensorDataReader,
     tensor_name: &str,
@@ -6062,28 +6156,6 @@ fn required_tensor_metadata<'a>(
     })
 }
 
-fn plan_vector_weight(
-    reader: &GgufTensorDataReader,
-    tensor_name: String,
-    expected_len: usize,
-) -> Result<VectorWeightPlan, Qwen3AsrLlmTransformerError> {
-    let tensor = required_tensor_metadata(reader, &tensor_name)?;
-    if tensor.dims.as_slice() != [expected_len as u64] {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name,
-            shape: render_shape(&tensor.dims),
-            reason: format!("expected [{expected_len}]"),
-        });
-    }
-    Ok(VectorWeightPlan {
-        tensor_name,
-        len: expected_len,
-        ggml_type: tensor.ggml_type,
-        size_bytes: tensor.size_bytes,
-        offset_bytes: tensor.offset_bytes,
-    })
-}
-
 fn plan_projection_weight_for_input(
     reader: &GgufTensorDataReader,
     tensor_name: String,
@@ -6092,29 +6164,6 @@ fn plan_projection_weight_for_input(
     let tensor = required_tensor_metadata(reader, &tensor_name)?;
     let (input_width, output_width, layout) =
         parse_projection_shape_for_input(&tensor_name, &tensor.dims, input_width)?;
-    projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
-}
-
-fn plan_projection_weight_with_input_output(
-    reader: &GgufTensorDataReader,
-    tensor_name: String,
-    input_width: usize,
-    output_width: usize,
-) -> Result<ProjectionWeightPlan, Qwen3AsrLlmTransformerError> {
-    let tensor = required_tensor_metadata(reader, &tensor_name)?;
-    let layout = if tensor.dims.as_slice() == [input_width as u64, output_width as u64] {
-        DenseProjectionLayout::OutputByInput
-    } else if tensor.dims.as_slice() == [output_width as u64, input_width as u64] {
-        DenseProjectionLayout::InputByOutput
-    } else {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name,
-            shape: render_shape(&tensor.dims),
-            reason: format!(
-                "expected [{input_width} x {output_width}] or [{output_width} x {input_width}]"
-            ),
-        });
-    };
     projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
 }
 

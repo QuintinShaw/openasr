@@ -469,6 +469,15 @@ pub struct DomainReservationRequest {
     pub snapshot: DeviceMemorySnapshot,
     pub peak_bytes: u64,
     pub retained_bytes: u64,
+    /// Bytes that must fit in **live** free/observed capacity for this row.
+    ///
+    /// `None` (default) means the observed check uses [`Self::peak_bytes`] —
+    /// ordinary anonymous allocations. `Some(0)` is for already-open reclaimable
+    /// file-backed residency: the policy ledger still charges `peak_bytes` so
+    /// concurrent distinct packs fail closed, but live free is not required to
+    /// cover the mapping size again (clean file pages are reclaimable and often
+    /// still counted as free by the host).
+    pub observed_peak_bytes: Option<u64>,
     pub requires_reconciliation: bool,
     pub resource_id: String,
     pub(crate) cohort_id: Option<MemoryReservationCohortId>,
@@ -481,6 +490,7 @@ impl DomainReservationRequest {
             snapshot,
             peak_bytes: footprint.peak_bytes,
             retained_bytes: footprint.retained_bytes,
+            observed_peak_bytes: None,
             requires_reconciliation: footprint.requires_reconciliation,
             resource_id: footprint.resource_ids.join("+"),
             cohort_id: None,
@@ -521,6 +531,8 @@ pub struct DeviceMemoryBrokerSet {
             super::pack_weight_residency::PackWeightResidencyEntry,
         >,
     >,
+    /// Monotonic generation for pack-weight residency entries (ABA guard).
+    pub(crate) next_pack_weight_residency_generation: AtomicU64,
 }
 
 impl DeviceMemoryBrokerSet {
@@ -531,6 +543,8 @@ impl DeviceMemoryBrokerSet {
             next_anonymous_cohort: AtomicU64::new(1),
             pack_weight_residencies:
                 super::pack_weight_residency::empty_pack_weight_residency_table(),
+            next_pack_weight_residency_generation:
+                super::pack_weight_residency::new_pack_weight_residency_generation_counter(),
         }
     }
 
@@ -577,6 +591,11 @@ impl DeviceMemoryBrokerSet {
         struct Aggregate {
             snapshot: DeviceMemorySnapshot,
             peak_bytes: u64,
+            /// Live free/observed capacity required for this aggregate. Defaults
+            /// to [`Self::peak_bytes`] per row unless a request overrides with
+            /// [`DomainReservationRequest::observed_peak_bytes`] (e.g. already-
+            /// open reclaimable file-backed residency uses 0).
+            observed_peak_bytes: u64,
             retained_bytes: u64,
             requires_reconciliation: bool,
             resource_ids: Vec<String>,
@@ -623,6 +642,14 @@ impl DeviceMemoryBrokerSet {
                         retained_bytes: request.retained_bytes,
                     });
                 }
+                let row_observed_peak = request.observed_peak_bytes.unwrap_or(request.peak_bytes);
+                if row_observed_peak > request.peak_bytes {
+                    return Err(MemoryPlanningError::InvalidDomainFootprint {
+                        domain: request.domain.clone(),
+                        peak_bytes: request.peak_bytes,
+                        retained_bytes: row_observed_peak,
+                    });
+                }
                 if !seen_domains.insert(request.domain.clone()) {
                     return Err(MemoryPlanningError::DuplicateMemoryDomain {
                         domain: request.domain.clone(),
@@ -643,6 +670,12 @@ impl DeviceMemoryBrokerSet {
                         .ok_or(MemoryPlanningError::ArithmeticOverflow {
                             operation: "partitioned candidate peak sum",
                         })?;
+                    aggregate.observed_peak_bytes = aggregate
+                        .observed_peak_bytes
+                        .checked_add(row_observed_peak)
+                        .ok_or(MemoryPlanningError::ArithmeticOverflow {
+                            operation: "partitioned candidate observed peak sum",
+                        })?;
                     aggregate.retained_bytes = aggregate
                         .retained_bytes
                         .checked_add(request.retained_bytes)
@@ -662,6 +695,7 @@ impl DeviceMemoryBrokerSet {
                         Aggregate {
                             snapshot: normalized,
                             peak_bytes: request.peak_bytes,
+                            observed_peak_bytes: row_observed_peak,
                             retained_bytes: request.retained_bytes,
                             requires_reconciliation: request.requires_reconciliation,
                             resource_ids: vec![request.resource_id.clone()],
@@ -722,9 +756,20 @@ impl DeviceMemoryBrokerSet {
             // Pending reservations are not necessarily reflected in the
             // driver's free snapshot yet. Committed allocations normally are,
             // so subtracting committed bytes here would count them twice.
+            //
+            // Policy check uses peak_bytes (full ownership charge). Observed
+            // check uses observed_peak_bytes so reclaimable already-open
+            // file-backed residency can charge policy without requiring live
+            // free == pack size a second time.
+            let policy_ok = aggregate.peak_bytes <= policy_remaining;
             let observed_remaining = observed_ceiling.saturating_sub(account.pending_bytes);
-            let available_bytes = policy_remaining.min(observed_remaining);
-            if aggregate.peak_bytes > available_bytes {
+            let observed_ok = aggregate.observed_peak_bytes <= observed_remaining;
+            if !policy_ok || !observed_ok {
+                let available_bytes = if !policy_ok {
+                    policy_remaining
+                } else {
+                    observed_remaining
+                };
                 return Err(MemoryPlanningError::DeviceBudgetExceeded {
                     domain: domain.clone(),
                     resource_id: aggregate.resource_ids.join("+"),
@@ -1521,6 +1566,7 @@ mod tests {
             snapshot: snapshot(free),
             peak_bytes,
             retained_bytes,
+            observed_peak_bytes: None,
             requires_reconciliation: false,
             resource_id: resource_id.to_string(),
             cohort_id: None,

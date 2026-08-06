@@ -8182,20 +8182,20 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
     let residency =
         match crate::models::native_execution_services::current_native_execution_memory_broker() {
             Some(broker) => {
+                // Live host snapshot. FILE_BACKED residency uses observed_peak=0 so an
+                // already-open reclaimable mapping does not need free >= pack size;
+                // free=total would bypass real unreclaimable host pressure and is
+                // forbidden. Policy still charges full pack size for multi-pack
+                // fail-closed.
                 let total = crate::host::host_total_memory_bytes()
                     .or_else(crate::host::host_available_memory_bytes)
                     .unwrap_or(requested_bytes)
                     .max(1);
-                // The pack mapping is already open at preflight. FILE_BACKED host
-                // import does not allocate a second anonymous copy. Live free/inactive
-                // pages already treat clean file-backed pages as reclaimable, so the
-                // observed-free side must not re-apply pack size + headroom against
-                // the same mapping. Use total as the observed free floor so the
-                // *policy* ledger (committed residencies of distinct packs) remains
-                // the binding multi-pack constraint; same-mapping shares still charge
-                // zero incremental via residency.
+                let free = crate::host::host_available_memory_bytes()
+                    .unwrap_or(total)
+                    .min(total);
                 let candidate = DeviceMemorySnapshot {
-                    free_bytes: total,
+                    free_bytes: free,
                     total_bytes: total,
                     confidence: MemoryObservationConfidence::DeviceSnapshot,
                 };

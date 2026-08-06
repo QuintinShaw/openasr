@@ -287,6 +287,7 @@ impl<T> SystemMemoryOwner<T> {
                 snapshot: snapshot_before,
                 peak_bytes: quoted_peak_bytes,
                 retained_bytes: quoted_retained_bytes,
+                observed_peak_bytes: None,
                 // Rust allocator capacity is measured only after construction;
                 // the provisional/exclusive path is what makes reconciliation
                 // safe even when `reserve_exact` rounds upward.
@@ -496,6 +497,7 @@ mod tests {
                     snapshot: snapshot(200),
                     peak_bytes: 96,
                     retained_bytes: 96,
+                    observed_peak_bytes: None,
                     requires_reconciliation: true,
                     resource_id: "test.competing".to_string(),
                     cohort_id: None,
@@ -552,6 +554,7 @@ mod tests {
             snapshot: snapshot(200),
             peak_bytes: 96,
             retained_bytes: 96,
+            observed_peak_bytes: None,
             requires_reconciliation: true,
             resource_id: "test.concurrent-competing".to_string(),
             cohort_id: None,
