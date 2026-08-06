@@ -104,13 +104,11 @@ fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FunasrNanoDecoderMetadata,
 ) -> Result<QwenWholeDecoderPlan, FunasrNanoDecoderError> {
+    use crate::models::qwen::QwenDecoderContractOptions;
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
-        metadata.n_layers,
-        metadata.d_model,
-        metadata.n_heads,
-        metadata.n_kv_heads,
-        metadata.head_dim,
+        super::runtime_contract::funasr_nano_qwen_decoder_geometry(metadata),
+        QwenDecoderContractOptions::QWEN3,
         super::runtime_contract::funasr_nano_qwen_family_layer_names,
     )
     .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {

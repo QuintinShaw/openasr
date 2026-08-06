@@ -720,7 +720,7 @@ fn validate_speech_channel_consistency(
 /// shapes reversed). Vectors, conv kernels, and the mel tables must match
 /// exactly, mirroring the loaders' own shape assertions.
 /// Map mimo-asr backbone LLM metadata onto the shared Qwen-shaped geometry.
-fn mimo_asr_qwen_decoder_geometry(
+pub(crate) fn mimo_asr_qwen_decoder_geometry(
     llm: &MimoLlmMetadata,
 ) -> crate::models::qwen::QwenDecoderContractGeometry {
     crate::models::qwen::QwenDecoderContractGeometry {

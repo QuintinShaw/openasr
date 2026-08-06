@@ -487,7 +487,7 @@ pub(crate) fn parse_moss_td_execution_metadata<M: ScalarMetadataView>(
 
 /// Map moss-transcribe-diarize decoder metadata onto the shared Qwen-shaped
 /// geometry.
-fn moss_td_qwen_decoder_geometry(
+pub(crate) fn moss_td_qwen_decoder_geometry(
     decoder: &MossTdDecoderMetadata,
 ) -> crate::models::qwen::QwenDecoderContractGeometry {
     crate::models::qwen::QwenDecoderContractGeometry {

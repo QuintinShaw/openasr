@@ -757,7 +757,7 @@ pub(crate) fn funasr_nano_adapter_tensor_descriptors(
 }
 
 /// Map funasr-nano decoder metadata onto the shared Qwen-shaped geometry.
-fn funasr_nano_qwen_decoder_geometry(
+pub(crate) fn funasr_nano_qwen_decoder_geometry(
     decoder: &FunasrNanoDecoderMetadata,
 ) -> crate::models::qwen::QwenDecoderContractGeometry {
     crate::models::qwen::QwenDecoderContractGeometry {

@@ -20,6 +20,7 @@ use crate::ggml_runtime::{
     GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
 };
 
+use super::decoder_contract::{QwenDecoderContractGeometry, QwenDecoderContractOptions};
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
 use super::logits_head::{
@@ -187,6 +188,7 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
     #[error(
         "qwen3-asr llm transformer q/k norm width mismatch: vector_width={vector_width}, norm_width={norm_width}"
     )]
+    #[cfg(test)]
     QkNormWidthMismatch {
         vector_width: usize,
         norm_width: usize,
@@ -211,6 +213,7 @@ pub(crate) enum Qwen3AsrLlmTransformerError {
     #[error(
         "qwen3-asr llm transformer ffn projection width mismatch: gate_width={gate_width}, up_width={up_width}"
     )]
+    #[cfg(test)]
     FfnProjectionWidthMismatch { gate_width: usize, up_width: usize },
 }
 
@@ -5713,13 +5716,35 @@ impl QwenWholeDecoderPlan {
         reader: &GgufTensorDataReader,
         metadata: Qwen3AsrExecutionMetadata,
     ) -> Result<Self, Qwen3AsrLlmTransformerError> {
+        // Qwen3-ASR packs do not yet pin ffn_dim in execution metadata; resolve
+        // it from layer-0 gate once, then freeze geometry so every layer shares
+        // the same contract-validated widths as FunASR/MOSS/MiMo/FireRed.
+        let layer0_names = llm_layer_tensor_names(0);
+        let gate0 = plan_projection_weight_for_input(
+            reader,
+            layer0_names.ffn_gate_weight.clone(),
+            metadata.llm_d_model,
+        )?;
+        if gate0.layout != DenseProjectionLayout::OutputByInput {
+            return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: gate0.tensor_name,
+                shape: format!("{:?}", gate0.storage_dims),
+                reason: "qwen-family FFN gate must use ggml [in, out] dim order".to_string(),
+            });
+        }
+        let geometry = QwenDecoderContractGeometry {
+            n_layers: metadata.llm_layers,
+            d_model: metadata.llm_d_model,
+            n_heads: metadata.llm_heads,
+            n_kv_heads: metadata.llm_kv_heads,
+            head_dim: metadata.llm_head_dim,
+            ffn_dim: gate0.output_width,
+            vocab_size: metadata.vocab_size,
+        };
         Self::for_qwen_family(
             reader,
-            metadata.llm_layers,
-            metadata.llm_d_model,
-            metadata.llm_heads,
-            metadata.llm_kv_heads,
-            metadata.llm_head_dim,
+            geometry,
+            QwenDecoderContractOptions::QWEN3,
             |layer_index| {
                 let names = llm_layer_tensor_names(layer_index);
                 QwenFamilyLlmLayerTensorNames {
@@ -5742,32 +5767,32 @@ impl QwenWholeDecoderPlan {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Build a whole-decoder plan from the shared contract geometry + options.
+    ///
+    /// Shape expectations come only from [`QwenDecoderContractGeometry`] /
+    /// [`QwenDecoderContractOptions`] (the same source admission descriptors
+    /// expand from). The pack supplies tensor bytes/types/offsets; it cannot
+    /// invent a second geometry. Transposed `[out, in]` projections fail closed.
     pub(crate) fn for_qwen_family(
         reader: &GgufTensorDataReader,
-        layer_count: usize,
-        d_model: usize,
-        n_heads: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
+        geometry: QwenDecoderContractGeometry,
+        options: QwenDecoderContractOptions,
         mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
     ) -> Result<Self, Qwen3AsrLlmTransformerError> {
-        if layer_count == 0 {
-            return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                tensor_name: "<decoder layers>".to_string(),
-                shape: "[]".to_string(),
-                reason: "whole decoder requires at least one layer".to_string(),
-            });
-        }
-        let mut layers = Vec::with_capacity(layer_count);
-        for layer_index in 0..layer_count {
+        geometry.validate_basic().map_err(|reason| {
+            Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<decoder geometry>".to_string(),
+                shape: format!("{geometry:?}"),
+                reason,
+            }
+        })?;
+        let mut layers = Vec::with_capacity(geometry.n_layers);
+        for layer_index in 0..geometry.n_layers {
             layers.push(plan_qwen_family_layer(
                 reader,
                 names_for_layer(layer_index),
-                d_model,
-                n_heads,
-                n_kv_heads,
-                head_dim,
+                geometry,
+                options,
             )?);
         }
         Ok(Self { layers })
@@ -5885,95 +5910,125 @@ impl QwenWholeDecoderPlan {
 fn plan_qwen_family_layer(
     reader: &GgufTensorDataReader,
     names: QwenFamilyLlmLayerTensorNames,
-    d_model: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
+    geometry: QwenDecoderContractGeometry,
+    options: QwenDecoderContractOptions,
 ) -> Result<QwenWholeDecoderLayerPlan, Qwen3AsrLlmTransformerError> {
-    if d_model == 0 || head_dim == 0 {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name: "<decoder geometry>".to_string(),
-            shape: format!("d_model={d_model}, head_dim={head_dim}"),
-            reason: "decoder widths must be positive".to_string(),
-        });
-    }
-    let q_output_width = projection_output_width(n_heads, head_dim)?;
-    let kv_output_width = projection_output_width(n_kv_heads, head_dim)?;
+    // Geometry is the sole shape authority (same source as admission descriptors).
+    // Fail closed on transposed [out, in] packs; do not re-derive widths from
+    // tensor dims beyond verifying ExactDims match.
+    let d_model = geometry.d_model;
+    let head_dim = geometry.head_dim;
+    let q_dim =
+        geometry
+            .q_dim()
+            .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<decoder geometry>".to_string(),
+                shape: format!("{geometry:?}"),
+                reason: "qwen decoder q_dim overflow".to_string(),
+            })?;
+    let kv_dim =
+        geometry
+            .kv_dim()
+            .ok_or_else(|| Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                tensor_name: "<decoder geometry>".to_string(),
+                shape: format!("{geometry:?}"),
+                reason: "qwen decoder kv_dim overflow".to_string(),
+            })?;
+    let ffn_dim = geometry.ffn_dim;
+    let require_out_by_in =
+        |plan: &ProjectionWeightPlan| -> Result<(), Qwen3AsrLlmTransformerError> {
+            if plan.layout != DenseProjectionLayout::OutputByInput {
+                return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: plan.tensor_name.clone(),
+                    shape: format!("{:?}", plan.storage_dims),
+                    reason:
+                        "qwen-family projection weights must use the ggml [in, out] dim order; \
+                             this pack stores them as [out, in], which indicates it was built by \
+                             an older importer - re-pack from source with the current build"
+                            .to_string(),
+                });
+            }
+            Ok(())
+        };
+
     let attn_norm = plan_vector_weight(reader, names.attn_norm_name, d_model)?;
-    let q = plan_projection_weight_with_input_output(
-        reader,
-        names.attn_q_name,
-        d_model,
-        q_output_width,
-    )?;
-    if q.layout != DenseProjectionLayout::OutputByInput {
-        return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name: q.tensor_name.clone(),
-            shape: format!("[output={q_output_width}, input={d_model}]"),
-            reason: "qwen-family projection weights must use the ggml [in, out] dim order; this pack stores them as [out, in], which indicates it was built by an older importer - re-pack from source with the current build".to_string(),
-        });
-    }
-    let k = plan_projection_weight_with_layout(
-        reader,
-        names.attn_k_name,
-        d_model,
-        kv_output_width,
-        q.layout,
-    )?;
-    let v = plan_projection_weight_with_layout(
-        reader,
-        names.attn_v_name,
-        d_model,
-        kv_output_width,
-        q.layout,
-    )?;
-    let q_bias = names
-        .q_bias_name
-        .map(|name| plan_vector_weight(reader, name, q.output_width))
-        .transpose()?;
-    let k_bias = names
-        .k_bias_name
-        .map(|name| plan_vector_weight(reader, name, k.output_width))
-        .transpose()?;
-    let v_bias = names
-        .v_bias_name
-        .map(|name| plan_vector_weight(reader, name, v.output_width))
-        .transpose()?;
-    let output = plan_projection_weight_with_input_output(
-        reader,
-        names.attn_output_name,
-        q.output_width,
-        d_model,
-    )?;
-    let q_norm = names
-        .q_norm_name
-        .map(|name| plan_vector_weight(reader, name, head_dim))
-        .transpose()?;
-    let k_norm = names
-        .k_norm_name
-        .map(|name| plan_vector_weight(reader, name, head_dim))
-        .transpose()?;
-    if q_norm.is_some() != k_norm.is_some() {
-        return Err(Qwen3AsrLlmTransformerError::QkNormWidthMismatch {
-            vector_width: q_norm.as_ref().map_or(0, |plan| plan.len),
-            norm_width: k_norm.as_ref().map_or(0, |plan| plan.len),
-        });
-    }
+    let q = plan_projection_weight_with_input_output(reader, names.attn_q_name, d_model, q_dim)?;
+    require_out_by_in(&q)?;
+    let k = plan_projection_weight_with_input_output(reader, names.attn_k_name, d_model, kv_dim)?;
+    require_out_by_in(&k)?;
+    let v = plan_projection_weight_with_input_output(reader, names.attn_v_name, d_model, kv_dim)?;
+    require_out_by_in(&v)?;
+
+    let (q_bias, k_bias, v_bias) =
+        if options.qkv_bias {
+            let q_bias_name = names.q_bias_name.ok_or_else(|| {
+                Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: "<q_bias>".to_string(),
+                    shape: "[]".to_string(),
+                    reason: "qwen decoder options.qkv_bias requires q_bias_name".to_string(),
+                }
+            })?;
+            let k_bias_name = names.k_bias_name.ok_or_else(|| {
+                Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: "<k_bias>".to_string(),
+                    shape: "[]".to_string(),
+                    reason: "qwen decoder options.qkv_bias requires k_bias_name".to_string(),
+                }
+            })?;
+            let v_bias_name = names.v_bias_name.ok_or_else(|| {
+                Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: "<v_bias>".to_string(),
+                    shape: "[]".to_string(),
+                    reason: "qwen decoder options.qkv_bias requires v_bias_name".to_string(),
+                }
+            })?;
+            (
+                Some(plan_vector_weight(reader, q_bias_name, q_dim)?),
+                Some(plan_vector_weight(reader, k_bias_name, kv_dim)?),
+                Some(plan_vector_weight(reader, v_bias_name, kv_dim)?),
+            )
+        } else {
+            (None, None, None)
+        };
+
+    let output =
+        plan_projection_weight_with_input_output(reader, names.attn_output_name, q_dim, d_model)?;
+    require_out_by_in(&output)?;
+
+    let (q_norm, k_norm) =
+        if options.qk_norm {
+            let q_norm_name = names.q_norm_name.ok_or_else(|| {
+                Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: "<q_norm>".to_string(),
+                    shape: "[]".to_string(),
+                    reason: "qwen decoder options.qk_norm requires q_norm_name".to_string(),
+                }
+            })?;
+            let k_norm_name = names.k_norm_name.ok_or_else(|| {
+                Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: "<k_norm>".to_string(),
+                    shape: "[]".to_string(),
+                    reason: "qwen decoder options.qk_norm requires k_norm_name".to_string(),
+                }
+            })?;
+            (
+                Some(plan_vector_weight(reader, q_norm_name, head_dim)?),
+                Some(plan_vector_weight(reader, k_norm_name, head_dim)?),
+            )
+        } else {
+            (None, None)
+        };
+
     let ffn_norm = plan_vector_weight(reader, names.ffn_norm_name, d_model)?;
-    let gate = plan_projection_weight_for_input(reader, names.ffn_gate_name, d_model)?;
-    let up = plan_projection_weight_for_input(reader, names.ffn_up_name, d_model)?;
-    if gate.output_width != up.output_width {
-        return Err(Qwen3AsrLlmTransformerError::FfnProjectionWidthMismatch {
-            gate_width: gate.output_width,
-            up_width: up.output_width,
-        });
-    }
-    let down = plan_projection_weight_with_input_output(
-        reader,
-        names.ffn_down_name,
-        gate.output_width,
-        d_model,
-    )?;
+    let gate =
+        plan_projection_weight_with_input_output(reader, names.ffn_gate_name, d_model, ffn_dim)?;
+    require_out_by_in(&gate)?;
+    let up = plan_projection_weight_with_input_output(reader, names.ffn_up_name, d_model, ffn_dim)?;
+    require_out_by_in(&up)?;
+    let down =
+        plan_projection_weight_with_input_output(reader, names.ffn_down_name, ffn_dim, d_model)?;
+    require_out_by_in(&down)?;
+
     Ok(QwenWholeDecoderLayerPlan {
         d_model,
         head_dim,
@@ -6063,6 +6118,7 @@ fn plan_projection_weight_with_input_output(
     projection_plan_from_metadata(tensor_name, tensor, input_width, output_width, layout)
 }
 
+#[cfg(test)]
 fn plan_projection_weight_with_layout(
     reader: &GgufTensorDataReader,
     tensor_name: String,
@@ -6384,6 +6440,7 @@ fn load_projection_weight_with_input_output(
     })
 }
 
+#[cfg(test)]
 fn projection_output_width(
     heads: usize,
     head_dim: usize,
@@ -6757,9 +6814,10 @@ mod tests {
             .with_tensor_shape(names.attn_q_norm_weight, [8_u64])
             .with_tensor_shape(names.attn_k_norm_weight, [8_u64])
             .with_tensor_shape(names.ffn_norm_weight, [16_u64])
-            .with_tensor_shape(names.ffn_gate_weight, [32_u64, 16_u64])
-            .with_tensor_shape(names.ffn_up_weight, [32_u64, 16_u64])
-            .with_tensor_shape(names.ffn_down_weight, [16_u64, 32_u64]);
+            // ggml [in, out]: gate/up = [d_model, ffn_dim], down = [ffn_dim, d_model]
+            .with_tensor_shape(names.ffn_gate_weight, [16_u64, 32_u64])
+            .with_tensor_shape(names.ffn_up_weight, [16_u64, 32_u64])
+            .with_tensor_shape(names.ffn_down_weight, [32_u64, 16_u64]);
         if k_as_f16 {
             spec = spec.with_tensor_f16(k_weight_name);
         }

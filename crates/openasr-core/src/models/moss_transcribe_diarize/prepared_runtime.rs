@@ -250,11 +250,8 @@ pub(crate) fn build_moss_td_prepared_runtime(
     })?;
     let decoder_plan = QwenWholeDecoderPlan::for_qwen_family(
         &reader,
-        decoder_metadata.n_layers,
-        decoder_metadata.d_model,
-        decoder_metadata.n_heads,
-        decoder_metadata.n_kv_heads,
-        decoder_metadata.head_dim,
+        super::runtime_contract::moss_td_qwen_decoder_geometry(&decoder_metadata),
+        crate::models::qwen::QwenDecoderContractOptions::QWEN3,
         moss_td_qwen_family_layer_names,
     )
     .map_err(|error| MossTdPreparedRuntimeError::DecoderPlan {

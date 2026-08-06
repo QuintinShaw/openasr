@@ -92,13 +92,12 @@ fn plan_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &MimoLlmMetadata,
 ) -> Result<QwenWholeDecoderPlan, MimoLlmDecoderError> {
+    use super::runtime_contract::mimo_asr_qwen_decoder_geometry;
+    use crate::models::qwen::QwenDecoderContractOptions;
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
-        metadata.n_layers,
-        metadata.d_model,
-        metadata.n_heads,
-        metadata.n_kv_heads,
-        metadata.head_dim,
+        mimo_asr_qwen_decoder_geometry(metadata),
+        QwenDecoderContractOptions::QWEN2,
         mimo_asr_qwen_family_layer_names,
     )
     .map_err(|error| MimoLlmDecoderError::TensorReadFailed {

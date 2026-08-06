@@ -479,7 +479,7 @@ pub(crate) enum FireRedLlmRuntimeTensorContractError {
 }
 
 /// Map firered-llm decoder metadata onto the shared Qwen-shaped geometry.
-fn firered_llm_qwen_decoder_geometry(
+pub(crate) fn firered_llm_qwen_decoder_geometry(
     decoder: &FireRedLlmDecoderMetadata,
 ) -> crate::models::qwen::QwenDecoderContractGeometry {
     crate::models::qwen::QwenDecoderContractGeometry {

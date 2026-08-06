@@ -137,13 +137,12 @@ fn plan_qwen2_whole_decoder(
     reader: &crate::ggml_runtime::GgufTensorDataReader,
     metadata: &FireRedLlmDecoderMetadata,
 ) -> Result<QwenWholeDecoderPlan, FireRedLlmDecoderError> {
+    use super::runtime_contract::firered_llm_qwen_decoder_geometry;
+    use crate::models::qwen::QwenDecoderContractOptions;
     QwenWholeDecoderPlan::for_qwen_family(
         reader,
-        metadata.n_layers,
-        metadata.d_model,
-        metadata.n_heads,
-        metadata.n_kv_heads,
-        metadata.head_dim,
+        firered_llm_qwen_decoder_geometry(metadata),
+        QwenDecoderContractOptions::QWEN2,
         firered_llm_qwen_family_layer_names,
     )
     .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
