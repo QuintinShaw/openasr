@@ -265,16 +265,27 @@ mod tests {
 
     #[test]
     fn merges_trailing_orphan_into_previous_cue() {
+        // Duration forces a cut that leaves a dangling two-word tail of the
+        // same sentence. Inter-word gaps stay below MIN_PAUSE_GAP_S so the
+        // orphan merge is allowed (pause-split cues must not be re-glued).
+        // (Keep fixture in lockstep with subtitle::cues::tests.)
         let words = vec![
-            word("the", 0.0, 0.3),
-            word("quick", 0.5, 0.9),
-            word("brown", 1.2, 1.6),
-            word("fox", 2.0, 2.4),
-            word("jumps,", 3.0, 3.4),
-            word("over", 5.6, 5.9),
-            word("it", 6.0, 6.2),
+            word("alpha", 0.0, 0.5),
+            word("bravo", 0.6, 1.1),
+            word("charlie", 1.2, 1.7),
+            word("delta", 1.8, 2.3),
+            word("echo", 2.4, 2.9),
+            word("foxtrot", 3.0, 3.5),
+            word("golf", 3.6, 4.1),
+            word("hotel", 4.2, 4.7),
+            word("india", 4.8, 5.3),
+            word("juliet", 5.4, 5.9),
+            // 0.30s gap (< MIN_PAUSE_GAP_S) is the widest, so choose_cut lands
+            // here; the remaining two words are an orphan tail.
+            word("kilo", 6.2, 6.5),
+            word("lima", 6.55, 6.8),
         ];
-        let text = "the quick brown fox jumps, over it";
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
         let cues = segment_into_cues(segment(text, words));
         assert!(
             cues.last().map(|c| c.words.len()).unwrap_or(0) > ORPHAN_MAX_WORDS || cues.len() == 1,
