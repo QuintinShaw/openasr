@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-05T19:32:35+00:00",
+  "generated_at": "2026-08-06T01:29:40+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -3897,6 +3897,77 @@
       "upstream_release_date": "2022-09-21",
       "speaker_source": "external",
       "word_timestamp_source": "native"
+    },
+    {
+      "id": "diarizen-large-s80-v2",
+      "kind": "capability-pack",
+      "capability": {
+        "feature": "speaker-diarization",
+        "role": "speaker-segmenter"
+      },
+      "display_name": "DiariZen Large-s80-md-v2",
+      "family": "diarizen-segmentation",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "segmenter",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "BUT-FIT",
+      "license": "CC BY-NC 4.0",
+      "license_url": "https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md",
+      "license_class": "noncommercial",
+      "hf_repo": "OpenASR/diarizen-large-s80-v2",
+      "hf_revision": "655b0132a5539f55d5ad3fffc88a2206ab0b7238",
+      "public": true,
+      "min_cli_version": "0.1.28",
+      "recommended_quant": "fp16",
+      "pull_recommended": "diarizen-large-s80-v2:fp16",
+      "prose": {
+        "tagline": "DiariZen Large-s80-md-v2 \u2014 optional high-accuracy overlap-aware speaker segmentation for local Voice ID",
+        "overview": [
+          "DiariZen Large-s80-md-v2 is BUT Speech@FIT's overlap-aware speaker-segmentation\ncheckpoint built from a 24-layer WavLM Large encoder and a Conformer EEND head.\nOpenASR packages the pinned checkpoint as one fp16 `.oasr` capability pack and\nuses it as an optional external segmenter in the universal local-file Voice ID\npipeline. It predicts recording-local speaker activity; ReDimNet2-B6 still\nprovides clustering and enrolled-person identity. The checkpoint is licensed\nunder CC BY-NC 4.0, so downloading and activating it require explicit\nnon-commercial acknowledgement. OpenASR does not select it merely because Voice\nID was enabled; the permissive segmentation-3.0 pack remains the default."
+        ],
+        "highlights": [
+          "\ud83d\udde3\ufe0f **Overlap-aware local activity** \u2014 a WavLM Large + Conformer EEND segmenter predicts four local speaker streams in each 16 s window",
+          "\ud83c\udfaf **Qualified native accuracy** \u2014 OpenASR's fp16 pipeline measured 7.9491% DER on six locked Mandarin meeting excerpts, versus 18.6787% for the MOSS baseline under the same scoring protocol",
+          "\ud83e\udd1d **Shared Voice ID contract** \u2014 combines with FireRed Stream-VAD, ReDimNet2-B6 and automatic clustering; ASR models consume one normalized speaker timeline",
+          "\ud83d\udd12 **Explicit non-commercial consent** \u2014 the checkpoint is CC BY-NC 4.0 and is never downloaded or activated without acknowledgement; segmentation-3.0 remains the permissive default",
+          "\ud83e\udd80 **Native fp16 runtime** \u2014 the `.oasr` pack runs locally through OpenASR's persistent ggml graph without Python at inference time"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "diarizen-large-s80-v2:fp16",
+          "filename": "diarizen-large-s80-v2-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/diarizen-large-s80-v2/resolve/655b0132a5539f55d5ad3fffc88a2206ab0b7238/diarizen-large-s80-v2-fp16.oasr",
+          "sha256": "1d4b2c2e9fe3a3f6eebfc8f2280bca04dcbc6f9b14e4d9cbccb0fdca40e88311",
+          "size_bytes": 139425120,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": 0.512798,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "DiariZen Large-s80-md-v2\uff1a\u7528\u4e8e\u672c\u5730 Voice ID \u7684\u53ef\u9009\u9ad8\u7cbe\u5ea6\u91cd\u53e0\u8bed\u97f3\u8bf4\u8bdd\u4eba\u5206\u5272\u6a21\u578b",
+          "highlights": [
+            "\ud83d\udde3\ufe0f **\u611f\u77e5\u91cd\u53e0\u8bed\u97f3** \u2014 WavLM Large + Conformer EEND \u5728\u6bcf\u4e2a 16 \u79d2\u7a97\u53e3\u4e2d\u9884\u6d4b\u56db\u8def\u5c40\u90e8\u8bf4\u8bdd\u4eba\u6d3b\u52a8",
+            "\ud83c\udfaf **\u539f\u751f\u8d28\u91cf\u5df2\u9a8c\u6536** \u2014 OpenASR fp16 \u7ba1\u7ebf\u5728\u516d\u6bb5\u9501\u5b9a\u4e2d\u6587\u4f1a\u8bae\u97f3\u9891\u4e0a\u5b9e\u6d4b DER 7.9491%\uff0c\u540c\u53e3\u5f84 MOSS \u4e3a 18.6787%",
+            "\ud83e\udd1d **\u5171\u7528 Voice ID \u5951\u7ea6** \u2014 \u4e0e FireRed Stream-VAD\u3001ReDimNet2-B6 \u548c\u81ea\u52a8\u805a\u7c7b\u7ec4\u5408\uff0c\u5411\u4e0a\u5c42\u4ea4\u4ed8\u7edf\u4e00\u8bf4\u8bdd\u4eba\u65f6\u95f4\u7ebf",
+            "\ud83d\udd12 **\u5fc5\u987b\u660e\u786e\u786e\u8ba4\u975e\u5546\u4e1a\u8bb8\u53ef** \u2014 \u6743\u91cd\u4e3a CC BY-NC 4.0\uff0c\u4e0d\u4f1a\u88ab\u9ed8\u8ba4\u4e0b\u8f7d\u6216\u542f\u7528\uff1bsegmentation-3.0 \u4ecd\u662f\u5bbd\u677e\u8bb8\u53ef\u7684\u9ed8\u8ba4\u9009\u62e9",
+            "\ud83e\udd80 **\u539f\u751f fp16 \u8fd0\u884c\u65f6** \u2014 `.oasr` \u5305\u5728\u672c\u5730\u901a\u8fc7 OpenASR \u6301\u4e45\u5316 ggml \u8ba1\u7b97\u56fe\u8fd0\u884c\uff0c\u63a8\u7406\u65f6\u4e0d\u9700\u8981 Python"
+          ]
+        }
+      },
+      "min_core_version": "0.1.28"
     }
   ],
   "language_labels": {
