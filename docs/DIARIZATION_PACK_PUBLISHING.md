@@ -32,21 +32,22 @@ file-pipeline design.
 | --- | --- | --- | --- |
 | `redimnet2-b6-cn` | Sole speaker embedder and identity space | fp16 | MIT, published |
 | `pyannote-segmentation-3.0` | Default external local-activity segmenter | f32 | MIT, published |
-| `diarizen-large-s80-v2` | Optional external local-activity segmenter | fp16 | CC BY-NC 4.0, source-only staged, not published or pullable |
+| `diarizen-large-s80-v2` | Optional external local-activity segmenter | fp16 | CC BY-NC 4.0, published; explicit non-commercial acceptance required |
 
 FireRed Stream-VAD is a vendored Apache-2.0 runtime asset rather than a separate
 user-installed capability pack.
 
-`auto` uses segmentation-3.0 in the default installation. A future explicitly
+`auto` uses segmentation-3.0 in the default installation. An explicitly
 consented DiariZen installation may take precedence; removing or disabling it
 returns to segmentation-3.0. Request preflight freezes the chosen segmenter and
 the exact ReDimNet pack content for the whole job. A provider that is present but
 broken fails closed instead of silently changing algorithms mid-request.
 
-DiariZen's `release_public = false` publishing source deliberately produces no
-registry card, signed catalog entry, URL, size, or sha256. Do not manufacture
-those fields. Publishing requires a separately approved native quality/resource
-audit and product consent flow for its non-commercial license.
+DiariZen is a public but non-commercial capability pack. Catalog discovery does
+not grant permission to use it: pull surfaces must show the checkpoint license
+and require explicit acceptance, and runtime activation is a separate user
+choice. Enabling Voice ID alone continues to prepare segmentation-3.0 and never
+implicitly downloads or activates DiariZen.
 
 ## Qualification evidence
 
@@ -55,7 +56,7 @@ duration-weighted DER, a 0.25 s collar, and overlap scoring:
 
 | Path | DER | Scope |
 | --- | ---: | --- |
-| OpenASR native + DiariZen Large-s80-md-v2 fp16 + ReDimNet2-B6 fp16 | **7.9491%** | Production runtime path on the locked fixtures; source-only qualification, not a release/distribution claim |
+| OpenASR native + DiariZen Large-s80-md-v2 fp16 + ReDimNet2-B6 fp16 | **7.9491%** | Production runtime path on the locked fixtures; fixed-corpus qualification, not a cross-domain guarantee |
 | FireRed + DiariZen Large-s80-md-v2 fp16 + ReDimNet2-B6 research adapter | 8.1232% | Qualified pack reconstructed in the locked Python adapter |
 | FireRed + DiariZen Large-s80-md-v2 F32 + ReDimNet2-B6 research adapter | 8.1274% | Upstream-checkpoint precision reference |
 | FireRed + DiariZen Base-s80 + ReDimNet2-B6 research adapter | 9.0481% | Historical Base-s80 F32 reference configuration; not a current product model or native release claim |
@@ -117,10 +118,10 @@ Runtime override for a local development pack:
 export OPENASR_PYANNOTE_PACK=/path/to/pyannote-segmentation-3.0-f32.oasr
 ```
 
-### DiariZen Large-s80-md-v2 qualification only
+### DiariZen Large-s80-md-v2
 
-The converter is available for local qualification, but the output is not a
-published artifact:
+The converter reproduces the published fp16 artifact from the pinned upstream
+checkpoint:
 
 ```bash
 python3 tooling/diarizen/convert_diarizen.py \
@@ -131,8 +132,7 @@ python3 tooling/diarizen/convert_diarizen.py \
     --quant fp16
 ```
 
-Do not run public regeneration for this source while `release_public = false`.
-The local override is for controlled qualification, not a distribution promise:
+The local override remains available for controlled qualification:
 
 ```bash
 export OPENASR_DIARIZEN_PACK=/path/to/diarizen-large-s80-v2-fp16.oasr
@@ -148,8 +148,9 @@ tooling/publish-model/scripts/publish_catalog.sh
 ```
 
 That refreshes the committed full and public catalog signatures. Deploying the
-public projection to Cloudflare is a separate release action. A source-only
-DiariZen row must remain absent from both generated catalogs.
+public projection to Cloudflare is a separate release action. DiariZen may enter
+that projection only with `license_class = "noncommercial"` and verified
+CC BY-NC 4.0 provenance embedded in the pack.
 
 ## Operator pull
 
@@ -158,9 +159,9 @@ The currently published capability packs are pullable explicitly:
 ```bash
 openasr pull redimnet2-b6-cn
 openasr pull pyannote-segmentation-3.0
+openasr pull diarizen-large-s80-v2 --accept-license
 ```
 
-`openasr pull diarizen-large-s80-v2` is intentionally unavailable until a separate
-publication approval creates a real signed entry. Installed packs are resolved
-through the content-addressed model store or the development overrides above;
-runtime selection never authorizes a download.
+Omitting `--accept-license` for DiariZen fails closed. Installed packs are
+resolved through the content-addressed model store or the development overrides
+above; runtime selection never authorizes a download.

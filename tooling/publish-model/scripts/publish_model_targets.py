@@ -35,7 +35,8 @@ HF_TOKEN_ENV = "HF_TOKEN"
 PREFLIGHT_RECEIPT_SCHEMA = "openasr.model-pack-preflight.v1"
 BUILD_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # Models cleared for this pack-publish lane. Repository visibility and public
-# catalog listing remain separately gated; DiariZen stays `release_public=false`.
+# catalog listing remain separately gated; non-commercial packs additionally
+# retain their explicit license-acceptance contract.
 RELEASE_LANE_MODELS = (
     DEFAULT_MODEL,
     "qwen3-asr-1.7b",

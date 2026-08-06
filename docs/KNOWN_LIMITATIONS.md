@@ -36,9 +36,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   clears Voice ID's evidence gates. See [FAQ.md](FAQ.md#is-diarization-available)
   and [SECURITY.md](../SECURITY.md).
 - segmentation-3.0 is the default, MIT-licensed external segmenter. DiariZen
-  Large-s80-md-v2 is staged as an optional CC BY-NC 4.0 provider, but no
-  DiariZen pack is present in the signed full/public catalogs and it is not
-  currently an `openasr pull` target. The qualified candidate is fp16-only. Its
+  Large-s80-md-v2 is a published optional CC BY-NC 4.0 provider and remains
+  fp16-only. Download and activation require explicit non-commercial license
+  acknowledgement; merely enabling Voice ID does not install it. Its
   locked six-file F32/Python reference measured 8.1274% DER, and reconstructing
   the qualified mixed-precision pack in the same adapter measured 8.1232%, with
   no material precision loss. The native OpenASR path measured 7.9491% DER
@@ -49,8 +49,8 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   the external test harness output pipe failed before M3 started; it is not a
   claim of one uninterrupted six-file process. The historical Base-s80 F32
   reference was 9.0481%, and the segmentation-3.0 research adapter was 12.4466%.
-  These fixed Mandarin meeting-slice results qualify the implementation, not a
-  shipped product DER, cross-domain guarantee, or cross-recording Voice ID
+  These fixed Mandarin meeting-slice results qualify the published
+  implementation, not a cross-domain guarantee or cross-recording Voice ID
   enrollment/unknown-rejection guarantee; the AISHELL excerpts still
   underestimate speaker count.
 - Phrase bias / hotword boosting is implemented for the native runtime decode

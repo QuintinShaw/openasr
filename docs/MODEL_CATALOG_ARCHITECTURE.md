@@ -117,13 +117,12 @@ record the Hugging Face revision in `tmp/publish/<id>/hf_revision.txt`, then run
 `tooling/publish-model/scripts/regenerate_all.sh <id>`. Do not pass `--public` or
 add `release_public = true` until the public-listing gate passes.
 
-DiariZen Large-s80-md-v2 is intentionally in that source-only state. Its
-`release_public = false` row records the pinned upstream checkpoint and CC BY-NC
-4.0 license, but it has no generated local card, no full/public catalog entry,
-and no download URL or sha256. It is therefore not pullable. The current
-candidate is fp16-only. Do not invent publication metadata or
-promote it until the native quality/resource audit and the product's explicit
-non-commercial consent flow have both been approved.
+DiariZen Large-s80-md-v2 is a public fp16-only capability pack with
+`license_class = "noncommercial"`. Its signed entry records the pinned upstream
+checkpoint, immutable Hugging Face revision, sha256 and size. Every pull surface
+must require explicit CC BY-NC 4.0 acceptance; catalog visibility alone never
+authorizes a download or runtime activation. segmentation-3.0 remains the
+permissive default external segmenter.
 
 ## Local registry cards
 

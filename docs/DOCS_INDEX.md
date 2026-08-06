@@ -17,7 +17,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | [Model Release Audits](model-audits/README.md) | Per-family release audit forms (`model-audits/<family>.md`, from `model-audits/TEMPLATE.md`): ten performance/completeness dimensions, three-state status with mandatory justifications, enforced fail-closed by the publish pipeline before a family goes `public:true`. |
 | [Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md) | Catalog ownership chain (human-edited publishing catalog -> generated `model-registry/catalog.json`), `openasr pull` install mechanics, the local `model-registry/models/*.toml` cards, signed catalog hosting/cache, and the no-implicit-download boundary. |
 | [Catalog Forward Compatibility and Client Resilience](CATALOG_COMPATIBILITY.md) | What a running build must do with a catalog from a different epoch: fail-closed boundary (signature/epoch rollback/schema-major/required fields) vs. must-tolerate degradation (unknown language codes, unknown kind/license_class/capability role -> hide the entry, not the catalog); the epoch floor's narrower boot-local-candidate exception; the verify-then-persist + cache/embedded fallback chain; the `catalog_degraded` status surface (`doctor`, `/health`); and the 2026-07-16 cache-pollution incident this hardens against. |
-| [Known Limitations](KNOWN_LIMITATIONS.md) | Current user-visible limits: `.oasr`-only native packs, streaming guarantees, local-file-only universal Voice ID, staged/non-pullable DiariZen Large-s80-md-v2, generic accelerator selection, and qualification-only benchmarks. |
+| [Known Limitations](KNOWN_LIMITATIONS.md) | Current user-visible limits: `.oasr`-only native packs, streaming guarantees, local-file-only universal Voice ID, explicitly consented non-commercial DiariZen Large-s80-md-v2, generic accelerator selection, and qualification-only benchmarks. |
 | [FAQ](FAQ.md) | Current-behavior questions: what OpenASR is, which families run, which backends are active, and the conservative offline transcription lane. |
 | [Releasing](../RELEASING.md) | The commit-driven release process: the single workspace version, `scripts/bump-version.sh`, the version-triggered `Release core` workflow, and the post-release Docker Hub image push (`docker-release.yml`). |
 | [Agent Integration](AGENT_INTEGRATION.md) | How a coding agent uses OpenASR: the `skills/openasr` Skill (CLI path) and the local OpenAI-compatible HTTP API, including `openasr apikey` for opt-in loopback authentication. |
@@ -49,7 +49,7 @@ the onboarding and reviewer contract are its implementation and review views.
 
 | Doc | What it covers |
 | --- | --- |
-| [Diarization Pack Publishing](DIARIZATION_PACK_PUBLISHING.md) | Universal file Voice ID topology; published ReDimNet2-B6/segmentation-3.0 packs; and the staged, non-pullable DiariZen Large-s80-md-v2 qualification path. |
+| [Diarization Pack Publishing](DIARIZATION_PACK_PUBLISHING.md) | Universal file Voice ID topology; published ReDimNet2-B6/segmentation-3.0 packs; and the explicitly consented non-commercial DiariZen Large-s80-md-v2 path. |
 | [VBx PLDA Resegmentation](VBX_PLDA_RESEGMENTATION.md) | The PLDA-mixture / HMM VBx resegmentation refinement for diarization. |
 
 The diarization privacy model and surface-specific identity/redaction contract

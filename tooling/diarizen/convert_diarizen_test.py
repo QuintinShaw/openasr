@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -124,6 +126,26 @@ class PackRoundTripTest(unittest.TestCase):
             self.assertTrue(wavlm["normalize_waveform"])
             self.assertTrue(wavlm["encoder_layer_norm_first"])
             self.assertFalse(wavlm["transformer_layer_norm_first"])
+
+    def test_build_commit_env_is_baked_and_normalized(self):
+        import gguf
+
+        plan = [C.TensorPlan("proj.bias", np.zeros((2,), dtype=np.float32), "f32")]
+        commit = "ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "diarizen-provenance.oasr"
+            with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: commit}):
+                C.write_pack(out, plan, quant="f16")
+            reader = gguf.GGUFReader(str(out))
+            self.assertEqual(_kv_str(reader, C.BUILD_COMMIT_KEY), commit.lower())
+
+    def test_malformed_build_commit_fails_closed(self):
+        plan = [C.TensorPlan("proj.bias", np.zeros((2,), dtype=np.float32), "f32")]
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "diarizen-invalid-provenance.oasr"
+            with mock.patch.dict(os.environ, {C.BUILD_COMMIT_ENV: "not-a-commit"}):
+                with self.assertRaisesRegex(C.ConversionError, "40-hex"):
+                    C.write_pack(out, plan, quant="f16")
 
 
 def _kv_str(reader, key):

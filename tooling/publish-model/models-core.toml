@@ -411,16 +411,15 @@ feature = "speaker-diarization"
 role = "speaker-segmenter"
 
 # Optional higher-accuracy speaker segmenter. The code/runtime is MIT, but the
-# pinned Large-s80-md-v2 checkpoint is CC BY-NC 4.0 because some training corpora are
-# research-only/non-commercial. Keep it out of the public catalog until the
-# converted pack has passed native parity/DER/resource audits and a maintainer
-# deliberately publishes it with the product's explicit non-commercial consent
-# gate. segmentation-3.0 remains the permissive default/fallback.
+# pinned Large-s80-md-v2 checkpoint is CC BY-NC 4.0 because some training corpora
+# are research-only/non-commercial. The public pack therefore remains behind an
+# explicit non-commercial license acceptance gate. segmentation-3.0 remains the
+# permissive default/fallback and is never replaced by an implicit download.
 ["diarizen-large-s80-v2"]
 kind = "capability-pack"
 family = "diarizen-segmentation"
 hf_repo = "OpenASR/diarizen-large-s80-v2"
-release_public = false
+release_public = true
 size = "segmenter"
 registry_id = "diarizen-large-s80-v2"
 display_name = "DiariZen Large-s80-md-v2"

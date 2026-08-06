@@ -108,6 +108,14 @@ def pct(v) -> str:
     return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
 
 
+def pull_command(catalog: dict, model_ref: str) -> str:
+    """Render the exact consent-bearing CLI command for a catalog entry."""
+    command = f"openasr pull {model_ref}"
+    if catalog.get("license_class") in {"noncommercial", "gated"}:
+        command += " --accept-license"
+    return command
+
+
 def _catalog_kind(catalog: dict) -> str:
     """Return a validated semantic catalog kind; never infer it from family."""
     kind = catalog.get("kind")
@@ -220,7 +228,7 @@ def main(argv: list[str]) -> int:
                 f"{human_bytes(m.get('peak_rss_bytes'))} | {rtf(m.get('rtf_cpu'))} | "
                 f"{rtf(m.get('rtf_metal'))} | {pct(m.get('jfk_wer_vs_fp16'))} |"
             )
-        pulls.append(f"openasr pull {registry_id}:{meta.suffix}")
+        pulls.append(pull_command(catalog, f"{registry_id}:{meta.suffix}"))
 
     intro = (prose.get("intro") or generic_intro(catalog, upstream_link)).strip()
     ack = (prose.get("acknowledgement") or generic_ack(catalog, upstream_link)).strip()
@@ -272,11 +280,16 @@ def main(argv: list[str]) -> int:
         "drift_metric_label": prose.get("drift_metric_label") or "JFK ΔWER",
         "perf_table_rows": "\n".join(rows),
         "recommended_quant": rec,
-        "pull_recommended": f"openasr pull {registry_id}:{rec_suffix}",
+        "pull_recommended": pull_command(catalog, f"{registry_id}:{rec_suffix}"),
         "pull_lines": "\n".join(pulls),
         "aliases_inline": aliases,
         "upstream_link": upstream_link,
         "import_subcommand": catalog["import_subcommand"],
+        "import_command": prose.get("import_command")
+        or (
+            f"openasr model-pack {catalog['import_subcommand']} <src>.safetensors <out>.oasr \\\n"
+            f"  --package-id {registry_id}"
+        ),
         "upstream_license_link": catalog["license_source"],
         "acknowledgement_block": ack,
         "pack_quant_note": pack_quant_note(list(catalog["quants"])),

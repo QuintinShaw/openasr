@@ -1,0 +1,49 @@
+# Per-model prose for OpenASR/diarizen-large-s80-v2. This card summarizes the
+# pinned upstream model, OpenASR's native qualification, and its non-commercial
+# distribution boundary without copying upstream prose.
+
+pipeline_tag = "voice-activity-detection"
+import_command = "python3 tooling/diarizen/convert_diarizen.py --checkpoint <pytorch_model.bin> --config <config.toml> --out <diarizen-large-s80-v2-fp16.oasr> --model-id diarizen-large-s80-v2 --quant fp16"
+
+tagline = "DiariZen Large-s80-md-v2 — optional high-accuracy overlap-aware speaker segmentation for local Voice ID"
+
+highlights = [
+  "🗣️ **Overlap-aware local activity** — a WavLM Large + Conformer EEND segmenter predicts four local speaker streams in each 16 s window",
+  "🎯 **Qualified native accuracy** — OpenASR's fp16 pipeline measured 7.9491% DER on six locked Mandarin meeting excerpts, versus 18.6787% for the MOSS baseline under the same scoring protocol",
+  "🤝 **Shared Voice ID contract** — combines with FireRed Stream-VAD, ReDimNet2-B6 and automatic clustering; ASR models consume one normalized speaker timeline",
+  "🔒 **Explicit non-commercial consent** — the checkpoint is CC BY-NC 4.0 and is never downloaded or activated without acknowledgement; segmentation-3.0 remains the permissive default",
+  "🦀 **Native fp16 runtime** — the `.oasr` pack runs locally through OpenASR's persistent ggml graph without Python at inference time",
+]
+
+intro = """
+DiariZen Large-s80-md-v2 is BUT Speech@FIT's overlap-aware speaker-segmentation
+checkpoint built from a 24-layer WavLM Large encoder and a Conformer EEND head.
+OpenASR packages the pinned checkpoint as one fp16 `.oasr` capability pack and
+uses it as an optional external segmenter in the universal local-file Voice ID
+pipeline. It predicts recording-local speaker activity; ReDimNet2-B6 still
+provides clustering and enrolled-person identity. The checkpoint is licensed
+under CC BY-NC 4.0, so downloading and activating it require explicit
+non-commercial acknowledgement. OpenASR does not select it merely because Voice
+ID was enabled; the permissive segmentation-3.0 pack remains the default.
+"""
+
+acknowledgement = """
+This pack redistributes the pinned **BUT-FIT/diarizen-wavlm-large-s80-md-v2**
+checkpoint in OpenASR's `.oasr` runtime format. Credit for the model,
+architecture, training and original weights belongs to BUT Speech@FIT and the
+DiariZen authors. The checkpoint is licensed under **CC BY-NC 4.0**; OpenASR's
+format conversion does not broaden that license.
+"""
+
+[prose_locales."zh-CN"]
+tagline = "DiariZen Large-s80-md-v2：用于本地 Voice ID 的可选高精度重叠语音说话人分割模型"
+
+highlights = [
+  "🗣️ **感知重叠语音** — WavLM Large + Conformer EEND 在每个 16 秒窗口中预测四路局部说话人活动",
+  "🎯 **原生质量已验收** — OpenASR fp16 管线在六段锁定中文会议音频上实测 DER 7.9491%，同口径 MOSS 为 18.6787%",
+  "🤝 **共用 Voice ID 契约** — 与 FireRed Stream-VAD、ReDimNet2-B6 和自动聚类组合，向上层交付统一说话人时间线",
+  "🔒 **必须明确确认非商业许可** — 权重为 CC BY-NC 4.0，不会被默认下载或启用；segmentation-3.0 仍是宽松许可的默认选择",
+  "🦀 **原生 fp16 运行时** — `.oasr` 包在本地通过 OpenASR 持久化 ggml 计算图运行，推理时不需要 Python",
+]
+
+source_sha256 = "3315919e0d56d9878a429a481a0f0db2ae2c737e5c5807964e26d2b7b049bc82"

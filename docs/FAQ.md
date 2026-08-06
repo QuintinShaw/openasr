@@ -117,10 +117,10 @@ falling back to a different embedding space.
 
 segmentation-3.0 is the permissive default external segmenter. DiariZen
 Large-s80-md-v2 is a higher-accuracy optional provider whose checkpoint is CC
-BY-NC 4.0; it is staged for an explicit non-commercial consent flow but is not
-currently present in the downloadable catalog. The candidate pack is fp16-only.
-Do not interpret the staged source metadata as an available
-`openasr pull` target.
+BY-NC 4.0. Its published pack is fp16-only and requires explicit
+non-commercial license acceptance before download plus a separate activation
+choice. Enabling Voice ID alone still prepares segmentation-3.0; it never
+silently installs DiariZen.
 
 The operator-only `/v1/voice-id/*` API
 (`crates/openasr-server/src/routes/voice_id.rs`) manages people and samples,

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -37,6 +39,9 @@ LICENSE_SOURCE = (
 )
 TENSOR_SCHEMA = "compact-v2"
 GGUF_MAX_TENSOR_NAME_BYTES = 63
+BUILD_COMMIT_ENV = "OPENASR_BUILD_COMMIT"
+BUILD_COMMIT_KEY = "openasr.build.commit"
+BUILD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 EXPECTED_MODEL_PATH = "diarizen.models.eend.model_wavlm_conformer.Model"
 EXPECTED_MODEL_ARGS = {
@@ -57,6 +62,21 @@ EXPECTED_MODEL_ARGS = {
     "selected_channel": 0,
     "sample_rate": 16000,
 }
+
+
+def build_provenance_from_env() -> Optional[str]:
+    """Return validated build provenance using the shared publish contract."""
+    raw = os.environ.get(BUILD_COMMIT_ENV)
+    if raw is None:
+        return None
+    commit = raw.strip().lower()
+    if not commit:
+        return None
+    if BUILD_COMMIT_RE.fullmatch(commit) is None:
+        raise ConversionError(
+            f"{BUILD_COMMIT_ENV} must be a 40-hex git commit sha, got {raw!r}"
+        )
+    return commit
 
 WAVLM_CONV_CHANNELS = [512, 153, 224, 255, 302, 368, 211]
 WAVLM_CONV_KERNELS = [10, 3, 3, 3, 3, 2, 2]
@@ -333,6 +353,8 @@ def write_pack(
     writer.add_string("openasr.source.revision", PINNED_REVISION)
     writer.add_string("openasr.license.name", LICENSE_NAME)
     writer.add_string("openasr.license.source", LICENSE_SOURCE)
+    if build_commit := build_provenance_from_env():
+        writer.add_string(BUILD_COMMIT_KEY, build_commit)
     writer.add_string("diarizen.upstream_model_id", UPSTREAM_MODEL_ID)
     writer.add_string("diarizen.upstream_revision", PINNED_REVISION)
     writer.add_string("diarizen.tensor_schema", TENSOR_SCHEMA)

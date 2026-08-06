@@ -10,7 +10,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("render_card.py")
 sys.path.insert(0, str(SCRIPT.parent))
 
-from render_card import card_type_for_catalog, pipeline_tag_for_catalog  # noqa: E402
+from render_card import card_type_for_catalog, pipeline_tag_for_catalog, pull_command  # noqa: E402
 
 
 class RenderCardTest(unittest.TestCase):
@@ -116,7 +116,23 @@ class RenderCardTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pipeline_tag: voice-activity-detection", result.stdout)
         self.assertIn("Speaker-diarization support pack", result.stdout)
+        self.assertIn(
+            "openasr pull diarizen-large-s80-v2:fp16 --accept-license",
+            result.stdout,
+        )
+        self.assertIn("python3 tooling/diarizen/convert_diarizen.py", result.stdout)
+        self.assertNotIn("openasr model-pack external:", result.stdout)
         self.assertNotIn("pipeline_tag: automatic-speech-recognition", result.stdout)
+
+    def test_pull_command_keeps_permissive_simple_and_requires_restricted_consent(self) -> None:
+        self.assertEqual(
+            pull_command({"license_class": "permissive"}, "segmentation:fp16"),
+            "openasr pull segmentation:fp16",
+        )
+        self.assertEqual(
+            pull_command({"license_class": "noncommercial"}, "diarizen:fp16"),
+            "openasr pull diarizen:fp16 --accept-license",
+        )
 
     def test_forced_aligner_card_uses_the_public_importer(self) -> None:
         result = subprocess.run(
