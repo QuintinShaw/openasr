@@ -1607,6 +1607,12 @@ impl DolphinEncoderRuntime {
             encoder_out,
         })
     }
+
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), DolphinEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(ggml_err("release_transient_scheduler_working_set"))
+    }
 }
 
 /// One-shot convenience wrapper over [`DolphinEncoderRuntime`] for callers

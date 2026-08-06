@@ -593,7 +593,8 @@ pub(crate) fn run_dolphin_pipeline(
     // the pre-runtime per-call behavior. Production transcription only ever
     // reads `encoder.encoder_out` below; `after_subsample`/per-block taps
     // exist solely for `#[cfg(test)]` parity, so they stay off here (P6).
-    let encoder = if prepared.encoder.supports_input_frames(features.n_frames) {
+    let used_prepared_encoder = prepared.encoder.supports_input_frames(features.n_frames);
+    let encoder_result = if used_prepared_encoder {
         prepared
             .encoder
             .encode(&features.data, features.n_frames, false)
@@ -608,8 +609,18 @@ pub(crate) fn run_dolphin_pipeline(
             backend,
             false,
         )
-    }
-    .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
+    };
+    let release_result = if used_prepared_encoder {
+        prepared.encoder.release_transient_compute_memory()
+    } else {
+        Ok(())
+    };
+    let encoder = match (encoder_result, release_result) {
+        (Ok(output), Ok(())) => output,
+        (Err(error), _) | (Ok(_), Err(error)) => {
+            return Err(format!("dolphin encoder graph failed: {error}"));
+        }
+    };
 
     // Hotword deep-biasing (native `context_module.*` fusion). Upstream's
     // `decode()` computes `ctc_logprobs` from the *unbiased* encoder output

@@ -656,6 +656,14 @@ impl MimoAudiotokEncoderRuntime {
             rows,
         })
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), MimoAudiotokEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| build_err("release_transient_scheduler_working_set", source))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

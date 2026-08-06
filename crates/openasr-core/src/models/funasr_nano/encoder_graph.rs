@@ -495,6 +495,17 @@ impl FunasrNanoEncoderGraph {
             rows,
         })
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), FunasrNanoEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| FunasrNanoEncoderError::GraphBuildFailed {
+                step: "release_transient_scheduler_working_set",
+                source,
+            })
+    }
 }
 
 fn alloc_layer(

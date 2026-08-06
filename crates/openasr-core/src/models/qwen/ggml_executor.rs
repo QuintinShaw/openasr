@@ -323,11 +323,17 @@ impl Qwen3AsrGgmlExecutor {
                     .ok_or_else(|| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
                         reason: "audio actor received a non-qwen prepared runtime".to_string(),
                     })?;
-                state.runtime.encode(
+                let encode_result = state.runtime.encode(
                     &prepared_runtime.audio_encoder_weights,
                     prepared_runtime.metadata,
                     &mel_features,
-                )
+                );
+                let release_result = state.runtime.release_transient_compute_memory();
+                match (encode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
             })
             .map_err(|error| Self::map_actor_error("audio-encoder", error))?
             .map_err(map_audio_encoder_error)

@@ -322,7 +322,15 @@ impl FireRedAedGgmlExecutor {
     ) -> Result<FireRedEncoderOutput, FireRedAedExecutorError> {
         let runtime = self.checkout_encoder_runtime(preflight, metadata, backend)?;
         runtime
-            .call_mut(move |runtime| runtime.encode(&cmvn_features, n_frames))
+            .call_mut(move |runtime| {
+                let encode_result = runtime.encode(&cmvn_features, n_frames);
+                let release_result = runtime.release_transient_compute_memory();
+                match (encode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            })
             .map_err(|error| Self::map_actor_error("encoder", error))?
             .map_err(|error| FireRedAedExecutorError::EncoderFailed {
                 reason: error.to_string(),

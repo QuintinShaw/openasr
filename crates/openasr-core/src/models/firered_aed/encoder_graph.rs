@@ -171,6 +171,12 @@ impl FireRedEncoderGraphRuntime {
             n_frames,
         )
     }
+
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), FireRedEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| map_err("release_transient_scheduler_working_set", source))
+    }
 }
 
 /// Post-subsampling encoder time-frame count the 2x Conv2d(k3,s2) stem

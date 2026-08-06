@@ -459,7 +459,15 @@ impl MoonshineGgmlExecutor {
     ) -> Result<MoonshineEncoderOutput, MoonshineGgmlExecutorError> {
         let runtime = self.checkout_encoder_runtime(preflight, prepared, adapter, backend)?;
         runtime
-            .call_mut(move |state| state.runtime.encode(&features))
+            .call_mut(move |state| {
+                let encode_result = state.runtime.encode(&features);
+                let release_result = state.runtime.release_transient_compute_memory();
+                match (encode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            })
             .map_err(|error| Self::map_actor_error("encoder", error))?
             .map_err(|error| MoonshineGgmlExecutorError::EncoderFailed {
                 reason: error.to_string(),

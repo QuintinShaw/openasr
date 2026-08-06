@@ -285,6 +285,14 @@ impl GraniteSpeechEncoderRuntime {
             capture_mid_tap,
         )
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), GraniteSpeechEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(ggml_err("release_transient_scheduler_working_set"))
+    }
 }
 
 /// Weight source for the encoder graph: dequantized f32 tensors keyed by their

@@ -1458,42 +1458,11 @@ impl GgmlCpuGraphRunner {
             scheduler_cpu_fallback = Some(cpu);
         }
         let scheduler = if config.use_scheduler {
-            let mut backends = Vec::new();
-            let mut backend_private_leases = BTreeMap::new();
-            if matches!(
+            Some(build_graph_scheduler(
                 config.backend,
-                GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu
-            ) {
-                backends.push(backend.raw.as_ptr());
-                backend_private_leases.insert(
-                    backend.raw.as_ptr() as usize,
-                    Rc::clone(&backend.private_memory_leases),
-                );
-            }
-            for accel in &scheduler_accel_backends {
-                backends.push(accel.raw.as_ptr());
-                backend_private_leases.insert(
-                    accel.raw.as_ptr() as usize,
-                    Rc::clone(&accel.private_memory_leases),
-                );
-            }
-            if matches!(config.backend, GgmlCpuGraphBackend::Cpu) {
-                backends.push(backend.raw.as_ptr());
-                backend_private_leases.insert(
-                    backend.raw.as_ptr() as usize,
-                    Rc::clone(&backend.private_memory_leases),
-                );
-            }
-            if let Some(cpu) = scheduler_cpu_fallback.as_ref() {
-                backends.push(cpu.raw.as_ptr());
-                backend_private_leases.insert(
-                    cpu.raw.as_ptr() as usize,
-                    Rc::clone(&cpu.private_memory_leases),
-                );
-            }
-            Some(GgmlBackendSchedulerGuard::new(
-                &mut backends,
-                backend_private_leases,
+                &backend,
+                &scheduler_accel_backends,
+                scheduler_cpu_fallback.as_ref(),
                 config.graph_size,
             )?)
         } else {
@@ -1682,6 +1651,69 @@ impl GgmlCpuGraphRunner {
     /// process-resident allocation instead.
     pub(crate) fn release_cpu_step_buffer_pool(&mut self) {
         self.cpu_step_buffer_pool = GgmlCpuStepBufferPool::new();
+    }
+
+    /// Releases a completed transient stage's scheduler-owned graph buffers
+    /// while keeping its backend handles, loaded weight buffers, and runner
+    /// metadata resident.
+    ///
+    /// This is deliberately stronger than `ggml_backend_sched_reset`, which
+    /// only clears graph bookkeeping and retains the gallocr high-water
+    /// buffers. Phase-separated cached runtimes (for example an audio encoder
+    /// followed by a large decoder) use this after terminal output readback so
+    /// the next phase is quoted against physical memory that the prior phase
+    /// no longer needs. Callers MUST NOT invoke it while a persistent graph
+    /// session built from this runner is alive: rebuilding the scheduler would
+    /// invalidate that session's native scheduler pointer.
+    pub(crate) fn release_transient_scheduler_working_set(
+        &mut self,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let Some(current) = self.scheduler.as_ref() else {
+            return Ok(());
+        };
+        if current
+            .memory_owner
+            .poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(GgmlCpuGraphError::BackendSchedulerPoisoned);
+        }
+
+        // Construct the empty replacement first. If native scheduler creation
+        // fails, the current runtime remains intact and reusable.
+        let replacement = build_graph_scheduler(
+            self.backend_kind,
+            &self.backend,
+            &self._scheduler_accel_backends,
+            self._scheduler_cpu_fallback.as_ref(),
+            self.graph_size,
+        )?;
+        let released_owner = current.memory_owner.clone();
+        let released_private_leases = released_owner.private_leases();
+        let previous = self
+            .scheduler
+            .replace(replacement)
+            .expect("scheduler presence was checked above");
+
+        // Native buffers disappear before their owner-attached broker leases.
+        // CUDA may return freed buffers to its backend pool, so trim each
+        // participating backend only after gallocr destruction. The trim ABI
+        // synchronizes first and releases only reclaimable backend cache.
+        drop(previous);
+        for raw in released_owner.backend_private_leases.keys().copied() {
+            let backend = raw as ffi::GgmlBackendRaw;
+            let abi = unsafe { BackendMemoryAbi::from_backend(backend) }
+                .map_err(|source| memory_admission_error("scheduler-release/abi", source.into()))?;
+            abi.trim(0).map_err(|source| {
+                memory_admission_error("scheduler-release/trim", source.into())
+            })?;
+        }
+
+        // Only leases created by the retired scheduler are detached. Other
+        // live runners sharing a cached backend keep their own conservative
+        // high-water accounting.
+        released_owner.detach_private_leases(&released_private_leases);
+        Ok(())
     }
 
     pub(crate) fn start_static_tensor_arena(
@@ -4650,6 +4682,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             for owner in &private_owners {
                 owner.borrow_mut().push(lease.clone());
             }
+            memory_owner
+                .scheduler_private_leases
+                .borrow_mut()
+                .push(lease.clone());
             if provisional {
                 // Preserve any private growth performed by the transactional
                 // hook before the scheduler sibling changes the same device
@@ -6364,6 +6400,7 @@ type GgmlBackendPrivateLeaseOwner = Rc<RefCell<Vec<NativeBackendPrivateMemoryLea
 #[derive(Clone)]
 struct GgmlSchedulerMemoryOwner {
     backend_private_leases: BTreeMap<usize, GgmlBackendPrivateLeaseOwner>,
+    scheduler_private_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
     scheduler_leases: Arc<Mutex<Vec<NativeOwnerAttachedMemoryLease>>>,
     poisoned: Arc<AtomicBool>,
 }
@@ -6381,6 +6418,27 @@ impl GgmlSchedulerMemoryOwner {
             }
         }
         Ok(())
+    }
+
+    fn private_leases(&self) -> Vec<NativeBackendPrivateMemoryLease> {
+        self.scheduler_private_leases.borrow().clone()
+    }
+
+    fn detach_private_leases(&self, released: &[NativeBackendPrivateMemoryLease]) {
+        for owner in self.backend_private_leases.values() {
+            owner.borrow_mut().retain(|candidate| {
+                !released
+                    .iter()
+                    .any(|lease| candidate.shares_reservation_with(lease))
+            });
+        }
+        self.scheduler_private_leases
+            .borrow_mut()
+            .retain(|candidate| {
+                !released
+                    .iter()
+                    .any(|lease| candidate.shares_reservation_with(lease))
+            });
     }
 }
 
@@ -7419,6 +7477,7 @@ impl GgmlBackendSchedulerGuard {
                 raw,
                 memory_owner: GgmlSchedulerMemoryOwner {
                     backend_private_leases,
+                    scheduler_private_leases: Rc::new(RefCell::new(Vec::new())),
                     scheduler_leases: Arc::new(Mutex::new(Vec::new())),
                     poisoned: Arc::new(AtomicBool::new(false)),
                 },
@@ -7428,6 +7487,49 @@ impl GgmlBackendSchedulerGuard {
                 GgmlCpuGraphError::BackendSchedulerInitFailed
             })
     }
+}
+
+fn build_graph_scheduler(
+    backend_kind: GgmlCpuGraphBackend,
+    backend: &GgmlBackendGuard,
+    scheduler_accel_backends: &[GgmlBackendGuard],
+    scheduler_cpu_fallback: Option<&GgmlBackendGuard>,
+    graph_size: usize,
+) -> Result<GgmlBackendSchedulerGuard, GgmlCpuGraphError> {
+    let mut backends = Vec::new();
+    let mut backend_private_leases = BTreeMap::new();
+    if matches!(
+        backend_kind,
+        GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu
+    ) {
+        backends.push(backend.raw.as_ptr());
+        backend_private_leases.insert(
+            backend.raw.as_ptr() as usize,
+            Rc::clone(&backend.private_memory_leases),
+        );
+    }
+    for accel in scheduler_accel_backends {
+        backends.push(accel.raw.as_ptr());
+        backend_private_leases.insert(
+            accel.raw.as_ptr() as usize,
+            Rc::clone(&accel.private_memory_leases),
+        );
+    }
+    if matches!(backend_kind, GgmlCpuGraphBackend::Cpu) {
+        backends.push(backend.raw.as_ptr());
+        backend_private_leases.insert(
+            backend.raw.as_ptr() as usize,
+            Rc::clone(&backend.private_memory_leases),
+        );
+    }
+    if let Some(cpu) = scheduler_cpu_fallback {
+        backends.push(cpu.raw.as_ptr());
+        backend_private_leases.insert(
+            cpu.raw.as_ptr() as usize,
+            Rc::clone(&cpu.private_memory_leases),
+        );
+    }
+    GgmlBackendSchedulerGuard::new(&mut backends, backend_private_leases, graph_size)
 }
 
 impl Drop for GgmlBackendSchedulerGuard {
@@ -10227,6 +10329,110 @@ mod tests {
         assert_eq!(released.pending_bytes, baseline.pending_bytes);
         assert_eq!(released.committed_bytes, baseline.committed_bytes);
         assert_eq!(released.exclusive_pending, baseline.exclusive_pending);
+    }
+
+    fn assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
+        backend: GgmlCpuGraphBackend,
+    ) {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = backend;
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::default().context_bytes)
+            .expect("static tensor arena should initialize");
+        let weight = arena
+            .new_tensor_2d_f16(2, 2, "resident_weight")
+            .expect("resident weight should allocate");
+        arena
+            .set_f16_bits_slice(weight, &[0x3c00, 0x0000, 0x0000, 0x3c00], "resident_weight")
+            .expect("resident weight should upload");
+        let retired_scheduler_leases = std::sync::Arc::downgrade(
+            &runner
+                .scheduler
+                .as_ref()
+                .expect("scheduler was requested")
+                .memory_owner
+                .scheduler_leases,
+        );
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(2, 1, "input")
+            .expect("input should allocate");
+        graph.set_input(input).expect("input should be marked");
+        let output = graph
+            .mul_mat(arena.graph_tensor(weight), input)
+            .expect("resident weight should be usable");
+        graph.set_output(output).expect("output should be marked");
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("scheduler should allocate first graph");
+        graph
+            .set_f32_slice(input, &[2.0, 3.0], "input")
+            .expect("input should upload");
+        let values = graph
+            .compute_output_f32(output, 2)
+            .expect("first scheduler graph should compute");
+        assert_eq!(values, vec![2.0, 3.0]);
+        drop(graph);
+        assert!(retired_scheduler_leases.upgrade().is_some());
+
+        runner
+            .release_transient_scheduler_working_set()
+            .expect("completed transient graph working set should release");
+        assert!(
+            retired_scheduler_leases.upgrade().is_none(),
+            "retired scheduler leases must drop with the native gallocr"
+        );
+        let released =
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        assert_eq!(released.pending_bytes, 0);
+        assert!(!released.exclusive_pending);
+
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(2, 1, "input_after_release")
+            .expect("second input should allocate");
+        graph
+            .set_input(input)
+            .expect("second input should be marked");
+        let output = graph
+            .mul_mat(arena.graph_tensor(weight), input)
+            .expect("resident weight must survive scheduler release");
+        graph
+            .set_output(output)
+            .expect("second output should be marked");
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("rebuilt scheduler should allocate graph");
+        graph
+            .set_f32_slice(input, &[4.0, 5.0], "input_after_release")
+            .expect("second input should upload");
+        let values = graph
+            .compute_output_f32(output, 2)
+            .expect("rebuilt scheduler should remain reusable");
+        assert_eq!(values, vec![4.0, 5.0]);
+    }
+
+    #[test]
+    fn transient_scheduler_release_drops_owner_and_rebuilds_runner() {
+        assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
+            GgmlCpuGraphBackend::Cpu,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_transient_scheduler_release_drops_owner_and_rebuilds_runner() {
+        assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
+            GgmlCpuGraphBackend::Metal,
+        );
     }
 
     #[cfg(target_os = "macos")]

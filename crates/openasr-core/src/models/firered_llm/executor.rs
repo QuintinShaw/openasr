@@ -487,6 +487,7 @@ impl FireRedLlmGgmlExecutor {
             .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
                 reason: error.to_string(),
             })?;
+        drop(encoder_runtime);
 
         let adapter_profile_started_at = std::time::Instant::now();
         let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
@@ -507,6 +508,7 @@ impl FireRedLlmGgmlExecutor {
             .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
                 reason: error.to_string(),
             })?;
+        drop(adapter_runtime);
         // Opt-in perf diagnostic, same gate/shape as the decoder_backend line
         // below (mirrors the qwen `OPENASR_HYMT2_PROFILE` precedent): the
         // adapter stage regressed to 2868ms/18.4% of `execute` on the naive

@@ -341,6 +341,17 @@ impl Qwen3AsrAudioEncoderRuntime {
             profile_started,
         )
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), Qwen3AsrAudioEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
+                step: "release_transient_scheduler_working_set",
+                source,
+            })
+    }
 }
 
 fn encode_qwen3_audio_embeddings_with_graph<'a>(

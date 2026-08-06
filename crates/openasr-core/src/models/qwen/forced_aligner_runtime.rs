@@ -441,6 +441,10 @@ pub(crate) fn align_forced(
             &mel_features,
         )
         .map_err(Qwen3ForcedAlignerRuntimeError::AudioEncoderFailed)?;
+    audio_runtime
+        .release_transient_compute_memory()
+        .map_err(Qwen3ForcedAlignerRuntimeError::AudioEncoderFailed)?;
+    drop(audio_runtime);
 
     let (decode_prompt, timestamp_positions) = build_forced_aligner_decode_prompt(
         &assets.metadata,

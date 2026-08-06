@@ -562,34 +562,48 @@ fn encode_moss_td_chunks_with_cached_runtime(
     let samples = samples.to_vec();
     actor
         .call_mut(move |state| {
-            let mut concatenated_rows: Vec<f32> = Vec::new();
-            let mut total_frames = 0usize;
-            for chunk in samples.chunks(CHUNK_SAMPLES) {
-                let mel = whisper_log_mel_spectrogram_16khz_mono_v0(
-                    chunk,
-                    encoder_config.n_mels,
-                    MEL_TARGET_FRAMES,
-                )
-                .map_err(|error| MossTdExecutorError::FrontendFailed {
-                    reason: error.to_string(),
-                })?;
-                let encoder_out = state
-                    .runtime
-                    .encode(encoder_config, mel.data(), MEL_TARGET_FRAMES)
-                    .map_err(|error| MossTdExecutorError::EncoderFailed {
+            let encode_result = (|| {
+                let mut concatenated_rows: Vec<f32> = Vec::new();
+                let mut total_frames = 0usize;
+                for chunk in samples.chunks(CHUNK_SAMPLES) {
+                    let mel = whisper_log_mel_spectrogram_16khz_mono_v0(
+                        chunk,
+                        encoder_config.n_mels,
+                        MEL_TARGET_FRAMES,
+                    )
+                    .map_err(|error| MossTdExecutorError::FrontendFailed {
                         reason: error.to_string(),
                     })?;
-                let token_length = moss_td_chunk_token_length(chunk.len(), token_stride);
-                let keep_frames = moss_td_chunk_keep_frames(
-                    token_length,
-                    merge_size,
-                    encoder_config.max_source_positions,
-                );
-                let keep_values = keep_frames * encoder_config.d_model;
-                concatenated_rows.extend_from_slice(&encoder_out[..keep_values]);
-                total_frames += keep_frames;
+                    let encoder_out = state
+                        .runtime
+                        .encode(encoder_config, mel.data(), MEL_TARGET_FRAMES)
+                        .map_err(|error| MossTdExecutorError::EncoderFailed {
+                            reason: error.to_string(),
+                        })?;
+                    let token_length = moss_td_chunk_token_length(chunk.len(), token_stride);
+                    let keep_frames = moss_td_chunk_keep_frames(
+                        token_length,
+                        merge_size,
+                        encoder_config.max_source_positions,
+                    );
+                    let keep_values = keep_frames * encoder_config.d_model;
+                    concatenated_rows.extend_from_slice(&encoder_out[..keep_values]);
+                    total_frames += keep_frames;
+                }
+                Ok((concatenated_rows, total_frames))
+            })();
+            let release_result =
+                state
+                    .runtime
+                    .release_transient_compute_memory()
+                    .map_err(|error| MossTdExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    });
+            match (encode_result, release_result) {
+                (Ok(output), Ok(())) => Ok(output),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
             }
-            Ok((concatenated_rows, total_frames))
         })
         .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
             stage: "encoder",

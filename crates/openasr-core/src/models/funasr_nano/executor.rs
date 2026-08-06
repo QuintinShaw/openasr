@@ -361,28 +361,34 @@ impl FunasrNanoGgmlExecutor {
         )?;
         actor
             .call_mut(move |state| {
-                let encoder_output = state
-                    .runtime
-                    .encoder
-                    .encode(
-                        &encoder_input.data,
-                        encoder_input.n_frames,
-                        encoder_input.feature_dim,
-                    )
-                    .map_err(|error| FunasrNanoExecutorError::EncoderFailed {
-                        reason: error.to_string(),
-                    })?;
-                let (adapter_rows, adapter_frames) = state
-                    .runtime
-                    .adapter
-                    .run(
-                        &encoder_output.rows,
-                        encoder_output.frame_count,
-                        encoder_output.d_model,
-                    )
-                    .map_err(|error| FunasrNanoExecutorError::AdapterFailed {
-                        reason: error.to_string(),
-                    })?;
+                let encode_result = state.runtime.encoder.encode(
+                    &encoder_input.data,
+                    encoder_input.n_frames,
+                    encoder_input.feature_dim,
+                );
+                let encoder_release = state.runtime.encoder.release_transient_compute_memory();
+                let encoder_output = match (encode_result, encoder_release) {
+                    (Ok(output), Ok(())) => output,
+                    (Err(error), _) | (Ok(_), Err(error)) => {
+                        return Err(FunasrNanoExecutorError::EncoderFailed {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let adapter_result = state.runtime.adapter.run(
+                    &encoder_output.rows,
+                    encoder_output.frame_count,
+                    encoder_output.d_model,
+                );
+                let adapter_release = state.runtime.adapter.release_transient_compute_memory();
+                let (adapter_rows, adapter_frames) = match (adapter_result, adapter_release) {
+                    (Ok(output), Ok(())) => output,
+                    (Err(error), _) | (Ok(_), Err(error)) => {
+                        return Err(FunasrNanoExecutorError::AdapterFailed {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
                 let audio_token_count =
                     funasr_nano_audio_token_count(encoder_output.frame_count).min(adapter_frames);
                 if audio_token_count == 0 {

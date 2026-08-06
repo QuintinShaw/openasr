@@ -1006,6 +1006,17 @@ impl CohereTranscribeEncoderGraphRuntime {
             rows,
         })
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), CohereTranscribeEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
+                step: "release_transient_scheduler_working_set",
+                source,
+            })
+    }
 }
 
 #[derive(Clone, Copy)]

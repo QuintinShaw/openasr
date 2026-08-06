@@ -727,12 +727,16 @@ impl MimoAsrGgmlExecutor {
                 }
             })?;
 
-        let encoder_output = prepared
-            .encoder_runtime
-            .encode(&mel_features)
-            .map_err(|error| MimoAsrExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
+        let encode_result = prepared.encoder_runtime.encode(&mel_features);
+        let release_result = prepared.encoder_runtime.release_transient_compute_memory();
+        let encoder_output = match (encode_result, release_result) {
+            (Ok(output), Ok(())) => output,
+            (Err(error), _) | (Ok(_), Err(error)) => {
+                return Err(MimoAsrExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                });
+            }
+        };
 
         let mut codes = encode_rvq_codes(
             &prepared.codebooks,

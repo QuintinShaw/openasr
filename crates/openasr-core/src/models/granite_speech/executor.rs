@@ -595,22 +595,33 @@ impl GraniteSpeechGgmlExecutor {
             .call_mut(move |state| {
                 let prepared = &mut state.runtime;
                 let decode_result = (|| {
-                    let encoder_output = prepared
-                        .encoder
-                        .encode(&prepared.encoder_config, &features, frames, false)
-                        .map_err(|error| GraniteSpeechGgmlExecutorError::EncoderFailed {
-                            reason: error.to_string(),
-                        })?;
-                    let projector_output = prepared
-                        .projector
-                        .project(
-                            &prepared.projector_config,
-                            &encoder_output.encoder_out,
-                            encoder_output.frames,
-                        )
-                        .map_err(|error| GraniteSpeechGgmlExecutorError::ProjectorFailed {
-                            reason: error.to_string(),
-                        })?;
+                    let encoder_result =
+                        prepared
+                            .encoder
+                            .encode(&prepared.encoder_config, &features, frames, false);
+                    let encoder_release = prepared.encoder.release_transient_compute_memory();
+                    let encoder_output = match (encoder_result, encoder_release) {
+                        (Ok(output), Ok(())) => output,
+                        (Err(error), _) | (Ok(_), Err(error)) => {
+                            return Err(GraniteSpeechGgmlExecutorError::EncoderFailed {
+                                reason: error.to_string(),
+                            });
+                        }
+                    };
+                    let projector_result = prepared.projector.project(
+                        &prepared.projector_config,
+                        &encoder_output.encoder_out,
+                        encoder_output.frames,
+                    );
+                    let projector_release = prepared.projector.release_transient_compute_memory();
+                    let projector_output = match (projector_result, projector_release) {
+                        (Ok(output), Ok(())) => output,
+                        (Err(error), _) | (Ok(_), Err(error)) => {
+                            return Err(GraniteSpeechGgmlExecutorError::ProjectorFailed {
+                                reason: error.to_string(),
+                            });
+                        }
+                    };
                     let (prompt_token_ids, prompt_embeddings) = build_audio_prompt_embeddings(
                         &prepared.decoder_config,
                         &prepared.embed_table,

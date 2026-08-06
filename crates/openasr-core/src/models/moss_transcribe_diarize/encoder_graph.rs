@@ -585,6 +585,17 @@ impl MossEncoderRuntime {
             })?;
         Ok(values)
     }
+
+    /// Drops the completed encoder phase's scheduler/gallocr working set
+    /// without unloading its mmap-backed weights or backend. MOSS keeps this
+    /// runtime in an actor cache, but its decoder is a separate, much larger
+    /// phase and must not be quoted while the encoder's transient high-water
+    /// buffers remain resident.
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), MossEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| map_graph_error("release_transient_scheduler_working_set", source))
+    }
 }
 
 /// Test-only twin of [`MossEncoderRuntime::encode`] for the CPU-vs-Metal

@@ -307,4 +307,12 @@ impl FunasrNanoAdapterGraph {
         }
         Ok((rows, frame_count))
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), FunasrNanoAdapterError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| map_err("release_transient_scheduler_working_set", source))
+    }
 }

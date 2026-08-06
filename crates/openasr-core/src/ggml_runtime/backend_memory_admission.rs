@@ -774,6 +774,10 @@ impl NativeOwnerAttachedMemoryLease {
 }
 
 impl NativeBackendPrivateMemoryLease {
+    pub(crate) fn shares_reservation_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub(crate) fn is_pending(&self) -> bool {
         let inner = self.inner.borrow();
         !inner.committed && !inner.quarantined && inner.transaction.is_some()

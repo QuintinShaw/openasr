@@ -199,6 +199,14 @@ impl GraniteSpeechProjectorRuntime {
             build_loaded_projector_weights(&self.loaded, &self.query_arena, self.query, config)?;
         run_projector_graph(&mut self.runner, config, &weights, encoder_out, frames)
     }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), GraniteSpeechProjectorError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(ggml_err("release_transient_scheduler_working_set"))
+    }
 }
 
 pub(crate) trait GraniteSpeechProjectorWeightProvider {

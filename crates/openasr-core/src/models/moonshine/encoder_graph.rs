@@ -560,6 +560,12 @@ impl MoonshineEncoderGraphRuntime {
             rows,
         })
     }
+
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), MoonshineEncoderError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(build_err("release_transient_scheduler_working_set"))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
