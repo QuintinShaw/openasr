@@ -6,6 +6,7 @@ pub(crate) type GgmlBackendBufferRaw = *mut c_void;
 pub(crate) type GgmlBackendBufferTypeRaw = *mut c_void;
 pub(crate) type GgmlBackendSchedRaw = *mut c_void;
 pub(crate) type GgmlBackendSchedMemoryPlanRaw = *mut c_void;
+pub(crate) type GgmlGallocrRaw = *mut c_void;
 pub(crate) type GgmlBackendRegRaw = *mut c_void;
 pub(crate) type GgmlContextRaw = *mut c_void;
 pub(crate) type GgmlTensorRaw = *mut c_void;
@@ -493,6 +494,24 @@ unsafe extern "C" {
         size: usize,
     ) -> GgmlBackendBufferRaw;
     pub(crate) fn ggml_backend_buffer_get_size(buffer: GgmlBackendBufferRaw) -> usize;
+    pub(crate) fn ggml_gallocr_new(buft: GgmlBackendBufferTypeRaw) -> GgmlGallocrRaw;
+    pub(crate) fn ggml_gallocr_free(galloc: GgmlGallocrRaw);
+    pub(crate) fn ggml_gallocr_measure_n_v1(
+        galloc: GgmlGallocrRaw,
+        graph: GgmlCgraphRaw,
+        node_buffer_ids: *const c_int,
+        leaf_buffer_ids: *const c_int,
+    ) -> bool;
+    pub(crate) fn ggml_gallocr_measure_get_chunk_count_v1(galloc: GgmlGallocrRaw) -> u32;
+    pub(crate) fn ggml_gallocr_measure_get_chunk_v1(
+        galloc: GgmlGallocrRaw,
+        index: u32,
+        buft: *mut GgmlBackendBufferTypeRaw,
+        requested_bytes: *mut u64,
+        currently_allocated_bytes: *mut u64,
+    ) -> bool;
+    pub(crate) fn ggml_gallocr_measure_commit_v1(galloc: GgmlGallocrRaw) -> bool;
+    pub(crate) fn ggml_gallocr_alloc_graph(galloc: GgmlGallocrRaw, graph: GgmlCgraphRaw) -> bool;
     // Tensor allocator (ggml-alloc.h): binds tensors into an already-allocated
     // buffer -- the primitive `ggml_backend_alloc_ctx_tensors` itself uses,
     // exposed here to bind the CPU step pool's *reused* buffer without
