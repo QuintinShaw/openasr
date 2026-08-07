@@ -5329,13 +5329,24 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn allocate_direct_graph(&mut self, graph: NonNull<c_void>) -> Result<(), GgmlCpuGraphError> {
+        self.allocate_direct_graph_with(graph, GgmlGraphAllocatorGuard::allocate)
+    }
+
+    fn allocate_direct_graph_with(
+        &mut self,
+        graph: NonNull<c_void>,
+        allocate: impl FnOnce(
+            NonNull<c_void>,
+            NonNull<c_void>,
+        ) -> Result<GgmlGraphAllocatorGuard, GgmlCpuGraphError>,
+    ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         if self.frozen {
             return Ok(());
         }
-        self.frozen = true;
-        let allocator = GgmlGraphAllocatorGuard::allocate(graph, self.backend)?;
+        let allocator = allocate(graph, self.backend)?;
         self.graph_allocator = Some(allocator);
+        self.frozen = true;
         Ok(())
     }
 
@@ -8082,7 +8093,8 @@ mod tests {
         GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
         GpuProbeCache, GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
         flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, runtime_gpu_is_available, validate_graph_cancel_capability,
+        gpu_probe_log_message, memory_admission_failure, runtime_gpu_is_available,
+        validate_graph_cancel_capability,
     };
 
     #[test]
@@ -9900,6 +9912,55 @@ mod tests {
     }
 
     #[test]
+    fn failed_direct_graph_allocation_leaves_builder_retryable() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(GgmlCpuGraphConfig::metadata_context_bytes(4096))
+            .expect("persistent session should open");
+        let (input, output) = {
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
+            graph.set_input(input).expect("input flag");
+            let output = graph.mul(input, input).expect("square graph");
+            graph.set_output(output).expect("output flag");
+            let forward = graph
+                .build_forward_graph(&[output])
+                .expect("forward graph should build");
+            let error = graph
+                .allocate_direct_graph_with(forward, |_forward, _backend| {
+                    Err(memory_admission_failure(
+                        "direct-gallocr/test-injected",
+                        "injected allocation failure",
+                    ))
+                })
+                .expect_err("injected allocation must fail");
+            assert!(matches!(error, GgmlCpuGraphError::MemoryAdmission { .. }));
+            assert!(
+                !graph.frozen,
+                "a failed allocation must not freeze the builder"
+            );
+            assert!(graph.graph_allocator.is_none());
+            assert!(graph.prepared_graph.is_none());
+            (input, output)
+        };
+
+        let graph = session.builder();
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("the same builder must remain retryable after allocation failure");
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+            .expect("input upload");
+        assert_eq!(
+            graph
+                .compute_output_f32(output, 4)
+                .expect("retried graph should compute"),
+            vec![1.0, 4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
     fn persistent_graph_session_reuses_built_graph_for_i32_output() {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
@@ -10097,34 +10158,41 @@ mod tests {
         let broker = std::sync::Arc::clone(services.memory_broker());
         let _scope =
             crate::models::native_execution_services::install_native_execution_services(&services);
-
-        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
-            .expect("direct cpu graph runner should initialize");
-        let mut session = runner
-            .start_persistent_graph_session(1024 * 1024)
-            .expect("persistent session should open");
-        let graph = session.builder();
-        let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
-        graph.set_input(input).expect("input flag");
-        let output = graph.mul(input, input).expect("square graph");
-        graph.set_output(output).expect("output flag");
-        graph
-            .prepare_outputs_for_upload(&[output])
-            .expect("direct graph allocation should be admitted atomically");
-        graph
-            .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
-            .expect("input upload");
-        assert_eq!(
+        let domain = crate::device::execution_memory::MemoryDomainKey::SystemMemory;
+        let baseline = broker.usage(&domain);
+        {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("direct cpu graph runner should initialize");
+            let mut session = runner
+                .start_persistent_graph_session(1024 * 1024)
+                .expect("persistent session should open");
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
+            graph.set_input(input).expect("input flag");
+            let output = graph.mul(input, input).expect("square graph");
+            graph.set_output(output).expect("output flag");
             graph
-                .compute_output_f32(output, 4)
-                .expect("direct graph should compute"),
-            vec![1.0, 4.0, 9.0, 16.0]
-        );
+                .prepare_outputs_for_upload(&[output])
+                .expect("direct graph allocation should be admitted atomically");
+            graph
+                .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+                .expect("input upload");
+            assert_eq!(
+                graph
+                    .compute_output_f32(output, 4)
+                    .expect("direct graph should compute"),
+                vec![1.0, 4.0, 9.0, 16.0]
+            );
 
-        let usage = broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
-        assert_eq!(usage.pending_bytes, 0);
-        assert!(!usage.exclusive_pending);
-        assert!(usage.committed_bytes > 0);
+            let usage = broker.usage(&domain);
+            assert_eq!(usage.pending_bytes, 0);
+            assert!(!usage.exclusive_pending);
+            assert!(usage.committed_bytes > baseline.committed_bytes);
+        }
+        let released = broker.usage(&domain);
+        assert_eq!(released.pending_bytes, baseline.pending_bytes);
+        assert_eq!(released.committed_bytes, baseline.committed_bytes);
+        assert_eq!(released.exclusive_pending, baseline.exclusive_pending);
     }
 
     #[cfg(target_os = "macos")]
