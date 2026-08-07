@@ -209,7 +209,7 @@ pub(super) fn output_frames(samples: usize) -> usize {
         .iter()
         .zip(CONV_STRIDES)
         .try_fold(samples, |frames, (&kernel, stride)| {
-            (frames >= kernel).then_some((frames - kernel) / stride + 1)
+            (frames >= kernel).then(|| (frames - kernel) / stride + 1)
         })
         .unwrap_or(0)
 }

@@ -30,6 +30,7 @@ use super::{DiariZenSegmenterError, DiariZenWindowOutput, postprocess_logits};
 
 const GRAPH_SIZE: usize = 1 << 16;
 const STATIC_GRAPH_SIZE: usize = 1 << 10;
+const FEATURE_TILE_FRAMES: usize = 256;
 const LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const BATCH_NORM_EPSILON: f32 = 1.0e-5;
 
@@ -334,6 +335,13 @@ impl DiariZenRuntime {
     }
 
     #[cfg(test)]
+    pub(super) fn prepared_graph_allocation_bytes(&self) -> Option<u64> {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.session.prepared_allocation_bytes())
+    }
+
+    #[cfg(test)]
     pub(super) fn infer_trace(
         &mut self,
         samples: &[f32],
@@ -601,36 +609,10 @@ fn build_graph(
         .map_err(graph_error("allocate_pcm"))?;
     let mut traces = Vec::new();
 
-    let mut state = graph
+    let normalized_pcm = graph
         .norm(pcm, LAYER_NORM_EPSILON)
         .map_err(graph_error("wavlm_waveform_norm"))?;
-    let mut current_frames = samples;
-    for layer in 0..CONV_CHANNELS.len() {
-        let kernel = weight(
-            weights,
-            &format!("wavlm_model.feature_extractor.conv_layers.{layer}.conv.weight"),
-        )?;
-        state = graph
-            .conv_1d(kernel, state, CONV_STRIDES[layer], 0, 1)
-            .map_err(graph_error("wavlm_feature_conv"))?;
-        current_frames = (current_frames - CONV_KERNELS[layer]) / CONV_STRIDES[layer] + 1;
-        state = feature_layer_norm(
-            graph,
-            state,
-            weight(
-                weights,
-                &format!("wavlm_model.feature_extractor.conv_layers.{layer}.layer_norm.weight"),
-            )?,
-            weight(
-                weights,
-                &format!("wavlm_model.feature_extractor.conv_layers.{layer}.layer_norm.bias"),
-            )?,
-        )?;
-        state = graph
-            .gelu_erf(state)
-            .map_err(graph_error("wavlm_feature_gelu"))?;
-    }
-    debug_assert_eq!(current_frames, frames);
+    let mut state = wavlm_feature_extractor_tiled(graph, weights, normalized_pcm, samples, frames)?;
     state = graph
         .transpose(state)
         .and_then(|value| graph.cont(value))
@@ -845,6 +827,91 @@ fn affine_layer_norm<'a>(
         },
         DiariZenSegmenterError::graph,
     )
+}
+
+pub(super) fn feature_input_samples(output_frames: usize) -> Option<usize> {
+    CONV_KERNELS.iter().zip(CONV_STRIDES).rev().try_fold(
+        output_frames,
+        |samples, (&kernel, stride)| {
+            samples
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(stride))
+                .and_then(|value| value.checked_add(kernel))
+        },
+    )
+}
+
+fn wavlm_feature_extractor_tiled<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    weights: &GgmlLoadedWeightContext,
+    normalized_pcm: GgmlCpuTensor<'a>,
+    samples: usize,
+    frames: usize,
+) -> Result<GgmlCpuTensor<'a>, DiariZenSegmenterError> {
+    let total_stride = CONV_STRIDES.iter().product::<usize>();
+    let mut output = None;
+    for first_frame in (0..frames).step_by(FEATURE_TILE_FRAMES) {
+        let tile_frames = FEATURE_TILE_FRAMES.min(frames - first_frame);
+        let tile_samples = feature_input_samples(tile_frames).ok_or_else(|| {
+            DiariZenSegmenterError::Capacity(
+                "DiariZen feature-tile sample count overflowed".to_string(),
+            )
+        })?;
+        let sample_offset = first_frame.checked_mul(total_stride).ok_or_else(|| {
+            DiariZenSegmenterError::Capacity("DiariZen feature-tile offset overflowed".to_string())
+        })?;
+        let tile_end = sample_offset.checked_add(tile_samples).ok_or_else(|| {
+            DiariZenSegmenterError::Capacity("DiariZen feature-tile end overflowed".to_string())
+        })?;
+        if tile_end > samples {
+            return Err(DiariZenSegmenterError::Capacity(format!(
+                "DiariZen feature tile [{sample_offset}, {tile_end}) exceeds {samples} samples"
+            )));
+        }
+        let mut state = graph
+            .view_1d(
+                normalized_pcm,
+                tile_samples,
+                sample_offset * std::mem::size_of::<f32>(),
+            )
+            .map_err(graph_error("wavlm_feature_tile"))?;
+        let mut current_frames = tile_samples;
+        for layer in 0..CONV_CHANNELS.len() {
+            let kernel = weight(
+                weights,
+                &format!("wavlm_model.feature_extractor.conv_layers.{layer}.conv.weight"),
+            )?;
+            state = graph
+                .conv_1d(kernel, state, CONV_STRIDES[layer], 0, 1)
+                .map_err(graph_error("wavlm_feature_conv"))?;
+            current_frames = (current_frames - CONV_KERNELS[layer]) / CONV_STRIDES[layer] + 1;
+            state = feature_layer_norm(
+                graph,
+                state,
+                weight(
+                    weights,
+                    &format!("wavlm_model.feature_extractor.conv_layers.{layer}.layer_norm.weight"),
+                )?,
+                weight(
+                    weights,
+                    &format!("wavlm_model.feature_extractor.conv_layers.{layer}.layer_norm.bias"),
+                )?,
+            )?;
+            state = graph
+                .gelu_erf(state)
+                .map_err(graph_error("wavlm_feature_gelu"))?;
+        }
+        debug_assert_eq!(current_frames, tile_frames);
+        output = Some(match output {
+            None => state,
+            Some(previous) => graph
+                .concat(previous, state, 0)
+                .map_err(graph_error("wavlm_feature_tile_concat"))?,
+        });
+    }
+    output.ok_or_else(|| {
+        DiariZenSegmenterError::Capacity("DiariZen feature extractor produced no tiles".to_string())
+    })
 }
 
 fn feature_layer_norm<'a>(
@@ -1157,16 +1224,14 @@ fn wavlm_relative_mask<'a>(
         .and_then(|value| graph.sub(value, gate_a))
         .and_then(|value| graph.add(value, arena.graph_tensor(static_handles.two)))
         .map_err(graph_error("wavlm_gate_factor"))?;
-    let gated = graph
-        .mul(arena.graph_tensor(static_handles.relative_bias), factor)
-        .map_err(graph_error("wavlm_gate_relative_bias"))?;
-
+    let relative_bias = arena.graph_tensor(static_handles.relative_bias);
     let plane_bytes = frames * frames * std::mem::size_of::<f32>();
+    let factor_head_bytes = frames * std::mem::size_of::<f32>();
     let mut selected = None;
     for &head in REMAINING_HEADS[layer] {
         let plane = graph
             .view_3d(
-                gated,
+                relative_bias,
                 frames,
                 frames,
                 1,
@@ -1176,6 +1241,21 @@ fn wavlm_relative_mask<'a>(
             )
             .and_then(|value| graph.cont(value))
             .map_err(graph_error("wavlm_select_relative_head"))?;
+        let head_factor = graph
+            .view_3d(
+                factor,
+                1,
+                frames,
+                1,
+                std::mem::size_of::<f32>(),
+                factor_head_bytes,
+                head * factor_head_bytes,
+            )
+            .and_then(|value| graph.cont(value))
+            .map_err(graph_error("wavlm_select_relative_factor_head"))?;
+        let plane = graph
+            .mul(plane, head_factor)
+            .map_err(graph_error("wavlm_gate_relative_head"))?;
         selected = Some(match selected {
             None => plane,
             Some(previous) => graph
