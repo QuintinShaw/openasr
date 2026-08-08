@@ -99,23 +99,6 @@ pub(crate) enum FunasrNanoDecoderError {
     EmptyPrefillOutput,
 }
 
-fn plan_whole_decoder(
-    reader: &crate::ggml_runtime::GgufTensorDataReader,
-    metadata: &FunasrNanoDecoderMetadata,
-) -> Result<QwenWholeDecoderPlan, FunasrNanoDecoderError> {
-    let contract =
-        super::runtime_contract::funasr_nano_qwen_decoder_contract(metadata).map_err(|error| {
-            FunasrNanoDecoderError::TensorReadFailed {
-                reason: error.to_string(),
-            }
-        })?;
-    QwenWholeDecoderPlan::for_qwen_family(reader, contract).map_err(|error| {
-        FunasrNanoDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        }
-    })
-}
-
 fn map_tail_load_error(error: QwenDecoderTailLoadError) -> FunasrNanoDecoderError {
     match error {
         QwenDecoderTailLoadError::TokenEmbedding(error) => {
@@ -161,22 +144,28 @@ impl FunasrNanoDecoderRuntime {
         // `load_gguf_weight_context_from_preflight`, and FunASR ships a
         // combined encoder+adapter+decoder pack -- a decoder-only allowlist
         // would hide the non-decoder weights and break production load.
-        let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
+        //
+        // Bind the Qwen decoder contract exactly once: planner + tail + compile
+        // all consume this value (no second geometry/options/names assembly).
+        let contract = super::runtime_contract::funasr_nano_qwen_decoder_contract(&metadata)
+            .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
+                reason: error.to_string(),
+            })?;
+        let decoder_plan =
+            QwenWholeDecoderPlan::for_qwen_family(&reader, contract).map_err(|error| {
+                FunasrNanoDecoderError::TensorReadFailed {
+                    reason: error.to_string(),
+                }
+            })?;
         let QwenDecoderTail {
             logits_head,
             token_embedding,
-        } = {
-            let contract = super::runtime_contract::funasr_nano_qwen_decoder_contract(&metadata)
-                .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
-                    reason: error.to_string(),
-                })?;
-            load_qwen_decoder_tail_from_contract(
-                &reader,
-                contract,
-                FUNASR_NANO_RMS_NORM_EPSILON,
-                backend,
-            )
-        }
+        } = load_qwen_decoder_tail_from_contract(
+            &reader,
+            contract,
+            FUNASR_NANO_RMS_NORM_EPSILON,
+            backend,
+        )
         .map_err(map_tail_load_error)?;
         // Prepared Graph Plan prototype: plan is host-owned metadata built at
         // prepare; the shared compile seam is the only backend materialize path
@@ -533,10 +522,12 @@ mod trace_tests {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
         reader.tensor_index().enable_access_trace();
 
-        plan_whole_decoder(&reader, &metadata).expect("plan decoder");
+        // Same single-bind production shape: one contract value drives plan + tail.
+        let contract = funasr_nano_qwen_decoder_contract(&metadata).expect("bind decoder contract");
+        QwenWholeDecoderPlan::for_qwen_family(&reader, contract).expect("plan decoder");
         load_qwen_decoder_tail_from_contract(
             &reader,
-            funasr_nano_qwen_decoder_contract(&metadata).expect("bind decoder contract"),
+            contract,
             FUNASR_NANO_RMS_NORM_EPSILON,
             GgmlCpuGraphBackend::Cpu,
         )

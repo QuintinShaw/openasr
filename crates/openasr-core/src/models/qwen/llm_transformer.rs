@@ -5970,7 +5970,7 @@ fn plan_qwen_family_layer(
     let up = take_planned_projection(&mut projections, &names.ffn_up_name)?;
     let down = take_planned_projection(&mut projections, &names.ffn_down_name)?;
 
-    let (q_bias, k_bias, v_bias) = if options.qkv_bias {
+    let (q_bias, k_bias, v_bias) = if options.qkv_bias() {
         let q_bias_name = names.q_bias_name.as_deref().ok_or_else(|| {
             Qwen3AsrLlmTransformerError::InvalidTensorShape {
                 tensor_name: "<q_bias>".to_string(),
@@ -6001,7 +6001,7 @@ fn plan_qwen_family_layer(
         (None, None, None)
     };
 
-    let (q_norm, k_norm) = if options.qk_norm {
+    let (q_norm, k_norm) = if options.qk_norm() {
         let q_norm_name = names.q_norm_name.as_deref().ok_or_else(|| {
             Qwen3AsrLlmTransformerError::InvalidTensorShape {
                 tensor_name: "<q_norm>".to_string(),

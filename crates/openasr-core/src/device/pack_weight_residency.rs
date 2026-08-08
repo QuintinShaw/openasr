@@ -38,14 +38,38 @@ use super::execution_memory::{
     MemoryPlanningError, MemoryReservationCohortId,
 };
 
+/// Process-local identity of one already-open pack weight mapping.
+///
+/// Construct only from the live `Arc<Mmap>` that owns the host import. The
+/// identity is the Arc allocation pointer: clones of the same open mapping
+/// share it, and a separately admitted file (even at the same path) gets a
+/// fresh Arc and therefore a distinct identity. Generation tokens on the
+/// residency table handle ABA across drop/re-acquire of the same key; this
+/// type only names *which* open mapping is being charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PackWeightMappingIdentity(usize);
+
+impl PackWeightMappingIdentity {
+    /// Identity of the open mapping owned by `mmap`.
+    pub(crate) fn from_open_mmap(mmap: &Arc<memmap2::Mmap>) -> Self {
+        Self(std::sync::Arc::as_ptr(mmap) as usize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(id: usize) -> Self {
+        Self(id)
+    }
+
+    pub(crate) fn as_raw(self) -> usize {
+        self.0
+    }
+}
+
 /// Identity of one already-open pack mapping in one physical memory domain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PackWeightResidencyKey {
     pub domain: MemoryDomainKey,
-    /// [`std::sync::Arc::as_ptr`] of the process-local `Arc<Mmap>` (stable for
-    /// clones of the same open generation; distinct for separately admitted
-    /// files even at the same path).
-    pub mapping_identity: usize,
+    pub mapping_identity: PackWeightMappingIdentity,
 }
 
 #[derive(Debug)]
@@ -172,7 +196,8 @@ impl DeviceMemoryBrokerSet {
             requires_reconciliation: false,
             resource_id: format!(
                 "pack-weight-residency:{}:{:#x}",
-                key.domain, key.mapping_identity
+                key.domain,
+                key.mapping_identity.as_raw()
             ),
             cohort_id: None,
         };
@@ -286,7 +311,8 @@ impl DeviceMemoryBrokerSet {
             requires_reconciliation: false,
             resource_id: format!(
                 "pack-weight-residency-dead-inject:{}:{:#x}",
-                key.domain, key.mapping_identity
+                key.domain,
+                key.mapping_identity.as_raw()
             ),
             cohort_id: None,
         };
@@ -344,7 +370,7 @@ mod tests {
     fn key(id: usize) -> PackWeightResidencyKey {
         PackWeightResidencyKey {
             domain: MemoryDomainKey::SystemMemory,
-            mapping_identity: id,
+            mapping_identity: PackWeightMappingIdentity::from_raw_for_test(id),
         }
     }
 

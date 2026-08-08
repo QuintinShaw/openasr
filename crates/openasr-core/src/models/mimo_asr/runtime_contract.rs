@@ -843,15 +843,16 @@ fn mimo_asr_runtime_tensor_bindings(
     use crate::models::qwen::QwenDecoderContractGeometry;
     let profile = mimo_asr_qwen_decoder_profile();
     let decoder_geometry = mimo_asr_qwen_decoder_geometry(llm);
+    let decoder_tail = profile.tail_tensor_count();
     decoder_geometry
-        .validate_obligation_budget(profile.options(), /*tail*/ 3)
+        .validate_obligation_budget(profile.options(), decoder_tail)
         .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })?;
     let decoder_upper = decoder_geometry
         .n_layers
         .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
             profile.options(),
         ))
-        .and_then(|n| n.checked_add(3))
+        .and_then(|n| n.checked_add(decoder_tail))
         .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {
             count: usize::MAX,
             max: MIMO_MAX_TENSOR_OBLIGATIONS,

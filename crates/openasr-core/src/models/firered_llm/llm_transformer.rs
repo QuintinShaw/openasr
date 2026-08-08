@@ -133,22 +133,6 @@ pub(crate) enum FireRedLlmDecoderError {
     EmptyPrefillOutput,
 }
 
-fn plan_qwen2_whole_decoder(
-    reader: &crate::ggml_runtime::GgufTensorDataReader,
-    metadata: &FireRedLlmDecoderMetadata,
-) -> Result<QwenWholeDecoderPlan, FireRedLlmDecoderError> {
-    let contract = firered_llm_qwen_decoder_contract(metadata).map_err(|error| {
-        FireRedLlmDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        }
-    })?;
-    QwenWholeDecoderPlan::for_qwen_family(reader, contract).map_err(|error| {
-        FireRedLlmDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        }
-    })
-}
-
 fn map_tail_load_error(error: QwenDecoderTailLoadError) -> FireRedLlmDecoderError {
     match error {
         QwenDecoderTailLoadError::TokenEmbedding(error) => {
@@ -193,23 +177,27 @@ impl FireRedLlmDecoderRuntime {
                 .map_err(|error| FireRedLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
-        let decoder_plan = plan_qwen2_whole_decoder(&reader, &metadata)?;
-        let QwenDecoderTail {
-            logits_head,
-            token_embedding,
-        } = {
-            let contract = firered_llm_qwen_decoder_contract(&metadata).map_err(|error| {
+        // Bind the Qwen decoder contract exactly once for plan + tail + compile.
+        let contract = firered_llm_qwen_decoder_contract(&metadata).map_err(|error| {
+            FireRedLlmDecoderError::TensorReadFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_plan =
+            QwenWholeDecoderPlan::for_qwen_family(&reader, contract).map_err(|error| {
                 FireRedLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 }
             })?;
-            load_qwen_decoder_tail_from_contract(
-                &reader,
-                contract,
-                FIRERED_LLM_RMS_NORM_EPSILON,
-                backend,
-            )
-        }
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
+            &reader,
+            contract,
+            FIRERED_LLM_RMS_NORM_EPSILON,
+            backend,
+        )
         .map_err(map_tail_load_error)?;
         let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {

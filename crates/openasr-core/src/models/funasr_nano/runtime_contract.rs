@@ -771,7 +771,7 @@ pub(crate) fn funasr_nano_qwen_decoder_geometry(
     }
 }
 
-/// Layer name provider shared with [`super::llm_transformer::plan_whole_decoder`].
+/// Layer name provider shared with the FunASR-Nano Qwen decoder profile.
 pub(crate) fn funasr_nano_qwen_family_layer_names(
     layer: usize,
 ) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {

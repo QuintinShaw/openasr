@@ -90,23 +90,6 @@ pub(crate) enum MimoLlmDecoderError {
     EmptyPrefillOutput,
 }
 
-fn plan_whole_decoder(
-    reader: &crate::ggml_runtime::GgufTensorDataReader,
-    metadata: &MimoLlmMetadata,
-) -> Result<QwenWholeDecoderPlan, MimoLlmDecoderError> {
-    use super::runtime_contract::mimo_asr_qwen_decoder_contract;
-    let contract = mimo_asr_qwen_decoder_contract(metadata).map_err(|error| {
-        MimoLlmDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        }
-    })?;
-    QwenWholeDecoderPlan::for_qwen_family(reader, contract).map_err(|error| {
-        MimoLlmDecoderError::TensorReadFailed {
-            reason: error.to_string(),
-        }
-    })
-}
-
 fn map_tail_load_error(error: QwenDecoderTailLoadError) -> MimoLlmDecoderError {
     match error {
         QwenDecoderTailLoadError::TokenEmbedding(error) => {
@@ -148,23 +131,27 @@ impl MimoLlmDecoderRuntime {
                 .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 })?;
-        let decoder_plan = plan_whole_decoder(&reader, &metadata)?;
-        let QwenDecoderTail {
-            logits_head,
-            token_embedding,
-        } = {
-            let contract = mimo_asr_qwen_decoder_contract(&metadata).map_err(|error| {
+        // Bind the Qwen decoder contract exactly once for plan + tail + compile.
+        let contract = mimo_asr_qwen_decoder_contract(&metadata).map_err(|error| {
+            MimoLlmDecoderError::TensorReadFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_plan =
+            QwenWholeDecoderPlan::for_qwen_family(&reader, contract).map_err(|error| {
                 MimoLlmDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 }
             })?;
-            load_qwen_decoder_tail_from_contract(
-                &reader,
-                contract,
-                metadata.rms_norm_epsilon,
-                backend,
-            )
-        }
+        let QwenDecoderTail {
+            logits_head,
+            token_embedding,
+        } = load_qwen_decoder_tail_from_contract(
+            &reader,
+            contract,
+            metadata.rms_norm_epsilon,
+            backend,
+        )
         .map_err(map_tail_load_error)?;
         // Keep the output projection in the same static arena as the resident
         // decoder graph so Metal/GPU decode can return a device-side top-1

@@ -607,15 +607,16 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     use crate::models::qwen::QwenDecoderContractGeometry;
     let profile = moss_td_qwen_decoder_profile();
     let decoder_geometry = moss_td_qwen_decoder_geometry(&decoder);
+    let decoder_tail = profile.tail_tensor_count();
     decoder_geometry
-        .validate_obligation_budget(profile.options(), /*tail*/ 2)
+        .validate_obligation_budget(profile.options(), decoder_tail)
         .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })?;
     let decoder_upper = decoder_geometry
         .n_layers
         .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
             profile.options(),
         ))
-        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_add(decoder_tail))
         .ok_or(MossTdRuntimeContractError::TooManyTensorObligations {
             count: usize::MAX,
             max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,

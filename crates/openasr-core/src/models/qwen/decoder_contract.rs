@@ -62,7 +62,7 @@ impl QwenDecoderContractGeometry {
     pub(crate) fn layer_tensor_count(options: QwenDecoderContractOptions) -> usize {
         // attn_norm + q/k/v/out + ffn_norm + gate/up/down = 9
         // + optional 2 qk-norm or 3 qkv-bias
-        9 + if options.qk_norm { 2 } else { 0 } + if options.qkv_bias { 3 } else { 0 }
+        9 + if options.qk_norm() { 2 } else { 0 } + if options.qkv_bias() { 3 } else { 0 }
     }
 
     /// Structural pins shared by every Qwen-shaped decoder family, including
@@ -181,12 +181,12 @@ impl QwenDecoderVariant {
 
 /// Private POD projected from [`QwenDecoderVariant`] for descriptor helpers.
 ///
-/// Fields are crate-private so callers cannot assemble illegal qk_norm/qkv_bias
+/// Fields are private so callers cannot assemble illegal qk_norm/qkv_bias
 /// pairs. Construct only via [`QwenDecoderVariant::options`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwenDecoderContractOptions {
-    pub(crate) qk_norm: bool,
-    pub(crate) qkv_bias: bool,
+    qk_norm: bool,
+    qkv_bias: bool,
 }
 
 impl QwenDecoderContractOptions {
@@ -195,6 +195,14 @@ impl QwenDecoderContractOptions {
     pub(crate) const QWEN3: Self = QwenDecoderVariant::Qwen3.options();
     #[cfg(test)]
     pub(crate) const QWEN2: Self = QwenDecoderVariant::Qwen2.options();
+
+    pub(crate) const fn qk_norm(self) -> bool {
+        self.qk_norm
+    }
+
+    pub(crate) const fn qkv_bias(self) -> bool {
+        self.qkv_bias
+    }
 }
 
 /// Tail tensor names the family loader already uses.
@@ -401,7 +409,7 @@ pub(crate) fn qwen_decoder_layer_tensor_descriptors(
         "attention output projection must be ggml [n_heads*head_dim, d_model]",
     ));
 
-    if options.qk_norm {
+    if options.qk_norm() {
         let q_norm = names.q_norm_name.as_ref().ok_or_else(|| {
             "qwen decoder options.qk_norm requires q_norm_name on the layer name set".to_string()
         })?;
@@ -420,7 +428,7 @@ pub(crate) fn qwen_decoder_layer_tensor_descriptors(
         ));
     }
 
-    if options.qkv_bias {
+    if options.qkv_bias() {
         let q_bias = names.q_bias_name.as_ref().ok_or_else(|| {
             "qwen decoder options.qkv_bias requires q_bias_name on the layer name set".to_string()
         })?;
