@@ -380,6 +380,18 @@ struct WhisperEncoderPersistentStaticSession {
     encoder_hidden_size: usize,
 }
 
+impl WhisperEncoderPersistentStaticSession {
+    fn release_transient_compute_memory(&mut self) -> Result<(), WhisperGgmlExecutorError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
+                    reason: format!("could not release transient encoder working set: {error}"),
+                },
+            )
+    }
+}
+
 struct WhisperDecoderPersistentStaticSession {
     runner: GgmlCpuGraphRunner,
     cache: WhisperDecoderPersistentWeightCache,
@@ -3459,6 +3471,11 @@ fn run_whisper_encoder_actor(
                     state.runner.as_ref(),
                 )
             });
+            let release_result = if allow_persistent_session_reuse {
+                session.release_transient_compute_memory()
+            } else {
+                Ok(())
+            };
             if !allow_persistent_session_reuse {
                 // Short-form requests do not promise cross-request graph
                 // reuse. Drop the session while still on its owner thread;
@@ -3466,7 +3483,11 @@ fn run_whisper_encoder_actor(
                 // and prepared-runtime reuse.
                 state.session = None;
             }
-            result
+            match (result, release_result) {
+                (Ok(output), Ok(())) => Ok(output),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+            }
         })
         .map_err(|error| map_whisper_actor_error("encoder", error))?
 }

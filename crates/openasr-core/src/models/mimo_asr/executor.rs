@@ -765,12 +765,18 @@ impl MimoAsrGgmlExecutor {
         let summed = sum_speech_embeddings(&prepared.speech_embedding_tables, &codes);
 
         let llm_d_model = prepared.llm_metadata.d_model;
-        let speech_rows = prepared
+        let inlocal_result = prepared
             .inlocal_runtime
-            .run(&summed, usable_frames, llm_d_model)
-            .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
-                reason: error.to_string(),
-            })?;
+            .run(&summed, usable_frames, llm_d_model);
+        let inlocal_release = prepared.inlocal_runtime.release_transient_compute_memory();
+        let speech_rows = match (inlocal_result, inlocal_release) {
+            (Ok(output), Ok(())) => output,
+            (Err(error), _) | (Ok(_), Err(error)) => {
+                return Err(MimoAsrExecutorError::InputLocalFailed {
+                    reason: error.to_string(),
+                });
+            }
+        };
         let audio_group_count = usable_frames / group_size;
 
         // Disjoint field borrows: `&mut decoder` for the decode graph and

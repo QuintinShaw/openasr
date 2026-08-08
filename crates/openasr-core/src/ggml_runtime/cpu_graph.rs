@@ -1664,9 +1664,23 @@ impl GgmlCpuGraphRunner {
     /// the next phase is quoted against physical memory that the prior phase
     /// no longer needs. Callers MUST NOT invoke it while a persistent graph
     /// session built from this runner is alive: rebuilding the scheduler would
-    /// invalidate that session's native scheduler pointer.
+    /// invalidate that session's native scheduler pointer. If native trim
+    /// fails, the replacement scheduler retains the retired private leases so
+    /// accounting stays conservative and a later release can retry safely.
     pub(crate) fn release_transient_scheduler_working_set(
         &mut self,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.release_transient_scheduler_working_set_with(|backend| {
+            let abi = unsafe { BackendMemoryAbi::from_backend(backend) }
+                .map_err(|source| memory_admission_error("scheduler-release/abi", source.into()))?;
+            abi.trim(0)
+                .map_err(|source| memory_admission_error("scheduler-release/trim", source.into()))
+        })
+    }
+
+    fn release_transient_scheduler_working_set_with(
+        &mut self,
+        mut trim_backend: impl FnMut(ffi::GgmlBackendRaw) -> Result<(), GgmlCpuGraphError>,
     ) -> Result<(), GgmlCpuGraphError> {
         let Some(current) = self.scheduler.as_ref() else {
             return Ok(());
@@ -1702,11 +1716,19 @@ impl GgmlCpuGraphRunner {
         drop(previous);
         for raw in released_owner.backend_private_leases.keys().copied() {
             let backend = raw as ffi::GgmlBackendRaw;
-            let abi = unsafe { BackendMemoryAbi::from_backend(backend) }
-                .map_err(|source| memory_admission_error("scheduler-release/abi", source.into()))?;
-            abi.trim(0).map_err(|source| {
-                memory_admission_error("scheduler-release/trim", source.into())
-            })?;
+            if let Err(source) = trim_backend(backend) {
+                // A failed trim does not prove that backend-private cached
+                // bytes disappeared, so refunding here would under-account
+                // physical memory. Transfer the retired scheduler's lease
+                // tracking to the empty replacement instead: the next stage
+                // release retries trim and can then detach both generations.
+                self.scheduler
+                    .as_ref()
+                    .expect("replacement scheduler was installed above")
+                    .memory_owner
+                    .retain_private_leases_for_retry(&released_private_leases);
+                return Err(source);
+            }
         }
 
         // Only leases created by the retired scheduler are detached. Other
@@ -6440,6 +6462,18 @@ impl GgmlSchedulerMemoryOwner {
                     .any(|lease| candidate.shares_reservation_with(lease))
             });
     }
+
+    fn retain_private_leases_for_retry(&self, retained: &[NativeBackendPrivateMemoryLease]) {
+        let mut tracked = self.scheduler_private_leases.borrow_mut();
+        for lease in retained {
+            if !tracked
+                .iter()
+                .any(|candidate| candidate.shares_reservation_with(lease))
+            {
+                tracked.push(lease.clone());
+            }
+        }
+    }
 }
 
 /// GPU-class backends are expensive to initialize (device enumeration + driver
@@ -10425,6 +10459,82 @@ mod tests {
         assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
             GgmlCpuGraphBackend::Cpu,
         );
+    }
+
+    #[test]
+    fn transient_scheduler_release_retains_private_leases_until_trim_can_retry() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let output = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect("scheduler graph should allocate and compute");
+        assert_eq!(output, vec![4.0, 6.0]);
+
+        let retired = runner
+            .scheduler
+            .as_ref()
+            .expect("scheduler was requested")
+            .memory_owner
+            .private_leases();
+        assert!(
+            !retired.is_empty(),
+            "scheduler allocation should retain backend-private accounting"
+        );
+        let usage_before_failure =
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        let error = runner
+            .release_transient_scheduler_working_set_with(|_| {
+                Err(GgmlCpuGraphError::BackendSchedulerPoisoned)
+            })
+            .expect_err("injected trim failure must fail the release");
+        assert!(matches!(error, GgmlCpuGraphError::BackendSchedulerPoisoned));
+
+        let retained = runner
+            .scheduler
+            .as_ref()
+            .expect("failed release installs an empty replacement")
+            .memory_owner
+            .private_leases();
+        assert_eq!(retained.len(), retired.len());
+        assert!(retired.iter().all(|lease| {
+            retained
+                .iter()
+                .any(|candidate| candidate.shares_reservation_with(lease))
+        }));
+        assert_eq!(
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory),
+            usage_before_failure,
+            "a failed trim must not refund bytes that may still be physically cached"
+        );
+
+        runner
+            .release_transient_scheduler_working_set()
+            .expect("a later successful trim should release retained accounting");
+        assert!(
+            runner
+                .scheduler
+                .as_ref()
+                .expect("successful release keeps an empty scheduler")
+                .memory_owner
+                .private_leases()
+                .is_empty(),
+            "retained private leases must detach after the retry succeeds"
+        );
+        let released =
+            broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
+        assert_eq!(released.pending_bytes, 0);
+        assert!(!released.exclusive_pending);
+        assert!(!released.quarantined);
+        let output = runner
+            .compute_add_f32(&[5.0, 6.0], &[7.0, 8.0])
+            .expect("runner should remain reusable after trim retry");
+        assert_eq!(output, vec![12.0, 14.0]);
     }
 
     #[cfg(target_os = "macos")]
