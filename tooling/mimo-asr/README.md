@@ -64,7 +64,12 @@ openasr model-pack requant "$STAGING" "$FINAL" --quant q4-k
 
 The command verifies the source before reading it and seals/verifies the
 output. It reports the verified path, content id, and converted/copied tensor
-counts. Do not add a Python K-quant implementation or relabel the q8_0 pack.
+counts. Q4_K is applied to the eligible text-decoder matrices; the fp16 audio
+tokenizer/input-local matrices are copied exactly. The shared acoustic Q8_0
+rule is a minimum precision floor, not a request to discard higher-precision
+source weights. A source whose acoustic matrices are already below that floor
+is rejected because requantization cannot reconstruct lost signal. Do not add
+a Python K-quant implementation or relabel the q8_0 pack.
 
 Set `OPENASR_BUILD_COMMIT=<40-hex sha>` to bake `openasr.build.commit`
 provenance (the publish pipeline's `convert.sh` always exports it); a set but
