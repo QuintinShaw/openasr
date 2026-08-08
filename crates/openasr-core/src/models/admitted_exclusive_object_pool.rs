@@ -720,8 +720,12 @@ mod tests {
         drop(first_checkout);
         second.join().expect("second thread");
         assert_eq!(maximum_active_builders.load(Ordering::SeqCst), 1);
-        assert_eq!(builds.load(Ordering::SeqCst), 2);
-        assert_eq!(pool.usage_for_test().0, builds.load(Ordering::SeqCst));
+        let build_count = builds.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&build_count),
+            "the second checkout may build after waiting or reuse the first owner"
+        );
+        assert_eq!(pool.usage_for_test().0, build_count);
     }
 
     #[test]
