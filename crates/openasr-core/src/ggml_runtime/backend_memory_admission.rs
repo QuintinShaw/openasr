@@ -1718,6 +1718,7 @@ mod tests {
             },
             peak_bytes: bytes,
             retained_bytes: bytes,
+            observed_peak_bytes: None,
             requires_reconciliation: false,
             resource_id: resource_id.to_owned(),
             cohort_id: None,
