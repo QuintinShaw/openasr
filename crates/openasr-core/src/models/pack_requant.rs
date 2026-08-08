@@ -8,7 +8,7 @@
 //! transaction, and returns the resulting verification proof. It is not a raw
 //! GGUF writer and it never keeps the transformed multi-gigabyte pack in RAM.
 
-use std::{collections::BTreeMap, io::Write, path::Path, sync::Arc};
+use std::{collections::BTreeMap, io::Write, path::Path};
 
 use thiserror::Error;
 
@@ -16,9 +16,9 @@ use crate::ggml_runtime::gguf_header::parse_gguf_header;
 use crate::{
     VerifiedPack,
     ggml_runtime::{
-        GgufMetadataValue, GgufStreamTensorSpec, GgufTensorDataReader, GgufWriteError,
-        GgufWriteTensorType, GgufWriteValue, dequantize_ggml_row_to_f32, ggml_row_size_bytes,
-        quantize_f32_to_ggml_tensor_data_into, write_gguf_file_streaming_v0,
+        GgufMetadataValue, GgufStreamTensorSpec, GgufWriteError, GgufWriteTensorType,
+        GgufWriteValue, build_runtime_tensor_reader_from_preflight, dequantize_ggml_row_to_f32,
+        ggml_row_size_bytes, quantize_f32_to_ggml_tensor_data_into, write_gguf_file_streaming_v0,
     },
 };
 
@@ -204,13 +204,10 @@ pub fn requantize_oasr_pack(
             target: target.label(),
         });
     }
-    let reader = GgufTensorDataReader::from_preflight_parts(
-        preflight.runtime_source(),
-        preflight.metadata(),
-        Arc::new(preflight.tensor_index().clone()),
-    )
-    .map_err(|error| PackRequantError::SourceReader {
-        reason: error.to_string(),
+    let reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+        PackRequantError::SourceReader {
+            reason: error.to_string(),
+        }
     })?;
     write_gguf_file_streaming_v0(
         transaction.staging_path(),
