@@ -3437,6 +3437,66 @@ async fn transcriptions_returns_mock_json_by_default() {
     );
 }
 
+#[tokio::test]
+async fn failed_native_transcription_clears_id_scoped_progress_and_control() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime {
+            backend: openasr_core::BackendKind::Native,
+            native_execution: openasr_server::NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: None,
+        },
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let id = "native-failure-cleanup";
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        &sample_wav_bytes(),
+        &[("transcription_id", id)],
+    );
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let progress = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/audio/transcriptions/{id}/progress"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress.status(), StatusCode::OK);
+    let progress_body: Value =
+        serde_json::from_slice(&to_bytes(progress.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(progress_body["phase"], Value::Null);
+    assert_eq!(progress_body["fraction"], serde_json::json!(0.0));
+    assert_eq!(progress_body["done"], serde_json::json!(0));
+    assert_eq!(progress_body["total"], serde_json::json!(0));
+
+    let cancel = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/audio/transcriptions/{id}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::NOT_FOUND);
+}
+
 /// A real-world upload filename containing CJK characters and a space must
 /// parse as multipart/form-data like any other filename -- this previously
 /// got misdiagnosed as a client encoding bug when the true cause was uploads

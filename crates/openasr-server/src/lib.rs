@@ -1436,22 +1436,45 @@ impl DistributionContext {
         Self::with_execution_services(runtime, Arc::clone(supervisor.execution_services()))
     }
 
-    fn register_transcription(
+    /// Claims one client-supplied request id for the lifetime of a single
+    /// transcription. Duplicate live ids fail closed instead of replacing the
+    /// first request's control and letting either cleanup guard remove the
+    /// other's registry entry.
+    fn try_register_transcription(
         &self,
         transcription_id: &str,
         control: Arc<openasr_core::TranscriptionControl>,
-    ) {
-        self.transcriptions
+    ) -> bool {
+        let mut transcriptions = self
+            .transcriptions
             .lock()
-            .expect("active transcription registry mutex poisoned")
-            .insert(transcription_id.to_string(), control);
+            .expect("active transcription registry mutex poisoned");
+        if transcriptions.contains_key(transcription_id) {
+            return false;
+        }
+        transcriptions.insert(transcription_id.to_string(), control);
+        true
     }
 
-    fn clear_transcription(&self, transcription_id: &str) {
-        self.transcriptions
+    /// Releases an id only when `control` still owns it. The pointer fence is
+    /// defensive against future registration changes: a stale guard can never
+    /// clear a newer request that reused the same string id.
+    fn clear_transcription_if_current(
+        &self,
+        transcription_id: &str,
+        control: &Arc<openasr_core::TranscriptionControl>,
+    ) -> bool {
+        let mut transcriptions = self
+            .transcriptions
             .lock()
-            .expect("active transcription registry mutex poisoned")
-            .remove(transcription_id);
+            .expect("active transcription registry mutex poisoned");
+        let owns_entry = transcriptions
+            .get(transcription_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, control));
+        if owns_entry {
+            transcriptions.remove(transcription_id);
+        }
+        owns_entry
     }
 
     fn transcription_control(

@@ -380,8 +380,9 @@ pub(crate) struct TranscriptionProgressBody {
 impl TranscriptionProgressBody {
     /// `{phase:null,fraction:0,done:0,total:0}`: nothing running (or, for the
     /// id-scoped endpoint, this id has not published its first report yet --
-    /// e.g. still resolving the model -- which the client already treats as
-    /// "no signal, fall back to a time estimate" exactly like true idle).
+    /// e.g. still resolving the model). Clients treat this canonical shape as
+    /// "no signal yet" and keep their preparing state until a real stage is
+    /// published.
     fn idle() -> Self {
         Self {
             phase: None,
@@ -460,7 +461,7 @@ pub(crate) async fn transcription_progress() -> Result<Response, ApiError> {
 /// same idle body as the legacy endpoint above when `id` has not published a
 /// report yet (still resolving the model) or has already finished/never
 /// existed -- there is no ambiguity to fail closed on here, since `id` always
-/// names exactly one run.
+/// names exactly one run. A live duplicate id is rejected at registration.
 pub(crate) async fn transcription_progress_by_id(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
@@ -535,7 +536,7 @@ impl Drop for ActiveTranscriptionCleanup {
             self.control.request_cancel();
         }
         self.distribution
-            .clear_transcription(&self.transcription_id);
+            .clear_transcription_if_current(&self.transcription_id, &self.control);
     }
 }
 
@@ -556,6 +557,20 @@ fn active_transcription_control(
             "No in-flight transcription with id '{id}'. It may have already finished, been canceled, or never opted into control (missing transcription_id)."
         ))
     })
+}
+
+fn register_active_transcription(
+    distribution: &DistributionContext,
+    id: &str,
+) -> Result<Arc<openasr_core::TranscriptionControl>, ApiError> {
+    let control = Arc::new(openasr_core::TranscriptionControl::new());
+    if distribution.try_register_transcription(id, Arc::clone(&control)) {
+        Ok(control)
+    } else {
+        Err(ApiError::Conflict(format!(
+            "A native transcription with id '{id}' is already in flight. Use a unique transcription_id for each concurrent request."
+        )))
+    }
 }
 
 /// `POST /v1/audio/transcriptions/{id}/cancel`: cancel an in-flight file
@@ -666,14 +681,16 @@ async fn run_offline_transcription(
     // long-form slice boundaries; the mock backend has no such loop). The
     // cleanup guard removes the registry entry on every exit -- success, error,
     // or cancel.
-    let control = (runtime.backend == BackendKind::Native)
-        .then(|| parsed.transcription_id.clone())
-        .flatten()
-        .map(|id| {
-            let control = Arc::new(openasr_core::TranscriptionControl::new());
-            distribution.register_transcription(&id, Arc::clone(&control));
-            (id, control)
-        });
+    let control = if runtime.backend == BackendKind::Native {
+        if let Some(id) = parsed.transcription_id.clone() {
+            let control = register_active_transcription(&distribution, &id)?;
+            Some((id, control))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Armed for as long as the decode call below is in flight: if the client
     // disconnects and axum drops this handler future first, `Drop` cancels the
     // control so the (possibly paused) worker thread wakes and exits instead
@@ -1588,7 +1605,10 @@ mod native_model_ref_tests {
 mod active_transcription_cleanup_tests {
     use std::sync::Arc;
 
-    use super::{ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime};
+    use super::{
+        ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime,
+        register_active_transcription,
+    };
 
     fn distribution_for_test() -> DistributionContext {
         DistributionContext::new(DistributionRuntime {
@@ -1602,7 +1622,7 @@ mod active_transcription_cleanup_tests {
     fn drop_while_armed_cancels_control_and_clears_registry() {
         let distribution = distribution_for_test();
         let control = Arc::new(openasr_core::TranscriptionControl::new());
-        distribution.register_transcription("txn-disconnect", Arc::clone(&control));
+        assert!(distribution.try_register_transcription("txn-disconnect", Arc::clone(&control)));
 
         {
             let _cleanup = ActiveTranscriptionCleanup::new(
@@ -1631,7 +1651,7 @@ mod active_transcription_cleanup_tests {
     fn disarm_then_drop_does_not_cancel_but_still_clears_registry() {
         let distribution = distribution_for_test();
         let control = Arc::new(openasr_core::TranscriptionControl::new());
-        distribution.register_transcription("txn-normal", Arc::clone(&control));
+        assert!(distribution.try_register_transcription("txn-normal", Arc::clone(&control)));
 
         {
             let mut cleanup = ActiveTranscriptionCleanup::new(
@@ -1649,6 +1669,35 @@ mod active_transcription_cleanup_tests {
             "a normal completion must never fire a spurious cancel"
         );
         assert!(distribution.transcription_control("txn-normal").is_none());
+    }
+
+    #[test]
+    fn duplicate_live_transcription_id_is_rejected_without_replacing_its_owner() {
+        let distribution = distribution_for_test();
+        let first = register_active_transcription(&distribution, "txn-duplicate").unwrap();
+
+        let error = register_active_transcription(&distribution, "txn-duplicate")
+            .expect_err("a live client id must have exactly one owner");
+        assert!(matches!(error, super::ApiError::Conflict(_)));
+        let registered = distribution
+            .transcription_control("txn-duplicate")
+            .expect("the original owner must remain registered");
+        assert!(Arc::ptr_eq(&registered, &first));
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_remove_a_different_control_owner() {
+        let distribution = distribution_for_test();
+        let current = Arc::new(openasr_core::TranscriptionControl::new());
+        let stale = Arc::new(openasr_core::TranscriptionControl::new());
+        assert!(distribution.try_register_transcription("txn-fenced", Arc::clone(&current)));
+
+        assert!(!distribution.clear_transcription_if_current("txn-fenced", &stale));
+        let registered = distribution
+            .transcription_control("txn-fenced")
+            .expect("a stale guard must not clear the current owner");
+        assert!(Arc::ptr_eq(&registered, &current));
+        assert!(distribution.clear_transcription_if_current("txn-fenced", &current));
     }
 }
 
@@ -2613,6 +2662,41 @@ mod native_runtime_tests {
         assert_eq!(value["fraction"], serde_json::json!(0.0));
         assert_eq!(value["done"], serde_json::json!(0));
         assert_eq!(value["total"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn transcription_progress_serializes_every_rich_stage_field() {
+        use openasr_core::api::backend::{
+            LegacyNativeTranscriptionProgress, NativeTranscriptionProgress, TranscriptionStage,
+        };
+
+        let response = super::legacy_progress_response(LegacyNativeTranscriptionProgress::Single(
+            NativeTranscriptionProgress::new(
+                TranscriptionStage::IdentifySpeakers,
+                Some(0.4),
+                0.625,
+                Some(8),
+                Some(20),
+                Some("embedding speaker windows".to_string()),
+            ),
+        ))
+        .expect("a rich progress snapshot must serialize");
+        let value = response_json_body(response).await;
+
+        assert_eq!(value["phase"], serde_json::json!("decode"));
+        assert_eq!(value["fraction"], serde_json::json!(0.625));
+        assert_eq!(value["done"], serde_json::json!(625));
+        assert_eq!(value["total"], serde_json::json!(1000));
+        assert_eq!(value["stage"], serde_json::json!("identify_speakers"));
+        assert_eq!(value["stage_fraction"], serde_json::json!(0.4));
+        assert_eq!(value["completed_units"], serde_json::json!(8));
+        assert_eq!(value["total_units"], serde_json::json!(20));
+        assert_eq!(value["overall_fraction"], serde_json::json!(0.625));
+        assert_eq!(value["indeterminate"], serde_json::json!(false));
+        assert_eq!(
+            value["detail"],
+            serde_json::json!("embedding speaker windows")
+        );
     }
 
     /// Backward compatibility: a single active run's legacy read must still

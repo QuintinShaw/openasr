@@ -2307,7 +2307,7 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
     let control = Arc::new(openasr_core::TranscriptionControl::new());
-    distribution.register_transcription("txn-1", Arc::clone(&control));
+    assert!(distribution.try_register_transcription("txn-1", Arc::clone(&control)));
 
     pause_transcription_job(
         AxumPath("txn-1".to_string()),
@@ -2334,7 +2334,7 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     assert!(control.is_canceled());
 
     // Cleared entry (finished run) and unknown ids both fail closed with 404.
-    distribution.clear_transcription("txn-1");
+    assert!(distribution.clear_transcription_if_current("txn-1", &control));
     assert!(distribution.transcription_control("txn-1").is_none());
     let error = cancel_transcription_job(
         AxumPath("txn-1".to_string()),
