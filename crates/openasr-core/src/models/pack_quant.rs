@@ -97,6 +97,26 @@ impl TensorQuantizationContract {
         }
     }
 
+    /// Resolve the mathematical role once at the inventory seam.
+    ///
+    /// Consumers that need to distinguish a safety floor from a requested
+    /// storage rung (for example the post-build audit and conservative
+    /// requantization) must use this projection instead of parsing tensor
+    /// names beside the family classifier.
+    pub(crate) fn tensor_role(self, name: &str) -> Option<TensorRole> {
+        match self {
+            Self::SemanticRolesV1 { classify, .. } => Some(classify(name)),
+            Self::EntireAcousticPack { .. } => Some(TensorRole::AcousticEncoderMatrix),
+            Self::NotApplicable { reason, .. } => {
+                debug_assert!(
+                    !reason.trim().is_empty(),
+                    "NotApplicable quantization contracts require a reason"
+                );
+                None
+            }
+        }
+    }
+
     /// Project one tensor through the inventory-owned semantic policy.
     /// Repack/requant tooling consumes this exact seam rather than rebuilding
     /// family-name eligibility rules beside the original importer.
@@ -112,20 +132,13 @@ impl TensorQuantizationContract {
         if dims.len() != 2 {
             return None;
         }
-        match self {
-            Self::SemanticRolesV1 {
-                classify,
-                quantized_axis,
-                ..
-            } => classify_quant_tensor_role(dims, quantization, classify(name), quantized_axis),
-            Self::EntireAcousticPack { .. } => classify_quant_tensor_role(
-                dims,
-                quantization,
-                TensorRole::AcousticEncoderMatrix,
-                QuantizedAxis::First,
-            ),
-            Self::NotApplicable { .. } => None,
-        }
+        let role = self.tensor_role(name)?;
+        let quantized_axis = match self {
+            Self::SemanticRolesV1 { quantized_axis, .. } => quantized_axis,
+            Self::EntireAcousticPack { .. } => QuantizedAxis::First,
+            Self::NotApplicable { .. } => return None,
+        };
+        classify_quant_tensor_role(dims, quantization, role, quantized_axis)
     }
 }
 

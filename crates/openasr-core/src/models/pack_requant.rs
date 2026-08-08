@@ -31,6 +31,8 @@ use super::{
         PackEnvelope,
     },
     pack_quant::PackQuant,
+    pack_quant::{TensorQuantizationContract, TensorRole},
+    pack_quant_audit::{is_block_quant_type, meets_encoder_q8_floor},
     pack_verifier::{PackCandidate, PackRoute, PackVerifier},
 };
 
@@ -69,6 +71,10 @@ pub enum PackRequantError {
         architecture: String,
         target: &'static str,
     },
+    #[error(
+        "source acoustic tensor '{tensor}' uses ggml type {ggml_type}, below the required Q8_0 precision floor"
+    )]
+    SourceBelowAcousticFloor { tensor: String, ggml_type: i32 },
     #[error("could not build requant source reader: {reason}")]
     SourceReader { reason: String },
     #[error("could not start the sealed output transaction: {reason}")]
@@ -84,8 +90,10 @@ pub enum PackRequantError {
 /// v1 deliberately exposes only Q4_K: it closes the real MiMo external-tool
 /// gap without inventing a general arbitrary-precision conversion surface.
 /// The inventory projection is exact: decoder matrices eligible for Q4_K are
-/// written as Q4_K, acoustic matrices carrying the ASR quality floor are
-/// written as Q8_0, and tensors without a block-quant target are copied.
+/// written as Q4_K. Acoustic matrices are copied at their existing F16/F32 or
+/// Q8-class precision: Q8_0 is a lower safety bound, not an instruction to
+/// discard a source pack's higher acoustic precision. A below-floor acoustic
+/// source fails closed because requantization cannot reconstruct lost signal.
 pub fn requantize_oasr_pack(
     source: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -164,10 +172,17 @@ pub fn requantize_oasr_pack(
         .tensors()
         .iter()
         .map(|tensor| {
-            let target_type = descriptor
-                .quantization_contract
-                .tensor_classification
-                .target_write_type(&tensor.name, &tensor.dims, target);
+            let quantization_contract = descriptor.quantization_contract.tensor_classification;
+            let preserve_source = preserve_acoustic_source_tensor(
+                quantization_contract,
+                &tensor.name,
+                tensor.ggml_type,
+            )?;
+            let target_type = (!preserve_source)
+                .then(|| {
+                    quantization_contract.target_write_type(&tensor.name, &tensor.dims, target)
+                })
+                .flatten();
             let ggml_type = if let Some(target_type) = target_type
                 && tensor.ggml_type != target_type.ggml_type()
             {
@@ -176,13 +191,13 @@ pub fn requantize_oasr_pack(
             } else {
                 tensor.ggml_type
             };
-            GgufStreamTensorSpec {
+            Ok(GgufStreamTensorSpec {
                 name: tensor.name.clone(),
                 dims: tensor.dims.clone(),
                 ggml_type,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, PackRequantError>>()?;
     if converted_tensor_count == 0 {
         return Err(PackRequantError::NoEligibleTensor {
             architecture: model_architecture,
@@ -239,6 +254,31 @@ pub fn requantize_oasr_pack(
         converted_tensor_count,
         copied_tensor_count: specs.len() - converted_tensor_count,
     })
+}
+
+/// Return whether a tensor must be copied at source precision.
+///
+/// The audio Q8 policy is a floor: F16/F32 and Q8-class source storage already
+/// satisfies it. Re-encoding those weights to Q8 merely adds quantization
+/// error and, for sensitive audio tokenizers, can cross a behavioral cliff.
+/// Conversely, dequantizing a Q4 acoustic source and writing Q8 would only
+/// relabel already-lost information, so that input is rejected.
+fn preserve_acoustic_source_tensor(
+    contract: TensorQuantizationContract,
+    tensor: &str,
+    source_ggml_type: i32,
+) -> Result<bool, PackRequantError> {
+    if contract.tensor_role(tensor) != Some(TensorRole::AcousticEncoderMatrix) {
+        return Ok(false);
+    }
+    let wire_type = u32::try_from(source_ggml_type).unwrap_or(u32::MAX);
+    if is_block_quant_type(wire_type) && !meets_encoder_q8_floor(wire_type) {
+        return Err(PackRequantError::SourceBelowAcousticFloor {
+            tensor: tensor.to_string(),
+            ggml_type: source_ggml_type,
+        });
+    }
+    Ok(true)
 }
 
 fn requantize_tensor_rows(
@@ -493,27 +533,34 @@ mod tests {
     }
 
     #[test]
-    fn acoustic_projection_requantizes_rows_to_q8_floor() {
-        let target = GgufStreamTensorSpec {
-            name: "audio.encoder.weight".to_string(),
-            dims: vec![32, 2],
-            ggml_type: GgufWriteTensorType::Q8_0.ggml_type(),
+    fn acoustic_floor_preserves_high_precision_and_rejects_irrecoverable_sources() {
+        let contract = TensorQuantizationContract::EntireAcousticPack {
+            model_architecture: "fixture-acoustic",
         };
-        let source = (0..64_u32)
-            .flat_map(|index| ((index as f32 - 31.5) / 32.0).to_le_bytes())
-            .collect::<Vec<_>>();
-        let mut output = Vec::new();
-        requantize_tensor_rows(
-            &target,
-            GgufWriteTensorType::F32.ggml_type(),
-            &source,
-            &mut output,
-        )
-        .expect("requant acoustic rows");
-        assert_eq!(
-            output.len(),
-            ggml_row_size_bytes(GgufWriteTensorType::Q8_0.ggml_type(), 32).unwrap() * 2
+        assert!(
+            preserve_acoustic_source_tensor(
+                contract,
+                "encoder.weight",
+                GgufWriteTensorType::F16.ggml_type()
+            )
+            .unwrap()
         );
+        assert!(
+            preserve_acoustic_source_tensor(
+                contract,
+                "encoder.weight",
+                GgufWriteTensorType::Q8_0.ggml_type()
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            preserve_acoustic_source_tensor(
+                contract,
+                "encoder.weight",
+                GgufWriteTensorType::Q4_K.ggml_type()
+            ),
+            Err(PackRequantError::SourceBelowAcousticFloor { .. })
+        ));
     }
 
     #[test]
@@ -570,6 +617,15 @@ mod tests {
                 .iter()
                 .any(|tensor| tensor.ggml_type == GgufWriteTensorType::Q4_K.ggml_type())
         );
+        let acoustic = result
+            .verified_pack
+            .preflight()
+            .tensor_index()
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == "audio.proj2.weight")
+            .expect("acoustic projection");
+        assert_eq!(acoustic.ggml_type, GgufWriteTensorType::F16.ggml_type());
         let norm = result
             .verified_pack
             .preflight()
