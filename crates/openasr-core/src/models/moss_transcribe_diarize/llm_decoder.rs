@@ -85,8 +85,9 @@ impl MossTdDecoderRuntime {
         token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
-        // Prepared Graph Plan prototype: host prepare already owns the typed
-        // plan; compile through the shared seam (same entry FunASR-Nano uses).
+        // Structural Prepared Graph Plan adoption: host prepare already owns
+        // the typed plan and compiles through the shared seam (same entry
+        // FunASR-Nano uses). Performance remains an evidence-only claim.
         let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
                 plan: &decoder_plan,

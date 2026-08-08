@@ -3778,13 +3778,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .iter()
             .map(|(tensor, _)| *tensor)
             .collect::<Vec<_>>();
-        // Preparing before the first input upload is essential. Uploading into
-        // an unprepared direct graph falls back to allocating every declared
-        // intermediate in the ggml context; preparing first lets gallocr bind
-        // one liveness-planned buffer instead.
-        if materialize_layer_kv {
-            graph.prepare_outputs_for_upload(&requested_tensors)?;
-        } else {
+        // Stateless consumers need the one-shot liveness plan before uploads;
+        // otherwise the first upload allocates the declaration-sized CPU
+        // arena. Autoregressive consumers deliberately keep the established
+        // upload-first path: the fixed-span K/V inputs are persistent across
+        // the prefill/decode boundary, while a scheduler plan created before
+        // those uploads can recycle their backing storage and silently corrupt
+        // the materialized cache.
+        if !materialize_layer_kv {
             graph.prepare_one_shot_outputs_for_upload(&requested_tensors)?;
         }
         if env_var_truthy(QWEN3_LLM_PREFILL_ALLOCATION_PROFILE_ENV) {
@@ -7122,6 +7123,92 @@ mod tests {
         (temp, source, metadata)
     }
 
+    fn qwen2_scheduler_parity_layer_names(layer: usize) -> QwenFamilyLlmLayerTensorNames {
+        let prefix = format!("qwen2-parity.blk.{layer}");
+        QwenFamilyLlmLayerTensorNames {
+            attn_norm_name: format!("{prefix}.attn_norm.weight"),
+            attn_q_name: format!("{prefix}.attn_q.weight"),
+            attn_k_name: format!("{prefix}.attn_k.weight"),
+            attn_v_name: format!("{prefix}.attn_v.weight"),
+            attn_output_name: format!("{prefix}.attn_output.weight"),
+            q_norm_name: None,
+            k_norm_name: None,
+            q_bias_name: Some(format!("{prefix}.attn_q.bias")),
+            k_bias_name: Some(format!("{prefix}.attn_k.bias")),
+            v_bias_name: Some(format!("{prefix}.attn_v.bias")),
+            ffn_norm_name: format!("{prefix}.ffn_norm.weight"),
+            ffn_gate_name: format!("{prefix}.ffn_gate.weight"),
+            ffn_up_name: format!("{prefix}.ffn_up.weight"),
+            ffn_down_name: format!("{prefix}.ffn_down.weight"),
+        }
+    }
+
+    fn run_qwen2_scheduler_parity_fixture(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        contract: &QwenDecoderContract,
+        use_scheduler: bool,
+        hidden: &[f32],
+        token_count: usize,
+    ) -> Qwen3AsrLlmWholeStepOutput {
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some("cpu".into())),
+                (
+                    "OPENASR_GGML_USE_SCHEDULER",
+                    Some(if use_scheduler { "1" } else { "0" }.into()),
+                ),
+            ],
+            || {
+                let reader = GgufTensorDataReader::from_runtime_source(preflight.runtime_source())
+                    .expect("qwen2 parity reader");
+                let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, contract)
+                    .expect("qwen2 parity plan");
+                let mut executor = compile_qwen_whole_decoder_graph_from_prepared_plan(
+                    QwenPreparedDecoderGraphCompileRequest {
+                        plan: &plan,
+                        preflight,
+                        rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                        fused_logits_head: None,
+                        backend: GgmlCpuGraphBackend::Cpu,
+                    },
+                )
+                .expect("qwen2 parity executor");
+                executor
+                    .run_prefill(hidden, token_count, 1_000_000.0)
+                    .expect("qwen2 parity prefill")
+            },
+        )
+    }
+
+    fn assert_qwen2_scheduler_vectors_close(label: &str, scheduled: &[f32], direct: &[f32]) {
+        assert_eq!(scheduled.len(), direct.len(), "{label} length mismatch");
+        let mut max_abs = 0.0_f64;
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        for (&scheduled, &direct) in scheduled.iter().zip(direct) {
+            assert!(
+                scheduled.is_finite() && direct.is_finite(),
+                "{label} non-finite"
+            );
+            let error = f64::from(scheduled) - f64::from(direct);
+            max_abs = max_abs.max(error.abs());
+            squared_error += error * error;
+            squared_reference += f64::from(direct) * f64::from(direct);
+        }
+        let relative_l2 = if squared_reference == 0.0 {
+            squared_error.sqrt()
+        } else {
+            (squared_error / squared_reference).sqrt()
+        };
+        eprintln!(
+            "qwen2 scheduler parity {label}: max_abs={max_abs:.9} relative_l2={relative_l2:.12}"
+        );
+        assert!(
+            relative_l2 <= 1.0e-5,
+            "{label} scheduler drift exceeds numerical tolerance: max_abs={max_abs:.9} relative_l2={relative_l2:.12}"
+        );
+    }
+
     #[test]
     fn whole_decoder_plan_retains_no_weight_payload_and_materializes_one_layer_at_a_time() {
         let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
@@ -7214,11 +7301,81 @@ mod tests {
     }
 
     #[test]
+    fn qwen2_materialized_prefill_matches_with_and_without_scheduler() {
+        use crate::models::qwen::{
+            QwenDecoderTailTensorNames, QwenDecoderVariant, QwenFamilyDecoderProfile,
+        };
+        use crate::models::tensor_binding::project_fixture_tensors;
+
+        const LAYERS: usize = 4;
+        const D_MODEL: usize = 64;
+        const TOKEN_COUNT: usize = 48;
+        let geometry = QwenDecoderContractGeometry {
+            n_layers: LAYERS,
+            d_model: D_MODEL,
+            n_heads: 8,
+            n_kv_heads: 4,
+            head_dim: 8,
+            ffn_dim: 128,
+            vocab_size: 96,
+        };
+        let contract = QwenDecoderContract::bind(
+            geometry,
+            QwenFamilyDecoderProfile::new(
+                QwenDecoderVariant::Qwen2,
+                qwen2_scheduler_parity_layer_names,
+                QwenDecoderTailTensorNames {
+                    output_norm: "qwen2-parity.output_norm.weight",
+                    output_weight: Some("qwen2-parity.output.weight"),
+                    token_embd: "qwen2-parity.token_embd.weight",
+                },
+            ),
+        )
+        .expect("bind qwen2 scheduler parity contract");
+        let descriptors = contract
+            .runtime_tensor_descriptors()
+            .expect("qwen2 scheduler parity descriptors");
+        let mut spec = TinyGgufFixtureSpec::new(BTreeMap::new()).without_tensor("fixture.tensor");
+        for (name, dims) in project_fixture_tensors(&descriptors) {
+            spec = spec.with_tensor_shape(name, dims);
+        }
+        let temp = tempfile::tempdir().expect("qwen2 scheduler parity tempdir");
+        let path = temp.path().join("qwen2-scheduler-parity.oasr");
+        write_tiny_gguf_runtime_source(&path, &spec).expect("write qwen2 parity fixture");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(&path)
+                .expect("qwen2 parity preflight");
+        let hidden = deterministic_prefill_hidden(D_MODEL, TOKEN_COUNT);
+
+        let direct =
+            run_qwen2_scheduler_parity_fixture(&preflight, &contract, false, &hidden, TOKEN_COUNT);
+        let scheduled =
+            run_qwen2_scheduler_parity_fixture(&preflight, &contract, true, &hidden, TOKEN_COUNT);
+
+        assert_qwen2_scheduler_vectors_close("hidden", &scheduled.hidden, &direct.hidden);
+        assert_eq!(scheduled.layer_kv.len(), direct.layer_kv.len());
+        for (layer, ((scheduled_k, scheduled_v), (direct_k, direct_v))) in
+            scheduled.layer_kv.iter().zip(&direct.layer_kv).enumerate()
+        {
+            assert_qwen2_scheduler_vectors_close(
+                &format!("layer {layer} K"),
+                scheduled_k,
+                direct_k,
+            );
+            assert_qwen2_scheduler_vectors_close(
+                &format!("layer {layer} V"),
+                scheduled_v,
+                direct_v,
+            );
+        }
+    }
+
+    #[test]
     fn prepared_plan_compile_seam_is_the_sole_backend_materialize_entry() {
-        // Promotion-gate unit for the Prepared Graph Plan prototype: the
-        // shared compile request is the only way two Qwen-shaped adapters
-        // (FunASR / MOSS) turn a host-owned plan into a monomorphic executor.
-        // Geometry is not re-derived from metadata here.
+        // Structural-adoption gate: the shared compile request is the only
+        // way Qwen-shaped adapters turn a host-owned plan into a monomorphic
+        // executor. Geometry is not re-derived from metadata here; performance
+        // still requires an external receipt.
         let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
         let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
         let plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata).expect("decoder plan");

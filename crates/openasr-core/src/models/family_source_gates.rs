@@ -561,6 +561,57 @@ fn qwen_shaped_families_quote_only_through_the_bound_decoder_contract() {
 }
 
 #[test]
+fn qwen_shaped_family_constructors_keep_the_bound_plan_tail_compile_chain() {
+    let root = models_root();
+    for (relative, binder) in [
+        (
+            "funasr_nano/llm_transformer.rs",
+            "funasr_nano_qwen_decoder_contract",
+        ),
+        (
+            "mimo_asr/llm_transformer.rs",
+            "mimo_asr_qwen_decoder_contract",
+        ),
+        (
+            "firered_llm/llm_transformer.rs",
+            "firered_llm_qwen_decoder_contract",
+        ),
+    ] {
+        let syntax = ProductionSyntax::collect(&root.join(relative));
+        for required in [
+            binder,
+            "for_qwen_family",
+            "load_qwen_decoder_tail_from_contract",
+            "compile_qwen_whole_decoder_graph_from_prepared_plan",
+        ] {
+            assert!(
+                syntax.calls_or_invokes_method(required),
+                "{relative} must keep its production decoder on the bound contract chain; missing {required}"
+            );
+        }
+    }
+
+    let moss_prepare = "moss_transcribe_diarize/prepared_runtime.rs";
+    let syntax = ProductionSyntax::collect(&root.join(moss_prepare));
+    for required in [
+        "moss_td_qwen_decoder_contract",
+        "for_qwen_family",
+        "load_qwen_decoder_tail_from_contract",
+    ] {
+        assert!(
+            syntax.calls_or_invokes_method(required),
+            "{moss_prepare} must keep its production decoder on the bound contract chain; missing {required}"
+        );
+    }
+    let moss_compile = "moss_transcribe_diarize/llm_decoder.rs";
+    assert!(
+        ProductionSyntax::collect(&root.join(moss_compile))
+            .calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan"),
+        "{moss_compile} must materialize the prepared decoder through the shared compile seam"
+    );
+}
+
+#[test]
 fn native_transcribe_production_does_not_match_whisper_architecture_directly() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/backend/native_transcribe.rs");
     assert_production_does_not_reference(&path, "WHISPER_GGML_ARCHITECTURE_ID");

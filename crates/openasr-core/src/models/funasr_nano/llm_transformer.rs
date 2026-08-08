@@ -127,9 +127,10 @@ impl FunasrNanoDecoderRuntime {
             backend,
         )
         .map_err(map_tail_load_error)?;
-        // Prepared Graph Plan prototype: plan is host-owned metadata built at
-        // prepare; the shared compile seam is the only backend materialize path
-        // (same entry MOSS-TD uses). No family-local graph assembly here.
+        // Structural Prepared Graph Plan adoption: plan is host-owned metadata
+        // built at prepare; the shared compile seam is the only backend
+        // materialize path (same entry MOSS-TD uses). No performance claim is
+        // implied, and no family-local graph assembly remains here.
         let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
                 plan: &decoder_plan,
