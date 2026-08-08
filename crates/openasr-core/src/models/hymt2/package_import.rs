@@ -266,6 +266,10 @@ pub fn import_hymt2_gguf_to_runtime_pack(
                 appended_bytes.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
                 appended_bytes.extend_from_slice(&value.to_le_bytes());
             }
+            GgufWriteValue::U64(value) => {
+                appended_bytes.extend_from_slice(&GGUF_TYPE_UINT64.to_le_bytes());
+                appended_bytes.extend_from_slice(&value.to_le_bytes());
+            }
             GgufWriteValue::F32(value) => {
                 appended_bytes.extend_from_slice(&GGUF_TYPE_FLOAT32.to_le_bytes());
                 appended_bytes.extend_from_slice(&value.to_le_bytes());

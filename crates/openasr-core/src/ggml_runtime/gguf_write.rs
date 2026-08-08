@@ -2,6 +2,8 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, c_void},
+    fs::OpenOptions,
+    io::{self, Write},
     path::{Path, PathBuf},
     ptr::{self, null},
 };
@@ -71,6 +73,7 @@ pub(crate) fn build_provenance_from_env() -> Result<Option<(String, GgufWriteVal
 pub(crate) enum GgufWriteValue {
     String(String),
     U32(u32),
+    U64(u64),
     // The reader parses native f32/bool KV entries (external pack tooling
     // bakes hparams that way), so the write choke point can spell them too.
     // No Rust importer selects them yet -- available until one does (same
@@ -106,7 +109,7 @@ pub(crate) enum GgufWriteTensorType {
 }
 
 impl GgufWriteTensorType {
-    fn ggml_type(self) -> i32 {
+    pub(crate) fn ggml_type(self) -> i32 {
         match self {
             Self::F32 => ffi::GGML_TYPE_F32,
             Self::F16 => ffi::GGML_TYPE_F16,
@@ -214,6 +217,39 @@ pub(crate) enum GgufWriteError {
     GgmlTensorNameFailed { name: String },
     #[error("gguf write failed for '{path}'")]
     WriteFailed { path: PathBuf },
+    #[error("gguf streaming write failed for '{path}': {source}")]
+    StreamingIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("gguf tensor '{name}' streaming producer failed: {reason}")]
+    TensorStreamingProducer { name: String, reason: String },
+    #[error(
+        "gguf tensor '{name}' streaming producer wrote {actual} bytes, expected exactly {expected}"
+    )]
+    TensorStreamingLengthMismatch {
+        name: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("gguf tensor '{name}' raw ggml type {ggml_type} has an invalid row size")]
+    TensorRawTypeInvalid { name: String, ggml_type: i32 },
+    #[error("gguf streaming writer supports alignment 32, got {alignment}")]
+    StreamingAlignmentUnsupported { alignment: u64 },
+}
+
+/// Shape/type-only tensor declaration for a bounded-memory GGUF writer.
+///
+/// Unlike [`GgufWriteTensor`], this does not own the payload. The header is
+/// emitted first and each payload is then produced directly into the output
+/// file, so a multi-gigabyte requant never holds every transformed tensor in
+/// RAM at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GgufStreamTensorSpec {
+    pub name: String,
+    pub dims: Vec<u64>,
+    pub ggml_type: i32,
 }
 
 pub(crate) fn write_gguf_file_v0(
@@ -262,6 +298,213 @@ pub(crate) fn write_gguf_file_v0(
         });
     }
     Ok(())
+}
+
+/// Write a GGUF header followed by one tensor payload at a time.
+///
+/// `produce` must write exactly the declared byte length for each tensor. The
+/// writer enforces that boundary before advancing to the next aligned tensor,
+/// making a row-streaming requant both bounded-memory and structurally
+/// incapable of shifting later tensor offsets.
+pub(crate) fn write_gguf_file_streaming_v0<F>(
+    path: impl AsRef<Path>,
+    metadata: &BTreeMap<String, GgufWriteValue>,
+    tensors: &[GgufStreamTensorSpec],
+    mut produce: F,
+) -> Result<(), GgufWriteError>
+where
+    F: FnMut(usize, &GgufStreamTensorSpec, &mut dyn Write) -> Result<(), GgufWriteError>,
+{
+    let path = path.as_ref();
+    if path.exists() {
+        return Err(GgufWriteError::OutputExists {
+            path: path.to_path_buf(),
+        });
+    }
+    let provenance = build_provenance_from_env()?;
+    let metadata: Cow<'_, BTreeMap<String, GgufWriteValue>> = match provenance {
+        Some((key, value)) => {
+            let mut merged = metadata.clone();
+            merged.insert(key, value);
+            Cow::Owned(merged)
+        }
+        None => Cow::Borrowed(metadata),
+    };
+    validate_metadata(&metadata)?;
+    validate_stream_tensor_specs(tensors)?;
+
+    let path_cstring = path_to_cstring(path)?;
+    let gguf_context = unsafe { GgufContextGuard::from_raw(ffi::gguf_init_empty()) }
+        .ok_or(GgufWriteError::GgufContextInitFailed)?;
+    let ggml_context = GgmlContextGuard::init_for_tensor_defs(tensors.len())?;
+    for (key, value) in metadata.iter() {
+        set_metadata_value(gguf_context.as_ptr(), key, value)?;
+    }
+    for tensor in tensors {
+        add_stream_tensor_spec(gguf_context.as_ptr(), ggml_context.as_ptr(), tensor)?;
+    }
+    let success =
+        unsafe { ffi::gguf_write_to_file(gguf_context.as_ptr(), path_cstring.as_ptr(), true) };
+    if !success {
+        return Err(GgufWriteError::WriteFailed {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let alignment = metadata
+        .get("general.alignment")
+        .and_then(|value| match value {
+            GgufWriteValue::U32(value) => Some(u64::from(*value)),
+            _ => None,
+        })
+        .unwrap_or(32);
+    // gguf's public construction API validates `general.alignment` but does
+    // not update a fresh context's internal offset alignment. Until gguf
+    // exposes a setter, accepting a different value would write a header
+    // whose declared offsets disagree with its metadata. Fail closed rather
+    // than produce a corrupt container.
+    if alignment != 32 {
+        return Err(GgufWriteError::StreamingAlignmentUnsupported { alignment });
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|source| GgufWriteError::StreamingIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let zeroes = [0_u8; 256];
+    for (index, tensor) in tensors.iter().enumerate() {
+        let expected = stream_tensor_nbytes(tensor)?;
+        let mut exact = ExactTensorWriter {
+            tensor_name: &tensor.name,
+            inner: &mut file,
+            expected,
+            written: 0,
+        };
+        produce(index, tensor, &mut exact)?;
+        if exact.written != expected {
+            return Err(GgufWriteError::TensorStreamingLengthMismatch {
+                name: tensor.name.clone(),
+                expected,
+                actual: exact.written,
+            });
+        }
+        let padding = (alignment - expected % alignment) % alignment;
+        let mut remaining = padding;
+        while remaining > 0 {
+            let count = usize::try_from(remaining.min(zeroes.len() as u64)).unwrap();
+            file.write_all(&zeroes[..count])
+                .map_err(|source| GgufWriteError::StreamingIo {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            remaining -= count as u64;
+        }
+    }
+    file.flush().map_err(|source| GgufWriteError::StreamingIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+struct ExactTensorWriter<'a> {
+    tensor_name: &'a str,
+    inner: &'a mut std::fs::File,
+    expected: u64,
+    written: u64,
+}
+
+impl Write for ExactTensorWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(bytes.len())
+            .map_err(|_| io::Error::other("tensor write length does not fit u64"))?;
+        let next = self
+            .written
+            .checked_add(requested)
+            .ok_or_else(|| io::Error::other("tensor write length overflow"))?;
+        if next > self.expected {
+            return Err(io::Error::other(format!(
+                "tensor '{}' would exceed its declared {} bytes while writing {}",
+                self.tensor_name, self.expected, next
+            )));
+        }
+        let count = self.inner.write(bytes)?;
+        self.written = self
+            .written
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("tensor write count overflow"))?;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn validate_stream_tensor_specs(tensors: &[GgufStreamTensorSpec]) -> Result<(), GgufWriteError> {
+    let mut seen = BTreeSet::new();
+    for tensor in tensors {
+        if tensor.name.trim().is_empty() {
+            return Err(GgufWriteError::EmptyTensorName);
+        }
+        if !seen.insert(tensor.name.as_str()) {
+            return Err(GgufWriteError::DuplicateTensorName {
+                name: tensor.name.clone(),
+            });
+        }
+        if !(1..=4).contains(&tensor.dims.len()) {
+            return Err(GgufWriteError::UnsupportedTensorRank {
+                name: tensor.name.clone(),
+                rank: tensor.dims.len(),
+            });
+        }
+        for (index, value) in tensor.dims.iter().copied().enumerate() {
+            if value == 0 {
+                return Err(GgufWriteError::NonPositiveTensorDimension {
+                    name: tensor.name.clone(),
+                    index,
+                });
+            }
+            i64::try_from(value).map_err(|_| GgufWriteError::TensorDimensionOverflow {
+                name: tensor.name.clone(),
+                value,
+            })?;
+        }
+        stream_tensor_nbytes(tensor)?;
+    }
+    Ok(())
+}
+
+fn stream_tensor_nbytes(tensor: &GgufStreamTensorSpec) -> Result<u64, GgufWriteError> {
+    let ne0 =
+        i64::try_from(tensor.dims[0]).map_err(|_| GgufWriteError::TensorDimensionOverflow {
+            name: tensor.name.clone(),
+            value: tensor.dims[0],
+        })?;
+    let row_size = unsafe { ffi::ggml_row_size(tensor.ggml_type, ne0) };
+    if row_size == 0 {
+        return Err(GgufWriteError::TensorRawTypeInvalid {
+            name: tensor.name.clone(),
+            ggml_type: tensor.ggml_type,
+        });
+    }
+    let rows = tensor
+        .dims
+        .iter()
+        .skip(1)
+        .try_fold(1_u64, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| GgufWriteError::TensorElementCountOverflow {
+            name: tensor.name.clone(),
+            dims: tensor.dims.clone(),
+        })?;
+    u64::try_from(row_size)
+        .ok()
+        .and_then(|bytes| bytes.checked_mul(rows))
+        .ok_or_else(|| GgufWriteError::TensorByteLengthOverflow {
+            name: tensor.name.clone(),
+        })
 }
 
 pub(crate) fn quantize_f32_to_ggml_tensor_data(
@@ -484,6 +727,9 @@ fn set_metadata_value(
         GgufWriteValue::U32(value) => unsafe {
             ffi::gguf_set_val_u32(ctx, key_cstring.as_ptr(), *value);
         },
+        GgufWriteValue::U64(value) => unsafe {
+            ffi::gguf_set_val_u64(ctx, key_cstring.as_ptr(), *value);
+        },
         GgufWriteValue::F32(value) => {
             if !value.is_finite() {
                 return Err(GgufWriteError::NonFiniteMetadataValue {
@@ -568,6 +814,53 @@ fn add_tensor(
             name_cstring.as_ptr(),
             tensor.data.as_ptr().cast::<c_void>(),
         );
+    }
+    Ok(())
+}
+
+fn add_stream_tensor_spec(
+    gguf_ctx: ffi::GgufContextRaw,
+    ggml_ctx: ffi::GgmlContextRaw,
+    tensor: &GgufStreamTensorSpec,
+) -> Result<(), GgufWriteError> {
+    let name_cstring = cstring_for_field(&tensor.name, "tensor.name")?;
+    let dims = tensor
+        .dims
+        .iter()
+        .map(|value| {
+            i64::try_from(*value).map_err(|_| GgufWriteError::TensorDimensionOverflow {
+                name: tensor.name.clone(),
+                value: *value,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let raw_tensor = unsafe {
+        match dims.as_slice() {
+            [ne0] => ffi::ggml_new_tensor_1d(ggml_ctx, tensor.ggml_type, *ne0),
+            [ne0, ne1] => ffi::ggml_new_tensor_2d(ggml_ctx, tensor.ggml_type, *ne0, *ne1),
+            [ne0, ne1, ne2] => {
+                ffi::ggml_new_tensor_3d(ggml_ctx, tensor.ggml_type, *ne0, *ne1, *ne2)
+            }
+            [ne0, ne1, ne2, ne3] => {
+                ffi::ggml_new_tensor_4d(ggml_ctx, tensor.ggml_type, *ne0, *ne1, *ne2, *ne3)
+            }
+            _ => unreachable!("stream tensor rank was validated"),
+        }
+    };
+    if raw_tensor.is_null() {
+        return Err(GgufWriteError::GgmlTensorInitFailed {
+            name: tensor.name.clone(),
+        });
+    }
+    let raw_tensor = unsafe { ffi::ggml_set_name(raw_tensor, name_cstring.as_ptr()) };
+    if raw_tensor.is_null() {
+        return Err(GgufWriteError::GgmlTensorNameFailed {
+            name: tensor.name.clone(),
+        });
+    }
+    unsafe {
+        ffi::gguf_add_tensor(gguf_ctx, raw_tensor);
+        ffi::gguf_set_tensor_type(gguf_ctx, name_cstring.as_ptr(), tensor.ggml_type);
     }
     Ok(())
 }
@@ -664,10 +957,11 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        BUILD_COMMIT_ENV, GgufWriteError, GgufWriteTensor, GgufWriteTensorType, GgufWriteValue,
-        OASR_METADATA_KEY_BUILD_COMMIT, write_gguf_file_v0,
+        BUILD_COMMIT_ENV, GgufStreamTensorSpec, GgufWriteError, GgufWriteTensor,
+        GgufWriteTensorType, GgufWriteValue, OASR_METADATA_KEY_BUILD_COMMIT,
+        write_gguf_file_streaming_v0, write_gguf_file_v0,
     };
-    use crate::ggml_runtime::read_gguf_metadata;
+    use crate::ggml_runtime::{GgufTensorDataReader, read_gguf_metadata};
     use crate::test_process_env::with_test_process_env;
 
     fn fixture_pack(dir: &std::path::Path) -> (std::path::PathBuf, Vec<GgufWriteTensor>) {
@@ -813,6 +1107,84 @@ mod tests {
         assert_eq!(read.get_bool("family.attention.qk_norm"), Some(false));
         // Native typing must not leak into the scalar-string view.
         assert_eq!(read.get_string("family.rope.freq_base"), None);
+    }
+
+    #[test]
+    fn u64_metadata_round_trips_as_a_native_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let metadata = std::collections::BTreeMap::from([(
+            "family.large_count".to_string(),
+            GgufWriteValue::U64(u64::from(u32::MAX) + 1),
+        )]);
+
+        with_test_process_env([(BUILD_COMMIT_ENV, None)], || {
+            write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
+        });
+
+        let read = read_gguf_metadata(&path).expect("read pack metadata");
+        assert_eq!(
+            read.get_u64("family.large_count"),
+            Some(u64::from(u32::MAX) + 1)
+        );
+    }
+
+    #[test]
+    fn streaming_writer_emits_exact_aligned_tensor_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streamed.gguf");
+        let metadata = std::collections::BTreeMap::from([(
+            "general.alignment".to_string(),
+            GgufWriteValue::U32(32),
+        )]);
+        let specs = [
+            GgufStreamTensorSpec {
+                name: "first.weight".to_string(),
+                dims: vec![4, 2],
+                ggml_type: GgufWriteTensorType::F32.ggml_type(),
+            },
+            GgufStreamTensorSpec {
+                name: "second.weight".to_string(),
+                dims: vec![3],
+                ggml_type: GgufWriteTensorType::F32.ggml_type(),
+            },
+        ];
+        let values = [
+            (0..8).map(|value| value as f32).collect::<Vec<_>>(),
+            vec![10.0, 11.0, 12.0],
+        ];
+
+        with_test_process_env([(BUILD_COMMIT_ENV, None)], || {
+            write_gguf_file_streaming_v0(&path, &metadata, &specs, |index, _, sink| {
+                for value in &values[index] {
+                    sink.write_all(&value.to_le_bytes()).map_err(|error| {
+                        GgufWriteError::TensorStreamingProducer {
+                            name: specs[index].name.clone(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                }
+                Ok(())
+            })
+            .expect("stream pack");
+        });
+
+        let reader = GgufTensorDataReader::from_path(&path).expect("read streamed pack");
+        assert_eq!(
+            reader
+                .host_tensor_f32_copy_by_name("first.weight", &[4, 2])
+                .unwrap(),
+            values[0]
+        );
+        assert_eq!(
+            reader
+                .host_tensor_f32_copy_by_name("second.weight", &[3])
+                .unwrap(),
+            values[1]
+        );
+        let first = reader.tensor_index().get("first.weight").unwrap();
+        let second = reader.tensor_index().get("second.weight").unwrap();
+        assert_eq!(second.offset_bytes - first.offset_bytes, 32);
     }
 
     #[test]

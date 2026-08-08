@@ -522,6 +522,7 @@ mod tests {
         GgufHeaderView {
             version: 3,
             tensor_count,
+            metadata_count: u64::from(architecture.is_some()),
             string_metadata,
             tensors,
             header_len: 0,

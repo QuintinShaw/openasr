@@ -80,6 +80,9 @@ pub struct GgufHeaderTensor {
 pub struct GgufHeaderView {
     pub version: u32,
     pub tensor_count: u64,
+    /// Total metadata entries declared by the header, including values whose
+    /// type this string-oriented view deliberately skips.
+    pub metadata_count: u64,
     /// String-valued metadata only; non-string values are skipped during
     /// parsing (the audit surface needs `general.architecture`,
     /// `openasr.model.architecture`, and friends).
@@ -324,6 +327,7 @@ pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufHeaderView, GgufHeaderError
     Ok(GgufHeaderView {
         version,
         tensor_count,
+        metadata_count: kv_count,
         string_metadata,
         tensors,
         header_len: window.pos,
@@ -388,6 +392,7 @@ mod tests {
         let view = parse_gguf_header(&fixture_header()).expect("parse fixture");
         assert_eq!(view.version, 3);
         assert_eq!(view.tensor_count, 2);
+        assert_eq!(view.metadata_count, 3);
         assert_eq!(
             view.metadata_string("general.architecture"),
             Some("qwen3-asr-encoder-decoder")

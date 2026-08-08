@@ -47,6 +47,7 @@ pub mod oasr_metadata;
 pub(crate) mod pack_import_surface;
 pub mod pack_quant;
 pub mod pack_quant_audit;
+pub mod pack_requant;
 pub(crate) mod pack_verifier;
 pub(crate) mod parakeet_ctc;
 pub(crate) mod parakeet_runtime_memory;
