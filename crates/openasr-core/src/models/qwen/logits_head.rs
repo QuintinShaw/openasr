@@ -656,6 +656,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         let normed = graph.mul(normed, self.arena.graph_tensor(self.output_norm_weight))?;
         let logits = graph.mul_mat(self.arena.graph_tensor(self.output_weight), normed)?;
         graph.set_output(logits)?;
+        graph.prepare_outputs_for_upload(&[logits])?;
         graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden")?;
         graph.compute_output_f32(logits, self.vocab_size)
     }
@@ -686,6 +687,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             self.arena.graph_tensor(self.argmax_reverse_indices),
         )?;
         graph.set_output(top1)?;
+        graph.prepare_outputs_for_upload(&[top1])?;
         graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden")?;
         let token_ids = graph.compute_output_i32(top1, 1)?;
         let reversed_token_id =

@@ -17,7 +17,7 @@ use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlKvElementType,
     GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
-    GgufTensorDataReader, env_toggle_with_raw,
+    GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
 };
 
 use super::graph_config::qwen_decoder_graph_config;
@@ -46,6 +46,7 @@ const QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
 // Correctness escape hatch for backend kernels with divergent native GQA
 // behavior; keep it unless every backend's GQA path is verified.
 const QWEN3_LLM_NATIVE_GQA_ENV: &str = "OPENASR_QWEN_LLM_NATIVE_GQA";
+const QWEN3_LLM_PREFILL_ALLOCATION_PROFILE_ENV: &str = "OPENASR_QWEN_PREFILL_ALLOCATION_PROFILE";
 const QWEN3_LLM_CPU_SAFE_PREFILL_QUERY_TOKENS: usize = 8;
 /// Conservative single-query width kept for backends that have not been
 /// validated for multi-query host-cache prefill (legacy default). Discrete
@@ -1045,6 +1046,7 @@ fn qwen_llm_stack_config(
     n_seq: usize,
     use_flash_attention: bool,
     kv_cache_spec: LlmKvCacheSpec,
+    materialize_kv_outputs: bool,
 ) -> LlmDecoderStackConfig {
     LlmDecoderStackConfig {
         d_model: dims.d_model,
@@ -1067,6 +1069,7 @@ fn qwen_llm_stack_config(
         use_native_gqa: use_native_gqa || n_seq > 1,
         use_flash_attention,
         kv_cache_spec,
+        materialize_kv_outputs,
     }
 }
 
@@ -2798,6 +2801,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 true,
                 self.kv_cache_spec,
+                true,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -3023,6 +3027,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 true,
                 self.kv_cache_spec,
+                true,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -3149,6 +3154,32 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    /// Run a complete prompt as one causal forward pass without materializing
+    /// the per-layer K/V tensors for a later autoregressive decode.
+    ///
+    /// This is the exact execution contract needed by non-autoregressive
+    /// consumers such as Qwen3-ForcedAligner: they consume the final hidden
+    /// state once and never seed a decode cache. Keeping every layer's K/V as a
+    /// graph output extends all of those tensors' lifetimes to the end of the
+    /// graph and defeats the liveness allocator for no mathematical benefit.
+    pub(crate) fn run_stateless_prefill(
+        &mut self,
+        token_major_hidden: &[f32],
+        token_count: usize,
+        rope_theta: f32,
+    ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        self.run_prefill_with_batched_history(
+            token_major_hidden,
+            token_count,
+            1,
+            0,
+            token_count,
+            &[&[]],
+            rope_theta,
+            false,
+        )
+    }
+
     pub(crate) fn run_prefill_chunk(
         &mut self,
         token_major_hidden: &[f32],
@@ -3186,6 +3217,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             total_token_count,
             layer_caches_by_sequence,
             rope_theta,
+            true,
         )
     }
 
@@ -3441,6 +3473,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     n_seq,
                     use_flash_attention,
                     self.kv_cache_spec,
+                    true,
                 ),
                 LlmDecoderStackInputs {
                     state: hidden_tensor,
@@ -3547,6 +3580,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             total_token_count,
             &layer_caches_by_sequence,
             rope_theta,
+            true,
         )
     }
 
@@ -3559,6 +3593,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         total_token_count: usize,
         layer_caches_by_sequence: &[&[Qwen3AsrLayerKvCacheState]],
         rope_theta: f32,
+        materialize_layer_kv: bool,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         let dims = self.dims;
         if token_count == 0 {
@@ -3671,6 +3706,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 n_seq,
                 use_flash_attention,
                 self.kv_cache_spec,
+                materialize_layer_kv,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -3689,6 +3725,40 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let kv_inputs = stack.kv_inputs;
         let kv_outputs = stack.kv_outputs;
         graph.set_output(state)?;
+
+        let mut requested: Vec<(GgmlCpuTensor, usize)> =
+            Vec::with_capacity(1 + usize::from(materialize_layer_kv) * 2 * self.layers.len());
+        requested.push((state, expected_hidden));
+        let layer_kv_width = dims.k_width.checked_mul(output_tokens).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder prefill KV output width overflow",
+            },
+        )?;
+        if materialize_layer_kv {
+            for (k, v) in &kv_outputs {
+                requested.push((*k, layer_kv_width));
+                requested.push((*v, layer_kv_width));
+            }
+        }
+        let requested_tensors = requested
+            .iter()
+            .map(|(tensor, _)| *tensor)
+            .collect::<Vec<_>>();
+        // Preparing before the first input upload is essential. Uploading into
+        // an unprepared direct graph falls back to allocating every declared
+        // intermediate in the ggml context; preparing first lets gallocr bind
+        // one liveness-planned buffer instead.
+        if materialize_layer_kv {
+            graph.prepare_outputs_for_upload(&requested_tensors)?;
+        } else {
+            graph.prepare_one_shot_outputs_for_upload(&requested_tensors)?;
+        }
+        if env_var_truthy(QWEN3_LLM_PREFILL_ALLOCATION_PROFILE_ENV) {
+            eprintln!(
+                "openasr-qwen-prefill-allocation token_count={token_count} materialize_layer_kv={materialize_layer_kv} direct_graph_bytes={:?}",
+                graph.prepared_direct_graph_allocation_bytes()
+            );
+        }
 
         graph.set_f32_slice(
             hidden_tensor,
@@ -3803,28 +3873,22 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             }
         }
 
-        let mut requested: Vec<(GgmlCpuTensor, usize)> =
-            Vec::with_capacity(1 + 2 * self.layers.len());
-        requested.push((state, expected_hidden));
-        let layer_kv_width = dims.k_width.checked_mul(output_tokens).ok_or(
-            GgmlCpuGraphError::UnsupportedInputs {
-                reason: "whole-decoder prefill KV output width overflow",
-            },
-        )?;
-        for (k, v) in &kv_outputs {
-            requested.push((*k, layer_kv_width));
-            requested.push((*v, layer_kv_width));
-        }
         let build_micros = build_started_at.elapsed().as_micros();
         let compute_started_at = std::time::Instant::now();
         let mut outputs = graph.compute_outputs_f32(&requested)?;
         let compute_micros = compute_started_at.elapsed().as_micros();
         let hidden_out = outputs.remove(0);
-        let mut layer_kv = Vec::with_capacity(self.layers.len());
-        for _ in 0..self.layers.len() {
-            let k = outputs.remove(0);
-            let v = outputs.remove(0);
-            layer_kv.push((k, v));
+        let mut layer_kv = Vec::with_capacity(if materialize_layer_kv {
+            self.layers.len()
+        } else {
+            0
+        });
+        if materialize_layer_kv {
+            for _ in 0..self.layers.len() {
+                let k = outputs.remove(0);
+                let v = outputs.remove(0);
+                layer_kv.push((k, v));
+            }
         }
         Ok(Qwen3AsrLlmWholeStepOutput {
             hidden: hidden_out,
@@ -3938,6 +4002,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     n_seq,
                     true,
                     self.kv_cache_spec,
+                    true,
                 ),
                 LlmDecoderStackInputs {
                     state: hidden_tensor,
@@ -4253,6 +4318,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 n_seq,
                 true,
                 self.kv_cache_spec,
+                true,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -6741,6 +6807,39 @@ mod tests {
             "peak staging {} must fit within one layer payload {one_layer_payload}",
             executor.materialization_peak_staging_bytes
         );
+    }
+
+    #[test]
+    fn stateless_prefill_matches_full_hidden_without_materializing_kv() {
+        let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
+        let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
+        let projections = load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
+            .expect("synthetic projections");
+        let hidden = deterministic_prefill_hidden(metadata.llm_d_model, 7);
+
+        let mut full = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
+            &projections,
+            Some(&source),
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("full prefill executor");
+        let full = full
+            .run_prefill(&hidden, 7, 1_000_000.0)
+            .expect("full prefill");
+
+        let mut stateless = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
+            &projections,
+            Some(&source),
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("stateless prefill executor");
+        let stateless = stateless
+            .run_stateless_prefill(&hidden, 7, 1_000_000.0)
+            .expect("stateless prefill");
+
+        assert_eq!(stateless.hidden, full.hidden);
+        assert!(stateless.layer_kv.is_empty());
+        assert_eq!(full.layer_kv.len(), metadata.llm_layers);
     }
 
     #[test]

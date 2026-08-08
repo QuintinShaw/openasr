@@ -441,10 +441,14 @@ pub(crate) fn align_forced(
             &mel_features,
         )
         .map_err(Qwen3ForcedAlignerRuntimeError::AudioEncoderFailed)?;
+    // The encoder graph and mel input are not needed by the LLM stage. Release
+    // and drop them before constructing its much larger graph so the two
+    // stages do not overlap in the request's peak working set.
     audio_runtime
         .release_transient_compute_memory()
         .map_err(Qwen3ForcedAlignerRuntimeError::AudioEncoderFailed)?;
     drop(audio_runtime);
+    drop(mel_features);
 
     let (decode_prompt, timestamp_positions) = build_forced_aligner_decode_prompt(
         &assets.metadata,
@@ -464,6 +468,7 @@ pub(crate) fn align_forced(
         &audio_embeddings.rows,
     )?;
     let prefill_input = build_qwen3_llm_prefill_input(prompt_embeddings)?;
+    drop(audio_embeddings);
 
     let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
         &assets.decoder_plan,
@@ -475,7 +480,7 @@ pub(crate) fn align_forced(
     })?;
     let mut logits_runtime = assets.logits_head.new_runtime(backend)?;
     let prefill_output = whole_decoder
-        .run_prefill(
+        .run_stateless_prefill(
             &prefill_input.token_major_embeddings,
             prefill_input.token_count,
             FORCED_ALIGNER_ROPE_THETA,

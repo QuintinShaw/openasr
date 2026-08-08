@@ -1324,6 +1324,11 @@ pub(crate) struct LlmDecoderStackConfig {
     pub use_flash_attention: bool,
     /// Host/resident KV element types for this stack composition.
     pub kv_cache_spec: LlmKvCacheSpec,
+    /// Keep each layer's projected K/V alive as a graph output so a caller can
+    /// read it back into an autoregressive host cache. Stateless consumers
+    /// leave this false: attention still consumes the exact same K/V values in
+    /// graph, but their storage can be recycled after the layer finishes.
+    pub materialize_kv_outputs: bool,
 }
 
 /// Per-step inputs for one composition of an LLM decoder layer stack.
@@ -2164,12 +2169,14 @@ where
             map_err,
         )?;
         state = layer_out.output;
-        graph
-            .set_output(layer_out.projected_k)
-            .map_err(|source| map_err("llm_decoder_stack_projected_k", source))?;
-        graph
-            .set_output(layer_out.projected_v)
-            .map_err(|source| map_err("llm_decoder_stack_projected_v", source))?;
+        if config.materialize_kv_outputs {
+            graph
+                .set_output(layer_out.projected_k)
+                .map_err(|source| map_err("llm_decoder_stack_projected_k", source))?;
+            graph
+                .set_output(layer_out.projected_v)
+                .map_err(|source| map_err("llm_decoder_stack_projected_v", source))?;
+        }
         kv_inputs.push((key_history, value_history));
         kv_outputs.push((layer_out.projected_k, layer_out.projected_v));
     }
@@ -2906,6 +2913,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+                materialize_kv_outputs: true,
             },
             LlmDecoderStackInputs {
                 state,
@@ -2972,6 +2980,7 @@ mod tests {
                 use_native_gqa: false,
                 use_flash_attention: true,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+                materialize_kv_outputs: true,
             },
             LlmDecoderStackInputs {
                 state,
@@ -3141,6 +3150,7 @@ mod tests {
                 use_native_gqa: true,
                 use_flash_attention: true,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+                materialize_kv_outputs: true,
             },
             LlmDecoderStackInputs {
                 state,
@@ -3564,6 +3574,7 @@ mod tests {
                 use_native_gqa: options.use_native_gqa,
                 use_flash_attention: options.use_flash_attention,
                 kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+                materialize_kv_outputs: true,
             },
             LlmDecoderStackInputs {
                 state,

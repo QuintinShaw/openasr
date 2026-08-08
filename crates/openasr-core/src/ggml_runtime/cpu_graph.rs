@@ -4494,6 +4494,25 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         outputs: &[GgmlCpuTensor<'a>],
     ) -> Result<(), GgmlCpuGraphError> {
+        self.prepare_outputs_for_upload_with_cpu_step_reuse(outputs, true)
+    }
+
+    /// Prepare a one-shot graph through the scheduler/direct liveness
+    /// allocator even on plain CPU. This deliberately bypasses the CPU
+    /// grow-to-fit step pool, whose declaration-sized arena is appropriate for
+    /// repeated one-token decode but wasteful for a single wide prefill.
+    pub(crate) fn prepare_one_shot_outputs_for_upload(
+        &mut self,
+        outputs: &[GgmlCpuTensor<'a>],
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.prepare_outputs_for_upload_with_cpu_step_reuse(outputs, false)
+    }
+
+    fn prepare_outputs_for_upload_with_cpu_step_reuse(
+        &mut self,
+        outputs: &[GgmlCpuTensor<'a>],
+        reuse_cpu_step_buffer: bool,
+    ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         if self.prepared_graph.is_some() {
             return Ok(());
@@ -4501,7 +4520,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let graph = self.build_forward_graph(outputs)?;
         if self.scheduler.is_some() {
             self.allocate_scheduler_graph(graph)?;
-        } else if self.step_buffer_pool.is_some() {
+        } else if reuse_cpu_step_buffer && self.step_buffer_pool.is_some() {
             // Preserve the CPU per-step grow-to-fit pool. A one-shot gallocr
             // would save bytes for this graph but would also allocate and free
             // a backend buffer on every decoder step.
@@ -4531,6 +4550,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
         self.prepared_graph = Some(graph);
         Ok(())
+    }
+
+    /// Bytes reserved by the direct graph liveness allocator after
+    /// [`Self::prepare_outputs_for_upload`]. Scheduler-backed graphs own their
+    /// allocation plan separately and therefore return `None` here.
+    pub(crate) fn prepared_direct_graph_allocation_bytes(&self) -> Option<u64> {
+        self.graph_allocator
+            .as_ref()
+            .map(GgmlGraphAllocatorGuard::requested_bytes)
     }
 
     /// Rebind this prepared persistent graph after another graph temporarily
@@ -7684,7 +7712,6 @@ enum GgmlGraphAllocatorOwnership {
 
 struct GgmlGraphAllocatorGuard {
     _ownership: GgmlGraphAllocatorOwnership,
-    #[cfg(test)]
     requested_bytes: u64,
 }
 
@@ -7704,7 +7731,6 @@ impl GgmlGraphAllocatorGuard {
                 })?;
         let allocator = GgmlRawGraphAllocatorGuard::new(buft)?;
         let chunks = allocator.measure(graph)?;
-        #[cfg(test)]
         let requested_bytes = chunks.iter().try_fold(0_u64, |total, (_, requested, _)| {
             total.checked_add(*requested).ok_or_else(|| {
                 memory_admission_failure(
@@ -7803,12 +7829,10 @@ impl GgmlGraphAllocatorGuard {
             })?;
         Ok(Self {
             _ownership: GgmlGraphAllocatorOwnership::Admitted { _owner: allocation },
-            #[cfg(test)]
             requested_bytes,
         })
     }
 
-    #[cfg(test)]
     fn requested_bytes(&self) -> u64 {
         self.requested_bytes
     }
@@ -9969,6 +9993,42 @@ mod tests {
                 .expect("step after release should still compute");
             assert_eq!(output, vec![5.0, 6.0]);
             assert!(runner.cpu_step_buffer_pool.capacity_bytes > 0);
+        }
+
+        #[test]
+        fn one_shot_prepare_bypasses_the_cpu_step_pool_for_liveness_allocation() {
+            const ELEMENTS: usize = 4096;
+            const ADDITIONS: usize = 32;
+            let mut runner = cpu_no_scheduler_runner();
+            {
+                let mut graph = runner.start_graph();
+                let input = graph
+                    .new_tensor_1d_f32(ELEMENTS, "one_shot_input")
+                    .expect("input");
+                let increment = graph
+                    .new_tensor_1d_f32(ELEMENTS, "one_shot_increment")
+                    .expect("increment");
+                graph.set_input(input).expect("input flag");
+                graph.set_input(increment).expect("increment flag");
+                let mut output = input;
+                for _ in 0..ADDITIONS {
+                    output = graph.add(output, increment).expect("add node");
+                }
+                graph.set_output(output).expect("output flag");
+                graph
+                    .prepare_one_shot_outputs_for_upload(&[output])
+                    .expect("one-shot liveness prepare");
+                assert!(graph.graph_allocator.is_some());
+                assert!(graph.buffer.is_none());
+                let naive = (ADDITIONS + 2) * ELEMENTS * std::mem::size_of::<f32>();
+                assert!(
+                    graph
+                        .prepared_direct_graph_allocation_bytes()
+                        .is_some_and(|bytes| bytes < (naive / 2) as u64),
+                    "one-shot graph should recycle the addition chain"
+                );
+            }
+            assert_eq!(runner.cpu_step_buffer_pool.capacity_bytes, 0);
         }
 
         #[test]
