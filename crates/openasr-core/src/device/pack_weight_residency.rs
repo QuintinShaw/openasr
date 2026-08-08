@@ -51,7 +51,7 @@ pub(crate) struct PackWeightMappingIdentity(usize);
 
 impl PackWeightMappingIdentity {
     /// Identity of the open mapping owned by `mmap`.
-    pub(crate) fn from_open_mmap(mmap: &Arc<memmap2::Mmap>) -> Self {
+    fn from_open_mmap(mmap: &Arc<memmap2::Mmap>) -> Self {
         Self(std::sync::Arc::as_ptr(mmap) as usize)
     }
 
@@ -90,6 +90,11 @@ struct PackWeightResidencyInner {
     broker: Arc<DeviceMemoryBrokerSet>,
     key: PackWeightResidencyKey,
     generation: u64,
+    /// Owns the exact mapping whose Arc allocation address forms `key`.
+    /// Keeping this clone until the last residency handle drops makes address
+    /// reuse impossible while the table can still upgrade `live`.
+    #[allow(dead_code)]
+    mapping_owner: Option<Arc<memmap2::Mmap>>,
 }
 
 /// One owner of a shared pack-weight residency charge. Clone freely; the
@@ -125,6 +130,31 @@ impl Drop for PackWeightResidencyInner {
 }
 
 impl DeviceMemoryBrokerSet {
+    /// Acquire shared residency for an exact, already-open pack mapping.
+    ///
+    /// Identity and byte size are derived inside this Interface from the same
+    /// owning `Arc<Mmap>` that the returned handle retains. Callers therefore
+    /// cannot pair an unrelated identity/size with a lease, and the allocator
+    /// cannot reuse the identity address while a table entry remains live.
+    pub(crate) fn acquire_open_pack_weight_residency(
+        self: &Arc<Self>,
+        domain: MemoryDomainKey,
+        mapping: Arc<memmap2::Mmap>,
+        snapshot: DeviceMemorySnapshot,
+        cohort_id: Option<MemoryReservationCohortId>,
+    ) -> Result<(PackWeightResidencyHandle, u64), MemoryPlanningError> {
+        let bytes = u64::try_from(mapping.len()).map_err(|_| {
+            MemoryPlanningError::ReservationLedgerCorrupted {
+                domain: domain.clone(),
+            }
+        })?;
+        let key = PackWeightResidencyKey {
+            domain,
+            mapping_identity: PackWeightMappingIdentity::from_open_mmap(&mapping),
+        };
+        self.acquire_pack_weight_residency_inner(key, bytes, snapshot, cohort_id, Some(mapping))
+    }
+
     /// Acquire shared residency for one open pack mapping.
     ///
     /// Returns `(handle, incremental_bytes_charged_now)`. `incremental` is the
@@ -134,12 +164,24 @@ impl DeviceMemoryBrokerSet {
     /// `snapshot` must reflect **live** host free/total. Already-open file-backed
     /// residency does not need `free >= bytes` (observed peak is 0); the policy
     /// ledger still charges `bytes` so concurrent distinct packs fail closed.
+    #[cfg(test)]
     pub(crate) fn acquire_pack_weight_residency(
         self: &Arc<Self>,
         key: PackWeightResidencyKey,
         bytes: u64,
         snapshot: DeviceMemorySnapshot,
         cohort_id: Option<MemoryReservationCohortId>,
+    ) -> Result<(PackWeightResidencyHandle, u64), MemoryPlanningError> {
+        self.acquire_pack_weight_residency_inner(key, bytes, snapshot, cohort_id, None)
+    }
+
+    fn acquire_pack_weight_residency_inner(
+        self: &Arc<Self>,
+        key: PackWeightResidencyKey,
+        bytes: u64,
+        snapshot: DeviceMemorySnapshot,
+        cohort_id: Option<MemoryReservationCohortId>,
+        mapping_owner: Option<Arc<memmap2::Mmap>>,
     ) -> Result<(PackWeightResidencyHandle, u64), MemoryPlanningError> {
         if bytes == 0 {
             return Err(MemoryPlanningError::EmptyResourceId);
@@ -212,6 +254,7 @@ impl DeviceMemoryBrokerSet {
             broker: Arc::clone(self),
             key: key.clone(),
             generation,
+            mapping_owner,
         });
         table.insert(
             key,
@@ -407,6 +450,61 @@ mod tests {
             0
         );
         assert_eq!(broker.pack_weight_residency_live_count(), 0);
+    }
+
+    #[test]
+    fn production_lease_owns_mapping_until_the_last_handle_drops() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp mapping");
+        file.write_all(&[0_u8; 4096]).expect("seed mapping");
+        file.flush().expect("flush mapping");
+        let mapping = Arc::new(unsafe {
+            memmap2::MmapOptions::new()
+                .map(file.as_file())
+                .expect("map file")
+        });
+        let weak = Arc::downgrade(&mapping);
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            minimum_headroom_bytes: 0,
+            ..DeviceMemoryPolicy::default()
+        }));
+        let snap = snapshot(16 * GIB, 16 * GIB);
+        let (first, charged) = broker
+            .acquire_open_pack_weight_residency(
+                MemoryDomainKey::SystemMemory,
+                Arc::clone(&mapping),
+                snap,
+                None,
+            )
+            .expect("first production lease");
+        assert_eq!(charged, 4096);
+        let (second, shared) = broker
+            .acquire_open_pack_weight_residency(
+                MemoryDomainKey::SystemMemory,
+                Arc::clone(&mapping),
+                snap,
+                None,
+            )
+            .expect("shared production lease");
+        assert_eq!(shared, 0);
+
+        drop(mapping);
+        assert!(
+            weak.upgrade().is_some(),
+            "residency lease must retain the identity allocation"
+        );
+        drop(first);
+        assert!(weak.upgrade().is_some(), "second handle still owns mapping");
+        drop(second);
+        assert!(
+            weak.upgrade().is_none(),
+            "last lease drop must release the mapping owner"
+        );
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            0
+        );
     }
 
     #[test]

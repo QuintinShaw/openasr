@@ -34,9 +34,7 @@ use super::{
     GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
 use crate::device::execution_policy::ExecutionCandidateFailure;
-use crate::device::pack_weight_residency::{
-    PackWeightMappingIdentity, PackWeightResidencyHandle, PackWeightResidencyKey,
-};
+use crate::device::pack_weight_residency::PackWeightResidencyHandle;
 use crate::device::{
     execution_memory::{
         AllocationLifetime, DeviceMemorySnapshot, MemoryDomainKey, MemoryObservationConfidence,
@@ -8205,13 +8203,9 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
                     // Snapshot unusable: fall through to ordinary weight buffer.
                     return Ok(None);
                 };
-                let key = PackWeightResidencyKey {
-                    domain: MemoryDomainKey::SystemMemory,
-                    mapping_identity: PackWeightMappingIdentity::from_open_mmap(&mmap),
-                };
-                match broker.acquire_pack_weight_residency(
-                    key,
-                    requested_bytes,
+                match broker.acquire_open_pack_weight_residency(
+                    MemoryDomainKey::SystemMemory,
+                    Arc::clone(&mmap),
                     snapshot,
                     crate::models::native_execution_services::current_memory_reservation_cohort_id(
                     ),
