@@ -93,7 +93,7 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// are thread-affine. The accompanying [`SystemMemoryOwner`] accounts for the
 /// host logits/embedding representation, while native graph construction
 /// accounts backend buffers in their physical memory domain.
-type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey);
 
 struct FireRedLlmDecoderActorState {
     runtime: FireRedLlmDecoderRuntime,
@@ -305,13 +305,11 @@ impl FireRedLlmGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: super::runtime_contract::FireRedLlmDecoderMetadata,
-        kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FireRedLlmDecoderRuntimeActor, FireRedLlmExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
-            kv_capacity.resident_positions(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -340,10 +338,7 @@ impl FireRedLlmGgmlExecutor {
                         }
                     })?;
                 let quote = SystemMemoryAllocationQuote::new(
-                    format!(
-                        "firered-llm-decoder-runtime:{content_id}:positions={}",
-                        kv_capacity.resident_positions()
-                    ),
+                    format!("firered-llm-decoder-runtime:{content_id}"),
                     peak_bytes,
                     retained_bytes,
                 )
@@ -548,12 +543,8 @@ impl FireRedLlmGgmlExecutor {
         )
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FireRedLlmExecutorError::DecoderStateCapacity { source })?;
-        let decoder_actor = self.checkout_decoder_runtime(
-            preflight,
-            decoder_metadata,
-            kv_capacity,
-            decoder_backend,
-        )?;
+        let decoder_actor =
+            self.checkout_decoder_runtime(preflight, decoder_metadata, decoder_backend)?;
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
             eot_token_id: tokenizer.chatml_im_end_token_id,

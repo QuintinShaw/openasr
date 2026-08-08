@@ -34,6 +34,43 @@ fn assert_production_does_not_reference(path: &Path, symbol: &str) {
     );
 }
 
+fn assert_tuple_alias_components(path: &Path, alias: &str, expected: &[&str]) {
+    let file = parse_source(path);
+    let item = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Type(item) if item.ident == alias => Some(item),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{} must declare type alias {alias}", path.display()));
+    let Type::Tuple(tuple) = item.ty.as_ref() else {
+        panic!("{}::{alias} must be a tuple alias", path.display());
+    };
+    let actual = tuple
+        .elems
+        .iter()
+        .map(|component| match component {
+            Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_else(|| "<empty-path>".to_string()),
+            _ => panic!(
+                "{}::{alias} contains a non-path key component",
+                path.display()
+            ),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected,
+        "{}::{alias} must contain immutable resident-runtime identity only; request capacity belongs to session state",
+        path.display()
+    );
+}
+
 #[derive(Default)]
 pub(super) struct ProductionSyntax {
     identifiers: BTreeSet<String>,
@@ -609,6 +646,45 @@ fn qwen_shaped_family_constructors_keep_the_bound_plan_tail_compile_chain() {
             .calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan"),
         "{moss_compile} must materialize the prepared decoder through the shared compile seam"
     );
+}
+
+#[test]
+fn resident_model_actor_keys_exclude_request_capacity() {
+    let root = models_root();
+    for (relative, alias, expected) in [
+        (
+            "funasr_nano/executor.rs",
+            "FunasrNanoDecoderRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "mimo_asr/executor.rs",
+            "MimoAsrPreparedRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "firered_llm/executor.rs",
+            "FireRedLlmDecoderCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "moss_transcribe_diarize/executor.rs",
+            "MossTdDecoderRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "granite_speech/executor.rs",
+            "GraniteSpeechPreparedRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey"][..],
+        ),
+        (
+            "qwen/ggml_executor.rs",
+            "Qwen3AsrDecoderRuntimeCacheKey",
+            &["PackContentKey", "ExecutionLaneKey", "String"][..],
+        ),
+    ] {
+        assert_tuple_alias_components(&root.join(relative), alias, expected);
+    }
 }
 
 #[test]

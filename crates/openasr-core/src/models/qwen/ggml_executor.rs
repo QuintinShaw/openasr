@@ -92,10 +92,11 @@ const QWEN3_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 const QWEN3_DECODE_PROFILE_ENV: &str = "OPENASR_QWEN_DECODE_PROFILE";
 
 type Qwen3AsrAudioEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-/// The resident KV arena shape is part of the decoder identity. The logical
-/// per-request span is intentionally absent: it runs inside the preallocated
-/// resident capacity and must not fan out the actor cache for every chunk.
-type Qwen3AsrDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, String, usize);
+/// Decoder identity consists only of immutable pack, lane, and adapter facts.
+/// The reusable graph owns the request's resident KV envelope and rebuilds
+/// itself when that envelope changes; putting the envelope in this key would
+/// retain duplicate copies of identical decoder weights across audio lengths.
+type Qwen3AsrDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, String);
 
 struct Qwen3AsrAudioEncoderRuntimeActorState {
     runtime: Qwen3AsrAudioEncoderRuntime,
@@ -345,14 +346,12 @@ impl Qwen3AsrGgmlExecutor {
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
-        kv_capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Qwen3AsrDecoderRuntimeActor, Qwen3AsrGgmlExecutorError> {
         let decoder_backend = qwen_runtime_graph_config(backend).backend;
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(decoder_backend),
             qwen_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
-            kv_capacity.resident_positions(),
         );
         let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
@@ -722,7 +721,6 @@ impl Qwen3AsrGgmlExecutor {
             Arc::clone(&prepared_runtime_owner),
             adapter,
             backend,
-            kv_capacity,
         )?;
         qwen_decode_profile_log_opt("decoder_actor_checkout", whole_decoder_started_at);
 

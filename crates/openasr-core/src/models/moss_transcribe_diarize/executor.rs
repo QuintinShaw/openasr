@@ -160,7 +160,7 @@ const MOSS_TD_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const MOSS_TD_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
 type MossTdEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-type MossTdDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+type MossTdDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 
 struct MossTdEncoderActorState {
     runtime: MossEncoderRuntime,
@@ -848,13 +848,11 @@ impl MossTdGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
-        kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<MossTdDecoderRuntimeActor, MossTdExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(moss_td_runtime_graph_config(backend).backend),
-            kv_capacity.resident_positions(),
         );
         let preflight = preflight.clone();
         let content_id = preflight.runtime_source.content_id().to_string();
@@ -869,10 +867,7 @@ impl MossTdGgmlExecutor {
                     reason,
                 })?;
                 let quote = SystemMemoryAllocationQuote::new(
-                    format!(
-                        "moss-td-decoder-runtime:{content_id}:positions={}",
-                        kv_capacity.resident_positions()
-                    ),
+                    format!("moss-td-decoder-runtime:{content_id}"),
                     retained,
                     retained,
                 )
@@ -1072,8 +1067,7 @@ impl MossTdGgmlExecutor {
             });
         }
 
-        let decoder_actor =
-            self.checkout_decoder_runtime(preflight, prepared, kv_capacity_plan, backend)?;
+        let decoder_actor = self.checkout_decoder_runtime(preflight, prepared, backend)?;
         let decoded = run_moss_td_decoder_with_cached_runtime(
             &decoder_actor,
             decoder_metadata,

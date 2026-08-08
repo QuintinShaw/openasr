@@ -144,15 +144,17 @@ struct MimoAsrPreparedRuntime {
     inlocal_metadata: MimoInlocalMetadata,
 }
 
-/// Resident prepared-runtime actor pool keyed by content id, execution lane,
-/// and resident KV capacity. The
+/// Resident prepared-runtime actor pool keyed by content id and execution lane.
+/// Request-sized KV storage is allocated after checkout and released before the
+/// actor returns to this pool, so KV capacity is deliberately not part of the
+/// resident model identity. The
 /// pack half is a [`PackContentKey`] from the request's already-open source,
 /// so an in-place `.oasr` replacement at the same path resolves a different id
 /// and the next lookup rebuilds instead of reusing runtimes built from the old
 /// bytes. Entries are tagged with the idle-unload generation they were built
 /// service root can clear or target-evict every actor directly; each runtime is
 /// destroyed on the same owner thread that constructed its native contexts.
-type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 
 struct MimoAsrPreparedRuntimeActorState {
     runtime: MimoAsrPreparedRuntime,
@@ -567,12 +569,10 @@ impl MimoAsrGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
-        kv_capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<MimoAsrPreparedRuntimeActor, MimoAsrExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
-            kv_capacity.resident_positions(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -583,10 +583,7 @@ impl MimoAsrGgmlExecutor {
                 let (peak_bytes, retained_bytes) =
                     MimoAsrPreparedRuntime::quoted_system_memory_bytes(&quote_preflight, backend)?;
                 let quote = SystemMemoryAllocationQuote::new(
-                    format!(
-                        "mimo-asr-runtime:{content_id}:positions={}",
-                        kv_capacity.resident_positions()
-                    ),
+                    format!("mimo-asr-runtime:{content_id}"),
                     peak_bytes,
                     retained_bytes,
                 )
@@ -650,7 +647,7 @@ impl MimoAsrGgmlExecutor {
             super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
         )
         .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(preflight, backend, kv_capacity)?;
+        let actor = self.checkout_prepared_runtime(preflight, backend)?;
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);

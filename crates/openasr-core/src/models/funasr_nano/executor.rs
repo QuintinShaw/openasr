@@ -77,7 +77,7 @@ pub(crate) const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
 pub(crate) const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
 
 type FunasrNanoEncoderAdapterRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 
 /// Resident encoder-side runtime: the SAN-M encoder graph + transformer
 /// adaptor with their weights already uploaded to (or bound zero-copy in)
@@ -419,13 +419,11 @@ impl FunasrNanoGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
-        kv_capacity: Qwen3AsrKvCacheCapacity,
         backend: GgmlCpuGraphBackend,
     ) -> Result<FunasrNanoDecoderRuntimeActor, FunasrNanoExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
-            kv_capacity.resident_positions(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -454,10 +452,7 @@ impl FunasrNanoGgmlExecutor {
                         }
                     })?;
                 let quote = SystemMemoryAllocationQuote::new(
-                    format!(
-                        "funasr-nano-decoder-runtime:{content_id}:positions={}",
-                        kv_capacity.resident_positions()
-                    ),
+                    format!("funasr-nano-decoder-runtime:{content_id}"),
                     peak_bytes,
                     retained_bytes,
                 )
@@ -623,8 +618,7 @@ impl FunasrNanoGgmlExecutor {
         )
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FunasrNanoExecutorError::DecoderStateCapacity { source })?;
-        let decoder_actor =
-            self.checkout_decoder_runtime(preflight, decoder_metadata, kv_capacity, backend)?;
+        let decoder_actor = self.checkout_decoder_runtime(preflight, decoder_metadata, backend)?;
         let decoder_control = Arc::clone(&request.execution_context.control);
         let result = decoder_actor
             .call_mut(move |state| {

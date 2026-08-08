@@ -341,15 +341,17 @@ fn embedding_table_system_memory_bytes(
     Ok(bytes.finish())
 }
 
-/// Resident prepared-runtime actor pool keyed by content id, execution lane,
-/// and resident KV capacity.
+/// Resident prepared-runtime actor pool keyed by content id and execution lane.
+/// The request's resident KV envelope is mutable session state: the decode
+/// session rebuilds its arena when that envelope changes, so using it as model
+/// identity would retain duplicate copies of the same weights.
 /// The pack half is a [`PackContentKey`] from the request's already-open
 /// source, so an in-place `.oasr` replacement at the same path resolves a
 /// different id and the next lookup rebuilds instead of reusing a session whose
 /// device-bound weights came from the old bytes. Entries carry the idle-unload
 /// The service root can clear or target-evict these actors directly; each actor
 /// owns its memory lease and destroys the runtime on its owner thread.
-type GraniteSpeechPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, usize);
+type GraniteSpeechPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 struct GraniteSpeechPreparedRuntimeActorState {
     runtime: GraniteSpeechPreparedRuntime,
 }
@@ -497,12 +499,10 @@ impl GraniteSpeechGgmlExecutor {
         &self,
         preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
-        kv_capacity: GraniteSpeechKvCacheCapacity,
     ) -> Result<GraniteSpeechPreparedRuntimeActor, GraniteSpeechGgmlExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
-            kv_capacity.resident_positions(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -513,10 +513,7 @@ impl GraniteSpeechGgmlExecutor {
                 let (peak_bytes, retained_bytes) =
                     GraniteSpeechPreparedRuntime::quoted_system_memory_bytes(&quote_preflight)?;
                 let quote = SystemMemoryAllocationQuote::new(
-                    format!(
-                        "granite-speech-runtime:{content_id}:positions={}",
-                        kv_capacity.resident_positions()
-                    ),
+                    format!("granite-speech-runtime:{content_id}"),
                     peak_bytes,
                     retained_bytes,
                 )
@@ -589,7 +586,7 @@ impl GraniteSpeechGgmlExecutor {
                 capacity.validate_hard_cap(super::capacity::GRANITE_SPEECH_DECODER_MAX_POSITIONS)
             })
             .map_err(|source| GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(preflight, backend, kv_capacity)?;
+        let actor = self.checkout_prepared_runtime(preflight, backend)?;
         let control = Arc::clone(&request.execution_context.control);
         let result = actor
             .call_mut(move |state| {
