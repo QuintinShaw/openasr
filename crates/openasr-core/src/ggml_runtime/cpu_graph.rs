@@ -1352,6 +1352,7 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     backend_private_memory_owner: GgmlBackendPrivateLeaseOwner,
     graph_size: usize,
     buffer: Option<GgmlBackendBufferGuard>,
+    graph_allocator: Option<GgmlGraphAllocatorGuard>,
     /// `Some` only for plain `start_graph()` builders on the CPU backend with
     /// no scheduler -- the per-token rebuild path this pool targets. `None`
     /// for persistent-graph-session builders (which already allocate once and
@@ -1403,6 +1404,14 @@ impl GgmlPersistentGraphSession {
 
     pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
         self.builder.mark_poisoned_after_failed_compute();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_allocation_bytes(&self) -> Option<u64> {
+        self.builder
+            .graph_allocator
+            .as_ref()
+            .map(GgmlGraphAllocatorGuard::requested_bytes)
     }
 }
 
@@ -1650,6 +1659,7 @@ impl GgmlCpuGraphRunner {
             backend_private_memory_owner: Rc::clone(&self.backend.private_memory_leases),
             graph_size: self.graph_size,
             buffer: None,
+            graph_allocator: None,
             step_buffer_pool,
             frozen: false,
             prepared_graph: None,
@@ -1715,9 +1725,10 @@ impl GgmlCpuGraphRunner {
             backend_private_memory_owner: Rc::clone(&self.backend.private_memory_leases),
             graph_size: self.graph_size,
             buffer: None,
-            // A persistent session already allocates its buffer once (via
-            // `ensure_backend_buffer`) and keeps it for the session's whole
-            // lifetime, so it does not need the step pool's grow-to-fit reuse.
+            graph_allocator: None,
+            // A persistent session allocates its graph once and keeps that
+            // allocation for the session's whole lifetime, so it does not
+            // need the step pool's grow-to-fit reuse.
             step_buffer_pool: None,
             frozen: false,
             prepared_graph: None,
@@ -4428,8 +4439,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let graph = self.build_forward_graph(outputs)?;
         if self.scheduler.is_some() {
             self.allocate_scheduler_graph(graph)?;
-        } else {
+        } else if self.step_buffer_pool.is_some() {
+            // Preserve the CPU per-step grow-to-fit pool. A one-shot gallocr
+            // would save bytes for this graph but would also allocate and free
+            // a backend buffer on every decoder step.
             self.ensure_backend_buffer()?;
+        } else {
+            self.allocate_direct_graph(graph)?;
         }
         self.prepared_graph = Some(graph);
         Ok(())
@@ -5309,6 +5325,28 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
         let buffer = GgmlBackendBufferGuard::allocate(self.context, self.backend)?;
         self.buffer = Some(buffer);
+        Ok(())
+    }
+
+    fn allocate_direct_graph(&mut self, graph: NonNull<c_void>) -> Result<(), GgmlCpuGraphError> {
+        self.allocate_direct_graph_with(graph, GgmlGraphAllocatorGuard::allocate)
+    }
+
+    fn allocate_direct_graph_with(
+        &mut self,
+        graph: NonNull<c_void>,
+        allocate: impl FnOnce(
+            NonNull<c_void>,
+            NonNull<c_void>,
+        ) -> Result<GgmlGraphAllocatorGuard, GgmlCpuGraphError>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
+        if self.frozen {
+            return Ok(());
+        }
+        let allocator = allocate(graph, self.backend)?;
+        self.graph_allocator = Some(allocator);
+        self.frozen = true;
         Ok(())
     }
 
@@ -7374,6 +7412,230 @@ impl Drop for GgmlRawBackendBufferGuard {
     }
 }
 
+struct GgmlRawGraphAllocatorGuard {
+    raw: NonNull<c_void>,
+}
+
+impl GgmlRawGraphAllocatorGuard {
+    fn new(buft: NonNull<c_void>) -> Result<Self, GgmlCpuGraphError> {
+        NonNull::new(unsafe { ffi::ggml_gallocr_new(buft.as_ptr()) })
+            .map(|raw| Self { raw })
+            .ok_or_else(|| {
+                memory_admission_failure("direct-gallocr/create", "ggml_gallocr_new returned null")
+            })
+    }
+
+    fn measure(
+        &self,
+        graph: NonNull<c_void>,
+    ) -> Result<Vec<(NonNull<c_void>, u64, u64)>, GgmlCpuGraphError> {
+        if !unsafe {
+            ffi::ggml_gallocr_measure_n_v1(
+                self.raw.as_ptr(),
+                graph.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+            )
+        } {
+            return Err(memory_admission_failure(
+                "direct-gallocr/measure",
+                "ggml_gallocr_measure_n_v1 failed",
+            ));
+        }
+        let count = unsafe { ffi::ggml_gallocr_measure_get_chunk_count_v1(self.raw.as_ptr()) };
+        let mut chunks = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut buft = ptr::null_mut();
+            let mut requested_bytes = 0_u64;
+            let mut currently_allocated_bytes = 0_u64;
+            if !unsafe {
+                ffi::ggml_gallocr_measure_get_chunk_v1(
+                    self.raw.as_ptr(),
+                    index,
+                    &mut buft,
+                    &mut requested_bytes,
+                    &mut currently_allocated_bytes,
+                )
+            } {
+                return Err(memory_admission_failure(
+                    "direct-gallocr/describe",
+                    format!("ggml_gallocr_measure_get_chunk_v1 failed for chunk {index}"),
+                ));
+            }
+            let buft = NonNull::new(buft).ok_or_else(|| {
+                memory_admission_failure(
+                    "direct-gallocr/describe",
+                    format!("chunk {index} returned a null buffer type"),
+                )
+            })?;
+            chunks.push((buft, requested_bytes, currently_allocated_bytes));
+        }
+        Ok(chunks)
+    }
+
+    fn commit_and_bind(&self, graph: NonNull<c_void>) -> Result<(), GgmlCpuGraphError> {
+        if !unsafe { ffi::ggml_gallocr_measure_commit_v1(self.raw.as_ptr()) } {
+            return Err(memory_admission_failure(
+                "direct-gallocr/commit",
+                "ggml_gallocr_measure_commit_v1 failed",
+            ));
+        }
+        if !unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph.as_ptr()) } {
+            return Err(memory_admission_failure(
+                "direct-gallocr/bind",
+                "ggml_gallocr_alloc_graph failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GgmlRawGraphAllocatorGuard {
+    fn drop(&mut self) {
+        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) };
+    }
+}
+
+enum GgmlGraphAllocatorOwnership {
+    #[cfg(test)]
+    Direct { _owner: GgmlRawGraphAllocatorGuard },
+    Admitted {
+        _owner: NativeMemoryAllocation<GgmlRawGraphAllocatorGuard>,
+    },
+}
+
+struct GgmlGraphAllocatorGuard {
+    _ownership: GgmlGraphAllocatorOwnership,
+    #[cfg(test)]
+    requested_bytes: u64,
+}
+
+impl GgmlGraphAllocatorGuard {
+    fn allocate(
+        graph: NonNull<c_void>,
+        backend: NonNull<c_void>,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        ensure_backend_device_present(backend)?;
+        let buft =
+            NonNull::new(unsafe { ffi::ggml_backend_get_default_buffer_type(backend.as_ptr()) })
+                .ok_or_else(|| {
+                    memory_admission_failure(
+                        "direct-gallocr/describe",
+                        "backend returned no default buffer type",
+                    )
+                })?;
+        let allocator = GgmlRawGraphAllocatorGuard::new(buft)?;
+        let chunks = allocator.measure(graph)?;
+        #[cfg(test)]
+        let requested_bytes = chunks.iter().try_fold(0_u64, |total, (_, requested, _)| {
+            total.checked_add(*requested).ok_or_else(|| {
+                memory_admission_failure(
+                    "direct-gallocr/describe",
+                    "graph allocation byte count overflowed u64",
+                )
+            })
+        })?;
+
+        let Some(broker) =
+            crate::models::native_execution_services::current_native_execution_memory_broker()
+        else {
+            #[cfg(test)]
+            {
+                allocator.commit_and_bind(graph)?;
+                return Ok(Self {
+                    _ownership: GgmlGraphAllocatorOwnership::Direct { _owner: allocator },
+                    requested_bytes,
+                });
+            }
+            #[cfg(not(test))]
+            {
+                return Err(memory_admission_failure(
+                    "direct-gallocr/broker",
+                    "process-wide native execution memory broker is not installed",
+                ));
+            }
+        };
+
+        let semantics = NativeMemoryClaimSemantics {
+            resource_id: "direct-graph-gallocr".to_owned(),
+            lifetime: AllocationLifetime::SessionResident,
+            phases: PhaseSet::ALL,
+        };
+        let mut request_semantics = BTreeMap::new();
+        let mut requests = Vec::with_capacity(chunks.len());
+        for (index, (buft, requested_bytes, currently_allocated_bytes)) in
+            chunks.into_iter().enumerate()
+        {
+            let request_id = u64::try_from(index + 1).map_err(|_| {
+                memory_admission_failure(
+                    "direct-gallocr/describe",
+                    "graph allocation chunk count exceeds u64",
+                )
+            })?;
+            requests.push(ffi::GgmlBackendMemoryRequestV1 {
+                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+                usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+                request_id,
+                backend: backend.as_ptr(),
+                buft: buft.as_ptr(),
+                graph: graph.as_ptr(),
+                requested_bytes,
+                currently_allocated_bytes,
+                ..Default::default()
+            });
+            request_semantics.insert(
+                request_id,
+                NativeMemoryClaimSemantics {
+                    resource_id: format!("direct-graph-gallocr-chunk-{index}"),
+                    ..semantics.clone()
+                },
+            );
+        }
+        let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }
+            .map_err(|source| memory_admission_error("direct-gallocr/describe", source.into()))?;
+        let group = NativeQuotedBackendGroup::quote(
+            "direct-gallocr",
+            backend_memory_identity(backend)?,
+            abi,
+            requests,
+            request_semantics,
+            semantics,
+        )
+        .map_err(|source| memory_admission_error("direct-gallocr/quote", source))?;
+        let transaction = NativeMemoryAdmissionPlan::from_groups(vec![group])
+            .and_then(|plan| {
+                plan.try_reserve(
+                    &broker,
+                    crate::models::native_execution_services::current_memory_reservation_cohort_id(
+                    ),
+                )
+            })
+            .map_err(|source| memory_admission_error("direct-gallocr/reserve", source))?;
+        let allocation = transaction
+            .commit_engine_owned_with(|| {
+                allocator.commit_and_bind(graph)?;
+                Ok::<_, GgmlCpuGraphError>(allocator)
+            })
+            .map_err(|error| match error {
+                NativeMemoryAllocationError::NativeCommit { source } => source,
+                NativeMemoryAllocationError::PostAllocationStats { source } => {
+                    memory_admission_error("direct-gallocr/reconcile", source)
+                }
+                other => memory_admission_failure("direct-gallocr/commit", other.to_string()),
+            })?;
+        Ok(Self {
+            _ownership: GgmlGraphAllocatorOwnership::Admitted { _owner: allocation },
+            #[cfg(test)]
+            requested_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn requested_bytes(&self) -> u64 {
+        self.requested_bytes
+    }
+}
+
 enum GgmlBackendBufferOwnership {
     /// Low-level tests and internal helpers may run outside an explicitly
     /// injected native service root. Production dispatch never takes this
@@ -7831,7 +8093,8 @@ mod tests {
         GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
         GpuProbeCache, GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
         flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, runtime_gpu_is_available, validate_graph_cancel_capability,
+        gpu_probe_log_message, memory_admission_failure, runtime_gpu_is_available,
+        validate_graph_cancel_capability,
     };
 
     #[test]
@@ -9597,6 +9860,107 @@ mod tests {
     }
 
     #[test]
+    fn persistent_direct_graph_reuses_intermediate_storage_by_lifetime() {
+        const ELEMENTS: usize = 4096;
+        const ADDITIONS: usize = 64;
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(GgmlCpuGraphConfig::metadata_context_bytes(4096))
+            .expect("persistent session should open");
+        let (input, increment, output) = {
+            let graph = session.builder();
+            let input = graph
+                .new_tensor_1d_f32(ELEMENTS, "input")
+                .expect("input tensor");
+            let increment = graph
+                .new_tensor_1d_f32(ELEMENTS, "increment")
+                .expect("increment tensor");
+            graph.set_input(input).expect("input flag");
+            graph.set_input(increment).expect("increment flag");
+            let mut output = input;
+            for _ in 0..ADDITIONS {
+                output = graph.add(output, increment).expect("add node");
+            }
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("liveness-aware graph allocation");
+            (input, increment, output)
+        };
+
+        let allocated = session
+            .prepared_allocation_bytes()
+            .expect("direct persistent graph owns a graph allocator");
+        let naive = (ADDITIONS + 2) * ELEMENTS * std::mem::size_of::<f32>();
+        assert!(
+            allocated < (naive / 2) as u64,
+            "liveness allocation {allocated} should be far below declaration-order sum {naive}"
+        );
+
+        let graph = session.builder();
+        graph
+            .set_f32_slice(input, &vec![0.0; ELEMENTS], "input")
+            .expect("input upload");
+        graph
+            .set_f32_slice(increment, &vec![1.0; ELEMENTS], "increment")
+            .expect("increment upload");
+        let values = graph
+            .compute_output_f32(output, ELEMENTS)
+            .expect("compute reused graph");
+        assert!(values.iter().all(|value| *value == ADDITIONS as f32));
+    }
+
+    #[test]
+    fn failed_direct_graph_allocation_leaves_builder_retryable() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(GgmlCpuGraphConfig::metadata_context_bytes(4096))
+            .expect("persistent session should open");
+        let (input, output) = {
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
+            graph.set_input(input).expect("input flag");
+            let output = graph.mul(input, input).expect("square graph");
+            graph.set_output(output).expect("output flag");
+            let forward = graph
+                .build_forward_graph(&[output])
+                .expect("forward graph should build");
+            let error = graph
+                .allocate_direct_graph_with(forward, |_forward, _backend| {
+                    Err(memory_admission_failure(
+                        "direct-gallocr/test-injected",
+                        "injected allocation failure",
+                    ))
+                })
+                .expect_err("injected allocation must fail");
+            assert!(matches!(error, GgmlCpuGraphError::MemoryAdmission { .. }));
+            assert!(
+                !graph.frozen,
+                "a failed allocation must not freeze the builder"
+            );
+            assert!(graph.graph_allocator.is_none());
+            assert!(graph.prepared_graph.is_none());
+            (input, output)
+        };
+
+        let graph = session.builder();
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("the same builder must remain retryable after allocation failure");
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+            .expect("input upload");
+        assert_eq!(
+            graph
+                .compute_output_f32(output, 4)
+                .expect("retried graph should compute"),
+            vec![1.0, 4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
     fn persistent_graph_session_reuses_built_graph_for_i32_output() {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
@@ -9786,6 +10150,49 @@ mod tests {
         let usage = broker.usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory);
         assert_eq!(usage.pending_bytes, 0);
         assert!(!usage.exclusive_pending);
+    }
+
+    #[test]
+    fn direct_persistent_graph_with_injected_broker_clears_candidate_pending_state() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let broker = std::sync::Arc::clone(services.memory_broker());
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let domain = crate::device::execution_memory::MemoryDomainKey::SystemMemory;
+        let baseline = broker.usage(&domain);
+        {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("direct cpu graph runner should initialize");
+            let mut session = runner
+                .start_persistent_graph_session(1024 * 1024)
+                .expect("persistent session should open");
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
+            graph.set_input(input).expect("input flag");
+            let output = graph.mul(input, input).expect("square graph");
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("direct graph allocation should be admitted atomically");
+            graph
+                .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+                .expect("input upload");
+            assert_eq!(
+                graph
+                    .compute_output_f32(output, 4)
+                    .expect("direct graph should compute"),
+                vec![1.0, 4.0, 9.0, 16.0]
+            );
+
+            let usage = broker.usage(&domain);
+            assert_eq!(usage.pending_bytes, 0);
+            assert!(!usage.exclusive_pending);
+            assert!(usage.committed_bytes > baseline.committed_bytes);
+        }
+        let released = broker.usage(&domain);
+        assert_eq!(released.pending_bytes, baseline.pending_bytes);
+        assert_eq!(released.committed_bytes, baseline.committed_bytes);
+        assert_eq!(released.exclusive_pending, baseline.exclusive_pending);
     }
 
     #[cfg(target_os = "macos")]

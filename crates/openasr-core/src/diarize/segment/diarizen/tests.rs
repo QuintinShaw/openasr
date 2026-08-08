@@ -10,6 +10,18 @@ fn external_path(env: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{env} must point at the external DiariZen parity fixture"))
 }
 
+fn benchmark_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    match std::env::var("OPENASR_DIARIZEN_BENCH_BACKEND")
+        .unwrap_or_else(|_| "cpu".to_string())
+        .as_str()
+    {
+        "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        backend => panic!("unsupported OPENASR_DIARIZEN_BENCH_BACKEND '{backend}'"),
+    }
+}
+
 fn npy_bytes(npz: &std::path::Path, name: &str) -> Vec<u8> {
     let file = std::fs::File::open(npz).expect("open external npz fixture");
     let mut archive = zip::ZipArchive::new(file).expect("parse external npz fixture");
@@ -124,6 +136,22 @@ fn median_filter_uses_scipy_reflect_edges() {
             .collect::<Vec<_>>(),
         vec![1, 1, 1, 0, 0, 0, 0]
     );
+}
+
+#[test]
+fn feature_tiles_use_the_minimal_exact_receptive_field() {
+    for expected_frames in [1, 2, 31, 64, 128, 799] {
+        let samples = runtime::feature_input_samples(expected_frames)
+            .expect("valid output frame count has an inverse receptive field");
+        assert_eq!(config::output_frames(samples), expected_frames);
+        if samples > 0 {
+            assert_eq!(
+                config::output_frames(samples - 1),
+                expected_frames - 1,
+                "one fewer source sample must not manufacture the last feature frame"
+            );
+        }
+    }
 }
 
 #[test]
@@ -261,17 +289,18 @@ fn native_graph_matches_external_pytorch_golden() {
 fn native_fp16_exact_window_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let samples = synthetic_exact_window();
-    let mut runtime = DiariZenRuntime::new(
-        &pack,
-        samples.len(),
-        false,
-        Some(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu),
-    )
-    .expect("construct production runtime");
+    let mut runtime = DiariZenRuntime::new(&pack, samples.len(), false, Some(benchmark_backend()))
+        .expect("construct production runtime");
+    let allocation_bytes = runtime
+        .prepared_graph_allocation_bytes()
+        .expect("direct benchmark backend uses the liveness-aware graph allocator");
+    assert!(
+        allocation_bytes <= 96 * 1024 * 1024,
+        "the fixed 16-second production graph must stay below the audited 96 MiB ceiling; got {allocation_bytes} bytes"
+    );
 
     let warmup = runtime.infer(&samples).expect("warmup inference");
     assert_eq!(warmup.logits.len(), warmup.frame_count * POWERSET_CLASSES);
-
     let mut seconds = Vec::with_capacity(5);
     let mut checksum = 0.0_f64;
     for _ in 0..5 {
@@ -285,7 +314,7 @@ fn native_fp16_exact_window_benchmark() {
     let median_seconds = seconds[seconds.len() / 2];
     let audio_seconds = super::config::WINDOW_SAMPLES as f64 / super::config::SAMPLE_RATE_HZ as f64;
     eprintln!(
-        "DIARIZEN_NATIVE_BENCH median_seconds={median_seconds:.6} rtf={:.6} runs={seconds:?} checksum={checksum:.6}",
+        "DIARIZEN_NATIVE_BENCH median_seconds={median_seconds:.6} rtf={:.6} graph_allocation_bytes={allocation_bytes} runs={seconds:?} checksum={checksum:.6}",
         median_seconds / audio_seconds
     );
     assert!(median_seconds.is_finite() && median_seconds > 0.0);
@@ -297,13 +326,8 @@ fn native_fp16_exact_window_benchmark() {
 fn native_fp16_sixty_second_window_throughput_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let samples = synthetic_exact_window();
-    let mut runtime = DiariZenRuntime::new(
-        &pack,
-        samples.len(),
-        false,
-        Some(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu),
-    )
-    .expect("construct production runtime");
+    let mut runtime = DiariZenRuntime::new(&pack, samples.len(), false, Some(benchmark_backend()))
+        .expect("construct production runtime");
     runtime.infer(&samples).expect("warmup inference");
 
     // Match pyannote Inference.slide: all complete 16 s windows at the pinned
