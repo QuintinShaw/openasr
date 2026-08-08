@@ -289,6 +289,50 @@ mod tests {
         assert_eq!(out, english, "no-Han segment passes through verbatim");
     }
 
+    #[test]
+    #[ignore = "host-local: needs OPENASR_FIRERED_PUNC_REAL_PACK and OPENASR_AUX_BENCH_TEXT"]
+    fn firered_punc_aux_text_benchmark() {
+        let pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_PUNC_REAL_PACK",
+            "FireRedPunc runtime pack",
+        )
+        .expect("OPENASR_FIRERED_PUNC_REAL_PACK");
+        let text_path = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_TEXT",
+            "private auxiliary-model benchmark transcript",
+        )
+        .expect("OPENASR_AUX_BENCH_TEXT");
+        let text = std::fs::read_to_string(text_path).expect("read benchmark transcript");
+        let text = text.trim();
+        assert!(!text.is_empty(), "benchmark transcript must not be empty");
+        let backend = match std::env::var("OPENASR_AUX_BENCH_BACKEND")
+            .unwrap_or_else(|_| "cpu".to_string())
+            .as_str()
+        {
+            "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+            "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
+        };
+        let runtime = FireRedPuncRuntime::from_pack(&pack, backend).expect("load punc runtime");
+        let run = || runtime.punctuate(text).expect("punctuate benchmark text");
+
+        let mut output = run();
+        let seconds = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                output = run();
+                started.elapsed().as_secs_f64()
+            })
+            .collect::<Vec<_>>();
+        let output_sha256 = crate::testing::benchmark_sha256_bytes([output.as_bytes()]);
+        let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+        eprintln!(
+            "AUX_MODEL_BENCH model=fireredpunc backend={backend:?} chars={} median_seconds={median_seconds:.6} output_sha256={output_sha256} runs={seconds:?}",
+            text.chars().count(),
+        );
+    }
+
     /// Converter golden gate: the engine's per-token argmax labels for the
     /// converted `.oasr` pack must exactly match the upstream PyTorch forward.
     /// Both env vars are dev-only (the pack is uncommitted; the JSON is emitted

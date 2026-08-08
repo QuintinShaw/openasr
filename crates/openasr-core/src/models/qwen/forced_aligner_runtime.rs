@@ -616,6 +616,78 @@ mod tests {
         assert_eq!(prepared.samples_f32.as_ptr(), audio.as_ptr());
     }
 
+    #[test]
+    #[ignore = "host-local: needs OPENASR_FORCED_ALIGNER_PACK, OPENASR_AUX_BENCH_AUDIO, and OPENASR_AUX_BENCH_TEXT"]
+    fn forced_aligner_aux_audio_benchmark() {
+        let pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FORCED_ALIGNER_PACK",
+            "Qwen3 forced-aligner runtime pack",
+        )
+        .expect("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_AUDIO",
+            "private auxiliary-model benchmark audio",
+        )
+        .expect("OPENASR_AUX_BENCH_AUDIO");
+        let text_path = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_TEXT",
+            "private auxiliary-model benchmark transcript",
+        )
+        .expect("OPENASR_AUX_BENCH_TEXT");
+        let text = std::fs::read_to_string(text_path).expect("read benchmark transcript");
+        let text = text.trim();
+        assert!(!text.is_empty(), "benchmark transcript must not be empty");
+        let language =
+            std::env::var("OPENASR_AUX_BENCH_LANGUAGE").unwrap_or_else(|_| "Chinese".to_string());
+        let backend = match std::env::var("OPENASR_AUX_BENCH_BACKEND")
+            .unwrap_or_else(|_| "cpu".to_string())
+            .as_str()
+        {
+            "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+            "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
+        };
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &audio,
+            "forced-aligner auxiliary benchmark",
+            "forced-aligner auxiliary benchmark",
+        )
+        .expect("load benchmark audio");
+        let pcm = crate::PcmBuffer::from_vec(samples);
+        let audio_seconds = pcm.len() as f64 / 16_000.0;
+        let session = Qwen3ForcedAlignerSession::load(&pack, backend).expect("load aligner");
+        let run = || {
+            session
+                .align(pcm.full_slice(), text, &language)
+                .expect("align benchmark audio")
+        };
+
+        let mut items = run();
+        let seconds = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                items = run();
+                started.elapsed().as_secs_f64()
+            })
+            .collect::<Vec<_>>();
+        assert!(!items.is_empty(), "benchmark alignment must emit items");
+        let mut output_bytes = Vec::new();
+        for item in &items {
+            output_bytes.extend_from_slice(item.text.as_bytes());
+            output_bytes.push(0);
+            output_bytes.extend_from_slice(&item.start_time_s.to_le_bytes());
+            output_bytes.extend_from_slice(&item.end_time_s.to_le_bytes());
+        }
+        let output_sha256 = crate::testing::benchmark_sha256_bytes([output_bytes]);
+        let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+        eprintln!(
+            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} items={} output_sha256={output_sha256} runs={seconds:?}",
+            median_seconds / audio_seconds,
+            items.len(),
+        );
+    }
+
     /// Stage 5 gate: run the full NAR pipeline end-to-end against the real
     /// Qwen3-ForcedAligner-0.6B checkpoint for both fixtures (`jfk.wav`
     /// English, `zh_sample.wav` Chinese) and compare every word's start/end

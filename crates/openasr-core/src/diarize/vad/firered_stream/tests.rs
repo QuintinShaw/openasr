@@ -232,14 +232,19 @@ fn benchmark_forward_pass_rtf_on_real_5min_recording() {
     // Warm up (page-in, allocator warm) before timing.
     let _ = model.probabilities(&samples[..samples.len().min(16_000)]);
 
-    let start = std::time::Instant::now();
-    let probs = model.probabilities(&samples);
-    let elapsed = start.elapsed();
-
-    let rtf = elapsed.as_secs_f64() / audio_seconds;
+    let mut probs = Vec::new();
+    let seconds = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            probs = model.probabilities(&samples);
+            started.elapsed().as_secs_f64()
+        })
+        .collect::<Vec<_>>();
+    let probability_sha256 = crate::testing::benchmark_sha256_f32(&probs);
+    let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+    let rtf = median_seconds / audio_seconds;
     println!(
-        "Stream-VAD forward pass: {audio_seconds:.1}s audio in {:.3}s ({} frames), RTF={rtf:.5}",
-        elapsed.as_secs_f64(),
+        "AUX_MODEL_BENCH model=fireredvad backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
         probs.len(),
     );
     assert!(!probs.is_empty());

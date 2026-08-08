@@ -208,6 +208,63 @@ fn segmenter_rtf_bench_when_pack_present() {
     println!("pyannote rtf_cpu={rtf_cpu:.5} over {audio_seconds:.2}s fixture audio");
 }
 
+/// Shared private-audio benchmark used by the auxiliary-model Pareto gate.
+/// The recording path is always supplied explicitly; no customer audio path is
+/// embedded in the repository. Unlike the catalog fixture benchmark above,
+/// this exercises the production 10 s / 1 s sliding-window protocol.
+#[test]
+#[ignore = "host-local: needs OPENASR_PYANNOTE_PACK and OPENASR_AUX_BENCH_AUDIO"]
+fn segmentation3_aux_audio_sliding_benchmark() {
+    use super::LocalActivitySegmenter;
+
+    let pack = crate::testing::external_test_fixture_path(
+        "OPENASR_PYANNOTE_PACK",
+        "segmentation-3.0 runtime pack",
+    )
+    .expect("OPENASR_PYANNOTE_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "segmentation-3.0 auxiliary benchmark",
+        "segmentation-3.0 auxiliary benchmark",
+    )
+    .expect("load benchmark audio");
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let audio_seconds = pcm.len() as f64 / super::SAMPLE_RATE_HZ as f64;
+    let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load segmenter pack");
+    let run = || {
+        segmenter
+            .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false)
+            .expect("segment benchmark audio")
+    };
+
+    let warmup = run();
+    let mut last = warmup;
+    let seconds = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            last = run();
+            started.elapsed().as_secs_f64()
+        })
+        .collect::<Vec<_>>();
+    let activity_sha256 = crate::testing::benchmark_sha256_bytes(
+        last.windows
+            .iter()
+            .map(|window| window.frame_activity.as_slice())
+            .chain(std::iter::once(last.speaker_count.as_slice())),
+    );
+    let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+    eprintln!(
+        "AUX_MODEL_BENCH model=segmentation3 backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
+        median_seconds / audio_seconds,
+        last.windows.len(),
+    );
+}
+
 /// Round-trip oracle for Subtask B: converting the real pyannote-seg safetensors
 /// to a diarization `.oasr` (GGUF-v0, raw f32) and loading it back through
 /// [`PyannetModel::from_oasr`] must reproduce a **byte-identical** forward pass vs

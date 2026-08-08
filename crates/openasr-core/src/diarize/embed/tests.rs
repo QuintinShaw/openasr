@@ -59,7 +59,11 @@ fn embedder_rtf_bench_when_pack_present() {
         return;
     };
     let embedder = runtime.embedder();
-    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+    let wav = std::env::var_os("OPENASR_AUX_BENCH_AUDIO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+        });
     let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
         wav,
         "redimnet rtf bench",
@@ -68,17 +72,20 @@ fn embedder_rtf_bench_when_pack_present() {
     .expect("fixture wav loads");
     let audio_seconds = samples.len() as f64 / 16_000.0;
 
-    embedder.embed(&samples, 16_000).expect("warm-up embed");
-    let mut runs: Vec<f64> = (0..5)
+    let mut last_embedding = embedder.embed(&samples, 16_000).expect("warm-up embed");
+    let runs: Vec<f64> = (0..5)
         .map(|_| {
             let start = std::time::Instant::now();
-            embedder.embed(&samples, 16_000).expect("timed embed");
+            last_embedding = embedder.embed(&samples, 16_000).expect("timed embed");
             start.elapsed().as_secs_f64()
         })
         .collect();
-    runs.sort_by(f64::total_cmp);
-    let rtf_cpu = runs[runs.len() / 2] / audio_seconds;
-    println!("speaker_embedder rtf_cpu={rtf_cpu:.5} over {audio_seconds:.2}s fixture audio");
+    let embedding_sha256 = crate::testing::benchmark_sha256_f32(&last_embedding.0);
+    let (median_seconds, runs) = crate::testing::benchmark_median_seconds(runs);
+    let rtf_cpu = median_seconds / audio_seconds;
+    println!(
+        "AUX_MODEL_BENCH model=redimnet2 backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf_cpu:.6} embedding_sha256={embedding_sha256} runs={runs:?}"
+    );
 
     let crop_len = samples.len() / 4;
     let clips: Vec<&[f32]> = (0..4)

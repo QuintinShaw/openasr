@@ -359,3 +359,68 @@ fn native_fp16_sixty_second_window_throughput_benchmark() {
     assert!(elapsed.is_finite() && elapsed > 0.0);
     assert!(checksum.is_finite());
 }
+
+/// Private-audio production-window benchmark for the auxiliary-model Pareto
+/// gate. The same recording can be supplied to every auxiliary model without
+/// baking its path or content into the repository.
+#[test]
+#[ignore = "host-local: needs OPENASR_DIARIZEN_PACK and OPENASR_AUX_BENCH_AUDIO"]
+fn diarizen_aux_audio_sliding_benchmark() {
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "DiariZen auxiliary benchmark",
+        "DiariZen auxiliary benchmark",
+    )
+    .expect("load benchmark audio");
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let audio_seconds = pcm.len() as f64 / super::config::SAMPLE_RATE_HZ as f64;
+    let mut runtime = DiariZenRuntime::new(
+        &pack,
+        super::config::WINDOW_SAMPLES,
+        false,
+        Some(benchmark_backend()),
+    )
+    .expect("construct production runtime");
+    let mut run = || {
+        super::super::segment_diarizen_local_activity(
+            pcm.full_slice(),
+            super::config::SAMPLE_RATE_HZ,
+            &|| false,
+            |window| {
+                runtime
+                    .infer(&window)
+                    .map_err(|error| super::super::SegmentError::Inference(error.to_string()))
+            },
+        )
+        .expect("segment benchmark audio")
+    };
+
+    let warmup = run();
+    let mut last = warmup;
+    let seconds = (0..5)
+        .map(|_| {
+            let started = Instant::now();
+            last = run();
+            started.elapsed().as_secs_f64()
+        })
+        .collect::<Vec<_>>();
+    let activity_sha256 = crate::testing::benchmark_sha256_bytes(
+        last.windows
+            .iter()
+            .map(|window| window.frame_activity.as_slice())
+            .chain(std::iter::once(last.speaker_count.as_slice())),
+    );
+    let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+    eprintln!(
+        "AUX_MODEL_BENCH model=diarizen backend={:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
+        benchmark_backend(),
+        median_seconds / audio_seconds,
+        last.windows.len(),
+    );
+}

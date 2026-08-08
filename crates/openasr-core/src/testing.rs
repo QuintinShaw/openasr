@@ -4,6 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use sha2::{Digest, Sha256};
+
 use crate::arch::{
     COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, COHERE_TRANSCRIBE_DECODE_POLICY_ID,
     COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, COHERE_TRANSCRIBE_TOKENIZER_ID,
@@ -112,6 +115,36 @@ pub fn external_test_fixture_path(
             path,
         })
     }
+}
+
+/// Stable helpers shared by opt-in, host-local model benchmarks. They stay
+/// test-only so private recordings and performance harnesses never become a
+/// production API surface.
+#[cfg(test)]
+pub(crate) fn benchmark_median_seconds(mut seconds: Vec<f64>) -> (f64, Vec<f64>) {
+    assert!(!seconds.is_empty(), "benchmark needs at least one sample");
+    assert!(
+        seconds
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0),
+        "benchmark samples must be finite and positive: {seconds:?}"
+    );
+    seconds.sort_by(f64::total_cmp);
+    (seconds[seconds.len() / 2], seconds)
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_sha256_bytes(chunks: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
+    let mut hasher = Sha256::new();
+    for chunk in chunks {
+        hasher.update(chunk.as_ref());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_sha256_f32(values: &[f32]) -> String {
+    benchmark_sha256_bytes(values.iter().map(|value| value.to_le_bytes()))
 }
 
 #[cfg(test)]
