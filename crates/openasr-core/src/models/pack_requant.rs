@@ -83,9 +83,9 @@ pub enum PackRequantError {
 ///
 /// v1 deliberately exposes only Q4_K: it closes the real MiMo external-tool
 /// gap without inventing a general arbitrary-precision conversion surface.
-/// Acoustic tensors that the architecture policy clamps to Q8_0 are copied
-/// unchanged; only tensors whose semantic projection is exactly Q4_K are
-/// transformed.
+/// The inventory projection is exact: decoder matrices eligible for Q4_K are
+/// written as Q4_K, acoustic matrices carrying the ASR quality floor are
+/// written as Q8_0, and tensors without a block-quant target are copied.
 pub fn requantize_oasr_pack(
     source: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -172,11 +172,11 @@ pub fn requantize_oasr_pack(
                 .quantization_contract
                 .tensor_classification
                 .target_write_type(&tensor.name, &tensor.dims, target);
-            let ggml_type = if target_type == Some(GgufWriteTensorType::Q4_K)
-                && tensor.ggml_type != GgufWriteTensorType::Q4_K.ggml_type()
+            let ggml_type = if let Some(target_type) = target_type
+                && tensor.ggml_type != target_type.ggml_type()
             {
                 converted_tensor_count += 1;
-                GgufWriteTensorType::Q4_K.ggml_type()
+                target_type.ggml_type()
             } else {
                 tensor.ggml_type
             };
@@ -221,7 +221,7 @@ pub fn requantize_oasr_pack(
                 })?;
                 return Ok(());
             }
-            requantize_tensor_rows_to_q4_k(
+            requantize_tensor_rows(
                 target_spec,
                 source_payload.metadata.ggml_type,
                 source_payload.bytes,
@@ -245,7 +245,7 @@ pub fn requantize_oasr_pack(
     })
 }
 
-fn requantize_tensor_rows_to_q4_k(
+fn requantize_tensor_rows(
     target: &GgufStreamTensorSpec,
     source_ggml_type: i32,
     source_bytes: &[u8],
@@ -311,8 +311,21 @@ fn requantize_tensor_rows_to_q4_k(
                 },
             )?;
         }
-        let quantized =
-            quantize_f32_to_ggml_tensor_data(GgufWriteTensorType::Q4_K, &[target.dims[0]], &row)?;
+        let target_type = match target.ggml_type {
+            ggml_type if ggml_type == GgufWriteTensorType::Q4_K.ggml_type() => {
+                GgufWriteTensorType::Q4_K
+            }
+            ggml_type if ggml_type == GgufWriteTensorType::Q8_0.ggml_type() => {
+                GgufWriteTensorType::Q8_0
+            }
+            ggml_type => {
+                return Err(GgufWriteError::TensorStreamingProducer {
+                    name: target.name.clone(),
+                    reason: format!("unsupported requant target ggml type {ggml_type}"),
+                });
+            }
+        };
+        let quantized = quantize_f32_to_ggml_tensor_data(target_type, &[target.dims[0]], &row)?;
         sink.write_all(&quantized)
             .map_err(|error| GgufWriteError::TensorStreamingProducer {
                 name: target.name.clone(),
@@ -470,6 +483,46 @@ mod tests {
             "mimo-v2.5-asr:q4_k"
         );
         assert!(requantized_model_id("mimo-v2.5-asr:fp16", "q8_0", "q4_k").is_err());
+    }
+
+    #[test]
+    fn acoustic_projection_requantizes_rows_to_q8_floor() {
+        let target = GgufStreamTensorSpec {
+            name: "audio.encoder.weight".to_string(),
+            dims: vec![32, 2],
+            ggml_type: GgufWriteTensorType::Q8_0.ggml_type(),
+        };
+        let source = (0..64_u32)
+            .flat_map(|index| ((index as f32 - 31.5) / 32.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        requantize_tensor_rows(
+            &target,
+            GgufWriteTensorType::F32.ggml_type(),
+            &source,
+            &mut output,
+        )
+        .expect("requant acoustic rows");
+        assert_eq!(
+            output.len(),
+            ggml_row_size_bytes(GgufWriteTensorType::Q8_0.ggml_type(), 32).unwrap() * 2
+        );
+    }
+
+    #[test]
+    fn existing_output_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.oasr");
+        let output = dir.path().join("output.oasr");
+        crate::testing::write_tiny_gguf_runtime_source(&source, &qwen_requant_fixture())
+            .expect("write source fixture");
+        std::fs::write(&output, b"caller-owned").unwrap();
+
+        assert!(matches!(
+            requantize_oasr_pack(&source, &output, PackQuant::Q4_K),
+            Err(PackRequantError::OutputTransaction { .. })
+        ));
+        assert_eq!(std::fs::read(&output).unwrap(), b"caller-owned");
     }
 
     #[test]

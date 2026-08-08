@@ -221,6 +221,13 @@ mod tests {
             contract.target_write_type("blk.weight", &[256, 4], PackQuant::Q4_K),
             Some(GgufWriteTensorType::Q4_K)
         );
+        let acoustic_contract = TensorQuantizationContract::EntireAcousticPack {
+            model_architecture: "fixture-acoustic",
+        };
+        assert_eq!(
+            acoustic_contract.target_write_type("encoder.weight", &[32, 4], PackQuant::Q4_K),
+            Some(GgufWriteTensorType::Q8_0)
+        );
     }
 
     #[test]
