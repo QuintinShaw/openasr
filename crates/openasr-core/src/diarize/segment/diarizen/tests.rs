@@ -218,13 +218,8 @@ fn native_graph_matches_external_pytorch_golden() {
     let golden = external_path("OPENASR_DIARIZEN_GOLDEN");
     DiariZenSegmenter::probe_oasr(&pack).expect("strict pack probe");
     let waveform = npy_f32(&golden, "waveform");
-    let mut runtime = DiariZenRuntime::new(
-        &pack,
-        16_000,
-        true,
-        Some(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu),
-    )
-    .expect("construct test-geometry runtime");
+    let mut runtime = DiariZenRuntime::new(&pack, 16_000, true, Some(benchmark_backend()))
+        .expect("construct test-geometry runtime");
     let trace = runtime.infer_trace(&waveform).expect("native trace");
 
     for (name, actual) in &trace {
@@ -422,5 +417,144 @@ fn diarizen_aux_audio_sliding_benchmark() {
         benchmark_backend(),
         median_seconds / audio_seconds,
         last.windows.len(),
+    );
+}
+
+#[test]
+#[ignore = "host-local endurance gate: needs OPENASR_DIARIZEN_PACK and a >=15 minute OPENASR_AUX_BENCH_AUDIO"]
+fn diarizen_fifteen_minute_endurance() {
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model endurance audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "DiariZen endurance gate",
+        "DiariZen endurance gate",
+    )
+    .expect("load endurance audio");
+    let audio_seconds = samples.len() as f64 / super::config::SAMPLE_RATE_HZ as f64;
+    assert!(audio_seconds >= 15.0 * 60.0, "endurance audio is too short");
+    let backend = benchmark_backend();
+    let mut runtime =
+        DiariZenRuntime::new(&pack, super::config::WINDOW_SAMPLES, false, Some(backend))
+            .expect("construct production runtime");
+    runtime
+        .infer(&samples[..super::config::WINDOW_SAMPLES])
+        .expect("warm DiariZen runtime");
+
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let started = Instant::now();
+    let activity = super::super::segment_diarizen_local_activity(
+        pcm.full_slice(),
+        super::config::SAMPLE_RATE_HZ,
+        &|| false,
+        |window| {
+            runtime
+                .infer(&window)
+                .map_err(|error| super::super::SegmentError::Inference(error.to_string()))
+        },
+    )
+    .expect("segment endurance audio");
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    let activity_sha256 = crate::testing::benchmark_sha256_bytes(
+        activity
+            .windows
+            .iter()
+            .map(|window| window.frame_activity.as_slice())
+            .chain(std::iter::once(activity.speaker_count.as_slice())),
+    );
+    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+    eprintln!(
+        "AUX_MODEL_ENDURANCE model=diarizen backend={backend:?} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} windows={} activity_sha256={activity_sha256}",
+        elapsed_seconds / audio_seconds,
+        activity.windows.len(),
+    );
+}
+
+#[test]
+#[ignore = "host-local: needs OPENASR_DIARIZEN_PACK and OPENASR_AUX_BENCH_AUDIO"]
+fn diarizen_cpu_and_metal_activity_stays_semantically_close() {
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "DiariZen backend parity",
+        "DiariZen backend parity",
+    )
+    .expect("load parity audio");
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let run = |backend| {
+        let mut runtime =
+            DiariZenRuntime::new(&pack, super::config::WINDOW_SAMPLES, false, Some(backend))
+                .expect("construct parity runtime");
+        super::super::segment_diarizen_local_activity(
+            pcm.full_slice(),
+            super::config::SAMPLE_RATE_HZ,
+            &|| false,
+            |window| {
+                runtime
+                    .infer(&window)
+                    .map_err(|error| super::super::SegmentError::Inference(error.to_string()))
+            },
+        )
+        .expect("segment parity audio")
+    };
+
+    let cpu = run(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
+    let metal = run(crate::ggml_runtime::GgmlCpuGraphBackend::Metal);
+    assert_eq!(cpu.frame_clock, metal.frame_clock);
+    assert_eq!(cpu.local_speaker_slots, metal.local_speaker_slots);
+    assert_eq!(cpu.windows.len(), metal.windows.len());
+    assert_eq!(cpu.speaker_count.len(), metal.speaker_count.len());
+
+    let mut frame_count = 0usize;
+    let mut exact_mask_mismatches = 0usize;
+    let mut active_count_mismatches = 0usize;
+    for (cpu_window, metal_window) in cpu.windows.iter().zip(&metal.windows) {
+        assert_eq!(cpu_window.start_sample, metal_window.start_sample);
+        assert_eq!(
+            cpu_window.frame_activity.len(),
+            metal_window.frame_activity.len()
+        );
+        for (&cpu_mask, &metal_mask) in cpu_window
+            .frame_activity
+            .iter()
+            .zip(&metal_window.frame_activity)
+        {
+            frame_count += 1;
+            exact_mask_mismatches += usize::from(cpu_mask != metal_mask);
+            active_count_mismatches +=
+                usize::from(cpu_mask.count_ones() != metal_mask.count_ones());
+        }
+    }
+    let aggregate_mismatches = cpu
+        .speaker_count
+        .iter()
+        .zip(&metal.speaker_count)
+        .filter(|(cpu_count, metal_count)| cpu_count != metal_count)
+        .count();
+    let exact_mask_rate = exact_mask_mismatches as f64 / frame_count as f64;
+    let active_count_rate = active_count_mismatches as f64 / frame_count as f64;
+    let aggregate_rate = aggregate_mismatches as f64 / cpu.speaker_count.len() as f64;
+    eprintln!(
+        "DIARIZEN_BACKEND_PARITY frames={frame_count} exact_mask_mismatches={exact_mask_mismatches} exact_mask_rate={exact_mask_rate:.8} active_count_mismatches={active_count_mismatches} active_count_rate={active_count_rate:.8} aggregate_mismatches={aggregate_mismatches} aggregate_rate={aggregate_rate:.8}"
+    );
+
+    assert!(
+        active_count_rate <= 0.01,
+        "CPU/Metal active-speaker counts diverged for {:.3}% of window frames",
+        active_count_rate * 100.0
+    );
+    assert!(
+        aggregate_rate <= 0.01,
+        "CPU/Metal aggregated speaker counts diverged for {:.3}% of recording frames",
+        aggregate_rate * 100.0
     );
 }

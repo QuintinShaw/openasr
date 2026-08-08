@@ -1,9 +1,9 @@
 //! Parity tests for the ReDimNet2-B6 embedder.
 
 use super::{
-    EmbedError, RedimNet2Embedder, RedimNetResidentRuntime, SpeakerEmbedder,
-    SpeakerEmbeddingExecutionPlan, abort_successful_results_after_terminal_failure,
-    embed_batch_worker_range,
+    EmbedError, REDIMNET_MAX_BATCH_WORKERS, RedimNet2Embedder, RedimNetResidentRuntime,
+    SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
+    abort_successful_results_after_terminal_failure, embed_batch_worker_range,
 };
 use crate::diarize::contract::SpeakerEmbedding;
 
@@ -127,6 +127,81 @@ fn embedder_rtf_bench_when_pack_present() {
         batch_runs[1],
         batch_runs[3],
         sequential / batch
+    );
+}
+
+#[ignore = "host-local Pareto bench: needs OPENASR_REDIMNET_PACK, OPENASR_AUX_BENCH_AUDIO, and OPENASR_REDIMNET_BENCH_WORKERS"]
+#[test]
+fn redimnet_batch_worker_pareto_benchmark() {
+    let workers = std::env::var("OPENASR_REDIMNET_BENCH_WORKERS")
+        .expect("OPENASR_REDIMNET_BENCH_WORKERS")
+        .parse::<usize>()
+        .expect("worker count is an integer");
+    assert!((1..=REDIMNET_MAX_BATCH_WORKERS).contains(&workers));
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let runtime = super::PolicyResolvedSpeakerRuntime::load(services)
+        .expect("load policy-owned embedder")
+        .expect("redimnet2-b6 pack is present");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        audio,
+        "redimnet batch Pareto benchmark",
+        "redimnet batch Pareto benchmark",
+    )
+    .expect("load benchmark audio");
+    let window_samples = 24_000usize;
+    let step_samples = 12_000usize;
+    let batch_clips = REDIMNET_MAX_BATCH_WORKERS * 4;
+    assert!(
+        samples.len() >= (batch_clips - 1) * step_samples + window_samples,
+        "benchmark audio must cover one production embedding batch"
+    );
+    let clips = (0..batch_clips)
+        .map(|index| {
+            let start = index * step_samples;
+            &samples[start..start + window_samples]
+        })
+        .collect::<Vec<_>>();
+    let run = || {
+        runtime
+            .embedder()
+            .embed_batch(&clips, 16_000)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("embed every crop")
+    };
+
+    let mut embeddings = run();
+    let seconds = (0..3)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            embeddings = run();
+            started.elapsed().as_secs_f64()
+        })
+        .collect::<Vec<_>>();
+    let output_sha256 = crate::testing::benchmark_sha256_f32(
+        &embeddings
+            .iter()
+            .flat_map(|embedding| embedding.0.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+    let represented_audio_seconds = (window_samples * clips.len()) as f64 / 16_000.0;
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let plan = SpeakerEmbeddingExecutionPlan::for_clips(clips.len(), available, workers);
+    eprintln!(
+        "REDIMNET_BATCH_PARETO workers={} threads_per_runner={} audio_seconds={represented_audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} output_sha256={output_sha256} runs={seconds:?}",
+        plan.workers,
+        plan.threads_per_runner,
+        median_seconds / represented_audio_seconds,
     );
 }
 
@@ -305,6 +380,46 @@ fn redimnet_embedder_matches_python_reference_e2e_jfk() {
     let cos = cosine(&mine.0, &golden);
     println!("redimnet e2e jfk cosine={cos:.8}");
     assert!(cos >= 0.9999, "redimnet e2e jfk cosine {cos}");
+}
+
+#[test]
+#[ignore = "host-local: needs the ReDimNet F32 pack, private audio, and official Python embedding"]
+fn redimnet_matches_official_reference_on_aux_audio() {
+    let pack = crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_F32_PACK",
+        "ReDimNet2-B6 F32 runtime pack",
+    )
+    .expect("OPENASR_REDIMNET_F32_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model parity audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let reference = crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_REFERENCE_NPY",
+        "official ReDimNet2 embedding",
+    )
+    .expect("OPENASR_REDIMNET_REFERENCE_NPY");
+
+    let embedder = RedimNet2Embedder::from_oasr(&pack).expect("load ReDimNet F32 pack");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "redimnet official parity",
+        "redimnet official parity",
+    )
+    .expect("load parity audio");
+    let mut runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
+        .expect("construct resident runtime");
+    let actual = low_level_redimnet_embed(&embedder, &mut runtime, &samples)
+        .expect("run ReDimNet parity embedding");
+    let expected = read_redimnet_golden_embedding(&reference);
+    assert_eq!(actual.dim(), expected.len(), "embedding dimension");
+    let cos = cosine(&actual.0, &expected);
+    eprintln!(
+        "REDIMNET_OFFICIAL_PARITY cosine={cos:.8} dim={}",
+        actual.dim()
+    );
+    assert!(cos >= 0.9999, "ReDimNet official cosine {cos}");
 }
 
 #[test]

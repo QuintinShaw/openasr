@@ -48,6 +48,42 @@ fn max_abs_diff_with_location(got: &[f32], want: &[f32]) -> (f32, usize) {
     (worst, worst_idx)
 }
 
+/// Read the one-dimensional little-endian f32 NPY emitted by the pinned
+/// upstream FireRedVAD reference harness. Keeping this test-only parser local
+/// avoids adding a production dependency for a host-local parity fixture.
+fn read_reference_probabilities(path: &std::path::Path) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+    assert_eq!(&bytes[..6], b"\x93NUMPY", "npy magic");
+    let major = bytes[6];
+    let (header_start, header_len) = if major == 1 {
+        (
+            10,
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()) as usize,
+        )
+    } else {
+        (
+            12,
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
+        )
+    };
+    let header = std::str::from_utf8(&bytes[header_start..header_start + header_len])
+        .expect("npy header utf8");
+    assert!(header.contains("'<f4'"), "expected <f4 npy, got {header}");
+    assert!(
+        header.contains("'fortran_order': False"),
+        "expected C-order npy"
+    );
+    let data_start = header_start + header_len;
+    assert!(
+        (bytes.len() - data_start).is_multiple_of(4),
+        "npy f32 payload alignment"
+    );
+    bytes[data_start..]
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
 #[test]
 fn forward_pass_matches_reference_within_tolerance() {
     let (samples, reference_probs) = golden();
@@ -61,6 +97,84 @@ fn forward_pass_matches_reference_within_tolerance() {
         "max abs prob error {max_diff} at frame {at} (got {}, want {}) exceeds tolerance",
         probs[at],
         reference_probs[at],
+    );
+}
+
+#[test]
+#[ignore = "host-local: needs OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO and OPENASR_FIRERED_STREAM_VAD_REFERENCE_NPY"]
+fn firered_stream_vad_matches_official_reference_on_aux_audio() {
+    let audio = match crate::testing::external_test_fixture_path(
+        "OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO",
+        "official FireRedVAD parity audio",
+    ) {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            return;
+        }
+    };
+    let reference = match crate::testing::external_test_fixture_path(
+        "OPENASR_FIRERED_STREAM_VAD_REFERENCE_NPY",
+        "official FireRedVAD probability reference",
+    ) {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            return;
+        }
+    };
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "FireRedVAD official parity",
+        "FireRedVAD official parity",
+    )
+    .expect("load official parity audio");
+    let reference_probs = read_reference_probabilities(&reference);
+    let model = FireRedStreamVadModel::embedded().expect("vendored FireRedVAD weights");
+    let probabilities = model.probabilities(&samples);
+    let (max_abs, worst_frame) = max_abs_diff_with_location(&probabilities, &reference_probs);
+    let mut absolute_errors = probabilities
+        .iter()
+        .zip(&reference_probs)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .collect::<Vec<_>>();
+    absolute_errors.sort_by(f32::total_cmp);
+    let mean_abs = absolute_errors
+        .iter()
+        .map(|value| f64::from(*value))
+        .sum::<f64>()
+        / absolute_errors.len().max(1) as f64;
+    let p99_abs = absolute_errors[(absolute_errors.len() - 1) * 99 / 100];
+    let threshold_disagreements = probabilities
+        .iter()
+        .zip(&reference_probs)
+        .filter(|(actual, expected)| (**actual >= 0.5) != (**expected >= 0.5))
+        .count();
+    let options = crate::LongFormOptions::default();
+    let native_spans = super::provider::spans_from_probs(&probabilities, samples.len(), &options);
+    let reference_spans =
+        super::provider::spans_from_probs(&reference_probs, samples.len(), &options);
+    eprintln!(
+        "FIRERED_VAD_OFFICIAL_PARITY frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={}",
+        probabilities.len(),
+        probabilities[worst_frame],
+        reference_probs[worst_frame],
+        native_spans.len(),
+    );
+    assert!(
+        // Torch/BLAS and Rust use different f32 reduction orders. The DFSMN
+        // has a fixed 152-frame receptive field, so this is a local numerical
+        // bound rather than a sequence-length-dependent drift allowance.
+        max_abs < 5e-3,
+        "official probability max abs {max_abs} at frame {worst_frame} exceeds tolerance"
+    );
+    assert!(
+        mean_abs < 1e-4,
+        "official probability mean abs {mean_abs} exceeds tolerance"
+    );
+    assert_eq!(
+        native_spans, reference_spans,
+        "official and native probabilities must produce identical product speech spans despite {threshold_disagreements} near-threshold frame(s)"
     );
 }
 
@@ -203,13 +317,13 @@ fn longform_provider_contract_preserves_typed_cancellation() {
     assert!(matches!(error, LongFormVadProviderError::Canceled));
 }
 
-/// Host-local RTF benchmark over a real 5-minute recording (not part of the
+/// Host-local endurance benchmark over a real >=15-minute recording (not part of the
 /// default gate; run explicitly with `--ignored` on a machine that has the
 /// fixture). Prints wall-clock forward-pass time and RTF (`elapsed / audio_s`)
 /// to stdout with `--nocapture`.
 #[test]
-#[ignore = "host-local: requires tmp/audio/clips/black_cat_poe_ty_5min.wav"]
-fn benchmark_forward_pass_rtf_on_real_5min_recording() {
+#[ignore = "host-local: requires OPENASR_FIRERED_STREAM_VAD_BENCH_AUDIO with >=15 minutes of 16 kHz mono audio"]
+fn firered_stream_vad_fifteen_minute_endurance() {
     let path = match crate::testing::external_test_fixture_path(
         "OPENASR_FIRERED_STREAM_VAD_BENCH_AUDIO",
         "Stream-VAD benchmark audio fixture",
@@ -225,8 +339,12 @@ fn benchmark_forward_pass_rtf_on_real_5min_recording() {
         "Stream-VAD RTF benchmark",
         "Stream-VAD RTF benchmark",
     )
-    .expect("load real 5-minute wav fixture");
+    .expect("load real endurance wav fixture");
     let audio_seconds = samples.len() as f64 / super::frontend::SAMPLE_RATE_HZ as f64;
+    assert!(
+        audio_seconds >= 15.0 * 60.0,
+        "endurance audio is only {audio_seconds:.3}s"
+    );
 
     let model = FireRedStreamVadModel::embedded().expect("vendored Stream-VAD weights");
     // Warm up (page-in, allocator warm) before timing.
@@ -243,8 +361,9 @@ fn benchmark_forward_pass_rtf_on_real_5min_recording() {
     let probability_sha256 = crate::testing::benchmark_sha256_f32(&probs);
     let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
     let rtf = median_seconds / audio_seconds;
+    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
     println!(
-        "AUX_MODEL_BENCH model=fireredvad backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+        "AUX_MODEL_ENDURANCE model=fireredvad backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
         probs.len(),
     );
     assert!(!probs.is_empty());

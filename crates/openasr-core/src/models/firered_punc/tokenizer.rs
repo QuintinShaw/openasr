@@ -16,7 +16,6 @@
 //! a unicode-normalisation dependency.
 
 const CLS_TOKEN: &str = "[CLS]";
-const SEP_TOKEN: &str = "[SEP]";
 const UNK_TOKEN: &str = "[UNK]";
 const PAD_TOKEN: &str = "[PAD]";
 const WORDPIECE_CONTINUATION: &str = "##";
@@ -51,7 +50,6 @@ pub(crate) struct FireRedPuncTokenizer {
     vocab: Vec<String>,
     token_to_id: std::collections::BTreeMap<String, u32>,
     cls_id: u32,
-    sep_id: u32,
     unk_id: u32,
     pad_id: u32,
 }
@@ -72,14 +70,12 @@ impl FireRedPuncTokenizer {
                 .ok_or(FireRedPuncTokenizerError::MissingSpecialToken(tok))
         };
         let cls_id = lookup(CLS_TOKEN)?;
-        let sep_id = lookup(SEP_TOKEN)?;
         let unk_id = lookup(UNK_TOKEN)?;
         let pad_id = lookup(PAD_TOKEN)?;
         Ok(Self {
             vocab,
             token_to_id,
             cls_id,
-            sep_id,
             unk_id,
             pad_id,
         })
@@ -112,17 +108,12 @@ impl FireRedPuncTokenizer {
         self.cls_id
     }
 
-    pub(crate) fn sep_id(&self) -> u32 {
-        self.sep_id
-    }
-
     pub(crate) fn pad_id(&self) -> u32 {
         self.pad_id
     }
 
     /// Tokenise `text` into content subwords with original-text char spans.
-    /// The result excludes `[CLS]`/`[SEP]`; call [`Self::window_input_ids`] to
-    /// wrap a slice of pieces into model input ids.
+    /// The result excludes the leading `[CLS]` added by the runtime.
     pub(crate) fn encode(&self, text: &str) -> Vec<WordPiecePiece> {
         let chars: Vec<char> = text.chars().collect();
         let mut pieces = Vec::new();
@@ -231,15 +222,6 @@ impl FireRedPuncTokenizer {
         }
         out.extend(sub_pieces);
     }
-
-    /// Wrap a window of content pieces into `[CLS] ... [SEP]` model input ids.
-    pub(crate) fn window_input_ids(&self, window: &[WordPiecePiece]) -> Vec<u32> {
-        let mut ids = Vec::with_capacity(window.len() + 2);
-        ids.push(self.cls_id);
-        ids.extend(window.iter().map(|piece| piece.token_id));
-        ids.push(self.sep_id);
-        ids
-    }
 }
 
 fn is_whitespace(c: char) -> bool {
@@ -335,11 +317,13 @@ mod tests {
     }
 
     #[test]
-    fn window_ids_wrap_with_cls_and_sep() {
-        let tok = test_tokenizer();
-        let pieces = tok.encode("你好");
-        let ids = tok.window_input_ids(&pieces);
-        assert_eq!(ids, vec![tok.cls_id(), 4, 5, tok.sep_id()]);
+    fn sep_is_not_required_by_the_upstream_runtime_contract() {
+        let vocab = ["[PAD]", "[UNK]", "[CLS]", "你"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tok = FireRedPuncTokenizer::new(vocab).expect("only CLS is injected by the model");
+        assert_eq!(tok.encode("你")[0].token_id, 3);
     }
 
     #[test]

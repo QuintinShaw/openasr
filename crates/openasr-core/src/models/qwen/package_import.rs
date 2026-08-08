@@ -150,6 +150,7 @@ pub fn convert_local_qwen_source_to_runtime_pack(
     let tensors = build_qwen_runtime_tensors(
         &safetensor_files,
         request.quantization,
+        qwen_tensor_role,
         metadata_fields.n_mels,
         metadata_fields.n_fft,
         metadata_fields.sample_rate_hz,
@@ -184,6 +185,7 @@ pub fn convert_local_qwen_source_to_runtime_pack(
 pub(super) fn build_qwen_runtime_tensors(
     safetensor_files: &[SafetensorsFile],
     quantization: Qwen3AsrRuntimeQuantizationMode,
+    tensor_role: fn(&str) -> TensorRole,
     n_mels: usize,
     n_fft: usize,
     sample_rate_hz: u32,
@@ -230,7 +232,7 @@ pub(super) fn build_qwen_runtime_tensors(
             };
             let force_f32 = is_qwen_f32_tensor(&mapped_name, target_dims.len());
             let qtype = quantized_tensor_type_for_qwen(
-                qwen_tensor_role(&mapped_name),
+                tensor_role(&mapped_name),
                 &effective_dims,
                 force_f32,
                 quantization,

@@ -215,11 +215,11 @@ impl PunctuationClassifier for FireRedPuncRuntime {
         if content_token_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Wrap the content window in [CLS] ... [SEP] for the encoder.
-        let mut ids = Vec::with_capacity(content_token_ids.len() + 2);
-        ids.push(self.tokenizer.cls_id());
-        ids.extend_from_slice(content_token_ids);
-        ids.push(self.tokenizer.sep_id());
+        // The upstream FireRedPunc `add_cls()` contract prepends one [CLS]
+        // token and does not append [SEP]. An extra bidirectional-attention
+        // token changes the content logits, even though its own prediction is
+        // discarded.
+        let ids = model_input_ids(self.tokenizer.cls_id(), content_token_ids);
 
         let logits = self
             .graph
@@ -228,15 +228,26 @@ impl PunctuationClassifier for FireRedPuncRuntime {
             .map_err(|error| PunctuationError::Classifier(error.to_string()))?;
         let per_position =
             argmax_labels_per_position(&logits, self.metadata.label_count, ids.len());
-        // Drop the [CLS] (index 0) and [SEP] (last) predictions; return the
-        // labels aligned to the content tokens.
+        // Drop the [CLS] prediction and return labels aligned to content.
         Ok(per_position[1..=content_token_ids.len()].to_vec())
     }
+}
+
+fn model_input_ids(cls_id: u32, content_token_ids: &[u32]) -> Vec<u32> {
+    let mut ids = Vec::with_capacity(content_token_ids.len() + 1);
+    ids.push(cls_id);
+    ids.extend_from_slice(content_token_ids);
+    ids
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_input_matches_upstream_cls_only_contract() {
+        assert_eq!(model_input_ids(101, &[7, 8]), vec![101, 7, 8]);
+    }
 
     #[test]
     fn han_gate_rejects_segments_without_han_ideographs() {
@@ -327,8 +338,9 @@ mod tests {
             .collect::<Vec<_>>();
         let output_sha256 = crate::testing::benchmark_sha256_bytes([output.as_bytes()]);
         let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_BENCH model=fireredpunc backend={backend:?} chars={} median_seconds={median_seconds:.6} output_sha256={output_sha256} runs={seconds:?}",
+            "AUX_MODEL_BENCH model=fireredpunc backend={backend:?} chars={} median_seconds={median_seconds:.6} peak_rss_bytes={peak_rss_bytes} output_sha256={output_sha256} runs={seconds:?}",
             text.chars().count(),
         );
     }
@@ -372,9 +384,15 @@ mod tests {
                 .iter()
                 .map(|value| value.as_u64().expect("label is u64") as usize)
                 .collect();
-            let engine_labels = runtime
-                .predict_window_labels(&content_ids)
-                .expect("engine predict");
+            let budget = runtime.metadata.max_positions.saturating_sub(1).max(1);
+            let engine_labels = content_ids
+                .chunks(budget)
+                .flat_map(|window| {
+                    runtime
+                        .predict_window_labels(window)
+                        .expect("engine predict")
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
                 engine_labels,
                 ref_labels,

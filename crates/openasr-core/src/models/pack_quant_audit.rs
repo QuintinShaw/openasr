@@ -1,13 +1,13 @@
 //! Quantization-strategy self-check for `.oasr` packs: replay the current
 //! tensor-quantization policy against a pack's own tensor index and fail
-//! closed when an audio-encoder tensor sits below the Q8_0 safety floor (or
-//! any tensor exceeds the tier the pack claims).
+//! closed when a precision-sensitive tensor sits below the Q8_0 safety floor
+//! (or any tensor exceeds the tier the pack claims).
 //!
-//! This is the structural lesson of the q4_k over-quantization incident:
-//! sub-Q8 block quantization of the acoustic encoder is a behavioral cliff
-//! (long-audio greedy decode collapses into repetition or empty output), and
-//! nothing in a pack used to answer "was this built under the policy that
-//! floors the encoder at Q8_0?". The audit works on the GGUF header alone --
+//! This is the structural lesson of the q4_k over-quantization incidents:
+//! some semantic tensor roles have behavioral cliffs below Q8_0 (for example
+//! acoustic encoders and forced-alignment boundary projections), and nothing
+//! in a pack used to answer "was this built under the role policy that carries
+//! that floor?". The audit works on the GGUF header alone --
 //! metadata + tensor names/dims/types, all in a file's first few megabytes --
 //! so it also runs against published, remotely-hosted, read-only packs via an
 //! HTTP `Range` prefix fetch, with no source weights and no inference.
@@ -144,10 +144,10 @@ fn wire_types_equivalent_to(tensor_type: GgufWriteTensorType) -> &'static [u32] 
     }
 }
 
-/// True when the type satisfies the audio-encoder Q8_0 floor. Anything below
+/// True when the type satisfies the shared Q8_0 floor. Anything below
 /// -- the Q2..Q6 and IQ* rungs -- is the behavioral cliff the floor exists to
 /// prevent.
-pub fn meets_encoder_q8_floor(ggml_type: u32) -> bool {
+pub fn meets_q8_floor(ggml_type: u32) -> bool {
     wire_types_equivalent_to(GgufWriteTensorType::Q8_0).contains(&ggml_type)
 }
 
@@ -156,11 +156,6 @@ pub fn meets_encoder_q8_floor(ggml_type: u32) -> bool {
 /// the Q8_0 alignment rung) and 256-aligned (unlocks a tier's own K-quant
 /// rung, for `Decoder`).
 const REPRESENTATIVE_NE0_VALUES: [u64; 2] = [32, 256];
-const QUANT_ROLES: [TensorRole; 2] = [
-    TensorRole::AcousticEncoderMatrix,
-    TensorRole::TextDecoderMatrix,
-];
-
 /// The block-quant rungs a declared pack tier may contain, DERIVED from
 /// [`crate::models::pack_quant::classify_quant_tensor_role`] -- the same policy
 /// hand-copied per-tier table. `classify_quant_tensor_role` returns `None` for
@@ -169,7 +164,7 @@ const QUANT_ROLES: [TensorRole; 2] = [
 /// allowed) with no special-casing needed here.
 fn declared_tier_allows(declared: PackQuant, ggml_type: u32) -> bool {
     REPRESENTATIVE_NE0_VALUES.iter().any(|&ne0| {
-        QUANT_ROLES.iter().any(|&role| {
+        TensorRole::QUANTIZABLE.iter().any(|&role| {
             classify_quant_tensor_role(&[ne0], declared, role, QuantizedAxis::First).is_some_and(
                 |tensor_type| wire_types_equivalent_to(tensor_type).contains(&ggml_type),
             )
@@ -177,12 +172,12 @@ fn declared_tier_allows(declared: PackQuant, ggml_type: u32) -> bool {
     })
 }
 
-// --- per-architecture audio-encoder tensor rules ---------------------------
+// --- per-architecture tensor-role contracts -------------------------------
 
 /// Returns the required quantization classification from the architecture's
 /// sole registry row. Unknown is not equivalent to `NotApplicable`: callers
 /// fail closed when an unregistered architecture contains block quants.
-pub(crate) fn audio_encoder_tensors_for_architecture(
+pub(crate) fn quantization_contract_for_architecture(
     architecture: &str,
 ) -> Option<TensorQuantizationContract> {
     if let Some(descriptor) = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
@@ -197,9 +192,9 @@ pub(crate) fn audio_encoder_tensors_for_architecture(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantFloorViolationKind {
-    /// An audio-encoder tensor is block-quantized below Q8_0: the behavioral
-    /// cliff the shared floor exists to prevent.
-    EncoderBelowQ8Floor,
+    /// A precision-sensitive tensor is block-quantized below Q8_0: the
+    /// behavioral cliff the shared floor exists to prevent.
+    BelowQ8Floor,
     /// A tensor's block quant exceeds the rung the pack's declared tier can
     /// produce (the pack is mislabeled, or was built outside its tier).
     ExceedsDeclaredTier,
@@ -224,8 +219,8 @@ pub struct QuantFloorReport {
     pub tensor_count: u64,
     /// Block-quantized tensors in the pack.
     pub block_quant_tensors: usize,
-    /// Block-quantized tensors classified as audio encoder.
-    pub encoder_block_quant_tensors: usize,
+    /// Block-quantized tensors whose semantic role carries the Q8_0 floor.
+    pub q8_floor_block_quant_tensors: usize,
     pub violations: Vec<QuantFloorViolation>,
 }
 
@@ -248,7 +243,7 @@ pub enum QuantFloorAuditError {
     #[error("could not fetch pack header from '{url}': {reason}")]
     RemoteFetch { url: String, reason: String },
     #[error(
-        "cannot verify the audio-encoder quant floor: architecture '{architecture}' has no encoder tensor rule but the pack contains {block_quant_tensors} block-quantized tensor(s); add a rule to pack_quant_audit before shipping"
+        "cannot verify the quantization floor: architecture '{architecture}' has no tensor-role contract but the pack contains {block_quant_tensors} block-quantized tensor(s); add a contract to the architecture inventory before shipping"
     )]
     UnrecognizedArchitecture {
         architecture: String,
@@ -264,19 +259,20 @@ fn pack_architecture(view: &GgufHeaderView) -> Option<String> {
         .map(str::to_string)
 }
 
-fn is_encoder_tensor(rule: TensorQuantizationContract, name: &str) -> bool {
-    rule.tensor_role(name) == Some(TensorRole::AcousticEncoderMatrix)
+fn is_q8_floor_tensor(rule: TensorQuantizationContract, name: &str) -> bool {
+    rule.tensor_role(name)
+        .is_some_and(TensorRole::requires_q8_floor)
 }
 
 /// Replay the current quantization policy against a parsed pack header.
 ///
 /// Two independent invariants, both fail-closed:
-/// 1. FLOOR -- no audio-encoder tensor may be a sub-Q8 block quant, for ANY
-///    tier (the floor applies at every rung; see `classify_quant_tensor`).
+/// 1. FLOOR -- no tensor role carrying the Q8_0 floor may use a sub-Q8 block
+///    quant, for ANY tier.
 /// 2. CEILING -- when `declared` names the tier the pack claims, no tensor
 ///    may carry a block quant that tier cannot produce.
 ///
-/// A pack whose architecture has no encoder rule passes only if it contains
+/// A pack whose architecture has no tensor-role contract passes only if it contains
 /// no block-quant tensors at all; otherwise verification is impossible and
 /// the audit errors out rather than silently waving it through.
 pub fn audit_quant_floor(
@@ -286,7 +282,7 @@ pub fn audit_quant_floor(
     let architecture = pack_architecture(view);
     let rule = architecture
         .as_deref()
-        .and_then(audio_encoder_tensors_for_architecture);
+        .and_then(quantization_contract_for_architecture);
 
     let mut report = QuantFloorReport {
         build_commit: view
@@ -305,20 +301,20 @@ pub fn audit_quant_floor(
         }
         report.block_quant_tensors += 1;
 
-        let encoder = match rule {
-            Some(rule) => is_encoder_tensor(rule, &tensor.name),
+        let q8_floor = match rule {
+            Some(rule) => is_q8_floor_tensor(rule, &tensor.name),
             None => false,
         };
-        if encoder {
-            report.encoder_block_quant_tensors += 1;
+        if q8_floor {
+            report.q8_floor_block_quant_tensors += 1;
         }
 
-        if encoder && !meets_encoder_q8_floor(tensor.ggml_type) {
+        if q8_floor && !meets_q8_floor(tensor.ggml_type) {
             report.violations.push(QuantFloorViolation {
                 tensor: tensor.name.clone(),
                 dims: tensor.dims.clone(),
                 ggml_type: tensor.ggml_type,
-                kind: QuantFloorViolationKind::EncoderBelowQ8Floor,
+                kind: QuantFloorViolationKind::BelowQ8Floor,
             });
         }
         if let Some(declared) = declared
@@ -490,9 +486,9 @@ mod tests {
     use super::{
         GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, QuantFloorAuditError,
-        QuantFloorViolationKind, audio_encoder_tensors_for_architecture, audit_quant_floor,
-        declared_tier_allows, ggml_type_name, is_block_quant_type, is_encoder_tensor,
-        meets_encoder_q8_floor,
+        QuantFloorViolationKind, audit_quant_floor, declared_tier_allows, ggml_type_name,
+        is_block_quant_type, is_q8_floor_tensor, meets_q8_floor,
+        quantization_contract_for_architecture,
     };
     use crate::ggml_runtime::gguf_header::{GgufHeaderTensor, GgufHeaderView};
     use crate::models::pack_quant::{PackQuant, TensorQuantizationContract};
@@ -536,9 +532,9 @@ mod tests {
         assert!(is_block_quant_type(GGML_TYPE_Q4_K));
         // Unknown ids fail closed as block quants.
         assert!(is_block_quant_type(999));
-        assert!(meets_encoder_q8_floor(GGML_TYPE_Q8_0));
-        assert!(!meets_encoder_q8_floor(GGML_TYPE_Q6_K));
-        assert!(!meets_encoder_q8_floor(GGML_TYPE_F16));
+        assert!(meets_q8_floor(GGML_TYPE_Q8_0));
+        assert!(!meets_q8_floor(GGML_TYPE_Q6_K));
+        assert!(!meets_q8_floor(GGML_TYPE_F16));
         assert_eq!(ggml_type_name(GGML_TYPE_Q4_K), "q4_k");
         assert_eq!(ggml_type_name(999), "ggml-type-999");
     }
@@ -592,7 +588,7 @@ mod tests {
     }
 
     /// Assert every architecture in `architectures` has a quant-floor
-    /// encoder rule, panicking with the offending id otherwise. Factored out
+    /// tensor-role contract, panicking with the offending id otherwise. Factored out
     /// so `coverage_check_fails_closed_on_an_unruled_architecture` can prove
     /// this mechanism is not vacuous without needing to register a throwaway
     /// architecture in the real builtin/aux registries.
@@ -601,9 +597,9 @@ mod tests {
     ) {
         for architecture in architectures {
             assert!(
-                audio_encoder_tensors_for_architecture(architecture).is_some(),
-                "architecture '{architecture}' has no quant-floor encoder rule; add one to \
-                 pack_quant_audit::audio_encoder_tensors_for_architecture before shipping"
+                quantization_contract_for_architecture(architecture).is_some(),
+                "architecture '{architecture}' has no quantization contract; add one to \
+                 its architecture descriptor before shipping"
             );
         }
     }
@@ -631,18 +627,18 @@ mod tests {
         );
 
         let qwen_rule =
-            audio_encoder_tensors_for_architecture(QWEN_ARCH).expect("qwen semantic quant rule");
+            quantization_contract_for_architecture(QWEN_ARCH).expect("qwen semantic quant rule");
         assert!(matches!(
             qwen_rule,
             TensorQuantizationContract::SemanticRolesV1 { .. }
         ));
-        assert!(is_encoder_tensor(qwen_rule, "audio.blk.0.attn_q.weight"));
-        assert!(!is_encoder_tensor(qwen_rule, "blk.0.attn_q.weight"));
-        assert!(audio_encoder_tensors_for_architecture("not-a-family").is_none());
+        assert!(is_q8_floor_tensor(qwen_rule, "audio.blk.0.attn_q.weight"));
+        assert!(!is_q8_floor_tensor(qwen_rule, "blk.0.attn_q.weight"));
+        assert!(quantization_contract_for_architecture("not-a-family").is_none());
     }
 
     /// Proves `assert_every_architecture_has_an_encoder_rule` is not vacuous:
-    /// an architecture id with no entry in `audio_encoder_tensors_for_architecture`
+    /// an architecture id with no inventory tensor-role contract
     /// makes the check panic. This is the permanent stand-in for "add a new
     /// builtin family without filling in its quant-floor rule" -- adding a
     /// throwaway descriptor to the real `BUILTIN_ARCHITECTURE_DESCRIPTORS` /
@@ -651,7 +647,7 @@ mod tests {
     /// decode policy, tensor contract, ...), so this test isolates just the
     /// mechanism this change adds.
     #[test]
-    #[should_panic(expected = "has no quant-floor encoder rule")]
+    #[should_panic(expected = "has no quantization contract")]
     fn coverage_check_fails_closed_on_an_unruled_architecture() {
         assert_every_architecture_has_an_encoder_rule(
             ["definitely-not-a-real-architecture-id"].into_iter(),
@@ -670,12 +666,33 @@ mod tests {
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         assert_eq!(report.block_quant_tensors, 3);
-        assert_eq!(report.encoder_block_quant_tensors, 1);
+        assert_eq!(report.q8_floor_block_quant_tensors, 1);
         assert_eq!(report.violations.len(), 1);
         assert_eq!(report.violations[0].tensor, "audio.blk.0.attn_q.weight");
         assert_eq!(
             report.violations[0].kind,
-            QuantFloorViolationKind::EncoderBelowQ8Floor
+            QuantFloorViolationKind::BelowQ8Floor
+        );
+    }
+
+    #[test]
+    fn forced_aligner_boundary_matrix_below_q8_fails_the_same_floor() {
+        let view = view_with(
+            Some(crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID),
+            vec![
+                tensor("output.weight", GGML_TYPE_Q4_K),
+                tensor("token_embd.weight", GGML_TYPE_Q8_0),
+                tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert_eq!(report.block_quant_tensors, 3);
+        assert_eq!(report.q8_floor_block_quant_tensors, 2);
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(report.violations[0].tensor, "output.weight");
+        assert_eq!(
+            report.violations[0].kind,
+            QuantFloorViolationKind::BelowQ8Floor
         );
     }
 
@@ -693,13 +710,13 @@ mod tests {
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         assert!(report.passed(), "violations: {:?}", report.violations);
-        assert_eq!(report.encoder_block_quant_tensors, 2);
+        assert_eq!(report.q8_floor_block_quant_tensors, 2);
     }
 
     #[test]
     fn declared_tier_ceiling_catches_mislabeled_packs() {
         // Claims q8_0 but carries a Q4_K decoder tensor: impossible under the
-        // q8_0 tier (a ceiling violation, distinct from the encoder floor).
+        // q8_0 tier (a ceiling violation, distinct from the semantic floor).
         let view = view_with(
             Some(QWEN_ARCH),
             vec![
@@ -723,7 +740,7 @@ mod tests {
             vec![tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K)],
         );
         let error = audit_quant_floor(&view, Some(PackQuant::Q4_K))
-            .expect_err("must fail closed without an encoder rule");
+            .expect_err("must fail closed without a tensor-role contract");
         assert!(matches!(
             error,
             QuantFloorAuditError::UnrecognizedArchitecture { .. }
@@ -749,7 +766,7 @@ mod tests {
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         assert!(report.passed());
-        assert_eq!(report.encoder_block_quant_tensors, 0);
+        assert_eq!(report.q8_floor_block_quant_tensors, 0);
     }
 
     #[test]
@@ -766,7 +783,7 @@ mod tests {
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         // The pool tensor is still acoustic path: a sub-Q8 rung anywhere in
-        // this pack violates BOTH the encoder floor and the declared q4_k
+        // this pack violates BOTH the semantic floor and the declared q4_k
         // ceiling (Q6_K is outside its rung set), so it counts twice.
         assert_eq!(report.violations.len(), 2);
         assert!(
@@ -776,7 +793,7 @@ mod tests {
                 .all(|violation| violation.tensor == "resnet.pool.weight")
         );
         let kinds: Vec<_> = report.violations.iter().map(|v| v.kind).collect();
-        assert!(kinds.contains(&QuantFloorViolationKind::EncoderBelowQ8Floor));
+        assert!(kinds.contains(&QuantFloorViolationKind::BelowQ8Floor));
         assert!(kinds.contains(&QuantFloorViolationKind::ExceedsDeclaredTier));
     }
 
@@ -802,11 +819,11 @@ mod tests {
         assert_eq!(report.block_quant_tensors, 4);
         // Only the two encoder/adapter tensors are floor-relevant; the two
         // `llm.*` Q4_K tensors must not be counted as encoder.
-        assert_eq!(report.encoder_block_quant_tensors, 2);
+        assert_eq!(report.q8_floor_block_quant_tensors, 2);
     }
 
     /// A regression pin for the specific bug: an `EntirePack`-style rule
-    /// would flag this `llm.*` Q4_K tensor as `EncoderBelowQ8Floor`.
+    /// would flag this `llm.*` Q4_K tensor as `BelowQ8Floor`.
     #[test]
     fn firered_llm_llm_prefix_is_never_classified_as_encoder() {
         let view = view_with(
@@ -815,7 +832,7 @@ mod tests {
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         assert!(report.passed(), "violations: {:?}", report.violations);
-        assert_eq!(report.encoder_block_quant_tensors, 0);
+        assert_eq!(report.q8_floor_block_quant_tensors, 0);
     }
 
     #[test]

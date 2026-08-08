@@ -230,6 +230,16 @@ pub struct ProgressPlan {
     duration_known: bool,
 }
 
+fn forced_align_rtf(backend: ProgressBackendClass) -> f64 {
+    match backend {
+        ProgressBackendClass::Accelerated => 0.055,
+        // The Q8_0 quality-safe profile measured 0.141 median RTF and 0.146
+        // over sixteen consecutive segments on the production private-audio
+        // gate. Keep a small conservative margin for the final NAR graph.
+        ProgressBackendClass::AutoOrCpu => 0.15,
+    }
+}
+
 impl ProgressPlan {
     pub fn stages(&self) -> &[PlannedStage] {
         &self.stages
@@ -278,22 +288,25 @@ impl ProgressPlan {
         });
 
         if input.external_diarize {
-            // Prefer the resolved segmenter weight. `Auto` is only a provisional
-            // stand-in until prepare pins DiariZen vs Segmentation3_0.
+            // This stage includes the selected activity model, vendored VAD,
+            // ReDimNet embedding windows, and clustering. Earlier weights only
+            // priced the segmenter and made the bar reach 100% before the
+            // embedding loop. These production-geometry profiles price the
+            // complete stage; per-window callbacks provide the live fraction.
+            // `Auto` remains a provisional stand-in until prepare pins a
+            // provider.
             let rtf = match input.segmenter {
                 ProgressSegmenterKind::DiariZen => {
                     if accelerated {
-                        0.18
+                        0.89
                     } else {
-                        0.35
+                        1.31
                     }
                 }
                 ProgressSegmenterKind::Segmentation3_0 | ProgressSegmenterKind::Auto => {
-                    if accelerated {
-                        0.10
-                    } else {
-                        0.20
-                    }
+                    // Segmentation3 and ReDimNet are fixed-CPU stages even if
+                    // the primary ASR request later resolves an accelerator.
+                    0.66
                 }
             };
             stages.push(PlannedStage {
@@ -332,15 +345,14 @@ impl ProgressPlan {
         if input.punctuate {
             stages.push(PlannedStage {
                 stage: TranscriptionStage::Punctuate,
-                estimated_cost: 0.05 + duration * 0.01,
+                estimated_cost: 0.05 + duration * 0.001,
             });
         }
 
         if input.align {
-            let align_rtf = if accelerated { 0.10 } else { 0.20 };
             stages.push(PlannedStage {
                 stage: TranscriptionStage::Align,
-                estimated_cost: 0.20 + duration * align_rtf,
+                estimated_cost: 0.20 + duration * forced_align_rtf(input.backend),
             });
         }
 
@@ -384,14 +396,12 @@ impl ProgressPlan {
     pub fn post_hoc_align(audio_duration_s: f32, backend: ProgressBackendClass) -> Self {
         let input = ProgressPlanInput::post_hoc_align(audio_duration_s, backend);
         let duration = input.audio_duration_s.max(0.0) as f64;
-        let accelerated = matches!(backend, ProgressBackendClass::Accelerated);
-        let align_rtf = if accelerated { 0.10 } else { 0.20 };
         let duration_known = audio_duration_s.is_finite() && audio_duration_s > 0.0;
         Self {
             stages: vec![
                 PlannedStage {
                     stage: TranscriptionStage::Align,
-                    estimated_cost: (0.20 + duration * align_rtf).max(1e-6),
+                    estimated_cost: (0.20 + duration * forced_align_rtf(backend)).max(1e-6),
                 },
                 PlannedStage {
                     stage: TranscriptionStage::Project,
@@ -1126,6 +1136,114 @@ mod tests {
             accel.cost_of(TranscriptionStage::Decode).unwrap()
                 < cpu.cost_of(TranscriptionStage::Decode).unwrap()
         );
+    }
+
+    #[test]
+    fn measured_auxiliary_stage_costs_preserve_backend_and_provider_ordering() {
+        let build = |segmenter, backend| {
+            ProgressPlan::build(ProgressPlanInput {
+                audio_duration_s: 100.0,
+                voice_id: true,
+                external_diarize: true,
+                segmenter,
+                punctuate: true,
+                align: true,
+                backend,
+                persist: false,
+            })
+        };
+        let seg3_cpu = build(
+            ProgressSegmenterKind::Segmentation3_0,
+            ProgressBackendClass::AutoOrCpu,
+        );
+        let seg3_accel = build(
+            ProgressSegmenterKind::Segmentation3_0,
+            ProgressBackendClass::Accelerated,
+        );
+        let diarizen_cpu = build(
+            ProgressSegmenterKind::DiariZen,
+            ProgressBackendClass::AutoOrCpu,
+        );
+        let diarizen_accel = build(
+            ProgressSegmenterKind::DiariZen,
+            ProgressBackendClass::Accelerated,
+        );
+
+        assert_eq!(
+            seg3_cpu.cost_of(TranscriptionStage::Diarize),
+            seg3_accel.cost_of(TranscriptionStage::Diarize),
+            "Segmentation3 and ReDimNet remain fixed-CPU work"
+        );
+        assert!(
+            diarizen_accel.cost_of(TranscriptionStage::Diarize)
+                < diarizen_cpu.cost_of(TranscriptionStage::Diarize)
+        );
+        assert!(
+            diarizen_accel.cost_of(TranscriptionStage::Diarize)
+                > seg3_accel.cost_of(TranscriptionStage::Diarize)
+        );
+        assert!(
+            seg3_accel.cost_of(TranscriptionStage::Align)
+                < seg3_cpu.cost_of(TranscriptionStage::Align)
+        );
+        assert_eq!(
+            seg3_accel.cost_of(TranscriptionStage::Punctuate),
+            seg3_cpu.cost_of(TranscriptionStage::Punctuate),
+            "the measured punctuation cost is backend-independent at plan time"
+        );
+        let close = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() <= 1e-9,
+                "expected {expected}, got {actual}"
+            );
+        };
+        close(
+            seg3_cpu
+                .cost_of(TranscriptionStage::Diarize)
+                .expect("diarize stage"),
+            66.15,
+        );
+        close(
+            diarizen_cpu
+                .cost_of(TranscriptionStage::Diarize)
+                .expect("diarize stage"),
+            131.15,
+        );
+        close(
+            diarizen_accel
+                .cost_of(TranscriptionStage::Diarize)
+                .expect("diarize stage"),
+            89.15,
+        );
+        close(
+            seg3_cpu
+                .cost_of(TranscriptionStage::Punctuate)
+                .expect("punctuate stage"),
+            0.15,
+        );
+        close(
+            seg3_cpu
+                .cost_of(TranscriptionStage::Align)
+                .expect("align stage"),
+            15.20,
+        );
+        close(
+            seg3_accel
+                .cost_of(TranscriptionStage::Align)
+                .expect("align stage"),
+            5.70,
+        );
+        for (backend, full) in [
+            (ProgressBackendClass::AutoOrCpu, &seg3_cpu),
+            (ProgressBackendClass::Accelerated, &seg3_accel),
+        ] {
+            let post_hoc = ProgressPlan::post_hoc_align(100.0, backend);
+            assert_eq!(
+                post_hoc.cost_of(TranscriptionStage::Align),
+                full.cost_of(TranscriptionStage::Align),
+                "post-hoc and in-pipeline forced alignment must share one calibration"
+            );
+        }
     }
 
     #[test]

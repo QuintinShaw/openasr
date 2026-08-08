@@ -380,7 +380,7 @@ pub fn convert_local_firered_punc_source_to_runtime_pack(
             tokens.len()
         )));
     }
-    for special in ["[PAD]", "[UNK]", "[CLS]", "[SEP]"] {
+    for special in ["[PAD]", "[UNK]", "[CLS]"] {
         if !tokens.iter().any(|token| token == special) {
             return Err(validate_error(format!(
                 "FireRedPunc vocab.txt is missing required special token '{special}'"

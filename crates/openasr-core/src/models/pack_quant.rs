@@ -53,6 +53,10 @@ pub(crate) enum TensorRole {
     TextDecoderMatrix,
     EmbeddingTable,
     OutputProjection,
+    /// A model-specific boundary matrix whose downstream decisions are
+    /// unusually sensitive to K-quant perturbations. It carries the same Q8_0
+    /// floor as the acoustic encoder without being misclassified as acoustic.
+    PrecisionCriticalBoundaryMatrix,
     NonQuantizable,
 }
 
@@ -143,25 +147,45 @@ impl TensorQuantizationContract {
 }
 
 impl TensorRole {
-    fn carries_acoustic_q8_floor(self) -> Option<bool> {
-        match self {
-            Self::AcousticEncoderMatrix => Some(true),
-            Self::TextDecoderMatrix | Self::EmbeddingTable | Self::OutputProjection => Some(false),
-            Self::NonQuantizable => None,
-        }
+    /// Every quantizable semantic role. Consumers which derive the set of
+    /// producible storage rungs use this inventory instead of maintaining a
+    /// second, incomplete role table.
+    pub(crate) const QUANTIZABLE: [Self; 5] = [
+        Self::AcousticEncoderMatrix,
+        Self::TextDecoderMatrix,
+        Self::EmbeddingTable,
+        Self::OutputProjection,
+        Self::PrecisionCriticalBoundaryMatrix,
+    ];
+
+    /// Whether this semantic role carries the shared Q8_0 safety floor.
+    /// Writer classification, post-build audit, and requantization all consume
+    /// this projection; family-specific consumers must not recreate it.
+    pub(crate) const fn requires_q8_floor(self) -> bool {
+        matches!(
+            self,
+            Self::AcousticEncoderMatrix | Self::PrecisionCriticalBoundaryMatrix
+        )
+    }
+
+    const fn is_quantizable(self) -> bool {
+        !matches!(self, Self::NonQuantizable)
     }
 }
 
 /// Semantic quantization entry point. The family maps a source tensor to a
 /// [`TensorRole`] and storage orientation once; this shared policy applies the
-/// alignment and acoustic Q8 floor without inspecting a tensor name.
+/// alignment and any semantic Q8 floor without inspecting a tensor name.
 pub(crate) fn classify_quant_tensor_role(
     dims: &[u64],
     quantization: PackQuant,
     role: TensorRole,
     axis: QuantizedAxis,
 ) -> Option<GgufWriteTensorType> {
-    let carries_acoustic_q8_floor = role.carries_acoustic_q8_floor()?;
+    if !role.is_quantizable() {
+        return None;
+    }
+    let requires_q8_floor = role.requires_q8_floor();
     let ne0 = match axis {
         QuantizedAxis::First => dims.first(),
         QuantizedAxis::Last => dims.last(),
@@ -178,7 +202,7 @@ pub(crate) fn classify_quant_tensor_role(
     if !ne0.is_multiple_of(32_u64) {
         return None;
     }
-    if ne0.is_multiple_of(256_u64) && !carries_acoustic_q8_floor {
+    if ne0.is_multiple_of(256_u64) && !requires_q8_floor {
         if quantization == PackQuant::Q3_K {
             return Some(GgufWriteTensorType::Q3_K);
         }
@@ -361,6 +385,29 @@ mod tests {
                 QuantizedAxis::First
             ),
             Some(GgufWriteTensorType::Q8_0)
+        );
+    }
+
+    #[test]
+    fn precision_critical_boundaries_share_the_q8_floor_policy() {
+        assert!(TensorRole::PrecisionCriticalBoundaryMatrix.requires_q8_floor());
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[256, 5_000],
+                PackQuant::Q4_K,
+                TensorRole::PrecisionCriticalBoundaryMatrix,
+                QuantizedAxis::First,
+            ),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        assert_eq!(
+            classify_quant_tensor_role(
+                &[256, 256],
+                PackQuant::Q4_K,
+                TensorRole::TextDecoderMatrix,
+                QuantizedAxis::First,
+            ),
+            Some(GgufWriteTensorType::Q4_K)
         );
     }
 

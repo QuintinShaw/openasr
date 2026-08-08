@@ -132,7 +132,7 @@ const FRAME_SAMPLES: usize = (SAMPLE_RATE_HZ as u64 * FRAME_SHIFT_MS as u64 / 10
 
 /// Convert per-frame speech probabilities into sample-space speech spans with
 /// threshold gating plus min-speech / min-silence hysteresis.
-fn spans_from_probs(
+pub(super) fn spans_from_probs(
     probs: &[f32],
     total_samples: usize,
     options: &LongFormOptions,

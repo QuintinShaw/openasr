@@ -1202,6 +1202,7 @@ fn run_native_transcription_fallible_with_input(
         punctuate,
         execution_services,
         &request_execution_intent,
+        execution_context.as_ref(),
         &progress,
     )?;
     let native_validation =
@@ -1245,6 +1246,7 @@ fn run_native_transcription_fallible_with_input(
             language_hint.as_deref(),
             execution_services,
             &request_execution_intent,
+            execution_context.as_ref(),
             Some(&progress),
         )?;
         timeline_quality = crate::subtitle::TimelineQuality::ForcedAligned;
@@ -1327,8 +1329,12 @@ fn apply_punctuation_stage_with_policy(
     punctuate: bool,
     execution_services: &NativeExecutionServices,
     request_intent: &ExecutionIntent,
+    execution_context: &crate::RequestExecutionContext,
     progress: &ProgressReporter,
 ) -> Result<Transcription, BackendError> {
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     if !should_run_punctuation_stage(punctuate, emits_punctuation) {
         return Ok(transcription);
     }
@@ -1366,19 +1372,27 @@ fn apply_punctuation_stage_with_policy(
             // allocator/device failures are still recorded by the graph
             // boundary; the stage policy sees that typed side channel and
             // retries instead of silently accepting the no-op.
-            let Ok(runtime) = load_actor(
+            let runtime = match load_actor(
                 execution_services,
                 prepared_preflight,
                 &prepared_content_id,
                 candidate,
-            ) else {
-                return Ok(transcription.clone());
+            ) {
+                Ok(runtime) => runtime,
+                Err(error)
+                    if execution_context.is_canceled()
+                        || is_cooperative_cancel_reason(&error.to_string()) =>
+                {
+                    return Err(BackendError::TranscriptionCanceled);
+                }
+                Err(_) => return Ok(transcription.clone()),
             };
-            Ok(punctuate_transcription_segments_with_actor(
+            punctuate_transcription_segments_with_actor(
                 transcription.clone(),
                 &runtime,
+                execution_context,
                 progress,
-            ))
+            )
         },
     );
     let out = finish_optional_punctuation_stage(transcription, result)?;
@@ -1413,11 +1427,13 @@ fn finish_optional_punctuation_stage(
 fn optional_punctuation_failure_disables_stage(
     error: &PolicyResolvedAuxRuntimeError<BackendError>,
 ) -> bool {
-    matches!(
-        error,
+    match error {
+        PolicyResolvedAuxRuntimeError::Operation(BackendError::TranscriptionCanceled) => false,
         PolicyResolvedAuxRuntimeError::Operation(_)
-            | PolicyResolvedAuxRuntimeError::CandidatesExhausted { .. }
-    )
+        | PolicyResolvedAuxRuntimeError::CandidatesExhausted { .. } => true,
+        PolicyResolvedAuxRuntimeError::CandidateFailed { .. }
+        | PolicyResolvedAuxRuntimeError::EmptyPlan { .. } => false,
+    }
 }
 
 /// Restores punctuation on each finalized segment's text independently (the
@@ -1451,12 +1467,26 @@ fn punctuate_transcription_segments(
 fn punctuate_transcription_segments_with_actor(
     mut transcription: Transcription,
     runtime: &FireRedPuncActor,
+    execution_context: &crate::RequestExecutionContext,
     progress: &ProgressReporter,
-) -> Transcription {
+) -> Result<Transcription, BackendError> {
     let total = transcription.segments.len() as u64;
     for (index, segment) in transcription.segments.iter_mut().enumerate() {
-        if let Ok(punctuated) = punctuate(runtime, &segment.text) {
-            segment.text = punctuated;
+        if execution_context.is_canceled() {
+            return Err(BackendError::TranscriptionCanceled);
+        }
+        match punctuate(runtime, &segment.text) {
+            Ok(punctuated) => segment.text = punctuated,
+            Err(error)
+                if execution_context.is_canceled()
+                    || is_cooperative_cancel_reason(&error.to_string()) =>
+            {
+                return Err(BackendError::TranscriptionCanceled);
+            }
+            Err(_) => {}
+        }
+        if execution_context.is_canceled() {
+            return Err(BackendError::TranscriptionCanceled);
         }
         progress.report_units((index as u64).saturating_add(1), total.max(1));
     }
@@ -1467,7 +1497,7 @@ fn punctuate_transcription_segments_with_actor(
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    transcription
+    Ok(transcription)
 }
 
 /// Returns the audio at `input_path` as 16 kHz mono f32 samples, preferring
@@ -1571,6 +1601,9 @@ pub fn refine_existing_transcription_timeline(
         language_hint,
         execution_services,
         &request_intent,
+        &crate::RequestExecutionContext::uncancellable(
+            "post-hoc timeline refinement has no external request control",
+        ),
         Some(&progress),
     )?;
     progress.complete_stage_brief(TranscriptionStage::Project);
@@ -1599,8 +1632,15 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     language_hint: Option<&str>,
     execution_services: &NativeExecutionServices,
     request_intent: &ExecutionIntent,
+    execution_context: &crate::RequestExecutionContext,
     progress: Option<&ProgressReporter>,
 ) -> Result<Transcription, BackendError> {
+    let _abort_callback_guard = execution_context
+        .control
+        .arm_for_native_decode_if_cancellable();
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
         .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
     let language = transcription
@@ -1628,17 +1668,19 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         &execution_plan,
         "qwen3-forced-aligner",
         |candidate| {
+            if execution_context.is_canceled() {
+                return Err(BackendError::TranscriptionCanceled);
+            }
             let backend = resolved_runtime_for_candidate(
                 candidate,
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             )
             .backend();
             let session_load_started = Instant::now();
-            let session = Qwen3ForcedAlignerSession::load(&pack_path, backend).map_err(|error| {
-                BackendError::WordTimestampAlignmentFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+            let session =
+                Qwen3ForcedAlignerSession::load(&pack_path, backend).map_err(|error| {
+                    forced_alignment_error_to_backend(execution_context, error.to_string())
+                })?;
             crate::stage_timing::log_detail_stage(
                 "forced_aligner",
                 "session_load",
@@ -1648,6 +1690,9 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             let audio_samples = prepared_audio.as_slice().len();
             let mut completed_align_duration_s = 0.0f64;
             for (index, segment) in refined.segments.iter_mut().enumerate() {
+                if execution_context.is_canceled() {
+                    return Err(BackendError::TranscriptionCanceled);
+                }
                 if segment.text.trim().is_empty() {
                     continue;
                 }
@@ -1663,14 +1708,16 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     (f64::from(segment.end) - f64::from(segment.start)).max(0.0);
                 let alignment_started = Instant::now();
                 let items = session
-                    .align(
-                        prepared_audio.slice(range),
-                        &segment.text,
-                        &language,
-                    )
-                    .map_err(|error| BackendError::WordTimestampAlignmentFailed {
-                        reason: format!("segment {index}: {error}"),
+                    .align(prepared_audio.slice(range), &segment.text, &language)
+                    .map_err(|error| {
+                        forced_alignment_error_to_backend(
+                            execution_context,
+                            format!("segment {index}: {error}"),
+                        )
                     })?;
+                if execution_context.is_canceled() {
+                    return Err(BackendError::TranscriptionCanceled);
+                }
                 crate::stage_timing::log_detail_event(
                     "forced_aligner",
                     format_args!(
@@ -1690,12 +1737,35 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             }
             Ok(refined)
         },
-    )
-    .map_err(required_auxiliary_stage_error)?;
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error)
+            if execution_context.is_canceled()
+                || is_cooperative_cancel_reason(&error.to_string()) =>
+        {
+            return Err(BackendError::TranscriptionCanceled);
+        }
+        Err(error) => return Err(required_auxiliary_stage_error(error)),
+    };
+    if execution_context.is_canceled() {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     if let Some(progress) = progress {
         progress.complete_stage();
     }
     Ok(result)
+}
+
+fn forced_alignment_error_to_backend(
+    execution_context: &crate::RequestExecutionContext,
+    reason: String,
+) -> BackendError {
+    if execution_context.is_canceled() || is_cooperative_cancel_reason(&reason) {
+        BackendError::TranscriptionCanceled
+    } else {
+        BackendError::WordTimestampAlignmentFailed { reason }
+    }
 }
 
 fn forced_alignment_segment_sample_range(
@@ -3066,12 +3136,26 @@ fn compute_speaker_attribution(
         return Err(BackendError::TranscriptionCanceled);
     }
     progress.enter_stage(TranscriptionStage::Diarize);
-    // Install segmenter window-progress sink so real window completion drives
-    // stage_fraction (not a fixed percentage).
-    let diarize_progress = progress.clone();
+    // External diarization has two heavyweight, independently bounded loops:
+    // activity windows and ReDimNet embedding windows. Report both instead of
+    // reaching 100% after segmentation and appearing stalled during embedding.
+    // The split is a calibrated work share; movement within each share is
+    // driven only by completed production work units.
+    let segmenter = progress_segmenter_kind_for_provider(diarizer.segmenter_provider());
+    let segment_share = external_diarization_segment_share(segmenter);
+    let segment_progress = progress.clone();
     let _segment_progress_guard =
         crate::diarize::segment::install_window_progress_sink(move |done, total| {
-            diarize_progress.report_units(done as u64, total.max(1) as u64);
+            segment_progress.report_fraction(segment_share * completed_work_fraction(done, total));
+        });
+    let embedding_progress = progress.clone();
+    let _embedding_progress_guard =
+        crate::diarize::external::install_embedding_progress_sink(move |done, total| {
+            embedding_progress.report_fraction(external_diarization_embedding_progress(
+                segment_share,
+                done,
+                total,
+            ));
         });
     let diarization_started = Instant::now();
     let timeline = diarizer
@@ -3141,6 +3225,37 @@ fn compute_speaker_attribution(
         identities: identity.assignments,
         unnamed_speakers: identity.unnamed_speakers,
     })
+}
+
+fn completed_work_fraction(completed: usize, total: usize) -> f32 {
+    if total == 0 {
+        1.0
+    } else {
+        (completed as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+const EXTERNAL_DIARIZATION_EMBEDDING_END: f32 = 0.98;
+
+fn external_diarization_embedding_progress(
+    segment_share: f32,
+    completed: usize,
+    total: usize,
+) -> f32 {
+    segment_share
+        + (EXTERNAL_DIARIZATION_EMBEDDING_END - segment_share)
+            * completed_work_fraction(completed, total)
+}
+
+fn external_diarization_segment_share(segmenter: ProgressSegmenterKind) -> f32 {
+    match segmenter {
+        // Fifteen-minute production-geometry measurements put Segmentation3
+        // at roughly 34% of segment+embed compute and DiariZen Metal at 50%.
+        // Rounded shares are deliberately stable across hosts; actual window
+        // and embedding completion, not wall-clock interpolation, moves them.
+        ProgressSegmenterKind::Segmentation3_0 | ProgressSegmenterKind::Auto => 0.34,
+        ProgressSegmenterKind::DiariZen => 0.51,
+    }
 }
 
 fn external_diarization_error_to_backend(
@@ -4732,6 +4847,34 @@ mod tests {
             backend: ProgressBackendClass::AutoOrCpu,
             persist: false,
         })
+    }
+
+    #[test]
+    fn external_diarization_progress_shares_are_bounded_and_provider_specific() {
+        assert_eq!(completed_work_fraction(0, 0), 1.0);
+        assert_eq!(completed_work_fraction(0, 4), 0.0);
+        assert_eq!(completed_work_fraction(1, 4), 0.25);
+        assert_eq!(completed_work_fraction(8, 4), 1.0);
+
+        let seg3 = external_diarization_segment_share(ProgressSegmenterKind::Segmentation3_0);
+        let auto = external_diarization_segment_share(ProgressSegmenterKind::Auto);
+        let diarizen = external_diarization_segment_share(ProgressSegmenterKind::DiariZen);
+        assert_eq!(seg3, auto);
+        assert!(seg3 > 0.0);
+        assert!(diarizen > seg3);
+        assert!(diarizen < EXTERNAL_DIARIZATION_EMBEDDING_END);
+        for share in [seg3, diarizen] {
+            assert_eq!(
+                external_diarization_embedding_progress(share, 0, 4),
+                share,
+                "embedding starts exactly where segmentation ends"
+            );
+            assert_eq!(
+                external_diarization_embedding_progress(share, 4, 4),
+                EXTERNAL_DIARIZATION_EMBEDDING_END,
+                "embedding completion leaves an explicit clustering tail"
+            );
+        }
     }
 
     #[test]
@@ -6770,6 +6913,170 @@ mod tests {
         );
 
         assert!(matches!(result, Err(BackendError::NativeFailClosed { .. })));
+    }
+
+    #[test]
+    fn optional_punctuation_never_swallows_typed_cancellation() {
+        let error = PolicyResolvedAuxRuntimeError::Operation(BackendError::TranscriptionCanceled);
+
+        let result = finish_optional_punctuation_stage(
+            optional_punctuation_test_transcription(),
+            Err(error),
+        );
+
+        assert!(matches!(result, Err(BackendError::TranscriptionCanceled)));
+    }
+
+    #[test]
+    #[ignore = "host-local: needs OPENASR_FIRERED_PUNC_PACK and OPENASR_AUX_BENCH_TEXT"]
+    fn firered_punctuation_actor_fifteen_minute_and_cancel_endurance() {
+        crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_PUNC_PACK",
+            "FireRedPunc actor endurance pack",
+        )
+        .expect("OPENASR_FIRERED_PUNC_PACK");
+        let text_path = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_TEXT",
+            "private auxiliary-model benchmark transcript",
+        )
+        .expect("OPENASR_AUX_BENCH_TEXT");
+        let segment_text = std::fs::read_to_string(text_path).expect("read benchmark transcript");
+        let segment_text = segment_text.trim().to_string();
+        assert!(!segment_text.is_empty());
+
+        let make_transcription = || {
+            let segments = (0..60)
+                .map(|index| {
+                    segment(
+                        index as f32 * 15.0,
+                        (index + 1) as f32 * 15.0,
+                        &segment_text,
+                    )
+                })
+                .collect::<Vec<_>>();
+            Transcription {
+                text: segments
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                segments,
+                ..Default::default()
+            }
+        };
+        let progress_for = || {
+            ProgressReporter::install(
+                None,
+                ProgressPlan::build(ProgressPlanInput {
+                    audio_duration_s: 900.0,
+                    voice_id: false,
+                    external_diarize: false,
+                    segmenter: ProgressSegmenterKind::Auto,
+                    punctuate: true,
+                    align: false,
+                    backend: ProgressBackendClass::AutoOrCpu,
+                    persist: false,
+                }),
+            )
+        };
+        let services = native_execution_services_for_test();
+        let request_intent = ExecutionIntent::CpuOnly;
+        let detached =
+            crate::RequestExecutionContext::uncancellable("FireRedPunc host-local endurance run");
+        let progress = progress_for();
+        let started = Instant::now();
+        let punctuated = apply_punctuation_stage_with_policy(
+            make_transcription(),
+            Some(false),
+            true,
+            services.as_ref(),
+            &request_intent,
+            &detached,
+            &progress,
+        )
+        .expect("punctuate fifteen-minute-equivalent transcript");
+        let elapsed_seconds = started.elapsed().as_secs_f64();
+        let output_sha256 = crate::testing::benchmark_sha256_bytes(
+            punctuated
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_bytes()),
+        );
+        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        eprintln!(
+            "AUX_MODEL_ENDURANCE model=fireredpunc backend=cpu represented_audio_seconds=900.000000 elapsed_seconds={elapsed_seconds:.6} peak_rss_bytes={peak_rss_bytes} segments={} output_sha256={output_sha256}",
+            punctuated.segments.len(),
+        );
+        assert_eq!(punctuated.segments.len(), 60);
+
+        // Reuse the now-warm actor and cancel while its first long segment is
+        // in flight. The actor republishes this request's ggml cancel flag on
+        // its owner thread; the optional-stage policy must preserve the typed
+        // terminal status instead of silently returning raw ASR text.
+        let control = Arc::new(crate::api::backend::TranscriptionControl::new());
+        let execution_context = Arc::new(crate::RequestExecutionContext::new(
+            None,
+            Arc::clone(&control),
+        ));
+        let cancel_services = Arc::clone(&services);
+        let cancel_context = Arc::clone(&execution_context);
+        let cancel_input = make_transcription();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _abort_guard = cancel_context
+                .control
+                .arm_for_native_decode_if_cancellable();
+            let progress = progress_for();
+            let result = apply_punctuation_stage_with_policy(
+                cancel_input,
+                Some(false),
+                true,
+                cancel_services.as_ref(),
+                &ExecutionIntent::CpuOnly,
+                cancel_context.as_ref(),
+                &progress,
+            );
+            let _ = result_tx.send(result);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        control.request_cancel();
+        let error = result_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("canceled punctuation actor must not hang")
+            .expect_err("canceled punctuation actor must fail closed");
+        assert!(matches!(error, BackendError::TranscriptionCanceled));
+    }
+
+    #[test]
+    fn forced_alignment_graph_abort_maps_to_typed_cancellation() {
+        let control = Arc::new(crate::api::backend::TranscriptionControl::new());
+        let execution_context = crate::RequestExecutionContext::new(None, Arc::clone(&control));
+        control.request_cancel();
+
+        assert!(matches!(
+            forced_alignment_error_to_backend(
+                &execution_context,
+                "segment 2: arbitrary graph failure".to_string(),
+            ),
+            BackendError::TranscriptionCanceled
+        ));
+
+        let detached =
+            crate::RequestExecutionContext::uncancellable("cooperative-cancel reason mapping test");
+        assert!(matches!(
+            forced_alignment_error_to_backend(
+                &detached,
+                "segment 2: ggml graph compute aborted by cancel request".to_string(),
+            ),
+            BackendError::TranscriptionCanceled
+        ));
+        assert!(matches!(
+            forced_alignment_error_to_backend(
+                &detached,
+                "segment 2: malformed timestamp head".to_string(),
+            ),
+            BackendError::WordTimestampAlignmentFailed { .. }
+        ));
     }
 
     #[test]

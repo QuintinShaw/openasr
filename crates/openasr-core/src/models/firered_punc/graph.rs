@@ -286,7 +286,7 @@ impl FireRedPuncGraph {
     }
 
     /// Run the BERT forward over `token_ids` (the full sequence, including the
-    /// caller's `[CLS]`/`[SEP]` wrapping) and return `[label_count, seq]` logits
+    /// caller's leading `[CLS]`) and return `[label_count, seq]` logits
     /// laid out label-fastest: `logits[pos * label_count + label]`.
     pub(crate) fn forward(&mut self, token_ids: &[u32]) -> Result<Vec<f32>, FireRedPuncGraphError> {
         let seq = token_ids.len();

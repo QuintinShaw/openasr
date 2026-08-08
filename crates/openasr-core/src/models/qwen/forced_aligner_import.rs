@@ -34,12 +34,14 @@ use crate::models::local_source_import::{
     validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
+use crate::models::pack_quant::TensorRole;
 
 use super::package_import::{
     Qwen3AsrRuntimeQuantizationMode, build_qwen_runtime_tensors, insert_metadata,
     insert_metadata_string_array, insert_metadata_u32, load_merges, load_vocab_tokens,
     patch_added_tokens,
 };
+use super::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
@@ -188,6 +190,7 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
     let tensors = build_qwen_runtime_tensors(
         &safetensor_files,
         request.quantization,
+        forced_aligner_tensor_role,
         fields.n_mels,
         fields.n_fft,
         fields.sample_rate_hz,
@@ -217,6 +220,18 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
         model_id,
         tensor_count,
     })
+}
+
+/// Forced alignment reads prompt-token states and takes an argmax over the
+/// independent 5,000-bin timestamp head. Keeping both boundary projections at
+/// Q8_0 avoids rare multi-second jumps observed when an otherwise-Q4_K pack
+/// quantizes them to Q4_K. The large decoder-layer matrices remain Q4_K.
+pub(crate) fn forced_aligner_tensor_role(name: &str) -> TensorRole {
+    if name == OUTPUT_WEIGHT || name == TOKEN_EMBD_WEIGHT {
+        TensorRole::PrecisionCriticalBoundaryMatrix
+    } else {
+        super::package_import::qwen_tensor_role(name)
+    }
 }
 
 fn forced_aligner_metadata_fields(config: &ForcedAlignerConfigJson) -> ForcedAlignerMetadataFields {
@@ -474,6 +489,39 @@ fn validate_request(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn q4_pack_keeps_alignment_boundary_projections_at_q8() {
+        let contract = crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
+            model_architecture: QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+            classify: forced_aligner_tensor_role,
+            quantized_axis: crate::models::pack_quant::QuantizedAxis::First,
+        };
+        assert_eq!(
+            contract.target_write_type(
+                OUTPUT_WEIGHT,
+                &[1024, 5000],
+                crate::models::pack_quant::PackQuant::Q4_K,
+            ),
+            Some(crate::ggml_runtime::GgufWriteTensorType::Q8_0),
+        );
+        assert_eq!(
+            contract.target_write_type(
+                TOKEN_EMBD_WEIGHT,
+                &[1024, 152_064],
+                crate::models::pack_quant::PackQuant::Q4_K,
+            ),
+            Some(crate::ggml_runtime::GgufWriteTensorType::Q8_0),
+        );
+        assert_eq!(
+            contract.target_write_type(
+                "blk.0.attn_q.weight",
+                &[1024, 1024],
+                crate::models::pack_quant::PackQuant::Q4_K,
+            ),
+            Some(crate::ggml_runtime::GgufWriteTensorType::Q4_K),
+        );
+    }
 
     /// Stage 1 gate: convert the real downloaded Qwen3-ForcedAligner-0.6B
     /// checkpoint (if present on disk -- this test is opt-in / dev-machine

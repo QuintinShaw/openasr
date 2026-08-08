@@ -2447,7 +2447,7 @@ fn audit_quant_fails_closed_on_sub_q8_encoder() {
         .failure()
         .stderr(predicate::str::contains("audit FAILED"))
         .stdout(predicate::str::contains(
-            "audio encoder below the Q8_0 floor",
+            "precision-sensitive tensor below the Q8_0 floor",
         ));
 }
 

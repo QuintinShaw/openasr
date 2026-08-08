@@ -1113,7 +1113,7 @@ pub(super) fn validate_model_pack_path_command(path: &Path) -> Result<()> {
         package_path.display()
     );
     // Quantization-strategy self-check: replay the current policy (the
-    // audio-encoder Q8_0 floor, plus the declared-tier ceiling when the
+    // semantic-role Q8_0 floor, plus the declared-tier ceiling when the
     // filename names a tier) against the pack's own tensor index. Header-only,
     // no inference -- a pack that fails its own audit never passes `verify`.
     let declared = pack_tier_from_pack_filename(&package_path);
@@ -1192,7 +1192,7 @@ fn fail_closed_on_quant_floor_violations(
     }
     bail!(
         "Quantization-strategy audit FAILED for '{target}': {} violation(s) -- \
-         an audio-encoder tensor below the Q8_0 floor (long-audio decode collapses) \
+         a precision-sensitive tensor below the Q8_0 floor \
          or a tensor outside the pack's declared tier. Rebuild the pack with the \
          current importer policy.",
         audit.violations.len()
@@ -1202,7 +1202,7 @@ fn fail_closed_on_quant_floor_violations(
 fn print_quant_floor_report(audit: &openasr_core::models::pack_quant_audit::QuantFloorReport) {
     use openasr_core::models::pack_quant_audit::ggml_type_name;
     println!(
-        "Quantization-strategy audit: architecture={} build_commit={} tensors={} block_quant_tensors={} encoder_block_quant_tensors={}",
+        "Quantization-strategy audit: architecture={} build_commit={} tensors={} block_quant_tensors={} q8_floor_block_quant_tensors={}",
         audit
             .architecture
             .clone()
@@ -1213,12 +1213,12 @@ fn print_quant_floor_report(audit: &openasr_core::models::pack_quant_audit::Quan
             .unwrap_or_else(|| "<not recorded>".to_string()),
         audit.tensor_count,
         audit.block_quant_tensors,
-        audit.encoder_block_quant_tensors,
+        audit.q8_floor_block_quant_tensors,
     );
     for violation in &audit.violations {
         let kind = match violation.kind {
-            openasr_core::models::pack_quant_audit::QuantFloorViolationKind::EncoderBelowQ8Floor => {
-                "audio encoder below the Q8_0 floor"
+            openasr_core::models::pack_quant_audit::QuantFloorViolationKind::BelowQ8Floor => {
+                "precision-sensitive tensor below the Q8_0 floor"
             }
             openasr_core::models::pack_quant_audit::QuantFloorViolationKind::ExceedsDeclaredTier => {
                 "exceeds the declared tier"
@@ -1235,7 +1235,7 @@ fn print_quant_floor_report(audit: &openasr_core::models::pack_quant_audit::Quan
 
 /// The quant tier a pack's own filename claims (`<model>-<tier>.oasr`), for
 /// the audit's declared-tier ceiling. `None` when the name carries no known
-/// tier suffix -- the encoder floor still applies unconditionally.
+/// tier suffix -- the semantic-role floor still applies unconditionally.
 fn pack_tier_from_pack_filename(
     path: &Path,
 ) -> Option<openasr_core::models::pack_quant::PackQuant> {

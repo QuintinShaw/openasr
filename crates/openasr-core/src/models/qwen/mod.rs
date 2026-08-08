@@ -39,6 +39,7 @@ pub(crate) use decoder_contract::{
 pub(crate) use decoder_tail::{
     QwenDecoderTail, QwenDecoderTailLoadError, load_qwen_decoder_tail_from_contract,
 };
+pub(crate) use forced_aligner_import::forced_aligner_tensor_role;
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
     Qwen3ForcedAlignerLocalSourceError, Qwen3ForcedAlignerLocalSourceImportRequest,
@@ -72,12 +73,12 @@ pub(crate) use logits_head::{
     load_qwen3_llm_logits_head_from_reader,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor, logits_head_ggml_enabled,
 };
+pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{
     Qwen3AsrLocalSourceError, Qwen3AsrLocalSourceImportRequest,
     Qwen3AsrLocalSourceImportRuntimeResult, Qwen3AsrRuntimeQuantizationMode,
     convert_local_qwen_source_to_runtime_pack,
 };
-pub(crate) use package_import::{TENSOR_QUANTIZATION_CONTRACT, qwen_tensor_role};
 pub(crate) use prepared_runtime::{
     Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError, build_qwen_prepared_runtime,
 };

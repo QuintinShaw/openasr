@@ -65,7 +65,8 @@ pub(crate) enum PunctuationError {
 /// A model that scores punctuation for one window of content tokens.
 ///
 /// Implementations receive the content token ids for a single window (the
-/// tokenizer's `[CLS]`/`[SEP]` wrapping is the implementation's concern) and
+/// tokenizer's model-specific special-token wrapping is the implementation's
+/// concern) and
 /// return the argmax label id per content token, in the same order and length.
 /// Label ids index [`crate::models::firered_punc::config::PUNC_LABELS`].
 pub(crate) trait PunctuationClassifier {
@@ -79,16 +80,16 @@ pub(crate) trait PunctuationClassifier {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PunctuationRestoreConfig {
     /// Maximum content tokens per classifier window (BERT max positions minus
-    /// the `[CLS]`/`[SEP]` wrapping). Windows are cut only at word boundaries so
-    /// a word's subwords never span two windows.
+    /// the leading `[CLS]`). Windows follow the upstream fixed-width token
+    /// split; punctuation is emitted only from word-final pieces.
     pub max_content_tokens: usize,
 }
 
 impl Default for PunctuationRestoreConfig {
     fn default() -> Self {
-        // chinese-lert-base max_position_embeddings (512) - [CLS] - [SEP].
+        // chinese-lert-base max_position_embeddings (512) - leading [CLS].
         Self {
-            max_content_tokens: 510,
+            max_content_tokens: 511,
         }
     }
 }
@@ -118,7 +119,7 @@ pub(crate) fn restore_punctuation(
 
     // (char_end offset in the original text, punctuation mark) insertions.
     let mut insertions: Vec<(usize, char)> = Vec::new();
-    for window in word_boundary_windows(&pieces, config.max_content_tokens) {
+    for window in fixed_token_windows(&pieces, config.max_content_tokens) {
         let ids: Vec<u32> = window.iter().map(|piece| piece.token_id).collect();
         let labels = classifier.predict_window_labels(&ids)?;
         if labels.len() != window.len() {
@@ -142,33 +143,19 @@ pub(crate) fn restore_punctuation(
     Ok(apply_insertions(text, &mut insertions))
 }
 
-/// Split content pieces into windows of at most `max_content_tokens`, cutting
-/// only after a word-final piece so a word's subwords stay in one window. A
-/// single word longer than the budget is kept whole (it cannot be split).
-fn word_boundary_windows(
+/// Split content pieces into the upstream model's fixed-width windows.
+///
+/// FireRedPunc tokenizes the whole input first and then applies
+/// `Tensor::split(max_position_embeddings - 1)`. A window boundary may
+/// therefore fall between two WordPiece subwords. Punctuation is still
+/// attached only to `word_final` pieces below, so matching that encoder
+/// context does not insert a mark inside a word.
+fn fixed_token_windows(
     pieces: &[WordPiecePiece],
     max_content_tokens: usize,
 ) -> Vec<&[WordPiecePiece]> {
     let budget = max_content_tokens.max(1);
-    let mut windows = Vec::new();
-    let mut start = 0usize;
-    let mut last_word_end: Option<usize> = None;
-    for (idx, piece) in pieces.iter().enumerate() {
-        let len_if_included = idx - start + 1;
-        if len_if_included > budget && last_word_end.map(|end| end > start).unwrap_or(false) {
-            let cut = last_word_end.expect("checked Some above");
-            windows.push(&pieces[start..cut]);
-            start = cut;
-            last_word_end = None;
-        }
-        if piece.word_final {
-            last_word_end = Some(idx + 1);
-        }
-    }
-    if start < pieces.len() {
-        windows.push(&pieces[start..]);
-    }
-    windows
+    pieces.chunks(budget).collect()
 }
 
 /// Insert punctuation marks into `text` at the given original char offsets.
@@ -340,12 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn windows_cut_at_word_boundaries_cover_all_pieces() {
+    fn windows_match_the_upstream_fixed_token_split() {
         // Force a tiny budget so "你好世界" splits into multiple windows; every
         // char must still be classified and its label applied.
         let tok = test_tokenizer();
         let pieces = tok.encode("你好世界");
-        let windows = word_boundary_windows(&pieces, 2);
+        let windows = fixed_token_windows(&pieces, 2);
         assert!(windows.len() >= 2, "tiny budget splits the sequence");
         let total: usize = windows.iter().map(|w| w.len()).sum();
         assert_eq!(total, pieces.len(), "windows partition all pieces");
@@ -356,5 +343,36 @@ mod tests {
         };
         let out = restore_punctuation("你好世界", &tok, &classifier, cfg).expect("restore");
         assert_eq!(out, "你好，世界。");
+    }
+
+    #[test]
+    fn fixed_windows_may_split_wordpieces_without_inserting_inside_a_word() {
+        let tok = test_tokenizer();
+        let pieces = tok.encode("hello world");
+        let windows = fixed_token_windows(&pieces, 2);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.len())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(!windows[0][1].word_final, "first window ends inside world");
+        assert!(
+            windows[1][0].word_final,
+            "second window owns word-final label"
+        );
+
+        let classifier = ScriptedClassifier::new(vec![2, 1, 2]);
+        let out = restore_punctuation(
+            "hello world",
+            &tok,
+            &classifier,
+            PunctuationRestoreConfig {
+                max_content_tokens: 2,
+            },
+        )
+        .expect("restore");
+        assert_eq!(out, "hello。 world。");
     }
 }
