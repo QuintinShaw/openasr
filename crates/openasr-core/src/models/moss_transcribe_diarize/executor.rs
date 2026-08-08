@@ -860,7 +860,7 @@ impl MossTdGgmlExecutor {
             key,
             move || {
                 let retained = MossTdDecoderRuntime::quoted_resident_system_memory_bytes(
-                    prepared.decoder_metadata.n_layers,
+                    &prepared.decoder_plan,
                 )
                 .map_err(|reason| MossTdExecutorError::RuntimeOwnershipFailed {
                     stage: "decoder",

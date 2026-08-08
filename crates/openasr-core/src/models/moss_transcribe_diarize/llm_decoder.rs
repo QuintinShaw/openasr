@@ -69,8 +69,16 @@ pub(crate) struct MossTdPrefillOutput {
 }
 
 impl MossTdDecoderRuntime {
-    pub(crate) fn quoted_resident_system_memory_bytes(layer_count: usize) -> Result<u64, String> {
-        Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(layer_count)
+    /// Quote the actor-local graph handles from the already-prepared plan.
+    ///
+    /// Accepting the plan instead of a raw layer count keeps runtime admission
+    /// on the same source of truth as materialization.
+    pub(crate) fn quoted_resident_system_memory_bytes(
+        plan: &QwenWholeDecoderPlan,
+    ) -> Result<u64, String> {
+        Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
+            plan.layer_count(),
+        )
     }
 
     pub(crate) fn resident_system_memory_bytes(&self) -> Result<u64, String> {
