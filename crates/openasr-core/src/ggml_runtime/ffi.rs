@@ -571,6 +571,8 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_blas_init() -> GgmlBackendRaw;
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_blas_set_n_threads(backend: GgmlBackendRaw, n_threads: c_int);
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn openasr_ggml_metal_cached_device_count() -> usize;
     pub(crate) fn ggml_init(params: GgmlInitParams) -> GgmlContextRaw;
     pub(crate) fn ggml_reset(ctx: GgmlContextRaw);
     pub(crate) fn ggml_free(ctx: GgmlContextRaw);

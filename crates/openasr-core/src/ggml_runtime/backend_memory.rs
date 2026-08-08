@@ -499,6 +499,9 @@ impl Drop for SchedulerMemoryPlan<'_> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    use crate::ggml_runtime::ensure_backends_loaded;
+
     #[test]
     fn ffi_layouts_match_the_v1_fixed_width_contract() {
         assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryDomainIdV1>(), 24);
@@ -525,5 +528,48 @@ mod tests {
         assert!(error(ffi::GGML_STATUS_DEVICE_LOST, false).requires_quarantine());
         assert!(error(ffi::GGML_STATUS_BACKEND_POISONED, false).requires_quarantine());
         assert!(error(i32::MAX, false).requires_quarantine());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repeated_metal_memory_quotes_reuse_one_device_context() {
+        ensure_backends_loaded();
+        let backend = unsafe { ffi::ggml_backend_init_best() };
+        assert!(!backend.is_null(), "macOS must expose a ggml backend");
+
+        let name = unsafe {
+            std::ffi::CStr::from_ptr(ffi::ggml_backend_name(backend))
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        };
+        if !name.contains("metal") && !name.starts_with("mtl") {
+            unsafe { ffi::ggml_backend_free(backend) };
+            return;
+        }
+
+        let abi = unsafe { BackendMemoryAbi::from_backend(backend) }
+            .expect("Metal must expose the memory ABI");
+        let device = unsafe { ffi::ggml_backend_get_device(backend) };
+        assert!(!device.is_null());
+        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
+        assert!(!buft.is_null());
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+            request_id: 1,
+            backend,
+            buft,
+            requested_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        let before = unsafe { ffi::openasr_ggml_metal_cached_device_count() };
+        for _ in 0..128 {
+            abi.quote(&[request])
+                .expect("repeated Metal memory quote must remain valid");
+        }
+        let after = unsafe { ffi::openasr_ggml_metal_cached_device_count() };
+
+        unsafe { ffi::ggml_backend_free(backend) };
+        assert_eq!(after, before, "memory quote created Metal device contexts");
     }
 }
