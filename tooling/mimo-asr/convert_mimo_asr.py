@@ -91,11 +91,10 @@ _BUILD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # q4_k is intentionally not produced by this Python writer: the gguf Python
 # library only implements legacy-quant (Q4_0..Q8_0) block quantization, and
 # K-quant math belongs to ggml's single source of truth. The generic Rust
-# `openasr model-pack requant --quant q4-k` seam now exists, but the external
-# publish recipe has no binary-path argument to pass to this script. Therefore
-# this source-only converter remains fail-closed for q4-k; callers use the
-# documented fp16 staging + Rust requant two-step instead of forking math here
-# or compounding two lossy quantization passes.
+# `openasr model-pack requant --quant q4-k` seam now exists and the generic
+# publish lane invokes it after this converter produces fp16 staging. This
+# source-only converter remains fail-closed for q4-k so K-quant math is never
+# forked into Python and two lossy quantization passes are never compounded.
 QUANT_TOKEN_TO_LABEL = {
     "fp16": "fp16",
     "q8-0": "q8_0",

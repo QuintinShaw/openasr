@@ -42,8 +42,9 @@ canonical tokens; `openasr.pack.quant` records the canonical label
 **`q4-k` uses a two-step path.** The gguf Python library implements only
 legacy-quant block quantization (Q4_0..Q8_0); K-quant math belongs to ggml's
 single source of truth. The source-only converter therefore fails closed for
-`q4-k`, and the publish recipe intentionally does not guess a binary path.
-Stage an fp16 pack, then invoke the generic Rust seam. Starting from the
+`q4-k`; the generic publish lane supplies its already-built OpenASR binary for
+the second step. When running the converter manually, stage an fp16 pack and
+then invoke the generic Rust seam. Starting from the
 highest-precision representation avoids compounding Q8_0 and Q4_K
 quantization error:
 
