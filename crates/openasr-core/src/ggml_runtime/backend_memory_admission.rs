@@ -15,6 +15,8 @@ use std::{
     ops::{Deref, DerefMut},
     rc::Rc,
     sync::Arc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -107,6 +109,22 @@ impl NativeQuotedBackendGroup {
     ) -> Result<Vec<ffi::GgmlBackendMemoryClaimV1>, BackendMemoryAbiError> {
         self.abi.reserve_private(&self.requests, &self.quote)
     }
+
+    /// Re-quotes the same still-live backend requests after another
+    /// provisional candidate releases the physical-domain gate. Quote tokens
+    /// and stats generations are deliberately refreshed together; retrying a
+    /// broker admission with the old snapshot would make the observed-capacity
+    /// check optimistic after the other candidate commits.
+    fn refresh(self) -> Result<Self, NativeMemoryAdmissionError> {
+        Self::quote(
+            self.group_id,
+            self.backend_device_identity,
+            self.abi,
+            self.requests,
+            self.request_semantics,
+            self.shared_semantics,
+        )
+    }
 }
 
 /// Raw native evidence retained for diagnostics. `MemoryClaim::confidence`
@@ -133,6 +151,10 @@ pub(crate) struct NativeMemoryAdmissionPlan {
 }
 
 impl NativeMemoryAdmissionPlan {
+    const DOMAIN_BUSY_WAIT: Duration = Duration::from_secs(30);
+    const DOMAIN_BUSY_INITIAL_BACKOFF: Duration = Duration::from_millis(1);
+    const DOMAIN_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(32);
+
     pub(crate) fn from_groups(
         groups: Vec<NativeQuotedBackendGroup>,
     ) -> Result<Self, NativeMemoryAdmissionError> {
@@ -166,20 +188,34 @@ impl NativeMemoryAdmissionPlan {
         broker: &Arc<DeviceMemoryBrokerSet>,
         cohort_id: Option<MemoryReservationCohortId>,
     ) -> Result<NativeMemoryAllocationTransaction, NativeMemoryAdmissionError> {
-        classify_request_kinds(self.groups.iter().flat_map(|group| group.requests.iter()))?;
-        self.require_opaque_driver_headroom(broker)?;
-        for request in &mut self.requests {
-            request.cohort_id = cohort_id;
+        let deadline = Instant::now() + Self::DOMAIN_BUSY_WAIT;
+        let mut retry_delay = Self::DOMAIN_BUSY_INITIAL_BACKOFF;
+        loop {
+            classify_request_kinds(self.groups.iter().flat_map(|group| group.requests.iter()))?;
+            self.require_opaque_driver_headroom(broker)?;
+            for request in &mut self.requests {
+                request.cohort_id = cohort_id;
+            }
+            match broker.try_reserve_batch(self.requests.clone()) {
+                Ok(reservation) => {
+                    return Ok(NativeMemoryAllocationTransaction {
+                        groups: self.groups,
+                        claims: self.claims,
+                        requests: self.requests,
+                        evidence: self.evidence,
+                        reconciliation_baseline: self.reconciliation_baseline,
+                        reservation,
+                    });
+                }
+                Err(error @ MemoryPlanningError::DeviceDomainBusy { .. }) => {
+                    if !Self::wait_for_domain_busy_retry(deadline, &mut retry_delay)? {
+                        return Err(error.into());
+                    }
+                    self = self.refresh()?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        let reservation = broker.try_reserve_batch(self.requests.clone())?;
-        Ok(NativeMemoryAllocationTransaction {
-            groups: self.groups,
-            claims: self.claims,
-            requests: self.requests,
-            evidence: self.evidence,
-            reconciliation_baseline: self.reconciliation_baseline,
-            reservation,
-        })
     }
 
     /// Reserves several ownership partitions as one candidate-level atomic
@@ -191,35 +227,84 @@ impl NativeMemoryAdmissionPlan {
         broker: &Arc<DeviceMemoryBrokerSet>,
         cohort_id: Option<MemoryReservationCohortId>,
     ) -> Result<Vec<NativeMemoryAllocationTransaction>, NativeMemoryAdmissionError> {
-        for plan in &plans {
-            classify_request_kinds(plan.groups.iter().flat_map(|group| group.requests.iter()))?;
-            plan.require_opaque_driver_headroom(broker)?;
+        let deadline = Instant::now() + Self::DOMAIN_BUSY_WAIT;
+        let mut retry_delay = Self::DOMAIN_BUSY_INITIAL_BACKOFF;
+        loop {
+            for plan in &plans {
+                classify_request_kinds(plan.groups.iter().flat_map(|group| group.requests.iter()))?;
+                plan.require_opaque_driver_headroom(broker)?;
+            }
+            for request in plans.iter_mut().flat_map(|plan| &mut plan.requests) {
+                request.cohort_id = cohort_id;
+            }
+            let reservations = match broker
+                .try_reserve_partitioned(plans.iter().map(|plan| plan.requests.clone()).collect())
+            {
+                Ok(reservations) => reservations,
+                Err(error @ MemoryPlanningError::DeviceDomainBusy { .. }) => {
+                    if !Self::wait_for_domain_busy_retry(deadline, &mut retry_delay)? {
+                        return Err(error.into());
+                    }
+                    plans = plans
+                        .into_iter()
+                        .map(Self::refresh)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if reservations.len() != plans.len() {
+                return Err(
+                    NativeMemoryAdmissionError::PartitionedReservationSetMismatch {
+                        expected: plans.len(),
+                        actual: reservations.len(),
+                    },
+                );
+            }
+            return Ok(plans
+                .into_iter()
+                .zip(reservations)
+                .map(|(plan, reservation)| NativeMemoryAllocationTransaction {
+                    groups: plan.groups,
+                    claims: plan.claims,
+                    requests: plan.requests,
+                    evidence: plan.evidence,
+                    reconciliation_baseline: plan.reconciliation_baseline,
+                    reservation,
+                })
+                .collect());
         }
-        for request in plans.iter_mut().flat_map(|plan| &mut plan.requests) {
-            request.cohort_id = cohort_id;
-        }
-        let reservations = broker
-            .try_reserve_partitioned(plans.iter().map(|plan| plan.requests.clone()).collect())?;
-        if reservations.len() != plans.len() {
-            return Err(
-                NativeMemoryAdmissionError::PartitionedReservationSetMismatch {
-                    expected: plans.len(),
-                    actual: reservations.len(),
-                },
-            );
-        }
-        Ok(plans
+    }
+
+    fn refresh(self) -> Result<Self, NativeMemoryAdmissionError> {
+        let groups = self
+            .groups
             .into_iter()
-            .zip(reservations)
-            .map(|(plan, reservation)| NativeMemoryAllocationTransaction {
-                groups: plan.groups,
-                claims: plan.claims,
-                requests: plan.requests,
-                evidence: plan.evidence,
-                reconciliation_baseline: plan.reconciliation_baseline,
-                reservation,
-            })
-            .collect())
+            .map(NativeQuotedBackendGroup::refresh)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_groups(groups)
+    }
+
+    fn wait_for_domain_busy_retry(
+        deadline: Instant,
+        retry_delay: &mut Duration,
+    ) -> Result<bool, NativeMemoryAdmissionError> {
+        if super::thread_job_cancel_flag()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(NativeMemoryAdmissionError::CanceledWhileWaitingForDomain);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(*retry_delay);
+        *retry_delay = (*retry_delay * 2).min(Self::DOMAIN_BUSY_MAX_BACKOFF);
+        if super::thread_job_cancel_flag()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(NativeMemoryAdmissionError::CanceledWhileWaitingForDomain);
+        }
+        Ok(true)
     }
 
     fn require_opaque_driver_headroom(
@@ -1611,6 +1696,8 @@ pub(crate) enum NativeMemoryAdmissionError {
     Planning(#[from] MemoryPlanningError),
     #[error(transparent)]
     RequestKinds(#[from] NativeMemoryRequestKindError),
+    #[error("native memory admission was canceled while waiting for a provisional domain gate")]
+    CanceledWhileWaitingForDomain,
     #[error("partitioned native reservation set mismatch: expected={expected}, actual={actual}")]
     PartitionedReservationSetMismatch { expected: usize, actual: usize },
     #[error(
@@ -1694,11 +1781,161 @@ pub(crate) enum NativeMemoryAdmissionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, sync::Mutex};
+    use std::{
+        cell::Cell,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use crate::device::execution_memory::{DeviceMemoryPolicy, ExecutionPhase};
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[cfg(target_os = "macos")]
+    fn live_buffer_admission_plan(
+        group_id: &str,
+        request_id: u64,
+    ) -> (ffi::GgmlBackendRaw, NativeMemoryAdmissionPlan) {
+        crate::ggml_runtime::ensure_backends_loaded();
+        let backend = unsafe { ffi::ggml_backend_init_best() };
+        assert!(!backend.is_null(), "macOS must expose a ggml backend");
+        let device = unsafe { ffi::ggml_backend_get_device(backend) };
+        assert!(!device.is_null());
+        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
+        assert!(!buft.is_null());
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+            request_id,
+            backend,
+            buft,
+            requested_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        let semantics = semantics(group_id, PhaseSet::ALL);
+        let abi = unsafe { BackendMemoryAbi::from_backend(backend) }
+            .expect("the selected backend must expose the memory ABI");
+        let group = NativeQuotedBackendGroup::quote(
+            group_id,
+            identity(group_id),
+            abi,
+            vec![request],
+            BTreeMap::from([(request_id, semantics.clone())]),
+            semantics,
+        )
+        .unwrap();
+        let plan = NativeMemoryAdmissionPlan::from_groups(vec![group]).unwrap();
+        assert!(!plan.reservation_requests().is_empty());
+        (backend, plan)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn provisional_gate_for_plan(
+        broker: &Arc<DeviceMemoryBrokerSet>,
+        plan: &NativeMemoryAdmissionPlan,
+        resource_id: &str,
+    ) -> DeviceMemoryReservationBatch {
+        let quoted = &plan.reservation_requests()[0];
+        broker
+            .try_reserve_batch(vec![DomainReservationRequest {
+                domain: quoted.domain.clone(),
+                snapshot: quoted.snapshot,
+                peak_bytes: 0,
+                retained_bytes: 0,
+                observed_peak_bytes: None,
+                requires_reconciliation: true,
+                resource_id: resource_id.to_owned(),
+                cohort_id: None,
+            }])
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisional_domain_wait_requotes_after_the_competing_gate_releases() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let (backend, plan) = live_buffer_admission_plan("retry-single", 1);
+        let blocker = provisional_gate_for_plan(&broker, &plan, "competing-single");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            drop(blocker);
+        });
+
+        let started = Instant::now();
+        let transaction = plan.try_reserve(&broker, None).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        drop(transaction);
+        release.join().unwrap();
+        unsafe { ffi::ggml_backend_free(backend) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn partitioned_provisional_domain_wait_requotes_every_child_plan() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let (backend_a, plan_a) = live_buffer_admission_plan("retry-partition-a", 1);
+        let (backend_b, plan_b) = live_buffer_admission_plan("retry-partition-b", 2);
+        let blocker = provisional_gate_for_plan(&broker, &plan_a, "competing-partition");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            drop(blocker);
+        });
+
+        let started = Instant::now();
+        let transactions =
+            NativeMemoryAdmissionPlan::try_reserve_partitioned(vec![plan_a, plan_b], &broker, None)
+                .unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        drop(transactions);
+        release.join().unwrap();
+        unsafe {
+            ffi::ggml_backend_free(backend_a);
+            ffi::ggml_backend_free(backend_b);
+        }
+    }
+
+    #[test]
+    fn provisional_domain_wait_observes_job_cancellation_before_sleeping() {
+        let canceled = Arc::new(AtomicBool::new(true));
+        let _cancel = crate::ggml_runtime::InheritedJobCancelGuard::arm(&canceled);
+        let mut retry_delay = Duration::from_millis(32);
+
+        let error = NativeMemoryAdmissionPlan::wait_for_domain_busy_retry(
+            Instant::now() + Duration::from_secs(30),
+            &mut retry_delay,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NativeMemoryAdmissionError::CanceledWhileWaitingForDomain
+        ));
+        assert_eq!(retry_delay, Duration::from_millis(32));
+        assert!(canceled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn provisional_domain_wait_preserves_the_original_busy_error_after_deadline() {
+        let mut retry_delay = Duration::from_millis(1);
+
+        assert!(
+            !NativeMemoryAdmissionPlan::wait_for_domain_busy_retry(
+                Instant::now(),
+                &mut retry_delay,
+            )
+            .unwrap()
+        );
+        assert_eq!(retry_delay, Duration::from_millis(1));
+    }
 
     fn identity(value: &str) -> PhysicalDeviceKey {
         PhysicalDeviceKey::new(value).unwrap()

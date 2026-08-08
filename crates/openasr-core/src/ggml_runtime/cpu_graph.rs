@@ -7443,6 +7443,12 @@ fn memory_admission_error_maybe(
     source: NativeMemoryAdmissionError,
     record_capacity: bool,
 ) -> GgmlCpuGraphError {
+    if matches!(
+        source,
+        NativeMemoryAdmissionError::CanceledWhileWaitingForDomain
+    ) {
+        return GgmlCpuGraphError::Canceled;
+    }
     let reason = source.to_string();
     let device_lost = matches!(
         &source,
