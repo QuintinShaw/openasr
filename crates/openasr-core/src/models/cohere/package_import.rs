@@ -905,4 +905,11 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn positional_bias_dims_are_reversed_once_but_bytes_remain_head_major() {
+        let dims = normalize_cohere_weight_dims("enc.blk.0.attn.pos_bias_u", &[2, 8], vec![2, 8])
+            .expect("normalize pos bias");
+        assert_eq!(dims, vec![8, 2]);
+    }
 }

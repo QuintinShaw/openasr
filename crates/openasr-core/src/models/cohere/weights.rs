@@ -118,6 +118,47 @@ pub(crate) fn load_vector_weight_for_runtime(
     load_vector_weight_impl(reader, tensor_name, expected_len, true)
 }
 
+/// Load a rank-2 GGUF tensor whose mathematical consumer is a flattened
+/// vector, while pinning the writer's exact GGUF dimension order.
+///
+/// Transformer-XL positional biases originate as row-major HF
+/// `[n_heads, head_dim]`. The importer preserves the bytes and reverses only
+/// the GGUF dimensions to `[head_dim, n_heads]`, so flattening the decoded
+/// payload already yields the required head-major `d_model` vector. Treating
+/// this as a generic matrix and transposing again changes the mathematics.
+pub(crate) fn load_flattened_matrix_vector_weight(
+    reader: &GgufTensorDataReader,
+    tensor_name: &str,
+    expected_gguf_dims: [usize; 2],
+) -> Result<CohereVectorWeight, CohereWeightLoadError> {
+    let tensor = require_tensor(reader, tensor_name)?;
+    let expected_dims = expected_gguf_dims.map(|dim| dim as u64);
+    if tensor.dims.as_slice() != expected_dims {
+        return Err(CohereWeightLoadError::InvalidTensorShape {
+            tensor_name: tensor_name.to_string(),
+            shape: render_shape_u64(&tensor.dims),
+            reason: format!("expected exact GGUF dims {expected_dims:?}"),
+        });
+    }
+    let len = expected_gguf_dims[0]
+        .checked_mul(expected_gguf_dims[1])
+        .ok_or_else(|| CohereWeightLoadError::InvalidTensorShape {
+            tensor_name: tensor_name.to_string(),
+            shape: render_shape_u64(&tensor.dims),
+            reason: "flattened matrix element count overflowed".to_string(),
+        })?;
+    let values = reader
+        .host_tensor_f32_copy_dequantized_by_name(tensor_name, &expected_dims)
+        .map_err(map_tensor_read_error)?;
+    ensure_all_finite(tensor_name, &values)?;
+    Ok(CohereVectorWeight {
+        name: tensor_name.to_string(),
+        len,
+        values,
+        raw_ggml: None,
+    })
+}
+
 fn load_vector_weight_impl(
     reader: &GgufTensorDataReader,
     tensor_name: &str,

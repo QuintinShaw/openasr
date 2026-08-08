@@ -371,6 +371,7 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
         let names = encoder_layer_tensor_names(layer_idx);
         let enc_ffn_up_dims = [metadata.encoder_d_model, metadata.encoder_ffn_dim];
         let enc_ffn_down_dims = [metadata.encoder_ffn_dim, metadata.encoder_d_model];
+        let enc_pos_bias_dims = [metadata.encoder_head_dim, metadata.encoder_heads];
         let bindings = [
             TensorBindingSpec {
                 tensor_name: names.ff1_norm_weight.as_str(),
@@ -488,25 +489,14 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
                 reason: "expected encoder hidden-size bias",
             },
             TensorBindingSpec {
-                // pos_bias is graph-consumed as a row-major [heads, head_dim]
-                // matrix, but the importer still reverses HF dims for pos_bias
-                // while fixtures ship [heads, head_dim]. Loader accepts either
-                // and transposes on upload -- orientation is not uniquely
-                // determined yet, so keep Rank2EitherDims rather than guess.
                 tensor_name: names.attn_pos_bias_u.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.encoder_heads,
-                    metadata.encoder_head_dim,
-                ),
-                reason: "expected [heads, head_dim] positional bias matrix (either orientation until importer/fixture align)",
+                requirement: TensorBindingRequirement::ExactDims(&enc_pos_bias_dims),
+                reason: "Transformer-XL pos_bias_u must be GGUF [head_dim, n_heads]; bytes stay HF head-major and are flattened without transpose",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_pos_bias_v.as_str(),
-                requirement: TensorBindingRequirement::Rank2EitherDims(
-                    metadata.encoder_heads,
-                    metadata.encoder_head_dim,
-                ),
-                reason: "expected [heads, head_dim] positional bias matrix (either orientation until importer/fixture align)",
+                requirement: TensorBindingRequirement::ExactDims(&enc_pos_bias_dims),
+                reason: "Transformer-XL pos_bias_v must be GGUF [head_dim, n_heads]; bytes stay HF head-major and are flattened without transpose",
             },
             TensorBindingSpec {
                 tensor_name: names.ff1_up_weight.as_str(),
@@ -1021,6 +1011,38 @@ mod tests {
             error,
             CohereTranscribeRuntimeContractError::InvalidTensorShape { ref name, .. }
                 if name == ENC_PROJ_WEIGHT
+        ));
+    }
+
+    #[test]
+    fn rejects_transposed_transformer_xl_positional_bias() {
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        assert_ne!(
+            metadata.encoder_heads, metadata.encoder_head_dim,
+            "test requires distinguishable positional-bias dimensions"
+        );
+        let name = encoder_layer_tensor_names(0).attn_pos_bias_u;
+        // Canonical GGUF dims are [head_dim, n_heads]. Re-introducing source
+        // HF metadata order [n_heads, head_dim] must fail before the loader can
+        // transpose the already head-major payload a second time.
+        let spec = base.with_tensor_shape(
+            name.clone(),
+            [
+                metadata.encoder_heads as u64,
+                metadata.encoder_head_dim as u64,
+            ],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed positional bias must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { name: ref bad, .. }
+                if bad == &name
         ));
     }
 

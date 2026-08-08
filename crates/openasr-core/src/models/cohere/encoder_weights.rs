@@ -8,8 +8,7 @@ use super::tensor_names::{
 };
 use super::weights::{
     CohereMatrixWeight, CohereTensorWeight, CohereVectorWeight, CohereWeightLoadError,
-    load_matrix_weight, load_matrix_weight_for_runtime,
-    load_tensor_weight_with_rank_for_runtime_expected_type,
+    load_matrix_weight_for_runtime, load_tensor_weight_with_rank_for_runtime_expected_type,
     load_tensor_weight_with_required_dims_and_ranks,
     load_tensor_weight_with_required_dims_and_ranks_for_runtime,
     load_tensor_weight_with_required_dims_and_ranks_for_runtime_expected_type, load_vector_weight,
@@ -35,8 +34,8 @@ pub(crate) struct CohereEncoderLayerWeights {
     pub attn_out_weight: CohereMatrixWeight,
     pub attn_out_bias: CohereVectorWeight,
     pub attn_pos_weight: CohereMatrixWeight,
-    pub attn_pos_bias_u: CohereMatrixWeight,
-    pub attn_pos_bias_v: CohereMatrixWeight,
+    pub attn_pos_bias_u: CohereVectorWeight,
+    pub attn_pos_bias_v: CohereVectorWeight,
     pub conv_norm_weight: CohereVectorWeight,
     pub conv_norm_bias: CohereVectorWeight,
     pub conv_pw1_weight: CohereTensorWeight,
@@ -115,8 +114,6 @@ impl CohereTranscribeEncoderWeights {
                 &layer.attn_v_weight,
                 &layer.attn_out_weight,
                 &layer.attn_pos_weight,
-                &layer.attn_pos_bias_u,
-                &layer.attn_pos_bias_v,
                 &layer.ff2_up_weight,
                 &layer.ff2_down_weight,
             ] {
@@ -140,6 +137,8 @@ impl CohereTranscribeEncoderWeights {
                 &layer.attn_k_bias,
                 &layer.attn_v_bias,
                 &layer.attn_out_bias,
+                &layer.attn_pos_bias_u,
+                &layer.attn_pos_bias_v,
                 &layer.conv_norm_weight,
                 &layer.conv_norm_bias,
                 &layer.conv_pw1_bias,
@@ -314,17 +313,15 @@ pub(crate) fn load_cohere_transcribe_encoder_weights_from_reader(
                 enc_d_model,
                 enc_d_model,
             )?,
-            attn_pos_bias_u: load_matrix_weight(
+            attn_pos_bias_u: super::weights::load_flattened_matrix_vector_weight(
                 reader,
                 &names.attn_pos_bias_u,
-                enc_heads,
-                enc_head_dim,
+                [enc_head_dim, enc_heads],
             )?,
-            attn_pos_bias_v: load_matrix_weight(
+            attn_pos_bias_v: super::weights::load_flattened_matrix_vector_weight(
                 reader,
                 &names.attn_pos_bias_v,
-                enc_heads,
-                enc_head_dim,
+                [enc_head_dim, enc_heads],
             )?,
             conv_norm_weight: load_vector_weight(reader, &names.conv_norm_weight, enc_d_model)?,
             conv_norm_bias: load_vector_weight(reader, &names.conv_norm_bias, enc_d_model)?,
@@ -644,7 +641,7 @@ mod tests {
         assert_eq!(weights.pre_out_bias.values.len(), 16);
         assert_eq!(weights.encoder_projection_bias.values.len(), 16);
         assert_eq!(weights.layers[0].conv_pw1_bias.values.len(), 32);
-        assert_eq!(weights.layers[1].attn_pos_bias_u.rows, 2);
+        assert_eq!(weights.layers[1].attn_pos_bias_u.len, 16);
         assert!(weights.layers[1].conv_dw_weight.raw_ggml.is_none());
     }
 

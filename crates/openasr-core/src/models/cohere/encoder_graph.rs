@@ -397,14 +397,14 @@ impl CohereTranscribeEncoderGraphRuntime {
                     &layer.attn_pos_weight,
                     "enc_attn_pos_weight",
                 )?,
-                attn_pos_bias_u: new_static_row_major_matrix_tensor(
+                attn_pos_bias_u: new_static_tensor_1d_from_len(
                     &arena,
-                    &layer.attn_pos_bias_u,
+                    layer.attn_pos_bias_u.len,
                     "enc_attn_pos_bias_u",
                 )?,
-                attn_pos_bias_v: new_static_row_major_matrix_tensor(
+                attn_pos_bias_v: new_static_tensor_1d_from_len(
                     &arena,
-                    &layer.attn_pos_bias_v,
+                    layer.attn_pos_bias_v.len,
                     "enc_attn_pos_bias_v",
                 )?,
                 conv_norm_weight: new_static_tensor_1d_from_len(
@@ -1517,16 +1517,6 @@ fn new_static_projection_tensor(
         .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed { step, source })
 }
 
-fn new_static_row_major_matrix_tensor(
-    arena: &GgmlStaticTensorArena,
-    weight: &super::weights::CohereMatrixWeight,
-    step: &'static str,
-) -> Result<GgmlStaticTensor, CohereTranscribeEncoderError> {
-    arena
-        .new_tensor_2d_f32(weight.rows, weight.cols, step)
-        .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed { step, source })
-}
-
 fn upload_static_f32(
     arena: &mut GgmlStaticTensorArena,
     tensor: GgmlStaticTensor,
@@ -1618,21 +1608,6 @@ fn upload_static_projection_f32(
             transpose_matrix(&weight.values, weight.rows, weight.cols)?
         }
         super::weights::CohereMatrixLayout::ColumnsByRows => weight.values.clone(),
-    };
-    upload_static_f32(arena, tensor, &values, step)
-}
-
-fn upload_static_row_major_matrix_f32(
-    arena: &mut GgmlStaticTensorArena,
-    tensor: GgmlStaticTensor,
-    weight: &super::weights::CohereMatrixWeight,
-    step: &'static str,
-) -> Result<(), CohereTranscribeEncoderError> {
-    let values = match weight.layout {
-        super::weights::CohereMatrixLayout::RowsByColumns => weight.values.clone(),
-        super::weights::CohereMatrixLayout::ColumnsByRows => {
-            transpose_matrix(&weight.values, weight.cols, weight.rows)?
-        }
     };
     upload_static_f32(arena, tensor, &values, step)
 }
@@ -1759,16 +1734,16 @@ fn upload_static_encoder_layer(
             "enc_attn_pos_weight",
         )?;
     }
-    upload_static_row_major_matrix_f32(
+    upload_static_f32(
         arena,
         tensors.attn_pos_bias_u,
-        &layer.attn_pos_bias_u,
+        &layer.attn_pos_bias_u.values,
         "enc_attn_pos_bias_u",
     )?;
-    upload_static_row_major_matrix_f32(
+    upload_static_f32(
         arena,
         tensors.attn_pos_bias_v,
-        &layer.attn_pos_bias_v,
+        &layer.attn_pos_bias_v.values,
         "enc_attn_pos_bias_v",
     )?;
     upload_static_f32(

@@ -1992,11 +1992,11 @@ impl TinyGgufFixtureSpec {
                 )
                 .with_tensor_shape(
                     format!("{prefix}attn.pos_bias_u"),
-                    [encoder_heads, encoder_head_dim],
+                    [encoder_head_dim, encoder_heads],
                 )
                 .with_tensor_shape(
                     format!("{prefix}attn.pos_bias_v"),
-                    [encoder_heads, encoder_head_dim],
+                    [encoder_head_dim, encoder_heads],
                 )
                 .with_tensor_shape(format!("{prefix}conv.norm.weight"), [encoder_d_model])
                 .with_tensor_shape(format!("{prefix}conv.norm.bias"), [encoder_d_model])
