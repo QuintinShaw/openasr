@@ -135,12 +135,8 @@ pub fn requantize_oasr_pack(
             parsed: parsed_metadata_count,
         });
     }
-    let source_quant = preflight.metadata().get_string(PACK_QUANT_KEY).ok_or(
-        PackRequantError::MissingMetadata {
-            key: PACK_QUANT_KEY,
-        },
-    )?;
-    if source_quant == target.label() {
+    let source_quant = preflight.metadata().get_string(PACK_QUANT_KEY);
+    if source_quant == Some(target.label()) {
         return Err(PackRequantError::NoEligibleTensor {
             architecture: model_architecture,
             target: target.label(),
@@ -150,7 +146,7 @@ pub fn requantize_oasr_pack(
         .metadata()
         .get_string(MODEL_ID_KEY)
         .ok_or(PackRequantError::MissingMetadata { key: MODEL_ID_KEY })?;
-    let output_model_id = requantized_model_id(model_id, source_quant, target.label())?;
+    let output_model_id = requantized_model_id(model_id, target.label())?;
     let family_metadata =
         requantized_metadata(preflight.metadata().values(), &output_model_id, target)?;
     let transaction = OasrPackWriter::begin(
@@ -337,16 +333,17 @@ fn requantize_tensor_rows(
 
 fn requantized_model_id(
     source_model_id: &str,
-    source_quant: &str,
     target_quant: &str,
 ) -> Result<String, PackRequantError> {
-    let suffix = format!(":{source_quant}");
-    let base = source_model_id
-        .strip_suffix(&suffix)
-        .or_else(|| (!source_model_id.contains(':')).then_some(source_model_id))
-        .ok_or_else(|| PackRequantError::InvalidModelId {
-            model_id: source_model_id.to_string(),
-        })?;
+    let base = match source_model_id.rsplit_once(':') {
+        Some((base, suffix)) if ["fp16", "q8_0", "q3_k", "q4_k"].contains(&suffix) => base,
+        Some(_) => {
+            return Err(PackRequantError::InvalidModelId {
+                model_id: source_model_id.to_string(),
+            });
+        }
+        None => source_model_id,
+    };
     if base.trim().is_empty() {
         return Err(PackRequantError::InvalidModelId {
             model_id: source_model_id.to_string(),
@@ -479,10 +476,14 @@ mod tests {
     #[test]
     fn model_id_rebind_is_exact_and_does_not_guess_another_suffix() {
         assert_eq!(
-            requantized_model_id("mimo-v2.5-asr:q8_0", "q8_0", "q4_k").unwrap(),
+            requantized_model_id("mimo-v2.5-asr:q8_0", "q4_k").unwrap(),
             "mimo-v2.5-asr:q4_k"
         );
-        assert!(requantized_model_id("mimo-v2.5-asr:fp16", "q8_0", "q4_k").is_err());
+        assert_eq!(
+            requantized_model_id("moss-transcribe-diarize", "q4_k").unwrap(),
+            "moss-transcribe-diarize:q4_k"
+        );
+        assert!(requantized_model_id("mimo-v2.5-asr:custom", "q4_k").is_err());
     }
 
     #[test]
