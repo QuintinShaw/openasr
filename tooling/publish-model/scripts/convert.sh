@@ -130,7 +130,14 @@ if [[ -n "$EXTERNAL_CONVERTER" ]]; then
 
     cmd="$(expand_quoted_external_template "$SOURCE_TOKEN" "$REQUANT_STAGING")"
     log "external converter $MODEL @ $REQUANT_SOURCE_QUANT -> $REQUANT_STAGING"
-    (cd "$REPO_ROOT" && eval "$cmd") \
+    (
+      cd "$REPO_ROOT"
+      # gguf-py uses tempfile internally even when its final output lives on
+      # another volume. Keep those multi-gigabyte scratch tensors beside the
+      # staging pack instead of silently exhausting the system disk.
+      export TMPDIR="$REQUANT_STAGING_DIR"
+      eval "$cmd"
+    ) \
       || die "external converter failed for $MODEL @ $REQUANT_SOURCE_QUANT"
     [[ -f "$REQUANT_STAGING" ]] \
       || die "external converter produced no staging pack at $REQUANT_STAGING"
