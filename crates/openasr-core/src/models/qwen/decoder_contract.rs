@@ -14,6 +14,7 @@
 //!   to the family's layer-name provider so
 //!   admission and whole-decoder planning cannot pick different option pairs;
 //! - [`QwenDecoderTailTensorNames`] for norm / logits / embedding constants.
+//!
 //! Only the resulting [`QwenDecoderContract`] crosses admission, planning,
 //! tail loading, host quoting, or backend compilation seams; the three raw
 //! inputs are adapter-local construction details.
