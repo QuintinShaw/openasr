@@ -1,10 +1,8 @@
 //! Contract-projected loader for the Qwen-shaped decoder tail.
 //!
-//! Admission expands final RMSNorm / token embedding / optional logits weight
-//! through [`super::decoder_contract::qwen_decoder_tail_tensor_descriptors`].
-//! Production materialization must use that same geometry +
-//! [`QwenDecoderTailTensorNames`] pair so d_model/vocab shape authority cannot
-//! drift into a second hand-written table at each family call site.
+//! Admission and production materialization project final RMSNorm / token
+//! embedding / optional logits weight from one bound [`QwenDecoderContract`].
+//! Family callers cannot pass geometry or tensor names independently.
 //!
 //! When [`QwenDecoderTailTensorNames::output_weight`] is `None` (tied
 //! embeddings, e.g. MOSS-Transcribe-Diarize), the logits head reuses
@@ -16,7 +14,7 @@ use thiserror::Error;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
 use crate::models::tensor_binding::validate_tensor_binding_descriptors;
 
-use super::decoder_contract::{QwenDecoderContract, qwen_decoder_tail_tensor_descriptors};
+use super::decoder_contract::QwenDecoderContract;
 use super::logits_head::{
     Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError,
     load_llm_logits_head_from_reader_with_tensor_names,
@@ -43,25 +41,25 @@ pub(crate) enum QwenDecoderTailLoadError {
     TokenEmbedding(#[from] Qwen3AsrTokenEmbeddingError),
 }
 
-/// Load the decoder tail from the same geometry + tail names admission expands.
+/// Load the decoder tail from the same bound contract admission expands.
 ///
 /// Shape authority is only
-/// [`qwen_decoder_tail_tensor_descriptors`] (`VectorLen` / `ExactDims`). The
+/// the contract's tail projection (`VectorLen` / `ExactDims`). The
 /// pack cannot invent a second d_model/vocab geometry here. Transposed logits
 /// or embedding matrices and a missing final norm fail closed before any host
 /// materialization runs.
 ///
-/// `tail` is `'static` because the resident logits head stores the output-weight
+/// Contract tail names are `'static` because the resident logits head stores the output-weight
 /// tensor name for diagnostics and fused-graph binding.
 pub(crate) fn load_qwen_decoder_tail_from_contract(
     reader: &GgufTensorDataReader,
-    contract: QwenDecoderContract,
+    contract: &QwenDecoderContract,
     rms_norm_epsilon: f32,
     backend: GgmlCpuGraphBackend,
 ) -> Result<QwenDecoderTail, QwenDecoderTailLoadError> {
     let geometry = contract.geometry();
-    let tail = contract.tail();
-    let descriptors = qwen_decoder_tail_tensor_descriptors(&geometry, tail)
+    let (tail, descriptors) = contract
+        .tail_projection()
         .map_err(|reason| QwenDecoderTailLoadError::Contract { reason })?;
     // Single shape gate: the same ExactDims/VectorLen admission validated.
     validate_tensor_binding_descriptors(
@@ -105,10 +103,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
-    use crate::models::qwen::decoder_contract::qwen_decoder_tail_tensor_descriptors;
     use crate::models::qwen::{
         QwenDecoderContractGeometry, QwenDecoderTailTensorNames, QwenDecoderVariant,
-        QwenFamilyDecoderProfile,
+        QwenFamilyDecoderProfile, QwenFamilyLlmLayerTensorNames,
     };
     use crate::models::tensor_binding::{
         TensorBindingDescriptorRequirement, assert_trace_matches_descriptor_set,
@@ -118,17 +115,33 @@ mod tests {
 
     use super::*;
 
-    /// Bind geometry+tail for tail-only loader tests. Layer names are unused.
+    fn tail_test_layer_names(layer: usize) -> QwenFamilyLlmLayerTensorNames {
+        let prefix = format!("blk.{layer}");
+        QwenFamilyLlmLayerTensorNames {
+            attn_norm_name: format!("{prefix}.attn_norm.weight"),
+            attn_q_name: format!("{prefix}.attn_q.weight"),
+            attn_k_name: format!("{prefix}.attn_k.weight"),
+            attn_v_name: format!("{prefix}.attn_v.weight"),
+            attn_output_name: format!("{prefix}.attn_output.weight"),
+            q_norm_name: Some(format!("{prefix}.attn_q_norm.weight")),
+            k_norm_name: Some(format!("{prefix}.attn_k_norm.weight")),
+            q_bias_name: None,
+            k_bias_name: None,
+            v_bias_name: None,
+            ffn_norm_name: format!("{prefix}.ffn_norm.weight"),
+            ffn_gate_name: format!("{prefix}.ffn_gate.weight"),
+            ffn_up_name: format!("{prefix}.ffn_up.weight"),
+            ffn_down_name: format!("{prefix}.ffn_down.weight"),
+        }
+    }
+
     fn bind_tail_only(
         geometry: QwenDecoderContractGeometry,
         tail: QwenDecoderTailTensorNames<'static>,
     ) -> QwenDecoderContract {
-        fn stub_layer(_: usize) -> crate::models::qwen::QwenFamilyLlmLayerTensorNames {
-            unreachable!("tail-only fixture does not expand layers")
-        }
         QwenDecoderContract::bind(
             geometry,
-            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen3, stub_layer, tail),
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen3, tail_test_layer_names, tail),
         )
         .expect("tail-only bind")
     }
@@ -163,12 +176,10 @@ mod tests {
 
     fn write_tail_fixture(
         path: &std::path::Path,
-        geometry: &QwenDecoderContractGeometry,
-        tail: QwenDecoderTailTensorNames<'static>,
+        contract: &QwenDecoderContract,
         mutate: impl FnOnce(&mut BTreeMap<String, Vec<u64>>),
     ) {
-        let descriptors =
-            qwen_decoder_tail_tensor_descriptors(geometry, tail).expect("tail descriptors");
+        let (_, descriptors) = contract.tail_projection().expect("tail descriptors");
         let mut shapes: BTreeMap<String, Vec<u64>> =
             project_fixture_tensors(&descriptors).into_iter().collect();
         mutate(&mut shapes);
@@ -183,21 +194,16 @@ mod tests {
     fn loader_read_trace_matches_tail_descriptors_untied() {
         let geometry = tiny_geometry();
         let tail = untied_tail();
-        let descriptors =
-            qwen_decoder_tail_tensor_descriptors(&geometry, tail).expect("descriptors");
+        let contract = bind_tail_only(geometry, tail);
+        let (_, descriptors) = contract.tail_projection().expect("descriptors");
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("tail-untied.oasr");
-        write_tail_fixture(&path, &geometry, tail, |_| {});
+        write_tail_fixture(&path, &contract, |_| {});
 
         let reader = GgufTensorDataReader::from_path(&path).expect("reader");
         reader.tensor_index().enable_access_trace();
-        load_qwen_decoder_tail_from_contract(
-            &reader,
-            bind_tail_only(geometry, tail),
-            1e-6,
-            GgmlCpuGraphBackend::Cpu,
-        )
-        .expect("load untied tail");
+        load_qwen_decoder_tail_from_contract(&reader, &contract, 1e-6, GgmlCpuGraphBackend::Cpu)
+            .expect("load untied tail");
         assert_trace_matches_descriptor_set(&reader.tensor_index().access_trace(), &descriptors);
     }
 
@@ -205,21 +211,21 @@ mod tests {
     fn loader_read_trace_matches_tail_descriptors_tied() {
         let geometry = tiny_geometry();
         let tail = tied_tail();
-        let descriptors =
-            qwen_decoder_tail_tensor_descriptors(&geometry, tail).expect("descriptors");
+        let contract = bind_tail_only(geometry, tail);
+        let (_, descriptors) = contract.tail_projection().expect("descriptors");
         // Tied: descriptor set is norm + embd only (no separate output.weight).
         assert_eq!(descriptors.len(), 2);
         assert!(descriptors.iter().all(|d| d.tensor_name != "output.weight"));
 
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("tail-tied.oasr");
-        write_tail_fixture(&path, &geometry, tail, |_| {});
+        write_tail_fixture(&path, &contract, |_| {});
 
         let reader = GgufTensorDataReader::from_path(&path).expect("reader");
         reader.tensor_index().enable_access_trace();
         let loaded = load_qwen_decoder_tail_from_contract(
             &reader,
-            bind_tail_only(geometry, tail),
+            &contract,
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )
@@ -242,9 +248,10 @@ mod tests {
     fn rejects_transposed_logits_weight() {
         let geometry = tiny_geometry();
         let tail = untied_tail();
+        let contract = bind_tail_only(geometry, tail);
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("tail-transposed-logits.oasr");
-        write_tail_fixture(&path, &geometry, tail, |shapes| {
+        write_tail_fixture(&path, &contract, |shapes| {
             shapes.insert(
                 "output.weight".to_string(),
                 // Contract ExactDims is [d_model, vocab] = [4, 6]; force transpose.
@@ -254,7 +261,7 @@ mod tests {
         let reader = GgufTensorDataReader::from_path(&path).expect("reader");
         let err = load_qwen_decoder_tail_from_contract(
             &reader,
-            bind_tail_only(geometry, tail),
+            &contract,
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )
@@ -270,15 +277,16 @@ mod tests {
     fn rejects_missing_output_norm() {
         let geometry = tiny_geometry();
         let tail = untied_tail();
+        let contract = bind_tail_only(geometry, tail);
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("tail-missing-norm.oasr");
-        write_tail_fixture(&path, &geometry, tail, |shapes| {
+        write_tail_fixture(&path, &contract, |shapes| {
             shapes.remove("output_norm.weight");
         });
         let reader = GgufTensorDataReader::from_path(&path).expect("reader");
         let err = load_qwen_decoder_tail_from_contract(
             &reader,
-            bind_tail_only(geometry, tail),
+            &contract,
             1e-6,
             GgmlCpuGraphBackend::Cpu,
         )
@@ -294,8 +302,8 @@ mod tests {
     fn descriptor_exact_dims_are_d_model_by_vocab() {
         let geometry = tiny_geometry();
         let tail = untied_tail();
-        let descriptors =
-            qwen_decoder_tail_tensor_descriptors(&geometry, tail).expect("descriptors");
+        let contract = bind_tail_only(geometry, tail);
+        let (_, descriptors) = contract.tail_projection().expect("descriptors");
         let emb = descriptors
             .iter()
             .find(|d| d.tensor_name == "token_embd.weight")

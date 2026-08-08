@@ -525,9 +525,9 @@ pub(crate) fn moss_td_qwen_family_layer_names(
     }
 }
 
-/// Single-source Qwen3 decoder profile for MOSS-Transcribe-Diarize: options +
-/// layer names. Admission descriptors and whole-decoder planning both read
-/// this value.
+/// Adapter-local Qwen3 profile for MOSS-Transcribe-Diarize: closed variant,
+/// layer names, and tied tail. It is immediately geometry-bound into one
+/// contract consumed by admission, planning, tail load, and host quote.
 pub(crate) fn moss_td_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
         crate::models::qwen::QwenDecoderVariant::Qwen3,
@@ -551,14 +551,6 @@ pub(crate) fn moss_td_qwen_decoder_contract(
     .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })
 }
 
-pub(crate) fn moss_td_decoder_tensor_descriptors(
-    decoder: &MossTdDecoderMetadata,
-) -> Result<Vec<TensorBindingDescriptor>, MossTdRuntimeContractError> {
-    moss_td_qwen_decoder_contract(decoder)?
-        .runtime_tensor_descriptors()
-        .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })
-}
-
 /// Static tail tensor names shared by admission descriptors and the contract-
 /// projected tail loader. `output_weight = None` encodes MOSS tied embeddings.
 pub(crate) fn moss_td_qwen_decoder_tail_names()
@@ -575,8 +567,8 @@ pub(crate) fn moss_td_qwen_decoder_tail_names()
 /// moss-transcribe-diarize runtime tensor set: the Whisper-style encoder
 /// (`moss.enc.*`), the VQAdaptor bridge (`moss.adaptor.*`), and the
 /// Qwen3-parameterized decoder (`moss.llm.*`). Requirements reference the
-/// parsed metadata only, the same "shapes the pack itself declares" policy
-/// `qwen::runtime_contract::qwen3_runtime_tensor_descriptors` uses.
+/// parsed metadata only. Its decoder half is projected from the bound shared
+/// Qwen contract; encoder/adaptor descriptors remain MOSS-specific topology.
 pub(crate) fn moss_td_runtime_tensor_descriptors(
     metadata: MossTdExecutionMetadata,
 ) -> Result<Vec<TensorBindingDescriptor>, MossTdRuntimeContractError> {
@@ -601,26 +593,10 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
             count: usize::MAX,
             max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
         })?;
-    // Decoder half upper-bounds itself via shared Qwen obligation budget; pin a
-    // conservative decoder contribution so the full-pack ceiling still applies
-    // even if a future decoder option grows the per-layer count.
-    use crate::models::qwen::QwenDecoderContractGeometry;
-    let profile = moss_td_qwen_decoder_profile();
-    let decoder_geometry = moss_td_qwen_decoder_geometry(&decoder);
-    let decoder_tail = profile.tail_tensor_count();
-    decoder_geometry
-        .validate_obligation_budget(profile.options(), decoder_tail)
+    let decoder_contract = moss_td_qwen_decoder_contract(&decoder)?;
+    let decoder_upper = decoder_contract
+        .tensor_obligation_count()
         .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })?;
-    let decoder_upper = decoder_geometry
-        .n_layers
-        .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
-            profile.options(),
-        ))
-        .and_then(|n| n.checked_add(decoder_tail))
-        .ok_or(MossTdRuntimeContractError::TooManyTensorObligations {
-            count: usize::MAX,
-            max: MOSS_TD_MAX_TENSOR_OBLIGATIONS,
-        })?;
     let total_upper = non_decoder.checked_add(decoder_upper).ok_or(
         MossTdRuntimeContractError::TooManyTensorObligations {
             count: usize::MAX,
@@ -834,7 +810,11 @@ pub(crate) fn moss_td_runtime_tensor_descriptors(
     ]);
 
     // --- Qwen3 decoder (shared Qwen-shaped contract) ---------------------------
-    descriptors.extend(moss_td_decoder_tensor_descriptors(&decoder)?);
+    descriptors.extend(
+        decoder_contract
+            .runtime_tensor_descriptors()
+            .map_err(|reason| MossTdRuntimeContractError::InvalidDecoderGeometry { reason })?,
+    );
 
     Ok(descriptors)
 }
@@ -1004,8 +984,12 @@ mod tests {
             (enc.ffn_down_bias, vec![16]),
         ]);
         let decoder = parse_decoder_metadata(&tiny_metadata()).expect("tiny decoder metadata");
+        let decoder_contract =
+            moss_td_qwen_decoder_contract(&decoder).expect("tiny decoder contract");
         tensors.extend(crate::models::tensor_binding::project_fixture_tensors(
-            &moss_td_decoder_tensor_descriptors(&decoder).expect("tiny decoder descriptors"),
+            &decoder_contract
+                .runtime_tensor_descriptors()
+                .expect("tiny decoder descriptors"),
         ));
         tensors
     }

@@ -3,7 +3,7 @@ mod batched_decode;
 pub(crate) mod capacity;
 mod decode_budget;
 mod decode_prompt;
-pub(crate) mod decoder_contract;
+mod decoder_contract;
 mod decoder_tail;
 mod forced_aligner_align_text;
 mod forced_aligner_import;
@@ -63,7 +63,8 @@ pub(crate) use llm_transformer::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
     Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames,
     QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
-    compile_qwen_whole_decoder_graph_from_prepared_plan, even_prefill_chunk_len,
+    add_qwen_decoder_prepared_runtime_quote, compile_qwen_whole_decoder_graph_from_prepared_plan,
+    even_prefill_chunk_len, quoted_qwen_decoder_system_memory_bytes,
     resolve_qwen_family_production_kv_cache_policy,
 };
 pub(crate) use logits_head::{

@@ -18,13 +18,15 @@ use crate::models::qwen::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
     QwenDecoderTail, QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest,
     QwenWholeDecoderPlan, compile_qwen_whole_decoder_graph_from_prepared_plan,
-    load_qwen_decoder_tail_from_contract,
+    load_qwen_decoder_tail_from_contract, quoted_qwen_decoder_system_memory_bytes,
 };
 
 use super::runtime_contract::{
     FUNASR_NANO_RMS_NORM_EPSILON, FUNASR_NANO_ROPE_THETA, FunasrNanoDecoderMetadata,
+    funasr_nano_qwen_decoder_contract,
 };
-use super::tensor_names::{LLM_OUTPUT_WEIGHT, LLM_TOKEN_EMBD_WEIGHT};
+#[cfg(test)]
+use super::tensor_names::LLM_TOKEN_EMBD_WEIGHT;
 
 /// Exact Rust/system-memory quote for one resident FunASR-Nano decoder actor.
 /// Native ggml arenas account their own backend-domain allocations; this quote
@@ -36,51 +38,9 @@ pub(crate) fn quoted_funasr_nano_decoder_system_memory_bytes(
     metadata: &FunasrNanoDecoderMetadata,
     backend: GgmlCpuGraphBackend,
 ) -> Result<(u64, u64), String> {
-    let graph_retained = Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(
-        metadata.n_layers,
-    )?;
-    let plan_transient = QwenWholeDecoderPlan::quoted_retained_system_memory_bytes_for_family(
-        metadata.n_layers,
-        super::runtime_contract::funasr_nano_qwen_decoder_profile().names_for_layer(),
-    )?;
-    let (logits_peak, logits_retained) =
-        Qwen3AsrLlmLogitsHead::quoted_system_memory_bytes_from_reader(
-            reader,
-            LLM_OUTPUT_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-            backend,
-        )?;
-    let (embedding_peak, embedding_retained) =
-        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
-            reader,
-            LLM_TOKEN_EMBD_WEIGHT,
-            metadata.d_model,
-            metadata.vocab_size,
-        )?;
-
-    let retained_bytes = graph_retained
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(embedding_retained))
-        .ok_or_else(|| "funasr-nano decoder retained quote overflowed".to_string())?;
-    let logits_phase_peak = plan_transient
-        .checked_add(logits_peak)
-        .ok_or_else(|| "funasr-nano logits construction peak quote overflowed".to_string())?;
-    let embedding_phase_peak = plan_transient
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(embedding_peak))
-        .ok_or_else(|| "funasr-nano embedding construction peak quote overflowed".to_string())?;
-    let graph_phase_peak = plan_transient
-        .checked_add(logits_retained)
-        .and_then(|bytes| bytes.checked_add(embedding_retained))
-        .and_then(|bytes| bytes.checked_add(graph_retained))
-        .ok_or_else(|| "funasr-nano graph construction peak quote overflowed".to_string())?;
-    Ok((
-        logits_phase_peak
-            .max(embedding_phase_peak)
-            .max(graph_phase_peak),
-        retained_bytes,
-    ))
+    let contract =
+        funasr_nano_qwen_decoder_contract(metadata).map_err(|error| error.to_string())?;
+    quoted_qwen_decoder_system_memory_bytes(reader, &contract, backend)
 }
 
 #[derive(Debug, Error)]
@@ -152,7 +112,7 @@ impl FunasrNanoDecoderRuntime {
                 reason: error.to_string(),
             })?;
         let decoder_plan =
-            QwenWholeDecoderPlan::for_qwen_family(&reader, contract).map_err(|error| {
+            QwenWholeDecoderPlan::for_qwen_family(&reader, &contract).map_err(|error| {
                 FunasrNanoDecoderError::TensorReadFailed {
                     reason: error.to_string(),
                 }
@@ -162,7 +122,7 @@ impl FunasrNanoDecoderRuntime {
             token_embedding,
         } = load_qwen_decoder_tail_from_contract(
             &reader,
-            contract,
+            &contract,
             FUNASR_NANO_RMS_NORM_EPSILON,
             backend,
         )
@@ -524,10 +484,10 @@ mod trace_tests {
 
         // Same single-bind production shape: one contract value drives plan + tail.
         let contract = funasr_nano_qwen_decoder_contract(&metadata).expect("bind decoder contract");
-        QwenWholeDecoderPlan::for_qwen_family(&reader, contract).expect("plan decoder");
+        QwenWholeDecoderPlan::for_qwen_family(&reader, &contract).expect("plan decoder");
         load_qwen_decoder_tail_from_contract(
             &reader,
-            contract,
+            &contract,
             FUNASR_NANO_RMS_NORM_EPSILON,
             GgmlCpuGraphBackend::Cpu,
         )

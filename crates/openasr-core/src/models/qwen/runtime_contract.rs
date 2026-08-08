@@ -365,9 +365,10 @@ pub(crate) fn validate_qwen3_runtime_tensors_with_index(
 pub(crate) fn qwen3_runtime_tensor_descriptors(
     metadata: Qwen3AsrExecutionMetadata,
 ) -> Vec<TensorBindingDescriptor> {
-    // Tail matrices share the decoder_contract ggml [d_model, vocab] pin so the
-    // registry path and the bound decoder tail cannot disagree on orientation.
-    // Graph/logits_head mul_mat and get_rows both consume [d_model, vocab].
+    // The stock Qwen3-ASR route includes audio tensors and therefore owns a
+    // wider descriptor Adapter than the decoder-only contract. Keep its tail
+    // orientation deliberately identical to the bound decoder contract:
+    // graph/logits_head mul_mat and get_rows consume [d_model, vocab].
     let mut descriptors = vec![
         TensorBindingDescriptor {
             tensor_name: TOKEN_EMBD_WEIGHT.to_string(),

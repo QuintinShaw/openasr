@@ -8,12 +8,15 @@
 //! ffn norm, gate/up/down); Qwen3 adds 2 qk-norm tensors (11 total) and Qwen2
 //! adds 3 qkv-bias tensors (12 total).
 //!
-//! Family adapters supply only:
+//! Family adapters bind exactly once from:
 //! - [`QwenDecoderContractGeometry`] from pack metadata;
-//! - a [`QwenFamilyDecoderProfile`] that binds [`QwenDecoderContractOptions`]
-//!   (Qwen3 qk-norm vs Qwen2 qkv-bias) to the family's layer-name provider so
+//! - a [`QwenFamilyDecoderProfile`] that binds the closed Qwen2/Qwen3 variation
+//!   to the family's layer-name provider so
 //!   admission and whole-decoder planning cannot pick different option pairs;
 //! - [`QwenDecoderTailTensorNames`] for norm / logits / embedding constants.
+//! Only the resulting [`QwenDecoderContract`] crosses admission, planning,
+//! tail loading, host quoting, or backend compilation seams; the three raw
+//! inputs are adapter-local construction details.
 //!
 //! Projection weights use ordered ggml `[in, out]` [`ExactDims`] so a transposed
 //! pack fails closed at admission (same rule as FastConformer after pack-contract
@@ -58,11 +61,14 @@ impl QwenDecoderContractGeometry {
         self.n_kv_heads.checked_mul(self.head_dim)
     }
 
-    /// Upper bound on descriptors one layer emits under `options`.
-    pub(crate) fn layer_tensor_count(options: QwenDecoderContractOptions) -> usize {
+    /// Exact descriptor count emitted by one layer of `variant`.
+    const fn layer_tensor_count(variant: QwenDecoderVariant) -> usize {
         // attn_norm + q/k/v/out + ffn_norm + gate/up/down = 9
         // + optional 2 qk-norm or 3 qkv-bias
-        9 + if options.qk_norm() { 2 } else { 0 } + if options.qkv_bias() { 3 } else { 0 }
+        match variant {
+            QwenDecoderVariant::Qwen3 => 11,
+            QwenDecoderVariant::Qwen2 => 12,
+        }
     }
 
     /// Structural pins shared by every Qwen-shaped decoder family, including
@@ -125,13 +131,13 @@ impl QwenDecoderContractGeometry {
 
     /// Fail closed before allocating the full descriptor set when a geometry
     /// would construct more obligations than the global ceiling.
-    pub(crate) fn validate_obligation_budget(
+    fn tensor_obligation_count(
         self,
-        options: QwenDecoderContractOptions,
+        variant: QwenDecoderVariant,
         tail_tensor_count: usize,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         self.validate_basic()?;
-        let per_layer = Self::layer_tensor_count(options);
+        let per_layer = Self::layer_tensor_count(variant);
         let layer_total = self
             .n_layers
             .checked_mul(per_layer)
@@ -144,7 +150,7 @@ impl QwenDecoderContractGeometry {
                 "qwen decoder tensor obligations ({total}) exceed ceiling {QWEN_DECODER_MAX_TENSOR_OBLIGATIONS}"
             ));
         }
-        Ok(())
+        Ok(total)
     }
 }
 
@@ -161,17 +167,15 @@ pub(crate) enum QwenDecoderVariant {
 }
 
 impl QwenDecoderVariant {
-    pub(crate) const fn qk_norm(self) -> bool {
+    const fn qk_norm(self) -> bool {
         matches!(self, Self::Qwen3)
     }
 
-    pub(crate) const fn qkv_bias(self) -> bool {
+    const fn qkv_bias(self) -> bool {
         matches!(self, Self::Qwen2)
     }
 
-    /// Legacy options view for call sites still taking
-    /// [`QwenDecoderContractOptions`] (tests / transitional plan helpers).
-    pub(crate) const fn options(self) -> QwenDecoderContractOptions {
+    const fn options(self) -> QwenDecoderContractOptions {
         QwenDecoderContractOptions {
             qk_norm: self.qk_norm(),
             qkv_bias: self.qkv_bias(),
@@ -179,28 +183,22 @@ impl QwenDecoderVariant {
     }
 }
 
-/// Private POD projected from [`QwenDecoderVariant`] for descriptor helpers.
+/// Private implementation projection of [`QwenDecoderVariant`].
 ///
 /// Fields are private so callers cannot assemble illegal qk_norm/qkv_bias
 /// pairs. Construct only via [`QwenDecoderVariant::options`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QwenDecoderContractOptions {
+struct QwenDecoderContractOptions {
     qk_norm: bool,
     qkv_bias: bool,
 }
 
 impl QwenDecoderContractOptions {
-    /// Test-only named projections of the closed variant set.
-    #[cfg(test)]
-    pub(crate) const QWEN3: Self = QwenDecoderVariant::Qwen3.options();
-    #[cfg(test)]
-    pub(crate) const QWEN2: Self = QwenDecoderVariant::Qwen2.options();
-
-    pub(crate) const fn qk_norm(self) -> bool {
+    const fn qk_norm(self) -> bool {
         self.qk_norm
     }
 
-    pub(crate) const fn qkv_bias(self) -> bool {
+    const fn qkv_bias(self) -> bool {
         self.qkv_bias
     }
 }
@@ -240,25 +238,24 @@ impl QwenFamilyDecoderProfile {
         }
     }
 
-    #[allow(dead_code)] // closed-set accessor; production paths use options()
-    pub(crate) const fn variant(self) -> QwenDecoderVariant {
+    const fn variant(self) -> QwenDecoderVariant {
         self.variant
     }
 
-    pub(crate) const fn options(self) -> QwenDecoderContractOptions {
+    const fn options(self) -> QwenDecoderContractOptions {
         self.variant.options()
     }
 
-    pub(crate) const fn names_for_layer(self) -> fn(usize) -> QwenFamilyLlmLayerTensorNames {
+    const fn names_for_layer(self) -> fn(usize) -> QwenFamilyLlmLayerTensorNames {
         self.names_for_layer
     }
 
-    pub(crate) const fn tail(self) -> QwenDecoderTailTensorNames<'static> {
+    const fn tail(self) -> QwenDecoderTailTensorNames<'static> {
         self.tail
     }
 
     /// Descriptor count for the tail half (norm + embd [+ optional logits]).
-    pub(crate) const fn tail_tensor_count(self) -> usize {
+    const fn tail_tensor_count(self) -> usize {
         if self.tail.output_weight.is_some() {
             3
         } else {
@@ -272,7 +269,7 @@ impl QwenFamilyDecoderProfile {
 /// Fields are private: construct only via [`Self::bind`]. Production planner,
 /// tail loader, admission descriptors, and host quotes must take this value
 /// (or accessors on it) — not separately-threaded geometry/options/names/tail.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct QwenDecoderContract {
     geometry: QwenDecoderContractGeometry,
     profile: QwenFamilyDecoderProfile,
@@ -284,53 +281,165 @@ impl QwenDecoderContract {
         profile: QwenFamilyDecoderProfile,
     ) -> Result<Self, String> {
         geometry.validate_basic()?;
-        geometry.validate_obligation_budget(profile.options(), profile.tail_tensor_count())?;
+        geometry.tensor_obligation_count(profile.variant(), profile.tail_tensor_count())?;
+        validate_tail_names(profile.tail())?;
+        for layer_index in 0..geometry.n_layers {
+            validate_layer_names(profile.variant(), &(profile.names_for_layer())(layer_index))?;
+        }
         Ok(Self { geometry, profile })
     }
 
-    pub(crate) const fn geometry(self) -> QwenDecoderContractGeometry {
+    pub(super) const fn geometry(&self) -> QwenDecoderContractGeometry {
         self.geometry
     }
 
-    #[allow(dead_code)] // kept for diagnostics / family adapters
-    pub(crate) const fn profile(self) -> QwenFamilyDecoderProfile {
-        self.profile
-    }
-
-    #[allow(dead_code)] // closed-set accessor; production paths use options()
-    pub(crate) const fn variant(self) -> QwenDecoderVariant {
+    const fn variant(&self) -> QwenDecoderVariant {
         self.profile.variant()
     }
 
-    pub(crate) const fn options(self) -> QwenDecoderContractOptions {
+    const fn options(&self) -> QwenDecoderContractOptions {
         self.profile.options()
     }
 
-    pub(crate) const fn names_for_layer(self) -> fn(usize) -> QwenFamilyLlmLayerTensorNames {
+    const fn names_for_layer(&self) -> fn(usize) -> QwenFamilyLlmLayerTensorNames {
         self.profile.names_for_layer()
     }
 
-    pub(crate) const fn tail(self) -> QwenDecoderTailTensorNames<'static> {
+    pub(super) const fn tail(&self) -> QwenDecoderTailTensorNames<'static> {
         self.profile.tail()
     }
 
-    pub(crate) fn runtime_tensor_descriptors(self) -> Result<Vec<TensorBindingDescriptor>, String> {
-        qwen_decoder_runtime_tensor_descriptors(
+    /// Exact number of decoder tensor obligations represented by this proof.
+    pub(crate) fn tensor_obligation_count(&self) -> Result<usize, String> {
+        self.geometry
+            .tensor_obligation_count(self.variant(), self.profile.tail_tensor_count())
+    }
+
+    pub(crate) fn runtime_tensor_descriptors(
+        &self,
+    ) -> Result<Vec<TensorBindingDescriptor>, String> {
+        runtime_tensor_descriptors(
             &self.geometry,
             self.options(),
             self.names_for_layer(),
             self.tail(),
+            self.profile.tail_tensor_count(),
         )
     }
 
-    #[allow(dead_code)] // per-layer projection for admission/debug
-    pub(crate) fn layer_tensor_descriptors(
-        self,
+    pub(super) fn layer_projection(
+        &self,
         layer_index: usize,
-    ) -> Result<Vec<TensorBindingDescriptor>, String> {
+    ) -> Result<(QwenFamilyLlmLayerTensorNames, Vec<TensorBindingDescriptor>), String> {
+        if layer_index >= self.geometry.n_layers {
+            return Err(format!(
+                "qwen decoder layer index {layer_index} is outside n_layers={}",
+                self.geometry.n_layers
+            ));
+        }
         let names = (self.names_for_layer())(layer_index);
-        qwen_decoder_layer_tensor_descriptors(&self.geometry, self.options(), &names)
+        let descriptors = layer_tensor_descriptors(&self.geometry, self.options(), &names)?;
+        Ok((names, descriptors))
     }
+
+    pub(super) fn tail_projection(
+        &self,
+    ) -> Result<
+        (
+            QwenDecoderTailTensorNames<'static>,
+            Vec<TensorBindingDescriptor>,
+        ),
+        String,
+    > {
+        let tail = self.tail();
+        let descriptors = tail_tensor_descriptors(&self.geometry, tail)?;
+        Ok((tail, descriptors))
+    }
+}
+
+fn validate_tail_names(tail: QwenDecoderTailTensorNames<'_>) -> Result<(), String> {
+    for (label, name) in [
+        ("output_norm", tail.output_norm),
+        ("token_embd", tail.token_embd),
+    ] {
+        if name.is_empty() {
+            return Err(format!("qwen decoder tail {label} name must not be empty"));
+        }
+    }
+    if let Some(output_weight) = tail.output_weight {
+        if output_weight.is_empty() {
+            return Err("qwen decoder tail output_weight name must not be empty".to_string());
+        }
+        if output_weight == tail.output_norm || output_weight == tail.token_embd {
+            return Err(
+                "qwen decoder untied output_weight must name a distinct tensor".to_string(),
+            );
+        }
+    }
+    if tail.output_norm == tail.token_embd {
+        return Err("qwen decoder output_norm and token_embd names must differ".to_string());
+    }
+    Ok(())
+}
+
+fn validate_layer_names(
+    variant: QwenDecoderVariant,
+    names: &QwenFamilyLlmLayerTensorNames,
+) -> Result<(), String> {
+    let required = [
+        names.attn_norm_name.as_str(),
+        names.attn_q_name.as_str(),
+        names.attn_k_name.as_str(),
+        names.attn_v_name.as_str(),
+        names.attn_output_name.as_str(),
+        names.ffn_norm_name.as_str(),
+        names.ffn_gate_name.as_str(),
+        names.ffn_up_name.as_str(),
+        names.ffn_down_name.as_str(),
+    ];
+    if required.iter().any(|name| name.is_empty()) {
+        return Err("qwen decoder layer tensor names must not be empty".to_string());
+    }
+
+    let optional = [
+        names.q_norm_name.as_deref(),
+        names.k_norm_name.as_deref(),
+        names.q_bias_name.as_deref(),
+        names.k_bias_name.as_deref(),
+        names.v_bias_name.as_deref(),
+    ];
+    let expected = match variant {
+        QwenDecoderVariant::Qwen3 => [true, true, false, false, false],
+        QwenDecoderVariant::Qwen2 => [false, false, true, true, true],
+    };
+    for ((name, expected), label) in optional
+        .into_iter()
+        .zip(expected)
+        .zip(["q_norm", "k_norm", "q_bias", "k_bias", "v_bias"])
+    {
+        if name.is_some() != expected {
+            return Err(format!(
+                "qwen decoder {:?} requires {label} name presence={expected}",
+                variant
+            ));
+        }
+        if name.is_some_and(str::is_empty) {
+            return Err(format!("qwen decoder {label} name must not be empty"));
+        }
+    }
+
+    let active: Vec<&str> = required
+        .into_iter()
+        .chain(optional.into_iter().flatten())
+        .collect();
+    for (index, name) in active.iter().enumerate() {
+        if active[index + 1..].contains(name) {
+            return Err(format!(
+                "qwen decoder layer tensor name '{name}' is duplicated"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn descriptor(
@@ -363,7 +472,7 @@ fn exact_matrix(
 /// `names` must already reflect `options`: qk-norm / qkv-bias optional fields
 /// are read only when the corresponding option is enabled. Extra name strings
 /// present while the option is off are ignored (never admitted).
-pub(crate) fn qwen_decoder_layer_tensor_descriptors(
+fn layer_tensor_descriptors(
     geometry: &QwenDecoderContractGeometry,
     options: QwenDecoderContractOptions,
     names: &QwenFamilyLlmLayerTensorNames,
@@ -482,7 +591,7 @@ pub(crate) fn qwen_decoder_layer_tensor_descriptors(
 }
 
 /// Final norm, optional logits head, and token embedding.
-pub(crate) fn qwen_decoder_tail_tensor_descriptors(
+fn tail_tensor_descriptors(
     geometry: &QwenDecoderContractGeometry,
     tail: QwenDecoderTailTensorNames<'_>,
 ) -> Result<Vec<TensorBindingDescriptor>, String> {
@@ -514,25 +623,30 @@ pub(crate) fn qwen_decoder_tail_tensor_descriptors(
 }
 
 /// Full decoder-half contract: every layer plus the tail.
-pub(crate) fn qwen_decoder_runtime_tensor_descriptors(
+fn runtime_tensor_descriptors(
     geometry: &QwenDecoderContractGeometry,
     options: QwenDecoderContractOptions,
     mut names_for_layer: impl FnMut(usize) -> QwenFamilyLlmLayerTensorNames,
     tail: QwenDecoderTailTensorNames<'_>,
+    tail_tensor_count: usize,
 ) -> Result<Vec<TensorBindingDescriptor>, String> {
-    // Tail count comes only from the names' optional logits weight — same
-    // arithmetic profile.tail_tensor_count() uses. Do not hardcode `2 +`.
-    let tail_count = if tail.output_weight.is_some() { 3 } else { 2 };
-    geometry.validate_obligation_budget(options, tail_count)?;
+    geometry.tensor_obligation_count(
+        if options.qk_norm() {
+            QwenDecoderVariant::Qwen3
+        } else {
+            QwenDecoderVariant::Qwen2
+        },
+        tail_tensor_count,
+    )?;
     let mut descriptors = Vec::new();
     for layer in 0..geometry.n_layers {
-        descriptors.extend(qwen_decoder_layer_tensor_descriptors(
+        descriptors.extend(layer_tensor_descriptors(
             geometry,
             options,
             &names_for_layer(layer),
         )?);
     }
-    descriptors.extend(qwen_decoder_tail_tensor_descriptors(geometry, tail)?);
+    descriptors.extend(tail_tensor_descriptors(geometry, tail)?);
     Ok(descriptors)
 }
 
@@ -608,6 +722,22 @@ mod tests {
         }
     }
 
+    fn bind_qwen3(tail: QwenDecoderTailTensorNames<'static>) -> QwenDecoderContract {
+        QwenDecoderContract::bind(
+            qwen3_geometry(),
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen3, qwen3_layer_names, tail),
+        )
+        .expect("bind qwen3 contract")
+    }
+
+    fn bind_qwen2(tail: QwenDecoderTailTensorNames<'static>) -> QwenDecoderContract {
+        QwenDecoderContract::bind(
+            qwen2_geometry(),
+            QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen2, qwen2_layer_names, tail),
+        )
+        .expect("bind qwen2 contract")
+    }
+
     fn index_from_descriptors(descriptors: &[TensorBindingDescriptor]) -> GgufTensorIndex {
         let tensors = project_fixture_tensors(descriptors)
             .into_iter()
@@ -631,11 +761,12 @@ mod tests {
 
     #[test]
     fn qwen3_layer_count_includes_qk_norm_and_excludes_bias() {
-        let g = qwen3_geometry();
-        let names = qwen3_layer_names(0);
-        let layer =
-            qwen_decoder_layer_tensor_descriptors(&g, QwenDecoderContractOptions::QWEN3, &names)
-                .expect("qwen3 layer");
+        let contract = bind_qwen3(QwenDecoderTailTensorNames {
+            output_norm: "output_norm.weight",
+            output_weight: Some("output.weight"),
+            token_embd: "token_embd.weight",
+        });
+        let (_, layer) = contract.layer_projection(0).expect("qwen3 layer");
         // 5 attn weights + 2 qk-norm + 1 ffn_norm + 3 ffn = 11
         assert_eq!(layer.len(), 11);
         let names_set: std::collections::BTreeSet<_> =
@@ -671,11 +802,12 @@ mod tests {
 
     #[test]
     fn qwen2_layer_count_includes_bias_and_excludes_qk_norm() {
-        let g = qwen2_geometry();
-        let names = qwen2_layer_names(0);
-        let layer =
-            qwen_decoder_layer_tensor_descriptors(&g, QwenDecoderContractOptions::QWEN2, &names)
-                .expect("qwen2 layer");
+        let contract = bind_qwen2(QwenDecoderTailTensorNames {
+            output_norm: "llm.out_norm.weight",
+            output_weight: Some("llm.lm_head.weight"),
+            token_embd: "llm.tok_emb.weight",
+        });
+        let (_, layer) = contract.layer_projection(0).expect("qwen2 layer");
         // 5 attn weights + 3 bias + 1 ffn_norm + 3 ffn = 12
         assert_eq!(layer.len(), 12);
         let names_set: std::collections::BTreeSet<_> =
@@ -691,18 +823,12 @@ mod tests {
 
     #[test]
     fn full_decoder_with_tied_embeddings_omits_logits_weight() {
-        let g = qwen3_geometry();
-        let descriptors = qwen_decoder_runtime_tensor_descriptors(
-            &g,
-            QwenDecoderContractOptions::QWEN3,
-            qwen3_layer_names,
-            QwenDecoderTailTensorNames {
-                output_norm: "output_norm.weight",
-                output_weight: None,
-                token_embd: "token_embd.weight",
-            },
-        )
-        .expect("tied decoder");
+        let contract = bind_qwen3(QwenDecoderTailTensorNames {
+            output_norm: "output_norm.weight",
+            output_weight: None,
+            token_embd: "token_embd.weight",
+        });
+        let descriptors = contract.runtime_tensor_descriptors().expect("tied decoder");
         // 2 layers * 11 + norm + embd = 24
         assert_eq!(descriptors.len(), 24);
         assert!(descriptors.iter().all(|d| d.tensor_name != "output.weight"));
@@ -710,18 +836,14 @@ mod tests {
 
     #[test]
     fn full_decoder_with_separate_logits_includes_output_weight() {
-        let g = qwen2_geometry();
-        let descriptors = qwen_decoder_runtime_tensor_descriptors(
-            &g,
-            QwenDecoderContractOptions::QWEN2,
-            qwen2_layer_names,
-            QwenDecoderTailTensorNames {
-                output_norm: "llm.out_norm.weight",
-                output_weight: Some("llm.lm_head.weight"),
-                token_embd: "llm.tok_emb.weight",
-            },
-        )
-        .expect("untied decoder");
+        let contract = bind_qwen2(QwenDecoderTailTensorNames {
+            output_norm: "llm.out_norm.weight",
+            output_weight: Some("llm.lm_head.weight"),
+            token_embd: "llm.tok_emb.weight",
+        });
+        let descriptors = contract
+            .runtime_tensor_descriptors()
+            .expect("untied decoder");
         // 2 * 12 + norm + embd + logits = 27
         assert_eq!(descriptors.len(), 27);
         assert!(
@@ -733,18 +855,12 @@ mod tests {
 
     #[test]
     fn fixture_projection_satisfies_the_contract() {
-        let g = qwen3_geometry();
-        let descriptors = qwen_decoder_runtime_tensor_descriptors(
-            &g,
-            QwenDecoderContractOptions::QWEN3,
-            qwen3_layer_names,
-            QwenDecoderTailTensorNames {
-                output_norm: "output_norm.weight",
-                output_weight: Some("output.weight"),
-                token_embd: "token_embd.weight",
-            },
-        )
-        .expect("descriptors");
+        let contract = bind_qwen3(QwenDecoderTailTensorNames {
+            output_norm: "output_norm.weight",
+            output_weight: Some("output.weight"),
+            token_embd: "token_embd.weight",
+        });
+        let descriptors = contract.runtime_tensor_descriptors().expect("descriptors");
         let index = index_from_descriptors(&descriptors);
         validate_tensor_binding_descriptors(
             &index,
@@ -757,28 +873,26 @@ mod tests {
 
     #[test]
     fn rejects_transposed_query_projection() {
-        let g = qwen3_geometry();
-        let names = qwen3_layer_names(0);
-        let mut descriptors =
-            qwen_decoder_layer_tensor_descriptors(&g, QwenDecoderContractOptions::QWEN3, &names)
-                .expect("layer");
-        let q = descriptors
-            .iter_mut()
-            .find(|d| d.tensor_name == "blk.0.attn_q.weight")
-            .expect("q");
         // Correct ggml [d_model, q_dim] = [16, 16]; force a deliberate wrong pair
         // that EitherDims would have accepted for a non-square case by using kv.
         let g_rect = QwenDecoderContractGeometry {
             n_kv_heads: 2,
             ..qwen3_geometry()
         };
-        let names = qwen3_layer_names(0);
-        let mut rect = qwen_decoder_layer_tensor_descriptors(
-            &g_rect,
-            QwenDecoderContractOptions::QWEN3,
-            &names,
+        let contract = QwenDecoderContract::bind(
+            g_rect,
+            QwenFamilyDecoderProfile::new(
+                QwenDecoderVariant::Qwen3,
+                qwen3_layer_names,
+                QwenDecoderTailTensorNames {
+                    output_norm: "output_norm.weight",
+                    output_weight: Some("output.weight"),
+                    token_embd: "token_embd.weight",
+                },
+            ),
         )
-        .expect("rect layer");
+        .expect("rect contract");
+        let (_, mut rect) = contract.layer_projection(0).expect("rect layer");
         let k = rect
             .iter_mut()
             .find(|d| d.tensor_name == "blk.0.attn_k.weight")
@@ -811,12 +925,7 @@ mod tests {
         })
         .expect("unique");
         // Restore correct requirements for validation against the bad index.
-        let good = qwen_decoder_layer_tensor_descriptors(
-            &g_rect,
-            QwenDecoderContractOptions::QWEN3,
-            &names,
-        )
-        .expect("good");
+        let (_, good) = contract.layer_projection(0).expect("good");
         let err = validate_tensor_binding_descriptors(
             &index,
             &good,
@@ -828,19 +937,30 @@ mod tests {
             err.contains("blk.0.attn_k.weight"),
             "unexpected error: {err}"
         );
-        let _ = descriptors;
-        let _ = q;
     }
 
     #[test]
-    fn qk_norm_option_requires_name_slots() {
+    fn qwen3_contract_rejects_missing_qk_norm_name() {
         let g = qwen3_geometry();
-        let mut names = qwen3_layer_names(0);
-        names.q_norm_name = None;
-        let err =
-            qwen_decoder_layer_tensor_descriptors(&g, QwenDecoderContractOptions::QWEN3, &names)
-                .expect_err("missing q_norm name must fail");
-        assert!(err.contains("q_norm_name"), "{err}");
+        fn missing_q_norm(layer: usize) -> QwenFamilyLlmLayerTensorNames {
+            let mut names = qwen3_layer_names(layer);
+            names.q_norm_name = None;
+            names
+        }
+        let err = QwenDecoderContract::bind(
+            g,
+            QwenFamilyDecoderProfile::new(
+                QwenDecoderVariant::Qwen3,
+                missing_q_norm,
+                QwenDecoderTailTensorNames {
+                    output_norm: "output_norm.weight",
+                    output_weight: Some("output.weight"),
+                    token_embd: "token_embd.weight",
+                },
+            ),
+        )
+        .expect_err("missing q_norm name must fail at bind");
+        assert!(err.contains("q_norm"), "{err}");
     }
 
     #[test]
@@ -882,9 +1002,10 @@ mod tests {
             ffn_dim: 32,
             vocab_size: 64,
         };
-        // Force a tiny artificial budget by asking for an enormous tail count.
+        // Force overflow by asking the internal proof calculator for an
+        // enormous tail count. No descriptor allocation may occur first.
         let err = g
-            .validate_obligation_budget(QwenDecoderContractOptions::QWEN3, usize::MAX / 2)
+            .tensor_obligation_count(QwenDecoderVariant::Qwen3, usize::MAX / 2)
             .expect_err("obligation budget must fail closed");
         assert!(
             err.contains("overflow") || err.contains("ceiling") || err.contains("obligations"),
@@ -897,7 +1018,7 @@ mod tests {
     /// used by whole-decoder planning both read the same bound value. Flipping
     /// only the variant flips success/failure at both sites together.
     #[test]
-    fn family_decoder_profile_options_are_single_source_for_admission_and_plan() {
+    fn contract_bind_rejects_profile_variant_name_mismatch() {
         let g = qwen3_geometry();
         let tail = QwenDecoderTailTensorNames {
             output_norm: "output_norm.weight",
@@ -913,39 +1034,16 @@ mod tests {
             tail,
         );
 
-        let admission_ok =
-            QwenDecoderContract::bind(g, matched).and_then(|c| c.runtime_tensor_descriptors());
+        let admission_ok = QwenDecoderContract::bind(g, matched)
+            .and_then(|contract| contract.runtime_tensor_descriptors());
         assert!(admission_ok.is_ok(), "{admission_ok:?}");
 
         let admission_err = QwenDecoderContract::bind(g, mismatched)
-            .and_then(|c| c.runtime_tensor_descriptors())
-            .expect_err("mismatched profile variant must fail admission");
+            .expect_err("mismatched profile variant must fail at bind");
         assert!(
-            admission_err.contains("qkv_bias") || admission_err.contains("bias"),
+            admission_err.contains("q_norm") || admission_err.contains("bias"),
             "{admission_err}"
         );
-
-        // Plan path projects the same layer contract that
-        // `QwenWholeDecoderPlan::for_qwen_family` expands before materializing.
-        let plan_layer_ok = qwen_decoder_layer_tensor_descriptors(
-            &g,
-            matched.options(),
-            &(matched.names_for_layer())(0),
-        );
-        assert!(plan_layer_ok.is_ok(), "{plan_layer_ok:?}");
-
-        let plan_layer_err = qwen_decoder_layer_tensor_descriptors(
-            &g,
-            mismatched.options(),
-            &(mismatched.names_for_layer())(0),
-        )
-        .expect_err("mismatched profile variant must fail plan-layer contract");
-        assert!(
-            plan_layer_err.contains("qkv_bias") || plan_layer_err.contains("bias"),
-            "{plan_layer_err}"
-        );
-
-        assert_eq!(admission_err, plan_layer_err);
     }
 
     /// Production planner single-source gate: `QwenWholeDecoderPlan::for_qwen_family`
@@ -971,21 +1069,16 @@ mod tests {
             QwenFamilyDecoderProfile::new(QwenDecoderVariant::Qwen2, qwen3_layer_names, tail);
 
         // Matched profile binds and expands; mismatched Qwen2 variant against
-        // Qwen3 names fails when production expands descriptors (same gate
-        // admission uses). Bind itself only checks geometry/obligation budget.
+        // Qwen3 names fails while constructing the proof, before pack I/O.
         let contract = QwenDecoderContract::bind(g, matched).expect("matched bind");
         assert_eq!(contract.variant(), QwenDecoderVariant::Qwen3);
-        assert_eq!(contract.profile().variant(), QwenDecoderVariant::Qwen3);
         let descriptors = contract
             .runtime_tensor_descriptors()
             .expect("matched descriptors");
-        let mismatch_contract = QwenDecoderContract::bind(g, mismatched)
-            .expect("geometry bind does not inspect layer names");
-        let mismatch_err = mismatch_contract
-            .runtime_tensor_descriptors()
-            .expect_err("mismatched variant must fail descriptor expansion");
+        let mismatch_err = QwenDecoderContract::bind(g, mismatched)
+            .expect_err("mismatched variant must fail contract bind");
         assert!(
-            mismatch_err.contains("qkv_bias") || mismatch_err.contains("bias"),
+            mismatch_err.contains("q_norm") || mismatch_err.contains("bias"),
             "unexpected mismatch error: {mismatch_err}"
         );
 
@@ -1005,7 +1098,7 @@ mod tests {
         write_tiny_gguf_runtime_source(&path, &spec).expect("write fixture");
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&path).expect("reader");
 
-        let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, contract)
+        let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, &contract)
             .expect("production planner must accept bound matched contract");
         assert_eq!(plan.layer_count(), g.n_layers);
     }

@@ -757,8 +757,9 @@ pub(crate) fn mimo_asr_qwen_family_layer_names(
     }
 }
 
-/// Single-source Qwen2 backbone decoder profile for MiMo-ASR: options + layer names.
-/// Admission descriptors and whole-decoder planning both read this value.
+/// Adapter-local Qwen2 backbone profile for MiMo-ASR: closed variant, layer
+/// names, and tail. It is immediately geometry-bound into the contract
+/// consumed by admission, planning, tail load, host quote, and compilation.
 pub(crate) fn mimo_asr_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
         crate::models::qwen::QwenDecoderVariant::Qwen2,
@@ -780,14 +781,6 @@ pub(crate) fn mimo_asr_qwen_decoder_contract(
         mimo_asr_qwen_decoder_profile(),
     )
     .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
-}
-
-pub(crate) fn mimo_asr_backbone_decoder_tensor_descriptors(
-    llm: &MimoLlmMetadata,
-) -> Result<Vec<TensorBindingDescriptor>, MimoRuntimeTensorError> {
-    mimo_asr_qwen_decoder_contract(llm)?
-        .runtime_tensor_descriptors()
-        .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })
 }
 
 /// Static tail tensor names shared by admission descriptors and the contract-
@@ -840,23 +833,10 @@ fn mimo_asr_runtime_tensor_bindings(
             count: usize::MAX,
             max: MIMO_MAX_TENSOR_OBLIGATIONS,
         })?;
-    use crate::models::qwen::QwenDecoderContractGeometry;
-    let profile = mimo_asr_qwen_decoder_profile();
-    let decoder_geometry = mimo_asr_qwen_decoder_geometry(llm);
-    let decoder_tail = profile.tail_tensor_count();
-    decoder_geometry
-        .validate_obligation_budget(profile.options(), decoder_tail)
+    let decoder_contract = mimo_asr_qwen_decoder_contract(llm)?;
+    let decoder_upper = decoder_contract
+        .tensor_obligation_count()
         .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })?;
-    let decoder_upper = decoder_geometry
-        .n_layers
-        .checked_mul(QwenDecoderContractGeometry::layer_tensor_count(
-            profile.options(),
-        ))
-        .and_then(|n| n.checked_add(decoder_tail))
-        .ok_or(MimoRuntimeTensorError::TooManyTensorObligations {
-            count: usize::MAX,
-            max: MIMO_MAX_TENSOR_OBLIGATIONS,
-        })?;
     let total_upper = non_decoder.checked_add(decoder_upper).ok_or(
         MimoRuntimeTensorError::TooManyTensorObligations {
             count: usize::MAX,
@@ -885,7 +865,11 @@ fn mimo_asr_runtime_tensor_bindings(
         };
 
     // 36L Qwen2 backbone (qkv bias, no QK-norm) via the shared decoder contract.
-    bindings.extend(mimo_asr_backbone_decoder_tensor_descriptors(llm)?);
+    bindings.extend(
+        decoder_contract
+            .runtime_tensor_descriptors()
+            .map_err(|reason| MimoRuntimeTensorError::InvalidDecoderGeometry { reason })?,
+    );
 
     // 6L input-local transformer + the speech embedding sum path.
     let d_in = inlocal.d_model;
@@ -1292,8 +1276,11 @@ fn tiny_tensors() -> Vec<(String, Vec<u64>)> {
         rms_norm_epsilon: 1e-6,
         rope_theta: 640_000.0,
     };
+    let decoder_contract = mimo_asr_qwen_decoder_contract(&llm).expect("backbone decoder contract");
     tensors.extend(crate::models::tensor_binding::project_fixture_tensors(
-        &mimo_asr_backbone_decoder_tensor_descriptors(&llm).expect("backbone descriptors"),
+        &decoder_contract
+            .runtime_tensor_descriptors()
+            .expect("backbone descriptors"),
     ));
     // Input-local (1 layer, d=8, ffn=16) + speech path (group 4 x 8 -> 16).
     tensors.extend([

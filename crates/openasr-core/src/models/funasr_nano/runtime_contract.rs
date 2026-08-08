@@ -795,8 +795,9 @@ pub(crate) fn funasr_nano_qwen_family_layer_names(
     }
 }
 
-/// Single-source Qwen3 decoder profile for FunASR-Nano: variant + layer names + tail.
-/// Admission, plan, and tail load all read this value (or a geometry-bound contract).
+/// Adapter-local Qwen3 profile for FunASR-Nano: closed variant, layer names,
+/// and tail. It is immediately geometry-bound into the contract consumed by
+/// admission, planning, tail load, host quote, and backend compilation.
 pub(crate) fn funasr_nano_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
         crate::models::qwen::QwenDecoderVariant::Qwen3,

@@ -520,6 +520,47 @@ fn native_backend_production_does_not_match_dolphin_architecture_directly() {
 }
 
 #[test]
+fn qwen_shaped_families_quote_only_through_the_bound_decoder_contract() {
+    let root = models_root();
+    for (relative, required_call) in [
+        (
+            "funasr_nano/llm_transformer.rs",
+            "quoted_qwen_decoder_system_memory_bytes",
+        ),
+        (
+            "mimo_asr/llm_transformer.rs",
+            "quoted_qwen_decoder_system_memory_bytes",
+        ),
+        (
+            "firered_llm/llm_transformer.rs",
+            "quoted_qwen_decoder_system_memory_bytes",
+        ),
+        (
+            "moss_transcribe_diarize/prepared_runtime.rs",
+            "add_qwen_decoder_prepared_runtime_quote",
+        ),
+    ] {
+        let path = root.join(relative);
+        let syntax = ProductionSyntax::collect(&path);
+        assert!(
+            syntax.calls_or_invokes_method(required_call),
+            "{relative} must derive its decoder host quote from {required_call}"
+        );
+        for retired in [
+            "quoted_retained_system_memory_bytes_for_family",
+            "qwen_decoder_layer_tensor_descriptors",
+            "qwen_decoder_tail_tensor_descriptors",
+            "qwen_decoder_runtime_tensor_descriptors",
+        ] {
+            assert!(
+                !syntax.references_identifier(retired),
+                "{relative} must not reintroduce split Qwen decoder seam {retired}"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_transcribe_production_does_not_match_whisper_architecture_directly() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/backend/native_transcribe.rs");
     assert_production_does_not_reference(&path, "WHISPER_GGML_ARCHITECTURE_ID");

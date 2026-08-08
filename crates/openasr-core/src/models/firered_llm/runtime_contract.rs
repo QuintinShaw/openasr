@@ -519,8 +519,9 @@ pub(crate) fn firered_llm_qwen_family_layer_names(
     }
 }
 
-/// Single-source Qwen2 decoder profile for FireRedASR2-LLM: options + layer names.
-/// Admission descriptors and whole-decoder planning both read this value.
+/// Adapter-local Qwen2 profile for FireRedASR2-LLM: closed variant, layer
+/// names, and tail. It is immediately geometry-bound into the contract
+/// consumed by admission, planning, tail load, host quote, and compilation.
 pub(crate) fn firered_llm_qwen_decoder_profile() -> crate::models::qwen::QwenFamilyDecoderProfile {
     crate::models::qwen::QwenFamilyDecoderProfile::new(
         crate::models::qwen::QwenDecoderVariant::Qwen2,
