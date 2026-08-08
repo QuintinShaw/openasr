@@ -80,6 +80,7 @@ pub(super) struct ProductionSyntax {
     provider_name_parses: BTreeSet<String>,
     block_stack_none: bool,
     creates_request_output_pack: bool,
+    borrowed_field_calls: BTreeSet<(String, String, String)>,
 }
 
 impl ProductionSyntax {
@@ -100,6 +101,14 @@ impl ProductionSyntax {
 
     pub(super) fn has_unsafe_impl_for(&self, trait_name: &str) -> bool {
         self.unsafe_impl_traits.contains(trait_name)
+    }
+
+    fn calls_with_borrowed_field(&self, function: &str, receiver: &str, field: &str) -> bool {
+        self.borrowed_field_calls.contains(&(
+            function.to_string(),
+            receiver.to_string(),
+            field.to_string(),
+        ))
     }
 
     fn parses_provider_names(&self) -> bool {
@@ -157,6 +166,28 @@ impl<'ast> Visit<'ast> for ProductionSyntax {
             && let Some(last) = function.path.segments.last()
         {
             self.calls.insert(last.ident.to_string());
+            for argument in &node.args {
+                let Expr::Reference(reference) = argument else {
+                    continue;
+                };
+                let Expr::Field(field) = reference.expr.as_ref() else {
+                    continue;
+                };
+                let Expr::Path(receiver) = field.base.as_ref() else {
+                    continue;
+                };
+                let Some(receiver) = receiver.path.get_ident() else {
+                    continue;
+                };
+                let Member::Named(field) = &field.member else {
+                    continue;
+                };
+                self.borrowed_field_calls.insert((
+                    last.ident.to_string(),
+                    receiver.to_string(),
+                    field.to_string(),
+                ));
+            }
             if last.ident == "create"
                 && function
                     .path
@@ -641,10 +672,26 @@ fn qwen_shaped_family_constructors_keep_the_bound_plan_tail_compile_chain() {
         );
     }
     let moss_compile = "moss_transcribe_diarize/llm_decoder.rs";
+    let moss_compile_syntax = ProductionSyntax::collect(&root.join(moss_compile));
     assert!(
-        ProductionSyntax::collect(&root.join(moss_compile))
+        moss_compile_syntax
             .calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan"),
         "{moss_compile} must materialize the prepared decoder through the shared compile seam"
+    );
+    assert!(
+        moss_compile_syntax.references_identifier("QwenWholeDecoderPlan")
+            && moss_compile_syntax.calls_or_invokes_method("layer_count"),
+        "{moss_compile} must derive actor graph-handle quotes from the prepared decoder plan"
+    );
+
+    let moss_actor = "moss_transcribe_diarize/executor.rs";
+    assert!(
+        ProductionSyntax::collect(&root.join(moss_actor)).calls_with_borrowed_field(
+            "quoted_resident_system_memory_bytes",
+            "prepared",
+            "decoder_plan",
+        ),
+        "{moss_actor} must pass the prepared decoder plan into the actor memory quote"
     );
 }
 
