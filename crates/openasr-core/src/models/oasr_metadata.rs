@@ -619,6 +619,9 @@ mod envelope_tests {
 
     #[test]
     fn asr_envelope_derives_every_routing_key_from_inventory() {
+        let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(crate::WHISPER_GGML_ARCHITECTURE_ID)
+            .expect("Whisper inventory descriptor");
         let metadata = PackEnvelope::asr(crate::WHISPER_GGML_ARCHITECTURE_ID)
             .seal(BTreeMap::new())
             .expect("seal ASR envelope");
@@ -629,7 +632,11 @@ mod envelope_tests {
         );
         assert_eq!(
             string_value(&metadata, crate::arch::GENERAL_ARCHITECTURE_KEY),
-            Some(crate::WHISPER_GGML_ARCHITECTURE_ID)
+            descriptor
+                .identity
+                .runtime_architecture_aliases
+                .first()
+                .copied()
         );
         assert_eq!(
             string_value(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
