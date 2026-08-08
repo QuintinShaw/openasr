@@ -512,6 +512,19 @@ pub(crate) fn quantize_f32_to_ggml_tensor_data(
     dims: &[u64],
     values: &[f32],
 ) -> Result<Vec<u8>, GgufWriteError> {
+    let mut bytes = Vec::new();
+    quantize_f32_to_ggml_tensor_data_into(tensor_type, dims, values, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Quantize into a caller-owned buffer so row-streaming transforms can reuse
+/// one allocation for every row of a large tensor.
+pub(crate) fn quantize_f32_to_ggml_tensor_data_into(
+    tensor_type: GgufWriteTensorType,
+    dims: &[u64],
+    values: &[f32],
+    bytes: &mut Vec<u8>,
+) -> Result<(), GgufWriteError> {
     if !matches!(
         tensor_type,
         GgufWriteTensorType::Q8_0
@@ -543,7 +556,8 @@ pub(crate) fn quantize_f32_to_ggml_tensor_data(
         return Err(GgufWriteError::TensorQuantizationSourceNonFinite);
     }
     let expected_bytes = expected_tensor_nbytes_for("quantization-target", dims, tensor_type)?;
-    let mut bytes = vec![0_u8; expected_bytes];
+    bytes.clear();
+    bytes.resize(expected_bytes, 0_u8);
     let ne0 = *dims.first().unwrap_or(&0);
     let row_count = dims
         .iter()
@@ -581,7 +595,7 @@ pub(crate) fn quantize_f32_to_ggml_tensor_data(
             actual: produced,
         });
     }
-    Ok(bytes)
+    Ok(())
 }
 
 fn validate_metadata(metadata: &BTreeMap<String, GgufWriteValue>) -> Result<(), GgufWriteError> {
@@ -959,6 +973,7 @@ mod tests {
     use super::{
         BUILD_COMMIT_ENV, GgufStreamTensorSpec, GgufWriteError, GgufWriteTensor,
         GgufWriteTensorType, GgufWriteValue, OASR_METADATA_KEY_BUILD_COMMIT,
+        quantize_f32_to_ggml_tensor_data, quantize_f32_to_ggml_tensor_data_into,
         write_gguf_file_streaming_v0, write_gguf_file_v0,
     };
     use crate::ggml_runtime::{GgufTensorDataReader, read_gguf_metadata};
@@ -1185,6 +1200,24 @@ mod tests {
         let first = reader.tensor_index().get("first.weight").unwrap();
         let second = reader.tensor_index().get("second.weight").unwrap();
         assert_eq!(second.offset_bytes - first.offset_bytes, 32);
+    }
+
+    #[test]
+    fn reusable_quant_buffer_is_byte_identical_to_owned_wrapper() {
+        let values = (0..256)
+            .map(|index| (index as f32 - 127.5) / 64.0)
+            .collect::<Vec<_>>();
+        let owned = quantize_f32_to_ggml_tensor_data(GgufWriteTensorType::Q4_K, &[256], &values)
+            .expect("owned q4_k quantization");
+        let mut reused = vec![0xaa; 4096];
+        quantize_f32_to_ggml_tensor_data_into(
+            GgufWriteTensorType::Q4_K,
+            &[256],
+            &values,
+            &mut reused,
+        )
+        .expect("reused q4_k quantization");
+        assert_eq!(reused, owned);
     }
 
     #[test]

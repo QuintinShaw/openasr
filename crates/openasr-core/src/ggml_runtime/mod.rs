@@ -91,8 +91,8 @@ pub use gguf_tensor_index::{
 pub use gguf_write::{BUILD_COMMIT_ENV, OASR_METADATA_KEY_BUILD_COMMIT};
 pub(crate) use gguf_write::{
     GgufStreamTensorSpec, GgufWriteError, GgufWriteTensor, GgufWriteTensorType, GgufWriteValue,
-    build_provenance_from_env, quantize_f32_to_ggml_tensor_data, write_gguf_file_streaming_v0,
-    write_gguf_file_v0,
+    build_provenance_from_env, quantize_f32_to_ggml_tensor_data,
+    quantize_f32_to_ggml_tensor_data_into, write_gguf_file_streaming_v0, write_gguf_file_v0,
 };
 pub(crate) use job_cancel::{
     InheritedJobCancelGuard, arm_thread_job_cancel_flag, cancel_flag_requested_from_data,

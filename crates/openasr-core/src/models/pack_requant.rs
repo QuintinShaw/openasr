@@ -18,7 +18,7 @@ use crate::{
     ggml_runtime::{
         GgufMetadataValue, GgufStreamTensorSpec, GgufTensorDataReader, GgufWriteError,
         GgufWriteTensorType, GgufWriteValue, dequantize_ggml_row_to_f32, ggml_row_size_bytes,
-        quantize_f32_to_ggml_tensor_data, write_gguf_file_streaming_v0,
+        quantize_f32_to_ggml_tensor_data_into, write_gguf_file_streaming_v0,
     },
 };
 
@@ -286,7 +286,22 @@ fn requantize_tensor_rows(
             ),
         });
     }
+    let target_type = match target.ggml_type {
+        ggml_type if ggml_type == GgufWriteTensorType::Q4_K.ggml_type() => {
+            GgufWriteTensorType::Q4_K
+        }
+        ggml_type if ggml_type == GgufWriteTensorType::Q8_0.ggml_type() => {
+            GgufWriteTensorType::Q8_0
+        }
+        ggml_type => {
+            return Err(GgufWriteError::TensorStreamingProducer {
+                name: target.name.clone(),
+                reason: format!("unsupported requant target ggml type {ggml_type}"),
+            });
+        }
+    };
     let mut row = Vec::with_capacity(ne0);
+    let mut quantized = Vec::new();
     for source_row in source_bytes.chunks_exact(source_row_bytes) {
         row.clear();
         if source_ggml_type == GgufWriteTensorType::F32.ggml_type() {
@@ -307,21 +322,12 @@ fn requantize_tensor_rows(
                 },
             )?;
         }
-        let target_type = match target.ggml_type {
-            ggml_type if ggml_type == GgufWriteTensorType::Q4_K.ggml_type() => {
-                GgufWriteTensorType::Q4_K
-            }
-            ggml_type if ggml_type == GgufWriteTensorType::Q8_0.ggml_type() => {
-                GgufWriteTensorType::Q8_0
-            }
-            ggml_type => {
-                return Err(GgufWriteError::TensorStreamingProducer {
-                    name: target.name.clone(),
-                    reason: format!("unsupported requant target ggml type {ggml_type}"),
-                });
-            }
-        };
-        let quantized = quantize_f32_to_ggml_tensor_data(target_type, &[target.dims[0]], &row)?;
+        quantize_f32_to_ggml_tensor_data_into(
+            target_type,
+            &[target.dims[0]],
+            &row,
+            &mut quantized,
+        )?;
         sink.write_all(&quantized)
             .map_err(|error| GgufWriteError::TensorStreamingProducer {
                 name: target.name.clone(),
