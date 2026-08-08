@@ -2458,11 +2458,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         // for both prompt-prefill chunks and single-token autoregressive
         // decode steps (`ggml_executor`'s `QWEN_WHOLE_DECODER_BY_KEY` cache);
         // `n_threads` is fixed once here at construction, so one tier has to
-        // be picked for the whole executor rather than per call. mimo-asr,
-        // firered2-llm, moss-transcribe-diarize, and hymt2 all construct this
-        // executor through `new_with_rms_norm_epsilon_and_fused_logits_head`
-        // too, so they inherit the `Decoder` tier below automatically. See
-        // `qwen_decoder_graph_config` for the tier rationale.
+        // be picked for the whole executor rather than per call. This
+        // test-only numerical oracle uses the same `Decoder` tier that
+        // production family runtimes inherit through the shared prepared-plan
+        // compile seam. See `qwen_decoder_graph_config` for the rationale.
         let mut config = qwen_decoder_graph_config(backend);
         config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
