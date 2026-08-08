@@ -260,13 +260,15 @@ class QuantTokenTest(unittest.TestCase):
         self.assertEqual(C.QUANT_TOKEN_TO_LABEL["q8-0"], "q8_0")
         self.assertEqual(C.QUANT_TOKEN_TO_LABEL["q4-k"], "q4_k")
 
-    def test_q4_k_fails_closed_until_a_rust_requant_seam_exists(self):
-        # gguf-py implements no K-quant quantization; the converter must
-        # refuse instead of emitting a mislabeled pack or forking ggml's
-        # quantization math into Python.
+    def test_q4_k_fails_closed_for_source_only_lane(self):
+        # gguf-py implements no K-quant quantization. The source-only publish
+        # converter must refuse instead of emitting a mislabeled pack or
+        # forking ggml's quantization math into Python. Callers can stage q8_0
+        # and invoke the generic Rust `model-pack requant` command separately
+        # from the highest-precision fp16 staging pack.
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "mimo-tiny-q4_k.oasr"
-            with self.assertRaises(C.ConversionError):
+            with self.assertRaisesRegex(C.ConversionError, "model-pack requant"):
                 C.main([
                     "--main-dir", "/nonexistent-main",
                     "--tokenizer", "/nonexistent-tok.safetensors",

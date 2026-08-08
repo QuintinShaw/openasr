@@ -72,15 +72,81 @@ template_vars=(
 
 EXTERNAL_CONVERTER="$(cat_field_opt "$MODEL" external_converter)"
 IMPORT_COMMAND="$(cat_field_opt "$MODEL" import_command)"
+REQUANT_SOURCE_QUANT="$(cat_field_opt "$MODEL" requant_source_quant)"
+
+# Requantized external-converter sources are deliberately staged next to the
+# model's other build artifacts, not in the system temp directory.  This keeps
+# multi-gigabyte intermediate packs on the publish volume and lets the EXIT
+# trap remove them if either half of the two-step conversion fails.
+REQUANT_STAGING=""
+REQUANT_STAGING_DIR=""
+cleanup_requant_staging() {
+  if [[ -n "$REQUANT_STAGING" ]]; then
+    rm -f "$REQUANT_STAGING"
+  fi
+  if [[ -n "$REQUANT_STAGING_DIR" ]]; then
+    rmdir "$REQUANT_STAGING_DIR" 2>/dev/null || true
+  fi
+}
+
+# External recipes are trusted configuration, but their substituted paths are
+# not shell syntax.  Quote every data value before the recipe is evaluated so
+# a checkout/model path containing whitespace or shell metacharacters remains
+# one argument.  The legacy direct external-converter path intentionally keeps
+# its historical expansion below; this hardened expansion is only for the new
+# requant staging branch.
+expand_quoted_external_template() {
+  local quant_value="$1" out_value="$2"
+  local quoted_vars=(
+    "src=$(printf '%q' "$SRC")"
+    "work=$(printf '%q' "$WORK")"
+    "out=$(printf '%q' "$out_value")"
+    "packs_dir=$(printf '%q' "$PACKS")"
+    "registry_id=$(printf '%q' "$REGISTRY_ID")"
+    "quant=$(printf '%q' "$quant_value")"
+    "model=$(printf '%q' "$MODEL")"
+  )
+  expand_template "$EXTERNAL_CONVERTER" "${quoted_vars[@]}"
+}
 
 # Re-runnable by contract: the staged source is the truth, the pack a derived
 # artifact. Drop any previous build so the import never dies on OutputExists.
 rm -f "$OUT"
 
 if [[ -n "$EXTERNAL_CONVERTER" ]]; then
-  cmd="$(expand_template "$EXTERNAL_CONVERTER" "${template_vars[@]}")"
-  log "external converter $MODEL @ $QUANT -> $OUT"
-  (cd "$REPO_ROOT" && eval "$cmd")
+  if [[ "$QUANT" == "q4_k" && -n "$REQUANT_SOURCE_QUANT" ]]; then
+    [[ "$REQUANT_SOURCE_QUANT" != "$QUANT" ]] \
+      || die "model $MODEL requant_source_quant must differ from target $QUANT"
+    SOURCE_TOKEN="$(quant_token "$REQUANT_SOURCE_QUANT")" \
+      || die "model $MODEL declares unsupported requant_source_quant '$REQUANT_SOURCE_QUANT'"
+    REQUANT_STAGING_DIR="$(mktemp -d "$WORK/.requant-source.XXXXXX")" \
+      || die "cannot allocate requant staging pack under $WORK"
+    # Keep a unique directory and give the converter one explicit `.oasr`
+    # destination inside it.  The directory template is portable across BSD
+    # and GNU mktemp, while the converter owns creation of the output and may
+    # reject an already-existing destination.
+    REQUANT_STAGING="$REQUANT_STAGING_DIR/source.oasr"
+    trap cleanup_requant_staging EXIT
+
+    cmd="$(expand_quoted_external_template "$SOURCE_TOKEN" "$REQUANT_STAGING")"
+    log "external converter $MODEL @ $REQUANT_SOURCE_QUANT -> $REQUANT_STAGING"
+    (cd "$REPO_ROOT" && eval "$cmd") \
+      || die "external converter failed for $MODEL @ $REQUANT_SOURCE_QUANT"
+    [[ -f "$REQUANT_STAGING" ]] \
+      || die "external converter produced no staging pack at $REQUANT_STAGING"
+
+    log "requant $MODEL @ $QUANT ($TOKEN) -> $OUT"
+    "$BIN" model-pack requant "$REQUANT_STAGING" "$OUT" --quant q4-k \
+      || die "requant failed for $MODEL @ $QUANT"
+    cleanup_requant_staging
+    REQUANT_STAGING=""
+    REQUANT_STAGING_DIR=""
+    trap - EXIT
+  else
+    cmd="$(expand_template "$EXTERNAL_CONVERTER" "${template_vars[@]}")"
+    log "external converter $MODEL @ $QUANT -> $OUT"
+    (cd "$REPO_ROOT" && eval "$cmd")
+  fi
 elif [[ -n "$IMPORT_COMMAND" ]]; then
   cmd="$(expand_template "$IMPORT_COMMAND" "${template_vars[@]}")"
   log "import $MODEL @ $QUANT ($TOKEN) -> $OUT"

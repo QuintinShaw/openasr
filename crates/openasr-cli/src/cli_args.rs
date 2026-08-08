@@ -736,6 +736,21 @@ pub(crate) enum ModelPackCommand {
         #[arg(long, value_enum)]
         quant: Option<AuditQuantTier>,
     },
+    /// Requantize an ASR pack through the shared Rust/ggml K-quant seam.
+    ///
+    /// The source is verified before any tensor is read and the output is
+    /// sealed and verified before this command succeeds.  v1 intentionally
+    /// exposes only `q4-k`; other target tiers remain importer-owned until
+    /// their exact policy and proof contract are designed.
+    Requant {
+        /// Source `.oasr` pack to verify and transform.
+        source: PathBuf,
+        /// New `.oasr` pack path.  It must not already exist.
+        output: PathBuf,
+        /// Target quantization.  The only supported value is `q4-k`.
+        #[arg(long, value_enum)]
+        quant: RequantTarget,
+    },
     /// Show where model-pack storage space has gone and how much is reclaimable.
     Usage,
     /// Reclaim abandoned model-pack storage (unreferenced content and dead
@@ -756,6 +771,24 @@ pub(crate) enum AuditQuantTier {
     Q8_0,
     Q3_K,
     Q4_K,
+}
+
+/// Target tier exposed by the generic post-build requant seam.
+///
+/// Keep this separate from [`AuditQuantTier`]: the audit command accepts the
+/// complete set of declared tiers, while the writer currently has one and only
+/// one mathematically implemented target.  A future writer target must be
+/// added explicitly here rather than being accepted by a broad parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RequantTarget {
+    #[value(name = "q4-k")]
+    Q4K,
+}
+
+impl RequantTarget {
+    pub(crate) fn to_pack_quant(self) -> openasr_core::models::pack_quant::PackQuant {
+        openasr_core::models::pack_quant::PackQuant::Q4_K
+    }
 }
 
 impl AuditQuantTier {

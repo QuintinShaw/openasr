@@ -23,6 +23,12 @@
 #   external_converter       command template for families converted outside
 #                            `openasr model-pack import` entirely; must produce
 #                            the pack at {out}.
+#   requant_source_quant     optional internal source quant for external
+#                            converters that cannot emit a target tier (used
+#                            when the target is q4_k); the converter writes a
+#                            temporary source pack under {work}, then the
+#                            pipeline runs the shared Rust `model-pack requant`
+#                            seam into {out}.
 #
 # The required_* gates are fail-closed by design: an upstream that changes its
 # file layout, an exclude rule that strips the only checkpoint, or a tokenless
@@ -391,6 +397,7 @@ needs_license_flags = false
 extra_sources = ["XiaomiMiMo/MiMo-Audio-Tokenizer@main:tokenizer-src"]
 required_download_files = ["config.json", "model.safetensors.index.json", "model*.safetensors", "tokenizer-src/model.safetensors"]
 external_converter = "python3 tooling/mimo-asr/convert_mimo_asr.py --main-dir {src} --tokenizer {src}/tokenizer-src/model.safetensors --out {out} --package-id {registry_id} --quant {quant}"
+requant_source_quant = "fp16"
 
 # Qwen3-ForcedAligner-0.6B: shares its thinker (audio encoder + LM) tensor
 # layout byte-for-byte with qwen3-asr (see

@@ -2329,6 +2329,34 @@ fn verify_backends_manifest_rejects_a_signature_bound_to_a_different_url() {
 
 // --- model-pack audit-quant (quantization-strategy self-check) -------------
 
+#[test]
+fn model_pack_requant_help_exposes_only_q4_k() {
+    openasr()
+        .args(["model-pack", "requant", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--quant <QUANT>"))
+        .stdout(predicate::str::contains("q4-k"))
+        .stdout(predicate::str::contains("q8-0").not())
+        .stdout(predicate::str::contains("q3-k").not());
+}
+
+#[test]
+fn model_pack_requant_rejects_non_q4_k_targets_at_the_parser() {
+    openasr()
+        .args([
+            "model-pack",
+            "requant",
+            "source.oasr",
+            "output.oasr",
+            "--quant",
+            "q8-0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("possible values: q4-k"));
+}
+
 fn gguf_put_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
     bytes.extend_from_slice(value.as_bytes());

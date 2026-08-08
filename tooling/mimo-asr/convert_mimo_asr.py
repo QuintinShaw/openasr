@@ -88,12 +88,14 @@ _BUILD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # ``--quant {quant}`` expands ``quant_token``: fp16 / q8-0 / q4-k). Map them
 # to the canonical pack-quant labels baked into ``openasr.pack.quant``.
 #
-# q4_k is declared but NOT producible here: the gguf Python library only
-# implements legacy-quant (Q4_0..Q8_0) block quantization, and K-quant math
-# belongs to ggml's single source of truth -- it must come from a Rust-side
-# repack/requant seam, not a second Python implementation. Until that seam
-# exists this converter fails closed on q4-k instead of emitting a mislabeled
-# pack.
+# q4_k is intentionally not produced by this Python writer: the gguf Python
+# library only implements legacy-quant (Q4_0..Q8_0) block quantization, and
+# K-quant math belongs to ggml's single source of truth. The generic Rust
+# `openasr model-pack requant --quant q4-k` seam now exists, but the external
+# publish recipe has no binary-path argument to pass to this script. Therefore
+# this source-only converter remains fail-closed for q4-k; callers use the
+# documented fp16 staging + Rust requant two-step instead of forking math here
+# or compounding two lossy quantization passes.
 QUANT_TOKEN_TO_LABEL = {
     "fp16": "fp16",
     "q8-0": "q8_0",
@@ -842,11 +844,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     quant_label = QUANT_TOKEN_TO_LABEL[args.quant]
     if quant_label == "q4_k":
         raise ConversionError(
-            "q4_k conversion requires ggml's K-quant math, which the gguf "
-            "Python library does not implement; produce the fp16 pack here "
-            "and requantize through the Rust pack tooling once that seam "
-            "exists (a second Python quantizer would fork the quantization "
-            "contract)"
+            "q4_k is not emitted by the Python source converter: stage an "
+            "fp16 pack first, then run `openasr model-pack requant "
+            "<staging-fp16.oasr> <output-q4_k.oasr> --quant q4-k` so ggml "
+            "remains the single K-quant implementation"
         )
     # Catalog convention is colon-joined `family:quant` (see model-registry
     # pull ids and tooling/publish-model's f"{registry_id}:{suffix}"); a

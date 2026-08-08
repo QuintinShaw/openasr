@@ -9,6 +9,11 @@ pub(super) fn model_pack_command(command: ModelPackCommand) -> Result<()> {
             preflight_model_pack_command(&path, stage.as_deref(), json)
         }
         ModelPackCommand::AuditQuant { target, quant } => audit_pack_quant_command(&target, quant),
+        ModelPackCommand::Requant {
+            source,
+            output,
+            quant,
+        } => requant_model_pack_command(&source, &output, quant),
         ModelPackCommand::Usage => model_store_usage_command(),
         ModelPackCommand::Gc { dry_run } => model_store_gc_command(dry_run),
     }
@@ -1142,6 +1147,39 @@ pub(super) fn audit_pack_quant_command(target: &str, quant: Option<AuditQuantTie
     print_quant_floor_report(&audit);
     fail_closed_on_quant_floor_violations(&audit, target)?;
     println!("No downloads beyond the header prefix or inference were performed.");
+    Ok(())
+}
+
+fn requant_model_pack_command(source: &Path, output: &Path, target: RequantTarget) -> Result<()> {
+    let source = validate_local_ggml_package_cli_path(source)?;
+    ensure_ggml_package_output_suffix(output)?;
+    if output.exists() {
+        bail!(
+            "requant output '{}' already exists; choose a new destination",
+            output.display()
+        );
+    }
+
+    let result = openasr_core::models::pack_requant::requantize_oasr_pack(
+        &source,
+        output,
+        target.to_pack_quant(),
+    )
+    .map_err(anyhow::Error::new)?;
+    let verified = &result.verified_pack;
+    println!(
+        "Requantized ASR pack through the shared Rust/ggml seam:\n\
+         - source: {}\n\
+         - verified_path: {}\n\
+         - content_id: {}\n\
+         - converted_tensors: {}\n\
+         - copied_tensors: {}",
+        source.display(),
+        verified.path().display(),
+        verified.content_id(),
+        result.converted_tensor_count,
+        result.copied_tensor_count,
+    );
     Ok(())
 }
 

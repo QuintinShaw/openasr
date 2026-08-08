@@ -33,17 +33,37 @@ python3 convert_mimo_asr.py \
   --quant      q8-0                 # CLI canonical token: fp16 | q8-0 | q4-k
 ```
 
-One invocation produces exactly one pack at `--out` (the publish lane owns
-the naming via its `external_converter` template in
+For `fp16` and `q8-0`, one invocation produces exactly one pack at `--out`
+(the publish lane owns the naming via its `external_converter` template in
 `tooling/publish-model/models-publish.toml`). `--quant` takes the lane's CLI
 canonical tokens; `openasr.pack.quant` records the canonical label
 (`fp16` / `q8_0` / `q4_k`).
 
-**`q4-k` currently fails closed.** The gguf Python library implements only
+**`q4-k` uses a two-step path.** The gguf Python library implements only
 legacy-quant block quantization (Q4_0..Q8_0); K-quant math belongs to ggml's
-single source of truth, so this converter refuses to fork it in Python. The
-public catalog's q4_k tier needs a Rust-side repack/requant seam; until that
-exists, produce fp16/q8_0 here.
+single source of truth. The source-only converter therefore fails closed for
+`q4-k`, and the publish recipe intentionally does not guess a binary path.
+Stage an fp16 pack, then invoke the generic Rust seam. Starting from the
+highest-precision representation avoids compounding Q8_0 and Q4_K
+quantization error:
+
+```bash
+STAGING=/path/to/out/mimo-v2.5-asr-fp16.oasr
+FINAL=/path/to/out/mimo-v2.5-asr-q4_k.oasr
+
+python3 convert_mimo_asr.py \
+  --main-dir /path/to/MiMo-V2.5-ASR \
+  --tokenizer /path/to/MiMo-Audio-Tokenizer/model.safetensors \
+  --out "$STAGING" \
+  --package-id mimo-v2.5-asr \
+  --quant fp16
+
+openasr model-pack requant "$STAGING" "$FINAL" --quant q4-k
+```
+
+The command verifies the source before reading it and seals/verifies the
+output. It reports the verified path, content id, and converted/copied tensor
+counts. Do not add a Python K-quant implementation or relabel the q8_0 pack.
 
 Set `OPENASR_BUILD_COMMIT=<40-hex sha>` to bake `openasr.build.commit`
 provenance (the publish pipeline's `convert.sh` always exports it); a set but
