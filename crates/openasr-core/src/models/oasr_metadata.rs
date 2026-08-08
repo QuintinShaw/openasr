@@ -96,7 +96,12 @@ impl PackEnvelope {
                 insert_metadata(
                     &mut metadata,
                     crate::arch::GENERAL_ARCHITECTURE_KEY,
-                    descriptor.identity.model_architecture,
+                    descriptor
+                        .identity
+                        .runtime_architecture_aliases
+                        .first()
+                        .copied()
+                        .unwrap_or(descriptor.identity.model_architecture),
                 );
                 insert_metadata(
                     &mut metadata,
@@ -636,6 +641,22 @@ mod envelope_tests {
                 super::super::ggml_family_adapter::GGML_TOKENIZER_ID_KEY
             ),
             Some(crate::WHISPER_TOKENIZER_ID)
+        );
+    }
+
+    #[test]
+    fn asr_envelope_keeps_internal_architecture_distinct_from_gguf_alias() {
+        let metadata = PackEnvelope::asr(crate::QWEN3_ASR_GGML_ARCHITECTURE_ID)
+            .seal(BTreeMap::new())
+            .expect("seal Qwen ASR envelope");
+
+        assert_eq!(
+            string_value(&metadata, crate::arch::GENERAL_ARCHITECTURE_KEY),
+            Some("qwen3-asr")
+        );
+        assert_eq!(
+            string_value(&metadata, OASR_METADATA_KEY_MODEL_ARCHITECTURE),
+            Some(crate::QWEN3_ASR_GGML_ARCHITECTURE_ID)
         );
     }
 
