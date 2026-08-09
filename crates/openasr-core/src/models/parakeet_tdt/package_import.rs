@@ -21,6 +21,7 @@ use crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
+use crate::models::fastconformer::load_vocab_tokens;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
     decode_safetensors_payload_as_f32, encode_f16_bits_le, read_source_json_file, validate_error,
@@ -41,7 +42,6 @@ use super::runtime_contract::{
     PARAKEET_TDT_SUBSAMPLING_FACTOR_KEY, PARAKEET_TDT_VOCAB_SIZE_KEY,
 };
 const SOURCE_CONFIG_JSON: &str = "config.json";
-const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 
 pub type ParakeetTdtQuantizationMode = PackQuant;
@@ -86,32 +86,13 @@ struct ParakeetTdtEncoderConfigJson {
     scale_input: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenizerJson {
-    model: TokenizerModelJson,
-    #[serde(default)]
-    added_tokens: Vec<TokenizerAddedToken>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenizerModelJson {
-    vocab: BTreeMap<String, u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenizerAddedToken {
-    id: u32,
-    content: String,
-}
-
 pub fn convert_local_parakeet_tdt_source_to_runtime_pack(
     request: &ParakeetTdtImportRequest,
 ) -> Result<ParakeetTdtImportResult, LocalSourceImportError> {
     validate_output_pack_extension(&request.output_root)?;
     let config: ParakeetTdtConfigJson =
         read_source_json_file(&request.source_root, SOURCE_CONFIG_JSON)?;
-    let tokenizer: TokenizerJson =
-        read_source_json_file(&request.source_root, SOURCE_TOKENIZER_JSON)?;
+    let vocab_tokens = load_vocab_tokens(&request.source_root, config.vocab_size, "parakeet-tdt")?;
     let model_path = request.source_root.join(SOURCE_MODEL_SAFETENSORS);
     let safetensors = SafetensorsFile::open(&model_path)?;
 
@@ -142,7 +123,6 @@ pub fn convert_local_parakeet_tdt_source_to_runtime_pack(
         )));
     }
 
-    let vocab_tokens = build_vocab_tokens(&tokenizer, config.vocab_size)?;
     let tensors = build_parakeet_tdt_runtime_tensors(&safetensors, request.quantization)?;
     let metadata = parakeet_tdt_runtime_gguf_metadata(&config, request, &vocab_tokens);
 
@@ -166,36 +146,6 @@ pub fn convert_local_parakeet_tdt_source_to_runtime_pack(
         tensor_count,
         blank_token_id: config.blank_token_id,
     })
-}
-
-/// Build the ordered `tokenizer.ggml.tokens` list (ids 0..=vocab_size-1) from
-/// the BPE vocab + the added/special tokens (`<blank>` = the last id).
-fn build_vocab_tokens(
-    tokenizer: &TokenizerJson,
-    vocab_size: usize,
-) -> Result<Vec<String>, LocalSourceImportError> {
-    let mut tokens = vec![None::<String>; vocab_size];
-    for (token, &id) in &tokenizer.model.vocab {
-        if (id as usize) < vocab_size {
-            tokens[id as usize] = Some(token.clone());
-        }
-    }
-    for added in &tokenizer.added_tokens {
-        if (added.id as usize) < vocab_size {
-            tokens[added.id as usize] = Some(added.content.clone());
-        }
-    }
-    tokens
-        .into_iter()
-        .enumerate()
-        .map(|(id, token)| {
-            token.ok_or_else(|| {
-                validate_error(format!(
-                    "parakeet-tdt tokenizer is missing token for id {id}"
-                ))
-            })
-        })
-        .collect()
 }
 
 fn build_parakeet_tdt_runtime_tensors(

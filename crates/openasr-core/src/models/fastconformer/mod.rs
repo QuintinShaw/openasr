@@ -21,6 +21,7 @@
 
 pub(crate) mod contract;
 pub(crate) mod graph;
+pub(crate) mod tokenizer_json;
 pub(crate) mod weights;
 
 pub(crate) use contract::{
@@ -31,6 +32,7 @@ pub(crate) use graph::{
     FastConformerEncoderCore, FastConformerStackConfig, alloc_static, bind_loaded,
     build_conformer_stack, upload_graph_f32, upload_static,
 };
+pub(crate) use tokenizer_json::load_vocab_tokens;
 pub(crate) use weights::{
     FastConformerLayerWeights, NamedTensor, load_fastconformer_layer,
     load_fastconformer_subsampling, load_named,
