@@ -21,7 +21,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTokenEmbeddingTable};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
@@ -29,8 +32,7 @@ use crate::models::seq2seq_greedy_decode::{
 
 use super::decode_session::{GraniteSpeechDecodeSession, GraniteSpeechKvCacheCapacity};
 use super::decoder_graph::{
-    GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, GraniteSpeechDecoderWeightProvider,
-    embed_token_row,
+    GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, embed_token_row,
 };
 
 fn map_step_error(
@@ -39,6 +41,16 @@ fn map_step_error(
 ) -> impl Fn(GraniteSpeechDecoderError) -> Seq2SeqGreedyDecodeError {
     move |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
         reason: format!("granite-speech {label} decoder step {step_index}: {error}"),
+    }
+}
+
+fn map_embedding_error(
+    step_index: usize,
+) -> impl Fn(MappedTokenEmbeddingError) -> Seq2SeqGreedyDecodeError {
+    move |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+        reason: format!(
+            "granite-speech audio decoder step {step_index} token embedding gather failed: {error}"
+        ),
     }
 }
 
@@ -74,7 +86,7 @@ fn incremental_new_token(
 /// per-step full-prefix recompute (`O(n^2)` decode).
 pub(crate) struct GraniteSpeechDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
-    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    provider: &'p HashMap<String, Vec<f32>>,
     backend: GgmlCpuGraphBackend,
     session: Option<GraniteSpeechDecodeSession>,
     prompt_len: usize,
@@ -84,7 +96,7 @@ pub(crate) struct GraniteSpeechDecodeStepExecutor<'p> {
 impl<'p> GraniteSpeechDecodeStepExecutor<'p> {
     pub(crate) fn new(
         config: GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        provider: &'p HashMap<String, Vec<f32>>,
         backend: GgmlCpuGraphBackend,
         capacity: GraniteSpeechKvCacheCapacity,
     ) -> Self {
@@ -153,7 +165,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
 /// ids) -- this executor never re-derives the prompt embeddings from it.
 pub(crate) struct GraniteSpeechAudioDecodeStepExecutor<'p> {
     config: GraniteSpeechDecoderConfig,
-    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    provider: &'p HashMap<String, Vec<f32>>,
     backend: GgmlCpuGraphBackend,
     initial_prompt_embeddings: Vec<f32>,
     session: Option<GraniteSpeechDecodeSession>,
@@ -169,7 +181,7 @@ impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
     /// resident session instead.
     pub(crate) fn new(
         config: GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        provider: &'p HashMap<String, Vec<f32>>,
         backend: GgmlCpuGraphBackend,
         initial_prompt_embeddings: Vec<f32>,
         capacity: GraniteSpeechKvCacheCapacity,
@@ -225,20 +237,19 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
 
 /// Keep-quantized audio-prompt step executor that drives a **cross-request
 /// resident** [`GraniteSpeechDecodeSession`] (owned by
-/// `executor::GraniteSpeechPreparedRuntime`, taken from the thread-local
-/// resident cache) instead of building one per request. The session's heavy
+/// `executor::GraniteSpeechPreparedRuntime`, checked out from the admitted
+/// resident actor pool) instead of building one per request. The session's heavy
 /// state -- the graph runner, the mmap'd loaded weight context, and its
 /// zero-copy bound decoder weights -- is already built and reused; this
 /// executor only prefills the per-request audio-spliced prompt on the first
 /// step (the session was released to `prefilled = false` with empty K/V before
 /// being cached, so `prefill` starts clean) and advances the KV cache one token
-/// per subsequent step. `provider` is the resident embedding table, borrowed
-/// disjointly from the same prepared runtime as `session` (a `&mut` on
-/// `session`, a `&` on the embedding table -- distinct fields, both live at
-/// once). Mirrors firered/mimo's resident-decoder step drivers.
+/// per subsequent step. `embedding_table` is the compact mmap-backed row
+/// gatherer borrowed disjointly from the same prepared runtime as `session`.
+/// Only one generated-token row is materialized per step.
 pub(crate) struct GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
     session: &'s mut GraniteSpeechDecodeSession,
-    provider: &'s dyn GraniteSpeechDecoderWeightProvider,
+    embedding_table: &'s MappedTokenEmbeddingTable,
     initial_prompt_embeddings: Vec<f32>,
     prompt_len: usize,
     prefilled: bool,
@@ -248,13 +259,13 @@ pub(crate) struct GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
 impl<'s> GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
     pub(crate) fn new(
         session: &'s mut GraniteSpeechDecodeSession,
-        provider: &'s dyn GraniteSpeechDecoderWeightProvider,
+        embedding_table: &'s MappedTokenEmbeddingTable,
         initial_prompt_embeddings: Vec<f32>,
         capacity: GraniteSpeechKvCacheCapacity,
     ) -> Self {
         Self {
             session,
-            provider,
+            embedding_table,
             initial_prompt_embeddings,
             prompt_len: 0,
             prefilled: false,
@@ -271,9 +282,13 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
         // Steps after the first advance the resident session by one token.
         if self.prefilled {
             let new_token = incremental_new_token(self.session, self.prompt_len, &input)?;
+            let embedding = self
+                .embedding_table
+                .gather_rows(&[new_token])
+                .map_err(map_embedding_error(input.step_index))?;
             let logits = self
                 .session
-                .decode_step(new_token, self.provider)
+                .decode_step_from_embedding(&embedding)
                 .map_err(map_step_error(input.step_index, "audio"))?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits,

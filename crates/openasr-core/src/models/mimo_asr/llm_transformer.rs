@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
 
-use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
@@ -67,7 +67,7 @@ pub(crate) struct MimoLlmDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
     logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
-    token_embedding: Qwen3AsrTokenEmbeddingTable,
+    token_embedding: MappedTokenEmbeddingTable,
     metadata: MimoLlmMetadata,
 }
 

@@ -13,11 +13,12 @@ use thiserror::Error;
 
 use crate::GgufTensorDataReader;
 use crate::arch::OpenAsrPreparedRuntimeStrategy;
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 
 use super::qwen::{
-    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLogitsHead,
-    Qwen3AsrTokenEmbeddingTable, QwenDecoderTail, QwenDecoderTailLoadError, QwenWholeDecoderPlan,
-    load_qwen_decoder_tail_from_contract, load_qwen3_audio_encoder_weights_from_reader,
+    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLogitsHead, QwenDecoderTail,
+    QwenDecoderTailLoadError, QwenWholeDecoderPlan, load_qwen_decoder_tail_from_contract,
+    load_qwen3_audio_encoder_weights_from_reader,
 };
 use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 
@@ -30,7 +31,7 @@ use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 pub(crate) enum BuiltinRuntimeWeightComponents {
     Qwen3Asr {
         audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
-        token_embedding_table: Qwen3AsrTokenEmbeddingTable,
+        token_embedding_table: MappedTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
         decoder_plan: QwenWholeDecoderPlan,
     },
@@ -41,7 +42,7 @@ impl BuiltinRuntimeWeightComponents {
         self,
     ) -> Option<(
         Qwen3AsrAudioEncoderWeights,
-        Qwen3AsrTokenEmbeddingTable,
+        MappedTokenEmbeddingTable,
         Qwen3AsrLlmLogitsHead,
         QwenWholeDecoderPlan,
     )> {

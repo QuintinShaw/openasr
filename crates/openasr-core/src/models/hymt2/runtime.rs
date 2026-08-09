@@ -21,6 +21,7 @@ use crate::models::hymt2::prompt::{
     build_hymt2_subtitle_prompt_token_parts, build_hymt2_user_chat_prompt_tokens,
     build_subtitle_translation_prompt, max_output_tokens_for_source_tokens,
 };
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 #[cfg(test)]
 use crate::models::pack_verifier::{
     PackCandidate, PackRoute, PackVerificationError, PackVerifier, VerifiedPack,
@@ -30,8 +31,7 @@ use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
     Qwen3AsrLlmLogitsHeadRuntime, Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
-    Qwen3AsrLlmWholeStepTop1Output, Qwen3AsrTokenEmbeddingTable,
-    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    Qwen3AsrLlmWholeStepTop1Output, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     compile_qwen_whole_decoder_graph_from_prepared_plan, even_prefill_chunk_len,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor,
     load_qwen3_token_embedding_table_from_reader, logits_head_ggml_enabled,
@@ -83,7 +83,7 @@ enum Hymt2HostLeaseOwnership {
 pub struct Hymt2Runtime {
     metadata: Hymt2ExecutionMetadata,
     tokenizer: Hymt2Tokenizer,
-    token_embedding_table: Qwen3AsrTokenEmbeddingTable,
+    token_embedding_table: MappedTokenEmbeddingTable,
     logits_head: Qwen3AsrLlmLogitsHead,
     capacity: Hymt2DecoderCapacityContract,
     host_lease_ownership: Hymt2HostLeaseOwnership,
@@ -1370,7 +1370,7 @@ fn validate_non_empty_source_clause(source_clause: &str) -> Result<(), Hymt2Runt
 
 struct Hymt2GreedyStepper<'a> {
     metadata: Hymt2ExecutionMetadata,
-    token_embedding_table: &'a Qwen3AsrTokenEmbeddingTable,
+    token_embedding_table: &'a MappedTokenEmbeddingTable,
     logits_head: &'a Qwen3AsrLlmLogitsHead,
     logits_runtime: &'a mut Qwen3AsrLlmLogitsHeadRuntime,
     whole_decoder: &'a mut Qwen3AsrLlmWholeDecoderGraphExecutor,

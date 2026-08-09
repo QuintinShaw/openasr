@@ -6,11 +6,11 @@ use super::frontend::Qwen3AsrMelFrontendPlan;
 use super::llm_transformer::QwenWholeDecoderPlan;
 use super::logits_head::Qwen3AsrLlmLogitsHead;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
-use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
 use crate::QWEN3_ASR_GGML_ARCHITECTURE_ID;
 use crate::arch::OpenAsrPreparedRuntimeStrategy;
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::runtime_component_bootstrap::{
     BuiltinRuntimeComponentBootstrap, BuiltinRuntimeComponentBootstrapError,
     BuiltinTokenizerMaterializationMode, build_builtin_runtime_component_bootstrap,
@@ -25,7 +25,7 @@ pub(crate) struct Qwen3AsrPreparedRuntime {
     pub tokenizer: Option<Qwen3AsrTokenizer>,
     pub mel_frontend_plan: Qwen3AsrMelFrontendPlan,
     pub audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
-    pub token_embedding_table: Arc<Qwen3AsrTokenEmbeddingTable>,
+    pub token_embedding_table: Arc<MappedTokenEmbeddingTable>,
     pub logits_head: Arc<Qwen3AsrLlmLogitsHead>,
     pub decoder_plan: Arc<QwenWholeDecoderPlan>,
 }

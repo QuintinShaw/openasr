@@ -5,7 +5,7 @@
 //! just with the `Option` fields flipped), `qwen::Qwen3AsrLlmWholeDecoderGraphExecutor`
 //! for the whole-decoder ggml graph, `qwen::Qwen3AsrLayerKvCacheState` for the
 //! host-side per-layer GQA KV cache, and `qwen::Qwen3AsrLlmLogitsHead` /
-//! `qwen::Qwen3AsrTokenEmbeddingTable` for the output/embedding stage.
+//! `qwen::MappedTokenEmbeddingTable` for the output/embedding stage.
 //! Mirrors `firered_llm::llm_transformer`'s exact shape (see that module's
 //! doc comment for why this crate does not replicate qwen's GPU-tuned
 //! prefill-chunk/persistent-session machinery here: correctness-first single-
@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings,
     QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     compile_qwen_whole_decoder_graph_from_prepared_plan,
 };
@@ -59,7 +60,7 @@ pub(crate) struct MossTdDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Arc<Qwen3AsrLlmLogitsHead>,
     logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
-    token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
+    token_embedding: Arc<MappedTokenEmbeddingTable>,
     metadata: MossTdDecoderMetadata,
 }
 
@@ -90,7 +91,7 @@ impl MossTdDecoderRuntime {
         metadata: MossTdDecoderMetadata,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         logits_head: Arc<Qwen3AsrLlmLogitsHead>,
-        token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
+        token_embedding: Arc<MappedTokenEmbeddingTable>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
         // Structural Prepared Graph Plan adoption: host prepare already owns

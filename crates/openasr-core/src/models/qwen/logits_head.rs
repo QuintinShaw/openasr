@@ -844,7 +844,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
-    use crate::models::qwen::token_embedding::load_token_embedding_table_from_reader_with_tensor_name;
+    use crate::models::mapped_token_embedding::load_mapped_token_embedding_table_from_reader;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
     use super::*;
@@ -866,13 +866,9 @@ mod tests {
         crate::test_process_env::with_test_process_env(
             [(OPENASR_QWEN3_LLM_LOGITS_GGML_ENV, Some(OsString::from("1")))],
             || {
-                let embedding = load_token_embedding_table_from_reader_with_tensor_name(
-                    &reader,
-                    tied_weight_name,
-                    2,
-                    3,
-                )
-                .expect("mapped embedding");
+                let embedding =
+                    load_mapped_token_embedding_table_from_reader(&reader, tied_weight_name, 2, 3)
+                        .expect("mapped embedding");
                 let logits = load_llm_logits_head_from_reader_with_tensor_names(
                     &reader,
                     2,

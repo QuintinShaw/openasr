@@ -756,6 +756,42 @@ fn resident_model_actor_keys_exclude_request_capacity() {
 }
 
 #[test]
+fn granite_token_embeddings_stay_mapped_and_family_local() {
+    let root = models_root();
+    let granite_root = root.join("granite_speech");
+    assert!(
+        !granite_root.join("runtime_provider.rs").exists(),
+        "Granite must not restore the shallow host-f32 runtime provider",
+    );
+
+    let executor =
+        std::fs::read_to_string(granite_root.join("executor.rs")).expect("read Granite executor");
+    assert!(
+        executor.contains("load_mapped_token_embedding_table_from_reader")
+            && executor.contains("MappedTokenEmbeddingTable"),
+        "Granite production must own the shared mmap-backed token-row gatherer",
+    );
+    for forbidden in [
+        "GraniteSpeechDecoderWeightProvider",
+        "load_tensors_from_preflight",
+        "host_tensor_f32_copy_dequantized_by_name",
+    ] {
+        assert!(
+            !executor.contains(forbidden),
+            "Granite executor must not restore shallow/full-f32 seam '{forbidden}'",
+        );
+    }
+
+    let decode_executor = std::fs::read_to_string(granite_root.join("decode_executor.rs"))
+        .expect("read Granite decode executor");
+    assert!(
+        decode_executor.contains("decode_step_from_embedding")
+            && decode_executor.contains("gather_rows(&[new_token])"),
+        "Granite incremental decode must materialize exactly one mapped token row per step",
+    );
+}
+
+#[test]
 fn native_transcribe_production_does_not_match_whisper_architecture_directly() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/backend/native_transcribe.rs");
     assert_production_does_not_reference(&path, "WHISPER_GGML_ARCHITECTURE_ID");

@@ -5,20 +5,21 @@
 //! uses), `qwen::Qwen3AsrLlmWholeDecoderGraphExecutor` for the whole-decoder
 //! ggml graph, `qwen::Qwen3AsrLayerKvCacheState` for the host-side per-layer
 //! GQA KV cache, and `qwen::Qwen3AsrLlmLogitsHead` /
-//! `qwen::Qwen3AsrTokenEmbeddingTable` for the output/embedding stage. Mirrors
+//! `qwen::MappedTokenEmbeddingTable` for the output/embedding stage. Mirrors
 //! `moss_transcribe_diarize::llm_decoder`'s exact shape (both drive the same
 //! shared executor with a stock Qwen3-0.6B decoder).
 
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, Qwen3AsrTokenEmbeddingTable,
-    QwenDecoderTail, QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest,
-    QwenWholeDecoderPlan, compile_qwen_whole_decoder_graph_from_prepared_plan,
-    load_qwen_decoder_tail_from_contract, quoted_qwen_decoder_system_memory_bytes,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
+    QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
+    quoted_qwen_decoder_system_memory_bytes,
 };
 
 use super::runtime_contract::{
@@ -76,7 +77,7 @@ pub(crate) struct FunasrNanoDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
     logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
-    token_embedding: Qwen3AsrTokenEmbeddingTable,
+    token_embedding: MappedTokenEmbeddingTable,
     metadata: FunasrNanoDecoderMetadata,
 }
 

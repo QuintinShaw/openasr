@@ -19,16 +19,16 @@ use super::logits_head::{
     Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError,
     load_llm_logits_head_from_reader_with_tensor_names,
 };
-use super::token_embedding::{
-    Qwen3AsrTokenEmbeddingError, Qwen3AsrTokenEmbeddingTable,
-    load_token_embedding_table_from_reader_with_tensor_name,
+use crate::models::mapped_token_embedding::{
+    MappedTokenEmbeddingError, MappedTokenEmbeddingTable,
+    load_mapped_token_embedding_table_from_reader,
 };
 
 /// Final RMSNorm + logits head + token embedding loaded from one contract tail.
 #[derive(Debug)]
 pub(crate) struct QwenDecoderTail {
     pub logits_head: Qwen3AsrLlmLogitsHead,
-    pub token_embedding: Qwen3AsrTokenEmbeddingTable,
+    pub token_embedding: MappedTokenEmbeddingTable,
 }
 
 #[derive(Debug, Error)]
@@ -38,7 +38,7 @@ pub(crate) enum QwenDecoderTailLoadError {
     #[error(transparent)]
     LogitsHead(#[from] Qwen3AsrLlmLogitsHeadError),
     #[error(transparent)]
-    TokenEmbedding(#[from] Qwen3AsrTokenEmbeddingError),
+    TokenEmbedding(#[from] MappedTokenEmbeddingError),
 }
 
 /// Load the decoder tail from the same bound contract admission expands.
@@ -86,7 +86,7 @@ pub(crate) fn load_qwen_decoder_tail_from_contract(
         rms_norm_epsilon,
         backend,
     )?;
-    let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
+    let token_embedding = load_mapped_token_embedding_table_from_reader(
         reader,
         tail.token_embd,
         geometry.d_model,

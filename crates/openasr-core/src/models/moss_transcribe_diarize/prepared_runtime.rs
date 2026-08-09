@@ -10,13 +10,14 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::prepared_runtime_cache::{
     HostNeutralPreparedRuntime, PreparedRuntimeQuoteBuilder, PreparedRuntimeQuoteContext,
     SystemMemoryMaterialization,
 };
 use crate::models::qwen::{
-    Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable, QwenDecoderContract, QwenDecoderTail,
-    QwenDecoderTailLoadError, QwenWholeDecoderPlan, add_qwen_decoder_prepared_runtime_quote,
+    Qwen3AsrLlmLogitsHead, QwenDecoderContract, QwenDecoderTail, QwenDecoderTailLoadError,
+    QwenWholeDecoderPlan, add_qwen_decoder_prepared_runtime_quote,
     load_qwen_decoder_tail_from_contract,
 };
 use crate::models::system_memory_owner::{SystemMemoryAllocationQuote, SystemMemoryOwnerError};
@@ -41,7 +42,7 @@ pub(crate) struct MossTdPreparedRuntime {
     pub(crate) adaptor_weights: Arc<MossAdaptorWeights>,
     pub(crate) encoder_weights: Arc<MossEncoderWeights>,
     pub(crate) decoder_plan: Arc<QwenWholeDecoderPlan>,
-    pub(crate) token_embedding: Arc<Qwen3AsrTokenEmbeddingTable>,
+    pub(crate) token_embedding: Arc<MappedTokenEmbeddingTable>,
     pub(crate) logits_head: Arc<Qwen3AsrLlmLogitsHead>,
 }
 

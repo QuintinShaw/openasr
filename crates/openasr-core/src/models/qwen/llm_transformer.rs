@@ -30,7 +30,7 @@ use super::logits_head::{
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::{Qwen3AsrExecutionMetadata, qwen3_asr_decoder_contract};
 use super::tensor_names::llm_layer_tensor_names;
-use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::prepared_runtime_cache::{
     PreparedRuntimeQuoteBuilder, PreparedRuntimeQuoteContext,
 };
@@ -5722,7 +5722,7 @@ pub(crate) fn quoted_qwen_decoder_system_memory_bytes(
             backend,
         )?;
     let (embedding_peak, embedding_retained) =
-        Qwen3AsrTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
+        MappedTokenEmbeddingTable::quoted_system_memory_bytes_from_reader(
             reader,
             tail.token_embd,
             geometry.d_model,

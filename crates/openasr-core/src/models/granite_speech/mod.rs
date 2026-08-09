@@ -34,10 +34,8 @@
 //! Honest gaps, tracked outside weight-free CI: the importer is fp16-only
 //! and is reachable only through its force-linked CoreConvert symbol (no
 //! `openasr model-pack import granite-speech` subcommand yet -- the publish
-//! tooling records this), the encoder/projector still bind through the
-//! host-f32 loader in [`runtime_provider`] (their keep-quantized migration is
-//! a follow-up; the decoder already binds zero-copy), streaming re-runs the
-//! whole offline pipeline per partial (correctness-only cadence), and the
+//! tooling records this), streaming re-runs the whole offline pipeline per
+//! partial (correctness-only cadence), and the
 //! end-to-end golden tests need a local real pack, so they stay `#[ignore]`d.
 //! This module makes no performance claim.
 
@@ -52,7 +50,6 @@ pub mod package_import;
 pub(crate) mod prompt;
 pub(crate) mod qformer;
 pub(crate) mod runtime_contract;
-pub(crate) mod runtime_provider;
 pub(crate) mod tokenizer;
 
 #[cfg(test)]

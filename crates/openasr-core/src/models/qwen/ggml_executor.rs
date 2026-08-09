@@ -36,7 +36,6 @@ use super::prompt_embedding::{
     Qwen3AsrPromptEmbeddingError, build_qwen3_prompt_embeddings_with_audio_splice,
 };
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
-use super::token_embedding::Qwen3AsrTokenEmbeddingError;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::hparams::{QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY};
 use crate::arch::shape_orchestrator::{
@@ -60,6 +59,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::lora_adapter::{
     ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle, resolved_lora_adapter,
 };
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingError;
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
@@ -489,7 +489,9 @@ impl Qwen3AsrGgmlExecutor {
         tokenizer: Option<&Qwen3AsrTokenizer>,
         mel_frontend_plan: &Qwen3AsrMelFrontendPlan,
         audio_encoder_weights: &Qwen3AsrAudioEncoderWeights,
-        token_embedding_table: Arc<super::token_embedding::Qwen3AsrTokenEmbeddingTable>,
+        token_embedding_table: Arc<
+            crate::models::mapped_token_embedding::MappedTokenEmbeddingTable,
+        >,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
@@ -528,7 +530,9 @@ impl Qwen3AsrGgmlExecutor {
         preflight: &GgufRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
-        token_embedding_table: Arc<super::token_embedding::Qwen3AsrTokenEmbeddingTable>,
+        token_embedding_table: Arc<
+            crate::models::mapped_token_embedding::MappedTokenEmbeddingTable,
+        >,
         audio_encoder_weights: &Qwen3AsrAudioEncoderWeights,
         mel_features: &Qwen3AsrMelFeatures,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
@@ -1101,7 +1105,7 @@ fn map_audio_encoder_error(error: Qwen3AsrAudioEncoderError) -> Qwen3AsrGgmlExec
     }
 }
 
-fn map_token_embedding_error(error: Qwen3AsrTokenEmbeddingError) -> Qwen3AsrGgmlExecutorError {
+fn map_token_embedding_error(error: MappedTokenEmbeddingError) -> Qwen3AsrGgmlExecutorError {
     Qwen3AsrGgmlExecutorError::TokenEmbeddingPrefillFailed {
         reason: error.to_string(),
     }
@@ -1223,7 +1227,7 @@ struct Qwen3AsrPrefillOnlyGreedyStepExecutor<'a> {
     prefill_input: super::llm_prefill::Qwen3AsrLlmPrefillInput,
     logits_head: &'a Qwen3AsrLlmLogitsHead,
     logits_head_runtime: &'a mut Qwen3AsrLlmLogitsHeadRuntime,
-    token_embedding_table: Arc<super::token_embedding::Qwen3AsrTokenEmbeddingTable>,
+    token_embedding_table: Arc<crate::models::mapped_token_embedding::MappedTokenEmbeddingTable>,
     layer_kv_caches: Qwen3AsrHostKvCacheOwner,
     kv_capacity: Qwen3AsrKvCacheCapacity,
     whole_decoder: &'a mut Qwen3AsrLlmWholeDecoderGraphExecutor,

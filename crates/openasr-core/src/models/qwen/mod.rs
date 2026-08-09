@@ -88,9 +88,7 @@ pub(crate) use prepared_runtime::{
 pub(crate) use prompt_embedding::{
     Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
 };
-pub(crate) use token_embedding::{
-    Qwen3AsrTokenEmbeddingTable, load_qwen3_token_embedding_table_from_reader,
-};
+pub(crate) use token_embedding::load_qwen3_token_embedding_table_from_reader;
 pub(crate) use tokenizer::Qwen3AsrTokenizer;
 
 pub const QWEN3_ASR_MODEL_FAMILY: &str = "qwen3-asr";

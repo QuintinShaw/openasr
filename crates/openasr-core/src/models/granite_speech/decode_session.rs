@@ -72,6 +72,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlKvElementType, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
@@ -207,9 +209,8 @@ impl GraniteSpeechKvCacheCapacity {
 
 use super::decoder_graph::{
     GraniteDecoderLoadedWeights, GraniteDecoderWeightArena, GraniteDecoderWeights,
-    GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, GraniteSpeechDecoderWeightProvider,
-    embed_token_row, granite_post_attention, granite_pre_attention, linear, rms_norm,
-    weight_in_major,
+    GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, embed_token_row, granite_post_attention,
+    granite_pre_attention, linear, rms_norm, weight_in_major,
 };
 
 /// f32 resident KV element type for the Metal reuse path. f32 (not f16) keeps
@@ -492,7 +493,7 @@ impl GraniteSpeechDecodeSession {
     /// not retained; `decode_step` takes it again per call for the token embed.
     pub(crate) fn new(
         config: GraniteSpeechDecoderConfig,
-        provider: &dyn GraniteSpeechDecoderWeightProvider,
+        provider: &HashMap<String, Vec<f32>>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = decoder_graph_config(backend);
@@ -676,8 +677,34 @@ impl GraniteSpeechDecodeSession {
     pub(crate) fn decode_step(
         &mut self,
         new_token_id: u32,
-        provider: &dyn GraniteSpeechDecoderWeightProvider,
+        provider: &HashMap<String, Vec<f32>>,
     ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+        self.ensure_can_decode_step()?;
+        let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
+        self.decode_step_from_embedding_unchecked(&embed_row)
+    }
+
+    /// Advance one token from a caller-supplied embedding row. Production
+    /// uses this seam with the mmap-backed shared token table, while the
+    /// host-`HashMap` test path above remains an exact numerical oracle.
+    pub(crate) fn decode_step_from_embedding(
+        &mut self,
+        embed_row: &[f32],
+    ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+        self.ensure_can_decode_step()?;
+        if embed_row.len() != self.config.hidden_size {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: format!(
+                    "granite decode embedding row has {} values, expected {}",
+                    embed_row.len(),
+                    self.config.hidden_size
+                ),
+            });
+        }
+        self.decode_step_from_embedding_unchecked(embed_row)
+    }
+
+    fn ensure_can_decode_step(&self) -> Result<(), GraniteSpeechDecoderError> {
         if !self.prefilled {
             return Err(GraniteSpeechDecoderError::Shape {
                 reason: "granite decode session must be prefilled before decode_step".to_string(),
@@ -691,15 +718,19 @@ impl GraniteSpeechDecodeSession {
                 ),
             });
         }
+        Ok(())
+    }
 
+    fn decode_step_from_embedding_unchecked(
+        &mut self,
+        embed_row: &[f32],
+    ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
         if self.reuse_supported() {
             // Metal reuse path: one persistent single-token step against the
             // resident KV arena (write the new row via `set_rows`, attend the
             // fixed span). No graph rebuild, no host K/V round-trip.
-            return self.decode_step_reused(new_token_id, provider);
+            return self.decode_step_reused(embed_row);
         }
-
-        let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
 
         let seq_len = self.seq_len;
         let host_kv = self
@@ -712,7 +743,7 @@ impl GraniteSpeechDecodeSession {
             &mut self.runner,
             &self.weights,
             &self.config,
-            &embed_row,
+            embed_row,
             seq_len,
             host_kv,
         )?;
@@ -760,8 +791,7 @@ impl GraniteSpeechDecodeSession {
     /// tripping to the host. The new token occupies row `self.seq_len`.
     fn decode_step_reused(
         &mut self,
-        new_token_id: u32,
-        provider: &dyn GraniteSpeechDecoderWeightProvider,
+        embed_row: &[f32],
     ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
         let position = self.seq_len;
         let max_positions = self.resident_capacity;
@@ -772,8 +802,6 @@ impl GraniteSpeechDecodeSession {
                 ),
             });
         }
-        let embed_row = embed_token_row(&self.config, provider, new_token_id)?.to_vec();
-
         let needs_build = self
             .reuse
             .as_ref()
@@ -816,7 +844,7 @@ impl GraniteSpeechDecodeSession {
         let graph = reuse.session.builder();
 
         graph
-            .set_f32_slice(embed, &embed_row, "granite_reuse_embed")
+            .set_f32_slice(embed, embed_row, "granite_reuse_embed")
             .map_err(map_ggml("reuse_upload_embed"))?;
         graph
             .set_i32_slice(row_index, &[position_i32], "granite_reuse_row")

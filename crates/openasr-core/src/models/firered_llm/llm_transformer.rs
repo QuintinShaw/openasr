@@ -32,7 +32,7 @@
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
-use crate::models::qwen::Qwen3AsrTokenEmbeddingTable;
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
@@ -114,7 +114,7 @@ pub(crate) struct FireRedLlmDecoderRuntime {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     logits_head: Qwen3AsrLlmLogitsHead,
     logits_runtime: Qwen3AsrLlmLogitsHeadRuntime,
-    token_embedding: Qwen3AsrTokenEmbeddingTable,
+    token_embedding: MappedTokenEmbeddingTable,
     metadata: FireRedLlmDecoderMetadata,
 }
 
@@ -511,7 +511,7 @@ fn write_layer_kv(
 /// RMSNorm+matmul reference built from the same merged safetensors the `.oasr`
 /// pack was converted from. Deliberately tests the REAL production load path
 /// (`Qwen3AsrLlmWholeDecoderGraphExecutor`, `Qwen3AsrLlmLogitsHead`,
-/// `Qwen3AsrTokenEmbeddingTable`) against the real q8_0 dev pack, not a
+/// `MappedTokenEmbeddingTable`) against the real q8_0 dev pack, not a
 /// hand-rolled parallel implementation -- this is what caught the
 /// zero-copy-bind tensor-naming bug this module's history fixed (see
 /// `new_with_adapter`'s doc comment on `inner.attn_output_name`/`ffn_*_name`).

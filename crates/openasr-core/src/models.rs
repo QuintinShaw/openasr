@@ -39,6 +39,7 @@ pub(crate) mod kaldi_fbank;
 pub(crate) mod language;
 pub(crate) mod local_source_import;
 pub(crate) mod lora_adapter;
+pub(crate) mod mapped_token_embedding;
 pub(crate) mod mimo_asr;
 pub mod moonshine;
 pub(crate) mod moss_transcribe_diarize;

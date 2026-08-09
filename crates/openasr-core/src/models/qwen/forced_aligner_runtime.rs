@@ -49,11 +49,9 @@ use super::prompt_embedding::{
 };
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::OUTPUT_WEIGHT;
-use super::token_embedding::{
-    Qwen3AsrTokenEmbeddingError, Qwen3AsrTokenEmbeddingTable,
-    load_qwen3_token_embedding_table_from_reader,
-};
+use super::token_embedding::load_qwen3_token_embedding_table_from_reader;
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
+use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTokenEmbeddingTable};
 
 /// Same rope theta as the shared qwen3-asr LLM stack (`QWEN_ROPE_THETA` in
 /// `batched_decode.rs`); the forced aligner's LM shares that architecture
@@ -100,7 +98,7 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
     #[error("qwen3-forced-aligner audio encoder failed: {0}")]
     AudioEncoderFailed(#[from] Qwen3AsrAudioEncoderError),
     #[error("qwen3-forced-aligner token embedding failed: {0}")]
-    TokenEmbeddingFailed(#[from] Qwen3AsrTokenEmbeddingError),
+    TokenEmbeddingFailed(#[from] MappedTokenEmbeddingError),
     #[error("qwen3-forced-aligner prompt embedding failed: {0}")]
     PromptEmbeddingFailed(#[from] Qwen3AsrPromptEmbeddingError),
     #[error("qwen3-forced-aligner llm prefill input failed: {0}")]
@@ -365,7 +363,7 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
     pub merge_rank: std::collections::BTreeMap<String, usize>,
     pub mel_frontend_plan: Qwen3AsrMelFrontendPlan,
     pub audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
-    pub token_embedding_table: Qwen3AsrTokenEmbeddingTable,
+    pub token_embedding_table: MappedTokenEmbeddingTable,
     pub logits_head: Qwen3AsrLlmLogitsHead,
     pub decoder_plan: QwenWholeDecoderPlan,
 }

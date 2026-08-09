@@ -20,10 +20,12 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
+
 use super::decoder_graph::GraniteSpeechDecoderError;
-use super::decoder_graph::{
-    GraniteSpeechDecoderConfig, GraniteSpeechDecoderWeightProvider, embed_token_row,
-};
+use super::decoder_graph::{GraniteSpeechDecoderConfig, embed_token_row};
 use super::tokenizer::{GraniteSpeechTokenizer, GraniteSpeechTokenizerError};
 
 pub(crate) const GRANITE_SPEECH_AUDIO_TOKEN: &str = "<|audio|>";
@@ -70,6 +72,8 @@ pub(crate) enum GraniteSpeechPromptError {
     Tokenizer(#[from] GraniteSpeechTokenizerError),
     #[error("granite-speech prompt embedding lookup error: {0}")]
     Decoder(#[from] GraniteSpeechDecoderError),
+    #[error("granite-speech mapped token embedding lookup failed: {reason}")]
+    MappedTokenEmbedding { reason: String },
     #[error("granite-speech prompt audio embeddings shape error: {reason}")]
     Shape { reason: String },
 }
@@ -122,11 +126,59 @@ pub(crate) fn build_audio_prompt_token_ids(
 /// projected to the LLM's `hidden_size`, see `qformer::project`).
 pub(crate) fn build_audio_prompt_embeddings(
     config: &GraniteSpeechDecoderConfig,
-    provider: &dyn GraniteSpeechDecoderWeightProvider,
+    provider: &HashMap<String, Vec<f32>>,
     tokenizer: &GraniteSpeechTokenizer,
     prompt_text: &str,
     audio_embeddings: &[f32],
     audio_token_count: usize,
+) -> Result<(Vec<u32>, Vec<f32>), GraniteSpeechPromptError> {
+    build_audio_prompt_embeddings_with(
+        config,
+        tokenizer,
+        prompt_text,
+        audio_embeddings,
+        audio_token_count,
+        |token_ids| {
+            let mut rows = Vec::with_capacity(token_ids.len() * config.hidden_size);
+            for &token_id in token_ids {
+                rows.extend_from_slice(embed_token_row(config, provider, token_id)?);
+            }
+            Ok(rows)
+        },
+    )
+}
+
+pub(crate) fn build_audio_prompt_embeddings_from_mapped_table(
+    config: &GraniteSpeechDecoderConfig,
+    table: &MappedTokenEmbeddingTable,
+    tokenizer: &GraniteSpeechTokenizer,
+    prompt_text: &str,
+    audio_embeddings: &[f32],
+    audio_token_count: usize,
+) -> Result<(Vec<u32>, Vec<f32>), GraniteSpeechPromptError> {
+    build_audio_prompt_embeddings_with(
+        config,
+        tokenizer,
+        prompt_text,
+        audio_embeddings,
+        audio_token_count,
+        |token_ids| {
+            table.gather_rows(token_ids).map_err(|error| {
+                GraniteSpeechPromptError::MappedTokenEmbedding {
+                    reason: error.to_string(),
+                }
+            })
+        },
+    )
+}
+
+fn build_audio_prompt_embeddings_with(
+    config: &GraniteSpeechDecoderConfig,
+    tokenizer: &GraniteSpeechTokenizer,
+    prompt_text: &str,
+    audio_embeddings: &[f32],
+    audio_token_count: usize,
+    gather_text_rows: impl FnOnce(&[u32]) -> Result<Vec<f32>, GraniteSpeechPromptError>,
 ) -> Result<(Vec<u32>, Vec<f32>), GraniteSpeechPromptError> {
     if audio_embeddings.len() != audio_token_count * config.hidden_size {
         return Err(GraniteSpeechPromptError::Shape {
@@ -139,16 +191,39 @@ pub(crate) fn build_audio_prompt_embeddings(
     }
 
     let token_ids = build_audio_prompt_token_ids(tokenizer, prompt_text, audio_token_count)?;
+    let text_token_ids = token_ids
+        .iter()
+        .copied()
+        .filter(|token_id| *token_id != GRANITE_SPEECH_AUDIO_TOKEN_ID)
+        .collect::<Vec<_>>();
+    let text_rows = gather_text_rows(&text_token_ids)?;
+    let expected_text_values = text_token_ids
+        .len()
+        .checked_mul(config.hidden_size)
+        .ok_or_else(|| GraniteSpeechPromptError::Shape {
+            reason: "text embedding row count overflowed".to_string(),
+        })?;
+    if text_rows.len() != expected_text_values {
+        return Err(GraniteSpeechPromptError::Shape {
+            reason: format!(
+                "text embedding gather returned {} values, expected {expected_text_values}",
+                text_rows.len(),
+            ),
+        });
+    }
 
     let mut embeddings = Vec::with_capacity(token_ids.len() * config.hidden_size);
     let mut next_audio_slot = 0usize;
+    let mut next_text_slot = 0usize;
     for &token_id in &token_ids {
         if token_id == GRANITE_SPEECH_AUDIO_TOKEN_ID {
             let start = next_audio_slot * config.hidden_size;
             embeddings.extend_from_slice(&audio_embeddings[start..start + config.hidden_size]);
             next_audio_slot += 1;
         } else {
-            embeddings.extend_from_slice(embed_token_row(config, provider, token_id)?);
+            let start = next_text_slot * config.hidden_size;
+            embeddings.extend_from_slice(&text_rows[start..start + config.hidden_size]);
+            next_text_slot += 1;
         }
     }
 

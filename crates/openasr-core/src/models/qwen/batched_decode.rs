@@ -19,12 +19,12 @@ use super::llm_transformer::{
 };
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
-use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_prepared_registry::BuiltinPreparedRuntime;
 use crate::models::seq2seq_greedy_decode::{
@@ -99,7 +99,7 @@ pub(super) enum Qwen3AsrServeBatchPreparedAssets {
     #[cfg(test)]
     Fixture {
         tokenizer: Option<Qwen3AsrTokenizer>,
-        token_embedding_table: Arc<Qwen3AsrTokenEmbeddingTable>,
+        token_embedding_table: Arc<MappedTokenEmbeddingTable>,
         logits_head: Arc<Qwen3AsrLlmLogitsHead>,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
     },
@@ -107,7 +107,7 @@ pub(super) enum Qwen3AsrServeBatchPreparedAssets {
 
 struct Qwen3AsrServeBatchPreparedRef<'a> {
     tokenizer: Option<&'a Qwen3AsrTokenizer>,
-    token_embedding_table: &'a Arc<Qwen3AsrTokenEmbeddingTable>,
+    token_embedding_table: &'a Arc<MappedTokenEmbeddingTable>,
     logits_head: &'a Arc<Qwen3AsrLlmLogitsHead>,
     decoder_plan: &'a Arc<QwenWholeDecoderPlan>,
 }
@@ -2417,7 +2417,7 @@ mod tests {
         runtime_source: crate::GgmlRuntimeSource,
         runtime_source_preflight: crate::GgufRuntimeSourcePreflight,
         metadata: Qwen3AsrExecutionMetadata,
-        token_embedding_table: Qwen3AsrTokenEmbeddingTable,
+        token_embedding_table: MappedTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         layer_attention_projections: Arc<Vec<Qwen3AsrLlmLayerAttentionProjection>>,
@@ -2614,7 +2614,7 @@ mod tests {
     }
 
     fn qwen_real_pack_prefill_input(
-        token_embedding_table: &Qwen3AsrTokenEmbeddingTable,
+        token_embedding_table: &MappedTokenEmbeddingTable,
         prompt_tokens: &[u32],
     ) -> Qwen3AsrLlmPrefillInput {
         let token_count = prompt_tokens.len();

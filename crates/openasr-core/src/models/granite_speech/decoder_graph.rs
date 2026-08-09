@@ -120,16 +120,6 @@ impl GraniteSpeechDecoderConfig {
     }
 }
 
-pub(crate) trait GraniteSpeechDecoderWeightProvider {
-    fn tensor(&self, name: &str) -> Option<&[f32]>;
-}
-
-impl GraniteSpeechDecoderWeightProvider for HashMap<String, Vec<f32>> {
-    fn tensor(&self, name: &str) -> Option<&[f32]> {
-        self.get(name).map(Vec::as_slice)
-    }
-}
-
 pub(crate) struct DecoderLayerWeights<'a> {
     attn_norm_w: GgmlCpuTensor<'a>,
     q_w: GgmlCpuTensor<'a>,
@@ -149,12 +139,12 @@ struct DecoderWeights<'a> {
 }
 
 struct WeightBuilder<'p> {
-    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    provider: &'p HashMap<String, Vec<f32>>,
     uploads: Vec<(GgmlStaticTensor, &'p [f32], &'static str)>,
 }
 
 impl<'p> WeightBuilder<'p> {
-    fn new(provider: &'p dyn GraniteSpeechDecoderWeightProvider) -> Self {
+    fn new(provider: &'p HashMap<String, Vec<f32>>) -> Self {
         Self {
             provider,
             uploads: Vec::new(),
@@ -162,12 +152,11 @@ impl<'p> WeightBuilder<'p> {
     }
 
     fn fetch(&self, name: &str, expected: usize) -> Result<&'p [f32], GraniteSpeechDecoderError> {
-        let data =
-            self.provider
-                .tensor(name)
-                .ok_or_else(|| GraniteSpeechDecoderError::MissingWeight {
-                    name: name.to_string(),
-                })?;
+        let data = self.provider.get(name).map(Vec::as_slice).ok_or_else(|| {
+            GraniteSpeechDecoderError::MissingWeight {
+                name: name.to_string(),
+            }
+        })?;
         if data.len() != expected {
             return Err(GraniteSpeechDecoderError::WeightLen {
                 name: name.to_string(),
@@ -493,11 +482,12 @@ pub(crate) struct GraniteSpeechDecoderPrefillOutput {
 /// the same table `prefill_logits` itself gathers from.
 pub(crate) fn embed_token_row<'p>(
     config: &GraniteSpeechDecoderConfig,
-    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    provider: &'p HashMap<String, Vec<f32>>,
     token_id: u32,
 ) -> Result<&'p [f32], GraniteSpeechDecoderError> {
     let table = provider
-        .tensor("language_model.model.embed_tokens.weight")
+        .get("language_model.model.embed_tokens.weight")
+        .map(Vec::as_slice)
         .ok_or_else(|| GraniteSpeechDecoderError::MissingWeight {
             name: "language_model.model.embed_tokens.weight".to_string(),
         })?;
@@ -529,7 +519,7 @@ pub(crate) fn embed_token_row<'p>(
 /// text-only and audio-spliced prompts (`prompt.rs`) share one graph builder.
 pub(crate) fn prefill_logits(
     config: &GraniteSpeechDecoderConfig,
-    provider: &dyn GraniteSpeechDecoderWeightProvider,
+    provider: &HashMap<String, Vec<f32>>,
     token_ids: &[u32],
     backend: GgmlCpuGraphBackend,
 ) -> Result<GraniteSpeechDecoderPrefillOutput, GraniteSpeechDecoderError> {
@@ -551,7 +541,7 @@ pub(crate) fn prefill_logits(
 /// which mirrors HF's `GraniteSpeechModel.get_merged_audio_embeddings`).
 pub(crate) fn prefill_logits_from_embeddings(
     config: &GraniteSpeechDecoderConfig,
-    provider: &dyn GraniteSpeechDecoderWeightProvider,
+    provider: &HashMap<String, Vec<f32>>,
     embeddings: &[f32],
     n_tokens: usize,
     backend: GgmlCpuGraphBackend,
@@ -752,7 +742,7 @@ impl GraniteDecoderWeightArena {
     pub(crate) fn load<'p>(
         runner: &GgmlCpuGraphRunner,
         config: &GraniteSpeechDecoderConfig,
-        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        provider: &'p HashMap<String, Vec<f32>>,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let tensor_count = 32 + 32 * config.num_layers;
         let arena_bytes = GgmlCpuGraphConfig::metadata_context_bytes(tensor_count);
@@ -1008,15 +998,15 @@ impl GraniteDecoderWeights {
 }
 
 fn fetch_weight<'p>(
-    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    provider: &'p HashMap<String, Vec<f32>>,
     name: &str,
     expected: usize,
 ) -> Result<&'p [f32], GraniteSpeechDecoderError> {
-    let data = provider
-        .tensor(name)
-        .ok_or_else(|| GraniteSpeechDecoderError::MissingWeight {
+    let data = provider.get(name).map(Vec::as_slice).ok_or_else(|| {
+        GraniteSpeechDecoderError::MissingWeight {
             name: name.to_string(),
-        })?;
+        }
+    })?;
     if data.len() != expected {
         return Err(GraniteSpeechDecoderError::WeightLen {
             name: name.to_string(),
