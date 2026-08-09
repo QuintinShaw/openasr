@@ -225,9 +225,9 @@ mod tests {
             .with_tensor_shape("blk.0.attn_q_norm.weight", [8_u64])
             .with_tensor_shape("blk.0.attn_k_norm.weight", [8_u64])
             .with_tensor_shape("blk.0.ffn_norm.weight", [16_u64])
-            .with_tensor_shape("blk.0.ffn_gate.weight", [32_u64, 16_u64])
-            .with_tensor_shape("blk.0.ffn_up.weight", [32_u64, 16_u64])
-            .with_tensor_shape("blk.0.ffn_down.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.0.ffn_gate.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.0.ffn_up.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.0.ffn_down.weight", [32_u64, 16_u64])
             .with_tensor_shape("blk.1.attn_norm.weight", [16_u64])
             .with_tensor_shape("blk.1.attn_q.weight", [16_u64, 16_u64])
             .with_tensor_shape("blk.1.attn_k.weight", [16_u64, 16_u64])
@@ -236,9 +236,9 @@ mod tests {
             .with_tensor_shape("blk.1.attn_q_norm.weight", [8_u64])
             .with_tensor_shape("blk.1.attn_k_norm.weight", [8_u64])
             .with_tensor_shape("blk.1.ffn_norm.weight", [16_u64])
-            .with_tensor_shape("blk.1.ffn_gate.weight", [32_u64, 16_u64])
-            .with_tensor_shape("blk.1.ffn_up.weight", [32_u64, 16_u64])
-            .with_tensor_shape("blk.1.ffn_down.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.1.ffn_gate.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.1.ffn_up.weight", [16_u64, 32_u64])
+            .with_tensor_shape("blk.1.ffn_down.weight", [32_u64, 16_u64])
     }
 
     fn write_qwen_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {

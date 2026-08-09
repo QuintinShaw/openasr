@@ -486,8 +486,24 @@ mod tests {
         let metadata =
             crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(&spec.metadata)
                 .expect("qwen requant fixture metadata");
-        for descriptor in
-            crate::models::qwen::runtime_contract::qwen3_runtime_tensor_descriptors(metadata)
+        let decoder_contract = crate::models::qwen::QwenDecoderContract::bind(
+            crate::models::qwen::QwenDecoderContractGeometry {
+                n_layers: metadata.llm_layers,
+                d_model: metadata.llm_d_model,
+                n_heads: metadata.llm_heads,
+                n_kv_heads: metadata.llm_kv_heads,
+                head_dim: metadata.llm_head_dim,
+                ffn_dim: metadata.llm_d_model,
+                vocab_size: metadata.vocab_size,
+            },
+            crate::models::qwen::runtime_contract::qwen3_asr_decoder_profile(),
+        )
+        .expect("qwen requant fixture decoder contract");
+        for descriptor in crate::models::qwen::runtime_contract::qwen3_runtime_tensor_descriptors(
+            metadata,
+            &decoder_contract,
+        )
+        .expect("qwen requant fixture descriptors")
         {
             let dims = match descriptor.requirement {
                 TensorBindingDescriptorRequirement::ExactDims(dims) => dims,

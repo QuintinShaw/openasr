@@ -28,7 +28,7 @@ use super::logits_head::{
     first_max_token_id_from_reversed_argmax,
 };
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
-use super::runtime_contract::Qwen3AsrExecutionMetadata;
+use super::runtime_contract::{Qwen3AsrExecutionMetadata, qwen3_asr_decoder_contract};
 use super::tensor_names::llm_layer_tensor_names;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use crate::models::prepared_runtime_cache::{
@@ -157,6 +157,7 @@ struct FusedQkvProjectionWeight {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenseProjectionLayout {
+    #[allow(dead_code)]
     InputByOutput,
     OutputByInput,
 }
@@ -5848,70 +5849,14 @@ impl QwenWholeDecoderPlan {
         reader: &GgufTensorDataReader,
         metadata: Qwen3AsrExecutionMetadata,
     ) -> Result<Self, Qwen3AsrLlmTransformerError> {
-        // Qwen3-ASR packs do not yet pin ffn_dim in execution metadata; resolve
-        // it from layer-0 gate once, then freeze geometry so every layer shares
-        // the same contract-validated widths as FunASR/MOSS/MiMo/FireRed.
-        let layer0_names = llm_layer_tensor_names(0);
-        let gate0 = plan_projection_weight_for_input(
-            reader,
-            layer0_names.ffn_gate_weight.clone(),
-            metadata.llm_d_model,
-        )?;
-        if gate0.layout != DenseProjectionLayout::OutputByInput {
-            return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                tensor_name: gate0.tensor_name,
-                shape: format!("{:?}", gate0.storage_dims),
-                reason: "qwen-family FFN gate must use ggml [in, out] dim order".to_string(),
-            });
-        }
-        let geometry = QwenDecoderContractGeometry {
-            n_layers: metadata.llm_layers,
-            d_model: metadata.llm_d_model,
-            n_heads: metadata.llm_heads,
-            n_kv_heads: metadata.llm_kv_heads,
-            head_dim: metadata.llm_head_dim,
-            ffn_dim: gate0.output_width,
-            vocab_size: metadata.vocab_size,
-        };
-        // Qwen3-ASR uses the shared contract path: bind geometry to a Qwen3
-        // profile with the stock blk.N.* names, then plan from that value only.
-        fn qwen3_asr_layer_names(layer_index: usize) -> QwenFamilyLlmLayerTensorNames {
-            let names = llm_layer_tensor_names(layer_index);
-            QwenFamilyLlmLayerTensorNames {
-                attn_norm_name: names.attn_norm_weight,
-                attn_q_name: names.attn_q_weight,
-                attn_k_name: names.attn_k_weight,
-                attn_v_name: names.attn_v_weight,
-                attn_output_name: names.attn_output_weight,
-                q_norm_name: Some(names.attn_q_norm_weight),
-                k_norm_name: Some(names.attn_k_norm_weight),
-                q_bias_name: None,
-                k_bias_name: None,
-                v_bias_name: None,
-                ffn_norm_name: names.ffn_norm_weight,
-                ffn_gate_name: names.ffn_gate_weight,
-                ffn_up_name: names.ffn_up_weight,
-                ffn_down_name: names.ffn_down_weight,
-            }
-        }
-        // Tail names are not needed for whole-decoder layer planning; provide a
-        // stock tied-or-untied placeholder that matches Qwen3-ASR packs.
-        let profile = super::decoder_contract::QwenFamilyDecoderProfile::new(
-            super::decoder_contract::QwenDecoderVariant::Qwen3,
-            qwen3_asr_layer_names,
-            super::decoder_contract::QwenDecoderTailTensorNames {
-                output_norm: "output_norm.weight",
-                output_weight: Some("output.weight"),
-                token_embd: "token_embd.weight",
-            },
-        );
-        let contract = QwenDecoderContract::bind(geometry, profile).map_err(|reason| {
-            Qwen3AsrLlmTransformerError::InvalidTensorShape {
-                tensor_name: "<decoder geometry>".to_string(),
-                shape: format!("{geometry:?}"),
-                reason,
-            }
-        })?;
+        let contract =
+            qwen3_asr_decoder_contract(reader.tensor_index(), metadata).map_err(|error| {
+                Qwen3AsrLlmTransformerError::InvalidTensorShape {
+                    tensor_name: "<qwen3-asr decoder contract>".to_string(),
+                    shape: "[]".to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
         Self::for_qwen_family(reader, &contract)
     }
 
@@ -6289,6 +6234,7 @@ fn required_tensor_metadata<'a>(
     })
 }
 
+#[cfg(test)]
 fn plan_projection_weight_for_input(
     reader: &GgufTensorDataReader,
     tensor_name: String,
@@ -6703,6 +6649,7 @@ fn load_projection_weight_with_layout(
     )
 }
 
+#[cfg(test)]
 fn parse_projection_shape_for_input(
     tensor_name: &str,
     dims: &[u64],

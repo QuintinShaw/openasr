@@ -270,7 +270,7 @@ impl QwenFamilyDecoderProfile {
 /// Fields are private: construct only via [`Self::bind`]. Production planner,
 /// tail loader, admission descriptors, and host quotes must take this value
 /// (or accessors on it) — not separately-threaded geometry/options/names/tail.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct QwenDecoderContract {
     geometry: QwenDecoderContractGeometry,
     profile: QwenFamilyDecoderProfile,

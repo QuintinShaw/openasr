@@ -16,7 +16,7 @@ use super::tensor_names::{
     OUTPUT_NORM_WEIGHT as OUTPUT_NORM_WEIGHT_TENSOR_NAME,
     OUTPUT_WEIGHT as OUTPUT_WEIGHT_TENSOR_NAME,
 };
-const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
+pub(crate) const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 static NEXT_LOGITS_HEAD_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -404,6 +404,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_qwen3_llm_logits_head_from_reader(
     reader: &GgufTensorDataReader,
     _runtime_source: &GgmlRuntimeSource,

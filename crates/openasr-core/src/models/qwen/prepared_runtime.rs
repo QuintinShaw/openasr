@@ -38,7 +38,6 @@ impl Qwen3AsrPreparedRuntime {
         crate::models::system_memory_owner::SystemMemoryAllocationQuote,
         crate::models::system_memory_owner::SystemMemoryOwnerError,
     > {
-        use super::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT, llm_layer_tensor_names};
         use crate::models::system_memory_owner::SystemMemoryOwnerError;
 
         let execution = super::runtime_contract::parse_qwen3_execution_metadata(context.metadata)
@@ -49,25 +48,25 @@ impl Qwen3AsrPreparedRuntime {
             Self,
         >(pack_content_id);
         quote.add_tokenizer_metadata(context.metadata, true)?;
-        let mut decoder_tensor_names = std::collections::HashSet::new();
-        for layer_index in 0..execution.llm_layers {
-            let names = llm_layer_tensor_names(layer_index);
-            decoder_tensor_names.extend([
-                names.attn_norm_weight,
-                names.attn_q_weight,
-                names.attn_k_weight,
-                names.attn_v_weight,
-                names.attn_output_weight,
-                names.attn_q_norm_weight,
-                names.attn_k_norm_weight,
-                names.ffn_norm_weight,
-                names.ffn_gate_weight,
-                names.ffn_up_weight,
-                names.ffn_down_weight,
-            ]);
-        }
+        let decoder_contract =
+            super::runtime_contract::qwen3_asr_decoder_contract(context.tensor_index, execution)
+                .map_err(|error| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "prepared_runtime_quote",
+                        error.to_string(),
+                    )
+                })?;
+        let decoder_tensor_names = decoder_contract
+            .runtime_tensor_descriptors()
+            .map_err(|reason| {
+                SystemMemoryOwnerError::capacity_failure("prepared_runtime_quote", reason)
+            })?
+            .into_iter()
+            .map(|descriptor| descriptor.tensor_name)
+            .collect::<std::collections::HashSet<_>>();
+        let tail = decoder_contract.tail();
         for tensor in context.tensor_index.tensors() {
-            if tensor.name == TOKEN_EMBD_WEIGHT || tensor.name == OUTPUT_WEIGHT {
+            if tensor.name == tail.token_embd || tail.output_weight == Some(tensor.name.as_str()) {
                 continue;
             }
             if decoder_tensor_names.contains(&tensor.name) {
@@ -77,83 +76,7 @@ impl Qwen3AsrPreparedRuntime {
             quote.add_tensor_f32_or_raw_upper_bound(context.tensor_index, &tensor.name)?;
             quote.add_tensor_metadata(context.tensor_index, &tensor.name)?;
         }
-
-        let embedding = context.tensor_index.get(TOKEN_EMBD_WEIGHT).ok_or_else(|| {
-            SystemMemoryOwnerError::capacity_failure(
-                "prepared_runtime_quote",
-                format!("required tensor '{TOKEN_EMBD_WEIGHT}' is missing"),
-            )
-        })?;
-        if embedding.ggml_type == 0
-            || embedding.ggml_type == 1
-            || embedding.dims == [execution.llm_d_model as u64, execution.vocab_size as u64]
-        {
-            // F32/F16 in either orientation and token-major quantized tables
-            // are retained as owning views into the already-open mmap. Only
-            // the payload metadata is heap-owned.
-            quote.add_owned_tensor_payload_metadata(context.tensor_index, TOKEN_EMBD_WEIGHT)?;
-        } else {
-            // A quantized hidden-major table cannot be gathered by ggml row;
-            // this rare compatibility representation is transposed to f32.
-            quote.add_tensor_f32(context.tensor_index, TOKEN_EMBD_WEIGHT)?;
-        }
-
-        let output = context.tensor_index.get(OUTPUT_WEIGHT).ok_or_else(|| {
-            SystemMemoryOwnerError::capacity_failure(
-                "prepared_runtime_quote",
-                format!("required tensor '{OUTPUT_WEIGHT}' is missing"),
-            )
-        })?;
-        if super::logits_head::logits_head_ggml_enabled(context.backend)
-            && output.dims == [execution.llm_d_model as u64, execution.vocab_size as u64]
-        {
-            // The direct graph path keeps an owning mmap view. Its GGUF bytes
-            // are file-backed and shared with a tied token table, not copied
-            // into a second resident Vec.
-            quote.add_owned_tensor_payload_metadata(context.tensor_index, OUTPUT_WEIGHT)?;
-            quote.add_owned_elements::<usize>(
-                u64::try_from(output.dims.len()).map_err(|_| {
-                    SystemMemoryOwnerError::capacity_failure(
-                        "prepared_runtime_quote",
-                        "qwen logits rank does not fit u64",
-                    )
-                })?,
-                "qwen logits raw dims",
-            )?;
-        } else {
-            quote.add_tensor_f32(context.tensor_index, OUTPUT_WEIGHT)?;
-        }
-
-        // The whole decoder is retained as names/shapes/types only. Account
-        // its owned tensor-name strings a second time (the generic metadata
-        // pass above accounts the index's copy); no decoder weight payload is
-        // retained in the prepared runtime.
-        for layer_index in 0..execution.llm_layers {
-            let names = llm_layer_tensor_names(layer_index);
-            for name in [
-                names.attn_norm_weight,
-                names.attn_q_weight,
-                names.attn_k_weight,
-                names.attn_v_weight,
-                names.attn_output_weight,
-                names.attn_q_norm_weight,
-                names.attn_k_norm_weight,
-                names.ffn_norm_weight,
-                names.ffn_gate_weight,
-                names.ffn_up_weight,
-                names.ffn_down_weight,
-            ] {
-                quote.add_owned_bytes(
-                    u64::try_from(name.len()).map_err(|_| {
-                        SystemMemoryOwnerError::capacity_failure(
-                            "prepared_runtime_quote",
-                            "qwen decoder tensor-name length does not fit u64",
-                        )
-                    })?,
-                    "qwen decoder-plan tensor name",
-                )?;
-            }
-        }
+        super::add_qwen_decoder_prepared_runtime_quote(&mut quote, context, &decoder_contract)?;
         quote.finish()
     }
 
@@ -280,6 +203,10 @@ fn map_runtime_weight_component_error(
             component: "qwen3-asr.logits-head",
             reason,
         } => Qwen3AsrPreparedRuntimeError::LlmLogitsHeadFailed { reason },
+        BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
+            component: "qwen3-asr.decoder-tail",
+            reason,
+        } => Qwen3AsrPreparedRuntimeError::RuntimeContractViolation { reason },
         BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed { reason, .. } => {
             Qwen3AsrPreparedRuntimeError::LlmTransformerDecodeStepFailed { reason }
         }

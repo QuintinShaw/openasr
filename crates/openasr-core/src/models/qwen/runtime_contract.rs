@@ -1,23 +1,23 @@
 use thiserror::Error;
 
 use crate::GgufTensorIndex;
-use crate::arch::{
-    GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry, QWEN3_ASR_GGML_ARCHITECTURE_ID,
-};
+use crate::arch::GENERAL_ARCHITECTURE_KEY;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
 use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
     u64_to_u32, u64_to_usize, validate_positive_usize,
 };
-use crate::models::runtime_tensor_contract_registry::{
-    RuntimeTensorContractMetadata, resolve_builtin_runtime_tensor_contract_descriptors,
-};
 use crate::models::tensor_binding::{
     TensorBindingDescriptor, TensorBindingDescriptorRequirement, render_shape,
     require_tensor as require_tensor_binding, validate_tensor_binding_descriptors,
 };
 
+use super::QwenFamilyLlmLayerTensorNames;
+use super::decoder_contract::{
+    QwenDecoderContract, QwenDecoderContractGeometry, QwenDecoderTailTensorNames,
+    QwenDecoderVariant, QwenFamilyDecoderProfile,
+};
 use super::tensor_names::{
     AUDIO_CONV_OUT_BIAS, AUDIO_CONV_OUT_WEIGHT, AUDIO_CONV1_BIAS, AUDIO_CONV1_WEIGHT,
     AUDIO_CONV2_BIAS, AUDIO_CONV2_WEIGHT, AUDIO_CONV3_BIAS, AUDIO_CONV3_WEIGHT, AUDIO_LN_POST_BIAS,
@@ -324,7 +324,7 @@ pub(crate) fn parse_qwen3_execution_metadata<M: ScalarMetadataView>(
 pub(crate) fn validate_qwen3_runtime_tensors_with_index(
     index: &GgufTensorIndex,
     metadata: Qwen3AsrExecutionMetadata,
-) -> Result<(), Qwen3AsrRuntimeContractError> {
+) -> Result<QwenDecoderContract, Qwen3AsrRuntimeContractError> {
     let mel_filters = require_tensor(index, AUDIO_MEL_FILTERS)?;
     let expected_fft_bins = metadata
         .n_fft
@@ -347,11 +347,8 @@ pub(crate) fn validate_qwen3_runtime_tensors_with_index(
 
     validate_qwen3_audio_stem_tensor_shapes(index, metadata)?;
 
-    let descriptors = resolve_builtin_runtime_tensor_contract_descriptors(
-        qwen3_runtime_tensor_contract_id(),
-        RuntimeTensorContractMetadata::Qwen3Asr(metadata),
-    )
-    .expect("qwen builtin runtime tensor contract must resolve");
+    let contract = qwen3_asr_decoder_contract(index, metadata)?;
+    let descriptors = qwen3_runtime_tensor_descriptors(metadata, &contract)?;
     validate_tensor_binding_descriptors(
         index,
         &descriptors,
@@ -359,39 +356,92 @@ pub(crate) fn validate_qwen3_runtime_tensors_with_index(
         invalid_tensor_shape,
     )?;
 
-    Ok(())
+    Ok(contract)
+}
+
+fn qwen3_asr_layer_names(layer_index: usize) -> QwenFamilyLlmLayerTensorNames {
+    let names = llm_layer_tensor_names(layer_index);
+    QwenFamilyLlmLayerTensorNames {
+        attn_norm_name: names.attn_norm_weight,
+        attn_q_name: names.attn_q_weight,
+        attn_k_name: names.attn_k_weight,
+        attn_v_name: names.attn_v_weight,
+        attn_output_name: names.attn_output_weight,
+        q_norm_name: Some(names.attn_q_norm_weight),
+        k_norm_name: Some(names.attn_k_norm_weight),
+        q_bias_name: None,
+        k_bias_name: None,
+        v_bias_name: None,
+        ffn_norm_name: names.ffn_norm_weight,
+        ffn_gate_name: names.ffn_gate_weight,
+        ffn_up_name: names.ffn_up_weight,
+        ffn_down_name: names.ffn_down_weight,
+    }
+}
+
+pub(crate) const fn qwen3_asr_decoder_profile() -> QwenFamilyDecoderProfile {
+    QwenFamilyDecoderProfile::new(
+        QwenDecoderVariant::Qwen3,
+        qwen3_asr_layer_names,
+        QwenDecoderTailTensorNames {
+            output_norm: OUTPUT_NORM_WEIGHT,
+            output_weight: Some(OUTPUT_WEIGHT),
+            token_embd: TOKEN_EMBD_WEIGHT,
+        },
+    )
+}
+
+pub(crate) fn qwen3_asr_decoder_contract(
+    index: &GgufTensorIndex,
+    metadata: Qwen3AsrExecutionMetadata,
+) -> Result<QwenDecoderContract, Qwen3AsrRuntimeContractError> {
+    let gate_name = llm_layer_tensor_names(0).ffn_gate_weight;
+    let gate = require_tensor(index, &gate_name)?;
+    if gate.dims.len() != 2 || gate.dims[0] != metadata.llm_d_model as u64 {
+        return Err(invalid_tensor_shape(
+            &gate_name,
+            &gate.dims,
+            format!(
+                "expected ordered ggml [d_model, ffn_dim] with d_model={}",
+                metadata.llm_d_model
+            ),
+        ));
+    }
+    let ffn_dim = usize::try_from(gate.dims[1]).map_err(|_| {
+        invalid_tensor_shape(
+            &gate_name,
+            &gate.dims,
+            "ffn_dim does not fit usize".to_string(),
+        )
+    })?;
+    let geometry = QwenDecoderContractGeometry {
+        n_layers: metadata.llm_layers,
+        d_model: metadata.llm_d_model,
+        n_heads: metadata.llm_heads,
+        n_kv_heads: metadata.llm_kv_heads,
+        head_dim: metadata.llm_head_dim,
+        ffn_dim,
+        vocab_size: metadata.vocab_size,
+    };
+    QwenDecoderContract::bind(geometry, qwen3_asr_decoder_profile())
+        .map_err(|reason| invalid_tensor_shape(&gate_name, &gate.dims, reason))
 }
 
 pub(crate) fn qwen3_runtime_tensor_descriptors(
     metadata: Qwen3AsrExecutionMetadata,
-) -> Vec<TensorBindingDescriptor> {
+    contract: &QwenDecoderContract,
+) -> Result<Vec<TensorBindingDescriptor>, Qwen3AsrRuntimeContractError> {
     // The stock Qwen3-ASR route includes audio tensors and therefore owns a
     // wider descriptor Adapter than the decoder-only contract. Keep its tail
     // orientation deliberately identical to the bound decoder contract:
     // graph/logits_head mul_mat and get_rows consume [d_model, vocab].
-    let mut descriptors = vec![
-        TensorBindingDescriptor {
-            tensor_name: TOKEN_EMBD_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
-                metadata.llm_d_model,
-                metadata.vocab_size,
-            ]),
-            reason: "token embedding table must be ggml [d_model, vocab]".to_string(),
-        },
-        TensorBindingDescriptor {
-            tensor_name: OUTPUT_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::ExactDims(vec![
-                metadata.llm_d_model,
-                metadata.vocab_size,
-            ]),
-            reason: "logits head must be ggml [d_model, vocab]".to_string(),
-        },
-        TensorBindingDescriptor {
-            tensor_name: OUTPUT_NORM_WEIGHT.to_string(),
-            requirement: TensorBindingDescriptorRequirement::VectorLen(metadata.llm_d_model),
-            reason: "expected output norm vector with llm hidden size length".to_string(),
-        },
-    ];
+    let mut descriptors = contract.runtime_tensor_descriptors().map_err(|reason| {
+        Qwen3AsrRuntimeContractError::InvalidTensorShape {
+            name: "<decoder contract>".to_string(),
+            shape: "[]".to_string(),
+            reason,
+        }
+    })?;
     for layer_idx in 0..metadata.audio_layers {
         let names = audio_layer_tensor_names(layer_idx);
         descriptors.extend([
@@ -499,74 +549,7 @@ pub(crate) fn qwen3_runtime_tensor_descriptors(
             },
         ]);
     }
-    for layer_idx in 0..metadata.llm_layers {
-        let names = llm_layer_tensor_names(layer_idx);
-        descriptors.extend([
-            TensorBindingDescriptor {
-                tensor_name: names.attn_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::VectorLen(metadata.llm_d_model),
-                reason: "expected llm hidden-size vector".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_q_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 attn_q matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_k_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 attn_k matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_v_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 attn_v matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_output_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 attn_output matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_q_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::NonEmptyVector,
-                reason: "expected non-empty rank-1 q_norm vector".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.attn_k_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::NonEmptyVector,
-                reason: "expected non-empty rank-1 k_norm vector".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_norm_weight,
-                requirement: TensorBindingDescriptorRequirement::VectorLen(metadata.llm_d_model),
-                reason: "expected llm hidden-size vector".to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_gate_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 FFN gate matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_up_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 FFN up matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-            TensorBindingDescriptor {
-                tensor_name: names.ffn_down_weight,
-                requirement: TensorBindingDescriptorRequirement::Rank2WithDim(metadata.llm_d_model),
-                reason: "expected rank-2 FFN down matrix with one dimension = llm hidden size"
-                    .to_string(),
-            },
-        ]);
-    }
-    descriptors
+    Ok(descriptors)
 }
 
 fn validate_qwen3_audio_stem_tensor_shapes(
@@ -660,14 +643,6 @@ fn require_exact_dims<'a>(
         &tensor.dims,
         format!("expected {}", render_shape(expected)),
     ))
-}
-
-fn qwen3_runtime_tensor_contract_id() -> &'static str {
-    OpenAsrArchitectureRegistry::with_builtins()
-        .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
-        .expect("qwen architecture must be registered")
-        .pack_contract
-        .runtime_tensor_contract_id
 }
 
 fn require_tensor<'a>(
@@ -866,7 +841,38 @@ mod tests {
     }
 
     #[test]
-    fn runtime_ready_fixture_admits_ordered_tail_matrices() {
+    fn rejects_transposed_rectangular_decoder_matrix_at_admission() {
+        use crate::read_gguf_tensor_index;
+        use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready("qwen-decoder-rank2-neg");
+        let metadata = parse_qwen3_execution_metadata(&base.metadata).expect("metadata");
+        let gate_name = llm_layer_tensor_names(0).ffn_gate_weight;
+        let spec = base.with_tensor_shape(
+            &gate_name,
+            [
+                (metadata.llm_d_model * 2) as u64,
+                metadata.llm_d_model as u64,
+            ],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+
+        let error = validate_qwen3_runtime_tensors_with_index(&index, metadata)
+            .expect_err("transposed rectangular decoder matrix must fail closed");
+        match error {
+            Qwen3AsrRuntimeContractError::InvalidTensorShape { name, reason, .. } => {
+                assert_eq!(name, gate_name);
+                assert!(reason.contains("ordered ggml [d_model, ffn_dim]"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_ready_fixture_admits_contract_exact_dims() {
         use crate::read_gguf_tensor_index;
         use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
         use tempfile::NamedTempFile;
@@ -876,7 +882,18 @@ mod tests {
         write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
         let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
         let metadata = parse_qwen3_execution_metadata(&spec.metadata).expect("metadata");
-        validate_qwen3_runtime_tensors_with_index(&index, metadata)
+        let contract = validate_qwen3_runtime_tensors_with_index(&index, metadata)
             .expect("descriptor-projected fixture must satisfy ExactDims tail");
+        let q_name = llm_layer_tensor_names(0).attn_q_weight;
+        let q_descriptor = contract
+            .runtime_tensor_descriptors()
+            .expect("decoder descriptors")
+            .into_iter()
+            .find(|descriptor| descriptor.tensor_name == q_name)
+            .expect("q descriptor");
+        assert!(matches!(
+            q_descriptor.requirement,
+            TensorBindingDescriptorRequirement::ExactDims(_)
+        ));
     }
 }

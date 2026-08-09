@@ -90,7 +90,10 @@ pub(crate) fn materialize_builtin_audio_frontend(
         ) => load_cohere_transcribe_frontend_plan_from_reader(reader, metadata)
             .map(BuiltinAudioFrontendComponent::CohereTranscribe)
             .map_err(|error| materialization_failed(frontend_id, error)),
-        (crate::QWEN3_ASR_AUDIO_FRONTEND_ID, RuntimeTensorContractMetadata::Qwen3Asr(metadata)) => {
+        (
+            crate::QWEN3_ASR_AUDIO_FRONTEND_ID,
+            RuntimeTensorContractMetadata::Qwen3Asr { metadata, .. },
+        ) => {
             load_qwen3_mel_frontend_plan_from_reader(reader, metadata)
                 .map(BuiltinAudioFrontendComponent::Qwen3Asr)
                 .map_err(|error| materialization_failed(frontend_id, error))
@@ -130,7 +133,7 @@ pub(crate) fn materialize_builtin_audio_frontend(
 fn metadata_kind_label(metadata: RuntimeTensorContractMetadata) -> &'static str {
     match metadata {
         RuntimeTensorContractMetadata::CohereTranscribe(_) => "cohere-transcribe",
-        RuntimeTensorContractMetadata::Qwen3Asr(_) => QWEN3_ASR_MODEL_FAMILY,
+        RuntimeTensorContractMetadata::Qwen3Asr { .. } => QWEN3_ASR_MODEL_FAMILY,
     }
 }
 
@@ -262,12 +265,27 @@ mod tests {
     #[test]
     fn materializes_qwen_frontend_plan_for_architecture() {
         let (_runtime_path, preflight) = write_qwen_preflight();
-        let metadata = RuntimeTensorContractMetadata::Qwen3Asr(
-            crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(
-                &preflight.metadata,
-            )
-            .expect("metadata"),
-        );
+        let execution = crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("metadata");
+        let decoder_contract = crate::models::qwen::QwenDecoderContract::bind(
+            crate::models::qwen::QwenDecoderContractGeometry {
+                n_layers: execution.llm_layers,
+                d_model: execution.llm_d_model,
+                n_heads: execution.llm_heads,
+                n_kv_heads: execution.llm_kv_heads,
+                head_dim: execution.llm_head_dim,
+                ffn_dim: execution.llm_d_model,
+                vocab_size: execution.vocab_size,
+            },
+            crate::models::qwen::runtime_contract::qwen3_asr_decoder_profile(),
+        )
+        .expect("decoder contract");
+        let metadata = RuntimeTensorContractMetadata::Qwen3Asr {
+            metadata: execution,
+            decoder_contract,
+        };
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
 
         let plan = materialize_builtin_audio_frontend_for_architecture(

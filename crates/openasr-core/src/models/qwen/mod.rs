@@ -69,10 +69,12 @@ pub(crate) use llm_transformer::{
     even_prefill_chunk_len, quoted_qwen_decoder_system_memory_bytes,
     resolve_qwen_family_production_kv_cache_policy,
 };
+#[cfg(test)]
+pub(crate) use logits_head::load_qwen3_llm_logits_head_from_reader;
 pub(crate) use logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
-    load_qwen3_llm_logits_head_from_reader,
-    load_qwen3_llm_logits_head_from_reader_with_output_tensor, logits_head_ggml_enabled,
+    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrLlmLogitsHeadRuntime, load_qwen3_llm_logits_head_from_reader_with_output_tensor,
+    logits_head_ggml_enabled,
 };
 pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{

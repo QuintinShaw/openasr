@@ -21,9 +21,9 @@ use super::cohere::{
     load_cohere_transcribe_encoder_weights_from_reader,
 };
 use super::qwen::{
-    Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLogitsHead, Qwen3AsrTokenEmbeddingTable,
-    QwenWholeDecoderPlan, load_qwen3_audio_encoder_weights_from_reader,
-    load_qwen3_llm_logits_head_from_reader, load_qwen3_token_embedding_table_from_reader,
+    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrTokenEmbeddingTable, QwenDecoderTail, QwenDecoderTailLoadError, QwenWholeDecoderPlan,
+    load_qwen_decoder_tail_from_contract, load_qwen3_audio_encoder_weights_from_reader,
 };
 use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 
@@ -106,7 +106,7 @@ pub(crate) enum BuiltinRuntimeWeightComponentRegistryError {
 pub(crate) fn materialize_builtin_runtime_weight_components(
     strategy: OpenAsrPreparedRuntimeStrategy,
     reader: &GgufTensorDataReader,
-    runtime_source: &crate::GgmlRuntimeSource,
+    _runtime_source: &crate::GgmlRuntimeSource,
     metadata: RuntimeTensorContractMetadata,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<BuiltinRuntimeWeightComponents, BuiltinRuntimeWeightComponentRegistryError> {
@@ -137,19 +137,15 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
         }
         (
             OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1,
-            RuntimeTensorContractMetadata::Qwen3Asr(metadata),
+            RuntimeTensorContractMetadata::Qwen3Asr {
+                metadata,
+                decoder_contract,
+            },
         ) => {
             let audio_encoder_weights =
                 load_qwen3_audio_encoder_weights_from_reader(reader, metadata).map_err(
                     |error| BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
                         component: "qwen3-asr.audio-encoder-weights",
-                        reason: error.to_string(),
-                    },
-                )?;
-            let token_embedding_table =
-                load_qwen3_token_embedding_table_from_reader(reader, metadata).map_err(
-                    |error| BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-                        component: "qwen3-asr.token-embedding",
                         reason: error.to_string(),
                     },
                 )?;
@@ -159,16 +155,28 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
             // `backend` is the resolved value of whichever request happened
             // to populate this cache slot, threaded down explicitly from
             // that request's own `resolved_runtime`, never re-derived here.
-            let logits_head =
-                load_qwen3_llm_logits_head_from_reader(reader, runtime_source, metadata, backend)
-                    .map_err(|error| {
-                    BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-                        component: "qwen3-asr.logits-head",
-                        reason: error.to_string(),
-                    }
-                })?;
-            let decoder_plan =
-                QwenWholeDecoderPlan::for_qwen3_asr(reader, metadata).map_err(|error| {
+            let QwenDecoderTail {
+                logits_head,
+                token_embedding: token_embedding_table,
+            } = load_qwen_decoder_tail_from_contract(
+                reader,
+                &decoder_contract,
+                DEFAULT_RMS_NORM_EPSILON,
+                backend,
+            )
+            .map_err(|error| {
+                let component = match &error {
+                    QwenDecoderTailLoadError::TokenEmbedding(_) => "qwen3-asr.token-embedding",
+                    QwenDecoderTailLoadError::LogitsHead(_) => "qwen3-asr.logits-head",
+                    QwenDecoderTailLoadError::Contract { .. } => "qwen3-asr.decoder-tail",
+                };
+                BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
+                    component,
+                    reason: error.to_string(),
+                }
+            })?;
+            let decoder_plan = QwenWholeDecoderPlan::for_qwen_family(reader, &decoder_contract)
+                .map_err(|error| {
                     BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
                         component: "qwen3-asr.layer-attention-projections",
                         reason: error.to_string(),
@@ -202,6 +210,6 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
 fn metadata_kind_label(metadata: RuntimeTensorContractMetadata) -> &'static str {
     match metadata {
         RuntimeTensorContractMetadata::CohereTranscribe(_) => "cohere-transcribe",
-        RuntimeTensorContractMetadata::Qwen3Asr(_) => QWEN3_ASR_MODEL_FAMILY,
+        RuntimeTensorContractMetadata::Qwen3Asr { .. } => QWEN3_ASR_MODEL_FAMILY,
     }
 }
