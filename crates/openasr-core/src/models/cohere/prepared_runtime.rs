@@ -2,25 +2,25 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
-use super::CohereTranscribeFrontendPlan;
 use super::decoder_weights::CohereTranscribeDecoderWeights;
 use super::encoder_weights::CohereTranscribeEncoderWeights;
+use super::frontend::CohereTranscribeFrontendPlan;
 use super::prompt::{
     CohereTranscribeDecodePrompt, CohereTranscribeDecodePromptError,
     build_cohere_transcribe_decode_prompt,
 };
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 use super::tokenizer::CohereTranscribeTokenizer;
-use crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID;
-use crate::arch::OpenAsrPreparedRuntimeStrategy;
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::ggml_asr_executor::GgmlAsrExecutionOptions;
-use crate::models::runtime_component_bootstrap::{
-    BuiltinRuntimeComponentBootstrap, BuiltinRuntimeComponentBootstrapError,
-    BuiltinTokenizerMaterializationMode, build_builtin_runtime_component_bootstrap,
-};
-use crate::models::runtime_weight_component_registry::{
-    BuiltinRuntimeWeightComponentRegistryError, materialize_builtin_runtime_weight_components,
+use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
+
+use super::decoder_weights::load_cohere_transcribe_decoder_weights_for_runtime_from_reader;
+use super::encoder_weights::load_cohere_transcribe_encoder_weights_from_reader;
+use super::frontend::load_cohere_transcribe_frontend_plan_from_reader;
+use super::runtime_contract::{
+    parse_cohere_transcribe_execution_metadata,
+    validate_cohere_transcribe_runtime_tensors_with_index,
 };
 
 #[derive(Debug, Clone)]
@@ -179,34 +179,33 @@ pub(crate) enum CoherePreparedRuntimeError {
 
 pub(crate) fn build_cohere_prepared_runtime(
     preflight: &GgufRuntimeSourcePreflight,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    _backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CoherePreparedRuntime, CoherePreparedRuntimeError> {
-    let components = build_builtin_runtime_component_bootstrap(
-        COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-        preflight,
-        BuiltinTokenizerMaterializationMode::Required,
-    )
-    .map_err(map_runtime_component_bootstrap_error)?;
-    build_cohere_prepared_runtime_from_components(components, &preflight.runtime_source, backend)
-}
-
-pub(crate) fn build_cohere_prepared_runtime_from_components(
-    components: BuiltinRuntimeComponentBootstrap,
-    runtime_source: &crate::GgmlRuntimeSource,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Result<CoherePreparedRuntime, CoherePreparedRuntimeError> {
+    let metadata =
+        parse_cohere_transcribe_execution_metadata(&preflight.metadata).map_err(|error| {
+            CoherePreparedRuntimeError::RuntimeContractViolation {
+                reason: error.to_string(),
+            }
+        })?;
+    validate_cohere_transcribe_runtime_tensors_with_index(&preflight.tensor_index, metadata)
+        .map_err(
+            |error| CoherePreparedRuntimeError::RuntimeContractViolation {
+                reason: error.to_string(),
+            },
+        )?;
+    let tensor_reader = build_runtime_tensor_reader_from_preflight(preflight).map_err(|error| {
+        CoherePreparedRuntimeError::TensorReaderBuildFailed {
+            reason: error.to_string(),
+        }
+    })?;
     let debug_timings = std::env::var_os("OPENASR_COHERE_DEBUG_TIMINGS").is_some();
-    let runtime_metadata = components.metadata;
-    let metadata = runtime_metadata
-        .into_cohere_transcribe()
-        .expect("cohere bootstrap must carry cohere metadata");
-    let tensor_reader = components.tensor_reader;
     let tokenizer_start = Instant::now();
-    let tokenizer = components
-        .tokenizer
-        .expect("cohere component bootstrap must materialize tokenizer")
-        .into_cohere_transcribe()
-        .expect("cohere component bootstrap must return cohere tokenizer");
+    let tokenizer =
+        CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata).map_err(|error| {
+            CoherePreparedRuntimeError::TokenizerBuildFailed {
+                reason: error.to_string(),
+            }
+        })?;
     if debug_timings {
         eprintln!(
             "openasr cohere prepared-runtime: stage=tokenizer elapsed_ms={:.2}",
@@ -214,10 +213,12 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
         );
     }
     let frontend_start = Instant::now();
-    let frontend_plan = components
-        .audio_frontend
-        .into_cohere_transcribe()
-        .expect("cohere component bootstrap must return cohere frontend plan");
+    let frontend_plan = load_cohere_transcribe_frontend_plan_from_reader(&tensor_reader, metadata)
+        .map_err(
+            |error| CoherePreparedRuntimeError::FrontendPlanBuildFailed {
+                reason: error.to_string(),
+            },
+        )?;
     if debug_timings {
         eprintln!(
             "openasr cohere prepared-runtime: stage=frontend_plan elapsed_ms={:.2}",
@@ -225,16 +226,19 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
         );
     }
     let weights_start = Instant::now();
-    let (encoder_weights, decoder_weights) = materialize_builtin_runtime_weight_components(
-        OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
-        &tensor_reader,
-        runtime_source,
-        runtime_metadata,
-        backend,
-    )
-    .map_err(map_runtime_weight_component_error)?
-    .into_cohere_transcribe()
-    .expect("cohere weight registry must return cohere weights");
+    let encoder_weights =
+        load_cohere_transcribe_encoder_weights_from_reader(&tensor_reader, metadata).map_err(
+            |error| CoherePreparedRuntimeError::EncoderWeightsBuildFailed {
+                reason: error.to_string(),
+            },
+        )?;
+    let decoder_weights =
+        load_cohere_transcribe_decoder_weights_for_runtime_from_reader(&tensor_reader, metadata)
+            .map_err(
+                |error| CoherePreparedRuntimeError::DecoderWeightsBuildFailed {
+                    reason: error.to_string(),
+                },
+            )?;
     if debug_timings {
         eprintln!(
             "openasr cohere prepared-runtime: stage=weights elapsed_ms={:.2}",
@@ -248,52 +252,6 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
         encoder_weights: Arc::new(encoder_weights),
         decoder_weights: Arc::new(decoder_weights),
     })
-}
-
-fn map_runtime_weight_component_error(
-    error: BuiltinRuntimeWeightComponentRegistryError,
-) -> CoherePreparedRuntimeError {
-    match error {
-        BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-            component: "cohere-transcribe.decoder-weights",
-            reason,
-        } => CoherePreparedRuntimeError::DecoderWeightsBuildFailed { reason },
-        BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed { reason, .. } => {
-            CoherePreparedRuntimeError::EncoderWeightsBuildFailed { reason }
-        }
-        other => CoherePreparedRuntimeError::RuntimeContractViolation {
-            reason: other.to_string(),
-        },
-    }
-}
-
-fn map_runtime_component_bootstrap_error(
-    error: BuiltinRuntimeComponentBootstrapError,
-) -> CoherePreparedRuntimeError {
-    match error {
-        BuiltinRuntimeComponentBootstrapError::RuntimeAssetBootstrap { source } => match source {
-            crate::models::runtime_asset_bootstrap::BuiltinRuntimeAssetBootstrapError::RuntimeContractPreflight { source } => {
-            CoherePreparedRuntimeError::RuntimeContractViolation {
-                reason: source.to_string(),
-            }
-        }
-            crate::models::runtime_asset_bootstrap::BuiltinRuntimeAssetBootstrapError::TensorReaderBuild { source } => {
-            CoherePreparedRuntimeError::TensorReaderBuildFailed {
-                reason: source.to_string(),
-            }
-        }
-        },
-        BuiltinRuntimeComponentBootstrapError::TokenizerMaterialization { source } => {
-            CoherePreparedRuntimeError::TokenizerBuildFailed {
-                reason: source.to_string(),
-            }
-        }
-        BuiltinRuntimeComponentBootstrapError::AudioFrontendMaterialization { source } => {
-            CoherePreparedRuntimeError::FrontendPlanBuildFailed {
-                reason: source.to_string(),
-            }
-        }
-    }
 }
 
 #[cfg(test)]

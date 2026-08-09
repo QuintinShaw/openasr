@@ -554,6 +554,23 @@ fn shared_runtime_registries_do_not_reintroduce_family_architecture_matches() {
 }
 
 #[test]
+fn cohere_runtime_components_stay_in_the_family_module() {
+    let root = models_root();
+    for relative in [
+        "frontend_component_registry.rs",
+        "tokenizer_component_registry.rs",
+        "runtime_tensor_contract_registry.rs",
+        "runtime_weight_component_registry.rs",
+        "runtime_component_bootstrap.rs",
+    ] {
+        let path = root.join(relative);
+        for forbidden in ["CohereTranscribe", "COHERE_TRANSCRIBE", "cohere-transcribe"] {
+            assert_production_does_not_reference(&path, forbidden);
+        }
+    }
+}
+
+#[test]
 fn production_family_policy_does_not_parse_backend_provider_names() {
     use crate::arch::OpenAsrArchitectureRegistry;
 

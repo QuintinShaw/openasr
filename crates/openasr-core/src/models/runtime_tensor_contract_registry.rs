@@ -1,42 +1,36 @@
 //! Runtime tensor-contract validation + descriptor expansion for the
-//! **data-driven composer** families only (Cohere Transcribe + Qwen3-ASR) — the
-//! two whose runtime tensors are validated/expanded centrally before graph
-//! assembly. Reached only from those families' import + prepared-runtime paths.
+//! **data-driven composer** family only (Qwen3-ASR), whose runtime tensors are
+//! validated/expanded centrally before graph assembly.
 //!
 //! Families that select `FamilyOwned` prepared runtimes validate their tensor
 //! sets in their own modules (e.g. `validate_stage_against_descriptor`) and
 //! never route a contract id through here. The canonical architecture
 //! inventory identifies those contracts so generic tooling sees a first-class
-//! fail-closed marker instead of a generic unknown-contract error. This is
-//! intentionally independent from the outer executor capability: Cohere uses a
-//! dedicated executor facade while still sharing the composer runtime.
+//! fail-closed marker instead of a generic unknown-contract error. Dedicated
+//! executor families validate their own tensor contracts.
 
 use thiserror::Error;
 
 use crate::GgufTensorIndex;
 use crate::arch::{
-    COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID, OpenAsrArchitectureRegistry,
-    OpenAsrPreparedRuntimeStrategy, QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
+    OpenAsrArchitectureRegistry, OpenAsrPreparedRuntimeStrategy,
+    QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
 };
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
-use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
 use crate::models::qwen::QwenDecoderContract;
 use crate::models::runtime_contract::ScalarMetadataView;
 
-use super::cohere::runtime_contract::{
-    CohereTranscribeExecutionMetadata, cohere_transcribe_runtime_tensor_descriptors,
-    parse_cohere_transcribe_execution_metadata,
-    validate_cohere_transcribe_runtime_tensors_with_index,
-};
+#[cfg(test)]
+use super::qwen::runtime_contract::qwen3_runtime_tensor_descriptors;
 use super::qwen::runtime_contract::{
-    Qwen3AsrExecutionMetadata, parse_qwen3_execution_metadata, qwen3_runtime_tensor_descriptors,
+    Qwen3AsrExecutionMetadata, parse_qwen3_execution_metadata,
     validate_qwen3_runtime_tensors_with_index,
 };
+#[cfg(test)]
 use super::tensor_binding::TensorBindingDescriptor;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RuntimeTensorContractMetadata {
-    CohereTranscribe(CohereTranscribeExecutionMetadata),
     Qwen3Asr {
         metadata: Qwen3AsrExecutionMetadata,
         decoder_contract: QwenDecoderContract,
@@ -44,24 +38,9 @@ pub(crate) enum RuntimeTensorContractMetadata {
 }
 
 impl RuntimeTensorContractMetadata {
-    fn kind_label(self) -> &'static str {
-        match self {
-            Self::CohereTranscribe(_) => "cohere-transcribe",
-            Self::Qwen3Asr { .. } => QWEN3_ASR_MODEL_FAMILY,
-        }
-    }
-
-    pub(crate) fn into_cohere_transcribe(self) -> Option<CohereTranscribeExecutionMetadata> {
-        match self {
-            Self::CohereTranscribe(metadata) => Some(metadata),
-            Self::Qwen3Asr { .. } => None,
-        }
-    }
-
     pub(crate) fn into_qwen3_asr(self) -> Option<Qwen3AsrExecutionMetadata> {
         match self {
             Self::Qwen3Asr { metadata, .. } => Some(metadata),
-            Self::CohereTranscribe(_) => None,
         }
     }
 }
@@ -79,20 +58,13 @@ pub(crate) enum RuntimeTensorContractRegistryError {
         contract_id: String,
         family: &'static str,
     },
-    #[error(
-        "runtime tensor contract '{contract_id}' expected metadata for '{expected_kind}', got '{found_kind}'"
-    )]
-    MetadataKindMismatch {
-        contract_id: String,
-        expected_kind: &'static str,
-        found_kind: &'static str,
-    },
     #[error("runtime tensor contract '{contract_id}' metadata parse failed: {reason}")]
     MetadataParseFailed { contract_id: String, reason: String },
     #[error("runtime tensor contract '{contract_id}' validation failed: {reason}")]
     ValidationFailed { contract_id: String, reason: String },
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_builtin_runtime_tensor_contract_descriptors(
     contract_id: &str,
     metadata: RuntimeTensorContractMetadata,
@@ -110,24 +82,6 @@ pub(crate) fn resolve_builtin_runtime_tensor_contract_descriptors(
                 reason: error.to_string(),
             }
         }),
-        (
-            COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID,
-            RuntimeTensorContractMetadata::CohereTranscribe(metadata),
-        ) => Ok(cohere_transcribe_runtime_tensor_descriptors(metadata)),
-        (QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID, metadata) => {
-            Err(RuntimeTensorContractRegistryError::MetadataKindMismatch {
-                contract_id: contract_id.to_string(),
-                expected_kind: QWEN3_ASR_MODEL_FAMILY,
-                found_kind: metadata.kind_label(),
-            })
-        }
-        (COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID, metadata) => {
-            Err(RuntimeTensorContractRegistryError::MetadataKindMismatch {
-                contract_id: contract_id.to_string(),
-                expected_kind: "cohere-transcribe",
-                found_kind: metadata.kind_label(),
-            })
-        }
         (contract_id, _) => family_owned_runtime_contract_error(contract_id).map_or_else(
             || {
                 Err(RuntimeTensorContractRegistryError::UnknownContract {
@@ -174,28 +128,6 @@ pub(crate) fn validate_builtin_runtime_tensor_contract_for_architecture<M: Scala
                 metadata,
                 decoder_contract,
             })
-        }
-        COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID => {
-            let metadata =
-                parse_cohere_transcribe_execution_metadata(metadata).map_err(|error| {
-                    RuntimeTensorContractRegistryError::MetadataParseFailed {
-                        contract_id: descriptor
-                            .pack_contract
-                            .runtime_tensor_contract_id
-                            .to_string(),
-                        reason: error.to_string(),
-                    }
-                })?;
-            validate_cohere_transcribe_runtime_tensors_with_index(tensor_index, metadata).map_err(
-                |error| RuntimeTensorContractRegistryError::ValidationFailed {
-                    contract_id: descriptor
-                        .pack_contract
-                        .runtime_tensor_contract_id
-                        .to_string(),
-                    reason: error.to_string(),
-                },
-            )?;
-            Ok(RuntimeTensorContractMetadata::CohereTranscribe(metadata))
         }
         contract_id => family_owned_runtime_contract_error(contract_id).map_or_else(
             || {
@@ -296,31 +228,6 @@ mod tests {
             decoder_contract: qwen_contract(),
         }
     }
-
-    fn cohere_metadata() -> CohereTranscribeExecutionMetadata {
-        CohereTranscribeExecutionMetadata {
-            vocab_size: 16_384,
-            encoder_layers: 2,
-            encoder_d_model: 1_280,
-            encoder_heads: 8,
-            encoder_head_dim: 160,
-            encoder_ffn_dim: 5_120,
-            encoder_conv_kernel: 9,
-            decoder_layers: 2,
-            decoder_d_model: 1_024,
-            decoder_heads: 8,
-            decoder_head_dim: 128,
-            decoder_ffn_dim: 4_096,
-            decoder_max_context: 1_024,
-            decoder_start_token_id: 13_764,
-            sample_rate_hz: 16_000,
-            n_mels: 128,
-            n_fft: 400,
-            hop_length: 160,
-            win_length: 400,
-        }
-    }
-
     #[test]
     fn resolves_qwen_builtin_contract() {
         let descriptors = resolve_builtin_runtime_tensor_contract_descriptors(
@@ -334,35 +241,6 @@ mod tests {
                 .iter()
                 .any(|descriptor| descriptor.tensor_name == "audio.blk.0.attn_norm.weight")
         );
-    }
-
-    #[test]
-    fn resolves_cohere_builtin_contract() {
-        let descriptors = resolve_builtin_runtime_tensor_contract_descriptors(
-            COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID,
-            RuntimeTensorContractMetadata::CohereTranscribe(cohere_metadata()),
-        )
-        .expect("cohere descriptors");
-
-        assert!(
-            descriptors
-                .iter()
-                .any(|descriptor| descriptor.tensor_name == "enc.blk.1.conv.pw2.weight")
-        );
-    }
-
-    #[test]
-    fn rejects_mismatched_metadata_kind() {
-        let error = resolve_builtin_runtime_tensor_contract_descriptors(
-            QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
-            RuntimeTensorContractMetadata::CohereTranscribe(cohere_metadata()),
-        )
-        .expect_err("mismatched metadata kind must fail");
-
-        assert!(matches!(
-            error,
-            RuntimeTensorContractRegistryError::MetadataKindMismatch { .. }
-        ));
     }
 
     #[test]

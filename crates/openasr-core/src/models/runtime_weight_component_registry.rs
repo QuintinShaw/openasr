@@ -1,6 +1,6 @@
 //! Runtime weight-bundle materialization for the **data-driven composer**
-//! families only (Cohere Transcribe + Qwen3-ASR). Called solely from those two
-//! families' `prepared_runtime` paths — never generically across architectures.
+//! family only (Qwen3-ASR). Called solely from that family's
+//! `prepared_runtime` path — never generically across architectures.
 //!
 //! The dedicated-executor families (Whisper, Moonshine, Parakeet-CTC, wav2vec2/
 //! data2vec-CTC) materialize their weights in their own family modules and never
@@ -13,13 +13,7 @@ use thiserror::Error;
 
 use crate::GgufTensorDataReader;
 use crate::arch::OpenAsrPreparedRuntimeStrategy;
-use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
 
-use super::cohere::{
-    CohereTranscribeDecoderWeights, CohereTranscribeEncoderWeights,
-    load_cohere_transcribe_decoder_weights_for_runtime_from_reader,
-    load_cohere_transcribe_encoder_weights_from_reader,
-};
 use super::qwen::{
     DEFAULT_RMS_NORM_EPSILON, Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLogitsHead,
     Qwen3AsrTokenEmbeddingTable, QwenDecoderTail, QwenDecoderTailLoadError, QwenWholeDecoderPlan,
@@ -34,10 +28,6 @@ use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum BuiltinRuntimeWeightComponents {
-    CohereTranscribe {
-        encoder_weights: CohereTranscribeEncoderWeights,
-        decoder_weights: CohereTranscribeDecoderWeights,
-    },
     Qwen3Asr {
         audio_encoder_weights: Qwen3AsrAudioEncoderWeights,
         token_embedding_table: Qwen3AsrTokenEmbeddingTable,
@@ -47,21 +37,6 @@ pub(crate) enum BuiltinRuntimeWeightComponents {
 }
 
 impl BuiltinRuntimeWeightComponents {
-    pub(crate) fn into_cohere_transcribe(
-        self,
-    ) -> Option<(
-        CohereTranscribeEncoderWeights,
-        CohereTranscribeDecoderWeights,
-    )> {
-        match self {
-            Self::CohereTranscribe {
-                encoder_weights,
-                decoder_weights,
-            } => Some((encoder_weights, decoder_weights)),
-            _ => None,
-        }
-    }
-
     pub(crate) fn into_qwen3_asr(
         self,
     ) -> Option<(
@@ -82,7 +57,6 @@ impl BuiltinRuntimeWeightComponents {
                 logits_head,
                 decoder_plan,
             )),
-            _ => None,
         }
     }
 }
@@ -91,11 +65,6 @@ impl BuiltinRuntimeWeightComponents {
 pub(crate) enum BuiltinRuntimeWeightComponentRegistryError {
     #[error("a family-owned runtime cannot enter the shared composer registry")]
     FamilyOwnedRuntime,
-    #[error("builtin runtime weights expected metadata for '{expected_kind}', got '{found_kind}'")]
-    MetadataKindMismatch {
-        expected_kind: &'static str,
-        found_kind: &'static str,
-    },
     #[error("builtin runtime weights materialization failed for '{component}': {reason}")]
     MaterializationFailed {
         component: &'static str,
@@ -111,30 +80,6 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<BuiltinRuntimeWeightComponents, BuiltinRuntimeWeightComponentRegistryError> {
     match (strategy, metadata) {
-        (
-            OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
-            RuntimeTensorContractMetadata::CohereTranscribe(metadata),
-        ) => {
-            let encoder_weights =
-                load_cohere_transcribe_encoder_weights_from_reader(reader, metadata).map_err(
-                    |error| BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-                        component: "cohere-transcribe.encoder-weights",
-                        reason: error.to_string(),
-                    },
-                )?;
-            let decoder_weights =
-                load_cohere_transcribe_decoder_weights_for_runtime_from_reader(reader, metadata)
-                    .map_err(|error| {
-                        BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-                            component: "cohere-transcribe.decoder-weights",
-                            reason: error.to_string(),
-                        }
-                    })?;
-            Ok(BuiltinRuntimeWeightComponents::CohereTranscribe {
-                encoder_weights,
-                decoder_weights,
-            })
-        }
         (
             OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1,
             RuntimeTensorContractMetadata::Qwen3Asr {
@@ -189,27 +134,9 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                 decoder_plan,
             })
         }
-        (OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1, metadata) => Err(
-            BuiltinRuntimeWeightComponentRegistryError::MetadataKindMismatch {
-                expected_kind: "cohere-transcribe",
-                found_kind: metadata_kind_label(metadata),
-            },
-        ),
-        (OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1, metadata) => Err(
-            BuiltinRuntimeWeightComponentRegistryError::MetadataKindMismatch {
-                expected_kind: QWEN3_ASR_MODEL_FAMILY,
-                found_kind: metadata_kind_label(metadata),
-            },
-        ),
         (OpenAsrPreparedRuntimeStrategy::FamilyOwned, _) => {
             Err(BuiltinRuntimeWeightComponentRegistryError::FamilyOwnedRuntime)
         }
-    }
-}
-
-fn metadata_kind_label(metadata: RuntimeTensorContractMetadata) -> &'static str {
-    match metadata {
-        RuntimeTensorContractMetadata::CohereTranscribe(_) => "cohere-transcribe",
-        RuntimeTensorContractMetadata::Qwen3Asr { .. } => QWEN3_ASR_MODEL_FAMILY,
+        (_, _) => Err(BuiltinRuntimeWeightComponentRegistryError::FamilyOwnedRuntime),
     }
 }

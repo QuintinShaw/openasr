@@ -1,14 +1,9 @@
 use thiserror::Error;
 
-use crate::arch::{
-    COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
-};
+use crate::arch::{COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, GENERAL_ARCHITECTURE_KEY};
 use crate::models::runtime_contract::{
     MetadataContractError, ScalarMetadataView, required_string_scalar, required_u64_scalar,
     u64_to_u32, u64_to_usize, validate_positive_usize,
-};
-use crate::models::runtime_tensor_contract_registry::{
-    RuntimeTensorContractMetadata, resolve_builtin_runtime_tensor_contract_descriptors,
 };
 use crate::models::tensor_binding::{
     TensorBindingDescriptor, TensorBindingRequirement, TensorBindingSpec, render_shape,
@@ -245,11 +240,7 @@ pub(crate) fn validate_cohere_transcribe_runtime_tensors_with_index(
             format!("expected [{}, {}]", fft_bins, metadata.n_mels),
         ));
     }
-    let descriptors = resolve_builtin_runtime_tensor_contract_descriptors(
-        cohere_runtime_tensor_contract_id(),
-        RuntimeTensorContractMetadata::CohereTranscribe(metadata),
-    )
-    .expect("cohere builtin runtime tensor contract must resolve");
+    let descriptors = cohere_transcribe_runtime_tensor_descriptors(metadata);
     validate_tensor_binding_descriptors(
         index,
         &descriptors,
@@ -292,9 +283,11 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
     // layout the decoder get_rows path ships). Lifetime-bound ExactDims slices
     // below are copied into owned descriptors before this frame returns.
     let enc_proj_dims = [metadata.encoder_d_model, metadata.decoder_d_model];
+    let enc_attention_dims = [metadata.encoder_d_model, metadata.encoder_d_model];
     let dec_emb_dims = [metadata.vocab_size, metadata.decoder_d_model];
     let dec_pos_dims = [metadata.decoder_max_context, metadata.decoder_d_model];
     let dec_head_dims = [metadata.decoder_d_model, metadata.vocab_size];
+    let dec_attention_dims = [metadata.decoder_d_model, metadata.decoder_d_model];
     let top_level_bindings = [
         TensorBindingSpec {
             tensor_name: FE_WINDOW,
@@ -445,28 +438,28 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
             },
             TensorBindingSpec {
                 tensor_name: names.attn_q_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.encoder_d_model),
-                reason: "expected rank-2 encoder attention matrix with one dimension = encoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&enc_attention_dims),
+                reason: "expected ordered encoder attention matrix [encoder_d_model, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_k_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.encoder_d_model),
-                reason: "expected rank-2 encoder attention matrix with one dimension = encoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&enc_attention_dims),
+                reason: "expected ordered encoder attention matrix [encoder_d_model, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_v_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.encoder_d_model),
-                reason: "expected rank-2 encoder attention matrix with one dimension = encoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&enc_attention_dims),
+                reason: "expected ordered encoder attention matrix [encoder_d_model, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_out_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.encoder_d_model),
-                reason: "expected rank-2 encoder attention matrix with one dimension = encoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&enc_attention_dims),
+                reason: "expected ordered encoder attention matrix [encoder_d_model, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_pos_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.encoder_d_model),
-                reason: "expected rank-2 encoder attention matrix with one dimension = encoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&enc_attention_dims),
+                reason: "expected ordered encoder attention matrix [encoder_d_model, encoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_q_bias.as_str(),
@@ -619,43 +612,43 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
             },
             TensorBindingSpec {
                 tensor_name: names.attn_q_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder self-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_k_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder self-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_v_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder self-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_o_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder self-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.cross_q_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder cross-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.cross_k_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder cross-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.cross_v_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder cross-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.cross_o_weight.as_str(),
-                requirement: TensorBindingRequirement::Rank2WithDim(metadata.decoder_d_model),
-                reason: "expected rank-2 decoder matrix with one dimension = decoder hidden size",
+                requirement: TensorBindingRequirement::ExactDims(&dec_attention_dims),
+                reason: "expected ordered decoder cross-attention matrix [decoder_d_model, decoder_d_model]",
             },
             TensorBindingSpec {
                 tensor_name: names.attn_q_bias.as_str(),
@@ -725,14 +718,6 @@ pub(crate) fn cohere_transcribe_runtime_tensor_descriptors(
     descriptors
 }
 
-fn cohere_runtime_tensor_contract_id() -> &'static str {
-    OpenAsrArchitectureRegistry::with_builtins()
-        .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
-        .expect("cohere architecture must be registered")
-        .pack_contract
-        .runtime_tensor_contract_id
-}
-
 fn required_usize<M: ScalarMetadataView>(
     metadata: &M,
     key: &'static str,
@@ -790,13 +775,15 @@ fn invalid_tensor_shape(
 pub(crate) fn validate_runtime_pack_contract(
     preflight: &crate::GgufRuntimeSourcePreflight,
 ) -> Result<(), String> {
-    crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture(
-        crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-        preflight.metadata(),
-        preflight.tensor_index(),
-    )
-    .map(|_| ())
-    .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
+    let metadata =
+        parse_cohere_transcribe_execution_metadata(preflight.metadata()).map_err(|error| {
+            crate::models::runtime_pack_contract::metadata_validation_error(
+                COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                error,
+            )
+        })?;
+    validate_cohere_transcribe_runtime_tensors_with_index(preflight.tensor_index(), metadata)
+        .map_err(crate::models::runtime_pack_contract::tensor_validation_error)
 }
 
 #[cfg(test)]
@@ -1039,6 +1026,56 @@ mod tests {
         let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
         let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
             .expect_err("transposed positional bias must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { name: ref bad, .. }
+                if bad == &name
+        ));
+    }
+
+    #[test]
+    fn rejects_encoder_attention_wrong_ordered_dims() {
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        let name = encoder_layer_tensor_names(0).attn_q_weight;
+        let spec = base.with_tensor_shape(
+            name.clone(),
+            [
+                metadata.encoder_d_model as u64 + 1,
+                metadata.encoder_d_model as u64,
+            ],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("attention weight with wrong ordered dims must fail closed");
+        assert!(matches!(
+            error,
+            CohereTranscribeRuntimeContractError::InvalidTensorShape { name: ref bad, .. }
+                if bad == &name
+        ));
+    }
+
+    #[test]
+    fn rejects_decoder_cross_attention_wrong_ordered_dims() {
+        let file = NamedTempFile::new().expect("temp file");
+        let base = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let metadata = parse_cohere_transcribe_execution_metadata(&base.metadata)
+            .expect("runtime-ready metadata must parse");
+        let name = decoder_layer_tensor_names(0).cross_k_weight;
+        let spec = base.with_tensor_shape(
+            name.clone(),
+            [
+                metadata.decoder_d_model as u64,
+                metadata.decoder_d_model as u64 + 1,
+            ],
+        );
+        write_tiny_gguf_runtime_source(file.path(), &spec).expect("write fixture");
+        let index = read_gguf_tensor_index(file.path()).expect("read tensor index");
+        let error = validate_cohere_transcribe_runtime_tensors_with_index(&index, metadata)
+            .expect_err("cross-attention weight with wrong ordered dims must fail closed");
         assert!(matches!(
             error,
             CohereTranscribeRuntimeContractError::InvalidTensorShape { name: ref bad, .. }

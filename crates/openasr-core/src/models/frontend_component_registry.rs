@@ -1,5 +1,5 @@
 //! Tensor-backed audio-frontend registry for the **data-driven composer**
-//! families (Cohere Transcribe + Qwen3-ASR). These two materialize their mel
+//! families (Qwen3-ASR). Qwen materializes its mel
 //! frontend from GGUF tensors via `build_builtin_runtime_component_bootstrap`,
 //! so they need a central place to map `architecture -> frontend plan`.
 //!
@@ -13,32 +13,19 @@ use thiserror::Error;
 
 use crate::GgufTensorDataReader;
 use crate::arch::OpenAsrArchitectureRegistry;
-use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
 
-use super::cohere::{
-    CohereTranscribeFrontendPlan, load_cohere_transcribe_frontend_plan_from_reader,
-};
 use super::qwen::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BuiltinAudioFrontendComponent {
-    CohereTranscribe(CohereTranscribeFrontendPlan),
     Qwen3Asr(Qwen3AsrMelFrontendPlan),
 }
 
 impl BuiltinAudioFrontendComponent {
-    pub(crate) fn into_cohere_transcribe(self) -> Option<CohereTranscribeFrontendPlan> {
-        match self {
-            Self::CohereTranscribe(plan) => Some(plan),
-            _ => None,
-        }
-    }
-
     pub(crate) fn into_qwen3_asr(self) -> Option<Qwen3AsrMelFrontendPlan> {
         match self {
             Self::Qwen3Asr(plan) => Some(plan),
-            _ => None,
         }
     }
 }
@@ -49,14 +36,6 @@ pub(crate) enum BuiltinAudioFrontendComponentRegistryError {
     UnknownArchitecture { model_architecture: String },
     #[error("unknown builtin audio frontend '{frontend_id}'")]
     UnknownAudioFrontend { frontend_id: String },
-    #[error(
-        "builtin audio frontend '{frontend_id}' expected metadata for '{expected_kind}', got '{found_kind}'"
-    )]
-    MetadataKindMismatch {
-        frontend_id: String,
-        expected_kind: &'static str,
-        found_kind: &'static str,
-    },
     #[error("builtin audio frontend '{frontend_id}' materialization is unsupported: {reason}")]
     UnsupportedMaterialization { frontend_id: String, reason: String },
     #[error("builtin audio frontend '{frontend_id}' materialization failed: {reason}")]
@@ -83,35 +62,13 @@ pub(crate) fn materialize_builtin_audio_frontend(
     reader: &GgufTensorDataReader,
     metadata: RuntimeTensorContractMetadata,
 ) -> Result<BuiltinAudioFrontendComponent, BuiltinAudioFrontendComponentRegistryError> {
-    match (frontend_id, metadata) {
-        (
-            crate::COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
-            RuntimeTensorContractMetadata::CohereTranscribe(metadata),
-        ) => load_cohere_transcribe_frontend_plan_from_reader(reader, metadata)
-            .map(BuiltinAudioFrontendComponent::CohereTranscribe)
-            .map_err(|error| materialization_failed(frontend_id, error)),
-        (
-            crate::QWEN3_ASR_AUDIO_FRONTEND_ID,
-            RuntimeTensorContractMetadata::Qwen3Asr { metadata, .. },
-        ) => {
+    let RuntimeTensorContractMetadata::Qwen3Asr { metadata, .. } = metadata;
+    match frontend_id {
+        crate::QWEN3_ASR_AUDIO_FRONTEND_ID => {
             load_qwen3_mel_frontend_plan_from_reader(reader, metadata)
                 .map(BuiltinAudioFrontendComponent::Qwen3Asr)
                 .map_err(|error| materialization_failed(frontend_id, error))
         }
-        (crate::COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID, metadata) => Err(
-            BuiltinAudioFrontendComponentRegistryError::MetadataKindMismatch {
-                frontend_id: frontend_id.to_string(),
-                expected_kind: "cohere-transcribe",
-                found_kind: metadata_kind_label(metadata),
-            },
-        ),
-        (crate::QWEN3_ASR_AUDIO_FRONTEND_ID, metadata) => Err(
-            BuiltinAudioFrontendComponentRegistryError::MetadataKindMismatch {
-                frontend_id: frontend_id.to_string(),
-                expected_kind: QWEN3_ASR_MODEL_FAMILY,
-                found_kind: metadata_kind_label(metadata),
-            },
-        ),
         _ if OpenAsrArchitectureRegistry::with_builtins()
             .descriptors()
             .iter()
@@ -127,13 +84,6 @@ pub(crate) fn materialize_builtin_audio_frontend(
         _ => Err(BuiltinAudioFrontendComponentRegistryError::UnknownAudioFrontend {
             frontend_id: frontend_id.to_string(),
         }),
-    }
-}
-
-fn metadata_kind_label(metadata: RuntimeTensorContractMetadata) -> &'static str {
-    match metadata {
-        RuntimeTensorContractMetadata::CohereTranscribe(_) => "cohere-transcribe",
-        RuntimeTensorContractMetadata::Qwen3Asr { .. } => QWEN3_ASR_MODEL_FAMILY,
     }
 }
 
@@ -162,28 +112,6 @@ mod tests {
         read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
         validate_ggml_runtime_source_path,
     };
-
-    fn write_cohere_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
-        let file = NamedTempFile::new().expect("temp file");
-        let persisted = file.into_temp_path();
-        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-frontend-fixture");
-        write_tiny_gguf_runtime_source(&persisted, &spec).expect("write fixture");
-
-        let runtime_source =
-            validate_ggml_runtime_source_path(&persisted).expect("valid runtime source path");
-        let metadata =
-            read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
-            .expect("read gguf tensor index");
-        (
-            persisted,
-            GgufRuntimeSourcePreflight {
-                runtime_source,
-                metadata: Arc::new(metadata),
-                tensor_index: Arc::new(tensor_index),
-            },
-        )
-    }
 
     fn qwen_frontend_fixture_spec() -> TinyGgufFixtureSpec {
         let mut metadata = std::collections::BTreeMap::new();
@@ -239,30 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn materializes_cohere_frontend_plan_for_architecture() {
-        let (_runtime_path, preflight) = write_cohere_preflight();
-        let metadata = RuntimeTensorContractMetadata::CohereTranscribe(
-            crate::models::cohere::runtime_contract::parse_cohere_transcribe_execution_metadata(
-                &preflight.metadata,
-            )
-            .expect("metadata"),
-        );
-        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
-
-        let plan = materialize_builtin_audio_frontend_for_architecture(
-            crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-            &reader,
-            metadata,
-        )
-        .expect("frontend plan")
-        .into_cohere_transcribe()
-        .expect("cohere variant");
-
-        assert_eq!(plan.n_mels, 32);
-        assert_eq!(plan.win_length, 400);
-    }
-
-    #[test]
     fn materializes_qwen_frontend_plan_for_architecture() {
         let (_runtime_path, preflight) = write_qwen_preflight();
         let execution = crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(
@@ -305,25 +209,35 @@ mod tests {
     fn dedicated_executor_frontends_fail_closed_outside_composer_registry() {
         // Derive the expected set from the inventory. A new dedicated family
         // is covered without adding its frontend id to this test or registry.
-        let (_runtime_path, preflight) = write_cohere_preflight();
-        let base_metadata = RuntimeTensorContractMetadata::CohereTranscribe(
-            crate::models::cohere::runtime_contract::parse_cohere_transcribe_execution_metadata(
-                &preflight.metadata,
-            )
-            .expect("metadata"),
-        );
+        let (_runtime_path, preflight) = write_qwen_preflight();
+        let execution = crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("metadata");
+        let decoder_contract = crate::models::qwen::QwenDecoderContract::bind(
+            crate::models::qwen::QwenDecoderContractGeometry {
+                n_layers: execution.llm_layers,
+                d_model: execution.llm_d_model,
+                n_heads: execution.llm_heads,
+                n_kv_heads: execution.llm_kv_heads,
+                head_dim: execution.llm_head_dim,
+                ffn_dim: execution.llm_d_model,
+                vocab_size: execution.vocab_size,
+            },
+            crate::models::qwen::runtime_contract::qwen3_asr_decoder_profile(),
+        )
+        .expect("decoder contract");
+        let base_metadata = RuntimeTensorContractMetadata::Qwen3Asr {
+            metadata: execution,
+            decoder_contract,
+        };
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
 
         let dedicated_frontend_ids = OpenAsrArchitectureRegistry::with_builtins()
             .descriptors()
             .iter()
             .map(|descriptor| descriptor.pack_contract.audio_frontend_id)
-            .filter(|frontend_id| {
-                !matches!(
-                    *frontend_id,
-                    crate::COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID | crate::QWEN3_ASR_AUDIO_FRONTEND_ID
-                )
-            })
+            .filter(|frontend_id| !matches!(*frontend_id, crate::QWEN3_ASR_AUDIO_FRONTEND_ID))
             .collect::<std::collections::BTreeSet<_>>();
         assert!(!dedicated_frontend_ids.is_empty());
         for frontend_id in dedicated_frontend_ids {

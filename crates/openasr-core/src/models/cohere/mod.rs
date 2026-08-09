@@ -47,15 +47,6 @@ mod weights;
 
 pub const COHERE_TRANSCRIBE_MODEL_FAMILY: &str = "cohere-transcribe";
 
-pub(crate) use decoder_weights::{
-    CohereTranscribeDecoderWeights, load_cohere_transcribe_decoder_weights_for_runtime_from_reader,
-};
-pub(crate) use encoder_weights::{
-    CohereTranscribeEncoderWeights, load_cohere_transcribe_encoder_weights_from_reader,
-};
-pub(crate) use frontend::{
-    CohereTranscribeFrontendPlan, load_cohere_transcribe_frontend_plan_from_reader,
-};
 pub(crate) use ggml_executor::CohereTranscribeGgmlExecutor;
 pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{
@@ -65,4 +56,3 @@ pub use package_import::{
 pub(crate) use prepared_runtime::{
     CoherePreparedRuntime, CoherePreparedRuntimeError, build_cohere_prepared_runtime,
 };
-pub(crate) use tokenizer::CohereTranscribeTokenizer;

@@ -19,7 +19,6 @@ use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinTokenizerMaterializationMode {
     Optional,
-    Required,
 }
 
 #[derive(Debug)]
@@ -37,6 +36,7 @@ pub(crate) enum BuiltinRuntimeComponentBootstrapError {
         #[source]
         source: BuiltinRuntimeAssetBootstrapError,
     },
+    #[allow(dead_code)]
     #[error("tokenizer materialization failed: {source}")]
     TokenizerMaterialization {
         #[source]
@@ -65,12 +65,6 @@ pub(crate) fn build_builtin_runtime_component_bootstrap(
             materialize_builtin_tokenizer_for_architecture(model_architecture, &preflight.metadata)
                 .ok()
         }
-        BuiltinTokenizerMaterializationMode::Required => Some(
-            materialize_builtin_tokenizer_for_architecture(model_architecture, &preflight.metadata)
-                .map_err(|source| {
-                    BuiltinRuntimeComponentBootstrapError::TokenizerMaterialization { source }
-                })?,
-        ),
     };
     let audio_frontend = materialize_builtin_audio_frontend_for_architecture(
         model_architecture,
@@ -102,28 +96,6 @@ mod tests {
         read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
         validate_ggml_runtime_source_path,
     };
-
-    fn write_cohere_preflight() -> (TempPath, GgufRuntimeSourcePreflight) {
-        let file = NamedTempFile::new().expect("temp file");
-        let persisted = file.into_temp_path();
-        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
-        write_tiny_gguf_runtime_source(&persisted, &spec).expect("write fixture");
-
-        let runtime_source =
-            validate_ggml_runtime_source_path(&persisted).expect("valid runtime source path");
-        let metadata =
-            read_gguf_metadata_from_runtime_source(&runtime_source).expect("read gguf metadata");
-        let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
-            .expect("read gguf tensor index");
-        (
-            persisted,
-            GgufRuntimeSourcePreflight {
-                runtime_source,
-                metadata: Arc::new(metadata),
-                tensor_index: Arc::new(tensor_index),
-            },
-        )
-    }
 
     fn qwen_frontend_fixture_spec() -> TinyGgufFixtureSpec {
         let mut metadata = BTreeMap::new();
@@ -261,20 +233,6 @@ mod tests {
                 tensor_index: Arc::new(tensor_index),
             },
         )
-    }
-
-    #[test]
-    fn builds_required_cohere_runtime_components() {
-        let (_runtime_path, preflight) = write_cohere_preflight();
-        let components = build_builtin_runtime_component_bootstrap(
-            crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-            &preflight,
-            BuiltinTokenizerMaterializationMode::Required,
-        )
-        .expect("components");
-
-        assert!(components.tokenizer.is_some());
-        assert!(components.audio_frontend.into_cohere_transcribe().is_some());
     }
 
     #[test]

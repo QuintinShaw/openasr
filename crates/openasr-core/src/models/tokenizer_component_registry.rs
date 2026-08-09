@@ -4,25 +4,16 @@ use crate::NativeAsrError;
 use crate::arch::OpenAsrArchitectureRegistry;
 use crate::ggml_runtime::GgufMetadata;
 
-use super::cohere::CohereTranscribeTokenizer;
 use super::qwen::Qwen3AsrTokenizer;
 use super::whisper::WhisperTokenizer;
 
 #[derive(Debug, Clone)]
 pub(crate) enum BuiltinTokenizerComponent {
-    CohereTranscribe(CohereTranscribeTokenizer),
     Qwen3Asr(Qwen3AsrTokenizer),
     Whisper(WhisperTokenizer),
 }
 
 impl BuiltinTokenizerComponent {
-    pub(crate) fn into_cohere_transcribe(self) -> Option<CohereTranscribeTokenizer> {
-        match self {
-            Self::CohereTranscribe(tokenizer) => Some(tokenizer),
-            _ => None,
-        }
-    }
-
     pub(crate) fn into_qwen3_asr(self) -> Option<Qwen3AsrTokenizer> {
         match self {
             Self::Qwen3Asr(tokenizer) => Some(tokenizer),
@@ -71,16 +62,6 @@ pub(crate) fn materialize_builtin_tokenizer(
     metadata: &GgufMetadata,
 ) -> Result<BuiltinTokenizerComponent, BuiltinTokenizerComponentRegistryError> {
     match tokenizer_id {
-        crate::COHERE_TRANSCRIBE_TOKENIZER_ID => {
-            CohereTranscribeTokenizer::from_gguf_metadata(metadata)
-                .map(BuiltinTokenizerComponent::CohereTranscribe)
-                .map_err(
-                    |source| BuiltinTokenizerComponentRegistryError::MaterializationFailed {
-                        tokenizer_id: tokenizer_id.to_string(),
-                        source,
-                    },
-                )
-        }
         crate::QWEN3_ASR_TOKENIZER_ID => Qwen3AsrTokenizer::from_gguf_metadata(metadata)
             .map(BuiltinTokenizerComponent::Qwen3Asr)
             .map_err(
@@ -109,23 +90,6 @@ mod tests {
 
     use super::*;
     use crate::ggml_runtime::GgufMetadataValue;
-
-    fn cohere_metadata() -> GgufMetadata {
-        let mut values = BTreeMap::new();
-        values.insert(
-            "tokenizer.ggml.model".to_string(),
-            GgufMetadataValue::String("llama".to_string()),
-        );
-        values.insert(
-            "tokenizer.ggml.tokens".to_string(),
-            GgufMetadataValue::StringArray(vec![
-                "<|startoftranscript|>".to_string(),
-                "<|en|>".to_string(),
-                "<|endoftext|>".to_string(),
-            ]),
-        );
-        GgufMetadata::from_values_for_test(values)
-    }
 
     fn qwen_metadata() -> GgufMetadata {
         let mut values = BTreeMap::new();
@@ -224,18 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn materializes_builtin_cohere_tokenizer_for_architecture() {
-        let tokenizer = materialize_builtin_tokenizer_for_architecture(
-            crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-            &cohere_metadata(),
-        )
-        .expect("cohere tokenizer")
-        .into_cohere_transcribe()
-        .expect("cohere variant");
-        assert_eq!(tokenizer.token_id_by_content("<|en|>"), Some(1));
-    }
-
-    #[test]
     fn materializes_builtin_qwen_tokenizer_for_architecture() {
         let tokenizer = materialize_builtin_tokenizer_for_architecture(
             crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
@@ -263,11 +215,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_builtin_architecture() {
-        let error = materialize_builtin_tokenizer_for_architecture(
-            "not-a-builtin-arch",
-            &cohere_metadata(),
-        )
-        .expect_err("unknown architecture must fail");
+        let error =
+            materialize_builtin_tokenizer_for_architecture("not-a-builtin-arch", &qwen_metadata())
+                .expect_err("unknown architecture must fail");
         assert!(matches!(
             error,
             BuiltinTokenizerComponentRegistryError::UnknownArchitecture { .. }
