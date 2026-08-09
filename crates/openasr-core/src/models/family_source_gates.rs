@@ -465,6 +465,10 @@ fn removed_family_architecture_apis_cannot_return() {
         "QuantComponent",
         "supports_lora_adapter",
         "with_whisper_non_streaming_cpu",
+        "WhisperDecoderLoopRunner",
+        "WhisperTokenizerProvider",
+        "WhisperDecoderGraphRunnerGgmlV0",
+        "WhisperTokenizerProviderGgufV0",
         "block_stack: None",
     ];
     let mut violations = Vec::new();

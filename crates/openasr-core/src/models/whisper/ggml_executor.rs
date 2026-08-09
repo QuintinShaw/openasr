@@ -422,6 +422,8 @@ type WhisperEncoderRuntimeActor =
 type WhisperDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<WhisperDecoderPersistentSessionKey, WhisperDecoderRuntimeActorState>;
 
+const WHISPER_DECODER_GRAPH_RUNNER_ID: &str = "whisper-decoder-graph-ggml-v0";
+
 struct WhisperEncoderRuntimeActorState {
     session: Option<WhisperEncoderPersistentStaticSession>,
     runner: Arc<dyn WhisperEncoderGraphRunner>,
@@ -430,7 +432,6 @@ struct WhisperEncoderRuntimeActorState {
 
 struct WhisperDecoderRuntimeActorState {
     session: Option<WhisperDecoderPersistentStaticSession>,
-    runner: Arc<dyn WhisperDecoderLoopRunner>,
     _prepared_owner: PreparedRuntimeHandle<WhisperPreparedRuntime>,
 }
 
@@ -458,7 +459,6 @@ impl WhisperEncoderResultDelivery {
 }
 
 struct WhisperDecoderActorJob {
-    runtime_source: GgmlRuntimeSource,
     runtime_preflight: GgufRuntimeSourcePreflight,
     prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
     prelude_plan: WhisperEncoderPreludePlan,
@@ -572,7 +572,6 @@ impl WhisperDecoderActorJob {
             }
 
             run_whisper_decode_loop(
-                &self.runtime_source,
                 &self.prepared.execution,
                 session,
                 &self.prepared.decoder_weights,
@@ -585,7 +584,6 @@ impl WhisperDecoderActorJob {
                 &encoder_result,
                 self.audio_duration,
                 decoder_persistent_cache_populated,
-                state.runner.as_ref(),
                 &self.trace,
                 &self.control,
                 self.decode_work_progress.as_ref(),
@@ -778,34 +776,6 @@ trait WhisperMelFeatureInputProvider: Send + Sync {
     ) -> Result<WhisperMelFeatureInput, WhisperGgmlExecutorError>;
 }
 
-trait WhisperDecoderLoopRunner: Send + Sync {
-    fn runner_id(&self) -> &'static str;
-    #[allow(clippy::too_many_arguments)]
-    fn step_logits(
-        &self,
-        runtime_source: &GgmlRuntimeSource,
-        execution: &WhisperGgmlExecutionMetadata,
-        decoder_weights: &WhisperDecoderWeightSeam,
-        plan: &WhisperDecoderGraphPlan,
-        graph_input: &WhisperDecoderGraphExecutionInput,
-        graph_config: WhisperDecoderGraphExecutionConfig,
-        graph_runner: &mut GgmlCpuGraphRunner,
-        persistent_weights: Option<&WhisperDecoderPersistentWeightCache>,
-        self_kv_state: Option<&WhisperDecoderSelfKvCacheState>,
-        tensor_cache: &mut WhisperDecoderExecutionTensorCache,
-        decode_input: &WhisperDecoderStepSeamInput,
-    ) -> Result<WhisperDecoderStepLogits, WhisperGgmlExecutorError>;
-}
-
-trait WhisperTokenizerProvider: Send + Sync {
-    fn provider_id(&self) -> &'static str;
-    fn load_tokenizer(
-        &self,
-        _runtime_source: &GgmlRuntimeSource,
-        _metadata: &GgufMetadata,
-    ) -> Result<WhisperTokenizer, WhisperGgmlExecutorError>;
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 struct WhisperCpuEncoderPreludeComputeRunnerV0;
 
@@ -814,12 +784,6 @@ struct WhisperCpuEncoderGraphComputeRunnerV0;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct WhisperMelFeatureInputProviderFrontendV0;
-
-#[derive(Debug, Default, Clone, Copy)]
-struct WhisperDecoderGraphRunnerGgmlV0;
-
-#[derive(Debug, Default, Clone, Copy)]
-struct WhisperTokenizerProviderGgufV0;
 
 #[derive(Debug, Clone, PartialEq)]
 struct WhisperDecoderStepLogits {
@@ -3206,100 +3170,80 @@ impl WhisperMelFeatureInputProvider for WhisperMelFeatureInputProviderFrontendV0
     }
 }
 
-impl WhisperDecoderLoopRunner for WhisperDecoderGraphRunnerGgmlV0 {
-    fn runner_id(&self) -> &'static str {
-        "whisper-decoder-graph-ggml-v0"
+#[allow(clippy::too_many_arguments)]
+fn run_whisper_decoder_step_ggml_v0(
+    execution: &WhisperGgmlExecutionMetadata,
+    decoder_weights: &WhisperDecoderWeightSeam,
+    plan: &WhisperDecoderGraphPlan,
+    graph_input: &WhisperDecoderGraphExecutionInput,
+    graph_config: WhisperDecoderGraphExecutionConfig,
+    graph_runner: &mut GgmlCpuGraphRunner,
+    persistent_weights: Option<&WhisperDecoderPersistentWeightCache>,
+    self_kv_state: Option<&WhisperDecoderSelfKvCacheState>,
+    tensor_cache: &mut WhisperDecoderExecutionTensorCache,
+    decode_input: &WhisperDecoderStepSeamInput,
+) -> Result<WhisperDecoderStepLogits, WhisperGgmlExecutorError> {
+    let token_count = graph_input.decoder_prefix_tokens.len();
+    if token_count == 0 {
+        return Err(WhisperGgmlExecutorError::DecoderGraphUnsupported {
+            reason: "decoder prefix token_count must be > 0".to_string(),
+        });
     }
 
-    fn step_logits(
-        &self,
-        _runtime_source: &GgmlRuntimeSource,
-        execution: &WhisperGgmlExecutionMetadata,
-        decoder_weights: &WhisperDecoderWeightSeam,
-        plan: &WhisperDecoderGraphPlan,
-        graph_input: &WhisperDecoderGraphExecutionInput,
-        graph_config: WhisperDecoderGraphExecutionConfig,
-        graph_runner: &mut GgmlCpuGraphRunner,
-        persistent_weights: Option<&WhisperDecoderPersistentWeightCache>,
-        self_kv_state: Option<&WhisperDecoderSelfKvCacheState>,
-        tensor_cache: &mut WhisperDecoderExecutionTensorCache,
-        decode_input: &WhisperDecoderStepSeamInput,
-    ) -> Result<WhisperDecoderStepLogits, WhisperGgmlExecutorError> {
-        let token_count = graph_input.decoder_prefix_tokens.len();
-        if token_count == 0 {
-            return Err(WhisperGgmlExecutorError::DecoderGraphUnsupported {
-                reason: "decoder prefix token_count must be > 0".to_string(),
-            });
-        }
-
-        let graph_run_start = Instant::now();
-        let output = run_whisper_decoder_greedy_step_with_cache_and_runner_ggml_v0(
-            graph_runner,
-            persistent_weights,
-            self_kv_state,
-            decode_input.position_offset,
-            plan,
-            graph_input,
-            &decoder_weights.tensor_source,
-            graph_config,
-            tensor_cache,
+    let graph_run_start = Instant::now();
+    let output = run_whisper_decoder_greedy_step_with_cache_and_runner_ggml_v0(
+        graph_runner,
+        persistent_weights,
+        self_kv_state,
+        decode_input.position_offset,
+        plan,
+        graph_input,
+        &decoder_weights.tensor_source,
+        graph_config,
+        tensor_cache,
+    )
+    .map_err(|error| {
+        map_decoder_graph_execution_error(
+            WHISPER_DECODER_GRAPH_RUNNER_ID,
+            decode_input.step_index,
+            token_count,
+            error,
         )
-        .map_err(|error| {
-            map_decoder_graph_execution_error(
-                self.runner_id(),
+    })?;
+    let decoder_graph_run_ms = graph_run_start.elapsed().as_millis();
+    let logits_start = Instant::now();
+    if output.logits.len() != execution.vocab_size {
+        return Err(WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
+            reason: format!(
+                "runner '{WHISPER_DECODER_GRAPH_RUNNER_ID}' returned logits width mismatch at step {}: got {}, expected {}",
                 decode_input.step_index,
-                token_count,
-                error,
-            )
-        })?;
-        let decoder_graph_run_ms = graph_run_start.elapsed().as_millis();
-        let logits_start = Instant::now();
-        if output.logits.len() != execution.vocab_size {
-            return Err(WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
-                reason: format!(
-                    "runner '{}' returned logits width mismatch at step {}: got {}, expected {}",
-                    self.runner_id(),
-                    decode_input.step_index,
-                    output.logits.len(),
-                    execution.vocab_size
-                ),
-            });
-        }
-        Ok(WhisperDecoderStepLogits {
-            logits: output.logits,
-            greedy_token_hint: Some(output.greedy_token),
-            last_token_cross_attention_frame_probs: output.last_token_cross_attention_frame_probs,
-            decoder_graph_run_ms,
-            logits_ms: logits_start.elapsed().as_millis(),
-        })
+                output.logits.len(),
+                execution.vocab_size
+            ),
+        });
     }
+    Ok(WhisperDecoderStepLogits {
+        logits: output.logits,
+        greedy_token_hint: Some(output.greedy_token),
+        last_token_cross_attention_frame_probs: output.last_token_cross_attention_frame_probs,
+        decoder_graph_run_ms,
+        logits_ms: logits_start.elapsed().as_millis(),
+    })
 }
 
-impl WhisperTokenizerProvider for WhisperTokenizerProviderGgufV0 {
-    fn provider_id(&self) -> &'static str {
-        "whisper-tokenizer-gguf-v0"
-    }
-
-    fn load_tokenizer(
-        &self,
-        _runtime_source: &GgmlRuntimeSource,
-        metadata: &GgufMetadata,
-    ) -> Result<WhisperTokenizer, WhisperGgmlExecutorError> {
-        materialize_builtin_tokenizer_for_architecture(crate::WHISPER_GGML_ARCHITECTURE_ID, metadata)
-            .map_err(|error| WhisperGgmlExecutorError::TokenizerMissing {
-                reason: format!(
-                    "provider '{}' could not materialize tokenizer from preflight GGUF metadata: {error}",
-                    self.provider_id()
-                ),
-            })?
-            .into_whisper()
-            .ok_or_else(|| WhisperGgmlExecutorError::TokenizerMissing {
-                reason: format!(
-                    "provider '{}' resolved non-whisper tokenizer component for whisper architecture",
-                    self.provider_id()
-                ),
-            })
-    }
+fn load_whisper_tokenizer(
+    metadata: &GgufMetadata,
+) -> Result<WhisperTokenizer, WhisperGgmlExecutorError> {
+    materialize_builtin_tokenizer_for_architecture(crate::WHISPER_GGML_ARCHITECTURE_ID, metadata)
+        .map_err(|error| WhisperGgmlExecutorError::TokenizerMissing {
+            reason: format!(
+                "could not materialize tokenizer from preflight GGUF metadata: {error}"
+            ),
+        })?
+        .into_whisper()
+        .ok_or_else(|| WhisperGgmlExecutorError::TokenizerMissing {
+            reason: "resolved non-whisper tokenizer component for whisper architecture".to_string(),
+        })
 }
 
 #[derive(Clone)]
@@ -3307,8 +3251,6 @@ pub(crate) struct WhisperGgmlExecutor {
     mel_feature_input_provider: Arc<dyn WhisperMelFeatureInputProvider>,
     encoder_prelude_runner: Arc<dyn WhisperEncoderPreludeRunner>,
     encoder_graph_runner: Arc<dyn WhisperEncoderGraphRunner>,
-    decoder_runner: Arc<dyn WhisperDecoderLoopRunner>,
-    tokenizer_provider: Arc<dyn WhisperTokenizerProvider>,
     runtime_cache_by_path: PreparedRuntimeCache<WhisperPreparedRuntime>,
     serve_batch_engines: WhisperServeBatchEngineRegistry,
     encoder_runtimes: Arc<WhisperEncoderRuntimePool>,
@@ -3340,8 +3282,6 @@ impl Default for WhisperGgmlExecutor {
             mel_feature_input_provider: Arc::new(WhisperMelFeatureInputProviderFrontendV0),
             encoder_prelude_runner: Arc::new(WhisperCpuEncoderPreludeComputeRunnerV0),
             encoder_graph_runner: Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
-            decoder_runner: Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-            tokenizer_provider: Arc::new(WhisperTokenizerProviderGgufV0),
             runtime_cache_by_path: PreparedRuntimeCache::default(),
             serve_batch_engines: WhisperServeBatchEngineRegistry::default(),
             encoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
@@ -3397,7 +3337,6 @@ fn checkout_whisper_decoder_runtime(
     pool: &WhisperDecoderRuntimePool,
     runtime_source: &GgmlRuntimeSource,
     prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
-    runner: Arc<dyn WhisperDecoderLoopRunner>,
     decoder_state: Seq2SeqDecoderState,
     backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperDecoderRuntimeActor, WhisperGgmlExecutorError> {
@@ -3408,12 +3347,11 @@ fn checkout_whisper_decoder_runtime(
     );
     pool.checkout_or_try_build_with(
         key,
-        move || Ok((0, (prepared, runner))),
-        move |(prepared, runner)| {
+        move || Ok((0, prepared)),
+        move |prepared| {
             Ok(SystemMemoryOwner::without_allocation(
                 WhisperDecoderRuntimeActorState {
                     session: None,
-                    runner,
                     _prepared_owner: prepared,
                 },
             ))
@@ -3510,7 +3448,7 @@ impl WhisperGgmlExecutor {
                 tensor_index: &preflight.tensor_index,
                 backend,
             },
-            || build_whisper_prepared_runtime(preflight, self.tokenizer_provider.as_ref()),
+            || build_whisper_prepared_runtime(preflight),
             whisper_runtime_cache_slot_unavailable,
             |error| WhisperGgmlExecutorError::TensorMaterializationFailed {
                 reason: error.to_string(),
@@ -3655,7 +3593,6 @@ impl WhisperGgmlExecutor {
             self.mel_feature_input_provider.as_ref(),
             self.encoder_prelude_runner.as_ref(),
             Arc::clone(&self.encoder_graph_runner),
-            Arc::clone(&self.decoder_runner),
             reuse_runtime_state,
             skip_serve_batch,
             &request.execution_context,
@@ -3727,7 +3664,6 @@ impl GgmlAsrStreamingExecutor for WhisperGgmlExecutor {
 
 fn build_whisper_prepared_runtime(
     preflight: &GgufRuntimeSourcePreflight,
-    tokenizer_provider: &dyn WhisperTokenizerProvider,
 ) -> Result<WhisperPreparedRuntime, WhisperGgmlExecutorError> {
     let execution = validate_whisper_execution_metadata(&preflight.metadata)
         .map_err(map_metadata_contract_error)?;
@@ -3744,8 +3680,7 @@ fn build_whisper_prepared_runtime(
     let encoder_binding = build_encoder_graph_binding_seam(&encoder_weights, &execution)?;
     let decoder_weights =
         build_decoder_weight_seam(&tensor_reader, &tensor_binding.weights.bindings)?;
-    let tokenizer =
-        tokenizer_provider.load_tokenizer(&preflight.runtime_source, &preflight.metadata)?;
+    let tokenizer = load_whisper_tokenizer(&preflight.metadata)?;
     Ok(WhisperPreparedRuntime {
         execution,
         tensor_binding,
@@ -4051,7 +3986,6 @@ fn execute_whisper_with_prepared_runtime(
     mel_feature_input_provider: &dyn WhisperMelFeatureInputProvider,
     prelude_runner: &dyn WhisperEncoderPreludeRunner,
     encoder_graph_runner: Arc<dyn WhisperEncoderGraphRunner>,
-    decoder_runner: Arc<dyn WhisperDecoderLoopRunner>,
     allow_persistent_session_reuse: bool,
     skip_serve_batch: bool,
     execution_context: &std::sync::Arc<crate::RequestExecutionContext>,
@@ -4267,13 +4201,11 @@ fn execute_whisper_with_prepared_runtime(
         decoder_runtimes,
         runtime_source,
         Arc::clone(&prepared_owner),
-        Arc::clone(&decoder_runner),
         decoder_state,
         resolved_backend,
     )?;
 
     let decoder_job = WhisperDecoderActorJob {
-        runtime_source: runtime_source.clone(),
         runtime_preflight: preflight.clone(),
         prepared: Arc::clone(&prepared_owner),
         prelude_plan: prelude_plan.clone(),
@@ -4362,15 +4294,13 @@ fn execute_whisper_ggml_non_streaming_cpu(
     mel_feature_input_provider: &dyn WhisperMelFeatureInputProvider,
     prelude_runner: &dyn WhisperEncoderPreludeRunner,
     encoder_graph_runner: Arc<dyn WhisperEncoderGraphRunner>,
-    decoder_runner: Arc<dyn WhisperDecoderLoopRunner>,
-    tokenizer_provider: &dyn WhisperTokenizerProvider,
 ) -> Result<String, WhisperGgmlExecutorError> {
     let preflight = GgufRuntimeSourcePreflight {
         runtime_source: runtime_source.clone(),
         metadata: Arc::new(metadata.clone()),
         tensor_index: Arc::new(tensor_index.clone()),
     };
-    let runtime = build_whisper_prepared_runtime(&preflight, tokenizer_provider)?;
+    let runtime = build_whisper_prepared_runtime(&preflight)?;
     let decoder_state = whisper_decoder_state_for_execution(&runtime.execution);
     let prepared_owner = Arc::new(SystemMemoryOwner::without_allocation(runtime));
     let executor = WhisperGgmlExecutor::default();
@@ -4388,7 +4318,6 @@ fn execute_whisper_ggml_non_streaming_cpu(
         mel_feature_input_provider,
         prelude_runner,
         encoder_graph_runner,
-        decoder_runner,
         false,
         false,
         &std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
@@ -5162,10 +5091,8 @@ fn cross_attention_center_seconds(
 }
 
 struct WhisperGreedyDecodeStepRunnerAdapter<'a> {
-    runtime_source: &'a GgmlRuntimeSource,
     execution: &'a WhisperGgmlExecutionMetadata,
     decoder_weights: &'a WhisperDecoderWeightSeam,
-    decoder_runner: &'a dyn WhisperDecoderLoopRunner,
     trace: &'a WhisperGgmlTrace,
     decode_loop_start: Instant,
     decode_steps_completed: usize,
@@ -5323,7 +5250,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
             )
             .map_err(|error| {
                 map_decoder_graph_execution_error(
-                    self.decoder_runner.runner_id(),
+                    WHISPER_DECODER_GRAPH_RUNNER_ID,
                     self.decoder_step_input.step_index,
                     graph_token_count,
                     error,
@@ -5336,8 +5263,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
             if output.logits.len() != self.execution.vocab_size {
                 return Err(Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: format!(
-                        "runner '{}' returned reusable logits width mismatch at step {}: got {}, expected {}",
-                        self.decoder_runner.runner_id(),
+                        "runner '{WHISPER_DECODER_GRAPH_RUNNER_ID}' returned reusable logits width mismatch at step {}: got {}, expected {}",
                         self.decoder_step_input.step_index,
                         output.logits.len(),
                         self.execution.vocab_size
@@ -5352,23 +5278,21 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
                 logits_ms: logits_start.elapsed().as_millis(),
             })
         } else {
-            self.decoder_runner
-                .step_logits(
-                    self.runtime_source,
-                    self.execution,
-                    self.decoder_weights,
-                    plan_lookup.plan.as_ref(),
-                    &self.decoder_graph_input,
-                    self.decoder_graph_config,
-                    self.decoder_graph_runner,
-                    Some(self.decoder_persistent_weights),
-                    Some(&self.decoder_self_kv_state),
-                    &mut self.decoder_tensor_cache,
-                    &self.decoder_step_input,
-                )
-                .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                })
+            run_whisper_decoder_step_ggml_v0(
+                self.execution,
+                self.decoder_weights,
+                plan_lookup.plan.as_ref(),
+                &self.decoder_graph_input,
+                self.decoder_graph_config,
+                self.decoder_graph_runner,
+                Some(self.decoder_persistent_weights),
+                Some(&self.decoder_self_kv_state),
+                &mut self.decoder_tensor_cache,
+                &self.decoder_step_input,
+            )
+            .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })
         };
         let step_logits = match step_logits {
             Ok(step_logits) => step_logits,
@@ -5435,7 +5359,6 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
 
 #[allow(clippy::too_many_arguments)]
 fn run_whisper_decode_loop(
-    runtime_source: &GgmlRuntimeSource,
     execution: &WhisperGgmlExecutionMetadata,
     decoder_persistent_static: &mut WhisperDecoderPersistentStaticSession,
     decoder_weights: &WhisperDecoderWeightSeam,
@@ -5445,7 +5368,6 @@ fn run_whisper_decode_loop(
     encoder_result: &WhisperEncoderGraphSeamResult,
     audio_duration_seconds: f32,
     decoder_persistent_cache_populated: bool,
-    decoder_runner: &dyn WhisperDecoderLoopRunner,
     trace: &WhisperGgmlTrace,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
@@ -5526,7 +5448,7 @@ fn run_whisper_decode_loop(
             .map_err(|error| {
                 decorate_decoder_boundary_error(
                     map_decoder_graph_execution_error(
-                        decoder_runner.runner_id(),
+                        WHISPER_DECODER_GRAPH_RUNNER_ID,
                         0,
                         initial_prompt_tokens.len(),
                         error,
@@ -5599,10 +5521,8 @@ fn run_whisper_decode_loop(
         None => initial_prompt_tokens,
     };
     let mut step_runner = WhisperGreedyDecodeStepRunnerAdapter {
-        runtime_source,
         execution,
         decoder_weights,
-        decoder_runner,
         trace,
         decode_loop_start,
         decode_steps_completed: 0,

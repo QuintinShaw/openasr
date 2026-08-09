@@ -344,36 +344,34 @@ fn golden_diff_tiny_imported_decoder_graph_executes_one_step() {
     let mut decoder_tensor_cache = WhisperDecoderExecutionTensorCache::default();
     let mut decoder_graph_runner =
         GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("decoder graph runner");
-    let step_logits = WhisperDecoderGraphRunnerGgmlV0
-        .step_logits(
-            &runtime_source,
-            &execution,
-            &decoder_weights,
-            &plan,
-            &WhisperDecoderGraphExecutionInput {
-                decoder_prefix_tokens: vec![0_u32],
-                encoder_hidden_state: encoder_hidden_f32,
-                encoder_layout: WhisperDecoderHiddenStateLayout::SequenceHidden,
-            },
-            WhisperDecoderGraphExecutionConfig {
-                attention_heads: execution.decoder_attention_heads,
-                use_self_flash_attention: false,
-                use_cross_flash_attention: false,
-                collect_cross_attention: false,
-                layer_norm_epsilon: 1.0e-5_f32,
-            },
-            &mut decoder_graph_runner,
-            None,
-            None,
-            &mut decoder_tensor_cache,
-            &WhisperDecoderStepSeamInput {
-                encoder_frames,
-                encoder_hidden_size: encoder_hidden,
-                step_index: 0,
-                position_offset: 0,
-            },
-        )
-        .expect("decoder runner should execute one tiny step");
+    let step_logits = run_whisper_decoder_step_ggml_v0(
+        &execution,
+        &decoder_weights,
+        &plan,
+        &WhisperDecoderGraphExecutionInput {
+            decoder_prefix_tokens: vec![0_u32],
+            encoder_hidden_state: encoder_hidden_f32,
+            encoder_layout: WhisperDecoderHiddenStateLayout::SequenceHidden,
+        },
+        WhisperDecoderGraphExecutionConfig {
+            attention_heads: execution.decoder_attention_heads,
+            use_self_flash_attention: false,
+            use_cross_flash_attention: false,
+            collect_cross_attention: false,
+            layer_norm_epsilon: 1.0e-5_f32,
+        },
+        &mut decoder_graph_runner,
+        None,
+        None,
+        &mut decoder_tensor_cache,
+        &WhisperDecoderStepSeamInput {
+            encoder_frames,
+            encoder_hidden_size: encoder_hidden,
+            step_index: 0,
+            position_offset: 0,
+        },
+    )
+    .expect("decoder runner should execute one tiny step");
 
     assert_eq!(step_logits.logits.len(), execution.vocab_size);
     assert!(
@@ -419,8 +417,6 @@ fn whisper_preflight_fails_on_missing_metadata_before_encoder_prelude() {
         &mel_provider,
         runner.as_ref(),
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("missing whisper metadata must fail preflight");
 
@@ -480,8 +476,6 @@ fn whisper_tensor_shape_mismatch_fails_before_encoder_prelude() {
         &mel_provider,
         runner.as_ref(),
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("tensor shape mismatch must fail before prelude seam");
 
@@ -538,8 +532,6 @@ fn whisper_tensor_type_mismatch_fails_before_encoder_prelude() {
         &mel_provider,
         runner.as_ref(),
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("tensor type mismatch must fail before prelude seam");
 
@@ -604,8 +596,6 @@ fn mel_feature_extraction_failure_fails_before_encoder_execution() {
         &mel_provider,
         &prelude_runner,
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("mel seam should fail closed");
 
@@ -712,8 +702,6 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         &mel_provider,
         &WhisperCpuEncoderPreludeComputeRunnerV0,
         Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     );
     match output {
         Ok(text) => {
@@ -786,8 +774,6 @@ fn invalid_sample_rate_fails_closed_before_encoder_execution() {
         &mel_provider,
         &prelude_runner,
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("invalid sample rate must fail before encoder execution");
     assert!(
@@ -864,8 +850,6 @@ fn nan_audio_fails_closed_before_encoder_execution() {
         &mel_provider,
         &prelude_runner,
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("non-finite audio must fail before encoder execution");
     assert!(
@@ -931,8 +915,6 @@ fn unsupported_primitive_fixture_fails_closed_with_real_prelude_runner() {
         &mel_provider,
         &runner,
         Arc::new(graph_runner),
-        Arc::new(WhisperDecoderGraphRunnerGgmlV0),
-        &WhisperTokenizerProviderGgufV0,
     )
     .expect_err("fixture should force unsupported prelude primitive");
 
