@@ -196,6 +196,7 @@ impl SenseVoicePreparedRuntime {
         samples: &[f32],
         language: Option<&str>,
         phrase_bias: Option<&PhraseBiasConfig>,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<CtcGreedyDecodeResult, String> {
         // SenseVoice's own FunASR quick-start (and Handy's sherpa-based build)
         // default to `withitn`: raw `woitn` output has no punctuation or digit
@@ -246,6 +247,7 @@ impl SenseVoicePreparedRuntime {
             &detok,
             ctc_err_to_string,
             registry_err_to_string,
+            decode_work_progress,
         )
     }
 
@@ -254,8 +256,9 @@ impl SenseVoicePreparedRuntime {
         samples: &[f32],
         language: Option<&str>,
         phrase_bias: Option<&PhraseBiasConfig>,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<SenseVoiceTranscription, String> {
-        let result = self.decode_result(samples, language, phrase_bias)?;
+        let result = self.decode_result(samples, language, phrase_bias, decode_work_progress)?;
         let requested = build_sensevoice_prompt(language, true).map_err(|e| e.to_string())?;
         Ok(sensevoice_result_to_transcription(
             &result.text,
@@ -296,6 +299,7 @@ fn decode_sensevoice_pcm_cached(
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
+    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, String> {
     let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
@@ -303,7 +307,12 @@ fn decode_sensevoice_pcm_cached(
     let phrase_bias = phrase_bias.cloned();
     actor
         .call_mut(move |runtime| {
-            runtime.decode_result(&samples, language.as_deref(), phrase_bias.as_ref())
+            runtime.decode_result(
+                &samples,
+                language.as_deref(),
+                phrase_bias.as_ref(),
+                decode_work_progress.as_ref(),
+            )
         })
         .map_err(|error| error.to_string())?
 }
@@ -315,6 +324,7 @@ fn transcribe_sensevoice_pcm_cached(
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
+    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<SenseVoiceTranscription, String> {
     let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
@@ -322,7 +332,12 @@ fn transcribe_sensevoice_pcm_cached(
     let phrase_bias = phrase_bias.cloned();
     actor
         .call_mut(move |runtime| {
-            runtime.transcribe(&samples, language.as_deref(), phrase_bias.as_ref())
+            runtime.transcribe(
+                &samples,
+                language.as_deref(),
+                phrase_bias.as_ref(),
+                decode_work_progress.as_ref(),
+            )
         })
         .map_err(|error| error.to_string())?
 }
@@ -488,6 +503,10 @@ impl SenseVoiceGgmlExecutor {
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
+            request
+                .execution_context
+                .decode_work_progress_observer()
+                .cloned(),
         )
         .map(strip_tags_in_result)
         .map_err(fail)
@@ -544,6 +563,10 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
+            request
+                .execution_context
+                .decode_work_progress_observer()
+                .cloned(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -694,6 +717,7 @@ mod tests {
             Some("zh"),
             None,
             backend,
+            None,
         )
         .expect("zh transcribe");
         eprintln!(
@@ -726,6 +750,7 @@ mod tests {
             Some("en"),
             None,
             backend,
+            None,
         )
         .expect("en transcribe");
         eprintln!(
@@ -759,6 +784,7 @@ mod tests {
             None,
             None,
             backend,
+            None,
         )
         .expect("auto transcribe");
         eprintln!(
@@ -811,6 +837,7 @@ mod tests {
             Some("en"),
             None,
             backend,
+            None,
         )
         .expect("warm");
         let runs = 3;
@@ -823,6 +850,7 @@ mod tests {
                 Some("en"),
                 None,
                 backend,
+                None,
             )
             .expect("run");
         }

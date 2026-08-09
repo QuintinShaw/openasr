@@ -471,6 +471,7 @@ struct WhisperDecoderActorJob {
     allow_persistent_session_reuse: bool,
     backend: GgmlCpuGraphBackend,
     control: Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
 }
 
 impl WhisperDecoderActorJob {
@@ -587,6 +588,7 @@ impl WhisperDecoderActorJob {
                 state.runner.as_ref(),
                 &self.trace,
                 &self.control,
+                self.decode_work_progress.as_ref(),
             )
         })();
         if !self.allow_persistent_session_reuse {
@@ -4284,6 +4286,7 @@ fn execute_whisper_with_prepared_runtime(
         allow_persistent_session_reuse,
         backend: resolved_backend,
         control: Arc::clone(&execution_context.control),
+        decode_work_progress: execution_context.decode_work_progress_observer().cloned(),
     };
     let run_encoder = || {
         run_whisper_encoder_actor(
@@ -5445,6 +5448,7 @@ fn run_whisper_decode_loop(
     decoder_runner: &dyn WhisperDecoderLoopRunner,
     trace: &WhisperGgmlTrace,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -5657,6 +5661,7 @@ fn run_whisper_decode_loop(
         &mut step_runner,
         &decode_text_token_ids,
         control,
+        decode_work_progress,
     ) {
         Ok(decode) => {
             decode_loop_span.finish_with_extra(

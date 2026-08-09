@@ -756,6 +756,10 @@ impl Qwen3AsrGgmlExecutor {
         let decode_config_for_actor = decode_config.clone();
         let phrase_bias_for_actor = request.request_options.phrase_bias.clone();
         let control_for_actor = Arc::clone(&request.execution_context.control);
+        let decode_work_progress_for_actor = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let fused_top1_hint_allowed = qwen_fused_top1_hint_allowed(
             request.request_options.word_timestamps,
             request
@@ -806,6 +810,7 @@ impl Qwen3AsrGgmlExecutor {
                     &mut step_executor,
                     &decode_text_token_ids_for_actor,
                     &control_for_actor,
+                    decode_work_progress_for_actor.as_ref(),
                 );
                 // A failed compute may poison the reusable graph. Always
                 // release session-scoped buffers before the actor goes idle.

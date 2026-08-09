@@ -1,67 +1,8 @@
-use std::cell::RefCell;
-
 use thiserror::Error;
 
+use crate::api::backend::DecodeWorkProgressObserver;
 use crate::api::backend::{DecodeTruncation, DecodeTruncationReason};
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
-
-thread_local! {
-    // Optional per-token progress observer for the in-flight decode on this
-    // thread. Deliberately separate from `trace_token` (debug tracing has its
-    // own opt-in kind per policy, see `BuiltinDecodePolicySeq2SeqTraceKind`,
-    // and stays a no-op in production) -- this is a distinct, always-wireable
-    // hook so a higher layer (native file transcription) can observe decode
-    // progress without perturbing trace semantics. Modeled as a thread-local
-    // callback rather than a new parameter threaded through every family's
-    // `run_builtin_seq2seq_decode_policy` wrapper (cohere, whisper, qwen,
-    // moonshine, firered-aed, hymt2 each have their own error-mapping
-    // boilerplate around that single call): installing/removing the sink
-    // here keeps every family wrapper untouched. Native transcription runs
-    // the decode loop synchronously on the calling thread, so a thread-local
-    // is enough to attribute callbacks to the run that installed them; the
-    // sink closure itself carries that run's transcription id (see
-    // `run_dispatch_once_with_progress` in `native_transcribe.rs`) to publish
-    // into that id's own progress-registry entry.
-    static TOKEN_STEP_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
-        const { RefCell::new(None) };
-}
-
-/// RAII handle for an installed token-step progress sink: restores whatever
-/// sink (if any) was previously installed on this thread when dropped, so a
-/// caller's guard never has to know whether it is nesting inside another.
-pub(crate) struct TokenStepProgressGuard {
-    previous: Option<Box<dyn FnMut(usize, usize)>>,
-}
-
-impl Drop for TokenStepProgressGuard {
-    fn drop(&mut self) {
-        TOKEN_STEP_PROGRESS_SINK.with(|cell| {
-            *cell.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-/// Install `sink` as the active token-step progress callback for this thread
-/// for the returned guard's lifetime. `sink` is called once per generated
-/// token as `sink(step_index, max_generated_tokens)` -- `step_index` is
-/// 0-based and `max_generated_tokens` is this decode's configured cap (a
-/// conservative denominator: real decodes almost always finish well before
-/// it, so a fraction derived from it never overshoots what the eventual
-/// slice-complete signal reports).
-pub(crate) fn install_token_step_progress_sink(
-    sink: impl FnMut(usize, usize) + 'static,
-) -> TokenStepProgressGuard {
-    let previous = TOKEN_STEP_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
-    TokenStepProgressGuard { previous }
-}
-
-pub(crate) fn report_token_step_progress(step_index: usize, max_generated_tokens: usize) {
-    TOKEN_STEP_PROGRESS_SINK.with(|cell| {
-        if let Some(sink) = cell.borrow_mut().as_mut() {
-            sink(step_index, max_generated_tokens);
-        }
-    });
-}
 
 /// Largest token n-gram the degenerate-loop guard inspects (token ids, not
 /// characters). An observed greedy loop is a very short cycle - a single
@@ -292,6 +233,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
     trace_token: &mut dyn FnMut(usize, u32, bool),
     on_topk: &mut dyn FnMut(usize, &[f32]),
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&DecodeWorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     struct ClosureTokenDecoder<'a, E> {
         decode_text_token_ids: &'a dyn Fn(&[u32]) -> Result<String, E>,
@@ -318,6 +260,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
         trace_token,
         on_topk,
         control,
+        decode_work_progress,
     )
     .map_err(map_shared_error_to_family)?;
     Ok(Seq2SeqGreedyDecodeResult {
@@ -346,6 +289,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     trace_token: &mut dyn FnMut(usize, u32, bool),
     on_topk: &mut dyn FnMut(usize, &[f32]),
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&DecodeWorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeError> {
     if config.initial_prompt_tokens.is_empty() {
         return Err(Seq2SeqGreedyDecodeError::EmptyInitialPrompt);
@@ -386,7 +330,9 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             on_topk,
         )?;
         trace_token(step_index, selection.token_id, selection.reached_eot);
-        report_token_step_progress(step_index, config.max_generated_tokens);
+        if let Some(observer) = decode_work_progress {
+            observer.report(step_index + 1, config.max_generated_tokens);
+        }
         if selection.reached_eot {
             stop_reason = Some(Seq2SeqGreedyDecodeStopReason::StopToken);
             break;
@@ -753,6 +699,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -813,6 +760,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap_err();
 
@@ -868,6 +816,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -879,12 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn token_step_progress_sink_is_a_no_op_when_none_is_installed() {
-        // No sink installed on this thread: `report_token_step_progress`
-        // (called every step by the loop below) must be a silent no-op, not
-        // a panic or a decode-affecting side effect -- the default state for
-        // every caller that never installs a sink (mock backend, tests, any
-        // decode that runs before native transcription wires one up).
+    fn decode_work_progress_is_a_no_op_when_no_observer_is_supplied() {
         let mut step_executor = SyntheticStepExecutor {
             vocab_size: 16,
             sequence: vec![1, 2, 7],
@@ -913,6 +857,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -921,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn token_step_progress_sink_receives_one_call_per_step_with_max_generated_tokens() {
+    fn decode_work_progress_receives_one_completed_unit_per_step() {
         let mut step_executor = SyntheticStepExecutor {
             vocab_size: 16,
             sequence: vec![1, 2, 7],
@@ -943,14 +888,14 @@ mod tests {
         let mut no_token_trace = |_: usize, _: u32, _: bool| {};
         let mut no_topk_trace = |_: usize, _: &[f32]| {};
 
-        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let observed_for_sink = observed.clone();
-        let _sink_guard =
-            install_token_step_progress_sink(move |step_index, max_generated_tokens| {
-                observed_for_sink
-                    .borrow_mut()
-                    .push((step_index, max_generated_tokens));
-            });
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_observer = std::sync::Arc::clone(&observed);
+        let observer = DecodeWorkProgressObserver::new(move |completed_work, total_work| {
+            observed_for_observer
+                .lock()
+                .expect("progress observations")
+                .push((completed_work, total_work));
+        });
 
         let output = run_seq2seq_greedy_decode_loop_v0(
             &config,
@@ -959,6 +904,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            Some(&observer),
         )
         .unwrap();
 
@@ -967,30 +913,10 @@ mod tests {
         // `decode_step_logits` calls for a 2-token result), each carrying the
         // driver's own `config.max_generated_tokens` -- not something the
         // sink has to compute or guess.
-        assert_eq!(*observed.borrow(), vec![(0, 8), (1, 8), (2, 8)]);
-
-        drop(_sink_guard);
-        // Dropping the guard restores the prior (unset) sink: a step after
-        // the guard is gone must not still be observed.
-        let mut post_guard_step_executor = SyntheticStepExecutor {
-            vocab_size: 16,
-            sequence: vec![7],
-            logits_calls: 0,
-        };
-        let post_guard_config = Seq2SeqGreedyDecodeConfig {
-            max_generated_tokens: 3,
-            ..config
-        };
-        run_seq2seq_greedy_decode_loop_v0(
-            &post_guard_config,
-            &mut post_guard_step_executor,
-            &token_decoder,
-            &mut no_token_trace,
-            &mut no_topk_trace,
-            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
-        )
-        .unwrap();
-        assert_eq!(observed.borrow().len(), 3, "guard drop must stop reports");
+        assert_eq!(
+            *observed.lock().expect("progress observations"),
+            vec![(1, 8), (2, 8), (3, 8)]
+        );
     }
 
     #[test]
@@ -1265,6 +1191,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap_err();
 
@@ -1328,6 +1255,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -1384,6 +1312,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -1435,6 +1364,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -1705,6 +1635,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("guard should finish the decode, not error out");
 
@@ -1817,6 +1748,7 @@ mod tests {
                 &mut no_token_trace,
                 &mut no_topk_trace,
                 &worker_control,
+                None,
             );
             (result, step_executor.logits_calls)
         });
@@ -1881,6 +1813,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("no-control path stays successful");
         assert_eq!(output.text, "hello");

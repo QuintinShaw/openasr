@@ -588,6 +588,10 @@ impl GraniteSpeechGgmlExecutor {
             .map_err(|source| GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source })?;
         let actor = self.checkout_prepared_runtime(preflight, backend)?;
         let control = Arc::clone(&request.execution_context.control);
+        let decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let result = actor
             .call_mut(move |state| {
                 let prepared = &mut state.runtime;
@@ -680,6 +684,7 @@ impl GraniteSpeechGgmlExecutor {
                         |error: Seq2SeqGreedyDecodeError| error,
                         map_registry_error,
                         &control,
+                        decode_work_progress.as_ref(),
                     )
                     .map_err(|error| {
                         GraniteSpeechGgmlExecutorError::DecodeFailed {

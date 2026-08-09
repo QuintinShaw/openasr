@@ -302,6 +302,7 @@ impl Beam {
 /// `CtcGreedyDecodeResult` shape as the greedy path (token ids, per-token frame
 /// spans, frame count, detokenized text) so every downstream consumer -- word
 /// timestamps, per-word confidence, streaming -- is unchanged.
+#[cfg(test)]
 pub(crate) fn run_ctc_prefix_beam_decode<E>(
     blank_token_id: u32,
     vocab_size: usize,
@@ -309,6 +310,26 @@ pub(crate) fn run_ctc_prefix_beam_decode<E>(
     frame_logits: &[&[f32]],
     decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
     map_err: impl Fn(E) -> CtcGreedyDecodeError,
+) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
+    run_ctc_prefix_beam_decode_with_progress(
+        blank_token_id,
+        vocab_size,
+        graph,
+        frame_logits,
+        decode_text_token_ids,
+        map_err,
+        None,
+    )
+}
+
+pub(crate) fn run_ctc_prefix_beam_decode_with_progress<E>(
+    blank_token_id: u32,
+    vocab_size: usize,
+    graph: &CtcContextGraph,
+    frame_logits: &[&[f32]],
+    decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
+    map_err: impl Fn(E) -> CtcGreedyDecodeError,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
     if frame_logits.is_empty() {
         return Err(CtcGreedyDecodeError::EmptyFrames);
@@ -391,6 +412,9 @@ pub(crate) fn run_ctc_prefix_beam_decode<E>(
         }
 
         beams = prune_beams(next, CTC_PREFIX_BEAM_WIDTH);
+        if let Some(observer) = decode_work_progress {
+            observer.report(frame + 1, frame_logits.len());
+        }
     }
 
     // FINALIZE: select on the finalized score -- the running score plus the

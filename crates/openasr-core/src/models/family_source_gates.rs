@@ -783,3 +783,52 @@ fn shared_decode_topologies_call_their_declared_driver() {
         }
     }
 }
+
+#[test]
+fn decode_drivers_forward_request_scoped_work_progress() {
+    use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrDecodeDriverStrategy};
+
+    let root = models_root();
+    for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+        if descriptor.identity.module_slug == "hymt2"
+            || matches!(
+                descriptor.topology_contract.decode_driver,
+                OpenAsrDecodeDriverStrategy::Dedicated { .. }
+            )
+        {
+            continue;
+        }
+
+        let family_root = root.join(descriptor.identity.module_slug);
+        let mut files = Vec::new();
+        rust_files_below(&family_root, &mut files);
+        assert!(
+            files.iter().any(|path| {
+                ProductionSyntax::collect(path)
+                    .calls_or_invokes_method("decode_work_progress_observer")
+            }),
+            "inventory family '{}' must forward the request-scoped decode work observer into its shared driver",
+            descriptor.identity.model_family,
+        );
+    }
+
+    for module_slug in ["dolphin", "parakeet_tdt", "xasr_zipformer"] {
+        let family_root = root.join(module_slug);
+        let mut files = Vec::new();
+        rust_files_below(&family_root, &mut files);
+        assert!(
+            files.iter().any(|path| {
+                ProductionSyntax::collect(path)
+                    .calls_or_invokes_method("decode_work_progress_observer")
+            }),
+            "dedicated decode family '{module_slug}' must forward the request-scoped decode work observer into its natural work loop",
+        );
+    }
+
+    let seq2seq_source = std::fs::read_to_string(root.join("seq2seq_greedy_decode.rs"))
+        .expect("read shared seq2seq driver");
+    assert!(
+        !seq2seq_source.contains("thread_local!") && !seq2seq_source.contains("TokenStepProgress"),
+        "shared decode progress must travel with the request, never caller-thread TLS",
+    );
+}

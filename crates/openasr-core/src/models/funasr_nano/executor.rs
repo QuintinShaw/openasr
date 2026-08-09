@@ -620,6 +620,10 @@ impl FunasrNanoGgmlExecutor {
         .map_err(|source| FunasrNanoExecutorError::DecoderStateCapacity { source })?;
         let decoder_actor = self.checkout_decoder_runtime(preflight, decoder_metadata, backend)?;
         let decoder_control = Arc::clone(&request.execution_context.control);
+        let decoder_decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let result = decoder_actor
             .call_mut(move |state| {
                 let result = decode_with_decoder(
@@ -630,6 +634,7 @@ impl FunasrNanoGgmlExecutor {
                     &tokenizer,
                     kv_capacity,
                     &decoder_control,
+                    decoder_decode_work_progress.as_ref(),
                 );
                 state.runtime.release_session_scoped_buffers();
                 result
@@ -672,6 +677,7 @@ fn decode_with_decoder(
     tokenizer: &FunasrNanoTokenizer,
     kv_capacity: Qwen3AsrKvCacheCapacity,
     control: &Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, FunasrNanoExecutorError> {
     let token_value_count = decode_prompt
         .token_ids
@@ -733,6 +739,7 @@ fn decode_with_decoder(
         |error: Seq2SeqGreedyDecodeError| error,
         map_registry_error,
         control,
+        decode_work_progress,
     )
     .map_err(|error| FunasrNanoExecutorError::GreedyDecodeFailed {
         reason: error.to_string(),
@@ -954,6 +961,7 @@ mod tests {
                 )
                 .expect("test KV capacity"),
                 &control,
+                None,
             )
             .expect("decode");
             eprintln!("[{tag}] text = {}", result.text);

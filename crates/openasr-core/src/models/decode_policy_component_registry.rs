@@ -3,7 +3,8 @@ use thiserror::Error;
 use crate::PhraseBiasConfig;
 use crate::arch::OpenAsrArchitectureRegistry;
 use crate::models::ctc_greedy_decode::{
-    CtcGreedyDecodeConfig, CtcGreedyDecodeError, CtcGreedyDecodeResult, run_ctc_greedy_decode,
+    CtcGreedyDecodeConfig, CtcGreedyDecodeError, CtcGreedyDecodeResult,
+    run_ctc_greedy_decode_with_progress,
 };
 use crate::models::phrase_bias_decode::{
     PhraseBiasBuildError, PhraseBiasTokenEncoder, build_token_phrase_biases,
@@ -493,6 +494,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
     map_shared_error_to_family: fn(Seq2SeqGreedyDecodeError) -> E,
     map_registry_error: fn(BuiltinDecodePolicyComponentRegistryError) -> E,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     let descriptor = resolve_builtin_decode_policy(decode_policy_id).map_err(map_registry_error)?;
     let config = build_builtin_seq2seq_decode_policy_config(
@@ -528,6 +530,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
                 &mut trace_token,
                 &mut on_topk,
                 control,
+                decode_work_progress,
             )
         }
         // Fail closed: a CTC policy must never route through the seq2seq loop.
@@ -554,6 +557,7 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, String>,
     map_ctc_error_to_family: fn(CtcGreedyDecodeError) -> E,
     map_registry_error: fn(BuiltinDecodePolicyComponentRegistryError) -> E,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, E> {
     let descriptor = resolve_builtin_decode_policy(decode_policy_id).map_err(map_registry_error)?;
     match descriptor.execution_kind {
@@ -565,7 +569,7 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
                     },
                 )
             })?;
-            run_ctc_greedy_decode(
+            run_ctc_greedy_decode_with_progress(
                 CtcGreedyDecodeConfig {
                     blank_token_id,
                     vocab_size,
@@ -579,6 +583,7 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
                 frame_logits,
                 decode_text_token_ids,
                 |reason| CtcGreedyDecodeError::DetokenizeFailed { reason },
+                decode_work_progress,
             )
             .map_err(map_ctc_error_to_family)
         }
@@ -1221,6 +1226,7 @@ mod tests {
             |error| error.to_string(),
             |error| error.to_string(),
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("decode policy dispatch");
 
@@ -1266,6 +1272,7 @@ mod tests {
             |error| error.to_string(),
             |error| error.to_string(),
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("decode policy dispatch");
 
@@ -1316,6 +1323,7 @@ mod tests {
             |error| error.to_string(),
             |error| error.to_string(),
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("decode policy dispatch");
 
@@ -1504,6 +1512,7 @@ mod tests {
             &detok,
             ctc_err_to_string,
             registry_err_to_string,
+            None,
         )
         .expect("ctc decode");
         assert_eq!(result.token_ids, vec![5, 7]);
@@ -1524,6 +1533,7 @@ mod tests {
             &detok,
             ctc_err_to_string,
             registry_err_to_string,
+            None,
         )
         .expect_err("seq2seq policy must not run through the CTC path");
         assert!(

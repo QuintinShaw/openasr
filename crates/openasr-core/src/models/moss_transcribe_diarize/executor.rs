@@ -641,6 +641,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     audio_rows: &[f32],
     tokenizer: MossTdTokenizer,
     control: Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
     let decode_prompt_token_ids = decode_prompt_token_ids.to_vec();
     let audio_pad_positions = audio_pad_positions.to_vec();
@@ -715,6 +716,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 |error: Seq2SeqGreedyDecodeError| error,
                 map_registry_error,
                 &control,
+                decode_work_progress.as_ref(),
             );
             // Release this request's per-token grow-to-fit host buffer before
             // the runtime goes back into the cache (mirrors qwen3-asr's
@@ -1078,6 +1080,10 @@ impl MossTdGgmlExecutor {
             &audio_rows,
             tokenizer,
             Arc::clone(&request.execution_context.control),
+            request
+                .execution_context
+                .decode_work_progress_observer()
+                .cloned(),
         )?;
         // Normalize the model's own inline `[start][end][SNN]` markup into the
         // engine's shared segment representation. The decode prompt is fixed,

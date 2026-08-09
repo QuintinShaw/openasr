@@ -347,6 +347,7 @@ impl FireRedAedGgmlExecutor {
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         tokenizer: FireRedTokenizer,
         control: Arc<crate::api::backend::TranscriptionControl>,
+        decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<super::decoder_graph::FireRedAedGreedyDecodeOutput, FireRedAedExecutorError> {
         let runtime = self.checkout_decoder_runtime(preflight, metadata, decoder_state, backend)?;
@@ -360,6 +361,7 @@ impl FireRedAedGgmlExecutor {
                     encoder_frame_count,
                     |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
                     &control,
+                    decode_work_progress.as_ref(),
                 )
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?
@@ -504,6 +506,10 @@ impl FireRedAedGgmlExecutor {
             decoder_state,
             tokenizer,
             Arc::clone(&request.execution_context.control),
+            request
+                .execution_context
+                .decode_work_progress_observer()
+                .cloned(),
             backend,
         )?;
 

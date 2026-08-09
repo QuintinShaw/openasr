@@ -57,6 +57,7 @@ pub use native_transcribe::{
     describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
     refine_existing_transcription_timeline,
 };
+pub(crate) use request_execution_context::DecodeWorkProgressObserver;
 pub use request_execution_context::RequestExecutionContext;
 pub use transcription_control::{
     GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,

@@ -222,29 +222,31 @@ struct SliceProgressWindow {
     span_fraction: f32,
 }
 
-/// Cap token interpolation below 1.0 of the slice window so `complete_slice`
-/// still visibly closes the slice after the last token.
-const TOKEN_PROGRESS_SLICE_SHARE_CAP: f32 = 0.95;
+/// Cap decode-work interpolation below 1.0 of the slice window so
+/// `complete_slice` still visibly closes the slice after the last work unit.
+const DECODE_WORK_PROGRESS_SLICE_SHARE_CAP: f32 = 0.95;
 
-/// Publish at most every Nth generated token (plus always the first).
-const TOKEN_PROGRESS_PUBLISH_STRIDE: usize = 4;
+/// Publish at most every Nth work unit, plus the first and final units.
+const DECODE_WORK_PROGRESS_PUBLISH_STRIDE: usize = 4;
 
-fn token_step_fraction(
+fn decode_work_fraction(
     window: SliceProgressWindow,
-    step_index: usize,
-    estimated_total_tokens: usize,
+    completed_work: usize,
+    total_work: usize,
 ) -> f32 {
-    let ratio = if estimated_total_tokens == 0 {
-        TOKEN_PROGRESS_SLICE_SHARE_CAP
+    let ratio = if total_work == 0 {
+        DECODE_WORK_PROGRESS_SLICE_SHARE_CAP
     } else {
-        let raw = (step_index.saturating_add(1)) as f32 / estimated_total_tokens as f32;
-        raw.min(TOKEN_PROGRESS_SLICE_SHARE_CAP)
+        let raw = completed_work as f32 / total_work as f32;
+        raw.min(DECODE_WORK_PROGRESS_SLICE_SHARE_CAP)
     };
     window.start_fraction + window.span_fraction * ratio
 }
 
-fn should_publish_token_step(step_index: usize) -> bool {
-    step_index.is_multiple_of(TOKEN_PROGRESS_PUBLISH_STRIDE)
+fn should_publish_decode_work(completed_work: usize, total_work: usize) -> bool {
+    completed_work == 1
+        || completed_work == total_work
+        || completed_work.is_multiple_of(DECODE_WORK_PROGRESS_PUBLISH_STRIDE)
 }
 
 /// Whether the request is likely to run forced alignment (plan includes align
@@ -291,7 +293,7 @@ fn progress_segmenter_kind_for_provider(
     }
 }
 
-/// Run one `run_dispatch_once` with a per-token progress sink wired to the
+/// Run one `run_dispatch_once` with per-decode-work progress wired to the
 /// decode stage window for `slice_samples`, then `complete_slice` on success.
 #[allow(clippy::too_many_arguments)]
 fn run_dispatch_once_with_progress(
@@ -310,18 +312,14 @@ fn run_dispatch_once_with_progress(
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let window = decode_progress.slice_progress_window(slice_samples);
     let reporter = decode_progress.reporter.clone();
-    let _token_progress_guard =
-        crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
-            move |step_index, max_generated_tokens| {
-                if should_publish_token_step(step_index) {
-                    reporter.report_fraction(token_step_fraction(
-                        window,
-                        step_index,
-                        max_generated_tokens,
-                    ));
-                }
-            },
-        );
+    let observer =
+        crate::api::backend::DecodeWorkProgressObserver::new(move |completed_work, total_work| {
+            if should_publish_decode_work(completed_work, total_work) {
+                reporter.report_fraction(decode_work_fraction(window, completed_work, total_work));
+            }
+        });
+    let execution_context =
+        Arc::new(execution_context.with_decode_work_progress_observer(observer));
     let result = run_dispatch_once(
         dispatch,
         execution_services,
@@ -332,7 +330,7 @@ fn run_dispatch_once_with_progress(
         backend_preference,
         resolved_preference,
         auto_gpu_policy,
-        execution_context,
+        &execution_context,
     )?;
     decode_progress.complete_slice(slice_samples);
     Ok(result)
@@ -5218,28 +5216,25 @@ mod tests {
     }
 
     #[test]
-    fn token_step_fraction_normalizes_step_index_against_estimated_total() {
+    fn decode_work_fraction_normalizes_completed_units_against_total() {
         let window = SliceProgressWindow {
             start_fraction: 0.0,
             span_fraction: 1.0,
         };
-        // step_index is 0-based, so "step 0 of 10" already reads as 1/10 of
-        // the window, not 0/10 -- the first generated token must show
-        // forward motion instead of reporting the window's start again.
-        assert!((token_step_fraction(window, 0, 10) - 0.1).abs() < 1e-6);
-        assert!((token_step_fraction(window, 4, 10) - 0.5).abs() < 1e-6);
+        assert!((decode_work_fraction(window, 1, 10) - 0.1).abs() < 1e-6);
+        assert!((decode_work_fraction(window, 5, 10) - 0.5).abs() < 1e-6);
     }
 
     #[test]
-    fn token_step_fraction_scales_by_the_slice_window() {
+    fn decode_work_fraction_scales_by_the_slice_window() {
         // A slice that owns [0.2, 0.2 + 0.3) of the decode-phase fraction:
         // token progress must land inside that sub-range, not [0, 1].
         let window = SliceProgressWindow {
             start_fraction: 0.2,
             span_fraction: 0.3,
         };
-        let at_start = token_step_fraction(window, 0, 100);
-        let at_half = token_step_fraction(window, 49, 100);
+        let at_start = decode_work_fraction(window, 1, 100);
+        let at_half = decode_work_fraction(window, 50, 100);
         assert!((at_start - (0.2 + 0.3 * 0.01)).abs() < 1e-6);
         assert!((at_half - (0.2 + 0.3 * 0.50)).abs() < 1e-6);
         assert!(at_start >= window.start_fraction);
@@ -5247,41 +5242,41 @@ mod tests {
     }
 
     #[test]
-    fn token_step_fraction_caps_below_the_full_slice_span() {
-        // Even once step_index reaches (or blows past) estimated_total_tokens,
+    fn decode_work_fraction_caps_below_the_full_slice_span() {
+        // Even once completed work reaches (or blows past) total work,
         // the window's own share must stay strictly under its full span --
         // `DecodeProgress::complete_slice` owns closing out the remaining
-        // sliver, not per-token interpolation racing ahead of it.
+        // sliver, not work interpolation racing ahead of it.
         let window = SliceProgressWindow {
             start_fraction: 0.0,
             span_fraction: 1.0,
         };
-        let at_cap = token_step_fraction(window, 99, 100);
-        let past_cap = token_step_fraction(window, 500, 100);
-        assert!((at_cap - TOKEN_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
-        assert!((past_cap - TOKEN_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
+        let at_cap = decode_work_fraction(window, 100, 100);
+        let past_cap = decode_work_fraction(window, 501, 100);
+        assert!((at_cap - DECODE_WORK_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
+        assert!((past_cap - DECODE_WORK_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
         assert!(at_cap < window.start_fraction + window.span_fraction);
     }
 
     #[test]
-    fn token_step_fraction_is_monotonic_in_step_index() {
+    fn decode_work_fraction_is_monotonic_in_completed_work() {
         let window = SliceProgressWindow {
             start_fraction: 0.1,
             span_fraction: 0.4,
         };
-        let mut previous = token_step_fraction(window, 0, 37);
-        for step_index in 1..200 {
-            let current = token_step_fraction(window, step_index, 37);
+        let mut previous = decode_work_fraction(window, 0, 37);
+        for completed_work in 1..200 {
+            let current = decode_work_fraction(window, completed_work, 37);
             assert!(
                 current >= previous,
-                "fraction regressed at step {step_index}: {previous} -> {current}"
+                "fraction regressed at work {completed_work}: {previous} -> {current}"
             );
             previous = current;
         }
     }
 
     #[test]
-    fn token_step_fraction_falls_back_to_the_cap_when_estimate_is_zero() {
+    fn decode_work_fraction_falls_back_to_the_cap_when_total_is_zero() {
         // A zero denominator (defensive: no builtin family emits
         // max_generated_tokens=0, `Seq2SeqGreedyDecodeConfig` fails closed on
         // it) must not divide by zero or report the window as fully done --
@@ -5291,7 +5286,10 @@ mod tests {
             start_fraction: 0.0,
             span_fraction: 1.0,
         };
-        assert!((token_step_fraction(window, 0, 0) - TOKEN_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
+        assert!(
+            (decode_work_fraction(window, 0, 0) - DECODE_WORK_PROGRESS_SLICE_SHARE_CAP).abs()
+                < 1e-6
+        );
     }
 
     #[test]
@@ -5326,22 +5324,25 @@ mod tests {
     }
 
     #[test]
-    fn should_publish_token_step_throttles_to_every_stride_and_always_the_first() {
-        assert!(should_publish_token_step(0));
-        for step_index in 1..TOKEN_PROGRESS_PUBLISH_STRIDE {
+    fn should_publish_decode_work_throttles_and_keeps_first_and_final_units() {
+        assert!(should_publish_decode_work(1, 20));
+        for completed_work in 2..DECODE_WORK_PROGRESS_PUBLISH_STRIDE {
             assert!(
-                !should_publish_token_step(step_index),
-                "step {step_index} should be throttled"
+                !should_publish_decode_work(completed_work, 20),
+                "work unit {completed_work} should be throttled"
             );
         }
-        assert!(should_publish_token_step(TOKEN_PROGRESS_PUBLISH_STRIDE));
-        assert!(should_publish_token_step(TOKEN_PROGRESS_PUBLISH_STRIDE * 5));
+        assert!(should_publish_decode_work(
+            DECODE_WORK_PROGRESS_PUBLISH_STRIDE,
+            20
+        ));
+        assert!(should_publish_decode_work(20, 20));
     }
 
-    /// End-to-end wiring: token-step sink reports stage_fraction inside the
-    /// installed slice window, monotonically.
+    /// End-to-end wiring: a request-local observer reports stage progress from
+    /// a different thread, proving it follows the request rather than TLS.
     #[test]
-    fn token_step_progress_sink_reports_monotonically_inside_its_window() {
+    fn decode_work_progress_crosses_threads_and_stays_inside_its_window() {
         let _serial = progress_registry_test_lock();
         let id = "token-step-sink-window";
         assert_eq!(native_transcription_progress_for_id(id), None);
@@ -5354,30 +5355,50 @@ mod tests {
                 start_fraction: 0.0,
                 span_fraction: 1.0,
             };
-            let reporter_for_sink = reporter.clone();
-            let _sink_guard =
-                crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
-                    move |step_index, max_generated_tokens| {
-                        if should_publish_token_step(step_index) {
-                            reporter_for_sink.report_fraction(token_step_fraction(
-                                window,
-                                step_index,
-                                max_generated_tokens,
-                            ));
-                        }
-                    },
-                );
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+                let reporter = reporter.clone();
+                let observed = std::sync::Arc::clone(&observed);
+                move |completed_work, total_work| {
+                    if should_publish_decode_work(completed_work, total_work) {
+                        let fraction = decode_work_fraction(window, completed_work, total_work);
+                        observed
+                            .lock()
+                            .expect("progress observations")
+                            .push(fraction);
+                        reporter.report_fraction(fraction);
+                    }
+                }
+            });
+            let context =
+                crate::RequestExecutionContext::uncancellable("cross-thread progress test")
+                    .with_decode_work_progress_observer(observer);
+            std::thread::spawn(move || {
+                for completed_work in 1..=40 {
+                    context
+                        .decode_work_progress_observer()
+                        .expect("observer follows context")
+                        .report(completed_work, 40);
+                }
+            })
+            .join()
+            .expect("worker thread");
 
-            let mut previous = 0.0_f32;
-            for step_index in 0..40 {
-                crate::models::seq2seq_greedy_decode::report_token_step_progress(step_index, 40);
-                let progress =
-                    native_transcription_progress_for_id(id).expect("sink published at least once");
-                let stage_frac = progress.stage_fraction.unwrap_or(0.0);
-                assert!(stage_frac >= previous);
-                assert!(stage_frac <= window.start_fraction + window.span_fraction);
-                previous = stage_frac;
+            let observed = observed.lock().expect("progress observations");
+            assert_eq!(observed.len(), 11);
+            for pair in observed.windows(2) {
+                assert!(pair[0] <= pair[1], "progress regressed: {pair:?}");
             }
+            assert!(observed.iter().all(|value| *value <= 1.0));
+            assert!(
+                (observed.last().copied().unwrap_or_default()
+                    - DECODE_WORK_PROGRESS_SLICE_SHARE_CAP)
+                    .abs()
+                    < 1e-6
+            );
+            let progress =
+                native_transcription_progress_for_id(id).expect("observer published progress");
+            assert_eq!(progress.stage, TranscriptionStage::Decode);
         }
         assert_eq!(native_transcription_progress_for_id(id), None);
     }

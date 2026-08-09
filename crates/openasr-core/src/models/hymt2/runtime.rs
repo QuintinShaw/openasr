@@ -2245,6 +2245,7 @@ fn run_hymt2_shared_greedy_decode(
         map_shared_error_to_hymt2,
         map_registry_error_to_hymt2,
         control,
+        None,
     ) {
         Ok(result) => Ok((result.generated_tokens, result.text)),
         Err(Hymt2SharedDecodeError::Truncated { generated_tokens }) => {

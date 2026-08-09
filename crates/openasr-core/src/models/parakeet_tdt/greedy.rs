@@ -108,6 +108,7 @@ impl ParakeetTdtJoint {
 
 /// Greedy TDT over `frame_count` encoder frames of `enc_features`
 /// (frame-major `[frame][joint_hidden]`, already encoder-projected).
+#[cfg(test)]
 pub(crate) fn tdt_greedy_decode(
     enc_features: &[f32],
     frame_count: usize,
@@ -115,6 +116,26 @@ pub(crate) fn tdt_greedy_decode(
     predictor: &ParakeetTdtPredictor,
     joint: &ParakeetTdtJoint,
     is_canceled: &dyn Fn() -> bool,
+) -> Result<Vec<ParakeetTdtEmittedToken>, String> {
+    tdt_greedy_decode_with_progress(
+        enc_features,
+        frame_count,
+        metadata,
+        predictor,
+        joint,
+        is_canceled,
+        None,
+    )
+}
+
+pub(crate) fn tdt_greedy_decode_with_progress(
+    enc_features: &[f32],
+    frame_count: usize,
+    metadata: &ParakeetTdtExecutionMetadata,
+    predictor: &ParakeetTdtPredictor,
+    joint: &ParakeetTdtJoint,
+    is_canceled: &dyn Fn() -> bool,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<Vec<ParakeetTdtEmittedToken>, String> {
     if is_canceled() {
         return Err("parakeet-tdt decode canceled before predictor prefill".to_string());
@@ -197,6 +218,9 @@ pub(crate) fn tdt_greedy_decode(
                 t += 1;
                 break;
             }
+        }
+        if let Some(observer) = decode_work_progress {
+            observer.report(t.min(frame_count), frame_count);
         }
     }
     scratch.pred_out = pred_out;
@@ -308,14 +332,36 @@ mod tests {
         // forced advance.
         // Frame 2: m=[2, 0] -> tok0 again.
         let enc = vec![2.0, 0.0, 0.0, 2.0, 2.0, 0.0];
-        let emitted = tdt_greedy_decode(&enc, 3, &metadata(3, 2, 4), &predictor, &joint, &|| false)
-            .expect("decode");
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+            let observed = std::sync::Arc::clone(&observed);
+            move |completed, total| {
+                observed
+                    .lock()
+                    .expect("tdt progress")
+                    .push((completed, total));
+            }
+        });
+        let emitted = tdt_greedy_decode_with_progress(
+            &enc,
+            3,
+            &metadata(3, 2, 4),
+            &predictor,
+            &joint,
+            &|| false,
+            Some(&observer),
+        )
+        .expect("decode");
         assert_eq!(emitted.len(), 2);
         assert_eq!(emitted[0].token_id, 0);
         assert_eq!(emitted[0].start_frame, 0);
         assert_eq!(emitted[0].end_frame, 1);
         assert_eq!(emitted[1].start_frame, 2);
         assert!(emitted.iter().all(|e| e.probability > 0.0));
+        assert_eq!(
+            *observed.lock().expect("tdt progress"),
+            vec![(1, 3), (2, 3), (3, 3)]
+        );
     }
 
     /// Adversarial: joint always answers (token, duration 0). The

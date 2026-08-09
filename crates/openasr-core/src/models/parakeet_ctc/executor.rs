@@ -144,13 +144,19 @@ fn transcribe_parakeet_ctc_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
+    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<ParakeetCtcTranscription, String> {
     let actor = checkout_parakeet_ctc_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
     let phrase_bias = phrase_bias.cloned();
     actor
         .call_mut(move |runtime| {
-            runtime.transcribe(&samples, phrase_bias.as_ref(), word_timestamps)
+            runtime.transcribe(
+                &samples,
+                phrase_bias.as_ref(),
+                word_timestamps,
+                decode_work_progress.as_ref(),
+            )
         })
         .map_err(|error| error.to_string())?
 }
@@ -166,7 +172,7 @@ fn decode_parakeet_ctc_pcm_cached(
     let samples = samples.to_vec();
     let phrase_bias = phrase_bias.cloned();
     actor
-        .call_mut(move |runtime| runtime.decode_result(&samples, phrase_bias.as_ref()))
+        .call_mut(move |runtime| runtime.decode_result(&samples, phrase_bias.as_ref(), None))
         .map_err(|error| error.to_string())?
 }
 
@@ -307,8 +313,9 @@ impl ParakeetCtcPreparedRuntime {
         samples: &[f32],
         phrase_bias: Option<&PhraseBiasConfig>,
         word_timestamps: bool,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<ParakeetCtcTranscription, String> {
-        let result = self.decode_result(samples, phrase_bias)?;
+        let result = self.decode_result(samples, phrase_bias, decode_work_progress)?;
         parakeet_ctc_result_to_transcription(
             result,
             &self.tokenizer,
@@ -321,13 +328,19 @@ impl ParakeetCtcPreparedRuntime {
         &mut self,
         samples: &[f32],
         phrase_bias: Option<&PhraseBiasConfig>,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<CtcGreedyDecodeResult, String> {
         let frontend = ParakeetFrontend::new(&self.metadata);
         let features = frontend
             .features_from_samples(samples)
             .map_err(|e| e.to_string())?;
         let output = self.graph.encode(&features).map_err(|e| e.to_string())?;
-        decode_parakeet_ctc_result(&output, &self.tokenizer, phrase_bias)
+        decode_parakeet_ctc_result_with_progress(
+            &output,
+            &self.tokenizer,
+            phrase_bias,
+            decode_work_progress,
+        )
     }
 }
 
@@ -381,6 +394,15 @@ pub(crate) fn decode_parakeet_ctc_result(
     tokenizer: &ParakeetTokenizer,
     phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<CtcGreedyDecodeResult, String> {
+    decode_parakeet_ctc_result_with_progress(output, tokenizer, phrase_bias, None)
+}
+
+fn decode_parakeet_ctc_result_with_progress(
+    output: &super::encoder_graph::ParakeetCtcEncoderOutput,
+    tokenizer: &ParakeetTokenizer,
+    phrase_bias: Option<&PhraseBiasConfig>,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+) -> Result<CtcGreedyDecodeResult, String> {
     let frame_logits: Vec<&[f32]> = (0..output.frame_count)
         .map(|f| &output.logits[f * output.vocab_size..(f + 1) * output.vocab_size])
         .collect();
@@ -394,6 +416,7 @@ pub(crate) fn decode_parakeet_ctc_result(
         &detok,
         ctc_err_to_string,
         registry_err_to_string,
+        decode_work_progress,
     )
 }
 
@@ -518,6 +541,10 @@ impl GgmlAsrViewExecutor for ParakeetCtcGgmlExecutor {
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
+            request
+                .execution_context
+                .decode_work_progress_observer()
+                .cloned(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;

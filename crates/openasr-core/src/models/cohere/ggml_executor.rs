@@ -475,6 +475,7 @@ impl CohereTranscribeGgmlExecutor {
                 request.request_options.word_timestamps,
                 audio_duration,
                 &request.execution_context.control,
+                request.execution_context.decode_work_progress_observer(),
                 Arc::clone(&prepared_runtime_owner),
             )
             .map_err(map_decoder_error)?
@@ -706,6 +707,7 @@ impl CohereTranscribeGgmlExecutor {
         word_timestamps: bool,
         audio_duration_seconds: f32,
         control: &Arc<crate::TranscriptionControl>,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
     ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
         let actor = self
@@ -725,6 +727,7 @@ impl CohereTranscribeGgmlExecutor {
         let encoder_output = Arc::new(encoder_output);
         let phrase_bias = phrase_bias.cloned();
         let control = Arc::clone(control);
+        let decode_work_progress = decode_work_progress.cloned();
         actor
             .call_mut(move |state| {
                 state.runtime.activate_decoder_state(decoder_state)?;
@@ -739,6 +742,7 @@ impl CohereTranscribeGgmlExecutor {
                     word_timestamps,
                     audio_duration_seconds,
                     &control,
+                    decode_work_progress.as_ref(),
                 )
             })
             .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {

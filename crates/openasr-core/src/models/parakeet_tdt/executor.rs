@@ -36,7 +36,7 @@ use super::encoder_weights::{
     ParakeetTdtLstmLayerWeights, load_parakeet_tdt_encoder_weights,
     load_parakeet_tdt_joint_weights, load_parakeet_tdt_predictor_weights,
 };
-use super::greedy::{ParakeetTdtJoint, tdt_greedy_decode};
+use super::greedy::{ParakeetTdtJoint, tdt_greedy_decode_with_progress};
 use super::predictor::ParakeetTdtPredictor;
 use super::runtime_contract::{
     ParakeetTdtExecutionMetadata, parse_parakeet_tdt_execution_metadata,
@@ -264,6 +264,7 @@ impl ParakeetTdtPreparedRuntime {
         samples: &[f32],
         word_timestamps: bool,
         is_canceled: &dyn Fn() -> bool,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<ParakeetTdtTranscription, String> {
         let frontend = ParakeetFrontend::with_n_mels(self.metadata.n_mels);
         let features = frontend
@@ -283,13 +284,14 @@ impl ParakeetTdtPreparedRuntime {
                 output.joint_hidden, self.metadata.joint_hidden
             ));
         }
-        let emitted = tdt_greedy_decode(
+        let emitted = tdt_greedy_decode_with_progress(
             &output.features,
             output.frame_count,
             &self.metadata,
             &self.predictor,
             &self.joint,
             is_canceled,
+            decode_work_progress,
         )?;
         let token_ids: Vec<u32> = emitted.iter().map(|token| token.token_id).collect();
         let text = self.tokenizer.decode(&token_ids)?;
@@ -318,12 +320,18 @@ fn transcribe_parakeet_tdt_pcm_cached(
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
     control: Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<ParakeetTdtTranscription, String> {
     let actor = checkout_parakeet_tdt_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
     actor
         .call_mut(move |runtime| {
-            runtime.transcribe(&samples, word_timestamps, &|| control.is_canceled())
+            runtime.transcribe(
+                &samples,
+                word_timestamps,
+                &|| control.is_canceled(),
+                decode_work_progress.as_ref(),
+            )
         })
         .map_err(|error| error.to_string())?
 }
@@ -405,6 +413,10 @@ impl GgmlAsrViewExecutor for ParakeetTdtGgmlExecutor {
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
             Arc::clone(&request.execution_context.control),
+            request
+                .execution_context
+                .decode_work_progress_observer()
+                .cloned(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -522,6 +534,7 @@ mod tests {
             true,
             GgmlCpuGraphBackend::Cpu,
             Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("transcribe");
         eprintln!("parakeet-tdt hypothesis: {:?}", output.text);

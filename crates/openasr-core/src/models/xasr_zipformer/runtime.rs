@@ -462,6 +462,7 @@ impl XasrZipformerPreparedRuntime {
         &mut self,
         samples: &[f32],
         is_canceled: &dyn Fn() -> bool,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<XasrGreedyDecodeResult, String> {
         let total_profile = xasr_profile_start();
         let fbank_profile = xasr_profile_start();
@@ -489,7 +490,13 @@ impl XasrZipformerPreparedRuntime {
         );
 
         let mut state = self.new_decode_state();
-        self.decode_available_chunks(&mut state, &features, true, is_canceled)?;
+        self.decode_available_chunks(
+            &mut state,
+            &features,
+            true,
+            is_canceled,
+            decode_work_progress,
+        )?;
         let text = self.decode_text(state.emitted_token_ids())?;
         xasr_profile_log(
             "decode_total",
@@ -542,6 +549,7 @@ impl XasrZipformerPreparedRuntime {
         features: &XasrFbankFeatures,
         final_flush: bool,
         is_canceled: &dyn Fn() -> bool,
+        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<usize, String> {
         let mut new_tokens = 0usize;
         let mut greedy_elapsed = Duration::ZERO;
@@ -559,6 +567,12 @@ impl XasrZipformerPreparedRuntime {
             processed_chunks = processed_chunks
                 .checked_add(1)
                 .ok_or_else(|| "xasr processed chunk count overflows".to_string())?;
+            if let Some(observer) = decode_work_progress {
+                observer.report(
+                    state.feature_cursor.min(features.n_frames),
+                    features.n_frames,
+                );
+            }
         }
 
         if processed_chunks > 0 {
@@ -830,7 +844,7 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
             .collect::<Vec<_>>();
         let result = rebuilt
-            .call_mut(move |runtime| runtime.transcribe(&samples, &|| false))
+            .call_mut(move |runtime| runtime.transcribe(&samples, &|| false, None))
             .expect("rebuilt actor must remain live")
             .expect("rebuilt runtime must decode");
         assert!(result.text.is_char_boundary(result.text.len()));

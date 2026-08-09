@@ -139,7 +139,7 @@ impl XasrIncrementalDecoder {
         // driving this decoder); each hop is a single short chunk, so the
         // decode loop itself never cancels mid-hop.
         self.call_decode(move |runtime, state, features| {
-            runtime.decode_available_chunks(state, features, final_flush, &|| false)
+            runtime.decode_available_chunks(state, features, final_flush, &|| false, None)
         })
     }
 

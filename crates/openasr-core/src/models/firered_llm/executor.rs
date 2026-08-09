@@ -553,6 +553,10 @@ impl FireRedLlmGgmlExecutor {
         };
         let decoder_tokenizer = tokenizer.clone();
         let decoder_control = Arc::clone(&request.execution_context.control);
+        let decoder_decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
         let result = decoder_actor
             .call_mut(move |state| {
@@ -618,6 +622,7 @@ impl FireRedLlmGgmlExecutor {
                     |error: Seq2SeqGreedyDecodeError| error,
                     map_registry_error,
                     &decoder_control,
+                    decoder_decode_work_progress.as_ref(),
                 );
                 // CPU step buffers are invocation-scoped. Native weights and
                 // the stable resident arena remain with this actor.

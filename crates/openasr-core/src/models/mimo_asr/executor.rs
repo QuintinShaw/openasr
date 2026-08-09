@@ -651,6 +651,10 @@ impl MimoAsrGgmlExecutor {
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);
+        let decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         let result = actor
             .call_mut(move |state| {
                 let result = Self::transcribe_with_prepared(
@@ -659,6 +663,7 @@ impl MimoAsrGgmlExecutor {
                     input_rate,
                     kv_capacity,
                     control,
+                    decode_work_progress,
                 );
                 state.runtime.decoder.release_session_scoped_buffers();
                 result
@@ -706,6 +711,7 @@ impl MimoAsrGgmlExecutor {
         input_rate: u32,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         control: Arc<crate::api::backend::TranscriptionControl>,
+        decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<Seq2SeqGreedyDecodeResult, MimoAsrExecutorError> {
         // The OpenASR pipeline delivers 16kHz mono to every executor, but
         // MiMo's audio tokenizer (and its baked mel filterbank/window) is
@@ -863,6 +869,7 @@ impl MimoAsrGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
             &control,
+            decode_work_progress.as_ref(),
         )
         .map_err(|error| MimoAsrExecutorError::GreedyDecodeFailed {
             reason: error.to_string(),

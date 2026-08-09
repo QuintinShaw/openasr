@@ -109,6 +109,28 @@ pub(crate) fn joint_decode(
     decode_config: &DolphinJointDecodeConfig,
     is_canceled: &dyn Fn() -> bool,
 ) -> Result<DolphinJointDecodeResult, DolphinJointDecodeError> {
+    joint_decode_with_progress(
+        ctc_head,
+        rescore,
+        encoder_out,
+        rescoring_encoder_out,
+        frames,
+        decode_config,
+        is_canceled,
+        None,
+    )
+}
+
+pub(crate) fn joint_decode_with_progress(
+    ctc_head: &mut DolphinCtcHeadRuntime,
+    rescore: &mut DolphinDecoderRescoreRuntime,
+    encoder_out: &[f32],
+    rescoring_encoder_out: &[f32],
+    frames: usize,
+    decode_config: &DolphinJointDecodeConfig,
+    is_canceled: &dyn Fn() -> bool,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+) -> Result<DolphinJointDecodeResult, DolphinJointDecodeError> {
     let decoder_config = *rescore.config();
     let vocab = decoder_config.vocab_size;
     let d_model = decoder_config.d_model;
@@ -143,6 +165,7 @@ pub(crate) fn joint_decode(
         blank,
         decode_config.beam_size.max(1),
         is_canceled,
+        decode_work_progress,
     )?;
     if nbest.is_empty() {
         return Err(DolphinJointDecodeError::NoHypotheses);
@@ -155,6 +178,7 @@ pub(crate) fn joint_decode(
         decode_config,
         &nbest,
         is_canceled,
+        decode_work_progress,
     )?;
     let best_token_ids = scored_nbest
         .first()
@@ -432,6 +456,7 @@ fn ctc_prefix_beam_search(
     blank: usize,
     beam_size: usize,
     is_canceled: &dyn Fn() -> bool,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<Vec<(Vec<u32>, f32)>, DolphinJointDecodeError> {
     // (prefix, (log_pb, log_pnb)). Seed: empty prefix reachable only via blank.
     let mut cur: Vec<(Vec<u32>, (f64, f64))> = vec![(Vec::new(), (0.0, NEG_INF))];
@@ -486,6 +511,9 @@ fn ctc_prefix_beam_search(
         });
         items.truncate(beam_size);
         cur = items;
+        if let Some(observer) = decode_work_progress {
+            observer.report(t + 1, frames.saturating_add(2));
+        }
     }
 
     Ok(cur
@@ -526,6 +554,7 @@ fn attention_rescore(
     decode_config: &DolphinJointDecodeConfig,
     nbest: &[(Vec<u32>, f32)],
     is_canceled: &dyn Fn() -> bool,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<Vec<DolphinScoredHypothesis>, DolphinJointDecodeError> {
     let prompt = &decode_config.prompt_prefix;
     let prompt_len = prompt.len();
@@ -559,6 +588,9 @@ fn attention_rescore(
         })
         .collect();
     let nbest_logits = runtime.decode_nbest_prompt_logits(encoder_out, frames, &sequences)?;
+    if let Some(observer) = decode_work_progress {
+        observer.report(frames.saturating_add(1), frames.saturating_add(2));
+    }
 
     let mut scored = Vec::with_capacity(nbest.len());
     for ((tokens, ctc_score), logits) in nbest.iter().zip(&nbest_logits) {
@@ -590,6 +622,9 @@ fn attention_rescore(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.token_ids.cmp(&b.token_ids))
     });
+    if let Some(observer) = decode_work_progress {
+        observer.report(frames.saturating_add(2), frames.saturating_add(2));
+    }
     Ok(scored)
 }
 
@@ -664,8 +699,23 @@ mod tests {
             -10.0, -0.001, -10.0, //
             -10.0, -0.001, -10.0, //
         ];
-        let nbest = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4, &|| false).expect("decode");
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+            let observed = std::sync::Arc::clone(&observed);
+            move |completed, total| {
+                observed
+                    .lock()
+                    .expect("dolphin progress")
+                    .push((completed, total));
+            }
+        });
+        let nbest = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4, &|| false, Some(&observer))
+            .expect("decode");
         assert_eq!(nbest[0].0, vec![1]);
+        assert_eq!(
+            *observed.lock().expect("dolphin progress"),
+            vec![(1, 4), (2, 4)]
+        );
     }
 
     /// Cooperative cancellation: an already-canceled request must fail closed at
@@ -678,7 +728,7 @@ mod tests {
             -10.0, -0.001, -10.0, //
             -10.0, -0.001, -10.0, //
         ];
-        let error = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4, &|| true)
+        let error = ctc_prefix_beam_search(&log_probs, 2, 3, 0, 4, &|| true, None)
             .expect_err("a canceled prefix-beam search must fail closed");
         assert!(
             matches!(error, DolphinJointDecodeError::Canceled { .. }),

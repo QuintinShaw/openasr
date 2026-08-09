@@ -76,6 +76,7 @@ pub(crate) fn run_whisper_greedy_decode_loop(
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, WhisperGreedyDecodeError>,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<WhisperGreedyDecodeResult, WhisperGreedyDecodeError> {
     let shared = run_builtin_seq2seq_decode_policy(
         crate::WHISPER_DECODE_POLICY_ID,
@@ -88,6 +89,7 @@ pub(crate) fn run_whisper_greedy_decode_loop(
         map_shared_error,
         map_registry_error,
         control,
+        decode_work_progress,
     )?;
     Ok(WhisperGreedyDecodeResult {
         generated_tokens: shared.generated_tokens,
@@ -320,6 +322,7 @@ mod tests {
             &mut step_executor,
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .unwrap();
 
@@ -364,6 +367,7 @@ mod tests {
             &mut step_executor,
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect_err("no EOT should fail closed");
 
@@ -435,6 +439,7 @@ mod tests {
             &mut complete_executor,
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("stop-token decode succeeds");
         assert_eq!(
@@ -466,6 +471,7 @@ mod tests {
             &mut looping_executor,
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
         )
         .expect("guard-stopped decode still returns the kept prefix");
         assert_eq!(

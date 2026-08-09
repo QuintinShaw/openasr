@@ -300,6 +300,10 @@ impl MoonshineGgmlExecutor {
                     adapter.clone(),
                     decoder_state,
                     Arc::clone(&request.execution_context.control),
+                    request
+                        .execution_context
+                        .decode_work_progress_observer()
+                        .cloned(),
                 )?
             };
 
@@ -487,6 +491,7 @@ impl MoonshineGgmlExecutor {
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         control: Arc<crate::api::backend::TranscriptionControl>,
+        decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
         let tokenizer = prepared.tokenizer.clone();
         let metadata = prepared.metadata;
@@ -504,6 +509,7 @@ impl MoonshineGgmlExecutor {
                     word_timestamps,
                     audio_duration_seconds,
                     &control,
+                    decode_work_progress.as_ref(),
                 )
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?

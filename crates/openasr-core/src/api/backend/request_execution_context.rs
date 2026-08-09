@@ -25,9 +25,35 @@
 //! `uncancellable` takes a `reason` argument (never a no-argument escape
 //! hatch) -- see its doc comment for why.
 
+use std::fmt;
 use std::sync::Arc;
 
 use super::TranscriptionControl;
+
+/// Cloneable request-local decode-progress observer.
+///
+/// Unlike a thread-local callback, this value travels with the request into
+/// resident actor and serve-batch worker threads. The callback is immutable;
+/// any aggregation belongs to its captured reporter, so sharing it is safe and
+/// does not serialize the decoder's hot loop behind an extra mutex.
+#[derive(Clone)]
+pub(crate) struct DecodeWorkProgressObserver(Arc<dyn Fn(usize, usize) + Send + Sync + 'static>);
+
+impl fmt::Debug for DecodeWorkProgressObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DecodeWorkProgressObserver(..)")
+    }
+}
+
+impl DecodeWorkProgressObserver {
+    pub(crate) fn new(observer: impl Fn(usize, usize) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(observer))
+    }
+
+    pub(crate) fn report(&self, completed_work: usize, total_work: usize) {
+        (self.0)(completed_work, total_work);
+    }
+}
 
 /// Per-request execution context threaded explicitly through every decode
 /// dispatch surface. See the module docs for why this replaced the
@@ -41,6 +67,10 @@ pub struct RequestExecutionContext {
     pub request_id: Option<String>,
     /// Cancel/pause/resume control for this request's decode.
     pub control: Arc<TranscriptionControl>,
+    /// Optional per-slice decode-work progress. Private so every producer must
+    /// use the typed constructor below instead of inventing another callback
+    /// transport or process-global registry.
+    decode_work_progress: Option<DecodeWorkProgressObserver>,
 }
 
 // Manual, not derived: `TranscriptionControl` holds a `Mutex`/`Condvar` and
@@ -63,7 +93,26 @@ impl RequestExecutionContext {
         Self {
             request_id,
             control,
+            decode_work_progress: None,
         }
+    }
+
+    /// Clone this request context with a decode observer scoped to one slice.
+    /// Parallel slices share cancellation identity while retaining independent
+    /// progress windows.
+    pub(crate) fn with_decode_work_progress_observer(
+        &self,
+        observer: DecodeWorkProgressObserver,
+    ) -> Self {
+        Self {
+            request_id: self.request_id.clone(),
+            control: Arc::clone(&self.control),
+            decode_work_progress: Some(observer),
+        }
+    }
+
+    pub(crate) fn decode_work_progress_observer(&self) -> Option<&DecodeWorkProgressObserver> {
+        self.decode_work_progress.as_ref()
     }
 
     /// A context with no external owner: nothing can ever cancel or pause
@@ -122,6 +171,7 @@ impl RequestExecutionContext {
         Self {
             request_id: None,
             control: Arc::new(TranscriptionControl::detached()),
+            decode_work_progress: None,
         }
     }
 
@@ -151,5 +201,55 @@ mod tests {
         assert_eq!(context.request_id.as_deref(), Some("job-1"));
         control.request_cancel();
         assert!(context.is_canceled());
+    }
+
+    #[test]
+    fn decode_work_observers_cross_threads_without_cross_request_leakage() {
+        let observed_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let context_a = RequestExecutionContext::uncancellable("progress request A")
+            .with_decode_work_progress_observer(DecodeWorkProgressObserver::new({
+                let observed = Arc::clone(&observed_a);
+                move |completed, total| {
+                    observed
+                        .lock()
+                        .expect("request A progress")
+                        .push((completed, total));
+                }
+            }));
+        let context_b = RequestExecutionContext::uncancellable("progress request B")
+            .with_decode_work_progress_observer(DecodeWorkProgressObserver::new({
+                let observed = Arc::clone(&observed_b);
+                move |completed, total| {
+                    observed
+                        .lock()
+                        .expect("request B progress")
+                        .push((completed, total));
+                }
+            }));
+
+        let worker_a = std::thread::spawn(move || {
+            context_a
+                .decode_work_progress_observer()
+                .expect("request A observer")
+                .report(3, 8);
+        });
+        let worker_b = std::thread::spawn(move || {
+            context_b
+                .decode_work_progress_observer()
+                .expect("request B observer")
+                .report(5, 13);
+        });
+        worker_a.join().expect("request A worker");
+        worker_b.join().expect("request B worker");
+
+        assert_eq!(
+            *observed_a.lock().expect("request A progress"),
+            vec![(3, 8)]
+        );
+        assert_eq!(
+            *observed_b.lock().expect("request B progress"),
+            vec![(5, 13)]
+        );
     }
 }

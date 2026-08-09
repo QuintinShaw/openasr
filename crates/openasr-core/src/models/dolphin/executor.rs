@@ -57,7 +57,8 @@ use super::hotword_context::{
     apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
 };
 use super::joint_decode::{
-    DolphinCtcHeadRuntime, DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode,
+    DolphinCtcHeadRuntime, DolphinJointDecodeConfig, detokenize_char_tokens,
+    joint_decode_with_progress,
 };
 use super::language::{build_dolphin_decode_prefix, build_dolphin_multilingual_decode_prefix};
 use super::package_import::DolphinLanguageScheme;
@@ -522,6 +523,30 @@ pub(crate) fn run_dolphin_pipeline(
     phrase_bias: Option<&PhraseBiasConfig>,
     is_canceled: &dyn Fn() -> bool,
 ) -> Result<DolphinPipelineOutput, String> {
+    run_dolphin_pipeline_with_progress(
+        prepared,
+        weights,
+        metadata,
+        samples,
+        ctc_weight,
+        language,
+        phrase_bias,
+        is_canceled,
+        None,
+    )
+}
+
+fn run_dolphin_pipeline_with_progress(
+    prepared: &mut DolphinPreparedRuntime,
+    weights: &DolphinRuntimeWeights,
+    metadata: &GgufMetadata,
+    samples: &[f32],
+    ctc_weight: f32,
+    language: Option<&str>,
+    phrase_bias: Option<&PhraseBiasConfig>,
+    is_canceled: &dyn Fn() -> bool,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+) -> Result<DolphinPipelineOutput, String> {
     let backend = prepared.backend;
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
@@ -660,7 +685,7 @@ pub(crate) fn run_dolphin_pipeline(
         eos_token_id,
         blank_token_id,
     };
-    let decoded = joint_decode(
+    let decoded = joint_decode_with_progress(
         &mut prepared.ctc_head,
         &mut prepared.rescore,
         &encoder.encoder_out,
@@ -668,6 +693,7 @@ pub(crate) fn run_dolphin_pipeline(
         encoder.frames,
         &decode_config,
         is_canceled,
+        decode_work_progress,
     )
     .map_err(|error| format!("dolphin joint decode failed: {error}"))?;
 
@@ -913,11 +939,15 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
         // Cooperative cancellation fence for the CPU-side joint-decode loops; the
         // ggml graphs cancel through the shared runner on the same control.
         let control = std::sync::Arc::clone(&request.execution_context.control);
+        let decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
         // Thread the request language into the decode prefix builder; an
         // unsupported code / missing region token fails closed here (typed).
         let output = actor
             .call_mut(move |state| {
-                run_dolphin_pipeline(
+                run_dolphin_pipeline_with_progress(
                     &mut state.runtime,
                     &state._weights,
                     &metadata,
@@ -926,6 +956,7 @@ impl GgmlAsrViewExecutor for DolphinGgmlExecutor {
                     language.as_deref(),
                     phrase_bias.as_ref(),
                     &|| control.is_canceled(),
+                    decode_work_progress.as_ref(),
                 )
             })
             .map_err(|error| fail(error.to_string()))?

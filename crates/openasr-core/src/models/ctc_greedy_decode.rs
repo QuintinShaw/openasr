@@ -9,7 +9,7 @@
 
 use thiserror::Error;
 
-use crate::models::ctc_prefix_beam::{CtcContextGraph, run_ctc_prefix_beam_decode};
+use crate::models::ctc_prefix_beam::CtcContextGraph;
 use crate::models::phrase_bias_decode::TokenPhraseBias;
 use crate::models::seq2seq_greedy_decode::token_softmax_probability;
 
@@ -90,6 +90,7 @@ impl IncrementalCtcGreedyDecoder {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn append_frames(
         &mut self,
         frame_logits: &[&[f32]],
@@ -231,11 +232,22 @@ impl IncrementalCtcGreedyDecoder {
 ///   transcript. If the biases produce no positive context (e.g. only negative
 ///   anti-context, which the prefix beam does not represent), fall back to the
 ///   plain greedy path.
+#[cfg(test)]
 pub(crate) fn run_ctc_greedy_decode<E>(
     config: CtcGreedyDecodeConfig,
     frame_logits: &[&[f32]],
     decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
     map_err: impl Fn(E) -> CtcGreedyDecodeError,
+) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
+    run_ctc_greedy_decode_with_progress(config, frame_logits, decode_text_token_ids, map_err, None)
+}
+
+pub(crate) fn run_ctc_greedy_decode_with_progress<E>(
+    config: CtcGreedyDecodeConfig,
+    frame_logits: &[&[f32]],
+    decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
+    map_err: impl Fn(E) -> CtcGreedyDecodeError,
+    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
     if config.blank_token_id as usize >= config.vocab_size {
         return Err(CtcGreedyDecodeError::BlankOutOfRange {
@@ -246,17 +258,23 @@ pub(crate) fn run_ctc_greedy_decode<E>(
     if !config.phrase_biases.is_empty()
         && let Some(graph) = CtcContextGraph::from_token_phrase_biases(&config.phrase_biases)
     {
-        return run_ctc_prefix_beam_decode(
+        return crate::models::ctc_prefix_beam::run_ctc_prefix_beam_decode_with_progress(
             config.blank_token_id,
             config.vocab_size,
             &graph,
             frame_logits,
             decode_text_token_ids,
             map_err,
+            decode_work_progress,
         );
     }
     let mut decoder = IncrementalCtcGreedyDecoder::new(config)?;
-    decoder.append_frames(frame_logits)?;
+    for (frame_index, row) in frame_logits.iter().enumerate() {
+        decoder.append_frame(row)?;
+        if let Some(observer) = decode_work_progress {
+            observer.report(frame_index + 1, frame_logits.len());
+        }
+    }
     decoder.finish(decode_text_token_ids, map_err)
 }
 
@@ -315,6 +333,37 @@ mod tests {
     fn run(rows: &[Vec<f32>]) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
         let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
         run_ctc_greedy_decode(cfg(), &refs, decode_ids, |never| match never {})
+    }
+
+    #[test]
+    fn ctc_decode_reports_completed_frames_without_changing_output() {
+        let rows = [frame(1), frame(1), frame(BLANK), frame(2)];
+        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+            let observed = std::sync::Arc::clone(&observed);
+            move |completed, total| {
+                observed
+                    .lock()
+                    .expect("ctc progress")
+                    .push((completed, total));
+            }
+        });
+
+        let result = run_ctc_greedy_decode_with_progress(
+            cfg(),
+            &refs,
+            decode_ids,
+            |never| match never {},
+            Some(&observer),
+        )
+        .expect("ctc decode");
+
+        assert_eq!(result.token_ids, vec![1, 2]);
+        assert_eq!(
+            *observed.lock().expect("ctc progress"),
+            vec![(1, 4), (2, 4), (3, 4), (4, 4)]
+        );
     }
 
     /// Softmax probability of the one-hot peak in [`frame`] rows; every
