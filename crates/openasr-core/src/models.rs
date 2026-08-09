@@ -28,7 +28,6 @@ pub(crate) mod ggml_composed_executor;
 pub mod ggml_family_adapter;
 pub(crate) mod ggml_graph_config;
 pub(crate) mod ggml_streaming_audio;
-pub(crate) mod ggml_streaming_executor;
 pub(crate) mod ggml_streaming_session;
 pub(crate) mod gpt2_bpe;
 pub(crate) mod granite_speech;

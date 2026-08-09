@@ -27,8 +27,7 @@ use crate::models::seq2seq_serve_batch::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    ServeBatchPolicy, serve_batch_estimate_seq2seq_slot_bytes,
-    serve_batch_select_and_apply_greedy_step,
+    serve_batch_estimate_seq2seq_slot_bytes, serve_batch_select_and_apply_greedy_step,
 };
 use crate::{Segment, Transcription};
 
@@ -48,24 +47,6 @@ const MOONSHINE_SERVE_BATCH_REPLY_TIMEOUT: std::time::Duration =
 /// `ggml_executor`'s `MoonshineServeBatchConfig::from_env()` and the tests'
 /// struct-literal construction keep compiling unchanged.
 pub(super) type MoonshineServeBatchConfig = ServeBatchConfig;
-
-/// Resolves the shared server policy without exposing the generic family marker.
-pub(super) trait MoonshineServeBatchConfigFromPolicy: Sized {
-    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self>;
-    #[cfg(test)]
-    fn from_env() -> Result<Option<Self>, MoonshineServeBatchError>;
-}
-
-impl MoonshineServeBatchConfigFromPolicy for MoonshineServeBatchConfig {
-    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self> {
-        ServeBatchConfig::from_policy::<MoonshineFamily>(policy)
-    }
-
-    #[cfg(test)]
-    fn from_env() -> Result<Option<Self>, MoonshineServeBatchError> {
-        ServeBatchConfig::from_test_env::<MoonshineFamily>()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MoonshineServeBatchJob {
@@ -984,21 +965,29 @@ mod tests {
     #[test]
     fn moonshine_serve_batch_env_defaults_off() {
         with_serve_batch_env(None, || {
-            assert!(MoonshineServeBatchConfig::from_env().unwrap().is_none());
+            assert!(
+                MoonshineServeBatchConfig::from_test_env::<MoonshineFamily>()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn moonshine_serve_batch_env_one_keeps_default_path() {
         with_serve_batch_env(Some("1"), || {
-            assert!(MoonshineServeBatchConfig::from_env().unwrap().is_none());
+            assert!(
+                MoonshineServeBatchConfig::from_test_env::<MoonshineFamily>()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn moonshine_serve_batch_env_accepts_two_to_eight() {
         with_serve_batch_env(Some("4"), || {
-            let config = MoonshineServeBatchConfig::from_env()
+            let config = MoonshineServeBatchConfig::from_test_env::<MoonshineFamily>()
                 .unwrap()
                 .expect("enabled");
             assert_eq!(config.max_batch, 4);
@@ -1009,7 +998,7 @@ mod tests {
     fn moonshine_serve_batch_env_rejects_out_of_range() {
         with_serve_batch_env(Some("9"), || {
             assert!(matches!(
-                MoonshineServeBatchConfig::from_env(),
+                MoonshineServeBatchConfig::from_test_env::<MoonshineFamily>(),
                 Err(MoonshineServeBatchError::InvalidEnv { .. })
             ));
         });

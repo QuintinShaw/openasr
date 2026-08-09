@@ -26,7 +26,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -36,7 +36,6 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
     Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
@@ -196,17 +195,6 @@ impl Default for FunasrNanoGgmlExecutor {
         }
     }
 }
-
-/// No-op phrase-bias shim: funasr-nano's decode policy never consults these
-/// (no phrase bias, single config-supplied eot token) -- mirrors
-/// `firered_llm::executor::NoPhraseBiasTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 
 /// Drives `FunasrNanoDecoderRuntime` through the shared greedy loop: step 0
 /// consumes the pre-built (audio-spliced) prompt embeddings via one prefill
@@ -725,7 +713,7 @@ fn decode_with_decoder(
     let result = run_builtin_seq2seq_decode_policy(
         FUNASR_NANO_DECODE_POLICY_ID,
         &config,
-        &NoPhraseBiasTokenSource,
+        &(),
         None,
         &mut step_executor,
         &|token_ids: &[u32]| {

@@ -435,7 +435,10 @@ pub(crate) fn self_attention_weights_streaming_reference(
     let query_dim = num_heads
         .checked_mul(query_head_dim)
         .ok_or("xasr attention query dim overflow")?;
-    let pos_output_dim = weights.self_attn_pos_output_dim()?;
+    let pos_output_dim = weights.linear_pos.output_dim;
+    if pos_output_dim == 0 {
+        return Err("xasr attention linear_pos output dim must be > 0".to_string());
+    }
     if !pos_output_dim.is_multiple_of(num_heads) {
         return Err(format!(
             "xasr attention pos output dim {pos_output_dim} not divisible by heads {num_heads}"
@@ -887,19 +890,6 @@ fn project_embed_out(
         weights.out_norm_log_scale[0],
     )?;
     Ok(rows)
-}
-
-trait XasrSelfAttentionWeightExt {
-    fn self_attn_pos_output_dim(&self) -> Result<usize, String>;
-}
-
-impl XasrSelfAttentionWeightExt for XasrSelfAttentionWeightsWeights {
-    fn self_attn_pos_output_dim(&self) -> Result<usize, String> {
-        if self.linear_pos.output_dim == 0 {
-            return Err("xasr attention linear_pos output dim must be > 0".to_string());
-        }
-        Ok(self.linear_pos.output_dim)
-    }
 }
 
 fn apply_linear_to_rows(

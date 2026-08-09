@@ -36,7 +36,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
@@ -48,7 +48,6 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
     build_qwen3_prompt_embeddings_with_audio_splice,
@@ -190,20 +189,6 @@ impl Default for FireRedLlmGgmlExecutor {
         }
     }
 }
-
-/// A no-op phrase-bias/token-source shim: firered-llm's decode policy never
-/// consults these (no phrase bias, `seq2seq_stop_token_kind: None` -- eot is
-/// supplied directly via `BuiltinSeq2SeqDecodePolicyConfigInput`), so a real
-/// implementation would be dead weight. `resolve_builtin_decode_policy`'s
-/// config builder still requires the trait object, matching `()`'s existing
-/// blanket impl of `BuiltinSeq2SeqDecodePolicyTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
 
 /// Drives `FireRedLlmDecoderRuntime` through the shared greedy loop: the
 /// first step (index 0, no generated tokens yet) consumes the pre-built
@@ -608,7 +593,7 @@ impl FireRedLlmGgmlExecutor {
                 let decode_result = run_builtin_seq2seq_decode_policy(
                     FIRERED_LLM_DECODE_POLICY_ID,
                     &config,
-                    &NoPhraseBiasTokenSource,
+                    &(),
                     None,
                     &mut step_executor,
                     &|token_ids: &[u32]| {
