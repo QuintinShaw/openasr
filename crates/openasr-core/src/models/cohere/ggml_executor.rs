@@ -707,7 +707,7 @@ impl CohereTranscribeGgmlExecutor {
         word_timestamps: bool,
         audio_duration_seconds: f32,
         control: &Arc<crate::TranscriptionControl>,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
     ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
         let actor = self

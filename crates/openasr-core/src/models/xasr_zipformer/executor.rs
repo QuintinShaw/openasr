@@ -96,7 +96,7 @@ fn transcribe_xasr_zipformer_pcm_cached(
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
     control: std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<XasrZipformerTranscription, String> {
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());

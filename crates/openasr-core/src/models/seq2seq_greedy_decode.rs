@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::api::backend::DecodeWorkProgressObserver;
+use crate::api::backend::WorkProgressObserver;
 use crate::api::backend::{DecodeTruncation, DecodeTruncationReason};
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
 
@@ -233,7 +233,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
     trace_token: &mut dyn FnMut(usize, u32, bool),
     on_topk: &mut dyn FnMut(usize, &[f32]),
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&WorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     struct ClosureTokenDecoder<'a, E> {
         decode_text_token_ids: &'a dyn Fn(&[u32]) -> Result<String, E>,
@@ -289,7 +289,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     trace_token: &mut dyn FnMut(usize, u32, bool),
     on_topk: &mut dyn FnMut(usize, &[f32]),
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&WorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeError> {
     if config.initial_prompt_tokens.is_empty() {
         return Err(Seq2SeqGreedyDecodeError::EmptyInitialPrompt);
@@ -890,7 +890,7 @@ mod tests {
 
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_for_observer = std::sync::Arc::clone(&observed);
-        let observer = DecodeWorkProgressObserver::new(move |completed_work, total_work| {
+        let observer = WorkProgressObserver::new(move |completed_work, total_work| {
             observed_for_observer
                 .lock()
                 .expect("progress observations")

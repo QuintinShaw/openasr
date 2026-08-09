@@ -144,7 +144,7 @@ fn transcribe_parakeet_ctc_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<ParakeetCtcTranscription, String> {
     let actor = checkout_parakeet_ctc_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
@@ -313,7 +313,7 @@ impl ParakeetCtcPreparedRuntime {
         samples: &[f32],
         phrase_bias: Option<&PhraseBiasConfig>,
         word_timestamps: bool,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<ParakeetCtcTranscription, String> {
         let result = self.decode_result(samples, phrase_bias, decode_work_progress)?;
         parakeet_ctc_result_to_transcription(
@@ -328,7 +328,7 @@ impl ParakeetCtcPreparedRuntime {
         &mut self,
         samples: &[f32],
         phrase_bias: Option<&PhraseBiasConfig>,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<CtcGreedyDecodeResult, String> {
         let frontend = ParakeetFrontend::new(&self.metadata);
         let features = frontend
@@ -401,7 +401,7 @@ fn decode_parakeet_ctc_result_with_progress(
     output: &super::encoder_graph::ParakeetCtcEncoderOutput,
     tokenizer: &ParakeetTokenizer,
     phrase_bias: Option<&PhraseBiasConfig>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, String> {
     let frame_logits: Vec<&[f32]> = (0..output.frame_count)
         .map(|f| &output.logits[f * output.vocab_size..(f + 1) * output.vocab_size])

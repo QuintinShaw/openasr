@@ -168,7 +168,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     word_timestamps: bool,
     audio_duration_seconds: f32,
     control: &Arc<crate::TranscriptionControl>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let decode_text_token_ids = |token_ids: &[u32]| {
         tokenizer.decode_text_token_ids(token_ids).map_err(|error| {

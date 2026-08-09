@@ -14,49 +14,9 @@ mod pyannet;
 #[cfg(test)]
 mod tests;
 
-use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use rayon::prelude::*;
-
-thread_local! {
-    /// Optional window-progress observer for the in-flight segmenter on this
-    /// thread. Native transcription installs a sink that reports
-    /// `(completed_windows, total_windows)` so diarize stage_fraction tracks
-    /// real window completion rather than a fixed percentage.
-    static WINDOW_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
-        const { RefCell::new(None) };
-}
-
-/// RAII handle restoring the previous window-progress sink on drop.
-pub(crate) struct WindowProgressGuard {
-    previous: Option<Box<dyn FnMut(usize, usize)>>,
-}
-
-impl Drop for WindowProgressGuard {
-    fn drop(&mut self) {
-        WINDOW_PROGRESS_SINK.with(|cell| {
-            *cell.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-/// Install `sink` as the active segmenter window-progress callback for this
-/// thread. `sink(done, total)` is invoked after each completed batch/window.
-pub(crate) fn install_window_progress_sink(
-    sink: impl FnMut(usize, usize) + 'static,
-) -> WindowProgressGuard {
-    let previous = WINDOW_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
-    WindowProgressGuard { previous }
-}
-
-fn report_window_progress(done: usize, total: usize) {
-    WINDOW_PROGRESS_SINK.with(|cell| {
-        if let Some(sink) = cell.borrow_mut().as_mut() {
-            sink(done, total);
-        }
-    });
-}
 
 #[cfg(test)]
 pub(crate) use diarizen::DIARIZEN_PACK_PREFERENCE;
@@ -202,6 +162,7 @@ fn pyannote_window_pool() -> &'static Result<rayon::ThreadPool, String> {
 fn bounded_pyannote_window_map<T, F>(
     starts: &[usize],
     canceled: &dyn Fn() -> bool,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
     map: F,
 ) -> Result<Vec<T>, SegmentError>
 where
@@ -215,7 +176,9 @@ where
     })?;
     let total = starts.len();
     let mut output = Vec::with_capacity(total);
-    report_window_progress(0, total.max(1));
+    if let Some(progress) = progress {
+        progress.report(0, total.max(1));
+    }
     for starts_batch in starts.chunks(pool.current_num_threads().max(1)) {
         if canceled() {
             return Err(SegmentError::Canceled);
@@ -225,7 +188,9 @@ where
         for item in batch {
             output.push(item?);
         }
-        report_window_progress(output.len(), total.max(1));
+        if let Some(progress) = progress {
+            progress.report(output.len(), total.max(1));
+        }
     }
     Ok(output)
 }
@@ -394,6 +359,7 @@ pub(crate) trait LocalActivitySegmenter: Send + Sync {
         samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
+        progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<LocalActivity, SegmentError>;
 }
 
@@ -484,6 +450,7 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
         samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
+        progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<LocalActivity, SegmentError> {
         if sample_rate_hz != SAMPLE_RATE_HZ {
             return Err(SegmentError::UnsupportedSampleRate(sample_rate_hz));
@@ -500,7 +467,7 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
         let window_samples = (self.protocol.window_s * sample_rate_hz as f64) as usize;
         let step_samples = (self.protocol.step_s * sample_rate_hz as f64).round() as usize;
         let starts = sliding_window_starts(samples.len(), window_samples, step_samples);
-        let mut windows = bounded_pyannote_window_map(&starts, canceled, |start| {
+        let mut windows = bounded_pyannote_window_map(&starts, canceled, progress, |start| {
             let end = (start + window_samples).min(samples.len());
             let activity = if end - start == window_samples {
                 self.infer_window(&samples[start..end])?
@@ -536,6 +503,7 @@ pub(super) fn segment_diarizen_local_activity(
     samples: crate::PcmSlice,
     sample_rate_hz: u32,
     canceled: &dyn Fn() -> bool,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
     mut infer_window: impl FnMut(
         crate::PcmSlice,
     ) -> Result<diarizen::DiariZenWindowOutput, SegmentError>,
@@ -570,7 +538,9 @@ pub(super) fn segment_diarizen_local_activity(
     );
     let total_windows = starts.len();
     let mut windows = Vec::with_capacity(total_windows);
-    report_window_progress(0, total_windows.max(1));
+    if let Some(progress) = progress {
+        progress.report(0, total_windows.max(1));
+    }
     for start in starts {
         if canceled() {
             return Err(SegmentError::Canceled);
@@ -609,7 +579,9 @@ pub(super) fn segment_diarizen_local_activity(
             start_sample: start,
             frame_activity,
         });
-        report_window_progress(windows.len(), total_windows.max(1));
+        if let Some(progress) = progress {
+            progress.report(windows.len(), total_windows.max(1));
+        }
     }
 
     for window in &mut windows {
@@ -859,21 +831,22 @@ mod decode_tests {
     #[test]
     fn diarizen_adapter_uses_official_geometry_and_four_slot_masks() {
         let samples: crate::PcmSlice = vec![0.0f32; diarizen::DIARIZEN_WINDOW_SAMPLES].into();
-        let activity = segment_diarizen_local_activity(samples, 16_000, &|| false, |window| {
-            assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
-            Ok(diarizen::DiariZenWindowOutput {
-                frame_count: 4,
-                logits: Vec::new(),
-                powerset_class: Vec::new(),
-                activity: vec![
-                    1, 0, 0, 0, // local 0
-                    0, 1, 0, 1, // local 1 + 3 overlap
-                    0, 0, 1, 0, // local 2
-                    0, 0, 0, 0,
-                ],
+        let activity =
+            segment_diarizen_local_activity(samples, 16_000, &|| false, None, |window| {
+                assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
+                Ok(diarizen::DiariZenWindowOutput {
+                    frame_count: 4,
+                    logits: Vec::new(),
+                    powerset_class: Vec::new(),
+                    activity: vec![
+                        1, 0, 0, 0, // local 0
+                        0, 1, 0, 1, // local 1 + 3 overlap
+                        0, 0, 1, 0, // local 2
+                        0, 0, 0, 0,
+                    ],
+                })
             })
-        })
-        .expect("adapter");
+            .expect("adapter");
 
         assert_eq!(activity.frame_clock.midpoint_s(0), 0.0125);
         assert_eq!(activity.frame_clock.midpoint_s(1), 0.0325);
@@ -886,25 +859,60 @@ mod decode_tests {
     }
 
     #[test]
+    fn diarizen_progress_observer_reports_completed_windows() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&events);
+        let progress = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
+        segment_diarizen_local_activity(
+            vec![0.0f32; diarizen::DIARIZEN_WINDOW_SAMPLES].into(),
+            16_000,
+            &|| false,
+            Some(&progress),
+            |_| {
+                Ok(diarizen::DiariZenWindowOutput {
+                    frame_count: 1,
+                    logits: Vec::new(),
+                    powerset_class: Vec::new(),
+                    activity: vec![0; diarizen::DIARIZEN_LOCAL_SPEAKERS],
+                })
+            },
+        )
+        .expect("progress fixture");
+
+        assert_eq!(
+            *events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![(0, 1), (1, 1)]
+        );
+    }
+
+    #[test]
     fn diarizen_adapter_pads_and_truncates_the_orphan_window() {
         let samples: crate::PcmSlice = vec![1.0f32; 17 * 16_000].into();
         let mut calls = 0;
-        let activity = segment_diarizen_local_activity(samples, 16_000, &|| false, |window| {
-            calls += 1;
-            assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
-            if calls == 2 {
-                assert_eq!(window[15 * 16_000 + 6_399], 1.0);
-                assert_eq!(window[15 * 16_000 + 6_400], 0.0);
-                assert_eq!(window[diarizen::DIARIZEN_WINDOW_SAMPLES - 1], 0.0);
-            }
-            Ok(diarizen::DiariZenWindowOutput {
-                frame_count: 799,
-                logits: Vec::new(),
-                powerset_class: Vec::new(),
-                activity: vec![0; 799 * diarizen::DIARIZEN_LOCAL_SPEAKERS],
+        let activity =
+            segment_diarizen_local_activity(samples, 16_000, &|| false, None, |window| {
+                calls += 1;
+                assert_eq!(window.len(), diarizen::DIARIZEN_WINDOW_SAMPLES);
+                if calls == 2 {
+                    assert_eq!(window[15 * 16_000 + 6_399], 1.0);
+                    assert_eq!(window[15 * 16_000 + 6_400], 0.0);
+                    assert_eq!(window[diarizen::DIARIZEN_WINDOW_SAMPLES - 1], 0.0);
+                }
+                Ok(diarizen::DiariZenWindowOutput {
+                    frame_count: 799,
+                    logits: Vec::new(),
+                    powerset_class: Vec::new(),
+                    activity: vec![0; 799 * diarizen::DIARIZEN_LOCAL_SPEAKERS],
+                })
             })
-        })
-        .expect("adapter");
+            .expect("adapter");
 
         assert_eq!(calls, 2);
         assert_eq!(activity.windows[0].start_sample, 0);
@@ -918,11 +926,14 @@ mod decode_tests {
 
     #[test]
     fn diarizen_adapter_empty_and_cancellation_are_explicit() {
-        let empty =
-            segment_diarizen_local_activity(Vec::<f32>::new().into(), 16_000, &|| false, |_| {
-                panic!("empty audio must not run inference")
-            })
-            .expect("empty");
+        let empty = segment_diarizen_local_activity(
+            Vec::<f32>::new().into(),
+            16_000,
+            &|| false,
+            None,
+            |_| panic!("empty audio must not run inference"),
+        )
+        .expect("empty");
         assert!(empty.windows.is_empty());
         assert_eq!(empty.local_speaker_slots, 4);
 
@@ -931,6 +942,7 @@ mod decode_tests {
             vec![0.0f32; 17 * 16_000].into(),
             16_000,
             &|| calls.get() > 0,
+            None,
             |_| {
                 calls.set(calls.get() + 1);
                 Ok(diarizen::DiariZenWindowOutput {

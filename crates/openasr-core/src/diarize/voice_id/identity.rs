@@ -61,45 +61,6 @@
 //! Reporting the reason is explicitly **not** a licence to lower a gate so the
 //! name appears instead.
 
-use std::cell::RefCell;
-
-thread_local! {
-    /// Optional batch-progress observer for identity embedding windows.
-    /// Installed by native transcription as `(completed_windows, total)`.
-    static IDENTITY_BATCH_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
-        const { RefCell::new(None) };
-}
-
-/// RAII handle restoring the previous identity batch-progress sink on drop.
-pub(crate) struct IdentityBatchProgressGuard {
-    previous: Option<Box<dyn FnMut(usize, usize)>>,
-}
-
-impl Drop for IdentityBatchProgressGuard {
-    fn drop(&mut self) {
-        IDENTITY_BATCH_PROGRESS_SINK.with(|cell| {
-            *cell.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-/// Install `sink` as the active identity batch-progress callback for this thread.
-pub(crate) fn install_identity_batch_progress_sink(
-    sink: impl FnMut(usize, usize) + 'static,
-) -> IdentityBatchProgressGuard {
-    let previous =
-        IDENTITY_BATCH_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
-    IdentityBatchProgressGuard { previous }
-}
-
-fn report_identity_batch_progress(done: usize, total: usize) {
-    IDENTITY_BATCH_PROGRESS_SINK.with(|cell| {
-        if let Some(sink) = cell.borrow_mut().as_mut() {
-            sink(done, total);
-        }
-    });
-}
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
@@ -269,13 +230,12 @@ pub fn name_speakers_across_scopes(
     name_speakers_across_scopes_with(embedder, scopes)
 }
 
-/// Request-scoped variant used after transcription preflight has frozen an
-/// exact embedding-space snapshot.
-pub(crate) fn name_speakers_across_scopes_with_embedder(
+pub(crate) fn name_speakers_across_scopes_with_embedder_and_progress(
     embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     scopes: &mut [SpeakerScope<'_>],
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
-    name_speakers_across_scopes_with(Some(embedder), scopes)
+    name_speakers_across_scopes_with_progress(Some(embedder), scopes, progress)
 }
 
 /// [`name_speakers_across_scopes`] with the embedder passed explicitly.
@@ -289,10 +249,19 @@ fn name_speakers_across_scopes_with(
     embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     scopes: &mut [SpeakerScope<'_>],
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
-    name_speakers_across_scopes_with_library_state(
+    name_speakers_across_scopes_with_progress(embedder, scopes, None)
+}
+
+fn name_speakers_across_scopes_with_progress(
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+    scopes: &mut [SpeakerScope<'_>],
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with_library_state_and_progress(
         embedder,
         super::person_library_is_non_empty()?,
         scopes,
+        progress,
     )
 }
 
@@ -300,10 +269,25 @@ fn name_speakers_across_scopes_with(
 /// explicit. Production resolves the library state once at the boundary;
 /// tests inject it so their result cannot depend on a user's real Voice ID
 /// database.
+#[cfg(test)]
 fn name_speakers_across_scopes_with_library_state(
     embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
     person_library_non_empty: bool,
     scopes: &mut [SpeakerScope<'_>],
+) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+    name_speakers_across_scopes_with_library_state_and_progress(
+        embedder,
+        person_library_non_empty,
+        scopes,
+        None,
+    )
+}
+
+fn name_speakers_across_scopes_with_library_state_and_progress(
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+    person_library_non_empty: bool,
+    scopes: &mut [SpeakerScope<'_>],
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
     for scope in scopes.iter_mut() {
         normalize_local_labels(scope.segments);
@@ -340,6 +324,7 @@ fn name_speakers_across_scopes_with_library_state(
             scope.samples,
             scope_index,
             &mut refusals,
+            progress,
         )?);
     }
 
@@ -411,16 +396,17 @@ pub(crate) struct TimelineIdentityResolution {
 /// This is intentionally independent of ASR segments. A coarse or unaligned
 /// transcript can therefore delay text attribution without contaminating the
 /// audio evidence used to recognize people.
-pub(crate) fn resolve_timeline_identities_with_embedder(
+pub(crate) fn resolve_timeline_identities_with_embedder_and_progress(
     embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     timeline: &SpeakerTimeline,
     samples: &[f32],
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<TimelineIdentityResolution, SpeakerIdentityError> {
     let identity = embedder
         .identity()
         .ok_or(super::VoiceIdLibraryError::EmbedderIdentityUnavailable)?;
     let matcher = super::load_person_matcher_for_embedder(&identity, embedder)?;
-    resolve_timeline_identities_with_matcher(embedder, timeline, samples, &matcher)
+    resolve_timeline_identities_with_matcher(embedder, timeline, samples, &matcher, progress)
 }
 
 fn resolve_timeline_identities_with_matcher(
@@ -428,6 +414,7 @@ fn resolve_timeline_identities_with_matcher(
     timeline: &SpeakerTimeline,
     samples: &[f32],
     matcher: &super::PersonMatcher,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<TimelineIdentityResolution, SpeakerIdentityError> {
     let speakers: BTreeSet<SpeakerId> = timeline.turns.iter().map(|turn| turn.speaker).collect();
     let planned = evidence::plan_timeline_windows(&timeline.turns)
@@ -437,7 +424,7 @@ fn resolve_timeline_identities_with_matcher(
     let planned_windows = planned.values().map(Vec::len).sum::<usize>();
     let mut refusals = BTreeMap::new();
     let evidence_started = std::time::Instant::now();
-    let evidence = collect_label_evidence(embedder, planned, samples, 0, &mut refusals)?;
+    let evidence = collect_label_evidence(embedder, planned, samples, 0, &mut refusals, progress)?;
     crate::stage_timing::log_detail_event(
         "speaker_identity",
         format_args!(
@@ -491,6 +478,7 @@ fn collect_label_evidence(
     samples: &[f32],
     scope_index: usize,
     refusals: &mut BTreeMap<String, SpeakerNamingRefusal>,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<BTreeMap<String, LabelEvidence>, SpeakerIdentityError> {
     struct LabelWindows {
         planned: usize,
@@ -535,7 +523,9 @@ fn collect_label_evidence(
     // materialize every frontend feature tensor at once.
     let total_windows = pending.len();
     let mut completed_windows = 0usize;
-    report_identity_batch_progress(0, total_windows.max(1));
+    if let Some(progress) = progress {
+        progress.report(0, total_windows.max(1));
+    }
     for batch in pending.chunks(crate::diarize::embed::REDIMNET_BOUNDED_BATCH_SIZE) {
         let clips = batch.iter().map(|window| window.clip).collect::<Vec<_>>();
         let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
@@ -569,7 +559,9 @@ fn collect_label_evidence(
             }
         }
         completed_windows = completed_windows.saturating_add(batch.len());
-        report_identity_batch_progress(completed_windows, total_windows.max(1));
+        if let Some(progress) = progress {
+            progress.report(completed_windows, total_windows.max(1));
+        }
     }
 
     let mut evidence = BTreeMap::new();
@@ -1550,9 +1542,10 @@ mod tests {
             0.15,
         );
 
-        let resolution =
-            resolve_timeline_identities_with_matcher(&embedder, &timeline, &samples, &matcher)
-                .expect("timeline identity resolution");
+        let resolution = resolve_timeline_identities_with_matcher(
+            &embedder, &timeline, &samples, &matcher, None,
+        )
+        .expect("timeline identity resolution");
 
         assert_eq!(resolution.assignments.len(), 2);
         assert_eq!(resolution.unnamed_speakers.len(), 2);
@@ -1674,12 +1667,21 @@ mod tests {
 
         let batch_embedder = BatchProbeEmbedder::new();
         let mut batch_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
-        let batch = name_speakers_across_scopes_with(
+        let progress_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_progress = std::sync::Arc::clone(&progress_events);
+        let progress = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            observed_progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
+        let batch = name_speakers_across_scopes_with_progress(
             Some(&batch_embedder),
             &mut [SpeakerScope {
                 segments: &mut batch_segments,
                 samples: &samples,
             }],
+            Some(&progress),
         )
         .expect("batch path");
 
@@ -1708,6 +1710,14 @@ mod tests {
             .expect("observed starts");
         assert!(starts.len() > 1);
         assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+        let progress_events = progress_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(progress_events.first().copied(), Some((0, starts.len())));
+        assert_eq!(
+            progress_events.last().copied(),
+            Some((starts.len(), starts.len()))
+        );
     }
 
     #[test]

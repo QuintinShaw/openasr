@@ -76,7 +76,7 @@ pub(crate) fn run_whisper_greedy_decode_loop(
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, WhisperGreedyDecodeError>,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<WhisperGreedyDecodeResult, WhisperGreedyDecodeError> {
     let shared = run_builtin_seq2seq_decode_policy(
         crate::WHISPER_DECODE_POLICY_ID,

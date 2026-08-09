@@ -491,7 +491,7 @@ impl MoonshineGgmlExecutor {
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         control: Arc<crate::api::backend::TranscriptionControl>,
-        decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
         let tokenizer = prepared.tokenizer.clone();
         let metadata = prepared.metadata;

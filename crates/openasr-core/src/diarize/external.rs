@@ -5,7 +5,6 @@
 //! VAD union, embedding windows, automatic clustering, and overlap
 //! reconstruction stay local to this implementation.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,40 +39,22 @@ const EMBEDDING_STEP_S: f64 = 0.75;
 const EMBEDDING_BATCH_SIZE: usize = super::embed::REDIMNET_BOUNDED_BATCH_SIZE;
 const VAD_FRAME_STEP_SAMPLES: usize = 160;
 
-thread_local! {
-    /// Optional request-local observer for the ReDimNet portion of external
-    /// diarization. The segmenter has its own window sink because that seam is
-    /// shared by two providers; this one keeps embedding batching local to the
-    /// pipeline that owns it.
-    static EMBEDDING_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
-        const { RefCell::new(None) };
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExternalDiarizationProgress<'a> {
+    segmenter: Option<&'a crate::api::backend::WorkProgressObserver>,
+    embedding: Option<&'a crate::api::backend::WorkProgressObserver>,
 }
 
-pub(crate) struct EmbeddingProgressGuard {
-    previous: Option<Box<dyn FnMut(usize, usize)>>,
-}
-
-impl Drop for EmbeddingProgressGuard {
-    fn drop(&mut self) {
-        EMBEDDING_PROGRESS_SINK.with(|cell| {
-            *cell.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-pub(crate) fn install_embedding_progress_sink(
-    sink: impl FnMut(usize, usize) + 'static,
-) -> EmbeddingProgressGuard {
-    let previous = EMBEDDING_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
-    EmbeddingProgressGuard { previous }
-}
-
-fn report_embedding_progress(done: usize, total: usize) {
-    EMBEDDING_PROGRESS_SINK.with(|cell| {
-        if let Some(sink) = cell.borrow_mut().as_mut() {
-            sink(done, total);
+impl<'a> ExternalDiarizationProgress<'a> {
+    pub(crate) const fn new(
+        segmenter: &'a crate::api::backend::WorkProgressObserver,
+        embedding: &'a crate::api::backend::WorkProgressObserver,
+    ) -> Self {
+        Self {
+            segmenter: Some(segmenter),
+            embedding: Some(embedding),
         }
-    });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +548,7 @@ impl ExternalDiarizer {
         self.segmenter.provider()
     }
 
+    #[cfg(test)]
     pub(crate) fn diarize(
         &self,
         samples: crate::PcmSlice,
@@ -574,11 +556,29 @@ impl ExternalDiarizer {
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
     ) -> Result<SpeakerTimeline, ExternalDiarizationError> {
+        self.diarize_with_progress(
+            samples,
+            sample_rate_hz,
+            hint,
+            canceled,
+            ExternalDiarizationProgress::default(),
+        )
+    }
+
+    pub(crate) fn diarize_with_progress(
+        &self,
+        samples: crate::PcmSlice,
+        sample_rate_hz: u32,
+        hint: DiarizeHint,
+        canceled: &dyn Fn() -> bool,
+        progress: ExternalDiarizationProgress<'_>,
+    ) -> Result<SpeakerTimeline, ExternalDiarizationError> {
         self.diarize_with_clustering(
             samples,
             sample_rate_hz,
             hint,
             canceled,
+            progress,
             |clusterer, _chunks, embeddings, hint, canceled| {
                 clusterer
                     .cluster(embeddings, hint, canceled)
@@ -601,6 +601,7 @@ impl ExternalDiarizer {
             sample_rate_hz,
             hint,
             canceled,
+            ExternalDiarizationProgress::default(),
             |clusterer, chunks, embeddings, hint, canceled| {
                 let clustering = clusterer.diagnostics(embeddings, hint, canceled)?;
                 let labels = clustering.final_labels.clone();
@@ -618,6 +619,7 @@ impl ExternalDiarizer {
         sample_rate_hz: u32,
         hint: DiarizeHint,
         canceled: &dyn Fn() -> bool,
+        progress: ExternalDiarizationProgress<'_>,
         cluster: impl FnOnce(
             &AutomaticClusterer,
             &[TimeRange],
@@ -644,7 +646,7 @@ impl ExternalDiarizer {
             scratch_plan.peak_bytes,
         )
         .map_err(|error| ExternalDiarizationError::MemoryAdmission(error.to_string()))?;
-        let prepared = self.prepare_recording(samples, sample_rate_hz, canceled)?;
+        let prepared = self.prepare_recording(samples, sample_rate_hz, canceled, progress)?;
         if !prepared.embeddings.is_empty() {
             cancel_checkpoint(canceled)?;
         }
@@ -691,6 +693,7 @@ impl ExternalDiarizer {
         samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
+        progress: ExternalDiarizationProgress<'_>,
     ) -> Result<PreparedExternalRecording, ExternalDiarizationError> {
         if sample_rate_hz != SAMPLE_RATE_HZ {
             return Err(ExternalDiarizationError::UnsupportedSampleRate(
@@ -703,6 +706,7 @@ impl ExternalDiarizer {
             samples.clone(),
             sample_rate_hz,
             canceled,
+            progress.segmenter,
         )?;
         crate::stage_timing::log_detail_stage(
             "external_diarization",
@@ -727,12 +731,13 @@ impl ExternalDiarizer {
             planning_started.elapsed(),
         );
         let embedding_started = Instant::now();
-        let (embedded_chunks, embeddings) = embed_chunks(
+        let (embedded_chunks, embeddings) = embed_chunks_with_progress(
             self.embedder.as_ref(),
             samples.as_slice(),
             sample_rate_hz,
             &chunks,
             canceled,
+            progress.embedding,
         )?;
         crate::stage_timing::log_detail_stage(
             "external_diarization",
@@ -863,14 +868,17 @@ fn embedding_chunk_count(region: TimeRange) -> usize {
     count
 }
 
-fn embed_chunks(
+fn embed_chunks_with_progress(
     embedder: &dyn SpeakerEmbedder,
     samples: &[f32],
     sample_rate_hz: u32,
     chunks: &[TimeRange],
     canceled: &dyn Fn() -> bool,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<(Vec<TimeRange>, Vec<SpeakerEmbedding>), ExternalDiarizationError> {
-    report_embedding_progress(0, chunks.len());
+    if let Some(progress) = progress {
+        progress.report(0, chunks.len());
+    }
     if chunks.is_empty() {
         cancel_checkpoint(canceled)?;
         return Ok((Vec::new(), Vec::new()));
@@ -913,9 +921,22 @@ fn embed_chunks(
             }
         }
         processed_chunks = processed_chunks.saturating_add(batch.len());
-        report_embedding_progress(processed_chunks, chunks.len());
+        if let Some(progress) = progress {
+            progress.report(processed_chunks, chunks.len());
+        }
     }
     Ok((successful_chunks, embeddings))
+}
+
+#[cfg(test)]
+fn embed_chunks(
+    embedder: &dyn SpeakerEmbedder,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    chunks: &[TimeRange],
+    canceled: &dyn Fn() -> bool,
+) -> Result<(Vec<TimeRange>, Vec<SpeakerEmbedding>), ExternalDiarizationError> {
+    embed_chunks_with_progress(embedder, samples, sample_rate_hz, chunks, canceled, None)
 }
 
 fn circle_pad(samples: &[f32], target_len: usize) -> Vec<f32> {
@@ -1511,7 +1532,7 @@ mod tests {
         let embedder = InstrumentedBatchEmbedder::new(2);
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_events = std::sync::Arc::clone(&events);
-        let _guard = install_embedding_progress_sink(move |done, total| {
+        let progress = crate::api::backend::WorkProgressObserver::new(move |done, total| {
             sink_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1519,7 +1540,7 @@ mod tests {
         });
 
         let (successful_chunks, embeddings) =
-            embed_chunks(&embedder, &samples, 1, &chunks, &|| false)
+            embed_chunks_with_progress(&embedder, &samples, 1, &chunks, &|| false, Some(&progress))
                 .expect("bounded embedding with progress");
 
         assert_eq!(successful_chunks.len(), chunk_count);
@@ -1542,16 +1563,22 @@ mod tests {
         let (samples, chunks) = compact_embedding_fixture(chunk_count);
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_events = std::sync::Arc::clone(&events);
-        let _guard = install_embedding_progress_sink(move |done, total| {
+        let progress = crate::api::backend::WorkProgressObserver::new(move |done, total| {
             sink_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((done, total));
         });
 
-        let (successful_chunks, embeddings) =
-            embed_chunks(&OneTooShortBatchEmbedder, &samples, 1, &chunks, &|| false)
-                .expect("too-short windows are a supported sparse result");
+        let (successful_chunks, embeddings) = embed_chunks_with_progress(
+            &OneTooShortBatchEmbedder,
+            &samples,
+            1,
+            &chunks,
+            &|| false,
+            Some(&progress),
+        )
+        .expect("too-short windows are a supported sparse result");
 
         assert_eq!(successful_chunks.len(), chunk_count - 2);
         assert_eq!(embeddings.len(), chunk_count - 2);
@@ -1566,43 +1593,43 @@ mod tests {
     }
 
     #[test]
-    fn embedding_progress_guard_restores_the_previous_sink() {
-        let outer_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let outer_sink_events = std::sync::Arc::clone(&outer_events);
-        let outer = install_embedding_progress_sink(move |done, total| {
-            outer_sink_events
+    fn embedding_progress_observers_are_request_local() {
+        let (samples, chunks) = compact_embedding_fixture(3);
+        let embedder = InstrumentedBatchEmbedder::new(2);
+        let first_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_sink_events = std::sync::Arc::clone(&first_events);
+        let first = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            first_sink_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((done, total));
         });
-        report_embedding_progress(1, 4);
+        let second_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second_sink_events = std::sync::Arc::clone(&second_events);
+        let second = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+            second_sink_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((done, total));
+        });
 
-        let inner_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let inner_sink_events = std::sync::Arc::clone(&inner_events);
-        {
-            let _inner = install_embedding_progress_sink(move |done, total| {
-                inner_sink_events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((done, total));
-            });
-            report_embedding_progress(2, 4);
-        }
-        report_embedding_progress(3, 4);
-        drop(outer);
-        report_embedding_progress(4, 4);
+        embed_chunks_with_progress(&embedder, &samples, 1, &chunks, &|| false, Some(&first))
+            .expect("first request embedding");
+        embed_chunks_with_progress(&embedder, &samples, 1, &chunks, &|| false, Some(&second))
+            .expect("second request embedding");
 
+        let expected = vec![(0, 3), (3, 3)];
         assert_eq!(
-            *outer_events
+            *first_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![(1, 4), (3, 4)]
+            expected
         );
         assert_eq!(
-            *inner_events
+            *second_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![(2, 4)]
+            expected
         );
     }
 

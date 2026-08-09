@@ -1287,7 +1287,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
     encoder_frame_count: usize,
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     runtime.populate_cross_attention_cache(encoder_rows, encoder_frame_count)?;
 

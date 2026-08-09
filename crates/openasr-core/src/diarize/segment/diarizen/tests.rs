@@ -173,6 +173,7 @@ fn local_activity_owns_complete_windows_without_copying_the_source() {
         samples,
         super::config::SAMPLE_RATE_HZ,
         &|| false,
+        None,
         |window| {
             observed.push((window.backing_identity(), window.len()));
             Ok(DiariZenWindowOutput {
@@ -387,6 +388,7 @@ fn diarizen_aux_audio_sliding_benchmark() {
             pcm.full_slice(),
             super::config::SAMPLE_RATE_HZ,
             &|| false,
+            None,
             |window| {
                 runtime
                     .infer(&window)
@@ -451,6 +453,7 @@ fn diarizen_fifteen_minute_endurance() {
         pcm.full_slice(),
         super::config::SAMPLE_RATE_HZ,
         &|| false,
+        None,
         |window| {
             runtime
                 .infer(&window)
@@ -498,6 +501,7 @@ fn diarizen_cpu_and_metal_activity_stays_semantically_close() {
             pcm.full_slice(),
             super::config::SAMPLE_RATE_HZ,
             &|| false,
+            None,
             |window| {
                 runtime
                     .infer(&window)

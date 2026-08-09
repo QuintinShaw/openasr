@@ -30,22 +30,22 @@ use std::sync::Arc;
 
 use super::TranscriptionControl;
 
-/// Cloneable request-local decode-progress observer.
+/// Cloneable request-local completed-work observer.
 ///
 /// Unlike a thread-local callback, this value travels with the request into
-/// resident actor and serve-batch worker threads. The callback is immutable;
-/// any aggregation belongs to its captured reporter, so sharing it is safe and
-/// does not serialize the decoder's hot loop behind an extra mutex.
+/// resident actors, serve-batch workers, and auxiliary-model pipelines. The
+/// callback is immutable; aggregation belongs to its captured reporter, so
+/// sharing it is safe and does not serialize hot loops behind an extra mutex.
 #[derive(Clone)]
-pub(crate) struct DecodeWorkProgressObserver(Arc<dyn Fn(usize, usize) + Send + Sync + 'static>);
+pub(crate) struct WorkProgressObserver(Arc<dyn Fn(usize, usize) + Send + Sync + 'static>);
 
-impl fmt::Debug for DecodeWorkProgressObserver {
+impl fmt::Debug for WorkProgressObserver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DecodeWorkProgressObserver(..)")
+        f.write_str("WorkProgressObserver(..)")
     }
 }
 
-impl DecodeWorkProgressObserver {
+impl WorkProgressObserver {
     pub(crate) fn new(observer: impl Fn(usize, usize) + Send + Sync + 'static) -> Self {
         Self(Arc::new(observer))
     }
@@ -70,7 +70,7 @@ pub struct RequestExecutionContext {
     /// Optional per-slice decode-work progress. Private so every producer must
     /// use the typed constructor below instead of inventing another callback
     /// transport or process-global registry.
-    decode_work_progress: Option<DecodeWorkProgressObserver>,
+    decode_work_progress: Option<WorkProgressObserver>,
 }
 
 // Manual, not derived: `TranscriptionControl` holds a `Mutex`/`Condvar` and
@@ -102,7 +102,7 @@ impl RequestExecutionContext {
     /// progress windows.
     pub(crate) fn with_decode_work_progress_observer(
         &self,
-        observer: DecodeWorkProgressObserver,
+        observer: WorkProgressObserver,
     ) -> Self {
         Self {
             request_id: self.request_id.clone(),
@@ -111,7 +111,7 @@ impl RequestExecutionContext {
         }
     }
 
-    pub(crate) fn decode_work_progress_observer(&self) -> Option<&DecodeWorkProgressObserver> {
+    pub(crate) fn decode_work_progress_observer(&self) -> Option<&WorkProgressObserver> {
         self.decode_work_progress.as_ref()
     }
 
@@ -208,7 +208,7 @@ mod tests {
         let observed_a = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_b = Arc::new(std::sync::Mutex::new(Vec::new()));
         let context_a = RequestExecutionContext::uncancellable("progress request A")
-            .with_decode_work_progress_observer(DecodeWorkProgressObserver::new({
+            .with_decode_work_progress_observer(WorkProgressObserver::new({
                 let observed = Arc::clone(&observed_a);
                 move |completed, total| {
                     observed
@@ -218,7 +218,7 @@ mod tests {
                 }
             }));
         let context_b = RequestExecutionContext::uncancellable("progress request B")
-            .with_decode_work_progress_observer(DecodeWorkProgressObserver::new({
+            .with_decode_work_progress_observer(WorkProgressObserver::new({
                 let observed = Arc::clone(&observed_b);
                 move |completed, total| {
                     observed

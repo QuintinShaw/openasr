@@ -154,7 +154,7 @@ fn transcribe_wav2vec2_ctc_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<Wav2Vec2CtcTranscription, String> {
     let actor = checkout_wav2vec2_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
@@ -298,7 +298,7 @@ impl Wav2Vec2CtcPreparedRuntime {
         samples: &[f32],
         phrase_bias: Option<&PhraseBiasConfig>,
         word_timestamps: bool,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<Wav2Vec2CtcTranscription, String> {
         let result = self.decode_result(samples, phrase_bias, decode_work_progress)?;
         wav2vec2_ctc_result_to_transcription(
@@ -313,7 +313,7 @@ impl Wav2Vec2CtcPreparedRuntime {
         &mut self,
         samples: &[f32],
         phrase_bias: Option<&PhraseBiasConfig>,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<CtcGreedyDecodeResult, String> {
         let frontend = Wav2Vec2Frontend::new();
         let audio = frontend
@@ -388,7 +388,7 @@ fn decode_wav2vec2_ctc_result_with_progress(
     output: &super::encoder_graph::Wav2Vec2CtcEncoderOutput,
     tokenizer: &Wav2Vec2Tokenizer,
     phrase_bias: Option<&PhraseBiasConfig>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, String> {
     let frame_logits: Vec<&[f32]> = (0..output.frame_count)
         .map(|f| &output.logits[f * output.vocab_size..(f + 1) * output.vocab_size])

@@ -711,7 +711,7 @@ impl MimoAsrGgmlExecutor {
         input_rate: u32,
         kv_capacity: Qwen3AsrKvCacheCapacity,
         control: Arc<crate::api::backend::TranscriptionControl>,
-        decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
     ) -> Result<Seq2SeqGreedyDecodeResult, MimoAsrExecutorError> {
         // The OpenASR pipeline delivers 16kHz mono to every executor, but
         // MiMo's audio tokenizer (and its baked mel filterbank/window) is

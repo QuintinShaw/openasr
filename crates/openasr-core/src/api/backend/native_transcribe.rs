@@ -313,7 +313,7 @@ fn run_dispatch_once_with_progress(
     let window = decode_progress.slice_progress_window(slice_samples);
     let reporter = decode_progress.reporter.clone();
     let observer =
-        crate::api::backend::DecodeWorkProgressObserver::new(move |completed_work, total_work| {
+        crate::api::backend::WorkProgressObserver::new(move |completed_work, total_work| {
             if should_publish_decode_work(completed_work, total_work) {
                 reporter.report_fraction(decode_work_fraction(window, completed_work, total_work));
             }
@@ -3027,12 +3027,10 @@ fn finalize_native_transcription(
             // batch sub-progress.
             progress.enter_stage(TranscriptionStage::IdentifySpeakers);
             let identity_progress = progress.clone();
-            let _identity_progress_guard =
-                crate::diarize::voice_id::install_identity_batch_progress_sink(
-                    move |done, total| {
-                        identity_progress.report_units(done as u64, total.max(1) as u64);
-                    },
-                );
+            let identity_observer =
+                crate::api::backend::WorkProgressObserver::new(move |done, total| {
+                    identity_progress.report_units(done as u64, total.max(1) as u64);
+                });
             let mut scopes = speaker_scopes_by_provenance(
                 &mut transcription.segments,
                 &speaker.scope_by_segment,
@@ -3046,9 +3044,10 @@ fn finalize_native_transcription(
                         crate::diarize::voice_id::SpeakerIdentityError::EmbedderPackMissing,
                     ))?;
             transcription.unnamed_speakers =
-                crate::diarize::voice_id::name_speakers_across_scopes_with_embedder(
+                crate::diarize::voice_id::name_speakers_across_scopes_with_embedder_and_progress(
                     embedder,
                     &mut scopes,
+                    Some(&identity_observer),
                 )
                 .map_err(speaker_identity_error_to_backend)?;
             progress.complete_stage();
@@ -3226,24 +3225,29 @@ fn compute_speaker_attribution(
     let segmenter = progress_segmenter_kind_for_provider(diarizer.segmenter_provider());
     let segment_share = external_diarization_segment_share(segmenter);
     let segment_progress = progress.clone();
-    let _segment_progress_guard =
-        crate::diarize::segment::install_window_progress_sink(move |done, total| {
-            segment_progress.report_fraction(segment_share * completed_work_fraction(done, total));
-        });
+    let segment_observer = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+        segment_progress.report_fraction(segment_share * completed_work_fraction(done, total));
+    });
     let embedding_progress = progress.clone();
-    let _embedding_progress_guard =
-        crate::diarize::external::install_embedding_progress_sink(move |done, total| {
-            embedding_progress.report_fraction(external_diarization_embedding_progress(
-                segment_share,
-                done,
-                total,
-            ));
-        });
+    let embedding_observer = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+        embedding_progress.report_fraction(external_diarization_embedding_progress(
+            segment_share,
+            done,
+            total,
+        ));
+    });
     let diarization_started = Instant::now();
     let timeline = diarizer
-        .diarize(samples.clone(), 16_000, hint, &|| {
-            execution_context.is_canceled()
-        })
+        .diarize_with_progress(
+            samples.clone(),
+            16_000,
+            hint,
+            &|| execution_context.is_canceled(),
+            crate::diarize::external::ExternalDiarizationProgress::new(
+                &segment_observer,
+                &embedding_observer,
+            ),
+        )
         .map_err(external_diarization_error_to_backend)?;
     progress.complete_stage();
     crate::stage_timing::log_detail_stage(
@@ -3272,17 +3276,18 @@ fn compute_speaker_attribution(
     }
     progress.enter_stage(TranscriptionStage::IdentifySpeakers);
     let identity_progress = progress.clone();
-    let _identity_progress_guard =
-        crate::diarize::voice_id::install_identity_batch_progress_sink(move |done, total| {
-            identity_progress.report_units(done as u64, total.max(1) as u64);
-        });
+    let identity_observer = crate::api::backend::WorkProgressObserver::new(move |done, total| {
+        identity_progress.report_units(done as u64, total.max(1) as u64);
+    });
     let identity_started = Instant::now();
-    let identity = crate::diarize::voice_id::resolve_timeline_identities_with_embedder(
-        embedder,
-        &timeline,
-        samples.as_slice(),
-    )
-    .map_err(speaker_identity_error_to_backend)?;
+    let identity =
+        crate::diarize::voice_id::resolve_timeline_identities_with_embedder_and_progress(
+            embedder,
+            &timeline,
+            samples.as_slice(),
+            Some(&identity_observer),
+        )
+        .map_err(speaker_identity_error_to_backend)?;
     progress.complete_stage();
     crate::stage_timing::log_detail_stage(
         "speaker_attribution",
@@ -5356,7 +5361,7 @@ mod tests {
                 span_fraction: 1.0,
             };
             let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+            let observer = crate::api::backend::WorkProgressObserver::new({
                 let reporter = reporter.clone();
                 let observed = std::sync::Arc::clone(&observed);
                 move |completed_work, total_work| {

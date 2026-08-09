@@ -641,7 +641,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     audio_rows: &[f32],
     tokenizer: MossTdTokenizer,
     control: Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
     let decode_prompt_token_ids = decode_prompt_token_ids.to_vec();
     let audio_pad_positions = audio_pad_positions.to_vec();

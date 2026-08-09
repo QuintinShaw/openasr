@@ -677,7 +677,7 @@ fn decode_with_decoder(
     tokenizer: &FunasrNanoTokenizer,
     kv_capacity: Qwen3AsrKvCacheCapacity,
     control: &Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, FunasrNanoExecutorError> {
     let token_value_count = decode_prompt
         .token_ids

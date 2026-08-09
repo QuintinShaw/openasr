@@ -247,7 +247,7 @@ pub(crate) fn run_ctc_greedy_decode_with_progress<E>(
     frame_logits: &[&[f32]],
     decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
     map_err: impl Fn(E) -> CtcGreedyDecodeError,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
     if config.blank_token_id as usize >= config.vocab_size {
         return Err(CtcGreedyDecodeError::BlankOutOfRange {
@@ -340,7 +340,7 @@ mod tests {
         let rows = [frame(1), frame(1), frame(BLANK), frame(2)];
         let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+        let observer = crate::api::backend::WorkProgressObserver::new({
             let observed = std::sync::Arc::clone(&observed);
             move |completed, total| {
                 observed

@@ -135,7 +135,7 @@ pub(crate) fn tdt_greedy_decode_with_progress(
     predictor: &ParakeetTdtPredictor,
     joint: &ParakeetTdtJoint,
     is_canceled: &dyn Fn() -> bool,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Vec<ParakeetTdtEmittedToken>, String> {
     if is_canceled() {
         return Err("parakeet-tdt decode canceled before predictor prefill".to_string());
@@ -333,7 +333,7 @@ mod tests {
         // Frame 2: m=[2, 0] -> tok0 again.
         let enc = vec![2.0, 0.0, 0.0, 2.0, 2.0, 0.0];
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+        let observer = crate::api::backend::WorkProgressObserver::new({
             let observed = std::sync::Arc::clone(&observed);
             move |completed, total| {
                 observed

@@ -462,7 +462,7 @@ impl XasrZipformerPreparedRuntime {
         &mut self,
         samples: &[f32],
         is_canceled: &dyn Fn() -> bool,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<XasrGreedyDecodeResult, String> {
         let total_profile = xasr_profile_start();
         let fbank_profile = xasr_profile_start();
@@ -549,7 +549,7 @@ impl XasrZipformerPreparedRuntime {
         features: &XasrFbankFeatures,
         final_flush: bool,
         is_canceled: &dyn Fn() -> bool,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<usize, String> {
         let mut new_tokens = 0usize;
         let mut greedy_elapsed = Duration::ZERO;

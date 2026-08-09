@@ -545,7 +545,7 @@ fn run_dolphin_pipeline_with_progress(
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     is_canceled: &dyn Fn() -> bool,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<DolphinPipelineOutput, String> {
     let backend = prepared.backend;
     let tokens = metadata

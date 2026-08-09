@@ -889,3 +889,31 @@ fn decode_drivers_forward_request_scoped_work_progress() {
         "shared decode progress must travel with the request, never caller-thread TLS",
     );
 }
+
+#[test]
+fn auxiliary_progress_is_explicit_and_request_scoped() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/diarize");
+    for relative in ["segment/mod.rs", "external.rs", "voice_id/identity.rs"] {
+        let path = source_root.join(relative);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert!(
+            source.contains("WorkProgressObserver"),
+            "{} must carry the shared request-local work observer explicitly",
+            path.display(),
+        );
+        for forbidden in [
+            "thread_local!",
+            "ProgressGuard",
+            "install_window_progress_sink",
+            "install_embedding_progress_sink",
+            "install_identity_batch_progress_sink",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} must not restore auxiliary progress side channel '{forbidden}'",
+                path.display(),
+            );
+        }
+    }
+}

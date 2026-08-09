@@ -264,7 +264,7 @@ impl ParakeetTdtPreparedRuntime {
         samples: &[f32],
         word_timestamps: bool,
         is_canceled: &dyn Fn() -> bool,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<ParakeetTdtTranscription, String> {
         let frontend = ParakeetFrontend::with_n_mels(self.metadata.n_mels);
         let features = frontend
@@ -320,7 +320,7 @@ fn transcribe_parakeet_tdt_pcm_cached(
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
     control: Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<ParakeetTdtTranscription, String> {
     let actor = checkout_parakeet_tdt_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();

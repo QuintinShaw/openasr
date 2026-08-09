@@ -329,7 +329,7 @@ pub(crate) fn run_ctc_prefix_beam_decode_with_progress<E>(
     frame_logits: &[&[f32]],
     decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
     map_err: impl Fn(E) -> CtcGreedyDecodeError,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
     if frame_logits.is_empty() {
         return Err(CtcGreedyDecodeError::EmptyFrames);

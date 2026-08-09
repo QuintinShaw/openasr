@@ -88,7 +88,7 @@ pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
     word_timestamps: bool,
     audio_duration_seconds: f32,
     control: &Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
     runtime.populate_cross_attention_cache(encoder_output)?;
     let mut step_executor = MoonshineDecoderStepExecutor { runtime };

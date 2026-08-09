@@ -11,7 +11,7 @@ mod native;
 mod request_context;
 
 pub use mock::transcribe_with_mock_backend;
-pub(crate) use native::DecodeWorkProgressObserver;
+pub(crate) use native::WorkProgressObserver;
 pub use native::{
     GgmlAbortCallbackGuard, LegacyNativeTranscriptionProgress, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,

@@ -471,7 +471,7 @@ struct WhisperDecoderActorJob {
     allow_persistent_session_reuse: bool,
     backend: GgmlCpuGraphBackend,
     control: Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 }
 
 impl WhisperDecoderActorJob {
@@ -5370,7 +5370,7 @@ fn run_whisper_decode_loop(
     decoder_persistent_cache_populated: bool,
     trace: &WhisperGgmlTrace,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {

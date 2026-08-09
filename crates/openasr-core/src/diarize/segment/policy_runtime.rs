@@ -122,12 +122,13 @@ impl LocalActivitySegmenter for PolicyResolvedPyannoteSegmenterRuntime {
         samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
+        progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<LocalActivity, SegmentError> {
         self.runtime
             .lock()
             .map_err(|_| SegmentError::Inference("pyannote runtime lock is poisoned".into()))?
             .invoke_replay_safe(|owner| {
-                owner.segment_local_activity(samples.clone(), sample_rate_hz, canceled)
+                owner.segment_local_activity(samples.clone(), sample_rate_hz, canceled, progress)
             })
             .map_err(policy_error)
     }
@@ -179,24 +180,31 @@ impl LocalActivitySegmenter for PolicyResolvedDiariZenSegmenterRuntime {
         samples: crate::PcmSlice,
         sample_rate_hz: u32,
         canceled: &dyn Fn() -> bool,
+        progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<LocalActivity, SegmentError> {
-        super::segment_diarizen_local_activity(samples, sample_rate_hz, canceled, |window| {
-            self.runtime
-                .lock()
-                .map_err(|_| {
-                    SegmentError::Inference("DiariZen runtime lock is poisoned".to_string())
-                })?
-                .invoke_replay_safe(|actor| {
-                    actor
-                        .call_mut_fallible({
-                            let window = window.clone();
-                            move |runtime| runtime.infer(window.as_slice())
-                        })
-                        .map_err(|error| SegmentError::Inference(error.to_string()))?
-                        .map_err(diarizen_error)
-                })
-                .map_err(policy_error)
-        })
+        super::segment_diarizen_local_activity(
+            samples,
+            sample_rate_hz,
+            canceled,
+            progress,
+            |window| {
+                self.runtime
+                    .lock()
+                    .map_err(|_| {
+                        SegmentError::Inference("DiariZen runtime lock is poisoned".to_string())
+                    })?
+                    .invoke_replay_safe(|actor| {
+                        actor
+                            .call_mut_fallible({
+                                let window = window.clone();
+                                move |runtime| runtime.infer(window.as_slice())
+                            })
+                            .map_err(|error| SegmentError::Inference(error.to_string()))?
+                            .map_err(diarizen_error)
+                    })
+                    .map_err(policy_error)
+            },
+        )
     }
 }
 

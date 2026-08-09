@@ -196,7 +196,7 @@ impl SenseVoicePreparedRuntime {
         samples: &[f32],
         language: Option<&str>,
         phrase_bias: Option<&PhraseBiasConfig>,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<CtcGreedyDecodeResult, String> {
         // SenseVoice's own FunASR quick-start (and Handy's sherpa-based build)
         // default to `withitn`: raw `woitn` output has no punctuation or digit
@@ -256,7 +256,7 @@ impl SenseVoicePreparedRuntime {
         samples: &[f32],
         language: Option<&str>,
         phrase_bias: Option<&PhraseBiasConfig>,
-        decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     ) -> Result<SenseVoiceTranscription, String> {
         let result = self.decode_result(samples, language, phrase_bias, decode_work_progress)?;
         let requested = build_sensevoice_prompt(language, true).map_err(|e| e.to_string())?;
@@ -299,7 +299,7 @@ fn decode_sensevoice_pcm_cached(
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<CtcGreedyDecodeResult, String> {
     let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
@@ -324,7 +324,7 @@ fn transcribe_sensevoice_pcm_cached(
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
-    decode_work_progress: Option<crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<SenseVoiceTranscription, String> {
     let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();

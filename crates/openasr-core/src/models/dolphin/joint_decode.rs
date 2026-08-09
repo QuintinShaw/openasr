@@ -129,7 +129,7 @@ pub(crate) fn joint_decode_with_progress(
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
     is_canceled: &dyn Fn() -> bool,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<DolphinJointDecodeResult, DolphinJointDecodeError> {
     let decoder_config = *rescore.config();
     let vocab = decoder_config.vocab_size;
@@ -456,7 +456,7 @@ fn ctc_prefix_beam_search(
     blank: usize,
     beam_size: usize,
     is_canceled: &dyn Fn() -> bool,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Vec<(Vec<u32>, f32)>, DolphinJointDecodeError> {
     // (prefix, (log_pb, log_pnb)). Seed: empty prefix reachable only via blank.
     let mut cur: Vec<(Vec<u32>, (f64, f64))> = vec![(Vec::new(), (0.0, NEG_INF))];
@@ -554,7 +554,7 @@ fn attention_rescore(
     decode_config: &DolphinJointDecodeConfig,
     nbest: &[(Vec<u32>, f32)],
     is_canceled: &dyn Fn() -> bool,
-    decode_work_progress: Option<&crate::api::backend::DecodeWorkProgressObserver>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Vec<DolphinScoredHypothesis>, DolphinJointDecodeError> {
     let prompt = &decode_config.prompt_prefix;
     let prompt_len = prompt.len();
@@ -700,7 +700,7 @@ mod tests {
             -10.0, -0.001, -10.0, //
         ];
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observer = crate::api::backend::DecodeWorkProgressObserver::new({
+        let observer = crate::api::backend::WorkProgressObserver::new({
             let observed = std::sync::Arc::clone(&observed);
             move |completed, total| {
                 observed

@@ -33,7 +33,7 @@ fn segmenter_working_set_geometry_pins_provider_inference_concurrency() {
 #[test]
 fn bounded_pyannote_window_pool_preserves_order_and_worker_cap() {
     let starts: Vec<usize> = (0..17).collect();
-    let output = super::bounded_pyannote_window_map(&starts, &|| false, |start| {
+    let output = super::bounded_pyannote_window_map(&starts, &|| false, None, |start| {
         std::thread::sleep(std::time::Duration::from_micros(
             ((17 - start) % 4) as u64 * 50,
         ));
@@ -57,6 +57,7 @@ fn bounded_pyannote_window_pool_checks_cancellation_between_batches() {
     let result = super::bounded_pyannote_window_map(
         &starts,
         &|| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0,
+        None,
         Ok,
     );
     assert!(matches!(result, Err(super::SegmentError::Canceled)));
@@ -84,6 +85,7 @@ fn parallel_pyannote_windows_match_serial_reference() {
         pcm_samples,
         16_000,
         &|| false,
+        None,
     )
     .expect("parallel segmentation");
 
@@ -238,7 +240,7 @@ fn segmentation3_aux_audio_sliding_benchmark() {
     let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load segmenter pack");
     let run = || {
         segmenter
-            .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false)
+            .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
             .expect("segment benchmark audio")
     };
 
@@ -292,13 +294,13 @@ fn segmentation3_fifteen_minute_endurance() {
     let window_samples = 10 * super::SAMPLE_RATE_HZ as usize;
     let warmup = crate::PcmBuffer::from_vec(samples[..window_samples.min(samples.len())].to_vec());
     segmenter
-        .segment_local_activity(warmup.full_slice(), super::SAMPLE_RATE_HZ, &|| false)
+        .segment_local_activity(warmup.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
         .expect("warm segmentation runtime");
 
     let pcm = crate::PcmBuffer::from_vec(samples);
     let started = std::time::Instant::now();
     let activity = segmenter
-        .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false)
+        .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
         .expect("segment endurance audio");
     let elapsed_seconds = started.elapsed().as_secs_f64();
     let activity_sha256 = crate::testing::benchmark_sha256_bytes(
