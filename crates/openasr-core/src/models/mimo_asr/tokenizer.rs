@@ -6,15 +6,10 @@
 //! has nothing family-specific about it (same precedent as
 //! `firered_llm::tokenizer`/`qwen::tokenizer`).
 
-use std::collections::BTreeMap;
-
 use crate::NativeAsrError;
 use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
-use crate::models::gpt2_bpe::{
-    build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
-    validate_gpt2_bpe_table_admission,
-};
+use crate::models::gpt2_bpe::{Gpt2BpeTable, validate_gpt2_bpe_table_admission};
 use crate::models::oasr_metadata::{
     TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
     required_metadata_string, required_metadata_string_array, required_metadata_u32,
@@ -28,9 +23,7 @@ const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 
 #[derive(Debug, Clone)]
 pub(crate) struct MimoAsrTokenizer {
-    id_to_token: Vec<Option<String>>,
-    token_to_id: BTreeMap<String, u32>,
-    merge_rank: BTreeMap<String, usize>,
+    bpe: Gpt2BpeTable,
     pub special: MimoSpecialTokens,
 }
 
@@ -50,72 +43,12 @@ impl MimoAsrTokenizer {
             MIMO_ASR_TOKENIZER_FAMILY,
         )
         .map_err(|error| error.to_string())?;
-        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
-        bytes.add_usize(
-            tokens
-                .len()
-                .checked_mul(std::mem::size_of::<Option<String>>())
-                .ok_or_else(|| "mimo tokenizer id table quote overflowed".to_string())?,
-            "mimo tokenizer id table quote",
-        )?;
-        for (label, values, entry_size, copies) in [
-            (
-                "mimo tokenizer token quote",
-                tokens,
-                std::mem::size_of::<(String, u32)>(),
-                2usize,
-            ),
-            (
-                "mimo tokenizer merge quote",
-                merges,
-                std::mem::size_of::<(String, usize)>(),
-                1usize,
-            ),
-        ] {
-            bytes.add_usize(
-                values
-                    .len()
-                    .checked_mul(entry_size)
-                    .ok_or_else(|| format!("{label} entry bytes overflowed"))?,
-                label,
-            )?;
-            let strings = values
-                .iter()
-                .try_fold(0usize, |total, value| total.checked_add(value.len()))
-                .and_then(|bytes| bytes.checked_mul(copies))
-                .ok_or_else(|| format!("{label} string bytes overflowed"))?;
-            bytes.add_usize(strings, label)?;
-        }
-        Ok(bytes.finish())
+        Gpt2BpeTable::quoted_retained_system_memory_bytes(tokens, merges, "mimo-asr")
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
-        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
-        bytes.add_vec(&self.id_to_token, "mimo-asr tokenizer id table")?;
-        for token in self.id_to_token.iter().flatten() {
-            bytes.add_string(token, "mimo-asr tokenizer id token")?;
-        }
-        bytes.add_usize(
-            self.token_to_id
-                .len()
-                .checked_mul(std::mem::size_of::<(String, u32)>())
-                .ok_or_else(|| "mimo-asr tokenizer token map byte count overflowed".to_string())?,
-            "mimo-asr tokenizer token map entries",
-        )?;
-        for token in self.token_to_id.keys() {
-            bytes.add_string(token, "mimo-asr tokenizer token map key")?;
-        }
-        bytes.add_usize(
-            self.merge_rank
-                .len()
-                .checked_mul(std::mem::size_of::<(String, usize)>())
-                .ok_or_else(|| "mimo-asr tokenizer merge map byte count overflowed".to_string())?,
-            "mimo-asr tokenizer merge map entries",
-        )?;
-        for merge in self.merge_rank.keys() {
-            bytes.add_string(merge, "mimo-asr tokenizer merge key")?;
-        }
-        Ok(bytes.finish())
+        self.bpe.retained_system_memory_bytes_with_label("mimo-asr")
     }
 
     pub fn from_gguf_metadata(
@@ -154,12 +87,12 @@ impl MimoAsrTokenizer {
             MIMO_ASR_TOKENIZER_FAMILY,
         )?;
 
-        let id_to_token = tokens
-            .iter()
-            .map(|token| Some(token.clone()))
-            .collect::<Vec<_>>();
-        let token_to_id = build_token_to_id(tokens, MIMO_ASR_TOKENIZER_FAMILY)?;
-        let merge_rank = build_merge_rank(merges);
+        let bpe = Gpt2BpeTable::from_admitted_tables_with_error_family(
+            tokens,
+            merges,
+            MIMO_ASR_TOKENIZER_FAMILY,
+            "mimo-asr",
+        )?;
 
         for token_id in [
             special.eos_id,
@@ -171,15 +104,10 @@ impl MimoAsrTokenizer {
             special.eot_id,
             special.eostm_id,
         ] {
-            validate_token_id_in_range(&id_to_token, token_id)?;
+            bpe.validate_token_id(token_id)?;
         }
 
-        Ok(Self {
-            id_to_token,
-            token_to_id,
-            merge_rank,
-            special,
-        })
+        Ok(Self { bpe, special })
     }
 
     /// Decode generated token ids to text, dropping the audio-boundary and
@@ -188,39 +116,20 @@ impl MimoAsrTokenizer {
     /// with the 16L speech-gen `local_transformer` dropped -- P2.0 findings
     /// SS1 point 4/SS3's `asr_sft` postprocess strips it defensively too).
     pub fn decode_text_token_ids(&self, token_ids: &[u32]) -> Result<String, NativeAsrError> {
-        let mut bytes = Vec::new();
-        for token_id in token_ids {
-            if *token_id == self.special.eos_id
-                || *token_id == self.special.im_start_id
-                || *token_id == self.special.im_end_id
-                || *token_id == self.special.sosp_id
-                || *token_id == self.special.eosp_id
-                || *token_id == self.special.empty_id
-                || *token_id == self.special.eot_id
-                || *token_id == self.special.eostm_id
-            {
-                continue;
-            }
-            let index = usize::try_from(*token_id).map_err(|_| NativeAsrError::SessionFailed {
-                message: format!("mimo-asr tokenizer id {token_id} does not fit into usize"),
-            })?;
-            let Some(Some(token)) = self.id_to_token.get(index) else {
-                return Err(NativeAsrError::SessionFailed {
-                    message: format!("mimo-asr tokenizer id {token_id} is not in vocab"),
-                });
-            };
-            bytes.extend(token_to_bytes(token));
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        self.bpe.decode_token_ids(token_ids, |token_id| {
+            token_id == self.special.eos_id
+                || token_id == self.special.im_start_id
+                || token_id == self.special.im_end_id
+                || token_id == self.special.sosp_id
+                || token_id == self.special.eosp_id
+                || token_id == self.special.empty_id
+                || token_id == self.special.eot_id
+                || token_id == self.special.eostm_id
+        })
     }
 
     pub fn encode_prompt_text(&self, text: &str) -> Result<Vec<u32>, NativeAsrError> {
-        encode_prompt_text(
-            text,
-            &self.token_to_id,
-            &self.merge_rank,
-            MIMO_ASR_TOKENIZER_FAMILY,
-        )
+        self.bpe.encode_prompt_text(text)
     }
 }
 
@@ -236,24 +145,6 @@ impl PhraseBiasTokenEncoder for MimoAsrTokenizer {
     fn encode_phrase_bias_variants(&self, phrase: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
         encode_bpe_phrase_bias_variants(phrase, |text| self.encode_prompt_text(text)).map(Some)
     }
-}
-
-fn validate_token_id_in_range(
-    id_to_token: &[Option<String>],
-    token_id: u32,
-) -> Result<(), NativeAsrError> {
-    let index = usize::try_from(token_id).map_err(|_| NativeAsrError::UnsupportedModelPack {
-        reason: format!("mimo-asr tokenizer token id {token_id} does not fit into usize"),
-    })?;
-    if index < id_to_token.len() {
-        return Ok(());
-    }
-    Err(NativeAsrError::UnsupportedModelPack {
-        reason: format!(
-            "mimo-asr tokenizer token id {token_id} is out of range for vocab size {}",
-            id_to_token.len()
-        ),
-    })
 }
 
 #[cfg(test)]

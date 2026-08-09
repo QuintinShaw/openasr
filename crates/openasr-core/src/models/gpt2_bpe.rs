@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::NativeAsrError;
+use crate::models::runtime_memory::{checked_sum, element_bytes};
+use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
 
 /// Hard ceilings for GPT-2 BPE tables admitted from untrusted pack metadata.
 /// Production Qwen-family vocabs sit near 150k tokens / ~150k merges; these
@@ -64,6 +66,201 @@ pub(crate) fn validate_gpt2_bpe_table_admission(
         }
     }
     Ok(())
+}
+
+/// Owned byte-level GPT-2 BPE table shared by families whose only tokenizer
+/// differences are special-token and prompt adapters. Admission stays in the
+/// caller's metadata-validation order; this type owns the table maps and the
+/// common encode/decode shell once admission has succeeded.
+#[derive(Debug, Clone)]
+pub(crate) struct Gpt2BpeTable {
+    id_to_token: Vec<Option<String>>,
+    token_to_id: BTreeMap<String, u32>,
+    merge_rank: BTreeMap<String, usize>,
+    family: &'static str,
+    error_family: &'static str,
+}
+
+impl Gpt2BpeTable {
+    pub(crate) fn from_admitted_tables(
+        tokens: &[String],
+        merges: &[String],
+        family: &'static str,
+    ) -> Result<Self, NativeAsrError> {
+        Self::from_admitted_tables_with_error_family(tokens, merges, family, family)
+    }
+
+    pub(crate) fn from_admitted_tables_with_error_family(
+        tokens: &[String],
+        merges: &[String],
+        family: &'static str,
+        error_family: &'static str,
+    ) -> Result<Self, NativeAsrError> {
+        Ok(Self {
+            id_to_token: tokens.iter().map(|token| Some(token.clone())).collect(),
+            token_to_id: build_token_to_id(tokens, family)?,
+            merge_rank: build_merge_rank(merges),
+            family,
+            error_family,
+        })
+    }
+
+    pub(crate) fn token_id(&self, token: &str) -> Option<u32> {
+        self.token_to_id.get(token).copied()
+    }
+
+    pub(crate) fn validate_token_id(&self, token_id: u32) -> Result<(), NativeAsrError> {
+        let index =
+            usize::try_from(token_id).map_err(|_| NativeAsrError::UnsupportedModelPack {
+                reason: format!(
+                    "{} tokenizer token id {token_id} does not fit into usize",
+                    self.error_family
+                ),
+            })?;
+        if index < self.id_to_token.len() {
+            return Ok(());
+        }
+        Err(NativeAsrError::UnsupportedModelPack {
+            reason: format!(
+                "{} tokenizer token id {token_id} is out of range for vocab size {}",
+                self.error_family,
+                self.id_to_token.len()
+            ),
+        })
+    }
+
+    pub(crate) fn decode_token_ids<F>(
+        &self,
+        token_ids: &[u32],
+        skip_token: F,
+    ) -> Result<String, NativeAsrError>
+    where
+        F: Fn(u32) -> bool,
+    {
+        let mut bytes = Vec::new();
+        for token_id in token_ids {
+            if skip_token(*token_id) {
+                continue;
+            }
+            let index = usize::try_from(*token_id).map_err(|_| NativeAsrError::SessionFailed {
+                message: format!(
+                    "{} tokenizer id {token_id} does not fit into usize",
+                    self.error_family
+                ),
+            })?;
+            let Some(Some(token)) = self.id_to_token.get(index) else {
+                return Err(NativeAsrError::SessionFailed {
+                    message: format!(
+                        "{} tokenizer id {token_id} is not in vocab",
+                        self.error_family
+                    ),
+                });
+            };
+            bytes.extend(token_to_bytes(token));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub(crate) fn encode_prompt_text(&self, text: &str) -> Result<Vec<u32>, NativeAsrError> {
+        encode_prompt_text(text, &self.token_to_id, &self.merge_rank, self.family)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_count(&self) -> usize {
+        self.token_to_id.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_count(&self) -> usize {
+        self.merge_rank.len()
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        self.retained_system_memory_bytes_with_label(self.family)
+    }
+
+    pub(crate) fn retained_system_memory_bytes_with_label(
+        &self,
+        label_prefix: &str,
+    ) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        let id_table_label = format!("{label_prefix} tokenizer id table");
+        bytes.add_vec(&self.id_to_token, &id_table_label)?;
+        for token in self.id_to_token.iter().flatten() {
+            bytes.add_string(token, &format!("{label_prefix} tokenizer id token"))?;
+        }
+        for (label, len, entry_size) in [
+            (
+                format!("{label_prefix} tokenizer token map"),
+                self.token_to_id.len(),
+                std::mem::size_of::<(String, u32)>(),
+            ),
+            (
+                format!("{label_prefix} tokenizer merge map"),
+                self.merge_rank.len(),
+                std::mem::size_of::<(String, usize)>(),
+            ),
+        ] {
+            bytes.add_usize(
+                len.checked_mul(entry_size)
+                    .ok_or_else(|| format!("{label} byte count overflowed"))?,
+                &label,
+            )?;
+        }
+        for key in self.token_to_id.keys().chain(self.merge_rank.keys()) {
+            bytes.add_string(key, &format!("{label_prefix} tokenizer map key"))?;
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        tokens: &[String],
+        merges: &[String],
+        family: &str,
+    ) -> Result<u64, SystemMemoryOwnerError> {
+        let token_text_bytes = tokenizer_text_bytes(tokens, family, "tokenizer token text")?;
+        let merge_text_bytes = tokenizer_text_bytes(merges, family, "tokenizer merge text")?;
+        let token_text_copies = token_text_bytes.checked_mul(2).ok_or_else(|| {
+            tokenizer_capacity_error(family, "tokenizer token text copies byte count overflowed")
+        })?;
+
+        checked_sum(
+            [
+                element_bytes::<Option<String>>(tokens.len(), family, "tokenizer id table")?,
+                element_bytes::<(String, u32)>(tokens.len(), family, "tokenizer reverse map")?,
+                token_text_copies,
+                element_bytes::<(String, usize)>(merges.len(), family, "tokenizer merge map")?,
+                merge_text_bytes,
+            ],
+            family,
+            "tokenizer retained bytes",
+        )
+    }
+}
+
+fn tokenizer_text_bytes(
+    values: &[String],
+    family: &str,
+    label: &str,
+) -> Result<u64, SystemMemoryOwnerError> {
+    values.iter().try_fold(0_u64, |total, value| {
+        let length = u64::try_from(value.len()).map_err(|_| {
+            tokenizer_capacity_error(family, format!("{label} length does not fit u64"))
+        })?;
+        total.checked_add(length).ok_or_else(|| {
+            tokenizer_capacity_error(family, format!("{label} byte count overflowed"))
+        })
+    })
+}
+
+pub(crate) fn tokenizer_capacity_error(
+    family: &str,
+    reason: impl Into<String>,
+) -> SystemMemoryOwnerError {
+    SystemMemoryOwnerError::capacity_failure(
+        "model_runtime_memory",
+        format!("{family}: {}", reason.into()),
+    )
 }
 
 pub(crate) fn build_merge_rank(merges: &[String]) -> BTreeMap<String, usize> {
@@ -463,6 +660,42 @@ fn unicode_char_from_byte(byte: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_table_owns_common_encode_and_decode_shell() {
+        let tokens = vec![
+            "h".to_string(),
+            "i".to_string(),
+            "hi".to_string(),
+            "<|special|>".to_string(),
+        ];
+        let merges = vec!["h i".to_string()];
+        validate_gpt2_bpe_table_admission(&tokens, &merges, Some(4), "test")
+            .expect("table admission");
+        let table =
+            Gpt2BpeTable::from_admitted_tables(&tokens, &merges, "test").expect("table build");
+
+        assert_eq!(table.encode_prompt_text("hi").expect("encode"), vec![2]);
+        assert_eq!(
+            table
+                .decode_token_ids(&[3, 2], |token_id| token_id == 3)
+                .expect("decode"),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn table_admission_rejects_declared_vocab_drift_before_building_maps() {
+        let tokens = vec!["h".to_string()];
+        let merges = vec!["h h".to_string()];
+        let error = validate_gpt2_bpe_table_admission(&tokens, &merges, Some(2), "test")
+            .expect_err("vocab drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match declared vocab_size")
+        );
+    }
 
     #[test]
     fn pretokenize_splits_letter_and_punctuation_runs_at_the_category_boundary() {

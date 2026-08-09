@@ -6,22 +6,17 @@
 //! in this crate uses (there is nothing MOSS-specific about byte-level BPE
 //! encode/decode).
 
-use std::collections::BTreeMap;
-
 use crate::NativeAsrError;
 use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
-use crate::models::gpt2_bpe::{
-    build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
-    validate_gpt2_bpe_table_admission,
-};
+use crate::models::gpt2_bpe::tokenizer_capacity_error;
+use crate::models::gpt2_bpe::{Gpt2BpeTable, validate_gpt2_bpe_table_admission};
 use crate::models::oasr_metadata::{
     TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
     required_metadata_string, required_metadata_string_array, required_metadata_u32,
 };
 use crate::models::phrase_bias_decode::{PhraseBiasTokenEncoder, encode_bpe_phrase_bias_variants};
-use crate::models::runtime_memory::{checked_sum, element_bytes};
-use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
+use crate::models::system_memory_owner::SystemMemoryOwnerError;
 
 use super::runtime_contract::{
     LLM_AUDIO_END_TOKEN_ID_KEY, LLM_AUDIO_PAD_TOKEN_ID_KEY, LLM_AUDIO_START_TOKEN_ID_KEY,
@@ -33,9 +28,7 @@ const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 
 #[derive(Debug, Clone)]
 pub(crate) struct MossTdTokenizer {
-    id_to_token: Vec<Option<String>>,
-    token_to_id: BTreeMap<String, u32>,
-    merge_rank: BTreeMap<String, usize>,
+    bpe: Gpt2BpeTable,
     pub audio_start_token_id: u32,
     pub audio_end_token_id: u32,
     pub audio_pad_token_id: u32,
@@ -54,36 +47,7 @@ pub(crate) struct MossTdTokenizer {
 
 impl MossTdTokenizer {
     pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
-        let mut bytes = SystemMemoryCapacity::default();
-        bytes.add_vec(
-            &self.id_to_token,
-            "moss-transcribe-diarize tokenizer id table",
-        )?;
-        for token in self.id_to_token.iter().flatten() {
-            bytes.add_string(token, "moss-transcribe-diarize tokenizer id token")?;
-        }
-        for (label, len, entry_size) in [
-            (
-                "moss-transcribe-diarize tokenizer token map",
-                self.token_to_id.len(),
-                std::mem::size_of::<(String, u32)>(),
-            ),
-            (
-                "moss-transcribe-diarize tokenizer merge map",
-                self.merge_rank.len(),
-                std::mem::size_of::<(String, usize)>(),
-            ),
-        ] {
-            bytes.add_usize(
-                len.checked_mul(entry_size)
-                    .ok_or_else(|| format!("{label} byte count overflowed"))?,
-                label,
-            )?;
-        }
-        for key in self.token_to_id.keys().chain(self.merge_rank.keys()) {
-            bytes.add_string(key, "moss-transcribe-diarize tokenizer map key")?;
-        }
-        Ok(bytes.finish())
+        self.bpe.retained_system_memory_bytes()
     }
 
     pub(crate) fn quoted_retained_system_memory_bytes(
@@ -92,46 +56,20 @@ impl MossTdTokenizer {
         let tokens = metadata
             .get_string_array(TOKENIZER_GGML_TOKENS_KEY)
             .ok_or_else(|| {
-                tokenizer_capacity_error(format!(
-                    "metadata is missing '{TOKENIZER_GGML_TOKENS_KEY}'"
-                ))
+                tokenizer_capacity_error(
+                    MOSS_TD_TOKENIZER_FAMILY,
+                    format!("metadata is missing '{TOKENIZER_GGML_TOKENS_KEY}'"),
+                )
             })?;
         let merges = metadata
             .get_string_array(TOKENIZER_GGML_MERGES_KEY)
             .ok_or_else(|| {
-                tokenizer_capacity_error(format!(
-                    "metadata is missing '{TOKENIZER_GGML_MERGES_KEY}'"
-                ))
+                tokenizer_capacity_error(
+                    MOSS_TD_TOKENIZER_FAMILY,
+                    format!("metadata is missing '{TOKENIZER_GGML_MERGES_KEY}'"),
+                )
             })?;
-        let token_text_bytes = tokenizer_text_bytes(tokens, "tokenizer token text")?;
-        let merge_text_bytes = tokenizer_text_bytes(merges, "tokenizer merge text")?;
-        let token_text_copies = token_text_bytes.checked_mul(2).ok_or_else(|| {
-            tokenizer_capacity_error("tokenizer token text copies byte count overflowed")
-        })?;
-
-        checked_sum(
-            [
-                element_bytes::<Option<String>>(
-                    tokens.len(),
-                    MOSS_TD_TOKENIZER_FAMILY,
-                    "tokenizer id table",
-                )?,
-                element_bytes::<(String, u32)>(
-                    tokens.len(),
-                    MOSS_TD_TOKENIZER_FAMILY,
-                    "tokenizer reverse map",
-                )?,
-                token_text_copies,
-                element_bytes::<(String, usize)>(
-                    merges.len(),
-                    MOSS_TD_TOKENIZER_FAMILY,
-                    "tokenizer merge map",
-                )?,
-                merge_text_bytes,
-            ],
-            MOSS_TD_TOKENIZER_FAMILY,
-            "tokenizer retained bytes",
-        )
+        Gpt2BpeTable::quoted_retained_system_memory_bytes(tokens, merges, MOSS_TD_TOKENIZER_FAMILY)
     }
 
     pub fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
@@ -181,22 +119,16 @@ impl MossTdTokenizer {
             MOSS_TD_TOKENIZER_FAMILY,
         )?;
 
-        let id_to_token = tokens
-            .iter()
-            .map(|token| Some(token.clone()))
-            .collect::<Vec<_>>();
-        let token_to_id = build_token_to_id(tokens, MOSS_TD_TOKENIZER_FAMILY)?;
-        let merge_rank = build_merge_rank(merges);
+        let bpe = Gpt2BpeTable::from_admitted_tables(tokens, merges, MOSS_TD_TOKENIZER_FAMILY)?;
 
-        let im_start_token_id = *token_to_id.get("<|im_start|>").ok_or_else(|| {
-            NativeAsrError::UnsupportedModelPack {
-                reason: "moss-transcribe-diarize tokenizer vocab has no '<|im_start|>' entry"
-                    .to_string(),
-            }
-        })?;
+        let im_start_token_id =
+            bpe.token_id("<|im_start|>")
+                .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
+                    reason: "moss-transcribe-diarize tokenizer vocab has no '<|im_start|>' entry"
+                        .to_string(),
+                })?;
         let im_end_token_id =
-            *token_to_id
-                .get("<|im_end|>")
+            bpe.token_id("<|im_end|>")
                 .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
                     reason: "moss-transcribe-diarize tokenizer vocab has no '<|im_end|>' entry"
                         .to_string(),
@@ -204,7 +136,7 @@ impl MossTdTokenizer {
 
         let mut digit_token_ids = [0u32; 10];
         for (digit, slot) in "0123456789".chars().zip(digit_token_ids.iter_mut()) {
-            *slot = *token_to_id.get(digit.encode_utf8(&mut [0; 4]) as &str).ok_or_else(|| {
+            *slot = bpe.token_id(digit.encode_utf8(&mut [0; 4]) as &str).ok_or_else(|| {
                 NativeAsrError::UnsupportedModelPack {
                     reason: format!(
                         "moss-transcribe-diarize tokenizer vocab is missing a single-token entry for digit '{digit}'"
@@ -220,13 +152,11 @@ impl MossTdTokenizer {
             im_start_token_id,
             im_end_token_id,
         ] {
-            validate_token_id_in_range(&id_to_token, token_id)?;
+            bpe.validate_token_id(token_id)?;
         }
 
         Ok(Self {
-            id_to_token,
-            token_to_id,
-            merge_rank,
+            bpe,
             audio_start_token_id,
             audio_end_token_id,
             audio_pad_token_id,
@@ -237,58 +167,18 @@ impl MossTdTokenizer {
     }
 
     pub fn decode_text_token_ids(&self, token_ids: &[u32]) -> Result<String, NativeAsrError> {
-        let mut bytes = Vec::new();
-        for token_id in token_ids {
-            if *token_id == self.audio_start_token_id
-                || *token_id == self.audio_end_token_id
-                || *token_id == self.audio_pad_token_id
-                || *token_id == self.im_start_token_id
-                || *token_id == self.im_end_token_id
-            {
-                continue;
-            }
-            let index = usize::try_from(*token_id).map_err(|_| NativeAsrError::SessionFailed {
-                message: format!(
-                    "moss-transcribe-diarize tokenizer id {token_id} does not fit into usize"
-                ),
-            })?;
-            let Some(Some(token)) = self.id_to_token.get(index) else {
-                return Err(NativeAsrError::SessionFailed {
-                    message: format!(
-                        "moss-transcribe-diarize tokenizer id {token_id} is not in vocab"
-                    ),
-                });
-            };
-            bytes.extend(token_to_bytes(token));
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        self.bpe.decode_token_ids(token_ids, |token_id| {
+            token_id == self.audio_start_token_id
+                || token_id == self.audio_end_token_id
+                || token_id == self.audio_pad_token_id
+                || token_id == self.im_start_token_id
+                || token_id == self.im_end_token_id
+        })
     }
 
     pub fn encode_prompt_text(&self, text: &str) -> Result<Vec<u32>, NativeAsrError> {
-        encode_prompt_text(
-            text,
-            &self.token_to_id,
-            &self.merge_rank,
-            MOSS_TD_TOKENIZER_FAMILY,
-        )
+        self.bpe.encode_prompt_text(text)
     }
-}
-
-fn tokenizer_text_bytes(values: &[String], label: &str) -> Result<u64, SystemMemoryOwnerError> {
-    values.iter().try_fold(0_u64, |total, value| {
-        let length = u64::try_from(value.len())
-            .map_err(|_| tokenizer_capacity_error(format!("{label} length does not fit u64")))?;
-        total
-            .checked_add(length)
-            .ok_or_else(|| tokenizer_capacity_error(format!("{label} byte count overflowed")))
-    })
-}
-
-fn tokenizer_capacity_error(reason: impl Into<String>) -> SystemMemoryOwnerError {
-    SystemMemoryOwnerError::capacity_failure(
-        "model_runtime_memory",
-        format!("{MOSS_TD_TOKENIZER_FAMILY}: {}", reason.into()),
-    )
 }
 
 impl BuiltinSeq2SeqDecodePolicyTokenSource for MossTdTokenizer {}
@@ -303,26 +193,6 @@ impl PhraseBiasTokenEncoder for MossTdTokenizer {
     fn encode_phrase_bias_variants(&self, phrase: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
         encode_bpe_phrase_bias_variants(phrase, |text| self.encode_prompt_text(text)).map(Some)
     }
-}
-
-fn validate_token_id_in_range(
-    id_to_token: &[Option<String>],
-    token_id: u32,
-) -> Result<(), NativeAsrError> {
-    let index = usize::try_from(token_id).map_err(|_| NativeAsrError::UnsupportedModelPack {
-        reason: format!(
-            "moss-transcribe-diarize tokenizer token id {token_id} does not fit into usize"
-        ),
-    })?;
-    if index < id_to_token.len() {
-        return Ok(());
-    }
-    Err(NativeAsrError::UnsupportedModelPack {
-        reason: format!(
-            "moss-transcribe-diarize tokenizer token id {token_id} is out of range for vocab size {}",
-            id_to_token.len()
-        ),
-    })
 }
 
 #[cfg(test)]
@@ -461,8 +331,8 @@ mod tests {
 
         let metadata = GgufMetadata::from_values_for_test(values);
         let tokenizer = MossTdTokenizer::from_gguf_metadata(&metadata).expect("load tokenizer");
-        assert!(tokenizer.token_to_id.len() < tokens.len());
-        assert!(tokenizer.merge_rank.len() < merges.len());
+        assert!(tokenizer.bpe.token_count() < tokens.len());
+        assert!(tokenizer.bpe.merge_count() < merges.len());
         let actual = tokenizer
             .retained_system_memory_bytes()
             .expect("count retained tokenizer memory");

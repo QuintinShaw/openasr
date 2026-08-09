@@ -4,15 +4,10 @@
 //! `firered_llm`, and `moss_transcribe_diarize` use -- there is nothing
 //! Qwen3-specific about byte-level BPE encode/decode.
 
-use std::collections::BTreeMap;
-
 use crate::NativeAsrError;
 use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
-use crate::models::gpt2_bpe::{
-    build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
-    validate_gpt2_bpe_table_admission,
-};
+use crate::models::gpt2_bpe::{Gpt2BpeTable, validate_gpt2_bpe_table_admission};
 use crate::models::oasr_metadata::{
     TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
     required_metadata_string, required_metadata_string_array, required_metadata_u32,
@@ -29,9 +24,7 @@ const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 
 #[derive(Debug, Clone)]
 pub(crate) struct FunasrNanoTokenizer {
-    id_to_token: Vec<Option<String>>,
-    token_to_id: BTreeMap<String, u32>,
-    merge_rank: BTreeMap<String, usize>,
+    bpe: Gpt2BpeTable,
     pub chatml_im_start_token_id: u32,
     pub chatml_im_end_token_id: u32,
     pub endoftext_token_id: u32,
@@ -88,25 +81,18 @@ impl FunasrNanoTokenizer {
             FUNASR_NANO_TOKENIZER_FAMILY,
         )?;
 
-        let id_to_token = tokens
-            .iter()
-            .map(|token| Some(token.clone()))
-            .collect::<Vec<_>>();
-        let token_to_id = build_token_to_id(tokens, FUNASR_NANO_TOKENIZER_FAMILY)?;
-        let merge_rank = build_merge_rank(merges);
+        let bpe = Gpt2BpeTable::from_admitted_tables(tokens, merges, FUNASR_NANO_TOKENIZER_FAMILY)?;
 
         for token_id in [
             chatml_im_start_token_id,
             chatml_im_end_token_id,
             endoftext_token_id,
         ] {
-            validate_token_id_in_range(&id_to_token, token_id)?;
+            bpe.validate_token_id(token_id)?;
         }
 
         Ok(Self {
-            id_to_token,
-            token_to_id,
-            merge_rank,
+            bpe,
             chatml_im_start_token_id,
             chatml_im_end_token_id,
             endoftext_token_id,
@@ -114,34 +100,15 @@ impl FunasrNanoTokenizer {
     }
 
     pub fn decode_text_token_ids(&self, token_ids: &[u32]) -> Result<String, NativeAsrError> {
-        let mut bytes = Vec::new();
-        for token_id in token_ids {
-            if *token_id == self.chatml_im_start_token_id
-                || *token_id == self.chatml_im_end_token_id
-                || *token_id == self.endoftext_token_id
-            {
-                continue;
-            }
-            let index = usize::try_from(*token_id).map_err(|_| NativeAsrError::SessionFailed {
-                message: format!("Fun-ASR-Nano tokenizer id {token_id} does not fit into usize"),
-            })?;
-            let Some(Some(token)) = self.id_to_token.get(index) else {
-                return Err(NativeAsrError::SessionFailed {
-                    message: format!("Fun-ASR-Nano tokenizer id {token_id} is not in vocab"),
-                });
-            };
-            bytes.extend(token_to_bytes(token));
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        self.bpe.decode_token_ids(token_ids, |token_id| {
+            token_id == self.chatml_im_start_token_id
+                || token_id == self.chatml_im_end_token_id
+                || token_id == self.endoftext_token_id
+        })
     }
 
     pub fn encode_prompt_text(&self, text: &str) -> Result<Vec<u32>, NativeAsrError> {
-        encode_prompt_text(
-            text,
-            &self.token_to_id,
-            &self.merge_rank,
-            FUNASR_NANO_TOKENIZER_FAMILY,
-        )
+        self.bpe.encode_prompt_text(text)
     }
 }
 
@@ -157,24 +124,6 @@ impl PhraseBiasTokenEncoder for FunasrNanoTokenizer {
     fn encode_phrase_bias_variants(&self, phrase: &str) -> Result<Option<Vec<Vec<u32>>>, String> {
         encode_bpe_phrase_bias_variants(phrase, |text| self.encode_prompt_text(text)).map(Some)
     }
-}
-
-fn validate_token_id_in_range(
-    id_to_token: &[Option<String>],
-    token_id: u32,
-) -> Result<(), NativeAsrError> {
-    let index = usize::try_from(token_id).map_err(|_| NativeAsrError::UnsupportedModelPack {
-        reason: format!("Fun-ASR-Nano tokenizer token id {token_id} does not fit into usize"),
-    })?;
-    if index < id_to_token.len() {
-        return Ok(());
-    }
-    Err(NativeAsrError::UnsupportedModelPack {
-        reason: format!(
-            "Fun-ASR-Nano tokenizer token id {token_id} is out of range for vocab size {}",
-            id_to_token.len()
-        ),
-    })
 }
 
 #[cfg(test)]
