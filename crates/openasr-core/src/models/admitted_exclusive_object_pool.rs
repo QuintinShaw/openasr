@@ -698,6 +698,7 @@ mod tests {
         let second_builds = Arc::clone(&builds);
         let second_active = Arc::clone(&active_builders);
         let second_maximum = Arc::clone(&maximum_active_builders);
+        let (second_builder_entered_tx, second_builder_entered_rx) = mpsc::channel();
         let second = thread::spawn(move || {
             let checkout = second_pool
                 .checkout_or_try_build(
@@ -707,6 +708,9 @@ mod tests {
                         second_builds.fetch_add(1, Ordering::SeqCst);
                         let active = second_active.fetch_add(1, Ordering::SeqCst) + 1;
                         second_maximum.fetch_max(active, Ordering::SeqCst);
+                        second_builder_entered_tx
+                            .send(())
+                            .expect("report second builder entry");
                         thread::sleep(Duration::from_millis(10));
                         second_active.fetch_sub(1, Ordering::SeqCst);
                         Ok(owner(2, 32))
@@ -717,6 +721,9 @@ mod tests {
             drop(checkout);
         });
         let first_checkout = first.join().expect("first thread");
+        second_builder_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second builder should enter while the first checkout stays active");
         drop(first_checkout);
         second.join().expect("second thread");
         assert_eq!(maximum_active_builders.load(Ordering::SeqCst), 1);
