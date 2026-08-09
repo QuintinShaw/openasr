@@ -344,13 +344,14 @@ impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeigh
     }
 }
 
-/// Prepared per-`(pack, backend)` graph runtimes: the encoder, CTC head, and
-/// rescore decoder each keep their weights resident in a persistent
-/// WEIGHTS-usage arena (see the respective runtime types). Cached thread-local
-/// by `(PackContentKey, backend)` -- the sensevoice/moonshine prepared-runtime
-/// pattern -- so a warm request (or a streaming tick, which re-enters
-/// `execute()` per snapshot) pays zero weight re-upload: only the per-call
-/// audio features / encoder memory / token ids travel to the backend.
+/// Prepared per-`(pack content, execution lane)` graph runtimes: the encoder,
+/// CTC head, and rescore decoder each keep their weights resident in a persistent
+/// WEIGHTS-usage arena (see the respective runtime types). A finite
+/// executor-owned actor pool keys them by `(PackContentKey, ExecutionLaneKey)`
+/// and keeps the admitted host-weight lease beside the runtime, so a warm
+/// request (or a streaming tick, which re-enters `execute()` per snapshot)
+/// pays zero weight re-upload: only the per-call audio features / encoder
+/// memory / token ids travel to the backend.
 /// Residency changes no computed value; every output stays golden-identical.
 pub(crate) struct DolphinPreparedRuntime {
     backend: GgmlCpuGraphBackend,

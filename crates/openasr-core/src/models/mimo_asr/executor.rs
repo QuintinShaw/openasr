@@ -1154,9 +1154,9 @@ mod tests {
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
     }
 
-    /// Resident prepared-runtime cache regression: `execute()` twice in a row on
-    /// the same thread (same pack + backend) must hit the thread-local
-    /// `MIMO_ASR_PREPARED_BY_KEY` cache on the second call and still produce a
+    /// Resident prepared-runtime pool regression: `execute()` twice in a row
+    /// against the same pack content and execution lane must reuse the
+    /// executor-owned actor on the second call and still produce a
     /// transcript byte-identical to the first call (a cold cache-miss build) and
     /// to the dedicated single-call golden above -- the resident encoder /
     /// input-local / decoder carry no per-request state across calls that could

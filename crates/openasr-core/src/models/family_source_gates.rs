@@ -469,6 +469,16 @@ fn removed_family_architecture_apis_cannot_return() {
         "WhisperTokenizerProvider",
         "WhisperDecoderGraphRunnerGgmlV0",
         "WhisperTokenizerProviderGgufV0",
+        "GgmlAsrStreamingTranscriptDriverFactory",
+        "GgmlAsrStreamingTranscriptExecutor",
+        "MoonshineServeBatchConfigFromPolicy",
+        "XasrSelfAttentionWeightExt",
+        "FunasrNanoEncoderAdapterActorState",
+        "FunasrNanoDecoderActorState",
+        "FireRedLlmDecoderActorState",
+        "MimoAsrPreparedRuntimeActorState",
+        "GraniteSpeechPreparedRuntimeActorState",
+        "NoPhraseBiasTokenSource",
         "block_stack: None",
     ];
     let mut violations = Vec::new();

@@ -442,8 +442,8 @@ pub(crate) fn parakeet_ctc_result_to_transcription(
 }
 
 /// Dedicated GgmlAsrViewExecutor for parakeet-ctc (DedicatedRuntimeExecutorV1).
-/// Reuses a prepared runtime by `(canonical path, backend)`, runs the CTC
-/// pipeline, returns a single-segment transcription.
+/// Reuses a prepared runtime by `(PackContentKey, ExecutionLaneKey)`, runs the
+/// CTC pipeline, and returns a single-segment transcription.
 #[derive(Clone)]
 pub(crate) struct ParakeetCtcGgmlExecutor {
     runtime_pool: Arc<ParakeetCtcRuntimePool>,

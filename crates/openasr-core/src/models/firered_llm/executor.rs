@@ -964,9 +964,9 @@ mod tests {
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
     }
 
-    /// Resident decoder cache regression: calling `execute()` twice in a row
-    /// on the same thread (same pack + backend) must hit the thread-local
-    /// `FIRERED_LLM_DECODER_BY_KEY` cache on the second call and still
+    /// Resident decoder pool regression: calling `execute()` twice in a row
+    /// against the same pack content and execution lane must reuse the
+    /// executor-owned actor on the second call and still
     /// produce a byte-identical transcript to the first call and to the
     /// dedicated single-call goldens above -- the resident decoder carries no
     /// per-request state across calls that could leak into a later

@@ -2457,7 +2457,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         // This single resident graph is reused across the whole pack lifetime
         // for both prompt-prefill chunks and single-token autoregressive
-        // decode steps (`ggml_executor`'s `QWEN_WHOLE_DECODER_BY_KEY` cache);
+        // decode steps (the executor-owned resident decoder actor pool);
         // `n_threads` is fixed once here at construction, so one tier has to
         // be picked for the whole executor rather than per call. This
         // test-only numerical oracle uses the same `Decoder` tier that

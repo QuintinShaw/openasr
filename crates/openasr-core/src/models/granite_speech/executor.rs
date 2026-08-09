@@ -58,7 +58,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
-    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+    run_builtin_seq2seq_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -68,7 +68,6 @@ use crate::models::mapped_token_embedding::{
     MappedTokenEmbeddingTable, load_mapped_token_embedding_table_from_reader,
 };
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
-use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
@@ -90,8 +89,8 @@ const GRANITE_SPEECH_TOKEN_EMBEDDING: &str = "language_model.model.embed_tokens.
 /// `execute()` (a fresh runner init + `load_gguf_weight_context` +
 /// `GraniteDecoderLoadedWeights::load`, ~4.2s measured) purely to re-derive
 /// state that never changes between requests against the same pack. Mirrors
-/// `firered_llm`'s resident-decoder cache (`FIRERED_LLM_DECODER_BY_KEY`) and
-/// `mimo_asr`'s `MimoAsrPreparedRuntime`.
+/// the resident actor-pool pattern used by the other dedicated family
+/// executors.
 ///
 /// The single-runner invariant is preserved by construction: the session owns
 /// its runner and the loaded context that was built ON that runner together as
@@ -338,29 +337,16 @@ fn checked_sum_u64<const N: usize>(
 /// The pack half is a [`PackContentKey`] from the request's already-open
 /// source, so an in-place `.oasr` replacement at the same path resolves a
 /// different id and the next lookup rebuilds instead of reusing a session whose
-/// device-bound weights came from the old bytes. Entries carry the idle-unload
-/// The service root can clear or target-evict these actors directly; each actor
-/// owns its memory lease and destroys the runtime on its owner thread.
+/// device-bound weights came from the old bytes. Entries carry their admission
+/// lease. The service root can clear or target-evict these actors directly;
+/// each actor owns its memory lease and destroys the runtime on its owner thread.
 type GraniteSpeechPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-struct GraniteSpeechPreparedRuntimeActorState {
-    runtime: GraniteSpeechPreparedRuntime,
-}
-
-impl std::fmt::Debug for GraniteSpeechPreparedRuntimeActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GraniteSpeechPreparedRuntimeActorState")
-            .finish_non_exhaustive()
-    }
-}
 type GraniteSpeechPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     GraniteSpeechPreparedRuntimeCacheKey,
-    GraniteSpeechPreparedRuntimeActorState,
+    GraniteSpeechPreparedRuntime,
 >;
-type GraniteSpeechPreparedRuntimeActor = PinnedRuntimeActorCheckout<
-    GraniteSpeechPreparedRuntimeCacheKey,
-    GraniteSpeechPreparedRuntimeActorState,
->;
+type GraniteSpeechPreparedRuntimeActor =
+    PinnedRuntimeActorCheckout<GraniteSpeechPreparedRuntimeCacheKey, GraniteSpeechPreparedRuntime>;
 
 const GRANITE_SPEECH_EXECUTOR_ID: &str = crate::arch::GRANITE_SPEECH_EXECUTOR_COMPONENT_ID;
 /// Greedy decode stop token (`<|end_of_text|>` in the packed GPT-2 BPE
@@ -433,19 +419,6 @@ fn ensure_audio_within_capacity(sample_count: usize) -> Result<(), GraniteSpeech
     Ok(())
 }
 
-/// No-op phrase-bias shim: granite-speech applies keyword biasing through its
-/// own prompt convention (the `Keywords:` suffix assembled above), never the
-/// shared decode-time logit-boost path, so the registry-routed greedy loop is
-/// handed a token source that contributes nothing -- mirrors
-/// `mimo_asr::executor::NoPhraseBiasTokenSource`.
-struct NoPhraseBiasTokenSource;
-impl PhraseBiasTokenEncoder for NoPhraseBiasTokenSource {
-    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
-        Ok(None)
-    }
-}
-impl BuiltinSeq2SeqDecodePolicyTokenSource for NoPhraseBiasTokenSource {}
-
 fn map_registry_error(
     error: BuiltinDecodePolicyComponentRegistryError,
 ) -> Seq2SeqGreedyDecodeError {
@@ -457,9 +430,17 @@ fn map_registry_error(
 const GRANITE_SPEECH_RUNTIME_MAX_IDLE_ENTRIES: usize = 4;
 const GRANITE_SPEECH_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct GraniteSpeechGgmlExecutor {
     prepared_runtimes: Arc<GraniteSpeechPreparedRuntimePool>,
+}
+
+impl std::fmt::Debug for GraniteSpeechGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GraniteSpeechGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for GraniteSpeechGgmlExecutor {
@@ -514,9 +495,7 @@ impl GraniteSpeechGgmlExecutor {
                 let prepared = GraniteSpeechPreparedRuntime::build(&build_preflight, backend)?;
                 let retained = prepared.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
-                    GraniteSpeechPreparedRuntimeActorState { runtime: prepared },
-                    retained,
-                    retained,
+                    prepared, retained, retained,
                 ))
             }) {
                 Ok(owner) => Ok(owner),
@@ -583,8 +562,7 @@ impl GraniteSpeechGgmlExecutor {
             .decode_work_progress_observer()
             .cloned();
         let result = actor
-            .call_mut(move |state| {
-                let prepared = &mut state.runtime;
+            .call_mut(move |prepared| {
                 let decode_result = (|| {
                     let encoder_result =
                         prepared
@@ -669,7 +647,7 @@ impl GraniteSpeechGgmlExecutor {
                     run_builtin_seq2seq_decode_policy(
                         GRANITE_SPEECH_DECODE_POLICY_ID,
                         &decode_config,
-                        &NoPhraseBiasTokenSource,
+                        &(),
                         None,
                         &mut step_executor,
                         &decode_text_token_ids,
@@ -1264,9 +1242,9 @@ mod tests {
         );
     }
 
-    /// Resident prepared-runtime cache regression: calling `execute()` twice in
-    /// a row on the same thread (same pack + backend) MUST hit the thread-local
-    /// `GRANITE_SPEECH_PREPARED_BY_KEY` cache on the second call and still
+    /// Resident prepared-runtime pool regression: calling `execute()` twice in
+    /// a row against the same pack content and execution lane must reuse the
+    /// executor-owned actor on the second call and still
     /// produce a byte-identical transcript to the first (cache-miss/build)
     /// call. This is the load-bearing correctness gate for the resident cache:
     /// the second decode reuses a logically reset session. CPU host K/V was
