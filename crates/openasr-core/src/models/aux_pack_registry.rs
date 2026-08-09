@@ -503,6 +503,39 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_runtime_families_match_published_capability_families() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tooling/publish-model/models-core.toml");
+        let source = std::fs::read_to_string(&path).expect("read models-core.toml");
+        let catalog: toml::Value = toml::from_str(&source).expect("parse models-core.toml");
+        let published = catalog
+            .as_table()
+            .expect("models-core.toml top-level table")
+            .values()
+            .filter_map(toml::Value::as_table)
+            .filter(|entry| {
+                entry.get("kind").and_then(toml::Value::as_str) == Some("capability-pack")
+            })
+            .map(|entry| {
+                entry
+                    .get("family")
+                    .and_then(toml::Value::as_str)
+                    .expect("capability-pack family")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let runtime = AUX_PACK_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind != AuxPackKind::Translation)
+            .map(|descriptor| descriptor.catalog_family_id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            runtime, published,
+            "aux runtime and publish catalog capability-family IDs drifted apart",
+        );
+    }
+
+    #[test]
     fn every_auxiliary_quantization_contract_is_owned_by_its_descriptor() {
         for descriptor in AUX_PACK_DESCRIPTORS {
             let quantization = descriptor.quantization_classification;
