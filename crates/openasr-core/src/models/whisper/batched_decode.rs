@@ -50,27 +50,15 @@ use crate::models::serve_batch_env::{
 
 const WHISPER_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
 
-/// Field-identical alias onto the generic `ServeBatchConfig`. Preserved so
-/// `ggml_executor`'s `WhisperServeBatchConfig::from_env()` keeps compiling
-/// unchanged.
+/// Family-local name for the shared `ServeBatchConfig`.
 pub(super) type WhisperServeBatchConfig = ServeBatchConfig;
 
-/// Resolves the shared server policy without exposing the generic family marker.
-pub(super) trait WhisperServeBatchConfigFromPolicy: Sized {
-    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self>;
-    #[cfg(test)]
-    fn from_env() -> Result<Option<Self>, WhisperServeBatchError>;
-}
-
-impl WhisperServeBatchConfigFromPolicy for WhisperServeBatchConfig {
-    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self> {
-        ServeBatchConfig::from_policy::<WhisperFamily>(policy)
-    }
-
-    #[cfg(test)]
-    fn from_env() -> Result<Option<Self>, WhisperServeBatchError> {
-        ServeBatchConfig::from_test_env::<WhisperFamily>()
-    }
+/// Resolve the shared server policy while keeping the family marker private to
+/// the batched-decode module.
+pub(super) fn whisper_serve_batch_config_from_server_policy(
+    policy: ServeBatchPolicy,
+) -> Option<WhisperServeBatchConfig> {
+    ServeBatchConfig::from_policy::<WhisperFamily>(policy)
 }
 
 #[derive(Debug, Clone)]
@@ -1353,21 +1341,29 @@ mod tests {
     #[test]
     fn whisper_serve_batch_env_defaults_off() {
         with_serve_batch_env(None, || {
-            assert!(WhisperServeBatchConfig::from_env().unwrap().is_none());
+            assert!(
+                ServeBatchConfig::from_test_env::<WhisperFamily>()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn whisper_serve_batch_env_one_keeps_default_path() {
         with_serve_batch_env(Some("1"), || {
-            assert!(WhisperServeBatchConfig::from_env().unwrap().is_none());
+            assert!(
+                ServeBatchConfig::from_test_env::<WhisperFamily>()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn whisper_serve_batch_env_rejects_above_limit() {
         with_serve_batch_env(Some("9"), || {
-            let error = WhisperServeBatchConfig::from_env().unwrap_err();
+            let error = ServeBatchConfig::from_test_env::<WhisperFamily>().unwrap_err();
             assert!(error.to_string().contains("0..=8"));
         });
     }

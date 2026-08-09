@@ -73,8 +73,8 @@ use crate::{
 use crate::{GgufTensorIndexReadError, read_gguf_tensor_index_from_runtime_source};
 
 use super::batched_decode::{
-    WhisperServeBatchConfig, WhisperServeBatchConfigFromPolicy, WhisperServeBatchEngineRegistry,
-    WhisperServeBatchJob, shutdown_whisper_serve_batch_engines, submit_whisper_serve_batch_job,
+    WhisperServeBatchEngineRegistry, WhisperServeBatchJob, shutdown_whisper_serve_batch_engines,
+    submit_whisper_serve_batch_job, whisper_serve_batch_config_from_server_policy,
     whisper_serve_batch_decode_config,
 };
 #[cfg(test)]
@@ -4087,7 +4087,7 @@ fn execute_whisper_with_prepared_runtime(
     };
     let audio_duration = audio_duration_seconds(prepared_audio);
     let serve_batch_config =
-        WhisperServeBatchConfig::from_server_policy(request_options.serve_batch);
+        whisper_serve_batch_config_from_server_policy(request_options.serve_batch);
     let decoder_graph_config = whisper_decoder_graph_config(resolved_backend);
     let can_use_serve_batch = !skip_serve_batch
         && whisper_can_use_serve_batch(

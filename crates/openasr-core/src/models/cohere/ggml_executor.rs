@@ -7,8 +7,8 @@ use thiserror::Error;
 use std::path::{Path, PathBuf};
 
 use super::batched_decode::{
-    CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchEngineRegistry,
-    CohereServeBatchJob, cohere_serve_batch_decode_config,
+    CohereServeBatchEngineRegistry, CohereServeBatchJob,
+    cohere_serve_batch_config_from_server_policy, cohere_serve_batch_decode_config,
     cohere_serve_batch_text_postprocess_kind, shutdown_cohere_serve_batch_engines,
     submit_cohere_serve_batch_job,
 };
@@ -396,7 +396,7 @@ impl CohereTranscribeGgmlExecutor {
             .prefer_cpu_decoder_for_multichunk_metal;
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config =
-            CohereServeBatchConfig::from_server_policy(request.request_options.serve_batch);
+            cohere_serve_batch_config_from_server_policy(request.request_options.serve_batch);
         let decoder_config =
             cohere_decoder_graph_config(request.resolved_runtime.backend(), prefer_cpu_decoder);
         let can_use_serve_batch = !skip_serve_batch

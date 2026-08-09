@@ -141,13 +141,6 @@ pub(crate) fn serve_batch_build_identity_for_request(
     )
 }
 
-/// Supplies a verified runtime identity to cache-owning execution components.
-/// The pack resolver owns the content proof; consumers only carry it through
-/// keys and invalidate when the content id itself changes.
-pub trait RuntimeBuildIdentitySource {
-    fn runtime_build_identity(&self) -> Option<RuntimeBuildIdentity>;
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgmlAsrPreparedAudio {
     pub sample_rate_hz: u32,
@@ -725,12 +718,6 @@ pub struct GgmlAsrExecutionOptions {
     /// plumbs it here). `None` falls back to the server-side `OPENASR_ADAPTER`
     /// process environment variable.
     pub adapter_path: Option<PathBuf>,
-}
-
-impl RuntimeBuildIdentitySource for GgmlAsrExecutionOptions {
-    fn runtime_build_identity(&self) -> Option<RuntimeBuildIdentity> {
-        self.runtime_build_identity.clone()
-    }
 }
 
 impl GgmlAsrExecutionOptions {

@@ -45,28 +45,16 @@ const COHERE_SERVE_BATCH_SEND_TIMEOUT: std::time::Duration = std::time::Duration
 const COHERE_SERVE_BATCH_REPLY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
-/// Field-identical alias onto the generic `ServeBatchConfig`. Preserved so
-/// `ggml_executor`'s `CohereServeBatchConfig::from_env()` and the tests'
-/// struct-literal construction keep compiling unchanged.
+/// Family-local name for the shared `ServeBatchConfig`; owner-fixture tests
+/// use it for struct-literal construction.
 pub(super) type CohereServeBatchConfig = ServeBatchConfig;
 
-/// Lets the family executor resolve the shared server policy without exposing
-/// the generic family marker type outside this module.
-pub(super) trait CohereServeBatchConfigFromPolicy: Sized {
-    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self>;
-    #[cfg(test)]
-    fn from_env() -> Result<Option<Self>, CohereServeBatchError>;
-}
-
-impl CohereServeBatchConfigFromPolicy for CohereServeBatchConfig {
-    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self> {
-        ServeBatchConfig::from_policy::<CohereFamily>(policy)
-    }
-
-    #[cfg(test)]
-    fn from_env() -> Result<Option<Self>, CohereServeBatchError> {
-        ServeBatchConfig::from_test_env::<CohereFamily>()
-    }
+/// Resolve the shared server policy while keeping the family marker private to
+/// the batched-decode module.
+pub(super) fn cohere_serve_batch_config_from_server_policy(
+    policy: ServeBatchPolicy,
+) -> Option<CohereServeBatchConfig> {
+    ServeBatchConfig::from_policy::<CohereFamily>(policy)
 }
 
 #[derive(Debug, Clone)]
@@ -1790,14 +1778,20 @@ mod tests {
     #[test]
     fn cohere_serve_batch_env_defaults_off() {
         with_serve_batch_env(None, || {
-            assert!(CohereServeBatchConfig::from_env().unwrap().is_none());
+            assert!(
+                ServeBatchConfig::from_test_env::<CohereFamily>()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn cohere_policy_derives_width_and_queue_from_admission_limit() {
-        assert!(CohereServeBatchConfig::from_server_policy(ServeBatchPolicy::serial()).is_none());
-        let cfg = CohereServeBatchConfig::from_server_policy(ServeBatchPolicy {
+        assert!(
+            ServeBatchConfig::from_policy::<CohereFamily>(ServeBatchPolicy::serial()).is_none()
+        );
+        let cfg = ServeBatchConfig::from_policy::<CohereFamily>(ServeBatchPolicy {
             max_native_sessions: 12,
         })
         .expect("enabled");
@@ -1869,14 +1863,18 @@ mod tests {
     #[test]
     fn cohere_serve_batch_env_one_keeps_default_path() {
         with_serve_batch_env(Some("1"), || {
-            assert!(CohereServeBatchConfig::from_env().unwrap().is_none());
+            assert!(
+                ServeBatchConfig::from_test_env::<CohereFamily>()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn cohere_serve_batch_env_accepts_two_to_eight() {
         with_serve_batch_env(Some("4"), || {
-            let config = CohereServeBatchConfig::from_env()
+            let config = ServeBatchConfig::from_test_env::<CohereFamily>()
                 .unwrap()
                 .expect("enabled");
             assert_eq!(config.max_batch, 4);
@@ -1887,7 +1885,7 @@ mod tests {
     fn cohere_serve_batch_env_rejects_out_of_range() {
         with_serve_batch_env(Some("9"), || {
             assert!(matches!(
-                CohereServeBatchConfig::from_env(),
+                ServeBatchConfig::from_test_env::<CohereFamily>(),
                 Err(CohereServeBatchError::InvalidEnv { .. })
             ));
         });

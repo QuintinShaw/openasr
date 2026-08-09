@@ -479,6 +479,9 @@ fn removed_family_architecture_apis_cannot_return() {
         "MimoAsrPreparedRuntimeActorState",
         "GraniteSpeechPreparedRuntimeActorState",
         "NoPhraseBiasTokenSource",
+        "CohereServeBatchConfigFromPolicy",
+        "WhisperServeBatchConfigFromPolicy",
+        "RuntimeBuildIdentitySource",
         "block_stack: None",
     ];
     let mut violations = Vec::new();
