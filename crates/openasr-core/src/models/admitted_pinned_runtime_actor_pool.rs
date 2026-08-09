@@ -1199,10 +1199,30 @@ mod tests {
 
     #[test]
     fn final_handle_dropped_by_owner_thread_detaches_instead_of_self_joining() {
-        let drops = Arc::new(AtomicUsize::new(0));
+        struct DropNotifyingRuntime {
+            _thread_pinned: Rc<()>,
+            dropped: Option<mpsc::SyncSender<()>>,
+        }
+
+        impl Drop for DropNotifyingRuntime {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.dropped.take() {
+                    let _ = dropped.send(());
+                }
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
         let actor = PinnedRuntimeActor::spawn("pinned-self-drop-test", {
-            let drops = Arc::clone(&drops);
-            move || Ok::<_, String>(owner(1, 16, drops))
+            move || {
+                Ok::<_, String>(SystemMemoryOwner::with_committed_requested_bytes_for_test(
+                    DropNotifyingRuntime {
+                        _thread_pinned: Rc::new(()),
+                        dropped: Some(dropped_tx),
+                    },
+                    16,
+                ))
+            }
         })
         .expect("actor builds");
         let captured_final_handle = actor.clone();
@@ -1220,13 +1240,9 @@ mod tests {
         completed_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("owner-thread final drop must not self-join");
-        for _ in 0..100 {
-            if drops.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            thread::yield_now();
-        }
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued shutdown must drop the runtime on its owner thread");
     }
 
     /// The owner thread runs graph compute for whichever request currently
