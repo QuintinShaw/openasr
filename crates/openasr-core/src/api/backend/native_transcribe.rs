@@ -1707,14 +1707,36 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                 let segment_duration_s =
                     (f64::from(segment.end) - f64::from(segment.start)).max(0.0);
                 let alignment_started = Instant::now();
-                let items = session
-                    .align(prepared_audio.slice(range), &segment.text, &language)
-                    .map_err(|error| {
-                        forced_alignment_error_to_backend(
-                            execution_context,
-                            format!("segment {index}: {error}"),
-                        )
-                    })?;
+                let items = if let Some(progress) = progress {
+                    let completed_before_segment = completed_align_duration_s;
+                    let mut report_inner = |event| {
+                        let inner_fraction = forced_aligner_inner_fraction(event, backend);
+                        let stage_fraction = duration_weighted_fraction(
+                            completed_before_segment + segment_duration_s * inner_fraction,
+                            total_align_duration_s,
+                        );
+                        progress.report(
+                            stage_fraction,
+                            None,
+                            None,
+                            Some(forced_aligner_progress_detail(index, event)),
+                        );
+                    };
+                    session.align_with_progress(
+                        prepared_audio.slice(range),
+                        &segment.text,
+                        &language,
+                        &mut report_inner,
+                    )
+                } else {
+                    session.align(prepared_audio.slice(range), &segment.text, &language)
+                }
+                .map_err(|error| {
+                    forced_alignment_error_to_backend(
+                        execution_context,
+                        format!("segment {index}: {error}"),
+                    )
+                })?;
                 if execution_context.is_canceled() {
                     return Err(BackendError::TranscriptionCanceled);
                 }
@@ -1755,6 +1777,68 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         progress.complete_stage();
     }
     Ok(result)
+}
+
+/// Converts real ForcedAligner execution milestones into a calibrated share of
+/// one segment's work. Graph internals stay monolithic for peak memory and
+/// throughput; these cumulative boundaries make the observable progress less
+/// sparse without pretending to have layer-level completion signals.
+fn forced_aligner_inner_fraction(
+    event: crate::models::qwen::ForcedAlignerProgressEvent,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> f64 {
+    use crate::models::qwen::ForcedAlignerProgressEvent;
+
+    // Cumulative medians measured by `forced_aligner_aux_audio_benchmark` on
+    // the bound Q8_0 pack and 59.712 s reference fixture. CPU: mel=.01743,
+    // audio=.25288, prompt=.25467, decoder=.99134, timestamp=.99952. M1 Metal:
+    // mel=.06287, audio=.39172, prompt=.39563, decoder=.90061,
+    // timestamp=.99865. Rounded values avoid false precision while explicit
+    // `*Started` events describe monolithic graph work in flight. Unmeasured
+    // generic GPU routes retain the conservative CPU profile.
+    let (mel, audio, prompt, decoder, timestamp_span) = match backend {
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal => (0.063, 0.392, 0.396, 0.901, 0.098),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        | crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => (0.017, 0.253, 0.255, 0.991, 0.008),
+    };
+    match event {
+        ForcedAlignerProgressEvent::MelReady | ForcedAlignerProgressEvent::AudioEncodingStarted => {
+            mel
+        }
+        ForcedAlignerProgressEvent::AudioEncoded => audio,
+        ForcedAlignerProgressEvent::PromptPrepared
+        | ForcedAlignerProgressEvent::DecoderPrefillStarted => prompt,
+        ForcedAlignerProgressEvent::DecoderPrefilled
+        | ForcedAlignerProgressEvent::TimestampLogitsStarted { .. } => decoder,
+        ForcedAlignerProgressEvent::TimestampLogits { completed, total } => {
+            decoder + timestamp_span * f64::from(completed_work_fraction(completed, total))
+        }
+        ForcedAlignerProgressEvent::Finalized => 1.0,
+    }
+}
+
+fn forced_aligner_progress_detail(
+    segment_index: usize,
+    event: crate::models::qwen::ForcedAlignerProgressEvent,
+) -> String {
+    use crate::models::qwen::ForcedAlignerProgressEvent;
+
+    let phase = match event {
+        ForcedAlignerProgressEvent::MelReady => "mel_ready".to_string(),
+        ForcedAlignerProgressEvent::AudioEncodingStarted => "audio_encoding".to_string(),
+        ForcedAlignerProgressEvent::AudioEncoded => "audio_encoded".to_string(),
+        ForcedAlignerProgressEvent::PromptPrepared => "prompt_prepared".to_string(),
+        ForcedAlignerProgressEvent::DecoderPrefillStarted => "decoder_prefill".to_string(),
+        ForcedAlignerProgressEvent::DecoderPrefilled => "decoder_prefilled".to_string(),
+        ForcedAlignerProgressEvent::TimestampLogitsStarted { total } => {
+            format!("timestamp_logits:0/{total}")
+        }
+        ForcedAlignerProgressEvent::TimestampLogits { completed, total } => {
+            format!("timestamp_logits:{completed}/{total}")
+        }
+        ForcedAlignerProgressEvent::Finalized => "finalized".to_string(),
+    };
+    format!("forced_aligner segment={segment_index} phase={phase}")
 }
 
 fn forced_alignment_error_to_backend(
@@ -4875,6 +4959,68 @@ mod tests {
                 "embedding completion leaves an explicit clustering tail"
             );
         }
+    }
+
+    #[test]
+    fn forced_aligner_milestones_are_monotonic_and_fill_one_segment_window() {
+        use crate::models::qwen::ForcedAlignerProgressEvent;
+
+        let events = [
+            ForcedAlignerProgressEvent::MelReady,
+            ForcedAlignerProgressEvent::AudioEncodingStarted,
+            ForcedAlignerProgressEvent::AudioEncoded,
+            ForcedAlignerProgressEvent::PromptPrepared,
+            ForcedAlignerProgressEvent::DecoderPrefillStarted,
+            ForcedAlignerProgressEvent::DecoderPrefilled,
+            ForcedAlignerProgressEvent::TimestampLogitsStarted { total: 4 },
+            ForcedAlignerProgressEvent::TimestampLogits {
+                completed: 1,
+                total: 4,
+            },
+            ForcedAlignerProgressEvent::TimestampLogits {
+                completed: 4,
+                total: 4,
+            },
+            ForcedAlignerProgressEvent::Finalized,
+        ];
+        for backend in [
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        ] {
+            let inner: Vec<f64> = events
+                .iter()
+                .copied()
+                .map(|event| forced_aligner_inner_fraction(event, backend))
+                .collect();
+            assert!(inner.windows(2).all(|pair| pair[1] >= pair[0]));
+            assert_eq!(inner.last().copied(), Some(1.0));
+
+            let completed_before = 10.0;
+            let segment_duration = 20.0;
+            let total_duration = 50.0;
+            let stage: Vec<f32> = inner
+                .into_iter()
+                .map(|fraction| {
+                    duration_weighted_fraction(
+                        completed_before + segment_duration * fraction,
+                        total_duration,
+                    )
+                })
+                .collect();
+            assert!(stage.windows(2).all(|pair| pair[1] >= pair[0]));
+            assert!((stage.last().copied().unwrap() - 0.6).abs() < 1e-6);
+        }
+        assert_eq!(
+            forced_aligner_progress_detail(
+                3,
+                ForcedAlignerProgressEvent::TimestampLogits {
+                    completed: 2,
+                    total: 4,
+                },
+            ),
+            "forced_aligner segment=3 phase=timestamp_logits:2/4"
+        );
     }
 
     #[test]

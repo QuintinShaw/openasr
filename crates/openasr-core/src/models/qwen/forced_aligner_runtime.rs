@@ -280,6 +280,26 @@ pub(crate) struct ForcedAlignItem {
     pub end_time_s: f64,
 }
 
+/// Honest request-local milestones exposed by the NAR alignment pipeline.
+///
+/// The audio encoder and decoder each execute as one backend graph, so there
+/// is no truthful layer-level signal while either graph is in flight. These
+/// events sit only on already-existing ownership boundaries and in the
+/// timestamp-head loop; observers never enter model math or outlive a single
+/// synchronous [`align_forced_with_progress`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedAlignerProgressEvent {
+    MelReady,
+    AudioEncodingStarted,
+    AudioEncoded,
+    PromptPrepared,
+    DecoderPrefillStarted,
+    DecoderPrefilled,
+    TimestampLogitsStarted { total: usize },
+    TimestampLogits { completed: usize, total: usize },
+    Finalized,
+}
+
 /// Assembles the aligner's decode prompt directly from BPE-encoded pieces
 /// (rather than literally concatenating a Python-style string and
 /// re-tokenizing it): the shared `encode_prompt_text` special-token matcher
@@ -420,13 +440,40 @@ pub(crate) fn align_forced(
     language: &str,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
+    align_forced_with_progress(
+        preflight,
+        assets,
+        audio_samples_16khz_mono,
+        text,
+        language,
+        backend,
+        None,
+    )
+}
+
+pub(crate) fn align_forced_with_progress(
+    preflight: &GgufRuntimeSourcePreflight,
+    assets: &Qwen3ForcedAlignerPreparedAssets,
+    audio_samples_16khz_mono: crate::PcmSlice,
+    text: &str,
+    language: &str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    mut observer: Option<&mut dyn FnMut(ForcedAlignerProgressEvent)>,
+) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
+    let mut report = |event| {
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(event);
+        }
+    };
     let word_list = word_list_for_language(text, language)?;
 
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let prepared_audio = forced_aligner_prepared_audio(audio_samples_16khz_mono);
     let mel_features =
         qwen3_mel_features_from_prepared_audio(&prepared_audio, &assets.mel_frontend_plan)?;
+    report(ForcedAlignerProgressEvent::MelReady);
 
+    report(ForcedAlignerProgressEvent::AudioEncodingStarted);
     let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backend)
         .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
             reason: format!("audio encoder runtime init failed: {error}"),
@@ -438,6 +485,7 @@ pub(crate) fn align_forced(
             &mel_features,
         )
         .map_err(Qwen3ForcedAlignerRuntimeError::AudioEncoderFailed)?;
+    report(ForcedAlignerProgressEvent::AudioEncoded);
     // The encoder graph and mel input are not needed by the LLM stage. Release
     // and drop them before constructing its much larger graph so the two
     // stages do not overlap in the request's peak working set.
@@ -466,7 +514,9 @@ pub(crate) fn align_forced(
     )?;
     let prefill_input = build_qwen3_llm_prefill_input(prompt_embeddings)?;
     drop(audio_embeddings);
+    report(ForcedAlignerProgressEvent::PromptPrepared);
 
+    report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
     let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
         &assets.decoder_plan,
         preflight,
@@ -485,6 +535,7 @@ pub(crate) fn align_forced(
         .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
             reason: error.to_string(),
         })?;
+    report(ForcedAlignerProgressEvent::DecoderPrefilled);
 
     let hidden_size = prefill_input.hidden_size;
     let expected_timestamp_positions = word_list.len() * 2;
@@ -499,7 +550,14 @@ pub(crate) fn align_forced(
     }
 
     let mut raw_timestamps_ms = Vec::with_capacity(timestamp_positions.len());
-    for &position in &timestamp_positions {
+    // UI polling is much slower than one head projection. Cap observer calls
+    // at sixteen batches per segment so progress stays smooth without adding
+    // one registry lock per word boundary on long transcripts.
+    report(ForcedAlignerProgressEvent::TimestampLogitsStarted {
+        total: timestamp_positions.len(),
+    });
+    let timestamp_report_stride = timestamp_positions.len().div_ceil(16).max(1);
+    for (index, &position) in timestamp_positions.iter().enumerate() {
         let start = position * hidden_size;
         let end = start + hidden_size;
         let hidden_row = &prefill_output.hidden[start..end];
@@ -507,6 +565,15 @@ pub(crate) fn align_forced(
             logits_runtime.compute_top1_token_for_last_hidden(&assets.logits_head, hidden_row)?;
         raw_timestamps_ms
             .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
+        let completed = index + 1;
+        if completed == timestamp_positions.len()
+            || completed.is_multiple_of(timestamp_report_stride)
+        {
+            report(ForcedAlignerProgressEvent::TimestampLogits {
+                completed,
+                total: timestamp_positions.len(),
+            });
+        }
     }
 
     let fixed_ms = fix_timestamp(&raw_timestamps_ms)?;
@@ -521,6 +588,7 @@ pub(crate) fn align_forced(
             end_time_s: round_to_millis(end_ms as f64 / 1000.0),
         });
     }
+    report(ForcedAlignerProgressEvent::Finalized);
     Ok(items)
 }
 
@@ -597,6 +665,24 @@ impl Qwen3ForcedAlignerSession {
             self.backend,
         )
     }
+
+    pub(crate) fn align_with_progress(
+        &self,
+        audio_samples_16khz_mono: crate::PcmSlice,
+        text: &str,
+        language: &str,
+        observer: &mut dyn FnMut(ForcedAlignerProgressEvent),
+    ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
+        align_forced_with_progress(
+            self.verified.preflight(),
+            &self.assets,
+            audio_samples_16khz_mono,
+            text,
+            language,
+            self.backend,
+            Some(observer),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -661,13 +747,40 @@ mod tests {
         };
 
         let mut items = run();
-        let seconds = (0..5)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                items = run();
-                started.elapsed().as_secs_f64()
-            })
-            .collect::<Vec<_>>();
+        let mut seconds = Vec::with_capacity(5);
+        let mut phase_samples: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::with_capacity(5));
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let mut phase_seconds = [None; 6];
+            let mut observer = |event| {
+                let phase = match event {
+                    ForcedAlignerProgressEvent::MelReady => Some(0),
+                    ForcedAlignerProgressEvent::AudioEncoded => Some(1),
+                    ForcedAlignerProgressEvent::PromptPrepared => Some(2),
+                    ForcedAlignerProgressEvent::DecoderPrefilled => Some(3),
+                    ForcedAlignerProgressEvent::TimestampLogits { completed, total }
+                        if completed == total =>
+                    {
+                        Some(4)
+                    }
+                    ForcedAlignerProgressEvent::Finalized => Some(5),
+                    ForcedAlignerProgressEvent::AudioEncodingStarted
+                    | ForcedAlignerProgressEvent::DecoderPrefillStarted
+                    | ForcedAlignerProgressEvent::TimestampLogitsStarted { .. }
+                    | ForcedAlignerProgressEvent::TimestampLogits { .. } => None,
+                };
+                if let Some(phase) = phase {
+                    phase_seconds[phase] = Some(started.elapsed().as_secs_f64());
+                }
+            };
+            items = session
+                .align_with_progress(pcm.full_slice(), text, &language, &mut observer)
+                .expect("align benchmark audio with progress");
+            seconds.push(started.elapsed().as_secs_f64());
+            for (sample, phase_seconds) in phase_samples.iter_mut().zip(phase_seconds) {
+                sample.push(phase_seconds.expect("benchmark must report every phase"));
+            }
+        }
         assert!(!items.is_empty(), "benchmark alignment must emit items");
         let mut output_bytes = Vec::new();
         for item in &items {
@@ -678,8 +791,12 @@ mod tests {
         }
         let output_sha256 = crate::testing::benchmark_sha256_bytes([output_bytes]);
         let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+        let phase_cumulative_median_seconds =
+            phase_samples.map(|samples| crate::testing::benchmark_median_seconds(samples).0);
+        let phase_cumulative_fraction =
+            phase_cumulative_median_seconds.map(|seconds| seconds / median_seconds);
         eprintln!(
-            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} items={} output_sha256={output_sha256} runs={seconds:?}",
+            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
             median_seconds / audio_seconds,
             items.len(),
         );
