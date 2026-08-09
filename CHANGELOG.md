@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Subtitles: transcription results now keep readable paragraphs separate from
+  short subtitle cues. JSON responses expose `subtitle_cues` and
+  `timeline_quality`; SRT/VTT render the cue view. The server also provides
+  `POST /v1/audio/precise-timeline` to refine an existing transcript against
+  its source audio when the Qwen3 Forced Aligner capability pack is installed.
+- CLI: `openasr bench-receipt short-audio` writes a machine-readable receipt
+  for a measured short-audio run, binding the report to the selected pack,
+  source audio, runtime settings, and recorded measurements.
 - Voice ID: local file transcription now has one model-independent speaker
   pipeline. `moss-transcribe-diarize` keeps its in-decoder speaker turns; every
   other ASR family uses the shared FireRed Stream-VAD + speaker-segmenter +
@@ -36,6 +44,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: built-in model families now share the runtime admission, resource
+  ownership, request-progress, and importer/tokenizer building blocks while
+  retaining their family-specific graph and decode behavior.
+- Core: scheduler-backed graph stages release their completed transient working
+  sets before the next stage is admitted. DiariZen persistent graphs and
+  Qwen3 Forced Aligner prefill also use bounded-liveness allocation paths.
 - Voice ID: ReDimNet2-B6 now embeds independent speech windows through the
   ordered batch seam, reuses content-keyed resident runtimes, and freezes one
   exact pack snapshot for the entire request. Parallel work preserves input
@@ -61,6 +75,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `ggml`: unsupported Metal flash-attention head widths now select the existing
+  non-flash attention path before graph construction instead of failing the
+  request.
+- Server: native boot warm-up preserves the first causal failure in its startup
+  diagnostic instead of wrapping it in later generic errors.
+- Core: MOSS decoder admission derives its actor memory quote from the prepared
+  decoder plan, keeping the preflight estimate aligned with the graph it will
+  execute.
 - Voice ID: external diarization now treats the recording-wide speaker timeline
   as the shared source of truth for both transcript attribution and enrolled
   identity matching. Coarse ASR segments that cross speaker changes are split

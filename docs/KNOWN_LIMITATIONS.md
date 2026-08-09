@@ -5,10 +5,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
 
 ## Current limitations
 
-- OpenASR is Apache-2.0 open core, but there is no public binary release yet: no
-  published binaries/installers/checksums, and no package-manager channels. Build
-  from source meanwhile. Public model-pack distribution is limited to catalog
-  entries explicitly marked `public:true`.
+- OpenASR publishes binary archives and SHA-256 checksums for macOS, Linux, and
+  Windows on [GitHub Releases](https://github.com/QuintinShaw/openasr/releases).
+  There are no package-manager channels yet; building from source remains
+  supported. Public model-pack distribution is limited to catalog entries
+  explicitly marked `public:true`.
 - The only executable backends are the default `native` and the opt-in `mock`
   stub. Native transcription runs offline from `.oasr` runtime packs -- a pinned
   `--model-pack`, an installed pack, or one the CLI installs on first use through
