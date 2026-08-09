@@ -94,22 +94,10 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// accounts backend buffers in their physical memory domain.
 type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey);
 
-struct FireRedLlmDecoderActorState {
-    runtime: FireRedLlmDecoderRuntime,
-}
-
-impl std::fmt::Debug for FireRedLlmDecoderActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FireRedLlmDecoderActorState")
-            .finish_non_exhaustive()
-    }
-}
-
 type FireRedLlmDecoderRuntimePool =
-    AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
+    AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
 type FireRedLlmDecoderRuntimeActor =
-    PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderActorState>;
+    PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
 
 const FIRERED_LLM_EXECUTOR_ID: &str = crate::arch::FIRERED_LLM_EXECUTOR_COMPONENT_ID;
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
@@ -167,9 +155,17 @@ enum FireRedLlmExecutorError {
 const FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const FIRERED_LLM_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct FireRedLlmGgmlExecutor {
     decoder_runtimes: Arc<FireRedLlmDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for FireRedLlmGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FireRedLlmGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for FireRedLlmGgmlExecutor {
@@ -349,9 +345,7 @@ impl FireRedLlmGgmlExecutor {
                         }
                     })?;
                     Ok(SystemMemoryAllocationOutcome::new(
-                        FireRedLlmDecoderActorState { runtime },
-                        retained,
-                        retained,
+                        runtime, retained, retained,
                     ))
                 }) {
                     Ok(owner) => Ok(owner),
@@ -544,8 +538,7 @@ impl FireRedLlmGgmlExecutor {
             .cloned();
         let profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
         let result = decoder_actor
-            .call_mut(move |state| {
-                let decoder = &mut state.runtime;
+            .call_mut(move |decoder| {
                 if profile_enabled {
                     eprintln!(
                         "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
@@ -611,7 +604,7 @@ impl FireRedLlmGgmlExecutor {
                 );
                 // CPU step buffers are invocation-scoped. Native weights and
                 // the stable resident arena remain with this actor.
-                state.runtime.release_session_scoped_buffers();
+                decoder.release_session_scoped_buffers();
                 decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
                     reason: error.to_string(),
                 })

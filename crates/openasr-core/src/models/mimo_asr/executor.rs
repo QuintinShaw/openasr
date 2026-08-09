@@ -155,31 +155,25 @@ struct MimoAsrPreparedRuntime {
 /// destroyed on the same owner thread that constructed its native contexts.
 type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 
-struct MimoAsrPreparedRuntimeActorState {
-    runtime: MimoAsrPreparedRuntime,
-}
-
-impl std::fmt::Debug for MimoAsrPreparedRuntimeActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MimoAsrPreparedRuntimeActorState")
-            .finish_non_exhaustive()
-    }
-}
-
-type MimoAsrPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
-    MimoAsrPreparedRuntimeCacheKey,
-    MimoAsrPreparedRuntimeActorState,
->;
+type MimoAsrPreparedRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
 type MimoAsrPreparedRuntimeActor =
-    PinnedRuntimeActorCheckout<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntimeActorState>;
+    PinnedRuntimeActorCheckout<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
 
 const MIMO_ASR_RUNTIME_MAX_IDLE_ENTRIES: usize = 2;
 const MIMO_ASR_RUNTIME_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct MimoAsrGgmlExecutor {
     prepared_runtimes: Arc<MimoAsrPreparedRuntimePool>,
+}
+
+impl std::fmt::Debug for MimoAsrGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MimoAsrGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MimoAsrGgmlExecutor {
@@ -582,9 +576,7 @@ impl MimoAsrGgmlExecutor {
                 let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend)?;
                 let retained = runtime.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
-                    MimoAsrPreparedRuntimeActorState { runtime },
-                    retained,
-                    retained,
+                    runtime, retained, retained,
                 ))
             }) {
                 Ok(owner) => Ok(owner),
@@ -644,16 +636,16 @@ impl MimoAsrGgmlExecutor {
             .decode_work_progress_observer()
             .cloned();
         let result = actor
-            .call_mut(move |state| {
+            .call_mut(move |runtime| {
                 let result = Self::transcribe_with_prepared(
-                    &mut state.runtime,
+                    runtime,
                     samples,
                     input_rate,
                     kv_capacity,
                     control,
                     decode_work_progress,
                 );
-                state.runtime.decoder.release_session_scoped_buffers();
+                runtime.decoder.release_session_scoped_buffers();
                 result
             })
             .map_err(Self::map_actor_error)??;

@@ -88,44 +88,20 @@ struct FunasrNanoEncoderAdapterRuntime {
     adapter: FunasrNanoAdapterGraph,
 }
 
-struct FunasrNanoEncoderAdapterActorState {
-    runtime: FunasrNanoEncoderAdapterRuntime,
-}
-
-struct FunasrNanoDecoderActorState {
-    runtime: FunasrNanoDecoderRuntime,
-}
-
-impl std::fmt::Debug for FunasrNanoEncoderAdapterActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FunasrNanoEncoderAdapterActorState")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for FunasrNanoDecoderActorState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FunasrNanoDecoderActorState")
-            .finish_non_exhaustive()
-    }
-}
-
 type FunasrNanoEncoderAdapterRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     FunasrNanoEncoderAdapterRuntimeCacheKey,
-    FunasrNanoEncoderAdapterActorState,
+    FunasrNanoEncoderAdapterRuntime,
 >;
 type FunasrNanoDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     FunasrNanoDecoderRuntimeCacheKey,
-    FunasrNanoDecoderActorState,
+    FunasrNanoDecoderRuntime,
 >;
 type FunasrNanoEncoderAdapterRuntimeActor = PinnedRuntimeActorCheckout<
     FunasrNanoEncoderAdapterRuntimeCacheKey,
-    FunasrNanoEncoderAdapterActorState,
+    FunasrNanoEncoderAdapterRuntime,
 >;
 type FunasrNanoDecoderRuntimeActor =
-    PinnedRuntimeActorCheckout<FunasrNanoDecoderRuntimeCacheKey, FunasrNanoDecoderActorState>;
+    PinnedRuntimeActorCheckout<FunasrNanoDecoderRuntimeCacheKey, FunasrNanoDecoderRuntime>;
 
 #[derive(Debug, Error)]
 enum FunasrNanoExecutorError {
@@ -166,10 +142,18 @@ enum FunasrNanoExecutorError {
 const FUNASR_NANO_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const FUNASR_NANO_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct FunasrNanoGgmlExecutor {
     encoder_adapter_runtimes: Arc<FunasrNanoEncoderAdapterRuntimePool>,
     decoder_runtimes: Arc<FunasrNanoDecoderRuntimePool>,
+}
+
+impl std::fmt::Debug for FunasrNanoGgmlExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FunasrNanoGgmlExecutor")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for FunasrNanoGgmlExecutor {
@@ -324,9 +308,7 @@ impl FunasrNanoGgmlExecutor {
                     reason: error.to_string(),
                 })?;
                 Ok(SystemMemoryOwner::without_allocation(
-                    FunasrNanoEncoderAdapterActorState {
-                        runtime: FunasrNanoEncoderAdapterRuntime { encoder, adapter },
-                    },
+                    FunasrNanoEncoderAdapterRuntime { encoder, adapter },
                 ))
             },
             |error| Self::map_actor_error("encoder-adapter", error),
@@ -348,13 +330,13 @@ impl FunasrNanoGgmlExecutor {
             backend,
         )?;
         actor
-            .call_mut(move |state| {
-                let encode_result = state.runtime.encoder.encode(
+            .call_mut(move |runtime| {
+                let encode_result = runtime.encoder.encode(
                     &encoder_input.data,
                     encoder_input.n_frames,
                     encoder_input.feature_dim,
                 );
-                let encoder_release = state.runtime.encoder.release_transient_compute_memory();
+                let encoder_release = runtime.encoder.release_transient_compute_memory();
                 let encoder_output = match (encode_result, encoder_release) {
                     (Ok(output), Ok(())) => output,
                     (Err(error), _) | (Ok(_), Err(error)) => {
@@ -363,12 +345,12 @@ impl FunasrNanoGgmlExecutor {
                         });
                     }
                 };
-                let adapter_result = state.runtime.adapter.run(
+                let adapter_result = runtime.adapter.run(
                     &encoder_output.rows,
                     encoder_output.frame_count,
                     encoder_output.d_model,
                 );
-                let adapter_release = state.runtime.adapter.release_transient_compute_memory();
+                let adapter_release = runtime.adapter.release_transient_compute_memory();
                 let (adapter_rows, adapter_frames) = match (adapter_result, adapter_release) {
                     (Ok(output), Ok(())) => output,
                     (Err(error), _) | (Ok(_), Err(error)) => {
@@ -467,9 +449,7 @@ impl FunasrNanoGgmlExecutor {
                         }
                     })?;
                     Ok(SystemMemoryAllocationOutcome::new(
-                        FunasrNanoDecoderActorState { runtime },
-                        retained,
-                        retained,
+                        runtime, retained, retained,
                     ))
                 },
             ) {
@@ -613,9 +593,9 @@ impl FunasrNanoGgmlExecutor {
             .decode_work_progress_observer()
             .cloned();
         let result = decoder_actor
-            .call_mut(move |state| {
+            .call_mut(move |runtime| {
                 let result = decode_with_decoder(
-                    &mut state.runtime,
+                    runtime,
                     &decoder_metadata,
                     &decode_prompt,
                     &speech_rows,
@@ -624,7 +604,7 @@ impl FunasrNanoGgmlExecutor {
                     &decoder_control,
                     decoder_decode_work_progress.as_ref(),
                 );
-                state.runtime.release_session_scoped_buffers();
+                runtime.release_session_scoped_buffers();
                 result
             })
             .map_err(|error| Self::map_actor_error("decoder", error))??;
