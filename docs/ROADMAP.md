@@ -4,8 +4,10 @@ This file is the source of truth for OpenASR sequencing. Implemented status is
 the [Implemented baseline](#implemented-baseline) section below.
 
 OpenASR is licensed under Apache-2.0 and maintained as the public open core.
-Public binary-release readiness (signed/checksummed release artifacts and
-package-manager channels) is still deferred; build from source meanwhile.
+Versioned binary archives and SHA-256 checksums are published through
+[GitHub Releases](https://github.com/QuintinShaw/openasr/releases).
+Package-manager channels remain deferred; building from source remains
+supported.
 
 ## Implemented baseline
 
@@ -77,8 +79,8 @@ These were prior roadmap goals and are now shipped on the native runtime path:
 
 ## Deferred
 
-- Public binary-release readiness (signed/checksummed release artifacts, package channels).
-- Production distribution channels.
+- Package-manager integrations and additional production distribution channels
+  beyond GitHub Releases and Docker Hub.
 - Public true-streaming release guarantees, official streaming-enabled pack
   publication, and broad multilingual feature claims.
 
