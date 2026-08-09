@@ -361,6 +361,7 @@ run_openasr() {
     -u HUGGINGFACE_HUB_TOKEN \
     -u HUGGING_FACE_HUB_TOKEN \
     OPENASR_HOME="${openasr_home}" \
+    OPENASR_MODELS_DIR="${openasr_home}/models" \
     OPENASR_GGML_BACKEND="${ggml_backend}" \
     "${openasr_bin}" "$@"
 }
@@ -378,19 +379,8 @@ pack_file="$(basename "${pack_path}")"
 pack_sha256="$(shasum -a 256 "${pack_path}" | awk '{ print $1 }')"
 pack_size_bytes="$(wc -c < "${pack_path}" | tr -d '[:space:]')"
 
-python3 - "${openasr_home}" "${pack_path}" <<'PY'
-import sys
-from pathlib import Path
-
-home = Path(sys.argv[1]).resolve()
-pack = Path(sys.argv[2]).resolve()
-try:
-    pack.relative_to(home)
-except ValueError:
-    raise SystemExit(f"installed pack is outside OPENASR_HOME: {pack}")
-if pack.suffix != ".oasr":
-    raise SystemExit(f"installed pack is not a .oasr file: {pack}")
-PY
+python3 "${script_dir}/installed_pack_path.py" \
+  "${openasr_home}" "${pack_path}" "${pack_sha256}"
 
 echo "Transcribing with installed pack..."
 run_openasr transcribe "${audio}" \

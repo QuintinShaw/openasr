@@ -8,7 +8,10 @@ CI can keep the helper safe without doing network I/O.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -17,12 +20,26 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_SH = REPO_ROOT / "tooling" / "public-hf-e2e" / "run.sh"
+PACK_PATH_HELPER = REPO_ROOT / "tooling" / "public-hf-e2e" / "installed_pack_path.py"
+
+PACK_PATH_SPEC = importlib.util.spec_from_file_location(
+    "installed_pack_path", PACK_PATH_HELPER
+)
+assert PACK_PATH_SPEC is not None and PACK_PATH_SPEC.loader is not None
+installed_pack_path = importlib.util.module_from_spec(PACK_PATH_SPEC)
+PACK_PATH_SPEC.loader.exec_module(installed_pack_path)
 
 
-def run_helper(*args: str) -> subprocess.CompletedProcess[str]:
+def run_helper(
+    *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    command_env = os.environ.copy()
+    if env is not None:
+        command_env.update(env)
     return subprocess.run(
         [str(RUN_SH), *args],
         cwd=REPO_ROOT,
+        env=command_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -31,6 +48,147 @@ def run_helper(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PublicHfE2ETests(unittest.TestCase):
+    def test_installed_pack_path_accepts_legacy_oasr_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            pack = home / "models" / "legacy" / "pack.oasr"
+            pack.parent.mkdir(parents=True)
+            pack.write_bytes(b"legacy pack")
+            digest = hashlib.sha256(pack.read_bytes()).hexdigest()
+
+            installed_pack_path.validate_installed_pack_path(
+                str(home), str(pack), digest
+            )
+
+    def test_installed_pack_path_accepts_content_addressed_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            payload = b"content addressed pack"
+            digest = hashlib.sha256(payload).hexdigest()
+            pack = home / "models" / "objects" / "sha256" / digest / "content"
+            pack.parent.mkdir(parents=True)
+            pack.write_bytes(payload)
+
+            installed_pack_path.validate_installed_pack_path(
+                str(home), str(pack), digest
+            )
+
+    def test_installed_pack_path_rejects_content_object_with_wrong_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            payload = b"content addressed pack"
+            digest = hashlib.sha256(payload).hexdigest()
+            wrong_digest = hashlib.sha256(b"other pack").hexdigest()
+            pack = home / "models" / "objects" / "sha256" / wrong_digest / "content"
+            pack.parent.mkdir(parents=True)
+            pack.write_bytes(payload)
+
+            with self.assertRaisesRegex(ValueError, "canonical content-addressed"):
+                installed_pack_path.validate_installed_pack_path(
+                    str(home), str(pack), digest
+                )
+
+    def test_installed_pack_path_rejects_content_file_outside_canonical_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            payload = b"content addressed pack"
+            digest = hashlib.sha256(payload).hexdigest()
+            pack = home / "models" / "objects" / "sha256" / "content"
+            pack.parent.mkdir(parents=True)
+            pack.write_bytes(payload)
+
+            with self.assertRaisesRegex(ValueError, "canonical content-addressed"):
+                installed_pack_path.validate_installed_pack_path(
+                    str(home), str(pack), digest
+                )
+
+    def test_installed_pack_path_rejects_file_outside_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            pack = root / "outside.oasr"
+            pack.write_bytes(b"outside")
+            digest = hashlib.sha256(pack.read_bytes()).hexdigest()
+
+            with self.assertRaisesRegex(ValueError, "outside OPENASR_HOME"):
+                installed_pack_path.validate_installed_pack_path(
+                    str(home), str(pack), digest
+                )
+
+    def test_installed_pack_path_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            payload = b"outside content addressed pack"
+            digest = hashlib.sha256(payload).hexdigest()
+            outside = root / "outside-content"
+            outside.write_bytes(payload)
+            pack = home / "models" / "objects" / "sha256" / digest / "content"
+            pack.parent.mkdir(parents=True)
+            pack.symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, "outside OPENASR_HOME"):
+                installed_pack_path.validate_installed_pack_path(
+                    str(home), str(pack), digest
+                )
+
+    def test_runner_ignores_inherited_models_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workdir = root / "work"
+            inherited_models = root / "host-models"
+            capture = root / "models-dir.txt"
+            fake_openasr = root / "openasr"
+            fake_openasr.write_text(
+                """#!/usr/bin/env python3
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+models_dir = Path(os.environ["OPENASR_MODELS_DIR"])
+Path(os.environ["FAKE_OPENASR_ENV_CAPTURE"]).write_text(
+    str(models_dir), encoding="utf-8"
+)
+if sys.argv[1] == "pull":
+    payload = b"fake public pack"
+    digest = hashlib.sha256(payload).hexdigest()
+    pack = models_dir / "objects" / "sha256" / digest / "content"
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_bytes(payload)
+    print(f"installed\\tfake\\tq8\\t{pack}")
+elif sys.argv[1] == "transcribe":
+    output = Path(sys.argv[sys.argv.index("--output") + 1])
+    output.write_text("And so my fellow Americans ask not", encoding="utf-8")
+else:
+    raise SystemExit(f"unexpected command: {sys.argv[1]}")
+""",
+                encoding="utf-8",
+            )
+            fake_openasr.chmod(0o755)
+
+            result = run_helper(
+                "--bin",
+                str(fake_openasr),
+                "--workdir",
+                str(workdir),
+                "--catalog-url",
+                "model-registry/catalog.json",
+                env={
+                    "OPENASR_MODELS_DIR": str(inherited_models),
+                    "FAKE_OPENASR_ENV_CAPTURE": str(capture),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                Path(capture.read_text(encoding="utf-8")),
+                workdir / "openasr-home" / "models",
+            )
+            self.assertFalse(inherited_models.exists())
+
     def test_dry_run_summary_is_redacted_and_structured(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             summary_json = Path(temp) / "nested" / "summary.json"
