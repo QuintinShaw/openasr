@@ -59,7 +59,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -68,12 +68,12 @@ use crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID;
 use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
 };
-use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::models::local_source_import::{
-    LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
-    decode_safetensors_payload_as_f32, encode_f16_bits_le, load_gpt2_bpe_merges,
-    load_gpt2_bpe_vocab_tokens, pad_gpt2_bpe_vocab_tokens, read_source_json_file,
-    tensor_element_count, validate_error, validate_output_pack_extension,
+    LocalSourceImportError, SafetensorsFile, build_kaldi_mel_filterbank_tensor,
+    decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32, encode_f16_bits_le,
+    load_gpt2_bpe_merges, load_gpt2_bpe_vocab_tokens, pad_gpt2_bpe_vocab_tokens,
+    parse_kaldi_cmvn_stats, read_source_json_file, tensor_element_count, validate_error,
+    validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{OasrPackWriter, PackEnvelope};
 use crate::models::pack_quant::{
@@ -114,10 +114,6 @@ const SPEECH_TOKEN_TEXT: &str = "<speech>";
 const CHATML_IM_START_TOKEN_ID: u32 = 151_644;
 const CHATML_IM_END_TOKEN_ID: u32 = 151_645;
 const ENDOFTEXT_TOKEN_ID: u32 = 151_643;
-
-/// Kaldi CMVN variance floor (same constant `firered_aed::package_import`
-/// uses -- both families' fbank frontends share this formula verbatim).
-const CMVN_VARIANCE_FLOOR: f64 = 1e-20;
 
 // fbank frontend contract, identical to `firered_aed`'s (verified against
 // `fireredasr2/data/asr_feat.py`, and the two families' `cmvn.ark` files are
@@ -219,8 +215,10 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
             .encoder_adapter_source_root
             .join(SOURCE_ENCODER_ADAPTER_SAFETENSORS),
     )?;
-    let (cmvn_neg_mean, cmvn_inv_stddev) =
-        parse_kaldi_cmvn_stats(&request.encoder_adapter_source_root.join(SOURCE_CMVN_TXT))?;
+    let (cmvn_neg_mean, cmvn_inv_stddev) = parse_kaldi_cmvn_stats(
+        &request.encoder_adapter_source_root.join(SOURCE_CMVN_TXT),
+        "firered-llm",
+    )?;
 
     let encoder_hparams =
         derive_and_validate_encoder_hparams(&encoder_adapter_safetensors, cmvn_neg_mean.len())?;
@@ -239,7 +237,13 @@ pub fn convert_local_firered_llm_source_to_runtime_pack(
         vec![encoder_hparams.feature_dim as u64],
         &cmvn_inv_stddev,
     ));
-    tensors.push(build_mel_filterbank_tensor(encoder_hparams.feature_dim));
+    tensors.push(build_kaldi_mel_filterbank_tensor(
+        "firered.mel_filters",
+        SAMPLE_RATE_HZ,
+        FFT_SIZE,
+        encoder_hparams.feature_dim,
+        MEL_LOW_HZ,
+    ));
 
     let qwen2_config: Qwen2ConfigJson = read_source_json_file(
         &request.qwen2_metadata_source_root,
@@ -303,96 +307,6 @@ fn validate_request(request: &FireRedLlmImportRequest) -> Result<(), LocalSource
         ));
     }
     validate_output_pack_extension(&request.output_root)
-}
-
-// --- cmvn (identical formula to firered_aed::package_import) --------------
-
-fn parse_kaldi_cmvn_stats(path: &Path) -> Result<(Vec<f32>, Vec<f32>), LocalSourceImportError> {
-    let text = std::fs::read_to_string(path).map_err(|error| {
-        validate_error(format!(
-            "firered-llm import cannot read '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let open = text
-        .find('[')
-        .ok_or_else(|| validate_error("firered-llm cmvn.txt has no '[' matrix opener"))?;
-    let close = text
-        .rfind(']')
-        .ok_or_else(|| validate_error("firered-llm cmvn.txt has no ']' matrix closer"))?;
-    if close < open {
-        return Err(validate_error("firered-llm cmvn.txt has ']' before '['"));
-    }
-    let body = &text[open + 1..close];
-    let rows: Vec<Vec<f64>> = body
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            line.split_whitespace()
-                .map(|token| {
-                    token.parse::<f64>().map_err(|error| {
-                        validate_error(format!(
-                            "firered-llm cmvn.txt has a non-numeric value '{token}': {error}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<f64>, _>>()
-        })
-        .collect::<Result<Vec<Vec<f64>>, _>>()?;
-    if rows.len() != 2 {
-        return Err(validate_error(format!(
-            "firered-llm cmvn.txt must contain exactly 2 stat rows, found {}",
-            rows.len()
-        )));
-    }
-    let (sums, sum_squares) = (&rows[0], &rows[1]);
-    if sums.len() != sum_squares.len() || sums.len() < 2 {
-        return Err(validate_error(format!(
-            "firered-llm cmvn.txt row lengths are inconsistent ({} vs {})",
-            sums.len(),
-            sum_squares.len()
-        )));
-    }
-    let dim = sums.len() - 1;
-    let count = sums[dim];
-    if count < 1.0 {
-        return Err(validate_error(format!(
-            "firered-llm cmvn.txt frame count {count} must be >= 1"
-        )));
-    }
-    let mut neg_mean = Vec::with_capacity(dim);
-    let mut inv_stddev = Vec::with_capacity(dim);
-    for d in 0..dim {
-        let mean = sums[d] / count;
-        let variance = (sum_squares[d] / count - mean * mean).max(CMVN_VARIANCE_FLOOR);
-        neg_mean.push((-mean) as f32);
-        inv_stddev.push((1.0 / variance.sqrt()) as f32);
-    }
-    Ok((neg_mean, inv_stddev))
-}
-
-fn build_mel_filterbank_tensor(n_mels: usize) -> GgufWriteTensor {
-    let fft_bins = FFT_SIZE / 2 + 1;
-    let high_hz = (SAMPLE_RATE_HZ as f32) / 2.0;
-    let filters = filterbank(FilterbankConfig {
-        scale: MelScale::Kaldi,
-        sample_rate_hz: SAMPLE_RATE_HZ as f32,
-        n_fft: FFT_SIZE,
-        n_mels,
-        fmin: MEL_LOW_HZ,
-        fmax: high_hz,
-        mel_point_order: MelPointOrder::SpanTimesIndexFirst,
-    });
-    let mut bytes = Vec::with_capacity(filters.len() * 4);
-    for value in &filters {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    GgufWriteTensor {
-        name: "firered.mel_filters".to_string(),
-        dims: vec![n_mels as u64, fft_bins as u64],
-        tensor_type: GgufWriteTensorType::F32,
-        data: bytes,
-    }
 }
 
 fn f32_tensor(name: &str, dims: Vec<u64>, values: &[f32]) -> GgufWriteTensor {
@@ -1613,10 +1527,56 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cmvn.txt");
         std::fs::write(&path, " [\n  8.0 4.0 4.0 \n  32.0 8.0 0.0 ]\n").unwrap();
-        let (neg_mean, inv_stddev) = parse_kaldi_cmvn_stats(&path).unwrap();
+        let (neg_mean, inv_stddev) = parse_kaldi_cmvn_stats(&path, "firered-llm").unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(neg_mean, vec![-2.0, -1.0]);
         assert_eq!(inv_stddev, vec![0.5, 1.0]);
+    }
+
+    fn reference_pre_shared_mel_filterbank_tensor(n_mels: usize) -> GgufWriteTensor {
+        use crate::models::audio_frontend::mel::{
+            FilterbankConfig, MelPointOrder, MelScale, filterbank,
+        };
+
+        let fft_bins = FFT_SIZE / 2 + 1;
+        let high_hz = SAMPLE_RATE_HZ as f32 / 2.0;
+        let filters = filterbank(FilterbankConfig {
+            scale: MelScale::Kaldi,
+            sample_rate_hz: SAMPLE_RATE_HZ as f32,
+            n_fft: FFT_SIZE,
+            n_mels,
+            fmin: MEL_LOW_HZ,
+            fmax: high_hz,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+        });
+        let mut bytes = Vec::with_capacity(filters.len() * 4);
+        for value in &filters {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        GgufWriteTensor {
+            name: "firered.mel_filters".to_string(),
+            dims: vec![n_mels as u64, fft_bins as u64],
+            tensor_type: GgufWriteTensorType::F32,
+            data: bytes,
+        }
+    }
+
+    #[test]
+    fn mel_filterbank_tensor_is_byte_identical_to_pre_shared_impl() {
+        for n_mels in [80usize, 128usize] {
+            let expected = reference_pre_shared_mel_filterbank_tensor(n_mels);
+            let actual = build_kaldi_mel_filterbank_tensor(
+                "firered.mel_filters",
+                SAMPLE_RATE_HZ,
+                FFT_SIZE,
+                n_mels,
+                MEL_LOW_HZ,
+            );
+            assert_eq!(expected.name, actual.name, "n_mels={n_mels}");
+            assert_eq!(expected.dims, actual.dims, "n_mels={n_mels}");
+            assert_eq!(expected.tensor_type, actual.tensor_type, "n_mels={n_mels}");
+            assert_eq!(expected.data, actual.data, "n_mels={n_mels}");
+        }
     }
 
     #[test]

@@ -6,6 +6,8 @@ use memmap2::Mmap;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::ggml_runtime::{GgufWriteTensor, GgufWriteTensorType};
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::nn::half::{f16_bits_to_f32, f32_to_f16_bits};
 
 #[derive(Debug, Error)]
@@ -78,6 +80,110 @@ pub(crate) fn read_source_file_bytes(
 ) -> Result<Vec<u8>, LocalSourceImportError> {
     let path = root.join(relative_path);
     std::fs::read(&path).map_err(|source| LocalSourceImportError::Read { path, source })
+}
+
+/// Parse a Kaldi text CMVN accumulator matrix (`[ row0 \n row1 ]`) into the
+/// additive and multiplicative vectors baked into a runtime pack.
+pub(crate) fn parse_kaldi_cmvn_stats(
+    path: &Path,
+    family: &str,
+) -> Result<(Vec<f32>, Vec<f32>), LocalSourceImportError> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        validate_error(format!(
+            "{family} import cannot read '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let open = text
+        .find('[')
+        .ok_or_else(|| validate_error(format!("{family} cmvn.txt has no '[' matrix opener")))?;
+    let close = text
+        .rfind(']')
+        .ok_or_else(|| validate_error(format!("{family} cmvn.txt has no ']' matrix closer")))?;
+    if close < open {
+        return Err(validate_error(format!(
+            "{family} cmvn.txt has ']' before '['"
+        )));
+    }
+    let body = &text[open + 1..close];
+    let rows: Vec<Vec<f64>> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split_whitespace()
+                .map(|token| {
+                    token.parse::<f64>().map_err(|error| {
+                        validate_error(format!(
+                            "{family} cmvn.txt has a non-numeric value '{token}': {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<f64>, _>>()
+        })
+        .collect::<Result<Vec<Vec<f64>>, _>>()?;
+    if rows.len() != 2 {
+        return Err(validate_error(format!(
+            "{family} cmvn.txt must contain exactly 2 stat rows, found {}",
+            rows.len()
+        )));
+    }
+    let (sums, sum_squares) = (&rows[0], &rows[1]);
+    if sums.len() != sum_squares.len() || sums.len() < 2 {
+        return Err(validate_error(format!(
+            "{family} cmvn.txt row lengths are inconsistent ({} vs {})",
+            sums.len(),
+            sum_squares.len()
+        )));
+    }
+    let dim = sums.len() - 1;
+    let count = sums[dim];
+    if count < 1.0 {
+        return Err(validate_error(format!(
+            "{family} cmvn.txt frame count {count} must be >= 1"
+        )));
+    }
+    let mut neg_mean = Vec::with_capacity(dim);
+    let mut inv_stddev = Vec::with_capacity(dim);
+    for d in 0..dim {
+        let mean = sums[d] / count;
+        let variance = (sum_squares[d] / count - mean * mean).max(1e-20);
+        neg_mean.push((-mean) as f32);
+        inv_stddev.push((1.0 / variance.sqrt()) as f32);
+    }
+    Ok((neg_mean, inv_stddev))
+}
+
+/// Build the row-major F32 Kaldi mel-filterbank tensor embedded by local
+/// importers. The caller supplies the model-facing tensor name and frontend
+/// constants; this helper owns only the shared GGUF materialization.
+pub(crate) fn build_kaldi_mel_filterbank_tensor(
+    tensor_name: &str,
+    sample_rate_hz: u32,
+    fft_size: usize,
+    n_mels: usize,
+    low_hz: f32,
+) -> GgufWriteTensor {
+    let fft_bins = fft_size / 2 + 1;
+    let high_hz = sample_rate_hz as f32 / 2.0;
+    let filters = filterbank(FilterbankConfig {
+        scale: MelScale::Kaldi,
+        sample_rate_hz: sample_rate_hz as f32,
+        n_fft: fft_size,
+        n_mels,
+        fmin: low_hz,
+        fmax: high_hz,
+        mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+    });
+    let mut bytes = Vec::with_capacity(filters.len() * 4);
+    for value in &filters {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    GgufWriteTensor {
+        name: tensor_name.to_string(),
+        dims: vec![n_mels as u64, fft_bins as u64],
+        tensor_type: GgufWriteTensorType::F32,
+        data: bytes,
+    }
 }
 
 // --- Shared GPT-2 BPE source loading ----------------------------------------
@@ -729,9 +835,10 @@ fn decode_bf16_payload_as_f32(
 mod tests {
     use super::{
         LocalSourceImportError, SAFETENSORS_HEADER_MAX_BYTES, SafetensorsFile,
-        decode_safetensors_payload_as_f16_bits, decode_safetensors_payload_as_f32,
-        validate_output_pack_extension,
+        build_kaldi_mel_filterbank_tensor, decode_safetensors_payload_as_f16_bits,
+        decode_safetensors_payload_as_f32, parse_kaldi_cmvn_stats, validate_output_pack_extension,
     };
+    use crate::ggml_runtime::GgufWriteTensorType;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -822,6 +929,35 @@ mod tests {
     fn output_pack_extension_rejects_missing_extension() {
         validate_output_pack_extension(Path::new("/tmp/whisper-small"))
             .expect_err("extensionless output must be rejected");
+    }
+
+    #[test]
+    fn kaldi_cmvn_stats_preserve_formula_and_family_error_label() {
+        let dir = fixture_dir();
+        let path = dir.path().join("cmvn.txt");
+        std::fs::write(&path, " [\n  8.0 4.0 4.0 \n  32.0 8.0 0.0 ]\n").unwrap();
+        let (neg_mean, inv_stddev) = parse_kaldi_cmvn_stats(&path, "firered-aed").unwrap();
+        assert_eq!(neg_mean, vec![-2.0, -1.0]);
+        assert_eq!(inv_stddev, vec![0.5, 1.0]);
+
+        std::fs::write(&path, "0 1\n0 0\n").unwrap();
+        for family in ["firered-aed", "firered-llm"] {
+            let error = parse_kaldi_cmvn_stats(&path, family).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{family} cmvn.txt has no '[' matrix opener")
+            );
+        }
+    }
+
+    #[test]
+    fn kaldi_mel_filterbank_tensor_preserves_gguf_layout() {
+        let tensor =
+            build_kaldi_mel_filterbank_tensor("firered.mel_filters", 16_000, 512, 80, 20.0);
+        assert_eq!(tensor.name, "firered.mel_filters");
+        assert_eq!(tensor.dims, vec![80, 257]);
+        assert_eq!(tensor.tensor_type, GgufWriteTensorType::F32);
+        assert_eq!(tensor.data.len(), 80 * 257 * std::mem::size_of::<f32>());
     }
 
     // --- SafetensorsFile::open hardening (trust-boundary negative tests) ---
