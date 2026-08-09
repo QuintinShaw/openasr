@@ -111,9 +111,14 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
     preferred/Auto may Optimus-fall through discrete -> iGPU but always caches
     under the device that actually initialized)
   - streaming **worker** keys
-  What is intentionally **not** route-isolated yet (hard gate before public Exact):
-  - family prepared-runtime caches remain coarse `(path, backend)`
-  - serve-batch engine keys do not include route
+  - device-owning family runtime actor pools: `(PackContentKey, ExecutionLaneKey)`
+    (plus adapter fingerprint where applicable); the content key comes from the
+    already-open source, so same-path replacement misses
+  - serve-batch engine keys (build identity + `ExecutionLaneKey` + family
+    capacity geometry)
+  What is intentionally **not** partitioned by route:
+  - host-neutral prepared data is content-keyed only; its type contract forbids
+    backend handles, device buffers, schedulers, graphs, or uploaded arenas
   - **admission capacity stays per model identity** (CPU and accelerated share one
     slot for the same model; route does not multiply capacity)
   Exact device pins are fail-closed: missing devices, init failures, Metal
