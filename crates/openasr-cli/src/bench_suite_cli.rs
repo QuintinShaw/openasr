@@ -147,8 +147,8 @@ pub(crate) fn bench_suite(
 /// the pack is absent and the entry is `optional` (host lacks this pack).
 /// The bench passes select the backend via OPENASR_GGML_BACKEND. Map it to an
 /// explicit per-request execution target so families whose Auto default
-/// differs from the env-global (xasr stays CPU on Auto) actually run what the
-/// pass label claims — a metal pass must never silently record CPU numbers.
+/// excludes Metal on Apple Silicon actually run what the pass label claims --
+/// a metal pass must never silently record CPU numbers.
 fn bench_execution_target() -> Option<ExecutionTarget> {
     let raw = std::env::var("OPENASR_GGML_BACKEND").ok()?;
     let value = raw.trim();

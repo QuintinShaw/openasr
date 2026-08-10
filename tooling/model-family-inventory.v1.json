@@ -1014,7 +1014,7 @@
       },
       "optimization": {
         "prefer_cpu_decoder_for_multichunk_metal": false,
-        "auto_gpu_policy": "all-backends",
+        "auto_gpu_policy": "except-metal",
         "encoder_attention_span": "global-quadratic",
         "encoder_attention_max_safe_chunk_seconds": 30.0
       },

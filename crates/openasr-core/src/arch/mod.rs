@@ -2275,7 +2275,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
         optimization_contract: OpenAsrOptimizationContract {
             prefer_cpu_decoder_for_multichunk_metal: false,
-            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+            // The reusable incremental decoder closed Moonshine's earlier
+            // per-step graph rebuild, but the small Apple Silicon graph remains
+            // dispatch-bound. Keep explicit Metal available as a lower-resident-
+            // memory trade-off, while Auto chooses CPU on Apple Silicon and
+            // still permits the generic CUDA/HIP/Vulkan accelerated lane.
+            auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
             },
@@ -3542,22 +3547,13 @@ mod tests {
     /// Pins `auto_gpu_policy` per builtin architecture. Most builtins let
     /// Auto pick any GPU-class backend automatically when available
     /// (`AllBackends`), matching how `resolve_runtime_backend` behaves
-    /// generically. xasr-zipformer alone is `ExceptMetal` -- Auto still
+    /// generically. xasr-zipformer and moonshine are `ExceptMetal` -- Auto still
     /// prefers the generic GPU lane (CUDA/HIP/Vulkan) but falls back to CPU
-    /// on Apple Silicon Metal specifically, per a platform-specific
-    /// performance audit that found its streaming chunk graph dispatch-bound
-    /// and net-slower on Metal (an explicit `--backend metal` request is
-    /// unaffected). Two other families measured a similar Metal slowdown but
-    /// are deliberately NOT gated this round: qwen (the slowdown looks like a
-    /// fixed size x quant platform trade-off, not a qwen-specific bug --
-    /// mimo/firered-llm share qwen's exact decode driver and measure faster
-    /// on Metal at their 8B @ q4_k config -- but that read awaits a dedicated
-    /// follow-up before it's baked into the default; see
-    /// `models::qwen::graph_config`) and moonshine (this audit found and
-    /// applied an actual architectural fix -- decoder scheduler-off to
-    /// activate the reusable incremental decode graph, see
-    /// `models::moonshine::graph_config` -- rather than gating around the
-    /// problem). See the field doc and each family's own executor/
+    /// on Apple Silicon Metal specifically because their current graph shapes
+    /// are dispatch-bound there (an explicit `--backend metal` request is
+    /// unaffected). Qwen remains explicitly `AllBackends`; this table must not
+    /// broaden one family's platform gate to neighboring architectures.
+    /// See the field doc and each family's own executor/
     /// `graph_config` doc comment for detail. A silent flip of this table
     /// would silently deny Auto users a GPU their hardware supports (or
     /// silently regress them onto a Metal path known to be slower), for any
@@ -3587,7 +3583,7 @@ mod tests {
                 XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
                 AutoGpuPolicy::ExceptMetal,
             ),
-            (MOONSHINE_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (MOONSHINE_GGML_ARCHITECTURE_ID, AutoGpuPolicy::ExceptMetal),
             (DOLPHIN_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (SENSEVOICE_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
@@ -3640,38 +3636,45 @@ mod tests {
             ResolvedFamilyRuntimeInput,
         };
 
-        let model_architecture = XASR_ZIPFORMER_GGML_ARCHITECTURE_ID;
-        let policy = family_auto_gpu_policy_for_model_architecture(model_architecture);
-        assert_eq!(policy, AutoGpuPolicy::ExceptMetal);
+        for model_architecture in [
+            XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            MOONSHINE_GGML_ARCHITECTURE_ID,
+        ] {
+            let policy = family_auto_gpu_policy_for_model_architecture(model_architecture);
+            assert_eq!(policy, AutoGpuPolicy::ExceptMetal);
 
-        // Auto: gated to CPU only if the generic resolver would have picked
-        // Metal specifically. `resolve` is a pure function here -- no
-        // thread-local install/read round-trip.
-        let resolved = GgmlCpuGraphConfig::runtime_default().backend;
-        let gated = ResolvedFamilyRuntimeInput::resolve(None, policy).backend();
-        if matches!(resolved, GgmlCpuGraphBackend::Metal) {
-            assert_eq!(gated, GgmlCpuGraphBackend::Cpu);
-        } else {
-            assert_eq!(gated, resolved);
-        }
-        assert_ne!(gated, GgmlCpuGraphBackend::Metal);
+            // Auto: gated to CPU only if the generic resolver would have picked
+            // Metal specifically. `resolve` is a pure function here -- no
+            // thread-local install/read round-trip.
+            let resolved = GgmlCpuGraphConfig::runtime_default().backend;
+            let gated = ResolvedFamilyRuntimeInput::resolve(None, policy).backend();
+            if matches!(resolved, GgmlCpuGraphBackend::Metal) {
+                assert_eq!(gated, GgmlCpuGraphBackend::Cpu);
+            } else {
+                assert_eq!(gated, resolved);
+            }
+            assert_ne!(gated, GgmlCpuGraphBackend::Metal);
 
-        // An explicit accelerated request always wins, even on Metal: the
-        // gate only ever pins Auto, so an explicit preference must still
-        // resolve to a GPU-class backend regardless of `policy`.
-        let accelerated = ResolvedFamilyRuntimeInput::resolve(
-            Some(RequestBackendPreference::Accelerated),
-            policy,
-        )
-        .backend();
-        assert!(accelerated.is_gpu_class());
+            // An explicit accelerated request always wins, even on Metal: the
+            // gate only ever pins Auto, so an explicit preference must still
+            // resolve to a GPU-class backend regardless of `policy`.
+            let accelerated = ResolvedFamilyRuntimeInput::resolve(
+                Some(RequestBackendPreference::Accelerated),
+                policy,
+            )
+            .backend();
+            assert!(accelerated.is_gpu_class());
 
-        // An explicit CPU-only request always wins too.
-        assert_eq!(
-            ResolvedFamilyRuntimeInput::resolve(Some(RequestBackendPreference::CpuOnly), policy)
+            // An explicit CPU-only request always wins too.
+            assert_eq!(
+                ResolvedFamilyRuntimeInput::resolve(
+                    Some(RequestBackendPreference::CpuOnly),
+                    policy,
+                )
                 .backend(),
-            GgmlCpuGraphBackend::Cpu
-        );
+                GgmlCpuGraphBackend::Cpu
+            );
+        }
     }
 
     /// Pins `encoder_attention_span` per builtin architecture -- the single

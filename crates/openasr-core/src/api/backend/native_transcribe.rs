@@ -4817,17 +4817,16 @@ mod tests {
     }
 
     #[test]
-    fn family_auto_gpu_policy_lookup_matches_dolphin_and_xasr_gates() {
+    fn family_auto_gpu_policy_lookup_matches_measured_metal_gates() {
         use crate::ggml_runtime::AutoGpuPolicy;
 
         // Regression pin: dolphin lets Auto pick any GPU-class backend
         // (it flipped from CPU-pinned once its encoder weight-placement fix
-        // let Metal truly offload and beat CPU end-to-end). xasr-zipformer is
-        // `ExceptMetal`: Auto still prefers the generic GPU lane but falls
-        // back to CPU on Apple Silicon Metal specifically per the platform
-        // performance audit. qwen measured a similar Metal slowdown but is
-        // deliberately left `AllBackends` pending a dedicated follow-up (see
-        // `models::qwen::graph_config`).
+        // let Metal truly offload and beat CPU end-to-end). xasr-zipformer and
+        // moonshine are `ExceptMetal`: Auto still prefers the generic GPU lane
+        // but falls back to CPU on Apple Silicon Metal for their dispatch-bound
+        // graph shapes. Qwen stays explicitly `AllBackends`; a family-specific
+        // platform gate must not spread to a neighboring architecture.
         assert_eq!(
             crate::arch::family_auto_gpu_policy_for_model_architecture(
                 crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
@@ -4839,6 +4838,12 @@ mod tests {
                 crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
             ),
             AutoGpuPolicy::AllBackends
+        );
+        assert_eq!(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID
+            ),
+            AutoGpuPolicy::ExceptMetal
         );
         assert_eq!(
             crate::arch::family_auto_gpu_policy_for_model_architecture(
@@ -4890,9 +4895,8 @@ mod tests {
         // "cpu" regardless of what the generic resolver would pick.
         assert_eq!(label_for(AutoGpuPolicy::Never), "cpu");
 
-        // Auto, family gate enabled (`AllBackends` shape, every builtin
-        // family but the three `ExceptMetal` ones): reports exactly what the
-        // generic resolver picks -- unchanged behavior.
+        // Auto, family gate enabled (`AllBackends` shape): reports exactly
+        // what the generic resolver picks -- unchanged behavior.
         let generic_auto_label = match GgmlCpuGraphConfig::runtime_default().backend {
             GgmlCpuGraphBackend::Cpu => "cpu",
             GgmlCpuGraphBackend::Metal => "metal",

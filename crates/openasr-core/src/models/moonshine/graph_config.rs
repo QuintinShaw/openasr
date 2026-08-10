@@ -60,7 +60,9 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
 /// now gets the same persistent reused graph qwen's decoder already uses.
 /// This is a pure backend/scheduling choice: output must stay byte-identical
 /// (verified via the moonshine golden test), since it does not change which
-/// arithmetic runs, only whether the graph is rebuilt per token.
+/// arithmetic runs, only whether the graph is rebuilt per token. This remains
+/// the explicit-Metal path; the architecture's measured Auto policy chooses
+/// CPU on Apple Silicon because the small end-to-end graph is dispatch-bound.
 pub(crate) fn moonshine_decoder_graph_config(
     backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
