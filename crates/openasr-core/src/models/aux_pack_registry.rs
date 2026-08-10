@@ -89,6 +89,21 @@ const AUX_CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabi
         AcceleratedPlacementCapabilities::FULL_DEVICE,
     );
 
+const AUX_CPU_AND_NON_METAL_FULL_DEVICE_EXECUTION: ExecutionCapabilities =
+    ExecutionCapabilities::new(true)
+        .with_provider(
+            ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Hip,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Vulkan,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        );
+
 /// Which pull-time error prefix a matched aux family reports, preserving the
 /// exact wording `api::backend::native`'s tests assert on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,13 +325,15 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
+        // Timestamp classification contains near-tied bins whose backend-level
+        // floating-point differences are amplified by the reference LIS repair.
+        // Metal does not currently satisfy this runtime's timestamp parity
+        // contract. Treat that as a provider capability boundary, rather than
+        // an Auto preference, while preserving the existing CUDA/HIP/Vulkan
+        // capability declarations.
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
-            // The runtime has no partial-offload topology. Metal is fast and
-            // remains available explicitly, but current Q8_0/FP16 parity
-            // evidence has rare boundary deviations above the model's 80 ms
-            // resolution. Auto therefore keeps the quality-safe CPU path.
-            auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
+            capabilities: AUX_CPU_AND_NON_METAL_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         quantization_classification:
@@ -443,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_auto_avoids_metal_without_disabling_other_accelerators() {
+    fn forced_aligner_omits_unvalidated_metal_without_disabling_other_accelerators() {
         let policy = auxiliary_execution_policy(
             crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         );
@@ -454,19 +471,26 @@ mod tests {
         else {
             panic!("forced aligner must remain request-scoped");
         };
-        assert_eq!(auto_gpu_policy, AutoGpuPolicy::ExceptMetal);
+        assert_eq!(auto_gpu_policy, AutoGpuPolicy::AllBackends);
         assert!(capabilities.supports_cpu());
-        assert!(capabilities.supports(
+        assert!(!capabilities.supports(
             ExecutionProvider::Metal,
             crate::device::execution_policy::ExecutionPlacement::FullDevice,
         ));
-        assert!(
-            !capabilities.supports(
-                ExecutionProvider::Metal,
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert!(capabilities.supports(
+                provider,
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+            ));
+            assert!(!capabilities.supports(
+                provider,
                 crate::device::execution_policy::ExecutionPlacement::Hybrid,
-            ),
-            "forced aligner has no partial-offload topology"
-        );
+            ));
+        }
     }
 
     #[test]
