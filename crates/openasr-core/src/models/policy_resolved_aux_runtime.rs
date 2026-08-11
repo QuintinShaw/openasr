@@ -56,24 +56,6 @@ pub(crate) fn resolve_auxiliary_execution_plan(
     architecture_id: &'static str,
     request_intent: &ExecutionIntent,
 ) -> Result<ExecutionPlan, AuxiliaryExecutionPlanError> {
-    resolve_auxiliary_execution_plan_with_auto_policy(
-        execution_services,
-        architecture_id,
-        request_intent,
-        None,
-    )
-}
-
-/// Resolve an auxiliary stage with an optional content-derived Auto policy.
-/// Capabilities and ownership always remain descriptor-owned; the override is
-/// reserved for a verified pack whose bytes carry a stricter compatibility
-/// boundary than the current family default.
-pub(crate) fn resolve_auxiliary_execution_plan_with_auto_policy(
-    execution_services: &NativeExecutionServices,
-    architecture_id: &'static str,
-    request_intent: &ExecutionIntent,
-    content_auto_gpu_policy: Option<AutoGpuPolicy>,
-) -> Result<ExecutionPlan, AuxiliaryExecutionPlanError> {
     let policy = auxiliary_execution_policy(architecture_id)
         .ok_or(AuxiliaryExecutionPlanError::UnregisteredArchitecture { architecture_id })?;
     let ownership = auxiliary_runtime_ownership(architecture_id)
@@ -87,9 +69,8 @@ pub(crate) fn resolve_auxiliary_execution_plan_with_auto_policy(
     );
     let AuxiliaryExecutionPolicy::RequestScoped {
         capabilities,
-        auto_gpu_policy: descriptor_auto_gpu_policy,
+        auto_gpu_policy,
     } = policy;
-    let auto_gpu_policy = content_auto_gpu_policy.unwrap_or(descriptor_auto_gpu_policy);
     let intent = request_intent.clone();
     let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
     execution_services
@@ -100,7 +81,6 @@ pub(crate) fn resolve_auxiliary_execution_plan_with_auto_policy(
 
 pub(crate) fn resolved_runtime_for_auxiliary_candidate(
     candidate: &ExecutionCandidate,
-    auto_gpu_policy: AutoGpuPolicy,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     let preference = match candidate.placement {
         crate::device::execution_policy::ExecutionPlacement::CpuOnly => {
@@ -111,7 +91,10 @@ pub(crate) fn resolved_runtime_for_auxiliary_candidate(
             RequestBackendPreference::Exact(candidate.device.route.clone()),
         ),
     };
-    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
+    // The policy resolver has already selected this candidate. Mapping its
+    // CpuOnly/Exact route into the runtime must not re-apply a family Auto
+    // policy or force every caller to repeat descriptor-owned policy data.
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, AutoGpuPolicy::AllBackends)
 }
 
 type AuxiliaryRuntimeBuilder<R, E> =

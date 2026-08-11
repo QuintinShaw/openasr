@@ -208,11 +208,7 @@ fn build_candidate(
             ),
         });
     }
-    let backend = resolved_runtime_for_auxiliary_candidate(
-        candidate,
-        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-    )
-    .backend();
+    let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
     let key = AuxiliaryPinnedRuntimeCacheKey::for_current_session_lane::<Hymt2TranslationCandidate>(
         HUNYUAN_DENSE_ARCHITECTURE_VALUE,
         expected_content_id,

@@ -91,7 +91,6 @@ impl FireRedStreamVadProvider {
         let backend =
             crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(
                 candidate,
-                super::AUTO_GPU_POLICY,
             )
             .backend();
         Ok(Self::shared_for_backend_and_placement(

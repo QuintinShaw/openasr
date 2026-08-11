@@ -39,11 +39,7 @@ pub(crate) fn load_actor(
             actual: preflight.runtime_source.content_id().to_string(),
         });
     }
-    let backend = resolved_runtime_for_auxiliary_candidate(
-        candidate,
-        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-    )
-    .backend();
+    let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
     let key = AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<FireRedPuncRuntime>(
         FIRERED_PUNC_ARCHITECTURE_VALUE,
         expected_content_id,

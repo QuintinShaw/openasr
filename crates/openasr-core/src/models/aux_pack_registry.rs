@@ -332,15 +332,14 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
-        // Contract-compliant packs keep the acoustic encoder, token embedding,
-        // and 5,000-way boundary head at the shared Q8 safety floor. That shape
-        // passes the official timestamp envelope and is materially faster and
-        // smaller on Metal, so the descriptor's importer-contract default is
-        // AllBackends. The runtime derives a legacy-pack override from the
-        // already-open tensor index, keeping pre-floor published packs on CPU.
+        // Explicit Metal remains available for packs that satisfy the runtime's
+        // semantic Q8 floor. On Metal hosts Auto stays on CPU because the
+        // current Metal path is faster but still crosses the official maximum
+        // timestamp-drift envelope on near-tie boundaries; CUDA/HIP/Vulkan
+        // remain eligible under ExceptMetal.
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
             capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
-            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+            auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
         quantization_classification:
@@ -467,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_current_contract_allows_every_accelerator() {
+    fn forced_aligner_keeps_explicit_accelerators_while_auto_avoids_metal() {
         let policy = auxiliary_execution_policy(
             crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         );
@@ -478,7 +477,7 @@ mod tests {
         else {
             panic!("forced aligner must remain request-scoped");
         };
-        assert_eq!(auto_gpu_policy, AutoGpuPolicy::AllBackends);
+        assert_eq!(auto_gpu_policy, AutoGpuPolicy::ExceptMetal);
         assert!(capabilities.supports_cpu());
         for provider in [
             ExecutionProvider::Metal,

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::{
     NativeExecutionServices,
     device::execution_policy::{ExecutionCandidate, ExecutionIntent},
-    ggml_runtime::{AutoGpuPolicy, GgmlCpuGraphBackend},
+    ggml_runtime::GgmlCpuGraphBackend,
     models::{
         admitted_pinned_runtime_actor_pool::PinnedRuntimeActor,
         policy_resolved_aux_runtime::{
@@ -95,8 +95,7 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
         let services_for_builder = Arc::clone(&execution_services);
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
-            let backend =
-                resolved_runtime_for_auxiliary_candidate(candidate, AutoGpuPolicy::Never).backend();
+            let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
             if backend == GgmlCpuGraphBackend::Cpu {
                 let key = AuxiliaryRuntimeCacheKey::for_current_lane::<PyannoteSegmenter>(
                     PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -385,8 +384,7 @@ fn load_diarizen_actor(
             preflight.runtime_source.content_id(),
         ));
     }
-    let backend =
-        resolved_runtime_for_auxiliary_candidate(candidate, AutoGpuPolicy::AllBackends).backend();
+    let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
     let key = AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<diarizen::DiariZenRuntime>(
         DIARIZEN_GGML_ARCHITECTURE_ID,
         expected_content_id,

@@ -500,8 +500,9 @@ fn firered_stream_vad_fifteen_minute_endurance() {
     let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
     let rtf = median_seconds / audio_seconds;
     let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+    let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
     println!(
-        "AUX_MODEL_ENDURANCE model=fireredvad backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+        "AUX_MODEL_ENDURANCE model=fireredvad backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
         probs.len(),
     );
     assert!(!probs.is_empty());

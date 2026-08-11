@@ -399,11 +399,8 @@ impl PolicyResolvedSpeakerRuntime {
         let preflight_for_builder = preflight.clone();
         let builder = Arc::new(
             move |execution_candidate: &crate::device::execution_policy::ExecutionCandidate| {
-                let backend = resolved_runtime_for_auxiliary_candidate(
-                    execution_candidate,
-                    crate::ggml_runtime::AutoGpuPolicy::Never,
-                )
-                .backend();
+                let backend =
+                    resolved_runtime_for_auxiliary_candidate(execution_candidate).backend();
                 let key = AuxiliaryRuntimeCacheKey::host_neutral::<RedimNet2Embedder>(
                     REDIMNET2_GGML_ARCHITECTURE_ID,
                     content_for_builder.clone(),

@@ -58,8 +58,7 @@ use crate::models::firered_punc::policy_runtime::{FireRedPuncActor, load_actor, 
 use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
 use crate::models::qwen::{
-    ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_auto_gpu_policy_for_preflight,
-    forced_aligner_pack, verify_forced_aligner_pack,
+    ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_pack, verify_forced_aligner_pack,
 };
 use crate::models::{
     aux_pack_registry::AuxPackKind,
@@ -1651,26 +1650,11 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         .unwrap_or_else(|| "en".to_string());
     let verified_forced_aligner = verify_forced_aligner_pack(&pack_path)
         .map_err(|error| forced_alignment_error_to_backend(execution_context, error.to_string()))?;
-    let content_auto_gpu_policy =
-        forced_aligner_auto_gpu_policy_for_preflight(verified_forced_aligner.preflight());
-    if matches!(
-        content_auto_gpu_policy,
-        crate::ggml_runtime::AutoGpuPolicy::ExceptMetal
-    ) {
-        crate::stage_timing::log_detail_event(
-            "forced_aligner",
-            format_args!("stage=plan event=legacy_quant_floor_fallback metal_eligible=false"),
-        );
-    }
-    let execution_plan = crate::models::policy_resolved_aux_runtime::resolve_auxiliary_execution_plan_with_auto_policy(
+    let execution_plan = resolve_auxiliary_execution_plan(
         execution_services,
         crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         request_intent,
-        Some(content_auto_gpu_policy),
-    )
-    .map_err(|error| BackendError::NativeFailClosed {
-        reason: error.to_string(),
-    })?;
+    )?;
     if let Some(progress) = progress {
         progress.enter_stage(TranscriptionStage::Align);
     }
@@ -1689,8 +1673,7 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             if execution_context.is_canceled() {
                 return Err(BackendError::TranscriptionCanceled);
             }
-            let backend =
-                resolved_runtime_for_candidate(candidate, content_auto_gpu_policy).backend();
+            let backend = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate).backend();
             let session_load_started = Instant::now();
             let session =
                 Qwen3ForcedAlignerSession::load_verified(verified_forced_aligner.clone(), backend)
@@ -7209,7 +7192,10 @@ mod tests {
             )
         };
         let services = native_execution_services_for_test();
-        let request_intent = ExecutionIntent::CpuOnly;
+        let backend_label =
+            std::env::var("OPENASR_AUX_BENCH_BACKEND").unwrap_or_else(|_| "cpu".to_string());
+        let request_intent = execution_intent_from_backend_env(Some(&backend_label))
+            .expect("OPENASR_AUX_BENCH_BACKEND must name a supported backend");
         let detached =
             crate::RequestExecutionContext::uncancellable("FireRedPunc host-local endurance run");
         let progress = progress_for();
@@ -7232,8 +7218,9 @@ mod tests {
                 .map(|segment| segment.text.as_bytes()),
         );
         let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=fireredpunc backend=cpu represented_audio_seconds=900.000000 elapsed_seconds={elapsed_seconds:.6} peak_rss_bytes={peak_rss_bytes} segments={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=fireredpunc backend={backend_label} represented_audio_seconds=900.000000 elapsed_seconds={elapsed_seconds:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} segments={} output_sha256={output_sha256}",
             punctuated.segments.len(),
         );
         assert_eq!(punctuated.segments.len(), 60);

@@ -1,10 +1,15 @@
-//! Process-wide peak resident-set-size probe for the performance harness.
+//! Process resident-set-size probes for the performance harness.
 //!
-//! On unix this is `getrusage` via a local `extern` block (avoiding a `libc`
-//! dependency); `ru_maxrss` units differ by platform — **bytes on macOS,
+//! Peak RSS uses `getrusage`; `ru_maxrss` units differ by platform — **bytes on macOS,
 //! kilobytes on Linux** — and are normalized to bytes here. On Windows it is
 //! `K32GetProcessMemoryInfo` via the already-present `windows-sys` crate,
 //! reading `PeakWorkingSetSize` (already in bytes).
+//!
+//! Current RSS is intentionally separate from the monotonic peak: it lets a
+//! long-running model gate distinguish a transient driver/compiler spike from
+//! memory that remains resident while the runtime is warm. Darwin uses Mach
+//! task info, Linux reads `/proc/self/statm`, and Windows reads
+//! `WorkingSetSize` from the same process counters.
 //!
 //! Caveat: this is a *process* high-water mark, not a per-call delta. A harness
 //! that loads several multi-GB packs in one process will see later entries
@@ -73,6 +78,40 @@ pub fn peak_rss_bytes() -> Option<u64> {
     }
 }
 
+/// Current resident set size of this process in bytes.
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+pub fn current_rss_bytes() -> Option<u64> {
+    let mut info: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    #[allow(deprecated)]
+    let task = unsafe { libc::mach_task_self() };
+    let result = unsafe {
+        libc::task_info(
+            task,
+            libc::MACH_TASK_BASIC_INFO,
+            (&mut info as *mut libc::mach_task_basic_info).cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS || count < libc::MACH_TASK_BASIC_INFO_COUNT {
+        return None;
+    }
+    let resident_size = info.resident_size;
+    (resident_size > 0).then_some(resident_size)
+}
+
+/// Current resident set size on procfs Unix platforms.
+#[cfg(all(test, unix, not(any(target_os = "macos", target_os = "ios"))))]
+pub fn current_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if resident_pages == 0 || page_size <= 0 {
+        return None;
+    }
+    resident_pages.checked_mul(page_size as u64)
+}
+
 /// Windows: peak working set size (the process high-water resident memory) via
 /// `K32GetProcessMemoryInfo`, already in bytes.
 #[cfg(windows)]
@@ -94,9 +133,30 @@ pub fn peak_rss_bytes() -> Option<u64> {
     Some(counters.PeakWorkingSetSize as u64)
 }
 
+#[cfg(all(test, windows))]
+pub fn current_rss_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if ok == 0 || counters.WorkingSetSize == 0 {
+        return None;
+    }
+    Some(counters.WorkingSetSize as u64)
+}
+
 /// Other unsupported platforms: no probe.
 #[cfg(not(any(unix, windows)))]
 pub fn peak_rss_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(all(test, not(any(unix, windows))))]
+pub fn current_rss_bytes() -> Option<u64> {
     None
 }
 
@@ -109,8 +169,15 @@ mod tests {
         // Allocate something measurable so the high-water mark is clearly set.
         let blob = vec![0u8; 8 * 1024 * 1024];
         std::hint::black_box(&blob);
+        let current = current_rss_bytes().expect("platform exposes a current-RSS probe");
+        assert!(
+            current >= 1024 * 1024,
+            "implausibly small current RSS: {current} bytes"
+        );
         let peak = peak_rss_bytes().expect("unix/windows platforms expose a peak-RSS probe");
-        // A running test process holds at least a few MB resident.
         assert!(peak >= 1024 * 1024, "implausibly small peak: {peak} bytes");
+        // The two kernel APIs use different accounting snapshots (Mach task
+        // residency versus getrusage high-water), so page-sized differences
+        // must not be treated as a probe failure.
     }
 }

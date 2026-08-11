@@ -1706,8 +1706,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend={} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} chunks={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend={} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} chunks={} output_sha256={output_sha256}",
             backend.trim().to_ascii_lowercase(),
             elapsed_seconds / audio_seconds,
             chunks.len(),

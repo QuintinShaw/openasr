@@ -671,26 +671,6 @@ fn validate_forced_aligner_metal_tensor_index(
     Ok(())
 }
 
-/// Content-aware Auto policy for the forced aligner. Current packs satisfy
-/// the semantic Q8 floor and can use Metal's measured Pareto path. Legacy
-/// packs remain usable on CPU, but are excluded from Auto Metal because their
-/// over-quantized acoustic/boundary tensors violate the quality contract.
-pub(crate) fn forced_aligner_auto_gpu_policy_for_preflight(
-    preflight: &GgufRuntimeSourcePreflight,
-) -> crate::ggml_runtime::AutoGpuPolicy {
-    forced_aligner_auto_gpu_policy_for_tensor_index(preflight.tensor_index())
-}
-
-fn forced_aligner_auto_gpu_policy_for_tensor_index(
-    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
-) -> crate::ggml_runtime::AutoGpuPolicy {
-    if validate_forced_aligner_metal_tensor_index(tensor_index).is_ok() {
-        crate::ggml_runtime::AutoGpuPolicy::AllBackends
-    } else {
-        crate::ggml_runtime::AutoGpuPolicy::ExceptMetal
-    }
-}
-
 pub(crate) fn verify_forced_aligner_pack(
     pack_path: &std::path::Path,
 ) -> Result<VerifiedPack, Qwen3ForcedAlignerRuntimeError> {
@@ -826,21 +806,13 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_auto_metal_requires_the_semantic_q8_floor() {
+    fn forced_aligner_explicit_metal_requires_the_semantic_q8_floor() {
         let q8 = crate::models::pack_quant_audit::GGML_TYPE_Q8_0 as i32;
         let q4 = crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32;
-        assert_eq!(
-            forced_aligner_auto_gpu_policy_for_tensor_index(&quant_floor_index(q8, q8)),
-            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-        );
-        assert_eq!(
-            forced_aligner_auto_gpu_policy_for_tensor_index(&quant_floor_index(q4, q8)),
-            crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
-        );
-        assert_eq!(
-            forced_aligner_auto_gpu_policy_for_tensor_index(&quant_floor_index(q8, q4)),
-            crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
-        );
+        validate_forced_aligner_metal_tensor_index(&quant_floor_index(q8, q8))
+            .expect("current Q8 contract must remain eligible for explicit Metal");
+        assert!(validate_forced_aligner_metal_tensor_index(&quant_floor_index(q4, q8)).is_err());
+        assert!(validate_forced_aligner_metal_tensor_index(&quant_floor_index(q8, q4)).is_err());
     }
 
     #[test]
@@ -1027,8 +999,9 @@ mod tests {
         }
         let output_sha256 = crate::testing::benchmark_sha256_bytes([output_bytes]);
         let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=qwen3-forced-aligner backend={backend:?} segment_audio_seconds={audio_seconds:.6} repetitions={repetitions} represented_audio_seconds={represented_audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} items={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=qwen3-forced-aligner backend={backend:?} segment_audio_seconds={audio_seconds:.6} repetitions={repetitions} represented_audio_seconds={represented_audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} items={} output_sha256={output_sha256}",
             elapsed_seconds / represented_audio_seconds,
             expected.len(),
         );

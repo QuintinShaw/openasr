@@ -219,8 +219,15 @@ impl PyannetGgmlRuntime {
         let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
         config.graph_size = GRAPH_SIZE;
         config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE);
+        // The stage remains Hybrid because SincNet runs on the host, but this
+        // runtime owns only the recurrent/classifier subgraph.  A GPU-backed
+        // instance must therefore execute that subgraph directly on-device;
+        // enabling the multi-backend scheduler here would permit an implicit
+        // CPU fallback and retain scheduler high-water for an otherwise
+        // device-complete graph.
+        let graph_placement = recurrent_graph_placement(backend, placement);
         let config =
-            crate::models::graph_runtime_config::apply_execution_placement(config, placement);
+            crate::models::graph_runtime_config::apply_execution_placement(config, graph_placement);
         let runner = GgmlCpuGraphRunner::new(config)?;
         let arena = runner
             .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(ARENA_TENSORS))?;
@@ -237,6 +244,13 @@ impl PyannetGgmlRuntime {
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, PyannetGgmlError> {
         Ok(self.model.persistent_host_commitment_bytes()?)
+    }
+
+    #[cfg(test)]
+    fn prepared_graph_allocation_bytes(&self) -> Option<u64> {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.session.prepared_allocation_bytes())
     }
 
     pub(crate) fn forward(
@@ -337,6 +351,17 @@ impl PyannetGgmlRuntime {
             output,
             frames,
         })
+    }
+}
+
+fn recurrent_graph_placement(
+    backend: GgmlCpuGraphBackend,
+    stage_placement: ExecutionPlacement,
+) -> ExecutionPlacement {
+    if backend.is_gpu_class() {
+        ExecutionPlacement::FullDevice
+    } else {
+        stage_placement
     }
 }
 
@@ -463,6 +488,18 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_stage_keeps_its_metal_subgraph_on_device() {
+        assert_eq!(
+            recurrent_graph_placement(GgmlCpuGraphBackend::Metal, ExecutionPlacement::Hybrid,),
+            ExecutionPlacement::FullDevice,
+        );
+        assert_eq!(
+            recurrent_graph_placement(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly,),
+            ExecutionPlacement::CpuOnly,
+        );
+    }
+
+    #[test]
     #[ignore = "requires OPENASR_PYANNOTE_F32_PACK and a representative Metal device"]
     fn recurrent_graph_matches_family_math_on_cpu_and_metal() {
         let pack = std::env::var_os("OPENASR_PYANNOTE_F32_PACK")
@@ -491,9 +528,19 @@ mod tests {
             let mut runtime =
                 PyannetGgmlRuntime::new(model, backend, placement).expect("ggml runtime");
             if backend == GgmlCpuGraphBackend::Metal {
-                assert!(runtime.runner.uses_scheduler());
+                assert!(!runtime.runner.uses_scheduler());
             }
             let (actual, actual_frames) = runtime.forward(&samples).expect("ggml forward");
+            if backend == GgmlCpuGraphBackend::Metal {
+                let prepared_bytes = runtime
+                    .prepared_graph_allocation_bytes()
+                    .expect("direct Metal graph allocation");
+                eprintln!("PYANNET_METAL_GRAPH prepared_allocation_bytes={prepared_bytes}",);
+                assert!(
+                    prepared_bytes <= 4 * 1024 * 1024,
+                    "PyanNet recurrent graph allocation regressed to {prepared_bytes} bytes"
+                );
+            }
             assert_eq!(actual_frames, frames);
             let max_abs = actual
                 .iter()
