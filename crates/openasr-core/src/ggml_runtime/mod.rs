@@ -4,6 +4,7 @@ pub(crate) mod backend_memory;
 pub(crate) mod backend_memory_admission;
 mod cpu_graph;
 mod env_flags;
+mod execution_telemetry;
 mod ffi;
 mod gguf_c_parser_sandbox;
 pub mod gguf_header;
@@ -55,11 +56,18 @@ pub use cpu_graph::{
     request_backend_override, resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
-    GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor,
-    GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
+    GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlStaticTensor, GgmlStaticTensorArena,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
+pub use execution_telemetry::{
+    GgmlExecutionNodeSample, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
+    GgmlExecutionTelemetryGuard,
+};
+pub(crate) use execution_telemetry::{
+    current_execution_telemetry_collector, install_execution_telemetry_collector,
+};
 pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32};
 pub(crate) use gguf_c_parser_sandbox::load_gguf_metadata_and_tensor_index_with_c_parser_sandbox;
 pub use gguf_c_parser_sandbox::{

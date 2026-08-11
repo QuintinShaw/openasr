@@ -303,8 +303,11 @@ fn load_matrix_weight_with_square_layout(
         }
         _ => None,
     };
+    let raw_runtime_layout_ready = matches!(layout, CohereMatrixLayout::ColumnsByRows)
+        || (matches!(layout, CohereMatrixLayout::RowsByColumns)
+            && square_layout_override == Some(CohereMatrixLayout::RowsByColumns));
     let values = if allow_empty_values_when_raw_runtime_ready
-        && matches!(layout, CohereMatrixLayout::ColumnsByRows)
+        && raw_runtime_layout_ready
         && raw_ggml.is_some()
     {
         Vec::new()

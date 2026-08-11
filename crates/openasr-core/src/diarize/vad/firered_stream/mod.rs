@@ -17,6 +17,7 @@ mod frontend;
 mod ggml_runtime;
 mod model;
 mod provider;
+mod realtime_runtime;
 mod streaming;
 mod weights;
 
@@ -27,6 +28,7 @@ use std::sync::OnceLock;
 
 pub use model::FireRedStreamVadModel;
 pub use provider::{FireRedStreamVadError, FireRedStreamVadProvider};
+pub(crate) use realtime_runtime::{FireRedRealtimeVadRuntime, FireRedRealtimeVadSession};
 pub use streaming::FireRedStreamingVad;
 
 pub(crate) fn execution_capabilities() -> crate::device::execution_policy::ExecutionCapabilities {

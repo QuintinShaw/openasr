@@ -24,7 +24,7 @@ use crate::models::parakeet_ctc::graph_config::parakeet_ctc_encoder_graph_config
 use super::encoder_weights::ParakeetEncoderWeights;
 use super::runtime_contract::ParakeetCtcExecutionMetadata;
 
-const PARAKEET_ENCODER_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
+const PARAKEET_CTC_TAIL_STATIC_TENSORS: usize = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ParakeetEncoderError {
@@ -93,7 +93,7 @@ impl ParakeetCtcEncoderGraph {
         // everything" arena pass alongside the subsampling + conformer layers.
         let (core, (ctc_head_weight, ctc_head_bias)) = FastConformerEncoderCore::build(
             config,
-            PARAKEET_ENCODER_GRAPH_CONTEXT_BYTES,
+            PARAKEET_CTC_TAIL_STATIC_TENSORS,
             runtime_preflight,
             &weights.subsampling,
             &weights.layers,

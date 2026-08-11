@@ -619,10 +619,8 @@ impl PolicyResolvedNativeStreamingSession {
                 (Ok(session), None) => return Ok((candidate_index, session)),
                 (Err(error), None) => return Err(error),
                 (result, Some(failure)) => {
-                    let error = match result {
-                        Err(error) => error,
-                        Ok(_) => candidate_success_with_failure_error("session-build", &failure),
-                    };
+                    let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
+                        .unwrap_or_else(|| candidate_success_with_failure_error("session-build", &failure));
                     if candidate_index + 1 == execution_plan.candidates().len() {
                         return Err(error);
                     }
@@ -671,11 +669,13 @@ impl PolicyResolvedNativeStreamingSession {
     ) -> Result<(), NativeAsrError> {
         let next_index = self.candidate_index.saturating_add(1);
         if next_index >= self.execution_plan.candidates().len() {
+            self.terminal_error = Some(previous_error.clone());
             return Err(previous_error);
         }
-        // Drop every resource owned by the failed candidate before the next
-        // candidate quotes or allocates anything.
-        self.session.take();
+        debug_assert!(
+            self.session.is_none(),
+            "a failed streaming candidate must be invalidated before replacement"
+        );
         let (candidate_index, mut session) =
             match Self::construct_from(self.factory.as_ref(), &self.execution_plan, next_index) {
                 Ok(constructed) => constructed,
@@ -702,6 +702,37 @@ impl PolicyResolvedNativeStreamingSession {
         Ok(())
     }
 
+    fn invalidate_current_candidate(&mut self) {
+        if let Some(session) = self.session.take() {
+            crate::models::native_execution_services::drop_execution_candidate_value_without_cache_publication(
+                session,
+            );
+        }
+    }
+
+    fn finish_current_attempt<T>(
+        &mut self,
+        operation: &'static str,
+        attempt: crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<
+            T,
+            NativeAsrError,
+        >,
+    ) -> Result<T, NativeAsrError> {
+        match (attempt.result, attempt.candidate_failure) {
+            (result, None) => result,
+            (result, Some(failure)) => {
+                let error =
+                    crate::models::native_execution_services::execution_candidate_failure_source(
+                        result,
+                    )
+                    .unwrap_or_else(|| candidate_success_with_failure_error(operation, &failure));
+                self.invalidate_current_candidate();
+                self.terminal_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
     fn ensure_auxiliary_ready(&mut self) -> Result<(), NativeAsrError> {
         if self.auxiliary_ready {
             return Ok(());
@@ -726,10 +757,11 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
 
     fn set_cancellation_token(&mut self, cancelled: Arc<AtomicBool>) {
         self.cancellation_token = Some(Arc::clone(&cancelled));
-        let _ = self.run_current(|session| {
+        let attempt = self.run_current(|session| {
             session.set_cancellation_token(cancelled);
             Ok::<_, NativeAsrError>(())
         });
+        let _ = self.finish_current_attempt("set-cancellation-token", attempt);
     }
 
     fn push_audio(
@@ -741,22 +773,19 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
         // cannot prove whether a failing implementation consumed part of the
         // frame, so retry is disabled before making the call.
         self.audio_started = true;
-        candidate_attempt_result(
-            "push-audio",
-            self.run_current(|session| session.push_audio(frame)),
-        )
+        let attempt = self.run_current(|session| session.push_audio(frame));
+        self.finish_current_attempt("push-audio", attempt)
     }
 
     fn poll_events(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
-        candidate_attempt_result(
-            "poll-events",
-            self.run_current(|session| session.poll_events()),
-        )
+        let attempt = self.run_current(|session| session.poll_events());
+        self.finish_current_attempt("poll-events", attempt)
     }
 
     fn flush(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         self.ensure_auxiliary_ready_for_buffered_audio()?;
-        candidate_attempt_result("flush", self.run_current(|session| session.flush()))
+        let attempt = self.run_current(|session| session.flush());
+        self.finish_current_attempt("flush", attempt)
     }
 
     fn warm_up(&mut self) -> Result<(), NativeAsrError> {
@@ -767,11 +796,11 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
                 (Ok(()), None) => return self.ensure_auxiliary_ready(),
                 (Err(error), None) => return Err(error),
                 (result, Some(failure)) => {
-                    let error = match result {
-                        Err(error) => error,
-                        Ok(()) => candidate_success_with_failure_error("warm-up", &failure),
-                    };
+                    let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
+                        .unwrap_or_else(|| candidate_success_with_failure_error("warm-up", &failure));
+                    self.invalidate_current_candidate();
                     if self.audio_started {
+                        self.terminal_error = Some(error.clone());
                         return Err(error);
                     }
                     log_streaming_candidate_retry("warm-up", &candidate, &failure);
@@ -783,35 +812,34 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
 
     fn finalize_utterance(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         self.ensure_auxiliary_ready_for_buffered_audio()?;
-        candidate_attempt_result(
-            "finalize-utterance",
-            self.run_current(|session| session.finalize_utterance()),
-        )
+        let attempt = self.run_current(|session| session.finalize_utterance());
+        self.finish_current_attempt("finalize-utterance", attempt)
     }
 
     fn split_utterance(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         self.ensure_auxiliary_ready_for_buffered_audio()?;
-        candidate_attempt_result(
-            "split-utterance",
-            self.run_current(|session| session.split_utterance()),
-        )
+        let attempt = self.run_current(|session| session.split_utterance());
+        self.finish_current_attempt("split-utterance", attempt)
     }
 
     fn finish(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         self.ensure_auxiliary_ready_for_buffered_audio()?;
-        candidate_attempt_result("finish", self.run_current(|session| session.finish()))
+        let attempt = self.run_current(|session| session.finish());
+        self.finish_current_attempt("finish", attempt)
     }
 
     fn close(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         self.ensure_auxiliary_ready_for_buffered_audio()?;
-        candidate_attempt_result("close", self.run_current(|session| session.close()))
+        let attempt = self.run_current(|session| session.close());
+        self.finish_current_attempt("close", attempt)
     }
 
     fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         // Cancellation is cleanup, never an inference boundary. It must stay
         // allocation-free even when the session was canceled before warmup or
         // the first audio frame.
-        candidate_attempt_result("cancel", self.run_current(|session| session.cancel()))
+        let attempt = self.run_current(|session| session.cancel());
+        self.finish_current_attempt("cancel", attempt)
     }
 }
 
@@ -824,20 +852,6 @@ fn candidate_success_with_failure_error(
             "execution candidate reported {:?} during {operation} ({}) despite returning success",
             failure.kind, failure.operation
         ),
-    }
-}
-
-fn candidate_attempt_result<T>(
-    operation: &'static str,
-    attempt: crate::models::native_execution_services::ExecutionCandidateAttemptOutcome<
-        T,
-        NativeAsrError,
-    >,
-) -> Result<T, NativeAsrError> {
-    match (attempt.result, attempt.candidate_failure) {
-        (result, None) => result,
-        (Err(error), Some(_)) => Err(error),
-        (Ok(_), Some(failure)) => Err(candidate_success_with_failure_error(operation, &failure)),
     }
 }
 
@@ -3180,6 +3194,26 @@ mod tests {
             *builds.lock().unwrap(),
             vec![ExecutionProvider::Vulkan, ExecutionProvider::Cpu]
         );
+    }
+
+    #[test]
+    fn streaming_terminal_candidate_warmup_failure_stays_fail_closed() {
+        let (builder, _, _) = streaming_test_builder(false, true, false);
+        let plan = ExecutionPlan::for_test(
+            ExecutionIntent::AcceleratedOnly,
+            vec![streaming_policy_candidate(
+                ExecutionProvider::Vulkan,
+                ExecutionPlacement::Hybrid,
+            )],
+        );
+        let mut session = PolicyResolvedNativeStreamingSession::start(builder, plan).unwrap();
+        let warmup_error = session
+            .warm_up()
+            .expect_err("the only candidate deliberately fails warm-up");
+        let later_error = session
+            .poll_events()
+            .expect_err("a terminal wrapper must fail closed instead of panicking");
+        assert_eq!(later_error, warmup_error);
     }
 
     #[test]

@@ -220,8 +220,16 @@ impl CohereTranscribeEncoderGraphRuntime {
             RuntimeWeightSource::Synthetic => None,
         };
         let arena_start = Instant::now();
+        let arena_tensor_count = weights
+            .layers
+            .len()
+            .checked_mul(35)
+            .and_then(|count| count.checked_add(14))
+            .ok_or(CohereTranscribeEncoderError::ShapeOverflow)?;
         let mut arena = runner
-            .start_static_tensor_arena(config.context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_count,
+            ))
             .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
                 step: "static_tensor_arena",
                 source,

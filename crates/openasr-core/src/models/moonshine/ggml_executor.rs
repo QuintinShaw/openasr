@@ -358,6 +358,10 @@ impl MoonshineGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
+        // Engine keys contain the old build identity, but the shared registry
+        // cannot safely inspect a family-private content id. Drop all idle
+        // owner references so a replaced pack cannot retain decoder graphs.
+        shutdown_moonshine_serve_batch_engines(&self.serve_batch_engines);
     }
 
     fn map_actor_error(

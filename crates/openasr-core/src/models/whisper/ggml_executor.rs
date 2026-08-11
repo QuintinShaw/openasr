@@ -915,7 +915,7 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
         // the prelude output is unchanged -- only the buffer each conv op reads
         // its weight from moves off the compute graph.
         let mut arena = runner
-            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(8))
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(4))
             .map_err(|error| map_graph_error("static_tensor_arena", error))?;
         let conv1_w_static = arena
             .new_tensor_3d_f16(
@@ -2321,14 +2321,26 @@ fn upload_encoder_graph_inputs<'a>(
 
 fn build_encoder_resident_weight_cache<'weights>(
     runner: &GgmlCpuGraphRunner,
-    context_bytes: usize,
     source_tensors: &HashMap<&str, &'weights WhisperMaterializedTensor>,
     encoder_weights: &'weights WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
     runtime_preflight: &GgufRuntimeSourcePreflight,
 ) -> Result<WhisperEncoderResidentWeightCache, WhisperGgmlExecutorError> {
+    // Worst case: 15 resident handles per layer plus final norm weight/bias.
+    // Eligible quantized linears bind zero-copy and use fewer handles, but the
+    // topology upper bound keeps sizing independent of pack materialization.
+    let arena_tensor_capacity = plan
+        .layers
+        .len()
+        .checked_mul(15)
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
+            reason: "encoder resident weight tensor count overflows usize".to_string(),
+        })?;
     let mut arena = runner
-        .start_static_tensor_arena(context_bytes)
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+            arena_tensor_capacity,
+        ))
         .map_err(|error| map_encoder_graph_error("ggml_static_tensor_arena", error))?;
     // Bind large quantized linear weights zero-copy to the mmap'd pack (no host
     // copy, no arena upload). Falls back to the arena path when unavailable.
@@ -3464,6 +3476,7 @@ impl WhisperGgmlExecutor {
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
+        shutdown_whisper_serve_batch_engines(&self.serve_batch_engines);
     }
 }
 
@@ -3809,7 +3822,6 @@ fn build_whisper_encoder_persistent_static_session(
         let encoder_tensor_index = build_encoder_tensor_index(encoder_weights);
         let cache = build_encoder_resident_weight_cache(
             &runner,
-            graph_config.context_bytes,
             &encoder_tensor_index,
             encoder_weights,
             plan,

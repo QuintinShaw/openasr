@@ -469,10 +469,13 @@ fn diarizen_fifteen_minute_endurance() {
             .map(|window| window.frame_activity.as_slice())
             .chain(std::iter::once(activity.speaker_count.as_slice())),
     );
-    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
-    let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
+    let memory = crate::metrics::process_memory_snapshot();
+    let peak_rss_bytes = memory.peak_rss_bytes.unwrap_or(0);
+    let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
+    let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
+    let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
     eprintln!(
-        "AUX_MODEL_ENDURANCE model=diarizen backend={backend:?} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} windows={} activity_sha256={activity_sha256}",
+        "AUX_MODEL_ENDURANCE model=diarizen backend={backend:?} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} windows={} activity_sha256={activity_sha256}",
         elapsed_seconds / audio_seconds,
         activity.windows.len(),
     );

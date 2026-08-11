@@ -330,8 +330,15 @@ impl MimoInputLocalRuntime {
                 .map_err(|error| MimoInputLocalError::GraphExecutionFailed {
                     reason: format!("build_runtime_tensor_reader_from_preflight: {error}"),
                 })?;
+        let arena_tensor_count = metadata
+            .n_layers
+            .checked_mul(5)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(MimoInputLocalError::ShapeOverflow)?;
         let mut arena = runner
-            .start_static_tensor_arena(config.context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_count,
+            ))
             .map_err(|source| build_err("static_tensor_arena", source))?;
 
         let d = metadata.d_model;

@@ -13,12 +13,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use openasr_core::{
-    BackendKind, ExecutionTarget, InstalledPack, NativeExecutionServices,
-    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt,
-    ShortAudioReceiptAudio, ShortAudioReceiptMetrics, ShortAudioReceiptPack, ShortAudioReceiptRun,
+    BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
+    InstalledPack, NativeExecutionServices, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio,
+    ShortAudioReceiptMetrics, ShortAudioReceiptPack, ShortAudioReceiptRun,
     ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text, list_installed_packs,
-    load_config, openasr_home, parse_model_ref, peak_rss_bytes, prepare_audio_input, receipt_os_id,
-    resolve_core_commit, resolve_installed_pack_reference, sha256_file,
+    load_config, openasr_home, parse_model_ref, prepare_audio_input, process_memory_snapshot,
+    receipt_os_id, resolve_core_commit, resolve_installed_pack_reference, sha256_file,
     validate_local_native_model_pack_path,
 };
 
@@ -101,12 +102,15 @@ pub(crate) fn bench_receipt_short_audio(
         ),
     )?;
     let audio_duration_s = prepared_audio.duration_seconds();
+    let memory_before_model = process_memory_snapshot();
 
     let core_commit = resolve_core_commit(options.core_commit, options.git_cwd).context(
         "Could not resolve core_commit. Pass --core-commit <40-hex>, set OPENASR_BUILD_COMMIT, or run inside a git checkout.",
     )?;
 
     let total_passes = options.warmup_runs.saturating_add(options.runs);
+    let execution_telemetry = GgmlExecutionTelemetryCollector::new();
+    let _execution_telemetry_guard = execution_telemetry.install();
     let mut rtf_samples = Vec::with_capacity(options.runs);
     let mut last_text = String::new();
     let mut notes = Vec::new();
@@ -118,7 +122,7 @@ pub(crate) fn bench_receipt_short_audio(
         );
     }
     notes.push(
-        "placement reports the requested device label; v0 does not introspect runtime weight placement"
+        "placement is the requested device; observed_placement reports actual ggml graph-node backends"
             .to_string(),
     );
     notes.push(format!(
@@ -190,6 +194,11 @@ pub(crate) fn bench_receipt_short_audio(
     let command = build_command_argv(&options, &pack_binding, &device_label);
     let env_allowlist = capture_env_allowlist();
 
+    let memory_after_model = process_memory_snapshot();
+    let observed_placement = execution_telemetry.snapshot();
+    if options.backend_kind == BackendKind::Native {
+        validate_observed_accelerator_placement(&device_label, &observed_placement)?;
+    }
     let receipt = ShortAudioReceipt::try_new(ShortAudioReceipt {
         schema: SHORT_AUDIO_RECEIPT_SCHEMA.to_string(),
         core_commit,
@@ -218,12 +227,20 @@ pub(crate) fn bench_receipt_short_audio(
             rtf_samples,
             rtf_median: None,
             ttft_s: None,
-            peak_rss_bytes: peak_rss_bytes(),
+            peak_rss_bytes: memory_after_model.peak_rss_bytes,
+            peak_rss_before_model_bytes: memory_before_model.peak_rss_bytes,
+            rss_before_model_bytes: memory_before_model.current_rss_bytes,
+            rss_after_model_bytes: memory_after_model.current_rss_bytes,
+            phys_footprint_before_model_bytes: memory_before_model.current_phys_footprint_bytes,
+            phys_footprint_after_model_bytes: memory_after_model.current_phys_footprint_bytes,
+            peak_phys_footprint_before_model_bytes: memory_before_model.peak_phys_footprint_bytes,
+            peak_phys_footprint_bytes: memory_after_model.peak_phys_footprint_bytes,
             peak_vram_bytes: None,
             measurement_method: Some(SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK.to_string()),
         },
         transcript: ShortAudioReceiptTranscript::from_text(last_text),
         placement: device_label,
+        observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
         scope: options.scope.to_string(),
         notes,
     })
@@ -463,6 +480,35 @@ fn capture_env_allowlist() -> BTreeMap<String, String> {
     out
 }
 
+fn validate_observed_accelerator_placement(
+    requested_device: &str,
+    observed: &GgmlExecutionPlacementSummary,
+) -> Result<()> {
+    if !requested_device.eq_ignore_ascii_case("metal") {
+        return Ok(());
+    }
+    let mut metal_nodes = 0_u64;
+    let mut non_metal = BTreeMap::<String, u64>::new();
+    for (backend, nodes) in &observed.observed_compute_nodes_by_backend {
+        let normalized = backend.to_ascii_lowercase();
+        if normalized.contains("metal") || normalized.starts_with("mtl") {
+            metal_nodes = metal_nodes.saturating_add(*nodes);
+        } else if *nodes > 0 {
+            non_metal.insert(backend.clone(), *nodes);
+        }
+    }
+    if metal_nodes == 0 {
+        bail!(
+            "Metal receipt observed no Metal compute nodes; observed={:?}",
+            observed.observed_compute_nodes_by_backend
+        );
+    }
+    if !non_metal.is_empty() {
+        bail!("Metal receipt observed compute-node fallback outside Metal: {non_metal:?}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +601,25 @@ mod tests {
             display_model_id(Some("funasr-nano"), "funasr-nano", "q4_k"),
             "funasr-nano:q4_k"
         );
+    }
+
+    #[test]
+    fn metal_placement_gate_ignores_metadata_views_but_rejects_compute_fallback() {
+        let mut observed = GgmlExecutionPlacementSummary {
+            direct_graph_computes: 0,
+            scheduler_graph_computes: 1,
+            observed_nodes_by_backend: BTreeMap::from([
+                ("CPU".to_string(), 1),
+                ("MTL0".to_string(), 20),
+            ]),
+            observed_compute_nodes_by_backend: BTreeMap::from([("MTL0".to_string(), 19)]),
+            observed_node_output_bytes_by_backend: BTreeMap::new(),
+            fallback_node_samples_by_backend: BTreeMap::new(),
+        };
+        validate_observed_accelerator_placement("metal", &observed).unwrap();
+        observed
+            .observed_compute_nodes_by_backend
+            .insert("CPU".to_string(), 1);
+        assert!(validate_observed_accelerator_placement("metal", &observed).is_err());
     }
 }

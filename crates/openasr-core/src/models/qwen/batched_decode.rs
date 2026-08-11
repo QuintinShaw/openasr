@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -31,6 +31,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
     build_seq2seq_greedy_stop_token_ids,
 };
+use crate::models::seq2seq_serve_batch::BoundedServeBatchEngineCache;
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
     OwnerAliveGuard, SERVE_BATCH_COLLECT_WINDOW, ServeBatchPolicy, serve_batch_bucket_width,
@@ -236,7 +237,9 @@ struct Qwen3AsrServeBatchEngineKey {
 /// process singleton partitioned by ambient scope ids.
 #[derive(Clone, Default)]
 pub(super) struct Qwen3AsrServeBatchEngineRegistry {
-    engines: Arc<Mutex<HashMap<Qwen3AsrServeBatchEngineKey, Arc<Qwen3AsrServeBatchEngine>>>>,
+    engines: Arc<
+        Mutex<BoundedServeBatchEngineCache<Qwen3AsrServeBatchEngineKey, Qwen3AsrServeBatchEngine>>,
+    >,
 }
 
 impl std::fmt::Debug for Qwen3AsrServeBatchEngineRegistry {
@@ -382,13 +385,8 @@ pub(super) fn submit_qwen_serve_batch_job(
     };
     let engine = qwen_serve_batch_engine_for_key(registry, key.clone(), config)?;
     let result = engine.submit(job);
-    if crate::models::native_execution_services::current_execution_candidate_failure().is_some()
-        && let Ok(mut engines) = registry.engines.lock()
-        && engines
-            .get(&key)
-            .is_some_and(|cached| Arc::ptr_eq(cached, &engine))
-    {
-        engines.remove(&key);
+    if crate::models::native_execution_services::current_execution_candidate_failure().is_some() {
+        evict_qwen_serve_batch_engine(registry, &key, &engine);
     }
     result
 }
@@ -414,29 +412,59 @@ fn qwen_serve_batch_engine_for_key(
         .map_err(|_| Qwen3AsrServeBatchError::RegistryPoisoned)?;
     if let Some(engine) = engines.get(&key) {
         if serve_batch_owner_alive(&engine.is_alive) {
-            return Ok(Arc::clone(engine));
+            let failed_registry = registry.clone();
+            let failed_key = key.clone();
+            let failed_engine = Arc::clone(&engine);
+            crate::models::native_execution_services::stage_execution_cache_rollback(move || {
+                evict_qwen_serve_batch_engine(&failed_registry, &failed_key, &failed_engine);
+            });
+            return Ok(engine);
         }
         // The cached owner thread exited (normal or panic); drop the stale
         // engine and respawn a fresh one with clean ggml state.
         engines.remove(&key);
     }
+    let generation = engines.generation();
     let engine = Arc::new(Qwen3AsrServeBatchEngine::spawn(key.clone(), config)?);
     drop(engines);
+    let failed_registry = registry.clone();
+    let failed_key = key.clone();
+    let failed_engine = Arc::clone(&engine);
+    crate::models::native_execution_services::stage_execution_cache_rollback(move || {
+        evict_qwen_serve_batch_engine(&failed_registry, &failed_key, &failed_engine);
+    });
     let registry = registry.clone();
     let staged_engine = Arc::clone(&engine);
     crate::models::native_execution_services::stage_execution_cache_commit(move || {
         let Ok(mut engines) = registry.engines.lock() else {
             return;
         };
+        if engines.generation() != generation {
+            return;
+        }
         if engines
             .get(&key)
             .is_some_and(|existing| serve_batch_owner_alive(&existing.is_alive))
         {
             return;
         }
-        engines.insert(key, staged_engine);
+        engines.remove(&key);
+        let _ = engines.insert_if_idle_capacity(key, staged_engine);
     });
     Ok(engine)
+}
+
+fn evict_qwen_serve_batch_engine(
+    registry: &Qwen3AsrServeBatchEngineRegistry,
+    key: &Qwen3AsrServeBatchEngineKey,
+    engine: &Arc<Qwen3AsrServeBatchEngine>,
+) {
+    let Ok(mut engines) = registry.engines.lock() else {
+        return;
+    };
+    if engines.contains_ptr(key, engine) {
+        engines.remove(key);
+    }
 }
 
 impl Qwen3AsrServeBatchEngine {

@@ -64,6 +64,17 @@ fn streaming_probabilities_for_backend(
     samples: &[f32],
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Vec<f32>, String> {
+    let default_chunk_samples = super::provider::offline_chunk_samples_for_backend(backend);
+    let chunk_seconds = std::env::var("OPENASR_FIRERED_STREAM_VAD_BENCH_CHUNK_SECONDS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("OPENASR_FIRERED_STREAM_VAD_BENCH_CHUNK_SECONDS must be an integer")
+        })
+        .unwrap_or_else(|| default_chunk_samples / super::frontend::SAMPLE_RATE_HZ as usize)
+        .max(1);
+    let chunk_samples = chunk_seconds.saturating_mul(super::frontend::SAMPLE_RATE_HZ as usize);
     let mut streaming = super::streaming::FireRedStreamingVad::from_model(model);
     let placement = if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
         crate::device::execution_policy::ExecutionPlacement::CpuOnly
@@ -75,7 +86,7 @@ fn streaming_probabilities_for_backend(
         .transpose()
         .map_err(|error| error.to_string())?;
     let mut probabilities = Vec::with_capacity(samples.len().div_ceil(160));
-    for chunk in samples.chunks(super::frontend::SAMPLE_RATE_HZ as usize) {
+    for chunk in samples.chunks(chunk_samples) {
         let next = if let Some(runtime) = runtime.as_mut() {
             streaming
                 .accept_f32_chunk_with(chunk, |features, frames, cache| {
@@ -210,8 +221,11 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     let reference_probs = read_reference_probabilities(&reference);
     let model = super::shared_model().expect("vendored FireRedVAD weights");
     let backend = benchmark_backend();
+    let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+    let _execution_placement_guard = execution_placement.install();
     let probabilities = streaming_probabilities_for_backend(model, &samples, backend)
         .expect("run policy-equivalent FireRedVAD");
+    let observed = execution_placement.snapshot();
     let (max_abs, worst_frame) = max_abs_diff_with_location(&probabilities, &reference_probs);
     let mut absolute_errors = probabilities
         .iter()
@@ -234,12 +248,18 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     let native_spans = super::provider::spans_from_probs(&probabilities, samples.len(), &options);
     let reference_spans =
         super::provider::spans_from_probs(&reference_probs, samples.len(), &options);
+    let memory = crate::metrics::process_memory_snapshot();
     eprintln!(
-        "FIRERED_VAD_OFFICIAL_PARITY backend={backend:?} frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={}",
+        "FIRERED_VAD_OFFICIAL_PARITY backend={backend:?} frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
         probabilities.len(),
         probabilities[worst_frame],
         reference_probs[worst_frame],
         native_spans.len(),
+        observed.observed_compute_nodes_by_backend,
+        memory.current_rss_bytes,
+        memory.peak_rss_bytes,
+        memory.current_phys_footprint_bytes,
+        memory.peak_phys_footprint_bytes,
     );
     assert!(
         // Torch/BLAS and Rust use different f32 reduction orders. The DFSMN
@@ -256,6 +276,20 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
         native_spans, reference_spans,
         "official and native probabilities must produce identical product speech spans despite {threshold_disagreements} near-threshold frame(s)"
     );
+    if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
+        assert!(
+            !observed.observed_compute_nodes_by_backend.is_empty()
+                && observed
+                    .observed_compute_nodes_by_backend
+                    .keys()
+                    .all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.starts_with("mtl") || backend.contains("metal")
+                    }),
+            "explicit Metal FireRedVAD route observed non-Metal compute: {:?}",
+            observed.observed_compute_nodes_by_backend
+        );
+    }
 }
 
 #[test]
@@ -499,10 +533,15 @@ fn firered_stream_vad_fifteen_minute_endurance() {
     let probability_sha256 = crate::testing::benchmark_sha256_f32(&probs);
     let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
     let rtf = median_seconds / audio_seconds;
-    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
-    let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
+    let memory = crate::metrics::process_memory_snapshot();
+    let peak_rss_bytes = memory.peak_rss_bytes.unwrap_or(0);
+    let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
+    let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
+    let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
+    let chunk_seconds = std::env::var("OPENASR_FIRERED_STREAM_VAD_BENCH_CHUNK_SECONDS")
+        .unwrap_or_else(|_| "1".to_string());
     println!(
-        "AUX_MODEL_ENDURANCE model=fireredvad backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+        "AUX_MODEL_ENDURANCE model=fireredvad backend={backend:?} chunk_seconds={chunk_seconds} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
         probs.len(),
     );
     assert!(!probs.is_empty());

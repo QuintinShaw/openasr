@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::ggml_runtime::GgmlExecutionPlacementSummary;
+
 /// Stable schema id for the short-audio receipt MVP.
 pub const SHORT_AUDIO_RECEIPT_SCHEMA: &str = "openasr.short-audio-receipt.v0";
 
@@ -67,6 +69,10 @@ pub struct ShortAudioReceipt {
     /// Reported weight/compute placement label (requested device in v0 when
     /// runtime placement is not introspected).
     pub placement: String,
+    /// Actual graph-node placement observed at compute time. Older receipts
+    /// and non-ggml backends may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_placement: Option<GgmlExecutionPlacementSummary>,
     /// Gate scope, typically [`SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE`].
     pub scope: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -126,6 +132,31 @@ pub struct ShortAudioReceiptMetrics {
     pub ttft_s: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rss_bytes: Option<u64>,
+    /// Process peak RSS captured immediately before the first model run. The
+    /// difference to `peak_rss_bytes` isolates additional high-water created
+    /// by model execution from CLI/audio preparation startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_before_model_bytes: Option<u64>,
+    /// Process RSS after audio preparation but before the first model run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_before_model_bytes: Option<u64>,
+    /// Process RSS after all warmup and measured runs, while resident runtime
+    /// caches still reflect the product's warm state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_after_model_bytes: Option<u64>,
+    /// Darwin process physical footprint before the first model run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phys_footprint_before_model_bytes: Option<u64>,
+    /// Darwin process physical footprint after all model runs while warm
+    /// runtimes remain resident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phys_footprint_after_model_bytes: Option<u64>,
+    /// Darwin lifetime maximum physical footprint before the first model run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_phys_footprint_before_model_bytes: Option<u64>,
+    /// Darwin lifetime maximum physical footprint after all model runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_phys_footprint_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_vram_bytes: Option<u64>,
     /// How RTF was measured. v0 uses wall-clock process elapsed.
@@ -443,11 +474,26 @@ mod tests {
                 rtf_median: Some(0.5),
                 ttft_s: None,
                 peak_rss_bytes: Some(1024),
+                peak_rss_before_model_bytes: Some(640),
+                rss_before_model_bytes: Some(512),
+                rss_after_model_bytes: Some(768),
+                phys_footprint_before_model_bytes: Some(448),
+                phys_footprint_after_model_bytes: Some(704),
+                peak_phys_footprint_before_model_bytes: Some(576),
+                peak_phys_footprint_bytes: Some(896),
                 peak_vram_bytes: None,
                 measurement_method: Some(SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK.to_string()),
             },
             transcript,
             placement: "cpu".to_string(),
+            observed_placement: Some(GgmlExecutionPlacementSummary {
+                direct_graph_computes: 1,
+                scheduler_graph_computes: 0,
+                observed_nodes_by_backend: BTreeMap::from([("CPU".to_string(), 12)]),
+                observed_compute_nodes_by_backend: BTreeMap::from([("CPU".to_string(), 10)]),
+                observed_node_output_bytes_by_backend: BTreeMap::from([("CPU".to_string(), 4096)]),
+                fallback_node_samples_by_backend: BTreeMap::new(),
+            }),
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
             notes: vec!["unit-test fixture".to_string()],
         }

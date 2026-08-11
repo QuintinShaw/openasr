@@ -1375,7 +1375,100 @@ fn owner_thread_loop<F: Seq2SeqServeBatchFamily>(
 /// map, while independently constructed service roots cannot observe one
 /// another's engines and therefore need no scope component in their keys.
 pub(crate) struct ServeBatchEngineRegistry<F: Seq2SeqServeBatchFamily> {
-    engines: Arc<Mutex<HashMap<F::EngineKey, Arc<ServeBatchEngine<F>>>>>,
+    engines: Arc<Mutex<BoundedServeBatchEngineCache<F::EngineKey, ServeBatchEngine<F>>>>,
+}
+
+/// A small executor-local LRU for heavyweight serve-batch owner threads.
+///
+/// Each owner may retain a decoder, logits runtime, reusable graphs, and up to
+/// `MAX_BATCH_LIMIT` batch-width variants. Keeping an unbounded map here made
+/// model/content/backend churn accumulate owner threads until the service-wide
+/// idle reaper ran. Four idle engines matches the family actor-pool bound. If
+/// all cached engines are concurrently borrowed, a newly spawned engine still
+/// serves its current request but is deliberately not retained afterwards.
+pub(crate) const SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES: usize = 4;
+
+pub(crate) struct BoundedServeBatchEngineCache<K, E> {
+    entries: HashMap<K, Arc<E>>,
+    recency: VecDeque<K>,
+    generation: u64,
+}
+
+impl<K, E> Default for BoundedServeBatchEngineCache<K, E> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            generation: 0,
+        }
+    }
+}
+
+impl<K, E> BoundedServeBatchEngineCache<K, E>
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    pub(crate) fn get(&mut self, key: &K) -> Option<Arc<E>> {
+        let engine = Arc::clone(self.entries.get(key)?);
+        self.touch(key);
+        Some(engine)
+    }
+
+    pub(crate) fn insert_if_idle_capacity(&mut self, key: K, engine: Arc<E>) -> bool {
+        if self.entries.contains_key(&key) {
+            self.remove(&key);
+        }
+        while self.entries.len() >= SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES {
+            let Some(evictable) = self.recency.iter().find_map(|candidate| {
+                self.entries
+                    .get(candidate)
+                    .filter(|cached| Arc::strong_count(cached) == 1)
+                    .map(|_| candidate.clone())
+            }) else {
+                return false;
+            };
+            self.remove(&evictable);
+        }
+        self.entries.insert(key.clone(), engine);
+        self.touch(&key);
+        true
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) -> Option<Arc<E>> {
+        self.recency.retain(|candidate| candidate != key);
+        self.entries.remove(key)
+    }
+
+    pub(crate) fn contains_ptr(&self, key: &K, engine: &Arc<E>) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, engine))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.recency.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn touch(&mut self, key: &K) {
+        self.recency.retain(|candidate| candidate != key);
+        self.recency.push_back(key.clone());
+    }
 }
 
 impl<F: Seq2SeqServeBatchFamily> Clone for ServeBatchEngineRegistry<F> {
@@ -1397,7 +1490,7 @@ impl<F: Seq2SeqServeBatchFamily> std::fmt::Debug for ServeBatchEngineRegistry<F>
 impl<F: Seq2SeqServeBatchFamily> Default for ServeBatchEngineRegistry<F> {
     fn default() -> Self {
         Self {
-            engines: Arc::new(Mutex::new(HashMap::new())),
+            engines: Arc::new(Mutex::new(BoundedServeBatchEngineCache::default())),
         }
     }
 }
@@ -1419,28 +1512,54 @@ where
         let mut engines = self.engines.lock().map_err(|_| F::registry_poisoned())?;
         if let Some(engine) = engines.get(&key) {
             if serve_batch_owner_alive(&engine.is_alive) {
-                return Ok(Arc::clone(engine));
+                let registry = self.clone();
+                let failed_key = key.clone();
+                let failed_engine = Arc::clone(&engine);
+                crate::models::native_execution_services::stage_execution_cache_rollback(
+                    move || registry.evict_exact(&failed_key, &failed_engine),
+                );
+                return Ok(engine);
             }
             engines.remove(&key);
         }
+        let generation = engines.generation();
         let engine = Arc::new(ServeBatchEngine::<F>::spawn(key.clone(), config)?);
         drop(engines);
 
+        let failed_registry = self.clone();
+        let failed_key = key.clone();
+        let failed_engine = Arc::clone(&engine);
+        crate::models::native_execution_services::stage_execution_cache_rollback(move || {
+            failed_registry.evict_exact(&failed_key, &failed_engine);
+        });
         let registry = self.clone();
         let staged_engine = Arc::clone(&engine);
         crate::models::native_execution_services::stage_execution_cache_commit(move || {
             let Ok(mut engines) = registry.engines.lock() else {
                 return;
             };
+            if engines.generation() != generation {
+                return;
+            }
             if engines
                 .get(&key)
                 .is_some_and(|existing| serve_batch_owner_alive(&existing.is_alive))
             {
                 return;
             }
-            engines.insert(key, staged_engine);
+            engines.remove(&key);
+            let _ = engines.insert_if_idle_capacity(key, staged_engine);
         });
         Ok(engine)
+    }
+
+    fn evict_exact(&self, key: &F::EngineKey, engine: &Arc<ServeBatchEngine<F>>) {
+        let Ok(mut engines) = self.engines.lock() else {
+            return;
+        };
+        if engines.contains_ptr(key, engine) {
+            engines.remove(key);
+        }
     }
 
     /// Removes the exact owner that participated in a typed candidate failure.
@@ -1455,15 +1574,7 @@ where
         {
             return;
         }
-        let Ok(mut engines) = self.engines.lock() else {
-            return;
-        };
-        if engines
-            .get(key)
-            .is_some_and(|cached| Arc::ptr_eq(cached, engine))
-        {
-            engines.remove(key);
-        }
+        self.evict_exact(key, engine);
     }
 
     /// Drops this executor's registry references. In-flight submitters retain
@@ -1939,6 +2050,48 @@ mod slot_isolation_tests {
         assert!(first.engines.lock().unwrap().is_empty());
         assert_eq!(second.engines.lock().unwrap().len(), 1);
         second.shutdown();
+    }
+
+    #[test]
+    fn bounded_engine_cache_evicts_the_least_recent_idle_owner() {
+        let mut cache = BoundedServeBatchEngineCache::<usize, usize>::default();
+        for key in 0..SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES {
+            assert!(cache.insert_if_idle_capacity(key, Arc::new(key)));
+        }
+
+        drop(cache.get(&0).expect("touch newest engine"));
+        assert!(cache.insert_if_idle_capacity(99, Arc::new(99)));
+
+        assert_eq!(cache.len(), SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES);
+        assert!(!cache.entries.contains_key(&1));
+        assert!(cache.entries.contains_key(&0));
+        assert!(cache.entries.contains_key(&99));
+    }
+
+    #[test]
+    fn bounded_engine_cache_does_not_retain_a_new_owner_when_all_slots_are_active() {
+        let mut cache = BoundedServeBatchEngineCache::<usize, usize>::default();
+        let mut active = Vec::new();
+        for key in 0..SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES {
+            let engine = Arc::new(key);
+            active.push(Arc::clone(&engine));
+            assert!(cache.insert_if_idle_capacity(key, engine));
+        }
+
+        assert!(!cache.insert_if_idle_capacity(99, Arc::new(99)));
+        assert_eq!(cache.len(), SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES);
+        assert!(!cache.entries.contains_key(&99));
+        drop(active);
+    }
+
+    #[test]
+    fn clearing_engine_cache_advances_publication_generation() {
+        let mut cache = BoundedServeBatchEngineCache::<usize, usize>::default();
+        assert!(cache.insert_if_idle_capacity(1, Arc::new(1)));
+        let stale_generation = cache.generation();
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_ne!(cache.generation(), stale_generation);
     }
 
     #[test]

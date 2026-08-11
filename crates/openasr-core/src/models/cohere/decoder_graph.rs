@@ -472,11 +472,6 @@ pub(crate) struct CohereDecoderGraphRuntime {
     reuse: Option<Seq2SeqReusableDecodeGraph>,
     metadata: CohereTranscribeExecutionMetadata,
     runner: GgmlCpuGraphRunner,
-    /// The `no_alloc` metadata context size used for `runner`'s own graph
-    /// context and `arena`; reused verbatim for
-    /// `start_persistent_graph_session` in [`Self::build_reusable_decode_graph`]
-    /// so it does not have to be recomputed from a hardcoded constant.
-    persistent_graph_context_bytes: usize,
     arena: GgmlStaticTensorArena,
     token_embedding: GgmlStaticTensor,
     positional_embedding: GgmlStaticTensor,
@@ -672,7 +667,6 @@ impl CohereDecoderGraphRuntime {
                 .max(GgmlCpuGraphConfig::metadata_context_bytes(
                     config.graph_size,
                 ));
-        let persistent_graph_context_bytes = config.context_bytes;
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             CohereDecoderGraphError::GraphBuildFailed {
                 step: "runner_init",
@@ -681,7 +675,6 @@ impl CohereDecoderGraphRuntime {
         })?;
         let arena_state = build_cohere_decoder_arena_state(
             &runner,
-            persistent_graph_context_bytes,
             decoder_weights,
             metadata,
             cross_hidden_size,
@@ -694,7 +687,6 @@ impl CohereDecoderGraphRuntime {
             reuse: None,
             metadata,
             runner,
-            persistent_graph_context_bytes,
             arena: arena_state.arena,
             token_embedding: arena_state.token_embedding,
             positional_embedding: arena_state.positional_embedding,
@@ -783,7 +775,6 @@ struct CohereDecoderArenaState {
 #[allow(clippy::too_many_arguments)]
 fn build_cohere_decoder_arena_state(
     runner: &GgmlCpuGraphRunner,
-    context_bytes: usize,
     decoder_weights: &CohereTranscribeDecoderWeights,
     metadata: CohereTranscribeExecutionMetadata,
     cross_hidden_size: usize,
@@ -791,8 +782,18 @@ fn build_cohere_decoder_arena_state(
     cross_alloc_frames: usize,
     n_seq: usize,
 ) -> Result<CohereDecoderArenaState, CohereDecoderGraphError> {
+    let arena_tensor_count = decoder_weights
+        .layers
+        .len()
+        .checked_mul(30)
+        .and_then(|count| count.checked_add(8))
+        .ok_or_else(|| CohereDecoderGraphError::InvalidInput {
+            reason: "cohere decoder static tensor count overflows usize".to_string(),
+        })?;
     let mut arena = runner
-        .start_static_tensor_arena(context_bytes)
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+            arena_tensor_count,
+        ))
         .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
             step: "static_tensor_arena",
             source,
@@ -2045,7 +2046,7 @@ impl CohereDecoderGraphRuntime {
             .unwrap_or(0);
         let mut session = self
             .runner
-            .start_persistent_graph_session(self.persistent_graph_context_bytes)
+            .start_capacity_sized_persistent_graph_session()
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "cohere_reuse_session",
                 source,
@@ -2693,6 +2694,16 @@ fn new_embedding_tensor_in_arena(
     weight: &CohereMatrixWeight,
     tensor_name: &'static str,
 ) -> Result<GgmlStaticTensor, CohereDecoderGraphError> {
+    if let Some(raw) = &weight.raw_ggml
+        && raw.dims.as_slice() == [weight.rows, weight.cols]
+    {
+        return arena
+            .new_tensor_2d_typed(weight.cols, weight.rows, raw.ggml_type, tensor_name)
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: tensor_name,
+                source,
+            });
+    }
     arena
         .new_tensor_2d_f32(weight.cols, weight.rows, tensor_name)
         .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
@@ -2839,11 +2850,13 @@ fn upload_embedding_to_arena(
 ) -> Result<(), CohereDecoderGraphError> {
     if let Some(raw) = &weight.raw_ggml
         && raw.dims.as_slice() == [weight.rows, weight.cols]
-        && arena
-            .set_bytes_slice(tensor, raw.bytes(), tensor_name)
-            .is_ok()
     {
-        return Ok(());
+        return arena
+            .set_bytes_slice(tensor, raw.bytes(), tensor_name)
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: tensor_name,
+                source,
+            });
     }
     arena
         .set_f32_slice(tensor, &weight.values, tensor_name)

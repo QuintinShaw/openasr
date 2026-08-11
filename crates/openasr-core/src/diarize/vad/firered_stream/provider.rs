@@ -31,6 +31,8 @@ pub enum FireRedStreamVadError {
     Graph { reason: String },
     #[error("firered Stream-VAD execution policy failed: {reason}")]
     ExecutionPolicy { reason: String },
+    #[error("firered Stream-VAD realtime runtime failed: {reason}")]
+    RealtimeRuntime { reason: String },
 }
 
 /// Neural VAD provider over the process-wide shared Stream-VAD model. Cheap
@@ -41,7 +43,23 @@ pub struct FireRedStreamVadProvider {
     placement: ExecutionPlacement,
 }
 
+const CPU_OFFLINE_CHUNK_SECONDS: usize = 1;
+const ACCELERATED_OFFLINE_CHUNK_SECONDS: usize = 32;
+
+pub(super) fn offline_chunk_samples_for_backend(backend: GgmlCpuGraphBackend) -> usize {
+    let seconds = if backend == GgmlCpuGraphBackend::Cpu {
+        CPU_OFFLINE_CHUNK_SECONDS
+    } else {
+        ACCELERATED_OFFLINE_CHUNK_SECONDS
+    };
+    seconds * SAMPLE_RATE_HZ as usize
+}
+
 impl FireRedStreamVadProvider {
+    fn offline_chunk_samples(&self) -> usize {
+        offline_chunk_samples_for_backend(self.backend)
+    }
+
     /// Borrow the shared Stream-VAD model. Returns `None` when the vendored
     /// weights could not be loaded.
     pub fn shared() -> Option<Self> {
@@ -104,10 +122,13 @@ impl FireRedStreamVadProvider {
         self.model.probabilities(samples)
     }
 
-    /// Recording-length-independent host peak for the bounded one-second
-    /// offline streaming step. The raw buffer can contain one chunk plus the
-    /// fbank overlap tail; geometric Vec growth is bounded by twice that
-    /// payload.
+    /// Recording-length-independent host peak for one bounded offline step.
+    /// CPU keeps one-second cancellation checkpoints. Accelerated execution
+    /// batches 32 seconds of this causal DFSMN per graph: the 15-minute Pareto
+    /// sweep found this faster and lower-memory than every larger candidate,
+    /// while preserving the exact per-frame output hash. The raw buffer can
+    /// contain one chunk plus the fbank overlap tail; geometric Vec growth is
+    /// bounded by twice that payload.
     ///
     /// Native ggml contexts, uploaded weights, and graph workspaces are quoted
     /// and admitted by the shared backend-allocation layer when the accelerated
@@ -115,7 +136,7 @@ impl FireRedStreamVadProvider {
     /// reservation owns only the family-local Rust/frontend payload that the
     /// backend cannot observe.
     pub(crate) fn invocation_scratch_peak_bytes(&self) -> u64 {
-        let buffered_samples = SAMPLE_RATE_HZ as usize + super::frontend::FRAME_LENGTH;
+        let buffered_samples = self.offline_chunk_samples() + super::frontend::FRAME_LENGTH;
         let raw_buffer_bytes = (buffered_samples as u64)
             .saturating_mul(std::mem::size_of::<f32>() as u64)
             .saturating_mul(2);
@@ -125,10 +146,11 @@ impl FireRedStreamVadProvider {
         )
     }
 
-    /// Offline speech slicing with bounded cancellation latency. One second
-    /// of PCM is frontended and scored at a time while the causal DFSMN cache
-    /// and the fbank overlap tail remain continuous, so output matches the
-    /// batch model without making a long recording one uninterruptible call.
+    /// Offline speech slicing with bounded cancellation latency. PCM is scored
+    /// in backend-appropriate bounded chunks while the causal DFSMN cache and
+    /// fbank overlap tail remain continuous, so chunk size changes scheduling
+    /// only, never the output sequence. Realtime streaming remains on its
+    /// caller-provided cadence and does not use this offline batching policy.
     pub(crate) fn compute_speech_slices_cancellable(
         &self,
         samples: &[f32],
@@ -157,7 +179,7 @@ impl FireRedStreamVadProvider {
             )
         };
         let mut probabilities = Vec::with_capacity(samples.len().div_ceil(FRAME_SAMPLES));
-        for chunk in samples.chunks(SAMPLE_RATE_HZ as usize) {
+        for chunk in samples.chunks(self.offline_chunk_samples()) {
             if canceled() {
                 return Err(FireRedStreamVadError::Canceled);
             }
@@ -300,4 +322,32 @@ fn push_span(
 
 fn ms_to_frames(ms: u32) -> usize {
     (ms.div_ceil(FRAME_SHIFT_MS)).max(1) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_chunk_policy_keeps_cpu_responsive_and_batches_accelerators() {
+        let model = super::super::shared_model().expect("vendored Stream-VAD model");
+        let cpu = FireRedStreamVadProvider {
+            model,
+            backend: GgmlCpuGraphBackend::Cpu,
+            placement: ExecutionPlacement::CpuOnly,
+        };
+        let metal = FireRedStreamVadProvider {
+            model,
+            backend: GgmlCpuGraphBackend::Metal,
+            placement: ExecutionPlacement::FullDevice,
+        };
+        assert_eq!(
+            cpu.offline_chunk_samples(),
+            offline_chunk_samples_for_backend(GgmlCpuGraphBackend::Cpu)
+        );
+        assert_eq!(
+            metal.offline_chunk_samples(),
+            offline_chunk_samples_for_backend(GgmlCpuGraphBackend::Metal)
+        );
+    }
 }

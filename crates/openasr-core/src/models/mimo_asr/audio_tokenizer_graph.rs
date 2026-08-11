@@ -32,7 +32,8 @@ use super::tensor_names::{
 };
 
 const LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
+const FIXED_STATIC_TENSOR_COUNT: usize = 10;
+const STATIC_TENSORS_PER_LAYER: usize = 9;
 
 /// conv1's input channel count: the audio-tokenizer graph bakes a fixed 128
 /// mel-band extent into the conv1 kernel arena tensor, so a pack whose
@@ -172,12 +173,7 @@ impl MimoAudiotokEncoderRuntime {
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoAudiotokEncoderError> {
         let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
-        config.context_bytes = config
-            .context_bytes
-            .max(GgmlCpuGraphConfig::metadata_context_bytes(
-                config.graph_size,
-            ))
-            .max(GRAPH_CONTEXT_BYTES);
+        config.set_graph_node_capacity(config.graph_size);
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| build_err("runner_init", source))?;
         // Zero-copy binding for the big 2-D attn/ffn matmul weights (mmap'd,
@@ -197,8 +193,12 @@ impl MimoAudiotokEncoderRuntime {
                 .map_err(|error| MimoAudiotokEncoderError::GraphExecutionFailed {
                     reason: format!("build_runtime_tensor_reader_from_preflight: {error}"),
                 })?;
+        let arena_tensor_capacity = FIXED_STATIC_TENSOR_COUNT
+            .saturating_add(metadata.n_layers.saturating_mul(STATIC_TENSORS_PER_LAYER));
         let mut arena = runner
-            .start_static_tensor_arena(config.context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_capacity,
+            ))
             .map_err(|source| build_err("static_tensor_arena", source))?;
 
         let d_model = metadata.d_model;

@@ -830,6 +830,42 @@ where
     )
 }
 
+/// One SAN-M/FSMN layer constructs at most 51 ggml operation nodes: 50 for
+/// the fixed norm/QKV/FSMN/attention/FFN path plus one residual when the input
+/// width already equals `d_model`. Static weights are leaf tensors and do not
+/// increase this operation-node bound.
+pub(crate) const SANM_FSMN_LAYER_GRAPH_NODE_UPPER_BOUND: usize = 51;
+
+/// Every SAN-M/FSMN layer contributes thirteen immutable weight leaves to the
+/// scheduler graph: nine arena-backed vectors/kernels and four mmap-backed
+/// matrix weights. The scheduler hashes nodes and leaves in one table, so its
+/// capacity must cover both even though a direct ggml cgraph stores them in
+/// separate arrays.
+pub(crate) const SANM_FSMN_LAYER_GRAPH_LEAF_UPPER_BOUND: usize = 13;
+
+/// Round the architecture-derived operation-node plus weight-leaf upper bound
+/// up to a power of two, then preserve the family config's existing minimum.
+/// This is deliberately stricter than sizing the cgraph arrays alone because a
+/// scheduler hashes nodes and leaves together. It replaces family-local flat
+/// metadata byte reservations without under-sizing the scheduler contract.
+pub(crate) fn sanm_fsmn_graph_node_capacity(
+    layer_count: usize,
+    fixed_nodes: usize,
+    fixed_leafs: usize,
+    minimum_capacity: usize,
+) -> usize {
+    let per_layer = SANM_FSMN_LAYER_GRAPH_NODE_UPPER_BOUND
+        .saturating_add(SANM_FSMN_LAYER_GRAPH_LEAF_UPPER_BOUND);
+    let upper_bound = layer_count
+        .saturating_mul(per_layer)
+        .saturating_add(fixed_nodes)
+        .saturating_add(fixed_leafs);
+    let architecture_capacity = upper_bound
+        .checked_next_power_of_two()
+        .unwrap_or(upper_bound);
+    architecture_capacity.max(minimum_capacity.max(1))
+}
+
 /// Scalar/shape knobs for one SenseVoice SAN-M encoder block (self-attention
 /// with a DFSMN depthwise-conv memory branch, then a plain ReLU FFN).
 ///
@@ -1102,6 +1138,22 @@ where
 mod tests {
     use super::*;
     use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
+
+    #[test]
+    fn sanm_graph_capacity_is_architecture_bounded_and_power_of_two() {
+        assert_eq!(sanm_fsmn_graph_node_capacity(0, 0, 0, 0), 1);
+        assert_eq!(sanm_fsmn_graph_node_capacity(1, 0, 0, 4_096), 4_096);
+        assert_eq!(sanm_fsmn_graph_node_capacity(50, 1_024, 16, 1), 8_192);
+
+        let capacity = sanm_fsmn_graph_node_capacity(64, 2_048, 16, 4_096);
+        let required = 64
+            * (SANM_FSMN_LAYER_GRAPH_NODE_UPPER_BOUND + SANM_FSMN_LAYER_GRAPH_LEAF_UPPER_BOUND)
+            + 2_048
+            + 16;
+        assert!(capacity >= required);
+        assert!(capacity.is_power_of_two());
+        assert!(capacity / 2 < required);
+    }
 
     /// Regression pin from the 2026-07-23 firered-aed v2 bisection
     /// (`crates/openasr-core/src/models/firered_aed/encoder_graph.rs`

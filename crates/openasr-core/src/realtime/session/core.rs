@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
 use super::{
@@ -15,7 +17,8 @@ use super::{
         VadStateMachine,
     },
 };
-use crate::diarize::vad::FireRedStreamingVad;
+use crate::diarize::vad::{FireRedRealtimeVadSession, FireRedStreamVadError};
+use crate::{ExecutionTarget, NativeExecutionServices};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeSessionConfig {
@@ -104,7 +107,7 @@ pub struct RealtimeSessionController {
     /// Streaming Stream-VAD detector, present only when the configured VAD
     /// mode is `ExternalProbability`. Feeds probabilities into `vad`; all
     /// endpointing stays in the state machine.
-    neural_vad: Option<Box<FireRedStreamingVad>>,
+    neural_vad: Option<FireRedRealtimeVadSession>,
     pub buffer: RealtimeBuffer,
     pub transcript: TranscriptLifecycle,
 }
@@ -164,11 +167,17 @@ impl RealtimeSessionController {
         if reset_runtime_state {
             self.buffer.reset();
             self.transcript.reset();
-            if let Some(neural) = self.neural_vad.as_mut() {
-                neural.reset();
-            }
+            // This controller is terminal after close. The accelerated VAD
+            // checkout is reset again before every future session reuse, so
+            // cleanup must not turn cancellation into a fallible inference
+            // operation or leave lifecycle state half-closed.
         }
         self.state = next_state;
+        // A terminal controller must not continue to hold an exclusive
+        // accelerated VAD checkout. Returning it here lets subsequent
+        // sessions reuse the bounded actor instead of exhausting the per-key
+        // instance limit while old closed controllers remain referenced.
+        drop(self.neural_vad.take());
         Ok(self.sequencer.next(
             RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionClosed(SessionClosedEvent {
                 reason,
@@ -223,21 +232,58 @@ impl RealtimeSessionController {
         Self::new_with_sequencer(config, sequencer)
     }
 
+    /// Construct a realtime controller whose neural VAD follows the same
+    /// request-local execution target and process-owned memory/placement
+    /// services as the ASR lane.
+    pub fn new_with_execution(
+        config: RealtimeSessionConfig,
+        execution_services: Arc<NativeExecutionServices>,
+        execution_target: ExecutionTarget,
+    ) -> Result<Self, RealtimeSessionError> {
+        let sequencer = RealtimeEventSequencer::new(config.session_id.clone())
+            .with_trace_id(config.trace_id.clone())
+            .with_request_id(config.request_id.clone());
+        Self::new_with_sequencer_and_execution(
+            config,
+            sequencer,
+            Some((execution_services, execution_target)),
+        )
+    }
+
     pub fn new_with_sequencer(
         config: RealtimeSessionConfig,
         sequencer: RealtimeEventSequencer,
     ) -> Result<Self, RealtimeSessionError> {
+        Self::new_with_sequencer_and_execution(config, sequencer, None)
+    }
+
+    fn new_with_sequencer_and_execution(
+        config: RealtimeSessionConfig,
+        sequencer: RealtimeEventSequencer,
+        execution: Option<(Arc<NativeExecutionServices>, ExecutionTarget)>,
+    ) -> Result<Self, RealtimeSessionError> {
         config.validate()?;
         let neural_vad = if config.vad.mode == VadMode::ExternalProbability {
+            let frame_samples = config
+                .audio_format
+                .sample_count_for_duration_ms(config.vad.frame_duration_ms)?;
             // Stream-VAD is the sole neural engine and is vendored
             // (`include_bytes!`), so in practice this always loads (a build
             // integrity problem otherwise). Still, fail closed with a typed
             // error instead of panicking on the request path -- the server
             // WS handler already surfaces `RealtimeSessionError` to the
             // client as a startup error.
-            Some(Box::new(
-                FireRedStreamingVad::shared().ok_or(RealtimeSessionError::StreamVadUnavailable)?,
-            ))
+            let session = match execution {
+                Some((services, target)) => {
+                    FireRedRealtimeVadSession::for_execution(
+                        services,
+                        target.into(),
+                        frame_samples,
+                    )?
+                }
+                None => FireRedRealtimeVadSession::host(frame_samples)?,
+            };
+            Some(session)
         } else {
             None
         };
@@ -267,27 +313,30 @@ impl RealtimeSessionController {
     /// Stream-VAD probability into the state machine; every other mode uses the
     /// energy gate. All endpointing/hysteresis lives in the state machine, not
     /// here.
-    pub fn process_vad_frame(&mut self, frame: &RealtimeAudioFrame) -> Vec<SpeechBoundaryEvent> {
-        self.process_vad_frame_with_speech(frame).0
+    pub fn process_vad_frame(
+        &mut self,
+        frame: &RealtimeAudioFrame,
+    ) -> Result<Vec<SpeechBoundaryEvent>, RealtimeSessionError> {
+        Ok(self.process_vad_frame_with_speech(frame)?.0)
     }
 
     pub fn process_vad_frame_with_speech(
         &mut self,
         frame: &RealtimeAudioFrame,
-    ) -> (Vec<SpeechBoundaryEvent>, bool) {
+    ) -> Result<(Vec<SpeechBoundaryEvent>, bool), RealtimeSessionError> {
         if self.vad.config().mode == VadMode::ExternalProbability
             && let Some(neural) = self.neural_vad.as_mut()
         {
-            let probability = neural.accept_frame(frame.samples());
-            return self.vad.process_decision_with_speech(
+            let probability = neural.accept_frame(frame.samples())?;
+            return Ok(self.vad.process_decision_with_speech(
                 frame,
                 VadFrameDecision {
                     decision: VadDecision::Probability(probability),
                     rms: None,
                 },
-            );
+            ));
         }
-        self.vad.process_energy_frame_with_speech(frame)
+        Ok(self.vad.process_energy_frame_with_speech(frame))
     }
 
     pub fn session_created_event(
@@ -355,11 +404,24 @@ impl RealtimeSessionController {
                 action: "reset",
             });
         }
+        // Reset the fallible device-owned state first. If it fails, leave the
+        // controller's host state untouched instead of exposing a half-reset
+        // lifecycle to the caller.
+        if let Some(neural) = self.neural_vad.as_mut() {
+            neural.reset()?;
+        }
         self.vad.reset();
         self.buffer.reset();
         self.transcript.reset();
         self.state = RealtimeSessionState::Configured;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn neural_vad_actor_identity_for_test(&self) -> Option<usize> {
+        self.neural_vad
+            .as_ref()
+            .and_then(FireRedRealtimeVadSession::actor_identity_for_test)
     }
 
     pub fn cancel(
@@ -411,4 +473,6 @@ pub enum RealtimeSessionError {
         "Stream-VAD is unavailable: vendored weights failed to parse (build-integrity problem)."
     )]
     StreamVadUnavailable,
+    #[error("{0}")]
+    StreamVadExecution(#[from] FireRedStreamVadError),
 }

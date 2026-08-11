@@ -48,10 +48,10 @@ use super::tensor_names::{
 
 pub(crate) const FIRERED_PUNC_MODEL_FAMILY: &str = "firered-punc";
 
-/// Runtime tensor quantization for the GGUF-backed `.oasr` output. The runtime
-/// loader dequantizes every tensor to f32 on read (BERT-base runs as an
-/// occasional finalize-only pass), so quantization only trades pack size for a
-/// small numeric perturbation; `Fp16` is the exact-parity default.
+/// Runtime tensor quantization for the GGUF-backed `.oasr` output. Dominant 2-D
+/// embeddings and matrix weights remain in their native F16/Q8/Q4 form and bind
+/// zero-copy at runtime; small 1-D biases and LayerNorm affines are read as f32.
+/// `Fp16` remains the exact-parity default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum FireRedPuncQuantizationMode {
@@ -260,8 +260,8 @@ fn build_tensor(
     }
 
     // Quantize the 2D weights per the requested mode; keep 1D tensors (biases,
-    // LayerNorm affines) exact in F16. The loader dequantizes everything on
-    // read either way.
+    // LayerNorm affines) exact in F16. The runtime binds 2D matrices directly
+    // and materializes only the small 1D vectors as f32.
     let quant_type = match quantization {
         FireRedPuncQuantizationMode::Fp16 => None,
         FireRedPuncQuantizationMode::Q8_0 if dims.len() == 2 => Some(GgufWriteTensorType::Q8_0),

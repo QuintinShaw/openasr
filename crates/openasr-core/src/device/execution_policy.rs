@@ -223,6 +223,11 @@ pub enum ExecutionCandidateFailureKind {
     DeviceUnavailable,
     /// The device was initialized but became unusable while executing.
     DeviceLost,
+    /// A graph completed on a backend other than the selected provider.
+    /// This is a candidate-local routing failure: Auto may try another row,
+    /// while an exact or accelerated-only plan remains fail-closed because it
+    /// contains no pure-CPU candidate.
+    PlacementViolation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +259,14 @@ impl ExecutionCandidateFailure {
     pub fn device_lost(operation: &'static str, detail: impl Into<String>) -> Self {
         Self {
             kind: ExecutionCandidateFailureKind::DeviceLost,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn placement(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            kind: ExecutionCandidateFailureKind::PlacementViolation,
             operation,
             detail: detail.into(),
         }

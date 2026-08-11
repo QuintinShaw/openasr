@@ -6,12 +6,15 @@
 //! Composed from the shared `nn::{attn, ffn, norm}` building blocks (the same
 //! `apply_affine_layer_norm` / `apply_feed_forward_residual` /
 //! `reshape_projection_to_attention_heads` used by the ASR encoders). All
-//! weights are host f32 uploaded to the graph arena; the forward is driven with
-//! `GgmlCpuGraphRunner` + `compute_output_f32`.
+//! dominant embeddings/matrix weights stay in the verified mmap-backed pack
+//! and bind zero-copy; only small biases and LayerNorm affines are uploaded as
+//! f32 arena tensors. The forward is driven with `GgmlCpuGraphRunner` +
+//! `compute_output_f32`.
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    WeightSlot, bind_loaded,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -26,14 +29,12 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use super::config::{FIRERED_PUNC_LAYER_NORM_EPSILON, FireRedPuncExecutionMetadata};
 use super::weights::{FireRedPuncLayerWeights, FireRedPuncWeights, NamedTensor};
 
-/// Fixed weight-arena tensors: token / token-type / position embeddings, the
-/// post-embedding LayerNorm weight+bias and the classification-head
-/// weight+bias.
-const FIRERED_PUNC_FIXED_ARENA_TENSORS: usize = 7;
-/// Weight-arena tensors per BERT block, mirroring [`LayerArena`]: the q/k/v,
-/// output, ffn-up and ffn-down weight+bias pairs plus the attention and FFN
-/// LayerNorm weight+bias pairs.
-const FIRERED_PUNC_ARENA_TENSORS_PER_LAYER: usize = 16;
+/// Fixed f32 arena tensors: the post-embedding LayerNorm weight+bias and the
+/// classification-head bias. Embeddings and the head matrix stay mmap-backed.
+const FIRERED_PUNC_FIXED_ARENA_TENSORS: usize = 3;
+/// Per-block f32 arena tensors: six linear biases plus two LayerNorm
+/// weight+bias pairs. The six matrix weights stay mmap-backed.
+const FIRERED_PUNC_ARENA_TENSORS_PER_LAYER: usize = 10;
 
 /// The runner's graph config, right-sized from the BERT forward-graph node
 /// budget instead of the historical flat 256 MB. Each post-norm BERT block
@@ -68,9 +69,13 @@ fn firered_punc_graph_config(
 /// fixed tensors plus [`FIRERED_PUNC_ARENA_TENSORS_PER_LAYER`] per BERT block.
 /// Over-counting only sizes the (cheap) tensor-overhead context; the real
 /// weight bytes land in the backend buffer.
-fn firered_punc_weight_arena_context_bytes(layers: usize) -> usize {
-    let tensor_count = FIRERED_PUNC_FIXED_ARENA_TENSORS
-        .saturating_add(FIRERED_PUNC_ARENA_TENSORS_PER_LAYER.saturating_mul(layers));
+fn firered_punc_weight_arena_context_bytes(layers: usize, keep_quantized: bool) -> usize {
+    let tensor_count = if keep_quantized {
+        FIRERED_PUNC_FIXED_ARENA_TENSORS
+            .saturating_add(FIRERED_PUNC_ARENA_TENSORS_PER_LAYER.saturating_mul(layers))
+    } else {
+        7_usize.saturating_add(16_usize.saturating_mul(layers))
+    };
     GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
 
@@ -87,6 +92,14 @@ pub(crate) enum FireRedPuncGraphError {
     SequenceTooLong { got: usize, max: usize },
     #[error("firered-punc input is empty")]
     EmptyInput,
+    #[error("firered-punc mmap weight '{name}' could not be bound: {reason}")]
+    WeightBinding { name: String, reason: String },
+    #[error("firered-punc tensor '{name}' has shape {got:?}, expected {expected:?}")]
+    WeightShape {
+        name: String,
+        got: Vec<usize>,
+        expected: Vec<usize>,
+    },
 }
 
 fn bf(step: &'static str) -> impl Fn(GgmlCpuGraphError) -> FireRedPuncGraphError {
@@ -98,19 +111,19 @@ fn bf2(step: &'static str, source: GgmlCpuGraphError) -> FireRedPuncGraphError {
 }
 
 struct LayerArena {
-    attn_q_weight: GgmlStaticTensor,
+    attn_q_weight: WeightSlot,
     attn_q_bias: GgmlStaticTensor,
-    attn_k_weight: GgmlStaticTensor,
+    attn_k_weight: WeightSlot,
     attn_k_bias: GgmlStaticTensor,
-    attn_v_weight: GgmlStaticTensor,
+    attn_v_weight: WeightSlot,
     attn_v_bias: GgmlStaticTensor,
-    attn_output_weight: GgmlStaticTensor,
+    attn_output_weight: WeightSlot,
     attn_output_bias: GgmlStaticTensor,
     attn_norm_weight: GgmlStaticTensor,
     attn_norm_bias: GgmlStaticTensor,
-    ffn_up_weight: GgmlStaticTensor,
+    ffn_up_weight: WeightSlot,
     ffn_up_bias: GgmlStaticTensor,
-    ffn_down_weight: GgmlStaticTensor,
+    ffn_down_weight: WeightSlot,
     ffn_down_bias: GgmlStaticTensor,
     ffn_norm_weight: GgmlStaticTensor,
     ffn_norm_bias: GgmlStaticTensor,
@@ -119,26 +132,48 @@ struct LayerArena {
 pub(crate) struct FireRedPuncGraph {
     metadata: FireRedPuncExecutionMetadata,
     runner: GgmlCpuGraphRunner,
+    // Owns the mmap-backed buffer aliased by every `WeightSlot::Loaded`.
+    _loaded_weights: Option<GgmlLoadedWeightContext>,
     arena: GgmlStaticTensorArena,
-    token_embd: GgmlStaticTensor,
-    token_type_embd: GgmlStaticTensor,
-    position_embd: GgmlStaticTensor,
+    token_embd: WeightSlot,
+    token_type_embd: WeightSlot,
+    position_embd: WeightSlot,
     embd_norm_weight: GgmlStaticTensor,
     embd_norm_bias: GgmlStaticTensor,
     layers: Vec<LayerArena>,
-    punc_head_weight: GgmlStaticTensor,
+    punc_head_weight: WeightSlot,
     punc_head_bias: GgmlStaticTensor,
 }
 
 fn alloc_2d(
     arena: &GgmlStaticTensorArena,
+    loaded: Option<&GgmlLoadedWeightContext>,
     weight: &NamedTensor,
     ne0: usize,
     ne1: usize,
     step: &'static str,
-) -> Result<GgmlStaticTensor, FireRedPuncGraphError> {
+) -> Result<WeightSlot, FireRedPuncGraphError> {
+    let expected = [ne0, ne1];
+    if weight.dims.as_slice() != expected {
+        return Err(FireRedPuncGraphError::WeightShape {
+            name: weight.name.clone(),
+            got: weight.dims.clone(),
+            expected: expected.to_vec(),
+        });
+    }
+    if loaded.is_some() {
+        return bind_loaded(loaded, &weight.name)
+            .map(WeightSlot::Loaded)
+            .map_err(|reason| FireRedPuncGraphError::WeightBinding {
+                name: weight.name.clone(),
+                reason,
+            });
+    }
     debug_assert_eq!(weight.values.len(), ne0 * ne1, "{step} shape");
-    arena.new_tensor_2d_f32(ne0, ne1, step).map_err(bf(step))
+    arena
+        .new_tensor_2d_f32(ne0, ne1, step)
+        .map(WeightSlot::Arena)
+        .map_err(bf(step))
 }
 
 fn alloc_1d(
@@ -162,6 +197,18 @@ fn upload(
         .map_err(bf(step))
 }
 
+fn upload_slot(
+    arena: &mut GgmlStaticTensorArena,
+    slot: WeightSlot,
+    weight: &NamedTensor,
+    step: &'static str,
+) -> Result<(), FireRedPuncGraphError> {
+    match slot {
+        WeightSlot::Arena(handle) => upload(arena, handle, weight, step),
+        WeightSlot::Loaded(_) => Ok(()),
+    }
+}
+
 impl FireRedPuncGraph {
     pub(crate) fn quoted_retained_system_memory_bytes(layers: usize) -> Result<u64, String> {
         let bytes = layers
@@ -182,10 +229,39 @@ impl FireRedPuncGraph {
         metadata: FireRedPuncExecutionMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedPuncGraphError> {
+        Self::new_inner(weights, metadata, backend, None)
+    }
+
+    pub(crate) fn new_from_preflight(
+        weights: &FireRedPuncWeights,
+        metadata: FireRedPuncExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        preflight: &GgufRuntimeSourcePreflight,
+    ) -> Result<Self, FireRedPuncGraphError> {
+        Self::new_inner(weights, metadata, backend, Some(preflight))
+    }
+
+    fn new_inner(
+        weights: &FireRedPuncWeights,
+        metadata: FireRedPuncExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        preflight: Option<&GgufRuntimeSourcePreflight>,
+    ) -> Result<Self, FireRedPuncGraphError> {
         let config = firered_punc_graph_config(metadata.layers, backend);
         let runner = GgmlCpuGraphRunner::new(config).map_err(bf("runner_init"))?;
+        let loaded_weights = preflight
+            .map(|preflight| {
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(bf("loaded_weight_context"))
+            })
+            .transpose()?;
+        let loaded = loaded_weights.as_ref();
         let mut arena = runner
-            .start_static_tensor_arena(firered_punc_weight_arena_context_bytes(metadata.layers))
+            .start_static_tensor_arena(firered_punc_weight_arena_context_bytes(
+                metadata.layers,
+                loaded.is_some(),
+            ))
             .map_err(bf("arena_init"))?;
 
         let d = metadata.d_model;
@@ -194,6 +270,7 @@ impl FireRedPuncGraph {
         // ----- declare arena tensors (first upload freezes allocation) -----
         let token_embd = alloc_2d(
             &arena,
+            loaded,
             &weights.token_embd,
             d,
             metadata.vocab_size,
@@ -201,13 +278,21 @@ impl FireRedPuncGraph {
         )?;
         let token_type_embd = alloc_2d(
             &arena,
+            loaded,
             &weights.token_type_embd,
             d,
-            weights.token_type_embd.values.len() / d,
+            *weights.token_type_embd.dims.get(1).ok_or_else(|| {
+                FireRedPuncGraphError::WeightShape {
+                    name: weights.token_type_embd.name.clone(),
+                    got: weights.token_type_embd.dims.clone(),
+                    expected: vec![d, 1],
+                }
+            })?,
             "token_type_embd",
         )?;
         let position_embd = alloc_2d(
             &arena,
+            loaded,
             &weights.position_embd,
             d,
             metadata.max_positions,
@@ -217,10 +302,11 @@ impl FireRedPuncGraph {
         let embd_norm_bias = alloc_1d(&arena, &weights.embd_norm_bias, "embd_norm_b")?;
         let mut layers = Vec::with_capacity(weights.layers.len());
         for layer in &weights.layers {
-            layers.push(alloc_layer(&arena, layer, d, ffn)?);
+            layers.push(alloc_layer(&arena, loaded, layer, d, ffn)?);
         }
         let punc_head_weight = alloc_2d(
             &arena,
+            loaded,
             &weights.punc_head_weight,
             d,
             metadata.label_count,
@@ -229,14 +315,14 @@ impl FireRedPuncGraph {
         let punc_head_bias = alloc_1d(&arena, &weights.punc_head_bias, "punc_head_b")?;
 
         // ----- upload arena values -----
-        upload(&mut arena, token_embd, &weights.token_embd, "token_embd")?;
-        upload(
+        upload_slot(&mut arena, token_embd, &weights.token_embd, "token_embd")?;
+        upload_slot(
             &mut arena,
             token_type_embd,
             &weights.token_type_embd,
             "token_type_embd",
         )?;
-        upload(
+        upload_slot(
             &mut arena,
             position_embd,
             &weights.position_embd,
@@ -257,7 +343,7 @@ impl FireRedPuncGraph {
         for (layer, handles) in weights.layers.iter().zip(&layers) {
             upload_layer(&mut arena, layer, handles)?;
         }
-        upload(
+        upload_slot(
             &mut arena,
             punc_head_weight,
             &weights.punc_head_weight,
@@ -273,6 +359,7 @@ impl FireRedPuncGraph {
         Ok(Self {
             metadata,
             runner,
+            _loaded_weights: loaded_weights,
             arena,
             token_embd,
             token_type_embd,
@@ -322,13 +409,13 @@ impl FireRedPuncGraph {
 
         // ----- embeddings: token + position + segment, then LayerNorm -----
         let tok = graph
-            .get_rows(self.arena.graph_tensor(self.token_embd), ids_t)
+            .get_rows(self.token_embd.graph(&self.arena), ids_t)
             .map_err(bf("embd_token"))?;
         let pos = graph
-            .get_rows(self.arena.graph_tensor(self.position_embd), pos_t)
+            .get_rows(self.position_embd.graph(&self.arena), pos_t)
             .map_err(bf("embd_pos"))?;
         let seg = graph
-            .get_rows(self.arena.graph_tensor(self.token_type_embd), type_t)
+            .get_rows(self.token_type_embd.graph(&self.arena), type_t)
             .map_err(bf("embd_seg"))?;
         let mut state = graph.add(tok, pos).map_err(bf("embd_add_pos"))?;
         state = graph.add(state, seg).map_err(bf("embd_add_seg"))?;
@@ -357,7 +444,7 @@ impl FireRedPuncGraph {
 
         // ----- classification head: [d_model, label] x [d_model, seq] -----
         let mut logits = graph
-            .mul_mat(self.arena.graph_tensor(self.punc_head_weight), state)
+            .mul_mat(self.punc_head_weight.graph(&self.arena), state)
             .map_err(bf("head_matmul"))?;
         logits = graph
             .add(logits, self.arena.graph_tensor(self.punc_head_bias))
@@ -504,9 +591,9 @@ fn bert_block<'a>(
     )?;
 
     // ----- feed-forward (erf-GELU) + post-norm -----
-    let up_w = arena.graph_tensor(h.ffn_up_weight);
+    let up_w = h.ffn_up_weight.graph(arena);
     let up_b = arena.graph_tensor(h.ffn_up_bias);
-    let down_w = arena.graph_tensor(h.ffn_down_weight);
+    let down_w = h.ffn_down_weight.graph(arena);
     let down_b = arena.graph_tensor(h.ffn_down_bias);
     let ffn_out = apply_feed_forward_residual(
         graph,
@@ -548,14 +635,12 @@ fn bert_block<'a>(
 fn linear<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     arena: &GgmlStaticTensorArena,
-    weight: GgmlStaticTensor,
+    weight: WeightSlot,
     bias: GgmlStaticTensor,
     x: GgmlCpuTensor<'a>,
     step: &'static str,
 ) -> Result<GgmlCpuTensor<'a>, FireRedPuncGraphError> {
-    let projected = graph
-        .mul_mat(arena.graph_tensor(weight), x)
-        .map_err(bf(step))?;
+    let projected = graph.mul_mat(weight.graph(arena), x).map_err(bf(step))?;
     graph
         .add(projected, arena.graph_tensor(bias))
         .map_err(bf(step))
@@ -563,24 +648,25 @@ fn linear<'a>(
 
 fn alloc_layer(
     arena: &GgmlStaticTensorArena,
+    loaded: Option<&GgmlLoadedWeightContext>,
     layer: &FireRedPuncLayerWeights,
     d: usize,
     ffn: usize,
 ) -> Result<LayerArena, FireRedPuncGraphError> {
     Ok(LayerArena {
-        attn_q_weight: alloc_2d(arena, &layer.attn_q_weight, d, d, "attn_q_w")?,
+        attn_q_weight: alloc_2d(arena, loaded, &layer.attn_q_weight, d, d, "attn_q_w")?,
         attn_q_bias: alloc_1d(arena, &layer.attn_q_bias, "attn_q_b")?,
-        attn_k_weight: alloc_2d(arena, &layer.attn_k_weight, d, d, "attn_k_w")?,
+        attn_k_weight: alloc_2d(arena, loaded, &layer.attn_k_weight, d, d, "attn_k_w")?,
         attn_k_bias: alloc_1d(arena, &layer.attn_k_bias, "attn_k_b")?,
-        attn_v_weight: alloc_2d(arena, &layer.attn_v_weight, d, d, "attn_v_w")?,
+        attn_v_weight: alloc_2d(arena, loaded, &layer.attn_v_weight, d, d, "attn_v_w")?,
         attn_v_bias: alloc_1d(arena, &layer.attn_v_bias, "attn_v_b")?,
-        attn_output_weight: alloc_2d(arena, &layer.attn_output_weight, d, d, "attn_out_w")?,
+        attn_output_weight: alloc_2d(arena, loaded, &layer.attn_output_weight, d, d, "attn_out_w")?,
         attn_output_bias: alloc_1d(arena, &layer.attn_output_bias, "attn_out_b")?,
         attn_norm_weight: alloc_1d(arena, &layer.attn_norm_weight, "attn_norm_w")?,
         attn_norm_bias: alloc_1d(arena, &layer.attn_norm_bias, "attn_norm_b")?,
-        ffn_up_weight: alloc_2d(arena, &layer.ffn_up_weight, d, ffn, "ffn_up_w")?,
+        ffn_up_weight: alloc_2d(arena, loaded, &layer.ffn_up_weight, d, ffn, "ffn_up_w")?,
         ffn_up_bias: alloc_1d(arena, &layer.ffn_up_bias, "ffn_up_b")?,
-        ffn_down_weight: alloc_2d(arena, &layer.ffn_down_weight, ffn, d, "ffn_down_w")?,
+        ffn_down_weight: alloc_2d(arena, loaded, &layer.ffn_down_weight, ffn, d, "ffn_down_w")?,
         ffn_down_bias: alloc_1d(arena, &layer.ffn_down_bias, "ffn_down_b")?,
         ffn_norm_weight: alloc_1d(arena, &layer.ffn_norm_weight, "ffn_norm_w")?,
         ffn_norm_bias: alloc_1d(arena, &layer.ffn_norm_bias, "ffn_norm_b")?,
@@ -610,13 +696,13 @@ fn upload_layer(
     layer: &FireRedPuncLayerWeights,
     h: &LayerArena,
 ) -> Result<(), FireRedPuncGraphError> {
-    upload(arena, h.attn_q_weight, &layer.attn_q_weight, "attn_q_w")?;
+    upload_slot(arena, h.attn_q_weight, &layer.attn_q_weight, "attn_q_w")?;
     upload(arena, h.attn_q_bias, &layer.attn_q_bias, "attn_q_b")?;
-    upload(arena, h.attn_k_weight, &layer.attn_k_weight, "attn_k_w")?;
+    upload_slot(arena, h.attn_k_weight, &layer.attn_k_weight, "attn_k_w")?;
     upload(arena, h.attn_k_bias, &layer.attn_k_bias, "attn_k_b")?;
-    upload(arena, h.attn_v_weight, &layer.attn_v_weight, "attn_v_w")?;
+    upload_slot(arena, h.attn_v_weight, &layer.attn_v_weight, "attn_v_w")?;
     upload(arena, h.attn_v_bias, &layer.attn_v_bias, "attn_v_b")?;
-    upload(
+    upload_slot(
         arena,
         h.attn_output_weight,
         &layer.attn_output_weight,
@@ -640,9 +726,9 @@ fn upload_layer(
         &layer.attn_norm_bias,
         "attn_norm_b",
     )?;
-    upload(arena, h.ffn_up_weight, &layer.ffn_up_weight, "ffn_up_w")?;
+    upload_slot(arena, h.ffn_up_weight, &layer.ffn_up_weight, "ffn_up_w")?;
     upload(arena, h.ffn_up_bias, &layer.ffn_up_bias, "ffn_up_b")?;
-    upload(
+    upload_slot(
         arena,
         h.ffn_down_weight,
         &layer.ffn_down_weight,
@@ -789,6 +875,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn equal_element_count_with_transposed_weight_shape_fails_closed() {
+        let metadata = tiny_metadata();
+        let mut weights = tiny_weights();
+        weights.token_embd.dims = vec![metadata.vocab_size, metadata.d_model];
+        let result = FireRedPuncGraph::new(
+            &weights,
+            metadata,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
+        assert!(matches!(
+            result,
+            Err(FireRedPuncGraphError::WeightShape { ref name, .. })
+                if name == "token_embd.weight"
+        ));
+    }
+
     /// Regression guard for the right-sized metadata contexts (the historical
     /// flat 256 MB over-reserved bookkeeping-only contexts; `ggml_init`
     /// mallocs the full `mem_size` even with `no_alloc=true`). A
@@ -811,9 +914,9 @@ mod tests {
             config.context_bytes
         );
         assert!(
-            firered_punc_weight_arena_context_bytes(layers) < 16 * 1024 * 1024,
+            firered_punc_weight_arena_context_bytes(layers, true) < 16 * 1024 * 1024,
             "firered-punc weight-arena metadata context regrew toward the old flat 256 MB: {}",
-            firered_punc_weight_arena_context_bytes(layers)
+            firered_punc_weight_arena_context_bytes(layers, true)
         );
     }
 }

@@ -1023,6 +1023,7 @@ impl Qwen3AsrGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
+        shutdown_qwen_serve_batch_engines(&self.serve_batch_engines);
     }
 
     #[cfg(test)]

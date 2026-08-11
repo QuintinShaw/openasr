@@ -270,6 +270,36 @@ where
         drop(detached);
     }
 
+    /// Detach a published value only when it is still the exact value the
+    /// caller observed. Candidate rollback may race clear/rebuild for the same
+    /// key; a stale failure must never evict the replacement owner.
+    pub(crate) fn evict_ready_if(&self, key: &K, predicate: impl FnOnce(&V) -> bool) -> bool {
+        let (detached, removed) = if let Ok(mut state) = self.inner.state.lock() {
+            let Some(slot) = state.entries.get(key).map(|entry| Arc::clone(&entry.slot)) else {
+                return false;
+            };
+            let matches = slot
+                .state
+                .lock()
+                .ok()
+                .is_some_and(|slot_state| match &*slot_state {
+                    WeightedSlotState::Ready(value) => predicate(value),
+                    WeightedSlotState::Empty
+                    | WeightedSlotState::Building
+                    | WeightedSlotState::Staged { .. } => false,
+                });
+            if matches {
+                (detach_entry(&mut state, key), true)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+        drop(detached);
+        removed
+    }
+
     pub(crate) fn evict_where(&self, mut predicate: impl FnMut(&K) -> bool) {
         let detached = if let Ok(mut state) = self.inner.state.lock() {
             let keys = state

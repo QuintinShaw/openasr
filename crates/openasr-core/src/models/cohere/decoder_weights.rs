@@ -271,6 +271,8 @@ mod tests {
         assert_eq!(weights.layers.len(), 2);
         assert_eq!(weights.token_embedding.rows, 32);
         assert_eq!(weights.token_embedding.cols, 16);
+        assert_eq!(weights.token_embedding.values.len(), 32 * 16);
+        assert_eq!(weights.positional_embedding.values.len(), 32 * 16);
         assert_eq!(weights.output_head_bias.values.len(), 32);
         assert_eq!(weights.layers[0].ffn_up_bias.values.len(), 32);
         assert_eq!(
@@ -278,6 +280,24 @@ mod tests {
             CohereMatrixLayout::ColumnsByRows
         );
         assert!(weights.output_head_weight.raw_ggml.is_some());
+    }
+
+    #[test]
+    fn runtime_loader_keeps_embeddings_in_raw_gguf_storage() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("tensor reader");
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+
+        let weights =
+            load_cohere_transcribe_decoder_weights_for_runtime_from_reader(&reader, metadata)
+                .expect("runtime weights");
+        assert!(weights.token_embedding.values.is_empty());
+        assert!(weights.token_embedding.raw_ggml.is_some());
+        assert!(weights.positional_embedding.values.is_empty());
+        assert!(weights.positional_embedding.raw_ggml.is_some());
     }
 
     #[test]

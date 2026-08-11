@@ -12,13 +12,16 @@
 #![allow(dead_code)]
 
 use crate::ggml_runtime::{
-    ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
-    WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
+    ArenaAllocError, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
+    GgufTensorDataReader, WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
     alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
     upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
 };
-use crate::nn::encoder::{SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer};
+use crate::nn::encoder::{
+    SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer,
+    sanm_fsmn_graph_node_capacity,
+};
 use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
@@ -26,7 +29,10 @@ use crate::models::sensevoice::graph_config::sensevoice_encoder_graph_config;
 
 use super::runtime_contract::{FUNASR_NANO_ENCODER_LAYER_NORM_EPSILON, FunasrNanoEncoderMetadata};
 
-const FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
+const SANM_ARENA_TENSORS_PER_LAYER: usize = 9;
+const FUNASR_NANO_FIXED_ARENA_TENSORS: usize = 4;
+const FUNASR_NANO_FIXED_GRAPH_NODES: usize = 6;
+const FUNASR_NANO_FIXED_GRAPH_LEAFS: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FunasrNanoEncoderError {
@@ -297,10 +303,15 @@ impl FunasrNanoEncoderGraph {
         let guard = super::runtime_contract::funasr_nano_encoder_read_guard(&metadata);
         let weights = load_encoder_weights(&reader, &guard, &metadata)?;
 
-        let mut config = sensevoice_encoder_graph_config(backend);
-        config.context_bytes = FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES;
         let total_layers = weights.enc_layers.len() + weights.tp_layers.len();
-        config.graph_size = config.graph_size.max(total_layers * 128 + 2048);
+        let mut config = sensevoice_encoder_graph_config(backend);
+        let graph_capacity = sanm_fsmn_graph_node_capacity(
+            total_layers,
+            FUNASR_NANO_FIXED_GRAPH_NODES,
+            FUNASR_NANO_FIXED_GRAPH_LEAFS,
+            config.graph_size,
+        );
+        config.set_graph_node_capacity(graph_capacity);
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             FunasrNanoEncoderError::GraphBuildFailed {
                 step: "runner_init",
@@ -313,8 +324,13 @@ impl FunasrNanoEncoderGraph {
                 .map_err(bf("loaded_weight_context"))?,
         );
         let loaded = loaded_weights.as_ref();
+        let arena_tensor_capacity = total_layers
+            .saturating_mul(SANM_ARENA_TENSORS_PER_LAYER)
+            .saturating_add(FUNASR_NANO_FIXED_ARENA_TENSORS);
         let mut arena = runner
-            .start_static_tensor_arena(FUNASR_NANO_ENCODER_GRAPH_CONTEXT_BYTES)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_capacity,
+            ))
             .map_err(|source| FunasrNanoEncoderError::GraphBuildFailed {
                 step: "static_tensor_arena",
                 source,

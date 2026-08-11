@@ -84,6 +84,7 @@ const HOTWORD_LAYER_NORM_EPS: f32 = 1e-5;
 /// sequence of token id 0, prepended before every real hotword phrase so the
 /// biasing attention always has a null option to attend to.
 const HOTWORD_NO_BIAS_TOKEN_ID: u32 = 0;
+const DOLPHIN_HOTWORD_GRAPH_NODE_CAPACITY: usize = 2_048;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DolphinHotwordError {
@@ -552,8 +553,10 @@ pub(crate) fn apply_hotword_deep_biasing(
     let rows = context_emb.len() / d;
 
     let graph_config = GgmlCpuGraphConfig {
-        context_bytes: 64 * 1024 * 1024,
-        graph_size: 2048,
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(
+            DOLPHIN_HOTWORD_GRAPH_NODE_CAPACITY,
+        ),
+        graph_size: DOLPHIN_HOTWORD_GRAPH_NODE_CAPACITY,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             backend,
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,

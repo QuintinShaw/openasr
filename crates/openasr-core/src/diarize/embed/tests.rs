@@ -473,17 +473,36 @@ fn redimnet_matches_official_reference_on_aux_audio() {
     let mut runtime =
         RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1), backend, placement)
             .expect("construct resident runtime");
+    let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+    let _execution_placement_guard = execution_placement.install();
     let actual = low_level_redimnet_embed(&embedder, &mut runtime, &samples)
         .expect("run ReDimNet parity embedding");
+    let observed = execution_placement.snapshot();
     let expected = read_redimnet_golden_embedding(&reference);
     assert_eq!(actual.dim(), expected.len(), "embedding dimension");
     let cos = cosine(&actual.0, &expected);
     eprintln!(
-        "REDIMNET_OFFICIAL_PARITY backend={} cosine={cos:.8} dim={}",
+        "REDIMNET_OFFICIAL_PARITY backend={} cosine={cos:.8} dim={} observed_compute_nodes={:?} observed_nodes={:?}",
         redimnet_backend_label(backend),
-        actual.dim()
+        actual.dim(),
+        observed.observed_compute_nodes_by_backend,
+        observed.observed_nodes_by_backend,
     );
     assert!(cos >= 0.9999, "ReDimNet official cosine {cos}");
+    if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
+        assert!(
+            !observed.observed_compute_nodes_by_backend.is_empty()
+                && observed
+                    .observed_compute_nodes_by_backend
+                    .keys()
+                    .all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.starts_with("mtl") || backend.contains("metal")
+                    }),
+            "explicit Metal ReDimNet route observed non-Metal compute: {:?}",
+            observed.observed_compute_nodes_by_backend
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -592,11 +611,15 @@ fn redimnet_backend_benchmark() {
             .collect::<Vec<_>>(),
     );
     let (median_seconds, runs) = crate::testing::benchmark_median_seconds(runs);
-    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+    let memory = crate::metrics::process_memory_snapshot();
     eprintln!(
-        "REDIMNET_BACKEND_BENCH backend={} audio_seconds={represented_audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} clips={} output_sha256={output_sha256} runs={runs:?}",
+        "REDIMNET_BACKEND_BENCH backend={} audio_seconds={represented_audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?} clips={} output_sha256={output_sha256} runs={runs:?}",
         redimnet_backend_label(backend),
         median_seconds / represented_audio_seconds,
+        memory.current_rss_bytes,
+        memory.peak_rss_bytes,
+        memory.current_phys_footprint_bytes,
+        memory.peak_phys_footprint_bytes,
         clips.len(),
     );
 }

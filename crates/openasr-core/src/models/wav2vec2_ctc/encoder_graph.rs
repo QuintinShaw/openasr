@@ -10,11 +10,11 @@
 #![allow(dead_code)]
 
 use crate::ggml_runtime::{
-    ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
-    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
-    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
-    upload_static_f32 as arena_upload_static_f32,
+    ArenaAllocError, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
+    alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
+    upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::runtime_memory::{checked_sum, element_bytes};
 use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
@@ -34,9 +34,10 @@ use super::runtime_contract::{
     Wav2Vec2CtcExecutionMetadata,
 };
 
-/// Base context budget; scaled up for the larger 24-layer / 1024-hidden variants
-/// (hubert/lv60/data2vec) so the arena + graph fit.
-const WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES: usize = 1536 * 1024 * 1024;
+const WAV2VEC2_GRAPH_NODES_PER_LAYER_UPPER_BOUND: usize = 256;
+const WAV2VEC2_GRAPH_FIXED_NODE_UPPER_BOUND: usize = 2_048;
+const WAV2VEC2_LAYER_STATIC_TENSOR_COUNT: usize = 10;
+const WAV2VEC2_FIXED_STATIC_TENSOR_COUNT: usize = 6;
 const LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const GROUP_NORM_EPSILON: f32 = 1.0e-5;
 
@@ -236,14 +237,21 @@ impl Wav2Vec2CtcEncoderGraph {
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Wav2Vec2EncoderError> {
         let mut config = wav2vec2_ctc_encoder_graph_config(backend);
-        config.context_bytes = WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES;
         // Larger variants (e.g. hubert-xlarge, ~48 transformer layers vs large's
         // 24) build more graph nodes than the default 4096-node cap, tripping
         // `GGML_ASSERT(cgraph->n_nodes < cgraph->size)`. Size the cgraph to the
         // data-driven layer count with generous per-layer headroom. Capacity only
         // — the built graph and op order are unchanged, so existing models stay
         // byte-identical.
-        config.graph_size = config.graph_size.max(weights.layers.len() * 256 + 2048);
+        let topology_graph_size = weights
+            .layers
+            .len()
+            .checked_mul(WAV2VEC2_GRAPH_NODES_PER_LAYER_UPPER_BOUND)
+            .and_then(|nodes| nodes.checked_add(WAV2VEC2_GRAPH_FIXED_NODE_UPPER_BOUND))
+            .ok_or_else(|| Wav2Vec2EncoderError::Shape {
+                reason: "wav2vec2 graph node capacity overflows usize".to_string(),
+            })?;
+        config.set_graph_node_capacity(config.graph_size.max(topology_graph_size));
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             Wav2Vec2EncoderError::GraphBuildFailed {
                 step: "runner_init",
@@ -259,8 +267,48 @@ impl Wav2Vec2CtcEncoderGraph {
                 })?,
         );
         let loaded = loaded_weights.as_ref();
+        let feature_extractor_tensor_count =
+            weights
+                .feature_extractor
+                .iter()
+                .try_fold(0usize, |count, layer| {
+                    let layer_count = 1usize
+                        .checked_add(usize::from(layer.conv_bias.is_some()))
+                        .and_then(|value| {
+                            value.checked_add(usize::from(layer.norm_weight.is_some()))
+                        })
+                        .and_then(|value| value.checked_add(usize::from(layer.norm_bias.is_some())))
+                        .ok_or_else(|| Wav2Vec2EncoderError::Shape {
+                            reason: "wav2vec2 feature-extractor tensor count overflows usize"
+                                .to_string(),
+                        })?;
+                    count
+                        .checked_add(layer_count)
+                        .ok_or_else(|| Wav2Vec2EncoderError::Shape {
+                            reason: "wav2vec2 feature-extractor tensor count overflows usize"
+                                .to_string(),
+                        })
+                })?;
+        let arena_tensor_count = weights
+            .layers
+            .len()
+            .checked_mul(WAV2VEC2_LAYER_STATIC_TENSOR_COUNT)
+            .and_then(|count| {
+                weights
+                    .pos_conv_layers
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|positional| count.checked_add(positional))
+            })
+            .and_then(|count| count.checked_add(feature_extractor_tensor_count))
+            .and_then(|count| count.checked_add(WAV2VEC2_FIXED_STATIC_TENSOR_COUNT))
+            .ok_or_else(|| Wav2Vec2EncoderError::Shape {
+                reason: "wav2vec2 static tensor count overflows usize".to_string(),
+            })?;
         let mut arena = runner
-            .start_static_tensor_arena(WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_count,
+            ))
             .map_err(|source| Wav2Vec2EncoderError::GraphBuildFailed {
                 step: "static_tensor_arena",
                 source,

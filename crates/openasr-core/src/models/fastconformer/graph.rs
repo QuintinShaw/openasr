@@ -360,7 +360,7 @@ impl FastConformerEncoderCore {
     /// tensor allocation).
     pub(crate) fn build<E, T>(
         graph_config: GgmlCpuGraphConfig,
-        context_bytes: usize,
+        tail_static_tensor_count: usize,
         runtime_preflight: &GgufRuntimeSourcePreflight,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
@@ -375,7 +375,7 @@ impl FastConformerEncoderCore {
     {
         Self::build_impl(
             graph_config,
-            context_bytes,
+            tail_static_tensor_count,
             RuntimeWeightSource::Verified(runtime_preflight),
             subsampling,
             layers,
@@ -389,7 +389,7 @@ impl FastConformerEncoderCore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_synthetic<E, T>(
         graph_config: GgmlCpuGraphConfig,
-        context_bytes: usize,
+        tail_static_tensor_count: usize,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
         declare_tail: impl FnOnce(
@@ -403,7 +403,7 @@ impl FastConformerEncoderCore {
     {
         Self::build_impl(
             graph_config,
-            context_bytes,
+            tail_static_tensor_count,
             RuntimeWeightSource::Synthetic,
             subsampling,
             layers,
@@ -415,7 +415,7 @@ impl FastConformerEncoderCore {
     #[allow(clippy::too_many_arguments)]
     fn build_impl<E, T>(
         mut graph_config: GgmlCpuGraphConfig,
-        context_bytes: usize,
+        tail_static_tensor_count: usize,
         runtime_source: RuntimeWeightSource<'_>,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
@@ -428,14 +428,17 @@ impl FastConformerEncoderCore {
     where
         E: FastConformerGraphError,
     {
-        graph_config.context_bytes = context_bytes;
         // FastConformer-XL builds more graph nodes than the default 4096-node
         // cap, tripping `GGML_ASSERT(cgraph->n_nodes < cgraph->size)`. Size
         // the cgraph to the actual (data-driven) layer count with generous
         // per-layer headroom. This is capacity only -- the built graph and
         // its op order are unchanged, so a model within the default cap
         // stays byte-for-byte identical.
-        graph_config.graph_size = graph_config.graph_size.max(layers.len() * 256 + 2048);
+        graph_config.set_graph_node_capacity(
+            graph_config
+                .graph_size
+                .max(layers.len().saturating_mul(256).saturating_add(2048)),
+        );
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| E::graph_build_failed("runner_init", source))?;
         // Bind the 2-D linears zero-copy from the mmap'd pack (no f32
@@ -451,8 +454,18 @@ impl FastConformerEncoderCore {
             RuntimeWeightSource::Synthetic => None,
         };
         let loaded = loaded_weights.as_ref();
+        // The arena holds 11 subsampling tensors, 24 tensors per Conformer
+        // layer, and the family tail supplied by the caller. Bulk linears are
+        // mmap-backed `WeightSlot::Loaded` values and do not consume arena
+        // metadata. Size this context from that exact contract instead of
+        // duplicating the runner's historical flat 768 MiB reservation.
+        let arena_tensor_capacity = 11usize
+            .saturating_add(layers.len().saturating_mul(24))
+            .saturating_add(tail_static_tensor_count);
         let mut arena = runner
-            .start_static_tensor_arena(context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_capacity,
+            ))
             .map_err(|source| E::graph_build_failed("static_tensor_arena", source))?;
 
         // ----- declare (allocate) all arena tensors first (first upload freezes) -----

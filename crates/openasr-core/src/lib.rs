@@ -158,8 +158,13 @@ pub use catalog_security::{
     read_catalog_degraded_status, record_catalog_degraded, render_catalog_signature_manifest,
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
+pub use ggml_runtime::{
+    GgmlExecutionNodeSample, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
+    GgmlExecutionTelemetryGuard,
+};
 pub use metrics::{
-    WerCounts, cer_counts, normalize_text, peak_rss_bytes, wer, wer_counts, word_prefix_error_rate,
+    ProcessMemorySnapshot, WerCounts, cer_counts, current_rss_bytes, normalize_text,
+    peak_rss_bytes, process_memory_snapshot, wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use short_audio_receipt::{

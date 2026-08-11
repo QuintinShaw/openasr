@@ -27,7 +27,9 @@ use crate::device::{
     execution_route::{ExecutionProvider, ExecutionRouteCacheKey, ResolvedExecutionRoute},
 };
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, RequestBackendOverrideGuard, RequestBackendPreference,
+    GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
+    GgmlExecutionTelemetryGuard, RequestBackendOverrideGuard, RequestBackendPreference,
+    current_execution_telemetry_collector, install_execution_telemetry_collector,
     install_request_backend_override, request_backend_override, resolve_request_execution_route,
 };
 
@@ -97,10 +99,12 @@ thread_local! {
 }
 
 type DeferredCacheCommit = Box<dyn FnOnce() + 'static>;
+type DeferredCacheRollback = Box<dyn FnOnce() + 'static>;
 
 struct ExecutionCacheJournal {
     attempt_id: ExecutionCacheAttemptId,
     commits: Vec<DeferredCacheCommit>,
+    rollbacks: Vec<DeferredCacheRollback>,
 }
 
 impl ExecutionCacheJournal {
@@ -108,12 +112,15 @@ impl ExecutionCacheJournal {
         Self {
             attempt_id,
             commits: Vec::new(),
+            rollbacks: Vec::new(),
         }
     }
 }
 
 impl ExecutionCacheJournal {
     fn commit(mut self) {
+        // A successful candidate makes rollback-only invalidations obsolete.
+        self.rollbacks.clear();
         for commit in self.commits.drain(..) {
             commit();
         }
@@ -125,6 +132,9 @@ impl ExecutionCacheJournal {
         // before the resources it was built from.
         while let Some(commit) = self.commits.pop() {
             drop(commit);
+        }
+        while let Some(rollback) = self.rollbacks.pop() {
+            rollback();
         }
     }
 }
@@ -179,6 +189,9 @@ impl ExecutionCacheJournalScope {
             parent
                 .commits
                 .append(&mut journal.as_mut().expect("journal available").commits);
+            parent
+                .rollbacks
+                .append(&mut journal.as_mut().expect("journal available").rollbacks);
             true
         });
         if !merged {
@@ -278,6 +291,7 @@ pub(crate) struct NativeExecutionContext {
     placement: Option<ExecutionPlacement>,
     failure_sink: Option<ExecutionCandidateFailureSink>,
     cache_attempt_id: Option<ExecutionCacheAttemptId>,
+    execution_telemetry: Option<GgmlExecutionTelemetryCollector>,
 }
 
 impl NativeExecutionContext {
@@ -322,6 +336,11 @@ impl NativeExecutionContext {
             .map(|context| context.cache_attempt_id)
             .reduce(|left, right| (left == right).then_some(left).flatten())
             .flatten();
+        let execution_telemetry = GgmlExecutionTelemetryCollector::fanout(
+            contexts
+                .iter()
+                .filter_map(|context| context.execution_telemetry.as_ref()),
+        );
         Ok(Some(Self {
             scope_id: first.scope_id,
             memory_broker: Arc::clone(&first.memory_broker),
@@ -329,6 +348,7 @@ impl NativeExecutionContext {
             placement: first.placement,
             failure_sink,
             cache_attempt_id,
+            execution_telemetry,
         }))
     }
 }
@@ -348,6 +368,7 @@ pub(crate) struct NativeExecutionContextGuard {
     previous_placement: Option<ExecutionPlacement>,
     previous_failure_sink: Option<ExecutionCandidateFailureSink>,
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
+    execution_telemetry: GgmlExecutionTelemetryGuard,
     backend: RequestBackendOverrideGuard,
 }
 
@@ -366,6 +387,8 @@ impl Drop for NativeExecutionContextGuard {
         let _ = &self.scope;
         // `backend` restores itself after this `Drop` returns.
         let _ = &self.backend;
+        // `execution_telemetry` restores itself after this `Drop` returns.
+        let _ = &self.execution_telemetry;
     }
 }
 
@@ -468,6 +491,7 @@ pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContex
         placement: current_execution_placement(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        execution_telemetry: current_execution_telemetry_collector(),
     })
 }
 
@@ -591,6 +615,24 @@ pub(crate) fn stage_execution_cache_commit(commit: impl FnOnce() + 'static) {
     // resident cache owner.
 }
 
+/// Registers cache invalidation that runs only if the active candidate rolls
+/// back. This is used for already-published owners that participated in a
+/// failed attempt: a placement violation is synthesized after the model call
+/// returns, so model-local code cannot reliably observe the failure side
+/// channel before returning.
+pub(crate) fn stage_execution_cache_rollback(rollback: impl FnOnce() + 'static) {
+    let mut rollback = Some(Box::new(rollback) as DeferredCacheRollback);
+    CURRENT_EXECUTION_CACHE_JOURNAL.with(|current| {
+        let mut current = current.borrow_mut();
+        let Some(journal) = current.as_mut() else {
+            return;
+        };
+        journal
+            .rollbacks
+            .push(rollback.take().expect("cache rollback is staged once"));
+    });
+}
+
 /// Low-level memory/backend code calls this at the point where a typed
 /// candidate-local failure is first known. A call outside a policy attempt is
 /// intentionally a no-op, preserving standalone low-level tests.
@@ -613,6 +655,7 @@ pub(crate) fn install_native_execution_context(
         .with(|current| current.replace(context.failure_sink));
     let previous_cache_attempt_id = CURRENT_EXECUTION_CACHE_ATTEMPT_ID
         .with(|current| current.replace(context.cache_attempt_id));
+    let execution_telemetry = install_execution_telemetry_collector(context.execution_telemetry);
     let backend = install_request_backend_override(context.backend_preference);
     NativeExecutionContextGuard {
         scope,
@@ -620,6 +663,7 @@ pub(crate) fn install_native_execution_context(
         previous_placement,
         previous_failure_sink,
         previous_cache_attempt_id,
+        execution_telemetry,
         backend,
     }
 }
@@ -637,6 +681,7 @@ pub(crate) fn install_native_execution_services(
         placement: current_execution_placement(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        execution_telemetry: current_execution_telemetry_collector(),
     })
 }
 
@@ -663,6 +708,7 @@ pub(crate) fn install_execution_candidate_attempt(
         placement: Some(candidate.placement),
         failure_sink: Some(failure_sink),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        execution_telemetry: current_execution_telemetry_collector(),
     })
 }
 
@@ -672,6 +718,108 @@ pub(crate) fn install_execution_candidate_attempt(
 pub(crate) struct ExecutionCandidateAttemptOutcome<T, E> {
     pub(crate) result: Result<T, E>,
     pub(crate) candidate_failure: Option<ExecutionCandidateFailure>,
+}
+
+/// Extracts an ordinary error from a failed candidate attempt while ensuring
+/// a value returned alongside the typed failure is destroyed transactionally.
+///
+/// A successful value can own an exclusive actor checkout. Its `Drop` stages
+/// an idle-cache return, so dropping it after the original attempt scope has
+/// ended would accidentally publish a runtime whose placement/admission was
+/// just rejected. The nested rollback journal keeps that destructor from
+/// resurrecting candidate-local cache state.
+pub(crate) fn execution_candidate_failure_source<T, E>(result: Result<T, E>) -> Option<E> {
+    match result {
+        Err(error) => Some(error),
+        Ok(value) => {
+            drop_execution_candidate_value_without_cache_publication(value);
+            None
+        }
+    }
+}
+
+/// Destroys candidate-owned state inside a rollback-only cache journal.
+///
+/// Exclusive checkouts publish themselves back to their idle pool from
+/// `Drop`. Candidate failure invalidates that owner, so every persistent
+/// runtime/session wrapper must use this helper before discarding its active
+/// lane.
+pub(crate) fn drop_execution_candidate_value_without_cache_publication<T>(value: T) {
+    let rollback = ExecutionCacheJournalScope::begin();
+    drop(value);
+    rollback.finish(false);
+}
+
+fn observed_backend_matches_provider(expected: ExecutionProvider, backend_name: &str) -> bool {
+    let observed = ExecutionProvider::from_backend_name(backend_name);
+    match expected {
+        ExecutionProvider::Cpu
+        | ExecutionProvider::Metal
+        | ExecutionProvider::Cuda
+        | ExecutionProvider::Hip
+        | ExecutionProvider::Vulkan => observed == expected,
+        // Generic/unknown routes cannot prove that compute stayed on the
+        // selected physical accelerator. Fail closed instead of treating a
+        // CPU BLAS label as sufficient evidence of GPU execution.
+        ExecutionProvider::Accelerator | ExecutionProvider::Unknown => false,
+    }
+}
+
+fn observed_placement_violation(
+    candidate: &ExecutionCandidate,
+    observed: &GgmlExecutionPlacementSummary,
+) -> Option<ExecutionCandidateFailure> {
+    if candidate.placement == ExecutionPlacement::CpuOnly {
+        return None;
+    }
+    let graph_compute_calls = observed
+        .direct_graph_computes
+        .saturating_add(observed.scheduler_graph_computes);
+    // Lazy streaming-session construction is allowed to defer proof until its
+    // first warmed compute. Once ggml reports a compute call, however, an
+    // empty node map is missing placement evidence and must fail closed.
+    if graph_compute_calls == 0 {
+        return None;
+    }
+    let expected = candidate.device.route.provider;
+    let selected_nodes = observed
+        .observed_compute_nodes_by_backend
+        .iter()
+        .filter(|(backend, _)| observed_backend_matches_provider(expected, backend))
+        .map(|(_, nodes)| *nodes)
+        .sum::<u64>();
+    let mismatched = observed
+        .observed_compute_nodes_by_backend
+        .iter()
+        .filter(|(backend, nodes)| {
+            if **nodes == 0 || observed_backend_matches_provider(expected, backend) {
+                return false;
+            }
+            candidate.placement == ExecutionPlacement::FullDevice
+                || ExecutionProvider::from_backend_name(backend) != ExecutionProvider::Cpu
+        })
+        .map(|(backend, nodes)| format!("{backend}={nodes}"))
+        .collect::<Vec<_>>();
+    (selected_nodes == 0 || !mismatched.is_empty()).then(|| {
+        let observation = if observed.observed_compute_nodes_by_backend.is_empty() {
+            "no backend nodes".to_string()
+        } else {
+            observed
+                .observed_compute_nodes_by_backend
+                .iter()
+                .filter(|(_, nodes)| **nodes > 0)
+                .map(|(backend, nodes)| format!("{backend}={nodes}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        ExecutionCandidateFailure::placement(
+            "execution-placement",
+            format!(
+                "selected provider {expected} with {:?} placement observed {observation}",
+                candidate.placement
+            ),
+        )
+    })
 }
 
 /// Runs a complete allocation/execution operation inside one candidate's
@@ -685,12 +833,24 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
     operation: impl FnOnce() -> Result<T, E>,
 ) -> ExecutionCandidateAttemptOutcome<T, E> {
     let failure_sink = ExecutionCandidateFailureSink::new();
+    let placement_collector = (candidate.placement != ExecutionPlacement::CpuOnly)
+        .then(GgmlExecutionTelemetryCollector::new);
+    let outer_collector = current_execution_telemetry_collector();
+    let combined_collector = GgmlExecutionTelemetryCollector::fanout(
+        outer_collector.iter().chain(placement_collector.iter()),
+    );
     let (result, candidate_failure) = {
+        let _telemetry = install_execution_telemetry_collector(combined_collector);
         let _attempt =
             install_execution_candidate_attempt(services, candidate, failure_sink.clone());
         let journal_scope = ExecutionCacheJournalScope::begin();
         let result = operation();
-        let candidate_failure = failure_sink.failure();
+        let mut candidate_failure = failure_sink.failure();
+        if result.is_ok() && candidate_failure.is_none() {
+            candidate_failure = placement_collector.as_ref().and_then(|collector| {
+                observed_placement_violation(candidate, &collector.snapshot())
+            });
+        }
         journal_scope.finish(result.is_ok() && candidate_failure.is_none());
         (result, candidate_failure)
     };
@@ -749,6 +909,11 @@ pub struct NativeExecutionServices {
         super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
             crate::diarize::embed::RedimNetResidentRuntime,
+        >,
+    firered_stream_vad_realtime_actors:
+        super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
+            super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+            crate::diarize::vad::FireRedRealtimeVadRuntime,
         >,
     dispatches: NativeExecutionDispatches,
 }
@@ -835,6 +1000,15 @@ impl NativeExecutionServices {
                         crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
                     ),
                 ),
+            firered_stream_vad_realtime_actors:
+                super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
+                    "openasr-firered-vad-realtime-owner",
+                    super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                        1,
+                        crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+                        4,
+                    ),
+                ),
             dispatches: NativeExecutionDispatches { offline, streaming },
         })
     }
@@ -902,6 +1076,15 @@ impl NativeExecutionServices {
         &self.redimnet_runtime_actors
     }
 
+    pub(crate) fn firered_stream_vad_realtime_actors(
+        &self,
+    ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
+        super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+        crate::diarize::vad::FireRedRealtimeVadRuntime,
+    > {
+        &self.firered_stream_vad_realtime_actors
+    }
+
     pub(crate) fn offline_dispatch(&self) -> &GgmlAsrExecutionDispatch {
         &self.dispatches.offline
     }
@@ -921,6 +1104,7 @@ impl NativeExecutionServices {
         self.diarizen_segmenter_actors.clear();
         self.pyannote_segmenter_actors.clear();
         self.redimnet_runtime_actors.clear();
+        self.firered_stream_vad_realtime_actors.clear();
     }
 
     /// Evicts one replaced pack identity from this root's prepared-runtime
@@ -977,6 +1161,8 @@ pub(crate) fn test_native_execution_services() -> Arc<NativeExecutionServices> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::device::{
         execution_policy::ExecutionDeviceSnapshot,
         execution_route::{
@@ -1029,6 +1215,124 @@ mod tests {
             },
             placement,
         }
+    }
+
+    fn record_test_graph_placements(backends: &[&str]) {
+        let collector = current_execution_telemetry_collector().expect("candidate collector");
+        collector.record_graph_compute(false);
+        let observed = backends
+            .iter()
+            .map(|backend| ((*backend).to_string(), (3, 96)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let compute = backends
+            .iter()
+            .map(|backend| ((*backend).to_string(), 2))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        collector.record_observed_graph(7, &observed, &compute, &std::collections::BTreeMap::new());
+    }
+
+    fn record_test_graph_placement(backend: &str) {
+        record_test_graph_placements(&[backend]);
+    }
+
+    #[test]
+    fn accelerated_candidate_fails_closed_on_observed_cpu_compute() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Metal,
+            "MTL0",
+            "0000:00:02.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            record_test_graph_placement("CPU/BLAS");
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        let failure = outcome
+            .candidate_failure
+            .expect("CPU graph under Metal candidate must fail closed");
+        assert_eq!(
+            failure.kind,
+            crate::device::execution_policy::ExecutionCandidateFailureKind::PlacementViolation
+        );
+        assert_eq!(failure.operation, "execution-placement");
+    }
+
+    #[test]
+    fn accelerated_candidate_accepts_compute_on_selected_provider() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Metal,
+            "MTL0",
+            "0000:00:02.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            record_test_graph_placement("MTL0");
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+    }
+
+    #[test]
+    fn hybrid_candidate_accepts_cpu_and_selected_device_compute() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Metal,
+            "MTL0",
+            "0000:00:02.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            record_test_graph_placements(&["CPU/BLAS", "MTL0"]);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+    }
+
+    #[test]
+    fn full_device_candidate_rejects_any_cpu_compute() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Metal,
+            "MTL0",
+            "0000:00:02.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            record_test_graph_placements(&["CPU/BLAS", "MTL0"]);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            outcome.candidate_failure.unwrap().kind,
+            crate::device::execution_policy::ExecutionCandidateFailureKind::PlacementViolation
+        );
+    }
+
+    #[test]
+    fn accelerated_candidate_rejects_compute_without_backend_node_evidence() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Metal,
+            "MTL0",
+            "0000:00:02.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            current_execution_telemetry_collector()
+                .expect("candidate collector")
+                .record_graph_compute(false);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            outcome.candidate_failure.unwrap().kind,
+            crate::device::execution_policy::ExecutionCandidateFailureKind::PlacementViolation
+        );
     }
 
     #[test]
@@ -1288,6 +1592,106 @@ mod tests {
         assert!(typed_success.result.is_ok());
         assert!(typed_success.candidate_failure.is_some());
         assert_eq!(*published.lock().unwrap(), vec!["clean"]);
+
+        let rollback_target = Arc::clone(&published);
+        let rollback = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            stage_execution_cache_rollback(move || {
+                rollback_target.lock().unwrap().push("rolled-back")
+            });
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::device_lost(
+                "test-rollback-action",
+                "invalidate an already-published owner",
+            ));
+            Ok::<_, ()>(())
+        });
+        assert!(rollback.candidate_failure.is_some());
+        assert_eq!(*published.lock().unwrap(), vec!["clean", "rolled-back"]);
+
+        let discarded_target = Arc::clone(&published);
+        let success = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            stage_execution_cache_rollback(move || {
+                discarded_target.lock().unwrap().push("must-not-run")
+            });
+            Ok::<_, ()>(())
+        });
+        assert!(success.candidate_failure.is_none());
+        assert_eq!(*published.lock().unwrap(), vec!["clean", "rolled-back"]);
+    }
+
+    #[test]
+    fn failed_candidate_evicts_the_exact_published_pinned_actor() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let pool = super::super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool::new(
+            "candidate-rollback-pinned-actor-test",
+            super::super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPoolLimits::new(1, 64),
+        );
+        let builds = Arc::new(AtomicUsize::new(0));
+        let get_actor = || {
+            pool.get_or_try_insert_with(
+                "same",
+                || Ok::<_, String>((16, ())),
+                {
+                    let builds = Arc::clone(&builds);
+                    move |()| {
+                        let value = builds.fetch_add(1, Ordering::SeqCst) + 1;
+                        Ok(super::super::system_memory_owner::SystemMemoryOwner::with_committed_requested_bytes_for_test(value, 16))
+                    }
+                },
+                |error| error.to_string(),
+            )
+        };
+
+        let first = run_execution_candidate_attempt(services.as_ref(), &candidate, get_actor);
+        assert!(first.candidate_failure.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        let persistent_actor = first.result.expect("first actor");
+
+        let failed = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let value = persistent_actor
+                .call_mut(|runtime| *runtime)
+                .map_err(|error| error.to_string())?;
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::device_lost(
+                "candidate-rollback-pinned-actor-test",
+                "invalidate the published owner",
+            ));
+            Ok::<_, String>(value)
+        });
+        assert!(failed.candidate_failure.is_some());
+        drop(failed.result);
+
+        let rebuilt = run_execution_candidate_attempt(services.as_ref(), &candidate, get_actor);
+        assert!(rebuilt.candidate_failure.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        drop(persistent_actor);
+    }
+
+    #[test]
+    fn value_returned_with_candidate_failure_cannot_publish_from_drop() {
+        struct PublishesOnDrop(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for PublishesOnDrop {
+            fn drop(&mut self) {
+                let target = Arc::clone(&self.0);
+                stage_execution_cache_commit(move || target.lock().unwrap().push("resurrected"));
+            }
+        }
+
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let value_target = Arc::clone(&published);
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::device_lost(
+                "test-owner",
+                "placement rejected after the owner was returned",
+            ));
+            Ok::<_, ()>(PublishesOnDrop(value_target))
+        });
+
+        assert!(outcome.candidate_failure.is_some());
+        assert!(execution_candidate_failure_source(outcome.result).is_none());
+        assert!(published.lock().unwrap().is_empty());
     }
 
     #[test]

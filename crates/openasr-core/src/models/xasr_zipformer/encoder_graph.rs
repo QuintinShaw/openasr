@@ -2461,12 +2461,12 @@ struct XasrOutCombinerGraphUpload<'a> {
     scale: GgmlCpuTensor<'a>,
 }
 
-/// Context bytes for the Zipformer weight arena's ggml metadata (tensor
-/// struct headers only -- the context is `no_alloc`, so this does not size
-/// the actual weight data; that lives in the arena's WEIGHTS-usage backend
-/// buffer, sized automatically from the tensors created below). Generously
-/// sized for the ~20 stacks/layers this model ships with.
-const XASR_WEIGHT_ARENA_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
+/// Each Zipformer layer contributes the same 18 model-lifetime matmul weight
+/// handles allocated by `allocate_layer_weight_arena_tensors` below. The pack
+/// supplies the layer count, so size the no-alloc metadata arena from that
+/// topology instead of reserving a fixed byte budget.
+const XASR_WEIGHT_ARENA_TENSORS_PER_LAYER: usize = 18;
+const XASR_EMBED_WEIGHT_ARENA_TENSORS: usize = 1;
 
 /// Residency for the Zipformer encoder's 2-D matmul weights (the dominant
 /// compute cost): feed-forward/self-attention/nonlin-attention/convolution
@@ -2791,7 +2791,21 @@ fn build_xasr_weight_arena(
     runner: &GgmlCpuGraphRunner,
     weights: &XasrEncoderWeights,
 ) -> Result<XasrEncoderWeightArena, GgmlCpuGraphError> {
-    let arena = runner.start_static_tensor_arena(XASR_WEIGHT_ARENA_CONTEXT_BYTES)?;
+    let layer_count = weights.stacks.iter().try_fold(0usize, |count, stack| {
+        count
+            .checked_add(stack.layers.len())
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr encoder layer count overflows usize",
+            })
+    })?;
+    let tensor_count = layer_count
+        .checked_mul(XASR_WEIGHT_ARENA_TENSORS_PER_LAYER)
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr encoder weight arena tensor count overflows usize",
+        })?;
+    let arena = runner.start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+        tensor_count.max(1),
+    ))?;
     let mut stacks = Vec::with_capacity(weights.stacks.len());
     for stack in &weights.stacks {
         let mut layers = Vec::with_capacity(stack.layers.len());
@@ -2832,7 +2846,9 @@ fn build_xasr_embed_weight_arena(
     runner: &GgmlCpuGraphRunner,
     weights: &XasrEncoderEmbedWeights,
 ) -> Result<XasrEncoderEmbedWeightArena, GgmlCpuGraphError> {
-    let arena = runner.start_static_tensor_arena(XASR_WEIGHT_ARENA_CONTEXT_BYTES)?;
+    let arena = runner.start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+        XASR_EMBED_WEIGHT_ARENA_TENSORS,
+    ))?;
     let out_weight = arena_linear_weight_tensor(&arena, &weights.out, "xasr_arena_embed_out_w")?;
     let mut arena = arena;
     upload_arena_linear_weight(

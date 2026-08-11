@@ -38,10 +38,16 @@ openasr.short-audio-receipt.v0
 | `metrics.rtf_samples` | no | Wall-clock RTF samples; may be empty. |
 | `metrics.rtf_median` | no | Median of `rtf_samples` when samples exist. |
 | `metrics.measurement_method` | no | v0 uses `wall_clock_process_elapsed`. |
-| `metrics.wer_or_cer` / `ttft_s` / `peak_*` | no | Optional; leave null/absent when not measured. |
+| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional quality/latency values; leave null/absent when not measured. |
+| `metrics.peak_rss_before_model_bytes` / `metrics.peak_rss_bytes` | no | Process RSS high-water before model execution and after all runs. Their difference isolates model-created high-water from CLI/audio setup. |
+| `metrics.rss_before_model_bytes` / `metrics.rss_after_model_bytes` | no | Current process RSS immediately before the first model run and after the last run while runtime caches remain warm. |
+| `metrics.phys_footprint_before_model_bytes` / `metrics.phys_footprint_after_model_bytes` | no | Darwin current physical footprint at the same lifecycle boundaries; absent on unsupported platforms. |
+| `metrics.peak_phys_footprint_before_model_bytes` / `metrics.peak_phys_footprint_bytes` | no | Darwin lifetime maximum physical footprint before model execution and after all runs. |
+| `metrics.peak_vram_bytes` | no | Optional backend/device high-water when a trustworthy probe is available. |
 | `transcript.text` | yes | Final transcript text (UTF-8). |
 | `transcript.text_sha256` | yes | Lowercase hex sha256 of the UTF-8 transcript bytes. |
-| `placement` | yes | v0 records the requested device label (runtime weight placement is not introspected). |
+| `placement` | yes | Legacy/requested placement label retained for v0 compatibility. It is not proof of where graph compute ran. |
+| `observed_placement` | no | Actual graph-node placement observed during compute: total/compute-node counts by backend, graph compute count, output bytes, and bounded fallback samples. Native Metal acceptance requires selected-device compute and rejects disallowed CPU/alternate-accelerator compute according to the execution placement. |
 | `scope` | yes | Default `short-audio-gate`. |
 | `notes` | no | Free-form annotations. |
 
@@ -77,6 +83,11 @@ The command is an **explicit tooling surface**. It does not change the default
   match the median of the samples.
 - Mock backend receipts may use an all-zero pack digest only as a plumbing
   placeholder; native receipts must bind real pack bytes.
+- `placement` alone is never accelerator proof. When a native accelerated run
+  executes a ggml graph, `observed_placement` is populated from runtime
+  telemetry and the emitter fails closed if the observed compute violates the
+  resolved FullDevice/Hybrid placement. Older v0 receipts remain readable
+  because this evidence field and all lifecycle memory fields are optional.
 
 ## Relationship to pack preflight
 

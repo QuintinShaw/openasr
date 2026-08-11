@@ -38,6 +38,7 @@ use crate::nn::ffn::{
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 const F32_BYTES: usize = std::mem::size_of::<f32>();
+const DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY: usize = 16_384;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DolphinEncoderError {
@@ -1312,8 +1313,10 @@ impl DolphinEncoderRuntime {
         pos_capacity_frames: usize,
     ) -> Result<Self, DolphinEncoderError> {
         let graph_config = GgmlCpuGraphConfig {
-            context_bytes: 64 * 1024 * 1024,
-            graph_size: 16384,
+            context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(
+                DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY,
+            ),
+            graph_size: DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY,
             n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
                 backend,
                 crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,

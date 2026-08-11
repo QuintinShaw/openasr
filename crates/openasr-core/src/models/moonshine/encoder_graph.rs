@@ -240,8 +240,40 @@ impl MoonshineEncoderGraphRuntime {
             RuntimeWeightSource::Synthetic => None,
         };
         let loaded = loaded_weights.as_ref();
+        let lora_target_count = adapter
+            .map(|adapter| {
+                weights
+                    .layers
+                    .iter()
+                    .flat_map(|layer| {
+                        [
+                            layer.attn_q.name.as_str(),
+                            layer.attn_k.name.as_str(),
+                            layer.attn_v.name.as_str(),
+                            layer.attn_o.name.as_str(),
+                            layer.ffn_up.name.as_str(),
+                            layer.ffn_down.name.as_str(),
+                        ]
+                    })
+                    .filter(|name| adapter.target(name).is_some())
+                    .count()
+            })
+            .unwrap_or(0);
+        let arena_tensor_count = weights
+            .layers
+            .len()
+            .checked_mul(4)
+            .and_then(|count| count.checked_add(8))
+            .and_then(|count| {
+                lora_target_count
+                    .checked_mul(2)
+                    .and_then(|lora| count.checked_add(lora))
+            })
+            .ok_or(MoonshineEncoderError::ShapeOverflow)?;
         let mut arena = runner
-            .start_static_tensor_arena(config.context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_count,
+            ))
             .map_err(build_err("static_tensor_arena"))?;
 
         let conv1_weight = new_conv_kernel_f16(&arena, &weights.conv1_weight, "enc_conv1_w")?;

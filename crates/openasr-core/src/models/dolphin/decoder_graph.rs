@@ -48,6 +48,8 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::encoder_graph::DolphinWeightProvider;
 
+const DOLPHIN_DECODER_GRAPH_NODE_CAPACITY: usize = 16_384;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DolphinDecoderError {
     #[error("dolphin decoder shape error: {reason}")]
@@ -670,8 +672,10 @@ fn build_causal_mask(tokens: usize) -> Vec<f32> {
 
 fn dolphin_decoder_runner_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     GgmlCpuGraphConfig {
-        context_bytes: 128 * 1024 * 1024,
-        graph_size: 16384,
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(
+            DOLPHIN_DECODER_GRAPH_NODE_CAPACITY,
+        ),
+        graph_size: DOLPHIN_DECODER_GRAPH_NODE_CAPACITY,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             backend,
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Decoder,

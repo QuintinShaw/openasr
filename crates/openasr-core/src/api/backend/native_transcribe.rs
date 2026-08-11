@@ -404,15 +404,13 @@ fn run_dispatch_once_with_progress_and_policy(
             }
             (Err(error), None) => return Err(error),
             (result, Some(failure)) => {
-                let error = match result {
-                    Err(error) => error,
-                    Ok(_) => BackendError::NativeFailClosed {
+                let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
+                    .unwrap_or_else(|| BackendError::NativeFailClosed {
                         reason: format!(
                             "execution candidate reported {:?} during '{}' despite returning success",
                             failure.kind, failure.operation
                         ),
-                    },
-                };
+                    });
                 if candidate_index + 1 == candidates.len() {
                     return Err(error);
                 }
@@ -4145,7 +4143,7 @@ fn run_auxiliary_stage_with_policy<T>(
                     return Err(PolicyResolvedAuxRuntimeError::CandidatesExhausted {
                         stage,
                         failure,
-                        source: result.err(),
+                        source: crate::models::native_execution_services::execution_candidate_failure_source(result),
                     });
                 }
                 crate::stage_timing::log_detail_event(
@@ -4158,7 +4156,10 @@ fn run_auxiliary_stage_with_policy<T>(
                         failure.operation,
                     ),
                 );
-                drop(result);
+                let _ =
+                    crate::models::native_execution_services::execution_candidate_failure_source(
+                        result,
+                    );
             }
         }
     }
@@ -7199,6 +7200,8 @@ mod tests {
         let detached =
             crate::RequestExecutionContext::uncancellable("FireRedPunc host-local endurance run");
         let progress = progress_for();
+        let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+        let _execution_placement_guard = execution_placement.install();
         let started = Instant::now();
         let punctuated = apply_punctuation_stage_with_policy(
             make_transcription(),
@@ -7211,19 +7214,38 @@ mod tests {
         )
         .expect("punctuate fifteen-minute-equivalent transcript");
         let elapsed_seconds = started.elapsed().as_secs_f64();
+        let observed = execution_placement.snapshot();
         let output_sha256 = crate::testing::benchmark_sha256_bytes(
             punctuated
                 .segments
                 .iter()
                 .map(|segment| segment.text.as_bytes()),
         );
-        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
-        let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
+        let memory = crate::metrics::process_memory_snapshot();
+        let peak_rss_bytes = memory.peak_rss_bytes.unwrap_or(0);
+        let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
+        let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
+        let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=fireredpunc backend={backend_label} represented_audio_seconds=900.000000 elapsed_seconds={elapsed_seconds:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} segments={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=fireredpunc backend={backend_label} represented_audio_seconds=900.000000 elapsed_seconds={elapsed_seconds:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} observed_compute_nodes={:?} segments={} output_sha256={output_sha256}",
+            observed.observed_compute_nodes_by_backend,
             punctuated.segments.len(),
         );
         assert_eq!(punctuated.segments.len(), 60);
+        if backend_label.eq_ignore_ascii_case("metal") {
+            assert!(
+                !observed.observed_compute_nodes_by_backend.is_empty()
+                    && observed
+                        .observed_compute_nodes_by_backend
+                        .keys()
+                        .all(|backend| {
+                            let backend = backend.to_ascii_lowercase();
+                            backend.starts_with("mtl") || backend.contains("metal")
+                        }),
+                "explicit Metal FireRedPunc product route observed non-Metal compute: {:?}",
+                observed.observed_compute_nodes_by_backend
+            );
+        }
 
         // Reuse the now-warm actor and cancel while its first long segment is
         // in flight. The actor republishes this request's ggml cancel flag on

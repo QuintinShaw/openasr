@@ -1253,7 +1253,11 @@ impl WsSession {
         config.translation = translation_summary;
         config.vad = vad;
         config.buffer = buffer;
-        let mut controller = match RealtimeSessionController::new(config) {
+        let mut controller = match RealtimeSessionController::new_with_execution(
+            config,
+            Arc::clone(self.runtime.native_execution.execution_services()),
+            execution_target.unwrap_or_default(),
+        ) {
             Ok(controller) => controller,
             Err(error) => {
                 self.emit_error(
@@ -3011,15 +3015,28 @@ impl WsSession {
             // No frame capture here: captured_audio_frames only feeds the
             // fallback path's dictation flush, which native streaming sessions
             // never reach — cloning every 20ms frame into it was pure waste.
-            let (boundaries, is_speech, vad_in_speech) = self
-                .controller
-                .as_mut()
-                .map(|controller| {
-                    let (boundaries, is_speech) = controller.process_vad_frame_with_speech(&frame);
-                    let vad_in_speech = controller.vad.state() == VadState::InSpeech;
-                    (boundaries, is_speech, vad_in_speech)
-                })
-                .unwrap_or_else(|| (Vec::new(), false, false));
+            let vad_result = if let Some(controller) = self.controller.as_mut() {
+                controller
+                    .process_vad_frame_with_speech(&frame)
+                    .map(|(boundaries, is_speech)| {
+                        let vad_in_speech = controller.vad.state() == VadState::InSpeech;
+                        (boundaries, is_speech, vad_in_speech)
+                    })
+            } else {
+                Ok((Vec::new(), false, false))
+            };
+            let (boundaries, is_speech, vad_in_speech) = match vad_result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.emit_error(
+                        RealtimeErrorCode::BackendCrashed,
+                        &format!("Realtime neural VAD failed: {error}"),
+                        false,
+                    )
+                    .await?;
+                    return Err(());
+                }
+            };
             if is_speech {
                 self.native_had_speech_since_last_poll = true;
             }
@@ -3103,9 +3120,24 @@ impl WsSession {
     pub(crate) async fn process_frame(&mut self, frame: RealtimeAudioFrame) -> Result<(), ()> {
         self.remember_captured_audio_frame(&frame);
         let mut envelopes = Vec::new();
+        let boundaries = {
+            let controller = self.controller.as_mut().expect("controller exists");
+            controller.process_vad_frame(&frame)
+        };
+        let boundaries = match boundaries {
+            Ok(boundaries) => boundaries,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::BackendCrashed,
+                    &format!("Realtime neural VAD failed: {error}"),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
         let utterances = {
             let controller = self.controller.as_mut().expect("controller exists");
-            let boundaries = controller.process_vad_frame(&frame);
             for boundary in &boundaries {
                 match vad_boundary_event(boundary) {
                     VadBoundaryEvent::Vad(event) => {

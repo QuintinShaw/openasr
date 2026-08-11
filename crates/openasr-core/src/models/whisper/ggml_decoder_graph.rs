@@ -40,7 +40,6 @@ use super::execution_policy::{
 use super::graph_config::whisper_decoder_graph_config;
 
 const GGML_TYPE_F16: i32 = 1;
-const WHISPER_DECODER_REUSE_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 
 enum RuntimeWeightSource<'a> {
     Verified(&'a GgufRuntimeSourcePreflight),
@@ -1572,8 +1571,29 @@ impl WhisperDecoderPersistentWeightCache {
             });
         }
         let persistent_build_start = Instant::now();
+        let layer_tensor_capacity = plan
+            .layers
+            .len()
+            .checked_mul(26)
+            .and_then(|count| {
+                if n_seq > 1 {
+                    plan.layers
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|per_sequence| per_sequence.checked_mul(n_seq))
+                        .and_then(|views| count.checked_add(views))
+                } else {
+                    Some(count)
+                }
+            })
+            .and_then(|count| count.checked_add(9))
+            .ok_or_else(|| WhisperDecoderGraphExecutionError::InvalidInput {
+                reason: "whisper decoder static tensor count overflows usize".to_string(),
+            })?;
         let mut arena = runner
-            .start_static_tensor_arena(GgmlCpuGraphConfig::conservative_default().context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                layer_tensor_capacity,
+            ))
             .map_err(
                 |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                     reason: format!(
@@ -3711,7 +3731,7 @@ fn build_whisper_decoder_reusable_incremental_graph_with_n_seq(
     let hidden = plan.input_shape.hidden_size;
     let encoder_frames = plan.input_shape.encoder_frames;
     let mut session = runner
-        .start_persistent_graph_session(WHISPER_DECODER_REUSE_GRAPH_CONTEXT_BYTES)
+        .start_capacity_sized_persistent_graph_session()
         .map_err(|error| map_decoder_execute_graph_error("whisper_reuse_session", error))?;
     let graph = session.builder();
     let token_id = graph

@@ -15,9 +15,10 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlKvElementType,
-    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
-    GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlRopeExtParams, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
+    env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
@@ -47,9 +48,37 @@ use crate::nn::decoder::{
 use crate::nn::half::f32_slice_to_f16_bits;
 
 const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
-// The whole-step decoder builds all layers into one graph per token, so its
-// graph context must hold ~layer_count x the per-layer node/intermediate budget.
-const QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
+// The whole-step decoder already enforces this cgraph node limit. Size the
+// no-alloc metadata contexts from that same topology contract instead of the
+// former 768 MiB byte guess: ggml reserves the full context address range even
+// though tensor payloads live in separate backend buffers.
+const QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE: usize = 1usize << 12;
+// Worst-case arena handles per layer: norms/biases (5), split QKV (3), four
+// non-bindable projections, and seven two-tensor LoRA slots. Current Qwen3 ASR
+// packs use materially fewer; this bound also covers Qwen2-shaped adapters.
+const QWEN3_LLM_STATIC_TENSORS_PER_LAYER_MAX: usize = 26;
+const QWEN3_LLM_STATIC_TENSOR_FIXED_MARGIN: usize = 16;
+
+fn qwen_llm_graph_context_bytes() -> usize {
+    GgmlCpuGraphConfig::metadata_context_bytes(QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE)
+}
+
+fn qwen_llm_weight_arena_context_bytes(layer_count: usize) -> Result<usize, GgmlCpuGraphError> {
+    let tensor_count = layer_count
+        .checked_mul(QWEN3_LLM_STATIC_TENSORS_PER_LAYER_MAX)
+        .and_then(|count| count.checked_add(QWEN3_LLM_STATIC_TENSOR_FIXED_MARGIN))
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "qwen decoder static tensor metadata count overflow",
+        })?;
+    let capacity =
+        tensor_count
+            .checked_next_power_of_two()
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "qwen decoder static tensor metadata capacity overflow",
+            })?;
+    Ok(GgmlCpuGraphConfig::metadata_context_bytes(capacity))
+}
+
 // Correctness escape hatch for backend kernels with divergent native GQA
 // behavior; keep it unless every backend's GQA path is verified.
 const QWEN3_LLM_NATIVE_GQA_ENV: &str = "OPENASR_QWEN_LLM_NATIVE_GQA";
@@ -1055,6 +1084,7 @@ fn qwen_llm_stack_config(
     token_count: usize,
     n_seq: usize,
     use_flash_attention: bool,
+    flash_attention_precision: GgmlFlashAttentionPrecision,
     kv_cache_spec: LlmKvCacheSpec,
     materialize_kv_outputs: bool,
 ) -> LlmDecoderStackConfig {
@@ -1078,6 +1108,7 @@ fn qwen_llm_stack_config(
         // serve needs n_seq > 1 support in the unfused head-expansion path.
         use_native_gqa: use_native_gqa || n_seq > 1,
         use_flash_attention,
+        flash_attention_precision,
         kv_cache_spec,
         materialize_kv_outputs,
     }
@@ -2169,6 +2200,7 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     use_native_gqa: bool,
     rms_norm_epsilon: f32,
     kv_cache_spec: LlmKvCacheSpec,
+    flash_attention_precision: GgmlFlashAttentionPrecision,
     #[cfg(test)]
     materialization_peak_staging_bytes: usize,
 }
@@ -2265,11 +2297,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             })?;
         plan.validate_materialization_reader(&reader)?;
         let mut config = qwen_decoder_graph_config(backend);
-        config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
+        config.graph_size = QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE;
+        config.context_bytes = qwen_llm_graph_context_bytes();
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
         let runner = GgmlCpuGraphRunner::new(config)?;
         let loaded = Some(runner.load_gguf_weight_context_from_preflight(preflight)?);
-        let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
+        let mut arena = runner
+            .start_static_tensor_arena(qwen_llm_weight_arena_context_bytes(plan.layers.len())?)?;
         let mut layers = Vec::with_capacity(plan.layers.len());
         let mut dims = None;
 
@@ -2352,6 +2386,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             use_native_gqa,
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+            flash_attention_precision: GgmlFlashAttentionPrecision::Default,
             #[cfg(test)]
             materialization_peak_staging_bytes,
         };
@@ -2464,14 +2499,16 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         // production family runtimes inherit through the shared prepared-plan
         // compile seam. See `qwen_decoder_graph_config` for the rationale.
         let mut config = qwen_decoder_graph_config(backend);
-        config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
+        config.graph_size = QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE;
+        config.context_bytes = qwen_llm_graph_context_bytes();
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
         let runner = GgmlCpuGraphRunner::new(config)?;
         // goals 7+8: bind output/gate/up/down zero-copy from the mmap'd pack
         // (native q8/f16) instead of copying them into the arena. The context is
         // owned by this executor (drops after `reuse`, before `runner`).
         let loaded = runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
-        let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
+        let mut arena = runner
+            .start_static_tensor_arena(qwen_llm_weight_arena_context_bytes(projections.len())?)?;
         let mut layers = Vec::with_capacity(projections.len());
         let mut fused_qkvs = Vec::with_capacity(projections.len());
         let mut dims: Option<Qwen3AsrLlmDecodeDims> = None;
@@ -2599,6 +2636,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             use_native_gqa,
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+            flash_attention_precision: GgmlFlashAttentionPrecision::Default,
             #[cfg(test)]
             materialization_peak_staging_bytes: 0,
         };
@@ -2642,6 +2680,16 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.reuse = None;
         self.kv_cache_spec = spec;
         Ok(())
+    }
+
+    /// Select the precision contract used by fused self-attention graphs.
+    ///
+    /// This is an invocation-local graph policy, not a pack or backend global.
+    /// Changing it discards a reusable graph so no session can retain kernels
+    /// compiled under the previous precision contract.
+    pub(crate) fn set_flash_attention_precision(&mut self, precision: GgmlFlashAttentionPrecision) {
+        self.reuse = None;
+        self.flash_attention_precision = precision;
     }
 
     /// Ends a decode session/slice: discards any reusable graph poisoned by an
@@ -2834,6 +2882,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 1,
                 true,
+                self.flash_attention_precision,
                 self.kv_cache_spec,
                 true,
             ),
@@ -3060,6 +3109,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 1,
                 true,
+                self.flash_attention_precision,
                 self.kv_cache_spec,
                 true,
             ),
@@ -3506,6 +3556,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     token_count,
                     n_seq,
                     use_flash_attention,
+                    self.flash_attention_precision,
                     self.kv_cache_spec,
                     true,
                 ),
@@ -3740,6 +3791,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 token_count,
                 n_seq,
                 use_flash_attention,
+                self.flash_attention_precision,
                 kv_cache_spec,
                 materialize_layer_kv,
             ),
@@ -4000,7 +4052,6 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             // there is no per-step host upload of the growing KV prefix.
             let resident_kv_arena = allocate_zeroed_llm_resident_kv_arena(
                 &self.runner,
-                QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES,
                 layer_count,
                 dims.head_dim,
                 max_positions,
@@ -4012,7 +4063,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
             let mut session = self
                 .runner
-                .start_persistent_graph_session(QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES)?;
+                .start_persistent_graph_session(qwen_llm_graph_context_bytes())?;
             let graph = session.builder();
             let hidden_tensor =
                 graph.new_tensor_2d_f32(dims.d_model, n_seq, "qwen_llm_reuse_hidden")?;
@@ -4037,6 +4088,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     1,
                     n_seq,
                     true,
+                    self.flash_attention_precision,
                     self.kv_cache_spec,
                     true,
                 ),
@@ -4305,7 +4357,6 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let rope = GgmlRopeExtParams::qwen_neox(dims.head_dim, max_positions, rope_theta)?;
         let mut resident_kv_arena = allocate_zeroed_llm_resident_kv_arena(
             &self.runner,
-            QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES,
             self.layers.len(),
             dims.head_dim,
             max_positions,
@@ -4328,7 +4379,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
         let mut session = self
             .runner
-            .start_persistent_graph_session(QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES)?;
+            .start_persistent_graph_session(qwen_llm_graph_context_bytes())?;
         let graph = session.builder();
         let hidden_tensor =
             graph.new_tensor_2d_f32(dims.d_model, n_seq, "qwen_llm_reuse_hidden")?;
@@ -4353,6 +4404,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 n_seq,
                 true,
+                self.flash_attention_precision,
                 self.kv_cache_spec,
                 true,
             ),
@@ -7883,7 +7935,6 @@ mod tests {
             .expect("cpu graph runner should initialize");
         let mut resident = allocate_zeroed_llm_resident_kv_arena(
             &runner,
-            GgmlCpuGraphConfig::default().context_bytes,
             1,
             2,
             3,
@@ -7947,7 +7998,6 @@ mod tests {
             .expect("cpu graph runner should initialize");
         let mut resident = allocate_zeroed_llm_resident_kv_arena(
             &runner,
-            GgmlCpuGraphConfig::default().context_bytes,
             1,
             2,
             3,
@@ -8025,7 +8075,6 @@ mod tests {
             .expect("cpu graph runner should initialize");
         let mut resident = allocate_zeroed_llm_resident_kv_arena(
             &runner,
-            GgmlCpuGraphConfig::default().context_bytes,
             1,
             2,
             3,

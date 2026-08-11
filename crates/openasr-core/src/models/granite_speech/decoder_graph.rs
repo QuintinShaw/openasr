@@ -561,9 +561,10 @@ pub(crate) fn prefill_logits_from_embeddings(
         });
     }
 
+    const GRAPH_SIZE: usize = 32_768;
     let graph_config = GgmlCpuGraphConfig {
-        context_bytes: 256 * 1024 * 1024,
-        graph_size: 32768,
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE),
+        graph_size: GRAPH_SIZE,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             backend,
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,

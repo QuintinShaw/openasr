@@ -222,14 +222,16 @@ const GRANITE_RESIDENT_KV_SPEC: LlmKvCacheSpec = LlmKvCacheSpec {
     resident: GgmlKvElementType::F32,
 };
 
-/// ggml metadata-context budget for both the session runner and the reused
-/// persistent decode graph. Holds tensor structs + names, not compute buffers.
-const GRANITE_DECODE_GRAPH_CONTEXT_BYTES: usize = 256 * 1024 * 1024;
+const GRANITE_DECODE_GRAPH_SIZE: usize = 32_768;
+
+fn granite_decode_graph_context_bytes() -> usize {
+    GgmlCpuGraphConfig::metadata_context_bytes(GRANITE_DECODE_GRAPH_SIZE)
+}
 
 fn decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     GgmlCpuGraphConfig {
-        context_bytes: GRANITE_DECODE_GRAPH_CONTEXT_BYTES,
-        graph_size: 32768,
+        context_bytes: granite_decode_graph_context_bytes(),
+        graph_size: GRANITE_DECODE_GRAPH_SIZE,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             backend,
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
@@ -763,12 +765,8 @@ impl GraniteSpeechDecodeSession {
         self.reuse = None;
         self.resident_kv = None;
         let num_layers = self.config.num_layers;
-        // Two KV tensors per layer plus a small fixed spare for the arena's
-        // metadata pool (tensor structs + names).
-        let context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(num_layers * 2 + 16);
         let arena = allocate_zeroed_llm_resident_kv_arena(
             &self.runner,
-            context_bytes,
             num_layers,
             self.config.head_dim,
             required,
@@ -905,12 +903,11 @@ impl GraniteSpeechDecodeSession {
         let kv_tensors: Vec<(GgmlCpuTensor<'static>, GgmlCpuTensor<'static>)> =
             resident_kv.graph_tensors();
 
-        // Same metadata-context budget the session runner itself uses (see
-        // `GRANITE_DECODE_GRAPH_CONTEXT_BYTES`): ample for the single-token
-        // graph's ~20-op-per-layer tensor structs.
+        // The persistent reuse graph has the same node capacity as the session
+        // runner; derive its metadata backing from that shared contract.
         let mut session = self
             .runner
-            .start_persistent_graph_session(GRANITE_DECODE_GRAPH_CONTEXT_BYTES)
+            .start_persistent_graph_session(granite_decode_graph_context_bytes())
             .map_err(map_ggml("reuse_session_start"))?;
         let graph = session.builder();
 

@@ -17,8 +17,8 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::ggml_runtime::{
-    GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
-    build_runtime_tensor_reader_from_preflight,
+    GgmlCpuGraphBackend, GgmlFlashAttentionPrecision, GgufMetadata, GgufRuntimeSourcePreflight,
+    GgufTensorDataReadError, build_runtime_tensor_reader_from_preflight,
 };
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 use crate::models::{
@@ -529,6 +529,13 @@ pub(crate) fn align_forced_with_progress(
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
+    if backend == GgmlCpuGraphBackend::Metal {
+        // Forced alignment turns a single near-tie attention argmax into an
+        // absolute timestamp choice. Request ggml's precise attention contract
+        // for this transient decoder only; ordinary Qwen-family decode keeps
+        // the faster backend default.
+        whole_decoder.set_flash_attention_precision(GgmlFlashAttentionPrecision::F32);
+    }
     let prefill_output = whole_decoder
         .run_stateless_prefill(
             &prefill_input.token_major_embeddings,
@@ -921,10 +928,14 @@ mod tests {
             phase_samples.map(|samples| crate::testing::benchmark_median_seconds(samples).0);
         let phase_cumulative_fraction =
             phase_cumulative_median_seconds.map(|seconds| seconds / median_seconds);
-        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        let memory = crate::metrics::process_memory_snapshot();
         eprintln!(
-            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
+            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
             median_seconds / audio_seconds,
+            memory.current_rss_bytes,
+            memory.peak_rss_bytes,
+            memory.current_phys_footprint_bytes,
+            memory.peak_phys_footprint_bytes,
             items.len(),
         );
     }
@@ -998,10 +1009,13 @@ mod tests {
             output_bytes.extend_from_slice(&item.end_time_s.to_le_bytes());
         }
         let output_sha256 = crate::testing::benchmark_sha256_bytes([output_bytes]);
-        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
-        let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
+        let memory = crate::metrics::process_memory_snapshot();
+        let peak_rss_bytes = memory.peak_rss_bytes.unwrap_or(0);
+        let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
+        let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
+        let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=qwen3-forced-aligner backend={backend:?} segment_audio_seconds={audio_seconds:.6} repetitions={repetitions} represented_audio_seconds={represented_audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} items={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=qwen3-forced-aligner backend={backend:?} segment_audio_seconds={audio_seconds:.6} repetitions={repetitions} represented_audio_seconds={represented_audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} items={} output_sha256={output_sha256}",
             elapsed_seconds / represented_audio_seconds,
             expected.len(),
         );
@@ -1132,6 +1146,8 @@ mod tests {
         )
         .expect("load parity audio");
         let session = Qwen3ForcedAlignerSession::load(&pack, backend).expect("load aligner");
+        let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+        let _execution_placement_guard = execution_placement.install();
         let items = session
             .align(
                 crate::PcmBuffer::from_vec(samples).full_slice(),
@@ -1139,6 +1155,7 @@ mod tests {
                 &language,
             )
             .expect("align parity audio");
+        let observed = execution_placement.snapshot();
         let reference: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(reference_path).expect("read official reference JSON"),
         )
@@ -1173,14 +1190,34 @@ mod tests {
         let median_ms = differences_ms[differences_ms.len() / 2];
         let p95_ms = differences_ms[(differences_ms.len() - 1) * 95 / 100];
         let max_ms = differences_ms[differences_ms.len() - 1];
+        let memory = crate::metrics::process_memory_snapshot();
         eprintln!(
-            "FORCED_ALIGNER_OFFICIAL_PARITY backend={backend:?} items={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3}",
+            "FORCED_ALIGNER_OFFICIAL_PARITY backend={backend:?} items={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
             items.len(),
             differences_ms.len(),
+            observed.observed_compute_nodes_by_backend,
+            memory.current_rss_bytes,
+            memory.peak_rss_bytes,
+            memory.current_phys_footprint_bytes,
+            memory.peak_phys_footprint_bytes,
         );
         assert!(median_ms < 80.0, "median drift {median_ms:.3}ms");
         assert!(p95_ms <= 160.0, "p95 drift {p95_ms:.3}ms");
         assert!(max_ms <= 320.0, "maximum drift {max_ms:.3}ms");
+        if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
+            assert!(
+                !observed.observed_compute_nodes_by_backend.is_empty()
+                    && observed
+                        .observed_compute_nodes_by_backend
+                        .keys()
+                        .all(|backend| {
+                            let backend = backend.to_ascii_lowercase();
+                            backend.starts_with("mtl") || backend.contains("metal")
+                        }),
+                "explicit Metal forced-aligner route observed non-Metal compute: {:?}",
+                observed.observed_compute_nodes_by_backend
+            );
+        }
     }
 
     /// Stage 5 gate: run the full NAR pipeline end-to-end against the real

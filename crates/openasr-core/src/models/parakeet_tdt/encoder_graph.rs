@@ -16,7 +16,7 @@ use crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config
 use super::encoder_weights::ParakeetTdtEncoderWeights;
 use super::runtime_contract::ParakeetTdtExecutionMetadata;
 
-const PARAKEET_TDT_ENCODER_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
+const PARAKEET_TDT_TAIL_STATIC_TENSORS: usize = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ParakeetTdtEncoderError {
@@ -79,7 +79,7 @@ impl ParakeetTdtEncoderGraph {
         let config = parakeet_tdt_encoder_graph_config(backend);
         let (core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
             config,
-            PARAKEET_TDT_ENCODER_GRAPH_CONTEXT_BYTES,
+            PARAKEET_TDT_TAIL_STATIC_TENSORS,
             runtime_preflight,
             &weights.subsampling,
             &weights.layers,

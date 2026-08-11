@@ -10,15 +10,18 @@
 #![allow(dead_code)]
 
 use crate::ggml_runtime::{
-    ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
-    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
-    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
-    upload_static_f32 as arena_upload_static_f32,
+    ArenaAllocError, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
+    alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
+    upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::runtime_memory::{checked_sum, element_bytes};
 use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
-use crate::nn::encoder::{SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer};
+use crate::nn::encoder::{
+    SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer,
+    sanm_fsmn_graph_node_capacity,
+};
 use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
@@ -26,7 +29,10 @@ use super::encoder_weights::{NamedTensor, SenseVoiceEncoderWeights, SenseVoiceLa
 use super::graph_config::sensevoice_encoder_graph_config;
 use super::runtime_contract::SenseVoiceExecutionMetadata;
 
-const SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
+const SANM_ARENA_TENSORS_PER_LAYER: usize = 9;
+const SENSEVOICE_FIXED_ARENA_TENSORS: usize = 5;
+const SENSEVOICE_FIXED_GRAPH_NODES: usize = 9;
+const SENSEVOICE_FIXED_GRAPH_LEAFS: usize = 7;
 /// FunASR LayerNorm epsilon (torch LayerNorm eps=1e-12 in EncoderLayerSANM).
 const ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-12;
 
@@ -209,10 +215,15 @@ impl SenseVoiceEncoderGraph {
         runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, SenseVoiceEncoderError> {
-        let mut config = sensevoice_encoder_graph_config(backend);
-        config.context_bytes = SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES;
         let total_layers = weights.enc_layers.len() + weights.tp_layers.len();
-        config.graph_size = config.graph_size.max(total_layers * 128 + 2048);
+        let mut config = sensevoice_encoder_graph_config(backend);
+        let graph_capacity = sanm_fsmn_graph_node_capacity(
+            total_layers,
+            SENSEVOICE_FIXED_GRAPH_NODES,
+            SENSEVOICE_FIXED_GRAPH_LEAFS,
+            config.graph_size,
+        );
+        config.set_graph_node_capacity(graph_capacity);
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             SenseVoiceEncoderError::GraphBuildFailed {
                 step: "runner_init",
@@ -228,8 +239,13 @@ impl SenseVoiceEncoderGraph {
                 })?,
         );
         let loaded = loaded_weights.as_ref();
+        let arena_tensor_capacity = total_layers
+            .saturating_mul(SANM_ARENA_TENSORS_PER_LAYER)
+            .saturating_add(SENSEVOICE_FIXED_ARENA_TENSORS);
         let mut arena = runner
-            .start_static_tensor_arena(SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+                arena_tensor_capacity,
+            ))
             .map_err(|source| SenseVoiceEncoderError::GraphBuildFailed {
                 step: "static_tensor_arena",
                 source,

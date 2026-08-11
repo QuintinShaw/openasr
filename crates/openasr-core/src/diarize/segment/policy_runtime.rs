@@ -533,6 +533,8 @@ mod tests {
                     .collect();
                 let pcm = crate::PcmBuffer::from_vec(samples);
                 let run = |intent| {
+                    let placement = crate::GgmlExecutionTelemetryCollector::new();
+                    let _placement_guard = placement.install();
                     let services = Arc::new(
                         NativeExecutionServices::for_local_process().expect("execution services"),
                     );
@@ -540,18 +542,34 @@ mod tests {
                         PolicyResolvedPyannoteSegmenterRuntime::load_with_intent(services, intent)
                             .expect("load PyanNet runtime")
                             .expect("PyanNet pack must resolve");
-                    runtime
+                    let activity = runtime
                         .segment_local_activity(pcm.full_slice(), 16_000, &|| false, None)
-                        .expect("segment activity")
+                        .expect("segment activity");
+                    (activity, placement.snapshot())
                 };
-                let cpu = run(ExecutionIntent::CpuOnly);
-                let metal = run(ExecutionIntent::ConstrainedAcceleratedOnly(
+                let (cpu, _) = run(ExecutionIntent::CpuOnly);
+                let (metal, metal_placement) = run(ExecutionIntent::ConstrainedAcceleratedOnly(
                     crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
                         crate::device::execution_route::ExecutionProvider::Metal,
                     ),
                 ));
                 assert_eq!(metal.windows, cpu.windows);
                 assert_eq!(metal.speaker_count, cpu.speaker_count);
+                assert!(
+                    !metal_placement.observed_compute_nodes_by_backend.is_empty(),
+                    "explicit Metal PyanNet route must observe recurrent/classifier compute nodes"
+                );
+                assert!(
+                    metal_placement
+                        .observed_compute_nodes_by_backend
+                        .keys()
+                        .all(|backend| {
+                            let backend = backend.to_ascii_lowercase();
+                            backend.starts_with("mtl") || backend.contains("metal")
+                        }),
+                    "explicit Metal PyanNet route observed non-Metal compute: {:?}",
+                    metal_placement.observed_compute_nodes_by_backend
+                );
             },
         );
     }

@@ -1464,7 +1464,7 @@ impl LivePipeline {
     }
 
     fn new_with_execution_services(
-        _execution_services: Arc<openasr_core::NativeExecutionServices>,
+        execution_services: Arc<openasr_core::NativeExecutionServices>,
         config: LivePipelineConfig,
         output_format: LiveOutputFormat,
         max_utterances: Option<usize>,
@@ -1476,7 +1476,11 @@ impl LivePipeline {
         session.vad = config.vad;
         session.buffer = config.buffer;
         Ok(Self {
-            controller: RealtimeSessionController::new(session)?,
+            controller: RealtimeSessionController::new_with_execution(
+                session,
+                execution_services,
+                openasr_core::ExecutionTarget::Auto,
+            )?,
             output_format,
             max_utterances,
             accepted_utterances: 0,
@@ -1535,7 +1539,7 @@ impl LivePipeline {
         transcription_worker: &mut LiveTranscriptionWorker,
     ) -> Result<()> {
         let frame_end_ms = frame.end_ms();
-        let boundaries = self.controller.process_vad_frame(&frame);
+        let boundaries = self.controller.process_vad_frame(&frame)?;
         self.emit_boundaries(&boundaries)?;
         let utterances = match self.controller.buffer.push_frame(frame, &boundaries) {
             Ok(utterances) => utterances,

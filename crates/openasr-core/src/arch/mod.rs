@@ -2275,11 +2275,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
         optimization_contract: OpenAsrOptimizationContract {
             prefer_cpu_decoder_for_multichunk_metal: false,
-            // The reusable incremental decoder closed Moonshine's earlier
-            // per-step graph rebuild, but the small Apple Silicon graph remains
-            // dispatch-bound. Keep explicit Metal available as a lower-resident-
-            // memory trade-off, while Auto chooses CPU on Apple Silicon and
-            // still permits the generic CUDA/HIP/Vulkan accelerated lane.
+            // Moonshine's host preparation keeps the product stage Hybrid, but
+            // the encoder and decoder are complete device graphs. Their exact
+            // device placement substantially narrows Metal's dispatch gap and
+            // lowers physical memory, but M1 q8 remains slightly slower than
+            // CPU. Keep explicit Metal available while Auto stays on CPU for
+            // Apple Silicon until the speed crossover is stable.
             auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,

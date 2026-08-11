@@ -1705,10 +1705,13 @@ mod tests {
                 .flat_map(|embedding| embedding.0.iter().copied())
                 .collect::<Vec<_>>(),
         );
-        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
-        let current_rss_bytes = crate::metrics::current_rss_bytes().unwrap_or(0);
+        let memory = crate::metrics::process_memory_snapshot();
+        let peak_rss_bytes = memory.peak_rss_bytes.unwrap_or(0);
+        let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
+        let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
+        let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend={} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} chunks={} output_sha256={output_sha256}",
+            "AUX_MODEL_ENDURANCE model=redimnet2-b6 backend={} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} chunks={} output_sha256={output_sha256}",
             backend.trim().to_ascii_lowercase(),
             elapsed_seconds / audio_seconds,
             chunks.len(),

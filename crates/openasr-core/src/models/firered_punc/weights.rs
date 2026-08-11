@@ -1,11 +1,10 @@
-//! Load a FireRedPunc `.oasr` pack into host f32 weights.
+//! Load FireRedPunc weight descriptors while retaining host f32 payloads only
+//! for the small 1-D biases and LayerNorm affines.
 //!
-//! FireRedPunc is BERT-base (~110M params) and runs as an occasional
-//! finalize-only pass, so -- unlike the ASR encoders that keep the dominant
-//! linears quantized and zero-copy -- every tensor is simply dequantized to f32
-//! and uploaded to the graph arena. That keeps the graph and its synthetic-
-//! weight numeric test straightforward; the conversion recipe may still store
-//! the pack quantized (the loader dequantizes on read).
+//! Embeddings and matrix weights remain in the verified mmap-backed pack and
+//! are bound zero-copy by the graph. This avoids expanding the ~110M-parameter
+//! BERT checkpoint into a second ~406 MiB f32 copy for an occasional
+//! finalize-only pass.
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
 
@@ -19,15 +18,16 @@ use super::tensor_names::{
 pub(crate) enum FireRedPuncWeightsError {
     #[error("firered-punc weight read failed: {0}")]
     Read(#[from] GgufTensorDataReadError),
-    #[error("firered-punc tensor '{name}' has {got} elements, expected {expected}")]
-    ElementCount {
+    #[error("firered-punc tensor '{name}' has shape {got:?}, expected {expected:?}")]
+    Shape {
         name: String,
-        got: usize,
-        expected: usize,
+        got: Vec<usize>,
+        expected: Vec<usize>,
     },
 }
 
-/// A host weight: stored dims (from the GGUF index) + dequantized f32 values.
+/// A weight descriptor. `values` is empty for mmap-bound 2-D tensors and holds
+/// dequantized f32 only for arena-backed 1-D tensors.
 #[derive(Debug, Clone)]
 pub(crate) struct NamedTensor {
     pub name: String,
@@ -115,7 +115,7 @@ impl FireRedPuncWeights {
                 .ok_or_else(|| "firered-punc staged-layer quote overflowed".to_string())?,
             "firered-punc staged layers",
         )?;
-        let mut add_tensor = |name: &str| -> Result<(), String> {
+        let mut add_tensor = |name: &str, retain_values: bool| -> Result<(), String> {
             let tensor = tensor_index
                 .get(name)
                 .ok_or_else(|| format!("firered-punc quote tensor '{name}' is missing"))?;
@@ -128,48 +128,51 @@ impl FireRedPuncWeights {
                     .ok_or_else(|| format!("firered-punc quote tensor '{name}' dims overflowed"))?,
                 "firered-punc staged tensor dims",
             )?;
-            let elements = tensor.num_elements().ok_or_else(|| {
-                format!("firered-punc quote tensor '{name}' element count overflowed")
-            })?;
-            bytes.add(
-                elements.checked_mul(4).ok_or_else(|| {
-                    format!("firered-punc quote tensor '{name}' f32 bytes overflowed")
-                })?,
-                "firered-punc staged tensor values",
-            )
+            if retain_values {
+                let elements = tensor.num_elements().ok_or_else(|| {
+                    format!("firered-punc quote tensor '{name}' element count overflowed")
+                })?;
+                bytes.add(
+                    elements.checked_mul(4).ok_or_else(|| {
+                        format!("firered-punc quote tensor '{name}' f32 bytes overflowed")
+                    })?,
+                    "firered-punc staged tensor values",
+                )?;
+            }
+            Ok(())
         };
-        for name in [
-            TOKEN_EMBD_WEIGHT,
-            TOKEN_TYPE_EMBD_WEIGHT,
-            POSITION_EMBD_WEIGHT,
-            EMBD_NORM_WEIGHT,
-            EMBD_NORM_BIAS,
-            PUNC_HEAD_WEIGHT,
-            PUNC_HEAD_BIAS,
+        for (name, retain_values) in [
+            (TOKEN_EMBD_WEIGHT, false),
+            (TOKEN_TYPE_EMBD_WEIGHT, false),
+            (POSITION_EMBD_WEIGHT, false),
+            (EMBD_NORM_WEIGHT, true),
+            (EMBD_NORM_BIAS, true),
+            (PUNC_HEAD_WEIGHT, false),
+            (PUNC_HEAD_BIAS, true),
         ] {
-            add_tensor(name)?;
+            add_tensor(name, retain_values)?;
         }
         for layer in 0..metadata.layers {
             let names = firered_punc_layer_tensor_names(layer);
-            for name in [
-                names.attn_q_weight,
-                names.attn_q_bias,
-                names.attn_k_weight,
-                names.attn_k_bias,
-                names.attn_v_weight,
-                names.attn_v_bias,
-                names.attn_output_weight,
-                names.attn_output_bias,
-                names.attn_norm_weight,
-                names.attn_norm_bias,
-                names.ffn_up_weight,
-                names.ffn_up_bias,
-                names.ffn_down_weight,
-                names.ffn_down_bias,
-                names.ffn_norm_weight,
-                names.ffn_norm_bias,
+            for (name, retain_values) in [
+                (names.attn_q_weight, false),
+                (names.attn_q_bias, true),
+                (names.attn_k_weight, false),
+                (names.attn_k_bias, true),
+                (names.attn_v_weight, false),
+                (names.attn_v_bias, true),
+                (names.attn_output_weight, false),
+                (names.attn_output_bias, true),
+                (names.attn_norm_weight, true),
+                (names.attn_norm_bias, true),
+                (names.ffn_up_weight, false),
+                (names.ffn_up_bias, true),
+                (names.ffn_down_weight, false),
+                (names.ffn_down_bias, true),
+                (names.ffn_norm_weight, true),
+                (names.ffn_norm_bias, true),
             ] {
-                add_tensor(&name)?;
+                add_tensor(&name, retain_values)?;
             }
         }
         Ok(bytes.finish())
@@ -207,6 +210,7 @@ impl FireRedPuncWeights {
 fn load_named(
     reader: &GgufTensorDataReader,
     name: &str,
+    retain_values: bool,
 ) -> Result<NamedTensor, FireRedPuncWeightsError> {
     let tensor = reader.tensor_index().get(name).ok_or_else(|| {
         FireRedPuncWeightsError::Read(GgufTensorDataReadError::TensorNotFound {
@@ -215,8 +219,11 @@ fn load_named(
         })
     })?;
     let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-    let shape_u64: Vec<u64> = tensor.dims.clone();
-    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &shape_u64)?;
+    let values = if retain_values {
+        reader.host_tensor_f32_copy_dequantized_by_name(name, &tensor.dims)?
+    } else {
+        Vec::new()
+    };
     Ok(NamedTensor {
         name: name.to_string(),
         dims,
@@ -227,14 +234,15 @@ fn load_named(
 fn load_expected(
     reader: &GgufTensorDataReader,
     name: &str,
-    expected: usize,
+    expected: &[usize],
+    retain_values: bool,
 ) -> Result<NamedTensor, FireRedPuncWeightsError> {
-    let tensor = load_named(reader, name)?;
-    if tensor.values.len() != expected {
-        return Err(FireRedPuncWeightsError::ElementCount {
+    let tensor = load_named(reader, name, retain_values)?;
+    if tensor.dims != expected {
+        return Err(FireRedPuncWeightsError::Shape {
             name: name.to_string(),
-            got: tensor.values.len(),
-            expected,
+            got: tensor.dims,
+            expected: expected.to_vec(),
         });
     }
     Ok(tensor)
@@ -249,22 +257,22 @@ fn load_layer(
     let d = metadata.d_model;
     let ffn = metadata.ffn_dim;
     Ok(FireRedPuncLayerWeights {
-        attn_q_weight: load_expected(reader, &names.attn_q_weight, d * d)?,
-        attn_q_bias: load_expected(reader, &names.attn_q_bias, d)?,
-        attn_k_weight: load_expected(reader, &names.attn_k_weight, d * d)?,
-        attn_k_bias: load_expected(reader, &names.attn_k_bias, d)?,
-        attn_v_weight: load_expected(reader, &names.attn_v_weight, d * d)?,
-        attn_v_bias: load_expected(reader, &names.attn_v_bias, d)?,
-        attn_output_weight: load_expected(reader, &names.attn_output_weight, d * d)?,
-        attn_output_bias: load_expected(reader, &names.attn_output_bias, d)?,
-        attn_norm_weight: load_expected(reader, &names.attn_norm_weight, d)?,
-        attn_norm_bias: load_expected(reader, &names.attn_norm_bias, d)?,
-        ffn_up_weight: load_expected(reader, &names.ffn_up_weight, d * ffn)?,
-        ffn_up_bias: load_expected(reader, &names.ffn_up_bias, ffn)?,
-        ffn_down_weight: load_expected(reader, &names.ffn_down_weight, ffn * d)?,
-        ffn_down_bias: load_expected(reader, &names.ffn_down_bias, d)?,
-        ffn_norm_weight: load_expected(reader, &names.ffn_norm_weight, d)?,
-        ffn_norm_bias: load_expected(reader, &names.ffn_norm_bias, d)?,
+        attn_q_weight: load_expected(reader, &names.attn_q_weight, &[d, d], false)?,
+        attn_q_bias: load_expected(reader, &names.attn_q_bias, &[d], true)?,
+        attn_k_weight: load_expected(reader, &names.attn_k_weight, &[d, d], false)?,
+        attn_k_bias: load_expected(reader, &names.attn_k_bias, &[d], true)?,
+        attn_v_weight: load_expected(reader, &names.attn_v_weight, &[d, d], false)?,
+        attn_v_bias: load_expected(reader, &names.attn_v_bias, &[d], true)?,
+        attn_output_weight: load_expected(reader, &names.attn_output_weight, &[d, d], false)?,
+        attn_output_bias: load_expected(reader, &names.attn_output_bias, &[d], true)?,
+        attn_norm_weight: load_expected(reader, &names.attn_norm_weight, &[d], true)?,
+        attn_norm_bias: load_expected(reader, &names.attn_norm_bias, &[d], true)?,
+        ffn_up_weight: load_expected(reader, &names.ffn_up_weight, &[d, ffn], false)?,
+        ffn_up_bias: load_expected(reader, &names.ffn_up_bias, &[ffn], true)?,
+        ffn_down_weight: load_expected(reader, &names.ffn_down_weight, &[ffn, d], false)?,
+        ffn_down_bias: load_expected(reader, &names.ffn_down_bias, &[d], true)?,
+        ffn_norm_weight: load_expected(reader, &names.ffn_norm_weight, &[d], true)?,
+        ffn_norm_bias: load_expected(reader, &names.ffn_norm_bias, &[d], true)?,
     })
 }
 
@@ -278,13 +286,23 @@ pub(crate) fn load_firered_punc_weights(
         layers.push(load_layer(reader, layer, metadata)?);
     }
     Ok(FireRedPuncWeights {
-        token_embd: load_expected(reader, TOKEN_EMBD_WEIGHT, d * metadata.vocab_size)?,
-        token_type_embd: load_named(reader, TOKEN_TYPE_EMBD_WEIGHT)?,
-        position_embd: load_expected(reader, POSITION_EMBD_WEIGHT, d * metadata.max_positions)?,
-        embd_norm_weight: load_expected(reader, EMBD_NORM_WEIGHT, d)?,
-        embd_norm_bias: load_expected(reader, EMBD_NORM_BIAS, d)?,
+        token_embd: load_expected(reader, TOKEN_EMBD_WEIGHT, &[d, metadata.vocab_size], false)?,
+        token_type_embd: load_expected(reader, TOKEN_TYPE_EMBD_WEIGHT, &[d, 2], false)?,
+        position_embd: load_expected(
+            reader,
+            POSITION_EMBD_WEIGHT,
+            &[d, metadata.max_positions],
+            false,
+        )?,
+        embd_norm_weight: load_expected(reader, EMBD_NORM_WEIGHT, &[d], true)?,
+        embd_norm_bias: load_expected(reader, EMBD_NORM_BIAS, &[d], true)?,
         layers,
-        punc_head_weight: load_expected(reader, PUNC_HEAD_WEIGHT, d * metadata.label_count)?,
-        punc_head_bias: load_expected(reader, PUNC_HEAD_BIAS, metadata.label_count)?,
+        punc_head_weight: load_expected(
+            reader,
+            PUNC_HEAD_WEIGHT,
+            &[d, metadata.label_count],
+            false,
+        )?,
+        punc_head_bias: load_expected(reader, PUNC_HEAD_BIAS, &[metadata.label_count], true)?,
     })
 }

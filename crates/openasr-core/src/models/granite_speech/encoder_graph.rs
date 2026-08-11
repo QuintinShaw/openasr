@@ -128,9 +128,10 @@ impl GraniteSpeechEncoderConfig {
 }
 
 fn encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    const GRAPH_SIZE: usize = 16_384;
     GgmlCpuGraphConfig {
-        context_bytes: 256 * 1024 * 1024,
-        graph_size: 16384,
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE),
+        graph_size: GRAPH_SIZE,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             backend,
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,

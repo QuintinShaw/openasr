@@ -91,7 +91,7 @@ impl FireRedPuncRuntime {
         quote.observe_transient_bytes(
             FireRedPuncWeights::quoted_staging_system_memory_bytes(tensor_index, &metadata)
                 .map_err(FireRedPuncRuntimeError::Capacity)?,
-            "firered-punc complete f32 upload staging",
+            "firered-punc 1-D f32 staging",
         );
         quote.finish().map_err(map_capacity)
     }
@@ -181,7 +181,7 @@ impl FireRedPuncRuntime {
         let construction_requested_peak_bytes = weights
             .retained_system_memory_bytes()
             .map_err(FireRedPuncRuntimeError::Capacity)?;
-        let graph = FireRedPuncGraph::new(&weights, metadata, backend)?;
+        let graph = FireRedPuncGraph::new_from_preflight(&weights, metadata, backend, preflight)?;
         Ok(Self {
             metadata,
             tokenizer,
@@ -325,6 +325,8 @@ mod tests {
             "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
             value => panic!("unsupported OPENASR_AUX_BENCH_BACKEND '{value}'"),
         };
+        let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+        let _execution_placement_guard = execution_placement.install();
         let runtime = FireRedPuncRuntime::from_pack(&pack, backend).expect("load punc runtime");
         let run = || runtime.punctuate(text).expect("punctuate benchmark text");
 
@@ -338,11 +340,31 @@ mod tests {
             .collect::<Vec<_>>();
         let output_sha256 = crate::testing::benchmark_sha256_bytes([output.as_bytes()]);
         let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
-        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        let observed = execution_placement.snapshot();
+        let memory = crate::metrics::process_memory_snapshot();
         eprintln!(
-            "AUX_MODEL_BENCH model=fireredpunc backend={backend:?} chars={} median_seconds={median_seconds:.6} peak_rss_bytes={peak_rss_bytes} output_sha256={output_sha256} runs={seconds:?}",
+            "AUX_MODEL_BENCH model=fireredpunc backend={backend:?} chars={} median_seconds={median_seconds:.6} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?} observed_compute_nodes={:?} output_sha256={output_sha256} runs={seconds:?}",
             text.chars().count(),
+            memory.current_rss_bytes,
+            memory.peak_rss_bytes,
+            memory.current_phys_footprint_bytes,
+            memory.peak_phys_footprint_bytes,
+            observed.observed_compute_nodes_by_backend,
         );
+        if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
+            assert!(
+                !observed.observed_compute_nodes_by_backend.is_empty()
+                    && observed
+                        .observed_compute_nodes_by_backend
+                        .keys()
+                        .all(|backend| {
+                            let backend = backend.to_ascii_lowercase();
+                            backend.starts_with("mtl") || backend.contains("metal")
+                        }),
+                "explicit Metal FireRedPunc benchmark observed non-Metal compute: {:?}",
+                observed.observed_compute_nodes_by_backend
+            );
+        }
     }
 
     /// Converter golden gate: the engine's per-token argmax labels for the
@@ -362,11 +384,11 @@ mod tests {
         ) else {
             return;
         };
-        let runtime = FireRedPuncRuntime::from_pack(
-            Path::new(&pack),
-            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-        )
-        .expect("load real pack");
+        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+        let _execution_placement_guard = execution_placement.install();
+        let runtime =
+            FireRedPuncRuntime::from_pack(Path::new(&pack), backend).expect("load real pack");
         let text = std::fs::read_to_string(Path::new(&json)).expect("read golden json");
         let entries: serde_json::Value = serde_json::from_str(&text).expect("parse golden json");
         let entries = entries.as_array().expect("golden json is a list");
@@ -402,6 +424,29 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "golden json had no entries");
-        eprintln!("firered-punc golden: {checked} sentences matched PyTorch reference");
+        let observed = execution_placement.snapshot();
+        let memory = crate::metrics::process_memory_snapshot();
+        eprintln!(
+            "FIRERED_PUNC_OFFICIAL_PARITY backend={backend:?} sentences={checked} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
+            observed.observed_compute_nodes_by_backend,
+            memory.current_rss_bytes,
+            memory.peak_rss_bytes,
+            memory.current_phys_footprint_bytes,
+            memory.peak_phys_footprint_bytes,
+        );
+        if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
+            assert!(
+                !observed.observed_compute_nodes_by_backend.is_empty()
+                    && observed
+                        .observed_compute_nodes_by_backend
+                        .keys()
+                        .all(|backend| {
+                            let backend = backend.to_ascii_lowercase();
+                            backend.starts_with("mtl") || backend.contains("metal")
+                        }),
+                "explicit Metal FireRedPunc route observed non-Metal compute: {:?}",
+                observed.observed_compute_nodes_by_backend
+            );
+        }
     }
 }

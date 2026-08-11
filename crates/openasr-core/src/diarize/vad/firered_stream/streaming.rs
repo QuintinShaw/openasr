@@ -58,12 +58,16 @@ impl FireRedStreamingVad {
     /// cache. `10ms` granularity (`FRAME_SHIFT_MS`) is well within the
     /// endpointer's hysteresis tolerance.
     pub fn accept_frame(&mut self, samples: &[i16]) -> f32 {
+        self.accept_frame_with_decision(samples).0
+    }
+
+    pub(super) fn accept_frame_with_decision(&mut self, samples: &[i16]) -> (f32, bool) {
         let float_samples = samples
             .iter()
             .map(|sample| *sample as f32 / 32_768.0)
             .collect::<Vec<_>>();
-        let _ = self.accept_f32_chunk(&float_samples);
-        self.last_prob
+        let produced_decision = !self.accept_f32_chunk(&float_samples).is_empty();
+        (self.last_prob, produced_decision)
     }
 
     /// Feed an offline/native f32 chunk and return every newly completed

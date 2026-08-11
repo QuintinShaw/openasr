@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
     GgufTensorDataReader, env_toggle_with_raw,
 };
 
@@ -17,7 +17,11 @@ use super::tensor_names::{
     OUTPUT_WEIGHT as OUTPUT_WEIGHT_TENSOR_NAME,
 };
 pub(crate) const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
-const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
+// The longest graph is input -> RMS norm -> affine -> projection -> first-max
+// argmax. Keep a small structural margin for metadata-only views without
+// coupling this helper to the whole decoder's much larger graph budget.
+const QWEN3_LLM_LOGITS_GRAPH_NODE_CAPACITY: usize = 64;
+const QWEN3_LLM_LOGITS_STATIC_TENSOR_COUNT: usize = 3;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 static NEXT_LOGITS_HEAD_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
@@ -707,9 +711,11 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         // matrix and execution lane; the batched form amortizes graph setup
         // and GPU submission without introducing a second runtime owner.
         let mut config = qwen_decoder_graph_config(backend);
-        config.context_bytes = QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES;
+        config.set_graph_node_capacity(QWEN3_LLM_LOGITS_GRAPH_NODE_CAPACITY);
         let runner = GgmlCpuGraphRunner::new(config)?;
-        let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
+        let mut arena = runner.start_static_tensor_arena(
+            GgmlCpuGraphConfig::metadata_context_bytes(QWEN3_LLM_LOGITS_STATIC_TENSOR_COUNT),
+        )?;
         let norm = arena.new_tensor_2d_f32(d_model, 1, "qwen_llm_logits_output_norm_weight")?;
         let weight = arena.new_matmul_weight_2d_typed(
             d_model,

@@ -22,9 +22,15 @@ use crate::{
 
 const INPUT_FEATURES: usize = 60;
 const GATE_COUNT: usize = 4;
-const GRAPH_SIZE: usize = 1 << 17;
+// One reusable direction graph contains one full recurrent scan. Keeping the
+// two input-width variants separate avoids padding the first layer from 60 to
+// 256 channels, while reducing live graph metadata by more than 5x versus one
+// monolithic four-layer bidirectional graph.
+const DIRECTION_GRAPH_SIZE: usize = 1 << 14;
+const MAX_DIRECTION_FRAMES: usize = 800;
 const ARENA_TENSORS: usize = 1 << 8;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
+const LSTM_GROUP_SPECS: [(usize, usize); 2] = [(INPUT_FEATURES, 2), (2 * HIDDEN, 6)];
 
 #[derive(Debug, Error)]
 pub(crate) enum PyannetGgmlError {
@@ -34,17 +40,17 @@ pub(crate) enum PyannetGgmlError {
     Graph(#[from] GgmlCpuGraphError),
     #[error("PyanNet recurrent input has {got} values, expected {expected}")]
     InvalidFeaturePayload { got: usize, expected: usize },
+    #[error("PyanNet recurrent input has {frames} frames, maximum supported is {maximum}")]
+    TooManyFrames { frames: usize, maximum: usize },
 }
 
 #[derive(Clone, Copy)]
-struct LstmDirectionHandles {
-    input_weight: GgmlStaticTensor,
-    recurrent_weight: GgmlStaticTensor,
-    combined_bias: GgmlStaticTensor,
-}
-
-struct LstmLayerHandles {
-    directions: [LstmDirectionHandles; 2],
+struct LstmStackHandles {
+    input_features: usize,
+    slots: usize,
+    input_weights: GgmlStaticTensor,
+    recurrent_weights: GgmlStaticTensor,
+    combined_biases: GgmlStaticTensor,
 }
 
 #[derive(Clone, Copy)]
@@ -54,29 +60,18 @@ struct LinearHandles {
 }
 
 struct WeightHandles {
-    lstm: Vec<LstmLayerHandles>,
+    lstm_groups: [LstmStackHandles; 2],
     classifier: [LinearHandles; 3],
     zero_state: GgmlStaticTensor,
 }
 
 impl WeightHandles {
     fn allocate(arena: &GgmlStaticTensorArena) -> Result<Self, GgmlCpuGraphError> {
-        let mut lstm = Vec::with_capacity(LSTM_WEIGHTS.len());
-        for layer in 0..LSTM_WEIGHTS.len() {
-            let input = if layer == 0 {
-                INPUT_FEATURES
-            } else {
-                2 * HIDDEN
-            };
-            lstm.push(LstmLayerHandles {
-                directions: [
-                    allocate_lstm_direction(arena, input, HIDDEN)?,
-                    allocate_lstm_direction(arena, input, HIDDEN)?,
-                ],
-            });
-        }
         Ok(Self {
-            lstm,
+            lstm_groups: [
+                allocate_lstm_stack(arena, INPUT_FEATURES, 2)?,
+                allocate_lstm_stack(arena, 2 * HIDDEN, 6)?,
+            ],
             classifier: [
                 allocate_linear(arena, 2 * HIDDEN, HIDDEN)?,
                 allocate_linear(arena, HIDDEN, HIDDEN)?,
@@ -91,42 +86,62 @@ impl WeightHandles {
         arena: &mut GgmlStaticTensorArena,
         weights: &Weights,
     ) -> Result<(), PyannetGgmlError> {
-        for (layer, ((w_name, r_name, b_name), handles)) in
-            LSTM_WEIGHTS.into_iter().zip(&self.lstm).enumerate()
-        {
+        let gate = GATE_COUNT * HIDDEN;
+        let mut input_weight_stacks = LSTM_GROUP_SPECS
+            .map(|(input, slots)| vec![0.0f32; input.saturating_mul(gate).saturating_mul(slots)]);
+        let mut recurrent_weight_stacks = LSTM_GROUP_SPECS
+            .map(|(_, slots)| vec![0.0f32; HIDDEN.saturating_mul(gate).saturating_mul(slots)]);
+        let mut combined_bias_stacks =
+            LSTM_GROUP_SPECS.map(|(_, slots)| vec![0.0f32; gate.saturating_mul(slots)]);
+
+        for (layer, (w_name, r_name, b_name)) in LSTM_WEIGHTS.into_iter().enumerate() {
             let input = if layer == 0 {
                 INPUT_FEATURES
             } else {
                 2 * HIDDEN
             };
-            let gate = GATE_COUNT * HIDDEN;
+            let group = usize::from(layer != 0);
             let w = weights.get(w_name)?;
             let r = weights.get(r_name)?;
             let bias = weights.get(b_name)?;
-            for (direction, direction_handles) in handles.directions.iter().enumerate() {
+            for direction in 0..2 {
+                let slot = if layer == 0 {
+                    direction
+                } else {
+                    (layer - 1) * 2 + direction
+                };
                 let w_start = direction * gate * input;
                 let r_start = direction * gate * HIDDEN;
                 let b_start = direction * 2 * gate;
-                arena.set_f32_slice(
-                    direction_handles.input_weight,
-                    &w[w_start..w_start + gate * input],
-                    "pyannet_lstm_input_weight",
-                )?;
-                arena.set_f32_slice(
-                    direction_handles.recurrent_weight,
-                    &r[r_start..r_start + gate * HIDDEN],
-                    "pyannet_lstm_recurrent_weight",
-                )?;
-                let mut combined_bias = vec![0.0f32; gate];
+                let stacked_w_start = slot * gate * input;
+                input_weight_stacks[group][stacked_w_start..stacked_w_start + gate * input]
+                    .copy_from_slice(&w[w_start..w_start + gate * input]);
+                let stacked_r_start = slot * gate * HIDDEN;
+                recurrent_weight_stacks[group][stacked_r_start..stacked_r_start + gate * HIDDEN]
+                    .copy_from_slice(&r[r_start..r_start + gate * HIDDEN]);
+                let stacked_b_start = slot * gate;
                 for index in 0..gate {
-                    combined_bias[index] = bias[b_start + index] + bias[b_start + gate + index];
+                    combined_bias_stacks[group][stacked_b_start + index] =
+                        bias[b_start + index] + bias[b_start + gate + index];
                 }
-                arena.set_f32_slice(
-                    direction_handles.combined_bias,
-                    &combined_bias,
-                    "pyannet_lstm_combined_bias",
-                )?;
             }
+        }
+        for (group, handles) in self.lstm_groups.iter().enumerate() {
+            arena.set_f32_slice(
+                handles.input_weights,
+                &input_weight_stacks[group],
+                "pyannet_lstm_input_weights",
+            )?;
+            arena.set_f32_slice(
+                handles.recurrent_weights,
+                &recurrent_weight_stacks[group],
+                "pyannet_lstm_recurrent_weights",
+            )?;
+            arena.set_f32_slice(
+                handles.combined_biases,
+                &combined_bias_stacks[group],
+                "pyannet_lstm_combined_biases",
+            )?;
         }
         for (handles, (weight_name, bias_name, input, output)) in self.classifier.iter().zip([
             ("onnx::MatMul_915", "linear.0.bias", 2 * HIDDEN, HIDDEN),
@@ -142,16 +157,30 @@ impl WeightHandles {
     }
 }
 
-fn allocate_lstm_direction(
+fn allocate_lstm_stack(
     arena: &GgmlStaticTensorArena,
     input: usize,
-    hidden: usize,
-) -> Result<LstmDirectionHandles, GgmlCpuGraphError> {
-    let gate = GATE_COUNT * hidden;
-    Ok(LstmDirectionHandles {
-        input_weight: arena.new_tensor_2d_f32(input, gate, "pyannet_lstm_input_weight")?,
-        recurrent_weight: arena.new_tensor_2d_f32(hidden, gate, "pyannet_lstm_recurrent_weight")?,
-        combined_bias: arena.new_tensor_1d_f32(gate, "pyannet_lstm_combined_bias")?,
+    slots: usize,
+) -> Result<LstmStackHandles, GgmlCpuGraphError> {
+    let gate = GATE_COUNT * HIDDEN;
+    Ok(LstmStackHandles {
+        input_features: input,
+        slots,
+        input_weights: arena.new_tensor_2d_f32(
+            input,
+            gate * slots,
+            "pyannet_lstm_input_weights",
+        )?,
+        recurrent_weights: arena.new_tensor_2d_f32(
+            HIDDEN,
+            gate * slots,
+            "pyannet_lstm_recurrent_weights",
+        )?,
+        combined_biases: arena.new_tensor_2d_f32(
+            1,
+            gate * slots,
+            "pyannet_lstm_combined_biases",
+        )?,
     })
 }
 
@@ -184,9 +213,10 @@ struct ResidentWeights {
     arena: GgmlStaticTensorArena,
 }
 
-struct PersistentGraph {
+struct PersistentDirectionGraph {
     session: GgmlPersistentGraphSession,
     input: GgmlCpuTensor<'static>,
+    row_indices: GgmlCpuTensor<'static>,
     output: GgmlCpuTensor<'static>,
     frames: usize,
 }
@@ -196,7 +226,7 @@ struct PersistentGraph {
 /// Field order is load-bearing: graph tensors drop before their static arena,
 /// and the arena drops before the backend runner that allocated it.
 pub(crate) struct PyannetGgmlRuntime {
-    graph: Option<PersistentGraph>,
+    direction_graphs: [Option<PersistentDirectionGraph>; 2],
     resident: ResidentWeights,
     model: PyannetModel,
     runner: GgmlCpuGraphRunner,
@@ -217,8 +247,8 @@ impl PyannetGgmlRuntime {
         placement: ExecutionPlacement,
     ) -> Result<Self, PyannetGgmlError> {
         let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
-        config.graph_size = GRAPH_SIZE;
-        config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE);
+        config.graph_size = DIRECTION_GRAPH_SIZE;
+        config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(DIRECTION_GRAPH_SIZE);
         // The stage remains Hybrid because SincNet runs on the host, but this
         // runtime owns only the recurrent/classifier subgraph.  A GPU-backed
         // instance must therefore execute that subgraph directly on-device;
@@ -235,7 +265,7 @@ impl PyannetGgmlRuntime {
         let mut arena = arena;
         handles.upload(&mut arena, model.weights())?;
         Ok(Self {
-            graph: None,
+            direction_graphs: std::array::from_fn(|_| None),
             resident: ResidentWeights { handles, arena },
             model,
             runner,
@@ -248,9 +278,14 @@ impl PyannetGgmlRuntime {
 
     #[cfg(test)]
     fn prepared_graph_allocation_bytes(&self) -> Option<u64> {
-        self.graph
-            .as_ref()
-            .and_then(|graph| graph.session.prepared_allocation_bytes())
+        self.direction_graphs
+            .iter()
+            .map(|graph| {
+                graph
+                    .as_ref()
+                    .and_then(|graph| graph.session.prepared_allocation_bytes())
+            })
+            .try_fold(0_u64, |total, bytes| Some(total.saturating_add(bytes?)))
     }
 
     pub(crate) fn forward(
@@ -281,76 +316,146 @@ impl PyannetGgmlRuntime {
         if frames == 0 {
             return Ok(Vec::new());
         }
-        if self
-            .graph
+        if frames > MAX_DIRECTION_FRAMES {
+            return Err(PyannetGgmlError::TooManyFrames {
+                frames,
+                maximum: MAX_DIRECTION_FRAMES,
+            });
+        }
+        let mut states = features.to_vec();
+        for layer in 0..LSTM_WEIGHTS.len() {
+            let group = usize::from(layer != 0);
+            let slot_base = if layer == 0 { 0 } else { (layer - 1) * 2 };
+            let forward = self.run_lstm_direction(&states, frames, group, slot_base, false)?;
+            let backward = self.run_lstm_direction(&states, frames, group, slot_base + 1, true)?;
+            states = interleave_bidirectional_states(&forward, &backward, frames);
+        }
+        self.run_classifier(&states, frames)
+    }
+
+    fn run_lstm_direction(
+        &mut self,
+        states: &[f32],
+        frames: usize,
+        group: usize,
+        slot: usize,
+        reverse: bool,
+    ) -> Result<Vec<f32>, PyannetGgmlError> {
+        let handles = self.resident.handles.lstm_groups[group];
+        debug_assert!(slot < handles.slots);
+        let expected = frames.saturating_mul(handles.input_features);
+        if states.len() != expected {
+            return Err(PyannetGgmlError::InvalidFeaturePayload {
+                got: states.len(),
+                expected,
+            });
+        }
+        if self.direction_graphs[group]
             .as_ref()
             .is_none_or(|graph| graph.frames != frames || graph.session.is_poisoned())
         {
-            self.graph = None;
-            self.graph = Some(self.build_graph(frames)?);
+            self.direction_graphs[group] = None;
+            self.direction_graphs[group] = Some(self.build_direction_graph(group, frames)?);
         }
-        let persistent = self.graph.as_mut().expect("PyanNet graph built");
+
+        let input = if reverse {
+            reverse_frame_major(states, frames, handles.input_features)
+        } else {
+            states.to_vec()
+        };
+        let gate = GATE_COUNT * HIDDEN;
+        let first_row = slot.saturating_mul(gate);
+        let rows = (first_row..first_row + gate)
+            .map(|row| i32::try_from(row).expect("PyanNet stacked LSTM row fits i32"))
+            .collect::<Vec<_>>();
+        let persistent = self.direction_graphs[group]
+            .as_mut()
+            .expect("PyanNet direction graph built");
         let graph = persistent.session.builder();
-        graph.set_f32_slice(persistent.input, features, "pyannet_recurrent_input")?;
-        Ok(graph.compute_output_f32(persistent.output, frames * NUM_CLASSES)?)
+        graph.set_f32_slice(persistent.input, &input, "pyannet_recurrent_input")?;
+        graph.set_i32_slice(persistent.row_indices, &rows, "pyannet_lstm_weight_rows")?;
+        let output = graph.compute_output_f32(persistent.output, frames * HIDDEN)?;
+        Ok(if reverse {
+            reverse_frame_major(&output, frames, HIDDEN)
+        } else {
+            output
+        })
     }
 
-    fn build_graph(&mut self, frames: usize) -> Result<PersistentGraph, GgmlCpuGraphError> {
+    fn build_direction_graph(
+        &mut self,
+        group: usize,
+        frames: usize,
+    ) -> Result<PersistentDirectionGraph, GgmlCpuGraphError> {
+        let handles = self.resident.handles.lstm_groups[group];
         let mut session = self.runner.start_persistent_graph_session(
-            GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE),
+            GgmlCpuGraphConfig::metadata_context_bytes(DIRECTION_GRAPH_SIZE),
         )?;
         let graph = session.builder();
-        let input = graph.new_tensor_2d_f32(INPUT_FEATURES, frames, "pyannet_recurrent_input")?;
+        let input =
+            graph.new_tensor_2d_f32(handles.input_features, frames, "pyannet_recurrent_input")?;
+        let row_indices =
+            graph.new_tensor_1d_i32(GATE_COUNT * HIDDEN, "pyannet_lstm_weight_rows")?;
+        let input_weight = graph.get_rows(
+            self.resident.arena.graph_tensor(handles.input_weights),
+            row_indices,
+        )?;
+        let recurrent_weight = graph.get_rows(
+            self.resident.arena.graph_tensor(handles.recurrent_weights),
+            row_indices,
+        )?;
+        let combined_bias = graph.reshape_1d(
+            graph.get_rows(
+                self.resident.arena.graph_tensor(handles.combined_biases),
+                row_indices,
+            )?,
+            GATE_COUNT * HIDDEN,
+        )?;
         let zero = self
             .resident
             .arena
             .graph_tensor(self.resident.handles.zero_state);
-        let mut states = input;
-        for layer in &self.resident.handles.lstm {
-            states = build_bidirectional_lstm(
-                graph,
-                &self.resident.arena,
-                layer,
-                states,
-                zero,
-                frames,
-                HIDDEN,
-            )?;
-        }
-        states = graph.leaky_relu(
-            linear(
-                graph,
-                &self.resident.arena,
-                self.resident.handles.classifier[0],
-                states,
-            )?,
-            ALPHA,
-        )?;
-        states = graph.leaky_relu(
-            linear(
-                graph,
-                &self.resident.arena,
-                self.resident.handles.classifier[1],
-                states,
-            )?,
-            ALPHA,
-        )?;
-        let logits = linear(
+        let output = build_lstm_direction(
             graph,
-            &self.resident.arena,
-            self.resident.handles.classifier[2],
-            states,
+            input_weight,
+            recurrent_weight,
+            combined_bias,
+            input,
+            zero,
+            frames,
+            HIDDEN,
         )?;
-        let output = graph.log(graph.soft_max(logits)?)?;
         graph.set_input(input)?;
+        graph.set_input(row_indices)?;
         graph.set_output(output)?;
         graph.prepare_outputs_for_upload(&[output])?;
-        Ok(PersistentGraph {
+        Ok(PersistentDirectionGraph {
             session,
             input,
+            row_indices,
             output,
             frames,
         })
+    }
+
+    fn run_classifier(
+        &mut self,
+        states: &[f32],
+        frames: usize,
+    ) -> Result<Vec<f32>, PyannetGgmlError> {
+        let mut graph = self.runner.start_graph();
+        let input = graph.new_tensor_2d_f32(2 * HIDDEN, frames, "pyannet_classifier_input")?;
+        let mut output = input;
+        for (index, handles) in self.resident.handles.classifier.iter().copied().enumerate() {
+            output = linear(&graph, &self.resident.arena, handles, output)?;
+            if index + 1 != self.resident.handles.classifier.len() {
+                output = graph.leaky_relu(output, ALPHA)?;
+            }
+        }
+        output = graph.log(graph.soft_max(output)?)?;
+        graph.set_input(input)?;
+        graph.set_f32_slice(input, states, "pyannet_classifier_input")?;
+        Ok(graph.compute_output_f32(output, frames * NUM_CLASSES)?)
     }
 }
 
@@ -377,62 +482,25 @@ fn linear<'a>(
     )
 }
 
-fn build_bidirectional_lstm<'a>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    arena: &GgmlStaticTensorArena,
-    handles: &LstmLayerHandles,
-    input: GgmlCpuTensor<'a>,
-    zero: GgmlCpuTensor<'a>,
-    frames: usize,
-    hidden: usize,
-) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    let forward = build_lstm_direction(
-        graph,
-        arena,
-        handles.directions[0],
-        input,
-        zero,
-        frames,
-        hidden,
-        false,
-    )?;
-    let backward = build_lstm_direction(
-        graph,
-        arena,
-        handles.directions[1],
-        input,
-        zero,
-        frames,
-        hidden,
-        true,
-    )?;
-    graph.concat(forward, backward, 0)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn build_lstm_direction<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
-    arena: &GgmlStaticTensorArena,
-    handles: LstmDirectionHandles,
+    input_weight: GgmlCpuTensor<'a>,
+    recurrent_weight: GgmlCpuTensor<'a>,
+    combined_bias: GgmlCpuTensor<'a>,
     input: GgmlCpuTensor<'a>,
     zero: GgmlCpuTensor<'a>,
     frames: usize,
     hidden: usize,
-    reverse: bool,
 ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
     let gate = GATE_COUNT * hidden;
-    let projected = graph.mul_mat(arena.graph_tensor(handles.input_weight), input)?;
+    let projected = graph.mul_mat(input_weight, input)?;
     let mut h = zero;
     let mut c = zero;
     let mut chronological = vec![zero; frames];
-    for step in 0..frames {
-        let frame = if reverse { frames - 1 - step } else { step };
+    for (frame, state) in chronological.iter_mut().enumerate() {
         let input_gates = graph.view_1d(projected, gate, frame * gate * F32_BYTES)?;
-        let recurrent_gates = graph.mul_mat(arena.graph_tensor(handles.recurrent_weight), h)?;
-        let gates = graph.add(
-            graph.add(input_gates, recurrent_gates)?,
-            arena.graph_tensor(handles.combined_bias),
-        )?;
+        let recurrent_gates = graph.mul_mat(recurrent_weight, h)?;
+        let gates = graph.add(graph.add(input_gates, recurrent_gates)?, combined_bias)?;
         let input_gate = graph.sigmoid(graph.view_1d(gates, hidden, 0)?)?;
         let output_gate = graph.sigmoid(graph.view_1d(gates, hidden, hidden * F32_BYTES)?)?;
         let forget_gate = graph.sigmoid(graph.view_1d(gates, hidden, 2 * hidden * F32_BYTES)?)?;
@@ -442,9 +510,33 @@ fn build_lstm_direction<'a>(
             graph.mul(input_gate, cell_gate)?,
         )?;
         h = graph.mul(output_gate, graph.tanh(c)?)?;
-        chronological[frame] = h;
+        *state = h;
     }
     balanced_time_concat(graph, chronological, hidden)
+}
+
+fn reverse_frame_major(values: &[f32], frames: usize, width: usize) -> Vec<f32> {
+    let mut reversed = vec![0.0f32; values.len()];
+    for frame in 0..frames {
+        let source = frame * width;
+        let target = (frames - 1 - frame) * width;
+        reversed[target..target + width].copy_from_slice(&values[source..source + width]);
+    }
+    reversed
+}
+
+fn interleave_bidirectional_states(forward: &[f32], backward: &[f32], frames: usize) -> Vec<f32> {
+    debug_assert_eq!(forward.len(), frames * HIDDEN);
+    debug_assert_eq!(backward.len(), frames * HIDDEN);
+    let mut combined = vec![0.0f32; frames * 2 * HIDDEN];
+    for frame in 0..frames {
+        let source = frame * HIDDEN;
+        let target = frame * 2 * HIDDEN;
+        combined[target..target + HIDDEN].copy_from_slice(&forward[source..source + HIDDEN]);
+        combined[target + HIDDEN..target + 2 * HIDDEN]
+            .copy_from_slice(&backward[source..source + HIDDEN]);
+    }
+    combined
 }
 
 /// Assemble chronological states with logarithmic concat depth. A left-fold
@@ -537,8 +629,8 @@ mod tests {
                     .expect("direct Metal graph allocation");
                 eprintln!("PYANNET_METAL_GRAPH prepared_allocation_bytes={prepared_bytes}",);
                 assert!(
-                    prepared_bytes <= 4 * 1024 * 1024,
-                    "PyanNet recurrent graph allocation regressed to {prepared_bytes} bytes"
+                    prepared_bytes <= 5 * 1024 * 1024,
+                    "PyanNet reusable direction graph allocations regressed to {prepared_bytes} bytes"
                 );
             }
             assert_eq!(actual_frames, frames);

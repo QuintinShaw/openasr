@@ -37,6 +37,7 @@ mod firered_stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use firered_stream::{FireRedRealtimeVadRuntime, FireRedRealtimeVadSession};
 pub use firered_stream::{FireRedStreamVadError, FireRedStreamVadProvider, FireRedStreamingVad};
 
 /// The process-wide Stream-VAD model, loaded once (~2.3 MB). Returns `None`
