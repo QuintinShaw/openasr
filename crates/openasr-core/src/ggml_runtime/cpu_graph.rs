@@ -3052,9 +3052,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         input: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         let shape = self.tensor_shape_4d(input)?;
-        if shape[1] != 1 || shape[2] != 1 || shape[3] != 1 {
+        if shape[2] != 1 || shape[3] != 1 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "ggml_top1_argmax input must have exactly one row group",
+                reason: "ggml_top1_argmax input must be a rank-2 row matrix",
             });
         }
         self.ensure_can_extend_graph("ggml_argmax")?;
@@ -3064,17 +3064,17 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     /// OpenASR greedy top-1 uses first-max tie semantics. Native ggml argmax
-    /// returns the last exact max, so reverse the single logits column first and
-    /// let the caller map the returned reversed index back to the original id.
+    /// returns the last exact max, so reverse every logits row first and let the
+    /// caller map each returned reversed index back to the original id.
     pub(crate) fn top1_argmax_first_max_reversed(
         &self,
         input: GgmlCpuTensor<'a>,
         reverse_indices: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         let shape = self.tensor_shape_4d(input)?;
-        if shape[1] != 1 || shape[2] != 1 || shape[3] != 1 {
+        if shape[2] != 1 || shape[3] != 1 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "ggml_first_max_argmax input must have exactly one row group",
+                reason: "ggml_first_max_argmax input must be a rank-2 row matrix",
             });
         }
         let index_shape = self.tensor_shape_4d(reverse_indices)?;
@@ -3090,10 +3090,19 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             "ggml_first_max_argmax reverse indices",
         )?;
 
-        let logits_as_rows = self.reshape_2d(input, 1, shape[0])?;
-        let reversed = self.get_rows(logits_as_rows, reverse_indices)?;
-        let reversed = self.cont(reversed)?;
-        let reversed = self.reshape_2d(reversed, shape[0], 1)?;
+        let reversed = if shape[1] == 1 {
+            let logits_as_rows = self.reshape_2d(input, 1, shape[0])?;
+            let reversed = self.get_rows(logits_as_rows, reverse_indices)?;
+            let reversed = self.cont(reversed)?;
+            self.reshape_2d(reversed, shape[0], 1)?
+        } else {
+            // `get_rows` selects along ne1. Transpose [vocab, rows] into
+            // [rows, vocab], select vocab rows in reverse order, then restore
+            // the original row-major logits shape before row-wise argmax.
+            let transposed = self.cont(self.transpose(input)?)?;
+            let reversed_transposed = self.get_rows(transposed, reverse_indices)?;
+            self.cont(self.transpose(reversed_transposed)?)?
+        };
         self.top1_argmax(reversed)
     }
 
@@ -3585,6 +3594,29 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_relu input")?;
         let raw = unsafe { ffi::ggml_relu(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_relu")
+    }
+
+    pub(crate) fn leaky_relu(
+        &self,
+        input: GgmlCpuTensor<'a>,
+        negative_slope: f32,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_leaky_relu")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_leaky_relu input")?;
+        if !(negative_slope.is_finite() && negative_slope >= 0.0) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_leaky_relu slope must be finite and non-negative",
+            });
+        }
+        let raw = unsafe {
+            ffi::ggml_leaky_relu(
+                self.context.as_ptr(),
+                input.raw.as_ptr(),
+                negative_slope,
+                false,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_leaky_relu")
     }
 
     pub(crate) fn sigmoid(
@@ -12240,6 +12272,55 @@ mod tests {
             .expect("top_k(1) should compute");
         assert_eq!(top1_index, vec![3]);
         assert_eq!(topk_index, vec![3]);
+    }
+
+    #[test]
+    fn rowwise_first_max_argmax_preserves_tie_order() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(1024 * 1024)
+            .expect("static arena should initialize");
+        let reverse_indices = arena
+            .new_tensor_1d_i32(4, "reverse_indices")
+            .expect("reverse-index allocation should succeed");
+        arena
+            .set_i32_slice(reverse_indices, &[3, 2, 1, 0], "reverse_indices")
+            .expect("reverse indices upload should succeed");
+
+        let mut graph = runner.start_graph();
+        let logits = graph
+            .new_tensor_2d_f32(4, 3, "rowwise_logits")
+            .expect("logits allocation should succeed");
+        graph
+            .set_input(logits)
+            .expect("logits set_input should succeed");
+        let top1 = graph
+            .top1_argmax_first_max_reversed(logits, arena.graph_tensor(reverse_indices))
+            .expect("rowwise first-max argmax should build");
+        graph
+            .set_output(top1)
+            .expect("set_output should succeed before allocation");
+        graph
+            .set_f32_slice(
+                logits,
+                &[
+                    1.0, 5.0, 5.0, 2.0, // first maximum is index 1
+                    9.0, 3.0, 2.0, 1.0, // maximum is index 0
+                    7.0, 7.0, 7.0, 7.0, // first maximum is index 0
+                ],
+                "rowwise_logits",
+            )
+            .expect("logits upload should succeed");
+
+        let reversed = graph
+            .compute_output_i32(top1, 3)
+            .expect("rowwise argmax should compute");
+        let original = reversed
+            .into_iter()
+            .map(|index| 3 - index)
+            .collect::<Vec<_>>();
+        assert_eq!(original, vec![1, 0, 0]);
     }
 
     #[test]

@@ -57,7 +57,10 @@ use crate::models::firered_punc::policy_runtime::{FireRedPuncActor, load_actor, 
 #[cfg(test)]
 use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
-use crate::models::qwen::{ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_pack};
+use crate::models::qwen::{
+    ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_auto_gpu_policy_for_preflight,
+    forced_aligner_pack, verify_forced_aligner_pack,
+};
 use crate::models::{
     aux_pack_registry::AuxPackKind,
     pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
@@ -1646,11 +1649,28 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         .clone()
         .or_else(|| language_hint.map(str::to_string))
         .unwrap_or_else(|| "en".to_string());
-    let execution_plan = resolve_auxiliary_execution_plan(
+    let verified_forced_aligner = verify_forced_aligner_pack(&pack_path)
+        .map_err(|error| forced_alignment_error_to_backend(execution_context, error.to_string()))?;
+    let content_auto_gpu_policy =
+        forced_aligner_auto_gpu_policy_for_preflight(verified_forced_aligner.preflight());
+    if matches!(
+        content_auto_gpu_policy,
+        crate::ggml_runtime::AutoGpuPolicy::ExceptMetal
+    ) {
+        crate::stage_timing::log_detail_event(
+            "forced_aligner",
+            format_args!("stage=plan event=legacy_quant_floor_fallback metal_eligible=false"),
+        );
+    }
+    let execution_plan = crate::models::policy_resolved_aux_runtime::resolve_auxiliary_execution_plan_with_auto_policy(
         execution_services,
         crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         request_intent,
-    )?;
+        Some(content_auto_gpu_policy),
+    )
+    .map_err(|error| BackendError::NativeFailClosed {
+        reason: error.to_string(),
+    })?;
     if let Some(progress) = progress {
         progress.enter_stage(TranscriptionStage::Align);
     }
@@ -1669,16 +1689,14 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             if execution_context.is_canceled() {
                 return Err(BackendError::TranscriptionCanceled);
             }
-            let backend = resolved_runtime_for_candidate(
-                candidate,
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-            )
-            .backend();
+            let backend =
+                resolved_runtime_for_candidate(candidate, content_auto_gpu_policy).backend();
             let session_load_started = Instant::now();
             let session =
-                Qwen3ForcedAlignerSession::load(&pack_path, backend).map_err(|error| {
-                    forced_alignment_error_to_backend(execution_context, error.to_string())
-                })?;
+                Qwen3ForcedAlignerSession::load_verified(verified_forced_aligner.clone(), backend)
+                    .map_err(|error| {
+                        forced_alignment_error_to_backend(execution_context, error.to_string())
+                    })?;
             crate::stage_timing::log_detail_stage(
                 "forced_aligner",
                 "session_load",
@@ -2374,14 +2392,25 @@ fn run_native_transcription_impl(
     // short recording used to come back silently cut with a success status.
     let mut truncated_decodes: Vec<TruncatedDecode> = Vec::new();
     if run_longform {
-        let vad_execution_plan = resolve_fixed_cpu_execution_plan(execution_services.as_ref())?;
+        let vad_execution_plan = resolve_longform_vad_execution_plan(
+            execution_services.as_ref(),
+            &request_execution_intent,
+        )?;
         let (mut plan, vad_engine_label) = run_auxiliary_stage_with_policy(
             execution_services.as_ref(),
             &vad_execution_plan,
             "longform-vad",
-            |_| {
+            |candidate| {
                 let (vad_provider, vad_engine_label) =
-                    resolve_longform_vad_provider(&longform_options)?;
+                    resolve_longform_vad_provider(
+                        &longform_options,
+                        resolved_runtime_for_candidate(
+                            candidate,
+                            crate::diarize::vad::STREAM_VAD_AUTO_GPU_POLICY,
+                        )
+                        .backend(),
+                        candidate.placement,
+                    )?;
                 let plan = plan_longform_slices_with_materialization_gate(
                     &prepared_audio,
                     16_000,
@@ -3405,15 +3434,23 @@ fn apply_speaker_attribution(
 /// typed `BackendError` on the request path instead of panicking.
 fn resolve_longform_vad_provider(
     _options: &crate::LongFormOptions,
+    backend: GgmlCpuGraphBackend,
+    placement: crate::device::execution_policy::ExecutionPlacement,
 ) -> Result<(Box<dyn LongFormVadProvider>, &'static str), BackendError> {
-    let provider = crate::diarize::vad::FireRedStreamVadProvider::shared().ok_or_else(|| {
-        BackendError::NativeFailClosed {
-            reason: "Stream-VAD is unavailable: vendored weights failed to parse \
+    let provider = crate::diarize::vad::FireRedStreamVadProvider::shared_for_backend_and_placement(
+        backend, placement,
+    )
+    .ok_or_else(|| BackendError::NativeFailClosed {
+        reason: "Stream-VAD is unavailable: vendored weights failed to parse \
                          (build-integrity problem)"
-                .to_string(),
-        }
+            .to_string(),
     })?;
-    Ok((Box::new(provider), "firered-stream"))
+    let label = match backend {
+        GgmlCpuGraphBackend::Cpu => "firered-stream-cpu",
+        GgmlCpuGraphBackend::Metal => "firered-stream-metal",
+        GgmlCpuGraphBackend::Gpu => "firered-stream-gpu",
+    };
+    Ok((Box::new(provider), label))
 }
 
 fn resolve_native_longform_policy(
@@ -4081,13 +4118,20 @@ fn resolve_auxiliary_execution_plan(
     })
 }
 
-fn resolve_fixed_cpu_execution_plan(
+fn resolve_longform_vad_execution_plan(
     execution_services: &NativeExecutionServices,
+    request_intent: &ExecutionIntent,
 ) -> Result<ExecutionPlan, BackendError> {
-    crate::models::policy_resolved_aux_runtime::resolve_fixed_cpu_execution_plan(execution_services)
-        .map_err(|error| BackendError::NativeFailClosed {
-            reason: error.to_string(),
-        })
+    let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+    execution_services
+        .policy_resolver()
+        .resolve(
+            request_intent.clone(),
+            crate::diarize::vad::STREAM_VAD_AUTO_GPU_POLICY,
+            crate::diarize::vad::stream_vad_execution_capabilities(),
+            &inventory,
+        )
+        .map_err(execution_policy_error_to_backend)
 }
 
 /// Execute one independent auxiliary model stage transactionally. A stage may
@@ -4594,7 +4638,8 @@ mod tests {
     #[test]
     fn auxiliary_execution_policy_preserves_typed_longform_cancel() {
         let services = native_execution_services_for_test();
-        let plan = resolve_fixed_cpu_execution_plan(services.as_ref()).expect("CPU plan");
+        let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
+            .expect("Auto VAD plan");
         let error =
             run_auxiliary_stage_with_policy(services.as_ref(), &plan, "longform-vad", |_| {
                 Err::<(), BackendError>(BackendError::TranscriptionCanceled)
@@ -6597,9 +6642,13 @@ mod tests {
     #[test]
     fn resolve_longform_vad_provider_always_resolves_stream_vad() {
         let options = crate::LongFormOptions::default();
-        let (_, label) =
-            resolve_longform_vad_provider(&options).expect("Stream-VAD must resolve in tests");
-        assert_eq!(label, "firered-stream");
+        let (_, label) = resolve_longform_vad_provider(
+            &options,
+            GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+        )
+        .expect("Stream-VAD must resolve in tests");
+        assert_eq!(label, "firered-stream-cpu");
     }
 
     // --- real-audio long-form slicing smoke test ---
@@ -6628,10 +6677,14 @@ mod tests {
         // `Vad` mode actually exercises slicing rather than the `total <=
         // chunk_samples` single-slice shortcut.
         options.chunk_seconds = 2.0;
-        let (provider, label) = resolve_longform_vad_provider(&options)
-            .expect("Stream-VAD's vendored weights must load in tests");
+        let (provider, label) = resolve_longform_vad_provider(
+            &options,
+            GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+        )
+        .expect("Stream-VAD's vendored weights must load in tests");
         assert_eq!(
-            label, "firered-stream",
+            label, "firered-stream-cpu",
             "Stream-VAD's vendored weights must load in tests"
         );
 

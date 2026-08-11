@@ -49,13 +49,30 @@ pub(crate) enum AuxiliaryExecutionPlanError {
 
 /// Resolves one auxiliary architecture without inheriting an ASR placement.
 ///
-/// `FixedCpu` is an explicit stage topology, so it intentionally ignores the
-/// request's accelerated intent. `RequestScoped` preserves that intent but
-/// still uses the auxiliary architecture's own capabilities and Auto policy.
+/// Every registered stage preserves the request intent while applying the
+/// auxiliary architecture's own capabilities and Auto policy.
 pub(crate) fn resolve_auxiliary_execution_plan(
     execution_services: &NativeExecutionServices,
     architecture_id: &'static str,
     request_intent: &ExecutionIntent,
+) -> Result<ExecutionPlan, AuxiliaryExecutionPlanError> {
+    resolve_auxiliary_execution_plan_with_auto_policy(
+        execution_services,
+        architecture_id,
+        request_intent,
+        None,
+    )
+}
+
+/// Resolve an auxiliary stage with an optional content-derived Auto policy.
+/// Capabilities and ownership always remain descriptor-owned; the override is
+/// reserved for a verified pack whose bytes carry a stricter compatibility
+/// boundary than the current family default.
+pub(crate) fn resolve_auxiliary_execution_plan_with_auto_policy(
+    execution_services: &NativeExecutionServices,
+    architecture_id: &'static str,
+    request_intent: &ExecutionIntent,
+    content_auto_gpu_policy: Option<AutoGpuPolicy>,
 ) -> Result<ExecutionPlan, AuxiliaryExecutionPlanError> {
     let policy = auxiliary_execution_policy(architecture_id)
         .ok_or(AuxiliaryExecutionPlanError::UnregisteredArchitecture { architecture_id })?;
@@ -68,36 +85,16 @@ pub(crate) fn resolve_auxiliary_execution_plan(
             ownership.as_str()
         ),
     );
-    let (intent, auto_gpu_policy, capabilities) = match policy {
-        AuxiliaryExecutionPolicy::FixedCpu => (
-            ExecutionIntent::CpuOnly,
-            AutoGpuPolicy::Never,
-            crate::device::execution_policy::ExecutionCapabilities::new(true),
-        ),
-        AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities,
-            auto_gpu_policy,
-        } => (request_intent.clone(), auto_gpu_policy, capabilities),
-    };
+    let AuxiliaryExecutionPolicy::RequestScoped {
+        capabilities,
+        auto_gpu_policy: descriptor_auto_gpu_policy,
+    } = policy;
+    let auto_gpu_policy = content_auto_gpu_policy.unwrap_or(descriptor_auto_gpu_policy);
+    let intent = request_intent.clone();
     let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
     execution_services
         .policy_resolver()
         .resolve(intent, auto_gpu_policy, capabilities, &inventory)
-        .map_err(AuxiliaryExecutionPlanError::from)
-}
-
-pub(crate) fn resolve_fixed_cpu_execution_plan(
-    execution_services: &NativeExecutionServices,
-) -> Result<ExecutionPlan, AuxiliaryExecutionPlanError> {
-    let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
-    execution_services
-        .policy_resolver()
-        .resolve(
-            ExecutionIntent::CpuOnly,
-            AutoGpuPolicy::Never,
-            crate::device::execution_policy::ExecutionCapabilities::new(true),
-            &inventory,
-        )
         .map_err(AuxiliaryExecutionPlanError::from)
 }
 
@@ -460,7 +457,7 @@ pub(crate) struct AuxiliaryRuntimeCacheKey {
     architecture_id: &'static str,
     pack_content_id: String,
     host_representation: AuxiliaryHostRepresentationKey,
-    lane: ExecutionLaneKey,
+    lane: Option<ExecutionLaneKey>,
 }
 
 /// Content/representation/physical-lane identity for a runtime that remains
@@ -521,6 +518,23 @@ impl AuxiliaryPinnedRuntimeCacheKey {
 }
 
 impl AuxiliaryRuntimeCacheKey {
+    /// Identifies an immutable host representation whose bytes and semantics
+    /// do not depend on the execution backend. CPU and accelerator candidates
+    /// deliberately share this owner; lane-specific device state belongs in a
+    /// pinned runtime actor keyed by [`AuxiliaryPinnedRuntimeCacheKey`].
+    pub(crate) fn host_neutral<T: Send + Sync + 'static>(
+        architecture_id: &'static str,
+        pack_content_id: impl Into<String>,
+        representation_id: &'static str,
+    ) -> Self {
+        Self {
+            architecture_id,
+            pack_content_id: pack_content_id.into(),
+            host_representation: AuxiliaryHostRepresentationKey::admitted::<T>(representation_id),
+            lane: None,
+        }
+    }
+
     pub(crate) fn for_current_lane<T: Send + Sync + 'static>(
         architecture_id: &'static str,
         pack_content_id: impl Into<String>,
@@ -531,7 +545,7 @@ impl AuxiliaryRuntimeCacheKey {
             architecture_id,
             pack_content_id: pack_content_id.into(),
             host_representation: AuxiliaryHostRepresentationKey::admitted::<T>(representation_id),
-            lane: current_execution_lane_key(backend),
+            lane: Some(current_execution_lane_key(backend)),
         }
     }
 }
@@ -1048,6 +1062,38 @@ mod tests {
         assert_eq!(**second, 7);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn host_neutral_owner_is_shared_while_lane_bound_owners_remain_isolated() {
+        let neutral_cpu = AuxiliaryRuntimeCacheKey::host_neutral::<usize>(
+            "test",
+            "sha256:neutral",
+            "test.host-neutral.v1",
+        );
+        let neutral_metal = AuxiliaryRuntimeCacheKey::host_neutral::<usize>(
+            "test",
+            "sha256:neutral",
+            "test.host-neutral.v1",
+        );
+        assert_eq!(neutral_cpu, neutral_metal);
+        assert!(neutral_cpu.lane.is_none());
+
+        let cpu = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
+            "test",
+            "sha256:lane-bound",
+            "test.lane-bound.v1",
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let metal = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
+            "test",
+            "sha256:lane-bound",
+            "test.lane-bound.v1",
+            GgmlCpuGraphBackend::Metal,
+        );
+        assert_ne!(cpu, metal);
+        assert!(cpu.lane.is_some());
+        assert!(metal.lane.is_some());
     }
 
     #[test]

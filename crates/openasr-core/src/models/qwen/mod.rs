@@ -48,7 +48,8 @@ pub use forced_aligner_import::{
 };
 pub(crate) use forced_aligner_runtime::{
     ForcedAlignItem, ForcedAlignerProgressEvent, Qwen3ForcedAlignerSession,
-    validate_forced_aligner_runtime_pack_contract,
+    forced_aligner_auto_gpu_policy_for_preflight, validate_forced_aligner_runtime_pack_contract,
+    verify_forced_aligner_pack,
 };
 pub(crate) use frontend::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;

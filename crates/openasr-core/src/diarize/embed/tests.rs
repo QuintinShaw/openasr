@@ -1,8 +1,8 @@
 //! Parity tests for the ReDimNet2-B6 embedder.
 
 use super::{
-    EmbedError, REDIMNET_MAX_BATCH_WORKERS, RedimNet2Embedder, RedimNetResidentRuntime,
-    SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
+    EmbedError, PolicyResolvedSpeakerRuntime, REDIMNET_MAX_BATCH_WORKERS, RedimNet2Embedder,
+    RedimNetResidentRuntime, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
     abort_successful_results_after_terminal_failure, embed_batch_worker_range,
 };
 use crate::diarize::contract::SpeakerEmbedding;
@@ -12,6 +12,43 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     dot / (na * nb)
+}
+
+fn redimnet_bench_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    match std::env::var("OPENASR_REDIMNET_BENCH_BACKEND")
+        .unwrap_or_else(|_| "cpu".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        backend => panic!("OPENASR_REDIMNET_BENCH_BACKEND must be cpu or metal, got {backend}"),
+    }
+}
+
+fn redimnet_backend_label(backend: crate::ggml_runtime::GgmlCpuGraphBackend) -> &'static str {
+    match backend {
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu => "cpu",
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal => "metal",
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => "gpu",
+    }
+}
+
+fn redimnet_bench_execution_intent() -> crate::device::execution_policy::ExecutionIntent {
+    match redimnet_bench_backend() {
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu => {
+            crate::device::execution_policy::ExecutionIntent::CpuOnly
+        }
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal => {
+            crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+                crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                    crate::ExecutionProvider::Metal,
+                ),
+            )
+        }
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu => unreachable!("bench parser rejects gpu"),
+    }
 }
 
 #[test]
@@ -141,9 +178,12 @@ fn redimnet_batch_worker_pareto_benchmark() {
     let services = std::sync::Arc::new(
         crate::NativeExecutionServices::for_local_process().expect("execution services"),
     );
-    let runtime = super::PolicyResolvedSpeakerRuntime::load(services)
-        .expect("load policy-owned embedder")
-        .expect("redimnet2-b6 pack is present");
+    let runtime = super::PolicyResolvedSpeakerRuntime::load_with_intent(
+        services,
+        redimnet_bench_execution_intent(),
+    )
+    .expect("load policy-owned embedder")
+    .expect("redimnet2-b6 pack is present");
     let audio = crate::testing::external_test_fixture_path(
         "OPENASR_AUX_BENCH_AUDIO",
         "private auxiliary-model benchmark audio",
@@ -197,8 +237,10 @@ fn redimnet_batch_worker_pareto_benchmark() {
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     let plan = SpeakerEmbeddingExecutionPlan::for_clips(clips.len(), available, workers);
+    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
     eprintln!(
-        "REDIMNET_BATCH_PARETO workers={} threads_per_runner={} audio_seconds={represented_audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} output_sha256={output_sha256} runs={seconds:?}",
+        "REDIMNET_BATCH_PARETO backend={} workers={} threads_per_runner={} audio_seconds={represented_audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} output_sha256={output_sha256} runs={seconds:?}",
+        redimnet_backend_label(redimnet_bench_backend()),
         plan.workers,
         plan.threads_per_runner,
         median_seconds / represented_audio_seconds,
@@ -336,9 +378,18 @@ fn low_level_redimnet_embed(
     runtime: &mut RedimNetResidentRuntime,
     samples: &[f32],
 ) -> Result<SpeakerEmbedding, EmbedError> {
+    low_level_redimnet_embed_with_threads(embedder, runtime, samples, Some(1))
+}
+
+fn low_level_redimnet_embed_with_threads(
+    embedder: &RedimNet2Embedder,
+    runtime: &mut RedimNetResidentRuntime,
+    samples: &[f32],
+    n_threads: Option<usize>,
+) -> Result<SpeakerEmbedding, EmbedError> {
     let (features, frames) = embedder.prepare_embedding_input(samples, 16_000)?;
     let raw = runtime
-        .forward(&features, frames, Some(1))
+        .forward(&features, frames, n_threads)
         .map_err(|error| EmbedError::Unavailable(error.to_string()))?;
     Ok(SpeakerEmbedding::l2_normalized(raw))
 }
@@ -366,8 +417,13 @@ fn redimnet_embedder_matches_python_reference_e2e_jfk() {
     )
     .expect("fixture wav loads");
 
-    let mut runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
-        .expect("construct resident runtime");
+    let mut runtime = RedimNetResidentRuntime::new(
+        embedder.shared_weights(),
+        Some(1),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+    )
+    .expect("construct resident runtime");
     let mine = low_level_redimnet_embed(&embedder, &mut runtime, &samples).expect("redimnet embed");
     assert_eq!(mine.dim(), 192);
 
@@ -408,18 +464,141 @@ fn redimnet_matches_official_reference_on_aux_audio() {
         "redimnet official parity",
     )
     .expect("load parity audio");
-    let mut runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
-        .expect("construct resident runtime");
+    let backend = redimnet_bench_backend();
+    let placement = if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly
+    } else {
+        crate::device::execution_policy::ExecutionPlacement::FullDevice
+    };
+    let mut runtime =
+        RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1), backend, placement)
+            .expect("construct resident runtime");
     let actual = low_level_redimnet_embed(&embedder, &mut runtime, &samples)
         .expect("run ReDimNet parity embedding");
     let expected = read_redimnet_golden_embedding(&reference);
     assert_eq!(actual.dim(), expected.len(), "embedding dimension");
     let cos = cosine(&actual.0, &expected);
     eprintln!(
-        "REDIMNET_OFFICIAL_PARITY cosine={cos:.8} dim={}",
+        "REDIMNET_OFFICIAL_PARITY backend={} cosine={cos:.8} dim={}",
+        redimnet_backend_label(backend),
         actual.dim()
     );
     assert!(cos >= 0.9999, "ReDimNet official cosine {cos}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "host-local: needs the published ReDimNet pack and private parity audio"]
+fn redimnet_cpu_and_metal_embeddings_stay_semantically_close() {
+    let pack = crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_PACK",
+        "published ReDimNet2-B6 pack",
+    )
+    .expect("OPENASR_REDIMNET_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model parity audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let embedder = RedimNet2Embedder::from_oasr(&pack).expect("load published ReDimNet pack");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "redimnet CPU/Metal parity",
+        "redimnet CPU/Metal parity",
+    )
+    .expect("load parity audio");
+    let run = |backend| {
+        let placement = if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+            crate::device::execution_policy::ExecutionPlacement::CpuOnly
+        } else {
+            crate::device::execution_policy::ExecutionPlacement::FullDevice
+        };
+        let mut runtime =
+            RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1), backend, placement)
+                .expect("construct resident runtime");
+        low_level_redimnet_embed(&embedder, &mut runtime, &samples).expect("run embedding")
+    };
+    let cpu = run(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
+    let metal = run(crate::ggml_runtime::GgmlCpuGraphBackend::Metal);
+    let similarity = cosine(&cpu.0, &metal.0);
+    eprintln!("REDIMNET_CPU_METAL_PARITY cosine={similarity:.8}");
+    assert!(
+        similarity >= 0.9999,
+        "CPU/Metal embedding cosine {similarity}"
+    );
+}
+
+#[test]
+#[ignore = "host-local benchmark: needs OPENASR_REDIMNET_PACK and OPENASR_AUX_BENCH_AUDIO"]
+fn redimnet_backend_benchmark() {
+    let _pack = crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_PACK",
+        "published ReDimNet2-B6 pack",
+    )
+    .expect("OPENASR_REDIMNET_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let backend = redimnet_bench_backend();
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "redimnet backend benchmark",
+        "redimnet backend benchmark",
+    )
+    .expect("load benchmark audio");
+    let window_samples = 24_000usize;
+    let step_samples = 12_000usize;
+    let clip_count = REDIMNET_MAX_BATCH_WORKERS * 4;
+    assert!(
+        samples.len() >= (clip_count - 1) * step_samples + window_samples,
+        "benchmark audio must cover one production embedding batch"
+    );
+    let clips = (0..clip_count)
+        .map(|index| {
+            let start = index * step_samples;
+            &samples[start..start + window_samples]
+        })
+        .collect::<Vec<_>>();
+    let represented_audio_seconds = (window_samples * clips.len()) as f64 / 16_000.0;
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let runtime =
+        PolicyResolvedSpeakerRuntime::load_with_intent(services, redimnet_bench_execution_intent())
+            .expect("load policy-resolved ReDimNet runtime")
+            .expect("OPENASR_REDIMNET_PACK must resolve");
+    let run = || {
+        runtime
+            .embedder()
+            .embed_batch(&clips, 16_000)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("embed production batch")
+    };
+    let mut embeddings = run();
+    let runs = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            embeddings = run();
+            started.elapsed().as_secs_f64()
+        })
+        .collect::<Vec<_>>();
+    let output_sha256 = crate::testing::benchmark_sha256_f32(
+        &embeddings
+            .iter()
+            .flat_map(|embedding| embedding.0.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    let (median_seconds, runs) = crate::testing::benchmark_median_seconds(runs);
+    let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+    eprintln!(
+        "REDIMNET_BACKEND_BENCH backend={} audio_seconds={represented_audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} clips={} output_sha256={output_sha256} runs={runs:?}",
+        redimnet_backend_label(backend),
+        median_seconds / represented_audio_seconds,
+        clips.len(),
+    );
 }
 
 #[test]
@@ -445,15 +624,25 @@ fn redimnet_batch_matches_single_order() {
     let clips: Vec<&[f32]> = (0..3)
         .map(|index| &samples[index * crop..(index + 1) * crop])
         .collect();
-    let mut single_runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
-        .expect("construct single resident runtime");
+    let mut single_runtime = RedimNetResidentRuntime::new(
+        embedder.shared_weights(),
+        Some(1),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+    )
+    .expect("construct single resident runtime");
     let single: Vec<SpeakerEmbedding> = clips
         .iter()
         .map(|clip| low_level_redimnet_embed(&embedder, &mut single_runtime, clip).expect("single"))
         .collect();
 
-    let mut batch_runtime = RedimNetResidentRuntime::new(embedder.shared_weights(), Some(1))
-        .expect("construct batch resident runtime");
+    let mut batch_runtime = RedimNetResidentRuntime::new(
+        embedder.shared_weights(),
+        Some(1),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+    )
+    .expect("construct batch resident runtime");
     let batch = clips
         .iter()
         .map(|clip| low_level_redimnet_embed(&embedder, &mut batch_runtime, clip))

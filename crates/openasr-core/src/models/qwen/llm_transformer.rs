@@ -3630,6 +3630,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         materialize_layer_kv: bool,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         let dims = self.dims;
+        let kv_cache_spec = self.kv_cache_spec;
         if token_count == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder prefill token count must be positive",
@@ -3739,7 +3740,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 token_count,
                 n_seq,
                 use_flash_attention,
-                self.kv_cache_spec,
+                kv_cache_spec,
                 materialize_layer_kv,
             ),
             LlmDecoderStackInputs {
@@ -3818,7 +3819,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         // Q8_0 must do the same rather than requiring a cache that only exists
         // after the prefill output has been written. A zero q8_0 block (scale
         // and quantized payload both zero) is the exact empty-history value.
-        let q8_empty_history = if matches!(self.kv_cache_spec.host, GgmlKvElementType::Q8_0)
+        let q8_empty_history = if matches!(kv_cache_spec.host, GgmlKvElementType::Q8_0)
             && position_offset == 0
         {
             let row_nbytes = GgmlKvElementType::Q8_0
@@ -3838,7 +3839,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             None
         };
         for (layer_index, (key_history, value_history)) in kv_inputs.into_iter().enumerate() {
-            match self.kv_cache_spec.host {
+            match kv_cache_spec.host {
                 GgmlKvElementType::F32 => {
                     let (key_values, value_values) = qwen_prefill_history_inputs_for_layer(
                         dims,

@@ -92,6 +92,10 @@ fn parallel_pyannote_windows_match_serial_reference() {
     let window_samples = (super::DEFAULT_WINDOW_S * 16_000.0) as usize;
     let step_samples = (super::DEFAULT_STEP_S * 16_000.0).round() as usize;
     let starts = super::sliding_window_starts(samples.len(), window_samples, step_samples);
+    assert!(
+        !starts.is_empty(),
+        "auxiliary audio must contain at least one PyanNet window"
+    );
     let frame_clock = super::activity_frame_clock();
     let mut windows = Vec::with_capacity(starts.len());
     for start in starts {
@@ -219,7 +223,7 @@ fn segmenter_rtf_bench_when_pack_present() {
 fn segmentation3_aux_audio_sliding_benchmark() {
     use super::LocalActivitySegmenter;
 
-    let pack = crate::testing::external_test_fixture_path(
+    let _pack = crate::testing::external_test_fixture_path(
         "OPENASR_PYANNOTE_PACK",
         "segmentation-3.0 runtime pack",
     )
@@ -237,7 +241,15 @@ fn segmentation3_aux_audio_sliding_benchmark() {
     .expect("load benchmark audio");
     let pcm = crate::PcmBuffer::from_vec(samples);
     let audio_seconds = pcm.len() as f64 / super::SAMPLE_RATE_HZ as f64;
-    let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load segmenter pack");
+    let backend = std::env::var("OPENASR_AUX_BENCH_BACKEND").unwrap_or_else(|_| "cpu".to_string());
+    let execution_intent = segmentation3_benchmark_execution_intent(&backend);
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let segmenter =
+        super::PolicyResolvedPyannoteSegmenterRuntime::load_with_intent(services, execution_intent)
+            .expect("load policy-resolved segmenter")
+            .expect("OPENASR_PYANNOTE_PACK must resolve");
     let run = || {
         segmenter
             .segment_local_activity(pcm.full_slice(), super::SAMPLE_RATE_HZ, &|| false, None)
@@ -261,7 +273,7 @@ fn segmentation3_aux_audio_sliding_benchmark() {
     );
     let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
     eprintln!(
-        "AUX_MODEL_BENCH model=segmentation3 backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
+        "AUX_MODEL_BENCH model=segmentation3 backend={backend} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
         median_seconds / audio_seconds,
         last.windows.len(),
     );
@@ -272,7 +284,7 @@ fn segmentation3_aux_audio_sliding_benchmark() {
 fn segmentation3_fifteen_minute_endurance() {
     use super::LocalActivitySegmenter;
 
-    let pack = crate::testing::external_test_fixture_path(
+    let _pack = crate::testing::external_test_fixture_path(
         "OPENASR_PYANNOTE_PACK",
         "segmentation-3.0 runtime pack",
     )
@@ -290,7 +302,15 @@ fn segmentation3_fifteen_minute_endurance() {
     .expect("load endurance audio");
     let audio_seconds = samples.len() as f64 / super::SAMPLE_RATE_HZ as f64;
     assert!(audio_seconds >= 15.0 * 60.0, "endurance audio is too short");
-    let segmenter = super::PyannoteSegmenter::from_oasr(&pack).expect("load segmenter pack");
+    let backend = std::env::var("OPENASR_AUX_BENCH_BACKEND").unwrap_or_else(|_| "cpu".to_string());
+    let execution_intent = segmentation3_benchmark_execution_intent(&backend);
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let segmenter =
+        super::PolicyResolvedPyannoteSegmenterRuntime::load_with_intent(services, execution_intent)
+            .expect("load policy-resolved segmenter")
+            .expect("OPENASR_PYANNOTE_PACK must resolve");
     let window_samples = 10 * super::SAMPLE_RATE_HZ as usize;
     let warmup = crate::PcmBuffer::from_vec(samples[..window_samples.min(samples.len())].to_vec());
     segmenter
@@ -312,10 +332,24 @@ fn segmentation3_fifteen_minute_endurance() {
     );
     let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
     eprintln!(
-        "AUX_MODEL_ENDURANCE model=segmentation3 backend=cpu audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} windows={} activity_sha256={activity_sha256}",
+        "AUX_MODEL_ENDURANCE model=segmentation3 backend={backend} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} windows={} activity_sha256={activity_sha256}",
         elapsed_seconds / audio_seconds,
         activity.windows.len(),
     );
+}
+
+fn segmentation3_benchmark_execution_intent(
+    backend: &str,
+) -> crate::device::execution_policy::ExecutionIntent {
+    match backend {
+        "cpu" => crate::device::execution_policy::ExecutionIntent::CpuOnly,
+        "metal" => crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+            crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                crate::device::execution_route::ExecutionProvider::Metal,
+            ),
+        ),
+        other => panic!("unsupported segmentation3 benchmark backend '{other}'"),
+    }
 }
 
 /// Round-trip oracle for Subtask B: converting the real pyannote-seg safetensors
@@ -379,4 +413,218 @@ fn pyannet_matches_onnx_reference() {
         .fold(0.0f32, f32::max);
     println!("pyannet max_abs_err={max_err:.5} over {frames} frames");
     assert!(max_err < 1e-2, "pyannet max abs error {max_err} too high");
+}
+
+#[test]
+#[ignore = "needs OPENASR_PYANNOTE_F32_PACK + OPENASR_PYANNOTE_INPUT + OPENASR_PYANNOTE_GOLDEN and Metal"]
+fn pyannet_metal_matches_onnx_reference() {
+    let pack = std::env::var("OPENASR_PYANNOTE_F32_PACK").expect("f32 pack");
+    let input = std::env::var("OPENASR_PYANNOTE_INPUT").expect("input");
+    let golden = std::env::var("OPENASR_PYANNOTE_GOLDEN").expect("golden");
+    let (in_dims, samples) = read_golden(&input, b"PYIN");
+    assert_eq!(in_dims.len(), 3);
+    let (y_dims, reference) = read_golden(&golden, b"PYYY");
+    let model = PyannetModel::from_oasr(std::path::Path::new(&pack)).expect("PyanNet pack");
+    let mut runtime = super::pyannet_ggml::PyannetGgmlRuntime::new(
+        model,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        crate::device::execution_policy::ExecutionPlacement::Hybrid,
+    )
+    .expect("Metal runtime");
+    let (actual, frames) = runtime.forward(&samples).expect("Metal forward");
+    assert_eq!(frames, y_dims[1], "frame count");
+    assert_eq!(actual.len(), reference.len());
+    let max_abs = actual
+        .iter()
+        .zip(&reference)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    let class_mismatches = actual
+        .chunks_exact(super::NUM_CLASSES)
+        .zip(reference.chunks_exact(super::NUM_CLASSES))
+        .filter(|(actual, expected)| row_argmax(actual) != row_argmax(expected))
+        .count();
+    eprintln!(
+        "PYANNET_METAL_OFFICIAL frames={frames} max_abs={max_abs:.8} class_mismatches={class_mismatches}"
+    );
+    assert!(max_abs < 1e-2, "Metal max abs error {max_abs} too high");
+    assert_eq!(
+        class_mismatches, 0,
+        "Metal must preserve the official powerset class"
+    );
+}
+
+#[test]
+#[ignore = "host-local diagnostic: needs OPENASR_PYANNOTE_F32_PACK + OPENASR_AUX_BENCH_AUDIO and Metal"]
+fn pyannet_cpu_and_metal_stay_within_measured_near_tie_envelope_on_aux_audio() {
+    let pack = std::env::var("OPENASR_PYANNOTE_F32_PACK").expect("f32 pack");
+    let audio = std::env::var("OPENASR_AUX_BENCH_AUDIO").expect("aux audio");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "PyanNet CPU/Metal diagnostic",
+        "PyanNet CPU/Metal diagnostic",
+    )
+    .expect("load auxiliary audio");
+    let pack = std::path::Path::new(&pack);
+    let reference = PyannetModel::from_oasr(pack).expect("reference PyanNet pack");
+    let mut ggml_cpu = super::pyannet_ggml::PyannetGgmlRuntime::new(
+        PyannetModel::from_oasr(pack).expect("ggml CPU PyanNet pack"),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+    )
+    .expect("ggml CPU runtime");
+    let mut metal = super::pyannet_ggml::PyannetGgmlRuntime::new(
+        PyannetModel::from_oasr(pack).expect("Metal PyanNet pack"),
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        crate::device::execution_policy::ExecutionPlacement::Hybrid,
+    )
+    .expect("Metal runtime");
+    let window_samples = (super::DEFAULT_WINDOW_S * super::SAMPLE_RATE_HZ as f64) as usize;
+    let step_samples = (super::DEFAULT_STEP_S * super::SAMPLE_RATE_HZ as f64).round() as usize;
+    let starts = super::sliding_window_starts(samples.len(), window_samples, step_samples);
+    assert!(
+        !starts.is_empty(),
+        "auxiliary audio must contain at least one PyanNet window"
+    );
+    let mut ggml_cpu_errors = Vec::with_capacity(starts.len() * 589 * super::NUM_CLASSES);
+    let mut metal_errors = Vec::with_capacity(starts.len() * 589 * super::NUM_CLASSES);
+    let mut backend_errors = Vec::with_capacity(starts.len() * 589 * super::NUM_CLASSES);
+    let mut ggml_cpu_class_mismatches = 0usize;
+    let mut class_mismatches = Vec::new();
+    let mut activity_mismatches = 0usize;
+    let mut max_metal_error = (0.0f32, 0usize, 0usize, 0usize, 0.0f32, 0.0f32);
+
+    for (window_index, start) in starts.iter().copied().enumerate() {
+        let end = (start + window_samples).min(samples.len());
+        let mut padded = Vec::new();
+        let window = if end - start == window_samples {
+            &samples[start..end]
+        } else {
+            padded.resize(window_samples, 0.0);
+            padded[..end - start].copy_from_slice(&samples[start..end]);
+            padded.as_slice()
+        };
+        let (cpu_logp, cpu_frames) = reference.forward(window).expect("reference forward");
+        let (ggml_cpu_logp, ggml_cpu_frames) = ggml_cpu.forward(window).expect("ggml CPU forward");
+        let (metal_logp, metal_frames) = metal.forward(window).expect("Metal forward");
+        assert_eq!(
+            cpu_frames, ggml_cpu_frames,
+            "window {window_index} ggml CPU frame count"
+        );
+        assert_eq!(
+            cpu_frames, metal_frames,
+            "window {window_index} frame count"
+        );
+        for (frame_index, ((cpu_row, ggml_cpu_row), metal_row)) in cpu_logp
+            .chunks_exact(super::NUM_CLASSES)
+            .zip(ggml_cpu_logp.chunks_exact(super::NUM_CLASSES))
+            .zip(metal_logp.chunks_exact(super::NUM_CLASSES))
+            .enumerate()
+        {
+            for (class, ((cpu, ggml_cpu), metal)) in
+                cpu_row.iter().zip(ggml_cpu_row).zip(metal_row).enumerate()
+            {
+                let ggml_cpu_error = (cpu - ggml_cpu).abs();
+                let metal_error = (cpu - metal).abs();
+                ggml_cpu_errors.push(ggml_cpu_error);
+                metal_errors.push(metal_error);
+                backend_errors.push((ggml_cpu - metal).abs());
+                if metal_error > max_metal_error.0 {
+                    max_metal_error = (metal_error, window_index, frame_index, class, *cpu, *metal);
+                }
+            }
+            let cpu_class = row_argmax(cpu_row);
+            let ggml_cpu_class = row_argmax(ggml_cpu_row);
+            let metal_class = row_argmax(metal_row);
+            ggml_cpu_class_mismatches += usize::from(cpu_class != ggml_cpu_class);
+            if cpu_class != metal_class {
+                activity_mismatches +=
+                    usize::from(super::POWERSET[cpu_class] != super::POWERSET[metal_class]);
+                class_mismatches.push((
+                    window_index,
+                    frame_index,
+                    cpu_class,
+                    metal_class,
+                    row_top_margin(cpu_row),
+                    row_top_margin(metal_row),
+                    cpu_row
+                        .iter()
+                        .zip(metal_row)
+                        .map(|(cpu, metal)| (cpu - metal).abs())
+                        .fold(0.0f32, f32::max),
+                ));
+            }
+        }
+    }
+    let (ggml_cpu_max_abs, ggml_cpu_p99_abs) = sorted_max_and_p99(&mut ggml_cpu_errors);
+    let (metal_max_abs, metal_p99_abs) = sorted_max_and_p99(&mut metal_errors);
+    let (backend_max_abs, backend_p99_abs) = sorted_max_and_p99(&mut backend_errors);
+    eprintln!(
+        "PYANNET_CPU_METAL_DIAGNOSTIC windows={} values={} ggml_cpu_max_abs={ggml_cpu_max_abs:.8} ggml_cpu_p99_abs={ggml_cpu_p99_abs:.8} ggml_cpu_class_mismatches={ggml_cpu_class_mismatches} metal_max_abs={metal_max_abs:.8} metal_p99_abs={metal_p99_abs:.8} backend_max_abs={backend_max_abs:.8} backend_p99_abs={backend_p99_abs:.8} class_mismatches={} activity_mismatches={} max_metal_error={max_metal_error:?} first_mismatches={:?}",
+        starts.len(),
+        metal_errors.len(),
+        class_mismatches.len(),
+        activity_mismatches,
+        class_mismatches.iter().take(12).collect::<Vec<_>>()
+    );
+    assert!(
+        ggml_cpu_max_abs < 2e-4,
+        "ggml CPU graph drifted from family math"
+    );
+    assert_eq!(
+        ggml_cpu_class_mismatches, 0,
+        "ggml CPU graph must preserve every family-math powerset class"
+    );
+    assert!(
+        metal_max_abs < 4e-2,
+        "Metal max abs {metal_max_abs} regressed"
+    );
+    assert!(
+        metal_p99_abs < 5e-3,
+        "Metal p99 abs {metal_p99_abs} regressed"
+    );
+    let compared_frames = metal_errors.len() / super::NUM_CLASSES;
+    assert!(
+        class_mismatches.len() as f64 / compared_frames.max(1) as f64 <= 1e-4,
+        "Metal powerset mismatch rate exceeded the measured near-tie envelope"
+    );
+    assert!(
+        activity_mismatches as f64 / compared_frames.max(1) as f64 <= 1e-4,
+        "Metal activity mismatch rate exceeded the measured near-tie envelope"
+    );
+    assert!(
+        class_mismatches
+            .iter()
+            .all(|mismatch| mismatch.4 <= mismatch.6),
+        "Metal changed a powerset class whose reference margin exceeded its row error"
+    );
+}
+
+fn sorted_max_and_p99(values: &mut [f32]) -> (f32, f32) {
+    values.sort_by(f32::total_cmp);
+    let max = values.last().copied().unwrap_or(0.0);
+    let p99_index = values.len().saturating_sub(1).saturating_mul(99) / 100;
+    (max, values.get(p99_index).copied().unwrap_or(0.0))
+}
+
+fn row_argmax(row: &[f32]) -> usize {
+    row.iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn row_top_margin(row: &[f32]) -> f32 {
+    let mut top = f32::NEG_INFINITY;
+    let mut second = f32::NEG_INFINITY;
+    for value in row.iter().copied() {
+        if value > top {
+            second = top;
+            top = value;
+        } else if value > second {
+            second = value;
+        }
+    }
+    top - second
 }

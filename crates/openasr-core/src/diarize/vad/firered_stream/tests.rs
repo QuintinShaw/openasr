@@ -48,6 +48,48 @@ fn max_abs_diff_with_location(got: &[f32], want: &[f32]) -> (f32, usize) {
     (worst, worst_idx)
 }
 
+fn benchmark_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    match std::env::var("OPENASR_FIRERED_STREAM_VAD_BENCH_BACKEND")
+        .unwrap_or_else(|_| "cpu".to_string())
+        .as_str()
+    {
+        "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        backend => panic!("unsupported FireRedVAD benchmark backend '{backend}'"),
+    }
+}
+
+fn streaming_probabilities_for_backend(
+    model: &'static FireRedStreamVadModel,
+    samples: &[f32],
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Result<Vec<f32>, String> {
+    let mut streaming = super::streaming::FireRedStreamingVad::from_model(model);
+    let placement = if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+        crate::device::execution_policy::ExecutionPlacement::CpuOnly
+    } else {
+        crate::device::execution_policy::ExecutionPlacement::FullDevice
+    };
+    let mut runtime = (backend != crate::ggml_runtime::GgmlCpuGraphBackend::Cpu)
+        .then(|| super::ggml_runtime::FireRedStreamVadGgmlRuntime::new(model, backend, placement))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let mut probabilities = Vec::with_capacity(samples.len().div_ceil(160));
+    for chunk in samples.chunks(super::frontend::SAMPLE_RATE_HZ as usize) {
+        let next = if let Some(runtime) = runtime.as_mut() {
+            streaming
+                .accept_f32_chunk_with(chunk, |features, frames, cache| {
+                    runtime.forward_chunk(features, frames, cache)
+                })
+                .map_err(|error| error.to_string())?
+        } else {
+            streaming.accept_f32_chunk(chunk)
+        };
+        probabilities.extend(next);
+    }
+    Ok(probabilities)
+}
+
 /// Read the one-dimensional little-endian f32 NPY emitted by the pinned
 /// upstream FireRedVAD reference harness. Keeping this test-only parser local
 /// avoids adding a production dependency for a host-local parity fixture.
@@ -101,6 +143,42 @@ fn forward_pass_matches_reference_within_tolerance() {
 }
 
 #[test]
+fn metal_graph_matches_cpu_probabilities_and_product_spans_on_macos() {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return;
+    }
+    let (samples, _) = golden();
+    let model = FireRedStreamVadModel::embedded().expect("vendored firered Stream-VAD weights");
+    let (features, frames) = model.cmvn_features(&samples);
+    let mut cpu_cache = super::model::FireRedStreamVadCache::new();
+    let cpu = model.forward_chunk(&features, frames, &mut cpu_cache);
+    let mut runtime = super::ggml_runtime::FireRedStreamVadGgmlRuntime::new(
+        &model,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        crate::device::execution_policy::ExecutionPlacement::FullDevice,
+    )
+    .expect("Apple Silicon must construct the FireRedVAD Metal graph");
+    let metal = runtime
+        .forward_chunk(
+            &features,
+            frames,
+            &mut super::model::FireRedStreamVadCache::new(),
+        )
+        .expect("Metal FireRedVAD forward");
+    let (max_abs, worst_frame) = max_abs_diff_with_location(&metal, &cpu);
+    assert!(
+        max_abs < 5e-3,
+        "Metal/CPU probability max abs {max_abs} at frame {worst_frame}"
+    );
+    let options = crate::LongFormOptions::default();
+    assert_eq!(
+        super::provider::spans_from_probs(&metal, samples.len(), &options),
+        super::provider::spans_from_probs(&cpu, samples.len(), &options),
+        "Metal and CPU probabilities must produce identical product speech spans"
+    );
+}
+
+#[test]
 #[ignore = "host-local: needs OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO and OPENASR_FIRERED_STREAM_VAD_REFERENCE_NPY"]
 fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     let audio = match crate::testing::external_test_fixture_path(
@@ -130,8 +208,10 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     )
     .expect("load official parity audio");
     let reference_probs = read_reference_probabilities(&reference);
-    let model = FireRedStreamVadModel::embedded().expect("vendored FireRedVAD weights");
-    let probabilities = model.probabilities(&samples);
+    let model = super::shared_model().expect("vendored FireRedVAD weights");
+    let backend = benchmark_backend();
+    let probabilities = streaming_probabilities_for_backend(model, &samples, backend)
+        .expect("run policy-equivalent FireRedVAD");
     let (max_abs, worst_frame) = max_abs_diff_with_location(&probabilities, &reference_probs);
     let mut absolute_errors = probabilities
         .iter()
@@ -155,7 +235,7 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     let reference_spans =
         super::provider::spans_from_probs(&reference_probs, samples.len(), &options);
     eprintln!(
-        "FIRERED_VAD_OFFICIAL_PARITY frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={}",
+        "FIRERED_VAD_OFFICIAL_PARITY backend={backend:?} frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={}",
         probabilities.len(),
         probabilities[worst_frame],
         reference_probs[worst_frame],
@@ -175,6 +255,60 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     assert_eq!(
         native_spans, reference_spans,
         "official and native probabilities must produce identical product speech spans despite {threshold_disagreements} near-threshold frame(s)"
+    );
+}
+
+#[test]
+#[ignore = "host-local benchmark: needs OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO and Metal"]
+fn firered_stream_vad_cpu_metal_aux_benchmark() {
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO",
+        "FireRedVAD CPU/Metal benchmark audio",
+    )
+    .expect("OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "FireRedVAD CPU/Metal benchmark",
+        "FireRedVAD CPU/Metal benchmark",
+    )
+    .expect("load benchmark audio");
+    let model = super::shared_model().expect("vendored FireRedVAD weights");
+    let audio_seconds = samples.len() as f64 / super::frontend::SAMPLE_RATE_HZ as f64;
+    let mut outputs = Vec::new();
+    for backend in [
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+    ] {
+        streaming_probabilities_for_backend(model, &samples[..samples.len().min(16_000)], backend)
+            .expect("warm FireRedVAD backend");
+        let mut probabilities = Vec::new();
+        let seconds = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                probabilities = streaming_probabilities_for_backend(model, &samples, backend)
+                    .expect("run FireRedVAD backend");
+                started.elapsed().as_secs_f64()
+            })
+            .collect::<Vec<_>>();
+        let probability_sha256 = crate::testing::benchmark_sha256_f32(&probabilities);
+        let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
+        eprintln!(
+            "AUX_MODEL_BENCH model=fireredvad backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+            median_seconds / audio_seconds,
+            probabilities.len(),
+        );
+        outputs.push(probabilities);
+    }
+    let (max_abs, worst_frame) = max_abs_diff_with_location(&outputs[1], &outputs[0]);
+    let options = crate::LongFormOptions::default();
+    assert!(
+        max_abs < 5e-3,
+        "CPU/Metal probability max abs {max_abs} at frame {worst_frame}"
+    );
+    assert_eq!(
+        super::provider::spans_from_probs(&outputs[1], samples.len(), &options),
+        super::provider::spans_from_probs(&outputs[0], samples.len(), &options),
+        "CPU and Metal must preserve product speech spans"
     );
 }
 
@@ -346,15 +480,19 @@ fn firered_stream_vad_fifteen_minute_endurance() {
         "endurance audio is only {audio_seconds:.3}s"
     );
 
-    let model = FireRedStreamVadModel::embedded().expect("vendored Stream-VAD weights");
+    let model = super::shared_model().expect("vendored Stream-VAD weights");
+    let backend = benchmark_backend();
     // Warm up (page-in, allocator warm) before timing.
-    let _ = model.probabilities(&samples[..samples.len().min(16_000)]);
+    let _ =
+        streaming_probabilities_for_backend(model, &samples[..samples.len().min(16_000)], backend)
+            .expect("warm FireRedVAD backend");
 
     let mut probs = Vec::new();
     let seconds = (0..5)
         .map(|_| {
             let started = std::time::Instant::now();
-            probs = model.probabilities(&samples);
+            probs = streaming_probabilities_for_backend(model, &samples, backend)
+                .expect("run FireRedVAD endurance backend");
             started.elapsed().as_secs_f64()
         })
         .collect::<Vec<_>>();
@@ -363,7 +501,7 @@ fn firered_stream_vad_fifteen_minute_endurance() {
     let rtf = median_seconds / audio_seconds;
     let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
     println!(
-        "AUX_MODEL_ENDURANCE model=fireredvad backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+        "AUX_MODEL_ENDURANCE model=fireredvad backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
         probs.len(),
     );
     assert!(!probs.is_empty());

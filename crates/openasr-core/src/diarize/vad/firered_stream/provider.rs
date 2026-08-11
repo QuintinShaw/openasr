@@ -4,9 +4,16 @@
 use thiserror::Error;
 
 use super::frontend::SAMPLE_RATE_HZ;
+use super::ggml_runtime::FireRedStreamVadGgmlRuntime;
 use super::model::{FRAME_SHIFT_MS, FireRedStreamVadModel};
 use super::streaming::FireRedStreamingVad;
 use super::weights::FireRedStreamVadWeightsError;
+use crate::NativeExecutionServices;
+use crate::device::{
+    execution_policy::{ExecutionIntent, ExecutionPlacement},
+    execution_route::enumerate_compute_devices_from_ggml,
+};
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::longform::{
     LongFormOptions, LongFormVadProvider, LongFormVadProviderError, LongFormVadProviderKind,
     LongFormVadSlice,
@@ -20,19 +27,77 @@ pub enum FireRedStreamVadError {
     UnsupportedSampleRate { expected: u32, actual: u32 },
     #[error("firered Stream-VAD was canceled")]
     Canceled,
+    #[error("firered Stream-VAD device graph failed: {reason}")]
+    Graph { reason: String },
+    #[error("firered Stream-VAD execution policy failed: {reason}")]
+    ExecutionPolicy { reason: String },
 }
 
 /// Neural VAD provider over the process-wide shared Stream-VAD model. Cheap
 /// to construct (it only borrows the model), so build one per request.
 pub struct FireRedStreamVadProvider {
     model: &'static FireRedStreamVadModel,
+    backend: GgmlCpuGraphBackend,
+    placement: ExecutionPlacement,
 }
 
 impl FireRedStreamVadProvider {
     /// Borrow the shared Stream-VAD model. Returns `None` when the vendored
     /// weights could not be loaded.
     pub fn shared() -> Option<Self> {
-        super::shared_model().map(|model| Self { model })
+        Self::shared_for_backend_and_placement(
+            GgmlCpuGraphBackend::Cpu,
+            ExecutionPlacement::CpuOnly,
+        )
+    }
+
+    pub(crate) fn shared_for_backend_and_placement(
+        backend: GgmlCpuGraphBackend,
+        placement: ExecutionPlacement,
+    ) -> Option<Self> {
+        super::shared_model().map(|model| Self {
+            model,
+            backend,
+            placement,
+        })
+    }
+
+    /// Resolve the request's VAD placement through the same request-local
+    /// execution policy used by long-form slicing. This keeps external
+    /// diarization from silently pinning its VAD sub-stage to CPU when the
+    /// caller explicitly selected Metal.
+    pub(crate) fn shared_for_intent(
+        execution_services: &NativeExecutionServices,
+        intent: &ExecutionIntent,
+    ) -> Result<Option<Self>, FireRedStreamVadError> {
+        let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+        let plan = execution_services
+            .policy_resolver()
+            .resolve(
+                intent.clone(),
+                super::AUTO_GPU_POLICY,
+                super::execution_capabilities(),
+                &inventory,
+            )
+            .map_err(|error| FireRedStreamVadError::ExecutionPolicy {
+                reason: error.to_string(),
+            })?;
+        let candidate =
+            plan.candidates()
+                .first()
+                .ok_or_else(|| FireRedStreamVadError::ExecutionPolicy {
+                    reason: "execution policy returned an empty candidate plan".to_string(),
+                })?;
+        let backend =
+            crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(
+                candidate,
+                super::AUTO_GPU_POLICY,
+            )
+            .backend();
+        Ok(Self::shared_for_backend_and_placement(
+            backend,
+            candidate.placement,
+        ))
     }
 
     /// Direct access to per-frame probabilities, for diagnostics/tests.
@@ -40,9 +105,16 @@ impl FireRedStreamVadProvider {
         self.model.probabilities(samples)
     }
 
-    /// Recording-length-independent peak for the bounded one-second offline
-    /// streaming step. The raw buffer can contain one chunk plus the fbank
-    /// overlap tail; geometric Vec growth is bounded by twice that payload.
+    /// Recording-length-independent host peak for the bounded one-second
+    /// offline streaming step. The raw buffer can contain one chunk plus the
+    /// fbank overlap tail; geometric Vec growth is bounded by twice that
+    /// payload.
+    ///
+    /// Native ggml contexts, uploaded weights, and graph workspaces are quoted
+    /// and admitted by the shared backend-allocation layer when the accelerated
+    /// runtime materializes. They must not be charged again here: this outer
+    /// reservation owns only the family-local Rust/frontend payload that the
+    /// backend cannot observe.
     pub(crate) fn invocation_scratch_peak_bytes(&self) -> u64 {
         let buffered_samples = SAMPLE_RATE_HZ as usize + super::frontend::FRAME_LENGTH;
         let raw_buffer_bytes = (buffered_samples as u64)
@@ -75,12 +147,33 @@ impl FireRedStreamVadProvider {
             return Ok(Vec::new());
         }
         let mut streaming = FireRedStreamingVad::from_model(self.model);
+        let mut device_runtime = if self.backend == GgmlCpuGraphBackend::Cpu {
+            None
+        } else {
+            Some(
+                FireRedStreamVadGgmlRuntime::new(self.model, self.backend, self.placement)
+                    .map_err(|error| FireRedStreamVadError::Graph {
+                        reason: error.to_string(),
+                    })?,
+            )
+        };
         let mut probabilities = Vec::with_capacity(samples.len().div_ceil(FRAME_SAMPLES));
         for chunk in samples.chunks(SAMPLE_RATE_HZ as usize) {
             if canceled() {
                 return Err(FireRedStreamVadError::Canceled);
             }
-            probabilities.extend(streaming.accept_f32_chunk(chunk));
+            let chunk_probabilities = if let Some(runtime) = device_runtime.as_mut() {
+                streaming
+                    .accept_f32_chunk_with(chunk, |features, frames, cache| {
+                        runtime.forward_chunk(features, frames, cache)
+                    })
+                    .map_err(|error| FireRedStreamVadError::Graph {
+                        reason: error.to_string(),
+                    })?
+            } else {
+                streaming.accept_f32_chunk(chunk)
+            };
+            probabilities.extend(chunk_probabilities);
         }
         if canceled() {
             return Err(FireRedStreamVadError::Canceled);

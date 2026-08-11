@@ -1,10 +1,10 @@
 //! Policy-resolved ownership for recording-local activity segmenters.
 //!
-//! Pyannote is a Send-safe, CPU-only host owner. DiariZen owns native ggml
-//! state and is therefore constructed, invoked, and destroyed on a dedicated
-//! admitted actor thread. Both providers expose the same local-activity seam;
-//! provider selection is frozen before materialization and never changes after
-//! an inference error.
+//! Pyannote uses a Send-safe host owner on CPU and a thread-pinned hybrid ggml
+//! owner for an explicit Metal route. DiariZen owns native ggml state for every
+//! backend. Both providers expose the same local-activity seam; provider
+//! selection is frozen before materialization and never changes after an
+//! inference error.
 
 use std::sync::{Arc, Mutex};
 
@@ -27,9 +27,10 @@ use crate::{
 };
 
 use super::{
-    DIARIZEN_GGML_ARCHITECTURE_ID, LocalActivity, LocalActivitySegmenter, PyannoteSegmenter,
-    SegmentError, SegmenterProvider, diarizen,
+    DIARIZEN_GGML_ARCHITECTURE_ID, LocalActivity, LocalActivitySegmenter, PyannetGgmlRuntime,
+    PyannoteSegmenter, SegmentError, SegmenterProvider, decode_activity, diarizen,
     pack::{PreparedSegmenterSource, PreparedSelectedSegmenter},
+    segment_pyannote_local_activity_serial,
 };
 use crate::diarize::embed::weights::WeightsError;
 use crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID;
@@ -40,10 +41,16 @@ const PYANNOTE_HOST_REPRESENTATION: &str = "pyannote-segmentation.f32-pure-rust.
 const DIARIZEN_RUNTIME_REPRESENTATION: &str = "diarizen-large-s80-v2.ggml.v1";
 
 type SharedPyannote = AdmittedHostObject<PyannoteSegmenter>;
+type PyannoteActor = PinnedRuntimeActor<PyannetGgmlRuntime>;
 type DiariZenActor = PinnedRuntimeActor<diarizen::DiariZenRuntime>;
 
+enum PyannoteRuntimeOwner {
+    Host(SharedPyannote),
+    Accelerated(PyannoteActor),
+}
+
 pub struct PolicyResolvedPyannoteSegmenterRuntime {
-    runtime: Mutex<PolicyResolvedAuxRuntime<SharedPyannote, SegmentError>>,
+    runtime: Mutex<PolicyResolvedAuxRuntime<PyannoteRuntimeOwner, SegmentError>>,
 }
 
 impl PolicyResolvedPyannoteSegmenterRuntime {
@@ -87,21 +94,44 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         )
         .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
         let services_for_builder = Arc::clone(&execution_services);
-        let builder = Arc::new(move |_candidate: &ExecutionCandidate| {
-            let key = AuxiliaryRuntimeCacheKey::for_current_lane::<PyannoteSegmenter>(
-                PYANNOTE_GGML_ARCHITECTURE_ID,
-                content_id.clone(),
-                PYANNOTE_HOST_REPRESENTATION,
-                GgmlCpuGraphBackend::Cpu,
-            );
-            services_for_builder
-                .auxiliary_runtime_owners()
-                .get_or_try_insert_admitted_with(
-                    key,
+        let builder = Arc::new(move |candidate: &ExecutionCandidate| {
+            let backend =
+                resolved_runtime_for_auxiliary_candidate(candidate, AutoGpuPolicy::Never).backend();
+            if backend == GgmlCpuGraphBackend::Cpu {
+                let key = AuxiliaryRuntimeCacheKey::for_current_lane::<PyannoteSegmenter>(
+                    PYANNOTE_GGML_ARCHITECTURE_ID,
+                    content_id.clone(),
+                    PYANNOTE_HOST_REPRESENTATION,
+                    GgmlCpuGraphBackend::Cpu,
+                );
+                services_for_builder
+                    .auxiliary_runtime_owners()
+                    .get_or_try_insert_admitted_with(
+                        key,
+                        retained_quote,
+                        || {
+                            build_admitted_pyannote(
+                                &source,
+                                &content_id,
+                                peak_quote,
+                                retained_quote,
+                            )
+                        },
+                        |error| SegmentError::LoadFailed(error.to_string()),
+                    )
+                    .map(PyannoteRuntimeOwner::Host)
+            } else {
+                load_pyannote_actor(
+                    services_for_builder.as_ref(),
+                    &source,
+                    &content_id,
+                    backend,
+                    candidate.placement,
+                    peak_quote,
                     retained_quote,
-                    || build_admitted_pyannote(&source, &content_id, peak_quote, retained_quote),
-                    |error| SegmentError::LoadFailed(error.to_string()),
                 )
+                .map(PyannoteRuntimeOwner::Accelerated)
+            }
         });
         let runtime = PolicyResolvedAuxRuntime::try_new(
             execution_services,
@@ -127,11 +157,103 @@ impl LocalActivitySegmenter for PolicyResolvedPyannoteSegmenterRuntime {
         self.runtime
             .lock()
             .map_err(|_| SegmentError::Inference("pyannote runtime lock is poisoned".into()))?
-            .invoke_replay_safe(|owner| {
-                owner.segment_local_activity(samples.clone(), sample_rate_hz, canceled, progress)
+            .invoke_replay_safe(|owner| match owner {
+                PyannoteRuntimeOwner::Host(owner) => owner.segment_local_activity(
+                    samples.clone(),
+                    sample_rate_hz,
+                    canceled,
+                    progress,
+                ),
+                PyannoteRuntimeOwner::Accelerated(actor) => segment_pyannote_local_activity_serial(
+                    samples.clone(),
+                    sample_rate_hz,
+                    canceled,
+                    progress,
+                    |window| {
+                        actor
+                            .call_mut_fallible({
+                                let window = window.clone();
+                                move |runtime| {
+                                    runtime
+                                        .forward(window.as_slice())
+                                        .map(|(logp, frames)| decode_activity(&logp, frames))
+                                }
+                            })
+                            .map_err(|error| SegmentError::Inference(error.to_string()))?
+                            .map_err(|error| SegmentError::Inference(error.to_string()))
+                    },
+                ),
             })
             .map_err(policy_error)
     }
+}
+
+fn load_pyannote_actor(
+    execution_services: &NativeExecutionServices,
+    source: &PreparedSegmenterSource,
+    expected_content_id: &str,
+    backend: GgmlCpuGraphBackend,
+    placement: crate::device::execution_policy::ExecutionPlacement,
+    peak_quote: u64,
+    retained_quote: u64,
+) -> Result<PyannoteActor, SegmentError> {
+    if source.preflight().runtime_source.content_id() != expected_content_id {
+        return Err(content_changed(
+            "PyanNet",
+            expected_content_id,
+            source.preflight().runtime_source.content_id(),
+        ));
+    }
+    let key = AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<PyannetGgmlRuntime>(
+        PYANNOTE_GGML_ARCHITECTURE_ID,
+        expected_content_id,
+        "pyannote-segmentation.hybrid-ggml.v1",
+        backend,
+    );
+    let preflight = source.preflight().clone();
+    let content_id = expected_content_id.to_string();
+    let quote_content_id = content_id.clone();
+    execution_services
+        .pyannote_segmenter_actors()
+        .get_or_try_insert_with(
+            key,
+            move || {
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!(
+                        "aux.{PYANNOTE_GGML_ARCHITECTURE_ID}.{quote_content_id}.hybrid-host-state"
+                    ),
+                    peak_quote,
+                    retained_quote,
+                )
+                .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+                Ok((retained_quote, quote))
+            },
+            move |quote| {
+                let snapshot = preflight
+                    .immutable_snapshot_matching_content_id(&content_id)
+                    .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+                let transaction = SystemMemoryOwner::try_allocate_transaction(quote, || {
+                    let runtime = PyannetGgmlRuntime::from_preflight(&snapshot, backend, placement)
+                        .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+                    let actual_retained = runtime
+                        .persistent_host_commitment_bytes()
+                        .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
+                    Ok::<_, SegmentError>(SystemMemoryAllocationOutcome::new(
+                        runtime,
+                        peak_quote,
+                        actual_retained,
+                    ))
+                });
+                match transaction {
+                    Ok(owner) => Ok(owner),
+                    Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                    Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                        Err(SegmentError::LoadFailed(error.to_string()))
+                    }
+                }
+            },
+            |error| SegmentError::Inference(error.to_string()),
+        )
 }
 
 struct PolicyResolvedDiariZenSegmenterRuntime {
@@ -394,5 +516,45 @@ mod tests {
             });
             assert!(matches!(mapped, SegmentError::Canceled));
         }
+    }
+
+    #[test]
+    #[ignore = "requires OPENASR_PYANNOTE_PACK and a representative Metal device"]
+    fn explicit_metal_pyannote_route_matches_cpu_product_activity() {
+        let pack = std::env::var_os("OPENASR_PYANNOTE_PACK")
+            .expect("OPENASR_PYANNOTE_PACK must point to a verified f32 pack");
+        crate::test_process_env::with_test_process_env(
+            [("OPENASR_PYANNOTE_PACK", Some(pack))],
+            || {
+                let samples: Vec<f32> = (0..12 * 16_000)
+                    .map(|index| {
+                        let time = index as f32 / 16_000.0;
+                        0.11 * (time * 307.0 * std::f32::consts::TAU).sin()
+                            + 0.04 * (time * 881.0 * std::f32::consts::TAU).cos()
+                    })
+                    .collect();
+                let pcm = crate::PcmBuffer::from_vec(samples);
+                let run = |intent| {
+                    let services = Arc::new(
+                        NativeExecutionServices::for_local_process().expect("execution services"),
+                    );
+                    let runtime =
+                        PolicyResolvedPyannoteSegmenterRuntime::load_with_intent(services, intent)
+                            .expect("load PyanNet runtime")
+                            .expect("PyanNet pack must resolve");
+                    runtime
+                        .segment_local_activity(pcm.full_slice(), 16_000, &|| false, None)
+                        .expect("segment activity")
+                };
+                let cpu = run(ExecutionIntent::CpuOnly);
+                let metal = run(ExecutionIntent::ConstrainedAcceleratedOnly(
+                    crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                        crate::device::execution_route::ExecutionProvider::Metal,
+                    ),
+                ));
+                assert_eq!(metal.windows, cpu.windows);
+                assert_eq!(metal.speaker_count, cpu.speaker_count);
+            },
+        );
     }
 }

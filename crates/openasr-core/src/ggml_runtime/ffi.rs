@@ -643,6 +643,12 @@ unsafe extern "C" {
     pub(crate) fn ggml_sqr(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_sqrt(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_log(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_leaky_relu(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        negative_slope: f32,
+        inplace: bool,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_mul_mat(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,

@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::ggml_runtime::GgufWriteTensorType;
 use crate::ggml_runtime::gguf_header::{GgufHeaderError, GgufHeaderView, parse_gguf_header};
+use crate::ggml_runtime::{GgufTensorIndex, GgufWriteTensorType};
 use crate::models::pack_quant::{
     PackQuant, QuantizedAxis, TensorQuantizationContract, TensorRole, classify_quant_tensor_role,
 };
@@ -264,6 +264,70 @@ fn is_q8_floor_tensor(rule: TensorQuantizationContract, name: &str) -> bool {
         .is_some_and(TensorRole::requires_q8_floor)
 }
 
+#[derive(Debug, Default)]
+struct Q8FloorInspection {
+    block_quant_tensors: usize,
+    q8_floor_block_quant_tensors: usize,
+    violations: Vec<QuantFloorViolation>,
+}
+
+/// Inspect the Q8 floor once for both the standalone header audit and the
+/// already-open runtime tensor index. Keeping the semantic-role decision in
+/// one loop prevents pull-time and execution-time acceptance from drifting.
+fn inspect_q8_floor<'a>(
+    rule: Option<TensorQuantizationContract>,
+    tensors: impl IntoIterator<Item = (&'a str, &'a [u64], u32)>,
+) -> Q8FloorInspection {
+    let mut inspection = Q8FloorInspection::default();
+    for (name, dims, ggml_type) in tensors {
+        if !is_block_quant_type(ggml_type) {
+            continue;
+        }
+        inspection.block_quant_tensors += 1;
+        let q8_floor = rule.is_some_and(|rule| is_q8_floor_tensor(rule, name));
+        if q8_floor {
+            inspection.q8_floor_block_quant_tensors += 1;
+        }
+        if q8_floor && !meets_q8_floor(ggml_type) {
+            inspection.violations.push(QuantFloorViolation {
+                tensor: name.to_string(),
+                dims: dims.to_vec(),
+                ggml_type,
+                kind: QuantFloorViolationKind::BelowQ8Floor,
+            });
+        }
+    }
+    inspection
+}
+
+/// Apply the shared semantic Q8 floor to an already-open runtime tensor
+/// index. This is intentionally tier-neutral: runtime safety only needs to
+/// know whether precision-critical tensors satisfy their minimum floor; the
+/// separate publishing audit owns declared-tier ceiling validation.
+pub(crate) fn runtime_tensor_index_q8_floor_violations(
+    architecture: &str,
+    tensor_index: &GgufTensorIndex,
+) -> Result<Vec<QuantFloorViolation>, QuantFloorAuditError> {
+    let rule = quantization_contract_for_architecture(architecture);
+    let inspection = inspect_q8_floor(
+        rule,
+        tensor_index.tensors().iter().map(|tensor| {
+            (
+                tensor.name.as_str(),
+                tensor.dims.as_slice(),
+                tensor.ggml_type as u32,
+            )
+        }),
+    );
+    if rule.is_none() && inspection.block_quant_tensors > 0 {
+        return Err(QuantFloorAuditError::UnrecognizedArchitecture {
+            architecture: architecture.to_string(),
+            block_quant_tensors: inspection.block_quant_tensors,
+        });
+    }
+    Ok(inspection.violations)
+}
+
 /// Replay the current quantization policy against a parsed pack header.
 ///
 /// Two independent invariants, both fail-closed:
@@ -295,27 +359,23 @@ pub fn audit_quant_floor(
         ..QuantFloorReport::default()
     };
 
+    let floor = inspect_q8_floor(
+        rule,
+        view.tensors.iter().map(|tensor| {
+            (
+                tensor.name.as_str(),
+                tensor.dims.as_slice(),
+                tensor.ggml_type,
+            )
+        }),
+    );
+    report.block_quant_tensors = floor.block_quant_tensors;
+    report.q8_floor_block_quant_tensors = floor.q8_floor_block_quant_tensors;
+    report.violations = floor.violations;
+
     for tensor in &view.tensors {
         if !is_block_quant_type(tensor.ggml_type) {
             continue;
-        }
-        report.block_quant_tensors += 1;
-
-        let q8_floor = match rule {
-            Some(rule) => is_q8_floor_tensor(rule, &tensor.name),
-            None => false,
-        };
-        if q8_floor {
-            report.q8_floor_block_quant_tensors += 1;
-        }
-
-        if q8_floor && !meets_q8_floor(tensor.ggml_type) {
-            report.violations.push(QuantFloorViolation {
-                tensor: tensor.name.clone(),
-                dims: tensor.dims.clone(),
-                ggml_type: tensor.ggml_type,
-                kind: QuantFloorViolationKind::BelowQ8Floor,
-            });
         }
         if let Some(declared) = declared
             && !declared_tier_allows(declared, tensor.ggml_type)
@@ -488,9 +548,12 @@ mod tests {
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, QuantFloorAuditError,
         QuantFloorViolationKind, audit_quant_floor, declared_tier_allows, ggml_type_name,
         is_block_quant_type, is_q8_floor_tensor, meets_q8_floor,
-        quantization_contract_for_architecture,
+        quantization_contract_for_architecture, runtime_tensor_index_q8_floor_violations,
     };
-    use crate::ggml_runtime::gguf_header::{GgufHeaderTensor, GgufHeaderView};
+    use crate::ggml_runtime::{
+        GgufTensorIndex, GgufTensorIndexSnapshot, GgufTensorMetadata,
+        gguf_header::{GgufHeaderTensor, GgufHeaderView},
+    };
     use crate::models::pack_quant::{PackQuant, TensorQuantizationContract};
     use std::collections::BTreeMap;
 
@@ -520,6 +583,25 @@ mod tests {
             ggml_type,
             data_offset: 0,
         }
+    }
+
+    fn runtime_index(tensors: &[(&str, i32)]) -> GgufTensorIndex {
+        GgufTensorIndex::from_snapshot(GgufTensorIndexSnapshot {
+            path: "/nonexistent/runtime-floor-test.oasr".into(),
+            data_section_offset_bytes: 0,
+            tensors: tensors
+                .iter()
+                .map(|(name, ggml_type)| GgufTensorMetadata {
+                    name: (*name).to_string(),
+                    dims: vec![256, 256],
+                    ggml_type: *ggml_type,
+                    type_name: format!("type-{ggml_type}"),
+                    size_bytes: 0,
+                    offset_bytes: 0,
+                })
+                .collect(),
+        })
+        .expect("valid synthetic tensor index")
     }
 
     const QWEN_ARCH: &str = crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID;
@@ -693,6 +775,36 @@ mod tests {
         assert_eq!(
             report.violations[0].kind,
             QuantFloorViolationKind::BelowQ8Floor
+        );
+    }
+
+    #[test]
+    fn runtime_index_uses_the_same_forced_aligner_q8_floor() {
+        let architecture = crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID;
+        let compliant = runtime_index(&[
+            ("output.weight", GGML_TYPE_Q8_0 as i32),
+            ("token_embd.weight", GGML_TYPE_Q8_0 as i32),
+            ("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K as i32),
+        ]);
+        assert!(
+            runtime_tensor_index_q8_floor_violations(architecture, &compliant)
+                .expect("registered architecture")
+                .is_empty()
+        );
+
+        let stale = runtime_index(&[
+            ("output.weight", GGML_TYPE_Q4_K as i32),
+            ("token_embd.weight", GGML_TYPE_Q4_K as i32),
+            ("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K as i32),
+        ]);
+        let violations = runtime_tensor_index_q8_floor_violations(architecture, &stale)
+            .expect("registered architecture");
+        assert_eq!(
+            violations
+                .iter()
+                .map(|violation| violation.tensor.as_str())
+                .collect::<Vec<_>>(),
+            ["output.weight", "token_embd.weight"]
         );
     }
 

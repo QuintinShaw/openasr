@@ -27,6 +27,7 @@ use crate::{
         policy_resolved_aux_runtime::{
             AuxiliaryPinnedRuntimeCacheKey, AuxiliaryRuntimeCacheKey, PolicyResolvedAuxRuntime,
             PolicyResolvedAuxRuntimeError, resolve_auxiliary_execution_plan,
+            resolved_runtime_for_auxiliary_candidate,
         },
         system_memory_owner::{
             AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
@@ -70,6 +71,21 @@ fn redimnet_frontend_pool() -> &'static Result<rayon::ThreadPool, String> {
     })
 }
 
+fn redimnet_resident_worker_limit(backend: GgmlCpuGraphBackend, pool_threads: usize) -> usize {
+    // The ignored Pareto harness deliberately sweeps the otherwise private
+    // production limit. nextest process isolation keeps this test-only env
+    // override from leaking into another request.
+    #[cfg(test)]
+    if std::env::var_os("OPENASR_REDIMNET_BENCH_WORKERS").is_some() {
+        return super::redimnet_batch_worker_limit(pool_threads);
+    }
+    if backend.is_gpu_class() {
+        1
+    } else {
+        super::redimnet_batch_worker_limit(pool_threads)
+    }
+}
+
 type SharedAdmittedEmbedder = AdmittedHostObject<RedimNet2Embedder>;
 type PendingActorBatch = CheckedOutPinnedRuntimeActorCall<
     AuxiliaryPinnedRuntimeCacheKey,
@@ -81,6 +97,8 @@ struct PolicySpeakerCandidate {
     parsed: SharedAdmittedEmbedder,
     services: Arc<NativeExecutionServices>,
     content_id: String,
+    backend: GgmlCpuGraphBackend,
+    placement: crate::device::execution_policy::ExecutionPlacement,
 }
 
 impl PolicySpeakerCandidate {
@@ -89,7 +107,7 @@ impl PolicySpeakerCandidate {
             REDIMNET2_GGML_ARCHITECTURE_ID,
             self.content_id.clone(),
             REDIMNET_RESIDENT_REPRESENTATION,
-            GgmlCpuGraphBackend::Cpu,
+            self.backend,
         )
     }
 
@@ -105,14 +123,17 @@ impl PolicySpeakerCandidate {
         EmbedError,
     > {
         let weights = self.parsed.shared_weights();
+        let backend = self.backend;
+        let placement = self.placement;
         self.services
             .redimnet_runtime_actors()
             .checkout_or_try_build_with(
                 self.actor_key(),
                 || Ok((0, (weights, threads, warmup))),
-                |(weights, threads, warmup)| {
-                    let mut runtime = RedimNetResidentRuntime::new(weights, Some(threads))
-                        .map_err(map_backbone_error)?;
+                move |(weights, threads, warmup)| {
+                    let mut runtime =
+                        RedimNetResidentRuntime::new(weights, Some(threads), backend, placement)
+                            .map_err(map_backbone_error)?;
                     if let Some((features, frames)) = warmup {
                         runtime
                             .forward(&features, frames, Some(threads))
@@ -159,11 +180,12 @@ impl PolicySpeakerCandidate {
         let available = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
-        let plan = SpeakerEmbeddingExecutionPlan::for_clips(
-            clips.len(),
-            available,
-            super::redimnet_batch_worker_limit(pool.current_num_threads()),
-        );
+        // A single full-device graph already saturates the integrated GPU;
+        // duplicating resident weights/graphs across four actors multiplies
+        // memory without introducing a batch dimension inside the model.
+        // CPU retains the measured bounded worker fan-out.
+        let max_workers = redimnet_resident_worker_limit(self.backend, pool.current_num_threads());
+        let plan = SpeakerEmbeddingExecutionPlan::for_clips(clips.len(), available, max_workers);
         let inherited_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let prepared = pool.install(|| {
             clips
@@ -376,12 +398,16 @@ impl PolicyResolvedSpeakerRuntime {
         let content_for_builder = content_id.clone();
         let preflight_for_builder = preflight.clone();
         let builder = Arc::new(
-            move |_candidate: &crate::device::execution_policy::ExecutionCandidate| {
-                let key = AuxiliaryRuntimeCacheKey::for_current_lane::<RedimNet2Embedder>(
+            move |execution_candidate: &crate::device::execution_policy::ExecutionCandidate| {
+                let backend = resolved_runtime_for_auxiliary_candidate(
+                    execution_candidate,
+                    crate::ggml_runtime::AutoGpuPolicy::Never,
+                )
+                .backend();
+                let key = AuxiliaryRuntimeCacheKey::host_neutral::<RedimNet2Embedder>(
                     REDIMNET2_GGML_ARCHITECTURE_ID,
                     content_for_builder.clone(),
                     REDIMNET_PARSED_HOST_REPRESENTATION,
-                    GgmlCpuGraphBackend::Cpu,
                 );
                 let parsed = services_for_builder
                     .auxiliary_runtime_owners()
@@ -402,6 +428,8 @@ impl PolicyResolvedSpeakerRuntime {
                     parsed,
                     services: Arc::clone(&services_for_builder),
                     content_id: content_for_builder.clone(),
+                    backend,
+                    placement: execution_candidate.placement,
                 };
                 let warmup = deterministic_warmup_audio();
                 let warmup = candidate

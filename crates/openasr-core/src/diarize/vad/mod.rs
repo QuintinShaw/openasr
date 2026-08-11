@@ -46,6 +46,14 @@ pub fn shared_model() -> Option<&'static firered_stream::FireRedStreamVadModel> 
     firered_stream::shared_model()
 }
 
+pub(crate) fn stream_vad_execution_capabilities()
+-> crate::device::execution_policy::ExecutionCapabilities {
+    firered_stream::execution_capabilities()
+}
+
+pub(crate) const STREAM_VAD_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
+    firered_stream::AUTO_GPU_POLICY;
+
 /// Single source of truth for VAD-mode selection strings. `Some(true)` selects
 /// the neural detector (Stream-VAD), `Some(false)` the energy gate, `None` is
 /// unrecognized. Shared by the batch, server, and CLI surfaces (and the

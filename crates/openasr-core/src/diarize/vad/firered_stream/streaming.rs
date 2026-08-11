@@ -73,17 +73,29 @@ impl FireRedStreamingVad {
     /// checkpoints between them instead of one uninterruptible whole-file
     /// fbank/DFSMN call.
     pub(super) fn accept_f32_chunk(&mut self, samples: &[f32]) -> Vec<f32> {
+        let model = self.model;
+        match self.accept_f32_chunk_with(samples, |features, frames, cache| {
+            Ok::<_, std::convert::Infallible>(model.forward_chunk(features, frames, cache))
+        }) {
+            Ok(probabilities) => probabilities,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn accept_f32_chunk_with<E>(
+        &mut self,
+        samples: &[f32],
+        forward: impl FnOnce(&[f32], usize, &mut FireRedStreamVadCache) -> Result<Vec<f32>, E>,
+    ) -> Result<Vec<f32>, E> {
         self.raw_buffer.extend_from_slice(samples);
         if self.raw_buffer.len() < FRAME_LENGTH {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let (features, n_frames) = self.model.cmvn_features(&self.raw_buffer);
         if n_frames == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let probs = self
-            .model
-            .forward_chunk(&features, n_frames, &mut self.cache);
+        let probs = forward(&features, n_frames, &mut self.cache)?;
         self.last_prob = *probs.last().expect("n_frames > 0 implies non-empty probs");
 
         // `frontend.compute` uses snip_edges framing: frame i spans
@@ -94,7 +106,7 @@ impl FireRedStreamingVad {
         let frame_shift_samples = (16_000u64 * FRAME_SHIFT_MS as u64 / 1000) as usize;
         let consumed = n_frames * frame_shift_samples;
         self.raw_buffer.drain(..consumed);
-        probs
+        Ok(probs)
     }
 
     /// Most recent probability without feeding new audio.

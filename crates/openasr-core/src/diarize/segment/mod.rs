@@ -10,6 +10,7 @@ mod ops;
 mod pack;
 mod policy_runtime;
 mod pyannet;
+mod pyannet_ggml;
 
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,7 @@ pub(crate) use pack::PYANNOTE_PACK_PREFERENCE;
 pub use pack::{DIARIZEN_PACK_ID, SEGMENTER_PACK_ID, segmenter_pack_installed};
 pub(crate) use pack::{PreparedSelectedSegmenter, SegmenterProvider, prepare_segmenter};
 pub use policy_runtime::{PolicyResolvedPyannoteSegmenterRuntime, PolicyResolvedSegmenterRuntime};
+pub(crate) use pyannet_ggml::PyannetGgmlRuntime;
 
 use pyannet::{NUM_CLASSES, PyannetModel};
 use thiserror::Error;
@@ -467,7 +469,7 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
         let window_samples = (self.protocol.window_s * sample_rate_hz as f64) as usize;
         let step_samples = (self.protocol.step_s * sample_rate_hz as f64).round() as usize;
         let starts = sliding_window_starts(samples.len(), window_samples, step_samples);
-        let mut windows = bounded_pyannote_window_map(&starts, canceled, progress, |start| {
+        let windows = bounded_pyannote_window_map(&starts, canceled, progress, |start| {
             let end = (start + window_samples).min(samples.len());
             let activity = if end - start == window_samples {
                 self.infer_window(&samples[start..end])?
@@ -482,20 +484,79 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
             })
         })?;
 
-        let frame_clock = activity_frame_clock();
-        for window in &mut windows {
-            window.frame_activity.truncate(
-                frame_clock
-                    .frame_count_for_samples(samples.len().saturating_sub(window.start_sample)),
-            );
-        }
-        let speaker_count = aggregate_speaker_count(&windows, frame_clock, samples.len());
-        Ok(LocalActivity {
-            frame_clock,
-            windows,
+        Ok(finalize_pyannote_activity(&samples, windows))
+    }
+}
+
+/// Serial sliding-window protocol for a thread-pinned accelerated PyanNet
+/// runtime. The CPU owner keeps its bounded Rayon implementation above; a
+/// single Metal actor deliberately submits windows in order so one persistent
+/// graph is never driven concurrently from multiple request threads.
+pub(super) fn segment_pyannote_local_activity_serial(
+    samples: crate::PcmSlice,
+    sample_rate_hz: u32,
+    canceled: &dyn Fn() -> bool,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
+    mut infer_window: impl FnMut(crate::PcmSlice) -> Result<Vec<u8>, SegmentError>,
+) -> Result<LocalActivity, SegmentError> {
+    if sample_rate_hz != SAMPLE_RATE_HZ {
+        return Err(SegmentError::UnsupportedSampleRate(sample_rate_hz));
+    }
+    if samples.is_empty() {
+        return Ok(LocalActivity {
+            frame_clock: activity_frame_clock(),
+            windows: Vec::new(),
             local_speaker_slots: MAX_LOCAL_SPEAKERS as u8,
-            speaker_count,
-        })
+            speaker_count: Vec::new(),
+        });
+    }
+    let window_samples = (DEFAULT_WINDOW_S * sample_rate_hz as f64) as usize;
+    let step_samples = (DEFAULT_STEP_S * sample_rate_hz as f64).round() as usize;
+    let starts = sliding_window_starts(samples.len(), window_samples, step_samples);
+    let total_windows = starts.len();
+    let mut windows = Vec::with_capacity(total_windows);
+    if let Some(progress) = progress {
+        progress.report(0, total_windows.max(1));
+    }
+    for start in starts {
+        if canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let end = (start + window_samples).min(samples.len());
+        let activity = if end - start == window_samples {
+            infer_window(samples.slice(start..end))?
+        } else {
+            let mut padded = vec![0.0f32; window_samples];
+            padded[..end - start].copy_from_slice(&samples[start..end]);
+            infer_window(padded.into())?
+        };
+        windows.push(LocalActivityWindow {
+            start_sample: start,
+            frame_activity: activity,
+        });
+        if let Some(progress) = progress {
+            progress.report(windows.len(), total_windows.max(1));
+        }
+    }
+    Ok(finalize_pyannote_activity(&samples, windows))
+}
+
+fn finalize_pyannote_activity(
+    samples: &crate::PcmSlice,
+    mut windows: Vec<LocalActivityWindow>,
+) -> LocalActivity {
+    let frame_clock = activity_frame_clock();
+    for window in &mut windows {
+        window.frame_activity.truncate(
+            frame_clock.frame_count_for_samples(samples.len().saturating_sub(window.start_sample)),
+        );
+    }
+    let speaker_count = aggregate_speaker_count(&windows, frame_clock, samples.len());
+    LocalActivity {
+        frame_clock,
+        windows,
+        local_speaker_slots: MAX_LOCAL_SPEAKERS as u8,
+        speaker_count,
     }
 }
 

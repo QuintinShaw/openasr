@@ -23,6 +23,7 @@ use crate::ggml_runtime::{
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 use crate::models::{
     aux_pack_registry::AuxPackKind,
+    pack_quant_audit::runtime_tensor_index_q8_floor_violations,
     pack_verifier::{PackCandidate, PackRoute, PackVerifier, VerifiedPack},
 };
 
@@ -58,6 +59,11 @@ use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTok
 /// byte-for-byte (see `forced_aligner_import.rs`), so it uses the same value.
 const FORCED_ALIGNER_ROPE_THETA: f32 = 1_000_000.0;
 const DEFAULT_RMS_NORM_EPSILON: f32 = 1.0e-6;
+/// Upper bound for one timestamp-classification graph. At the current 5k
+/// vocabulary this keeps each f32 logits matrix at or below 1.25 MiB while
+/// still amortizing graph construction and GPU submission across many words.
+/// The bound is independent of transcript length.
+const FORCED_ALIGNER_LOGITS_BATCH_ROWS: usize = 64;
 
 const KEY_SAMPLE_RATE: &str = "qwen3_forced_aligner.audio.sample_rate_hz";
 const KEY_N_MELS: &str = "qwen3_forced_aligner.audio.n_mels";
@@ -523,7 +529,6 @@ pub(crate) fn align_forced_with_progress(
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
-    let mut logits_runtime = assets.logits_head.new_runtime(backend)?;
     let prefill_output = whole_decoder
         .run_stateless_prefill(
             &prefill_input.token_major_embeddings,
@@ -536,6 +541,12 @@ pub(crate) fn align_forced_with_progress(
     report(ForcedAlignerProgressEvent::DecoderPrefilled);
 
     let hidden_size = prefill_input.hidden_size;
+    // `prefill_output.hidden` is ordinary host-owned output. Drop the much
+    // larger decoder graph/weight runtime before materializing the logits-head
+    // runtime so their transient GPU allocations never overlap.
+    drop(whole_decoder);
+    drop(prefill_input);
+    let mut logits_runtime = assets.logits_head.new_runtime(backend)?;
     let expected_timestamp_positions = word_list.len() * 2;
     if timestamp_positions.len() != expected_timestamp_positions {
         return Err(
@@ -547,35 +558,56 @@ pub(crate) fn align_forced_with_progress(
         );
     }
 
-    let mut raw_timestamps_ms = Vec::with_capacity(timestamp_positions.len());
-    // UI polling is much slower than one head projection. Cap observer calls
-    // at sixteen batches per segment so progress stays smooth without adding
-    // one registry lock per word boundary on long transcripts.
+    // Process bounded row batches instead of materializing a transcript-sized
+    // [vocab, timestamp_count] logits graph. This preserves graph/submission
+    // amortization while making peak memory independent of transcript length.
     report(ForcedAlignerProgressEvent::TimestampLogitsStarted {
         total: timestamp_positions.len(),
     });
-    let timestamp_report_stride = timestamp_positions.len().div_ceil(16).max(1);
-    for (index, &position) in timestamp_positions.iter().enumerate() {
-        let start = position * hidden_size;
-        let end = start + hidden_size;
-        let hidden_row = &prefill_output.hidden[start..end];
-        let bin =
-            logits_runtime.compute_top1_token_for_last_hidden(&assets.logits_head, hidden_row)?;
-        raw_timestamps_ms
-            .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
-        let completed = index + 1;
-        if completed == timestamp_positions.len()
-            || completed.is_multiple_of(timestamp_report_stride)
-        {
-            report(ForcedAlignerProgressEvent::TimestampLogits {
-                completed,
-                total: timestamp_positions.len(),
-            });
+    let mut raw_timestamps_ms = Vec::with_capacity(timestamp_positions.len());
+    let max_hidden_values = hidden_size
+        .checked_mul(FORCED_ALIGNER_LOGITS_BATCH_ROWS)
+        .ok_or(Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+            reason: "timestamp hidden-row batch capacity overflow".to_string(),
+        })?;
+    let mut timestamp_hidden = Vec::with_capacity(max_hidden_values);
+    for positions in timestamp_positions.chunks(FORCED_ALIGNER_LOGITS_BATCH_ROWS) {
+        timestamp_hidden.clear();
+        for &position in positions {
+            let start = position.checked_mul(hidden_size).ok_or(
+                Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                    reason: "timestamp hidden-row offset overflow".to_string(),
+                },
+            )?;
+            let end = start.checked_add(hidden_size).ok_or(
+                Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                    reason: "timestamp hidden-row end overflow".to_string(),
+                },
+            )?;
+            let row = prefill_output.hidden.get(start..end).ok_or(
+                Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                    reason: "timestamp hidden-row position exceeds prefill output".to_string(),
+                },
+            )?;
+            timestamp_hidden.extend_from_slice(row);
         }
+        let timestamp_bins = logits_runtime.compute_top1_tokens_for_hidden_rows(
+            &assets.logits_head,
+            &timestamp_hidden,
+            positions.len(),
+        )?;
+        raw_timestamps_ms.extend(
+            timestamp_bins
+                .into_iter()
+                .map(|bin| i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms)),
+        );
+        report(ForcedAlignerProgressEvent::TimestampLogits {
+            completed: raw_timestamps_ms.len(),
+            total: timestamp_positions.len(),
+        });
     }
 
     let fixed_ms = fix_timestamp(&raw_timestamps_ms)?;
-
     let mut items = Vec::with_capacity(word_list.len());
     for (index, word) in word_list.into_iter().enumerate() {
         let start_ms = fixed_ms[index * 2];
@@ -614,31 +646,98 @@ pub(crate) struct Qwen3ForcedAlignerSession {
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 }
 
+fn validate_forced_aligner_metal_quant_floor(
+    preflight: &GgufRuntimeSourcePreflight,
+) -> Result<(), String> {
+    validate_forced_aligner_metal_tensor_index(preflight.tensor_index())
+}
+
+fn validate_forced_aligner_metal_tensor_index(
+    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
+) -> Result<(), String> {
+    let violations = runtime_tensor_index_q8_floor_violations(
+        super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        tensor_index,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(first) = violations.first() {
+        return Err(format!(
+            "Metal requires the current forced-aligner Q8 safety floor; pack has {} violation(s), first tensor '{}' is {}",
+            violations.len(),
+            first.tensor,
+            crate::models::pack_quant_audit::ggml_type_name(first.ggml_type),
+        ));
+    }
+    Ok(())
+}
+
+/// Content-aware Auto policy for the forced aligner. Current packs satisfy
+/// the semantic Q8 floor and can use Metal's measured Pareto path. Legacy
+/// packs remain usable on CPU, but are excluded from Auto Metal because their
+/// over-quantized acoustic/boundary tensors violate the quality contract.
+pub(crate) fn forced_aligner_auto_gpu_policy_for_preflight(
+    preflight: &GgufRuntimeSourcePreflight,
+) -> crate::ggml_runtime::AutoGpuPolicy {
+    forced_aligner_auto_gpu_policy_for_tensor_index(preflight.tensor_index())
+}
+
+fn forced_aligner_auto_gpu_policy_for_tensor_index(
+    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
+) -> crate::ggml_runtime::AutoGpuPolicy {
+    if validate_forced_aligner_metal_tensor_index(tensor_index).is_ok() {
+        crate::ggml_runtime::AutoGpuPolicy::AllBackends
+    } else {
+        crate::ggml_runtime::AutoGpuPolicy::ExceptMetal
+    }
+}
+
+pub(crate) fn verify_forced_aligner_pack(
+    pack_path: &std::path::Path,
+) -> Result<VerifiedPack, Qwen3ForcedAlignerRuntimeError> {
+    let verified = PackVerifier
+        .verify_candidate(PackCandidate::new(pack_path))
+        .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<pack verifier>",
+            reason: error.to_string(),
+        })?;
+    if !matches!(
+        verified.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::ForcedAlignment,
+            ..
+        }
+    ) {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<pack route>",
+            reason: format!(
+                "expected auxiliary forced-alignment pack, got {:?}",
+                verified.route()
+            ),
+        });
+    }
+    Ok(verified)
+}
+
 impl Qwen3ForcedAlignerSession {
+    #[cfg(test)]
     pub(crate) fn load(
         pack_path: &std::path::Path,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
-        let verified = PackVerifier
-            .verify_candidate(PackCandidate::new(pack_path))
-            .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-                key: "<pack verifier>",
-                reason: error.to_string(),
+        Self::load_verified(verify_forced_aligner_pack(pack_path)?, backend)
+    }
+
+    pub(crate) fn load_verified(
+        verified: VerifiedPack,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
+        if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Metal) {
+            validate_forced_aligner_metal_quant_floor(verified.preflight()).map_err(|reason| {
+                Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+                    key: "<metal quantization floor>",
+                    reason,
+                }
             })?;
-        if !matches!(
-            verified.route(),
-            PackRoute::Aux {
-                kind: AuxPackKind::ForcedAlignment,
-                ..
-            }
-        ) {
-            return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-                key: "<pack route>",
-                reason: format!(
-                    "expected auxiliary forced-alignment pack, got {:?}",
-                    verified.route()
-                ),
-            });
         }
         let assets = load_forced_aligner_prepared_assets(verified.preflight(), backend)?;
         Ok(Self {
@@ -686,6 +785,63 @@ impl Qwen3ForcedAlignerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quant_floor_index(
+        output_type: i32,
+        token_embedding_type: i32,
+    ) -> crate::ggml_runtime::GgufTensorIndex {
+        crate::ggml_runtime::GgufTensorIndex::from_snapshot(
+            crate::ggml_runtime::GgufTensorIndexSnapshot {
+                path: "/nonexistent/forced-aligner-policy.oasr".into(),
+                data_section_offset_bytes: 0,
+                tensors: vec![
+                    crate::ggml_runtime::GgufTensorMetadata {
+                        name: "output.weight".to_string(),
+                        dims: vec![1024, 5000],
+                        ggml_type: output_type,
+                        type_name: "synthetic".to_string(),
+                        size_bytes: 0,
+                        offset_bytes: 0,
+                    },
+                    crate::ggml_runtime::GgufTensorMetadata {
+                        name: "token_embd.weight".to_string(),
+                        dims: vec![1024, 152_064],
+                        ggml_type: token_embedding_type,
+                        type_name: "synthetic".to_string(),
+                        size_bytes: 0,
+                        offset_bytes: 0,
+                    },
+                    crate::ggml_runtime::GgufTensorMetadata {
+                        name: "blk.0.ffn_gate.weight".to_string(),
+                        dims: vec![1024, 3072],
+                        ggml_type: crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32,
+                        type_name: "synthetic".to_string(),
+                        size_bytes: 0,
+                        offset_bytes: 0,
+                    },
+                ],
+            },
+        )
+        .expect("valid synthetic tensor index")
+    }
+
+    #[test]
+    fn forced_aligner_auto_metal_requires_the_semantic_q8_floor() {
+        let q8 = crate::models::pack_quant_audit::GGML_TYPE_Q8_0 as i32;
+        let q4 = crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32;
+        assert_eq!(
+            forced_aligner_auto_gpu_policy_for_tensor_index(&quant_floor_index(q8, q8)),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
+        assert_eq!(
+            forced_aligner_auto_gpu_policy_for_tensor_index(&quant_floor_index(q4, q8)),
+            crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
+        );
+        assert_eq!(
+            forced_aligner_auto_gpu_policy_for_tensor_index(&quant_floor_index(q8, q4)),
+            crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
+        );
+    }
 
     #[test]
     fn forced_aligner_frontend_keeps_the_callers_pcm_backing() {
@@ -793,8 +949,9 @@ mod tests {
             phase_samples.map(|samples| crate::testing::benchmark_median_seconds(samples).0);
         let phase_cumulative_fraction =
             phase_cumulative_median_seconds.map(|seconds| seconds / median_seconds);
+        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
         eprintln!(
-            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
+            "AUX_MODEL_BENCH model=qwen3-forced-aligner backend={backend:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} items={} output_sha256={output_sha256} runs={seconds:?} phase_cumulative_median_seconds={phase_cumulative_median_seconds:?} phase_cumulative_fraction={phase_cumulative_fraction:?}",
             median_seconds / audio_seconds,
             items.len(),
         );
@@ -913,24 +1070,14 @@ mod tests {
                 .align(pcm.full_slice(), text, &language)
                 .expect("align parity audio")
         };
-
         let cpu = run(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
         let metal = run(crate::ggml_runtime::GgmlCpuGraphBackend::Metal);
         assert_eq!(cpu.len(), metal.len(), "CPU/Metal item count");
-        let mut differences_ms = Vec::with_capacity(cpu.len() * 2);
-        for (index, (cpu_item, metal_item)) in cpu.iter().zip(&metal).enumerate() {
-            assert_eq!(cpu_item.text, metal_item.text, "item text at {index}");
-            differences_ms.push((cpu_item.start_time_s - metal_item.start_time_s).abs() * 1000.0);
-            differences_ms.push((cpu_item.end_time_s - metal_item.end_time_s).abs() * 1000.0);
-        }
-        differences_ms.sort_by(f64::total_cmp);
-        let median_ms = differences_ms[differences_ms.len() / 2];
-        let p95_ms = differences_ms[(differences_ms.len() - 1) * 95 / 100];
-        let max_ms = differences_ms[differences_ms.len() - 1];
+        let (median_ms, p95_ms, max_ms) = forced_aligner_timestamp_drift_stats(&cpu, &metal);
         eprintln!(
             "FORCED_ALIGNER_BACKEND_PARITY items={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3}",
             cpu.len(),
-            differences_ms.len(),
+            cpu.len() * 2,
         );
 
         assert!(
@@ -945,6 +1092,29 @@ mod tests {
             max_ms <= 320.0,
             "CPU/Metal maximum timestamp drift {max_ms:.3}ms exceeds four 80ms model bins"
         );
+    }
+
+    fn forced_aligner_timestamp_drift_stats(
+        expected: &[ForcedAlignItem],
+        actual: &[ForcedAlignItem],
+    ) -> (f64, f64, f64) {
+        assert_eq!(expected.len(), actual.len(), "forced-aligner item count");
+        let mut differences_ms = Vec::with_capacity(expected.len() * 2);
+        for (index, (expected_item, actual_item)) in expected.iter().zip(actual).enumerate() {
+            assert_eq!(
+                expected_item.text, actual_item.text,
+                "forced-aligner item text at {index}"
+            );
+            differences_ms
+                .push((expected_item.start_time_s - actual_item.start_time_s).abs() * 1000.0);
+            differences_ms.push((expected_item.end_time_s - actual_item.end_time_s).abs() * 1000.0);
+        }
+        differences_ms.sort_by(f64::total_cmp);
+        (
+            differences_ms[differences_ms.len() / 2],
+            differences_ms[(differences_ms.len() - 1) * 95 / 100],
+            differences_ms[differences_ms.len() - 1],
+        )
     }
 
     #[test]

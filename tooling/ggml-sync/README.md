@@ -16,9 +16,14 @@ The current local patch stack (oldest first):
 
 1. backend-dl: open plugins with `LOAD_WITH_ALTERED_SEARCH_PATH` on Windows.
 2. Filter `GGML_LOG_LEVEL_DEBUG` spam unless `GGML_DEBUG` / `OPENASR_GGML_DEBUG`.
-3. Persist the Metal pipeline cache (MTLBinaryArchive serialised to disk for
-   faster cold start).
-4. Isolate that Metal pipeline cache under an `openasr/` cache subdir.
+3. Precompile and embed capability-matched Metal libraries when a complete
+   Metal 3.1/4.0 build toolchain is available; otherwise preserve the portable
+   runtime-source fallback.
+4. Keep the additive Metal `MTLBinaryArchive` disk cache disabled by default.
+   It remains an explicit diagnostic opt-in under the isolated `openasr/`
+   cache subdir (`GGML_METAL_PIPELINE_CACHE_ENABLE=1` or an explicit
+   `GGML_METAL_PIPELINE_CACHE` directory); the in-process pipeline cache stays
+   enabled for every run.
 5. Default Metal residency sets on for Tensor-API devices and Apple-Silicon
    macOS GPUs; keep the conservative non-Tensor default on mobile and other
    devices (`GGML_METAL_RESIDENCY_ENABLE` / `GGML_METAL_NO_RESIDENCY` override).

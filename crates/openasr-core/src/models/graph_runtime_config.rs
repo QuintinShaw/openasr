@@ -66,7 +66,7 @@ pub(crate) fn apply_request_execution_placement(config: GgmlCpuGraphConfig) -> G
     apply_execution_placement(config, placement)
 }
 
-fn apply_execution_placement(
+pub(crate) fn apply_execution_placement(
     mut config: GgmlCpuGraphConfig,
     placement: ExecutionPlacement,
 ) -> GgmlCpuGraphConfig {
@@ -309,6 +309,36 @@ mod tests {
         );
 
         assert_eq!(config.backend, GgmlCpuGraphBackend::Cpu);
+        assert!(config.use_scheduler);
+    }
+
+    #[test]
+    fn full_device_disables_the_cross_backend_scheduler() {
+        let config = apply_execution_placement(
+            GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: true,
+                ..GgmlCpuGraphConfig::conservative_default()
+            },
+            ExecutionPlacement::FullDevice,
+        );
+
+        assert_eq!(config.backend, GgmlCpuGraphBackend::Metal);
+        assert!(!config.use_scheduler);
+    }
+
+    #[test]
+    fn hybrid_enables_the_cross_backend_scheduler() {
+        let config = apply_execution_placement(
+            GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: false,
+                ..GgmlCpuGraphConfig::conservative_default()
+            },
+            ExecutionPlacement::Hybrid,
+        );
+
+        assert_eq!(config.backend, GgmlCpuGraphBackend::Metal);
         assert!(config.use_scheduler);
     }
 

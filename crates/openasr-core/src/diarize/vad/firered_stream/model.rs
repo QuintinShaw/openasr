@@ -32,7 +32,7 @@ pub(crate) const PROJ: usize = 128;
 pub(crate) const NUM_BLOCKS: usize = 7;
 /// Frames of lookback history that must be carried across a chunk boundary
 /// (the FIR needs the previous `LOOKBACK_ORDER - 1` frames).
-const CACHE_FRAMES: usize = LOOKBACK_ORDER - 1;
+pub(super) const CACHE_FRAMES: usize = LOOKBACK_ORDER - 1;
 
 /// Per-session lookback state for the causal DFSMN stack: the trailing
 /// `<= LOOKBACK_ORDER - 1` frames of each of the 8 FSMN layers' inputs
@@ -58,6 +58,22 @@ impl FireRedStreamVadCache {
         self.fsmn1.clear();
         for block in &mut self.blocks {
             block.clear();
+        }
+    }
+
+    pub(super) fn layer(&self, index: usize) -> &[f32] {
+        if index == 0 {
+            &self.fsmn1
+        } else {
+            &self.blocks[index - 1]
+        }
+    }
+
+    pub(super) fn replace_layer(&mut self, index: usize, values: Vec<f32>) {
+        if index == 0 {
+            self.fsmn1 = values;
+        } else {
+            self.blocks[index - 1] = values;
         }
     }
 }
@@ -149,6 +165,10 @@ impl FireRedStreamVadModel {
             .saturating_add(fsmn) as u64)
             .saturating_mul(std::mem::size_of::<f32>() as u64);
         frontend_peak_bytes.max(feature_bytes.saturating_add(model_peak_bytes))
+    }
+
+    pub(super) fn weights(&self) -> &FireRedStreamVadWeights {
+        &self.weights
     }
 
     /// Causal forward over one chunk of `t` CMVN'd feature frames

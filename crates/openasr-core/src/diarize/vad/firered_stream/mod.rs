@@ -14,6 +14,7 @@
 //! mechanism to opt out of it.
 
 mod frontend;
+mod ggml_runtime;
 mod model;
 mod provider;
 mod streaming;
@@ -27,6 +28,16 @@ use std::sync::OnceLock;
 pub use model::FireRedStreamVadModel;
 pub use provider::{FireRedStreamVadError, FireRedStreamVadProvider};
 pub use streaming::FireRedStreamingVad;
+
+pub(crate) fn execution_capabilities() -> crate::device::execution_policy::ExecutionCapabilities {
+    crate::device::execution_policy::ExecutionCapabilities::new(true).with_provider(
+        crate::device::execution_route::ExecutionProvider::Metal,
+        crate::device::execution_policy::AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+}
+
+pub(crate) const AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
+    crate::ggml_runtime::AutoGpuPolicy::Never;
 
 static SHARED_MODEL: OnceLock<Option<FireRedStreamVadModel>> = OnceLock::new();
 

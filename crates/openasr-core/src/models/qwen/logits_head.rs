@@ -81,6 +81,22 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
         "qwen3-asr llm logits head hidden state has invalid shape: got {got}, expected hidden_size={expected}"
     )]
     InvalidHiddenStateShape { got: usize, expected: usize },
+    #[error(
+        "qwen3-asr llm logits head hidden rows have invalid shape: got {got} values for {row_count} row(s) of hidden_size={hidden_size}"
+    )]
+    InvalidHiddenRowsShape {
+        got: usize,
+        row_count: usize,
+        hidden_size: usize,
+    },
+    #[error(
+        "qwen3-asr llm logits head output rows have invalid shape: got {got} values for {row_count} row(s) of vocab_size={vocab_size}"
+    )]
+    InvalidLogitsRowsShape {
+        got: usize,
+        row_count: usize,
+        vocab_size: usize,
+    },
     #[error("qwen3-asr llm logits head inputs contain non-finite values")]
     NonFiniteInputs,
     #[error("qwen3-asr llm logits head fallback values are unavailable")]
@@ -313,6 +329,33 @@ impl Qwen3AsrLlmLogitsHead {
         Ok(logits)
     }
 
+    fn compute_logits_for_hidden_rows(
+        &self,
+        hidden: &[f32],
+        row_count: usize,
+    ) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+        let expected = self
+            .d_model
+            .checked_mul(row_count)
+            .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+        if row_count == 0 || hidden.len() != expected {
+            return Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape {
+                got: hidden.len(),
+                row_count,
+                hidden_size: self.d_model,
+            });
+        }
+        let output_len = self
+            .vocab_size
+            .checked_mul(row_count)
+            .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+        let mut logits = Vec::with_capacity(output_len);
+        for row in hidden.chunks_exact(self.d_model) {
+            logits.extend(self.compute_logits_for_last_hidden(row)?);
+        }
+        Ok(logits)
+    }
+
     pub(crate) fn compute_top1_token_for_last_hidden(
         &self,
         hidden: &[f32],
@@ -390,6 +433,67 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
             return validate_top1_token_id(token_id, head.vocab_size);
         }
         head.compute_top1_token_for_last_hidden(hidden)
+    }
+
+    pub(crate) fn compute_top1_tokens_for_hidden_rows(
+        &mut self,
+        head: &Qwen3AsrLlmLogitsHead,
+        hidden: &[f32],
+        row_count: usize,
+    ) -> Result<Vec<u32>, Qwen3AsrLlmLogitsHeadError> {
+        self.validate_head(head)?;
+        let expected_hidden = head
+            .d_model
+            .checked_mul(row_count)
+            .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+        if row_count == 0 || hidden.len() != expected_hidden {
+            return Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape {
+                got: hidden.len(),
+                row_count,
+                hidden_size: head.d_model,
+            });
+        }
+        if hidden.iter().any(|value| !value.is_finite()) {
+            return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
+        }
+        if let Some(executor) = self.executor.as_mut() {
+            let token_ids = executor
+                .compute_top1_rows(hidden, row_count)
+                .map_err(|source| Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                    reason: source.to_string(),
+                })?;
+            return token_ids
+                .into_iter()
+                .map(|token_id| validate_top1_token_id(token_id, head.vocab_size))
+                .collect();
+        }
+        let logits = head.compute_logits_for_hidden_rows(hidden, row_count)?;
+        let expected = head
+            .vocab_size
+            .checked_mul(row_count)
+            .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+        if logits.len() != expected {
+            return Err(Qwen3AsrLlmLogitsHeadError::InvalidLogitsRowsShape {
+                got: logits.len(),
+                row_count,
+                vocab_size: head.vocab_size,
+            });
+        }
+        logits
+            .chunks_exact(head.vocab_size)
+            .map(|row| {
+                let mut best_index = 0usize;
+                let mut best_value = f32::NEG_INFINITY;
+                for (index, value) in row.iter().copied().enumerate() {
+                    if value > best_value {
+                        best_index = index;
+                        best_value = value;
+                    }
+                }
+                u32::try_from(best_index)
+                    .map_err(|_| Qwen3AsrLlmLogitsHeadError::AllocationOverflow)
+            })
+            .collect()
     }
 
     fn validate_head(
@@ -597,15 +701,11 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             });
         }
 
-        // Norm + a single [1, d_model] x [d_model, vocab_size] projection per
-        // call -- a thin, memory-bandwidth-bound matrix-vector product with
-        // one output row, run once per decode step at the same cadence as
-        // the whole-decoder executor this feeds (thousands of decode-step
-        // calls dominating over a handful of prefill chunks). Little
-        // row-level parallelism to hand out per call regardless of thread
-        // count, so this takes the `Decoder` tier from
-        // `qwen_decoder_graph_config` on its own merits (there is no
-        // separate firered-aed logits-head module to mirror here).
+        // The regular autoregressive path projects one row per call, while
+        // forced alignment projects every timestamp row in one matrix. Both
+        // use the decoder execution tier because they share the same output
+        // matrix and execution lane; the batched form amortizes graph setup
+        // and GPU submission without introducing a second runtime owner.
         let mut config = qwen_decoder_graph_config(backend);
         config.context_bytes = QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES;
         let runner = GgmlCpuGraphRunner::new(config)?;
@@ -647,21 +747,42 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
     }
 
     fn compute(&mut self, hidden: &[f32]) -> Result<Vec<f32>, GgmlCpuGraphError> {
-        if hidden.len() != self.d_model {
+        self.compute_rows(hidden, 1)
+    }
+
+    fn compute_rows(
+        &mut self,
+        hidden: &[f32],
+        row_count: usize,
+    ) -> Result<Vec<f32>, GgmlCpuGraphError> {
+        let expected_hidden =
+            self.d_model
+                .checked_mul(row_count)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "logits head hidden rows shape overflow",
+                })?;
+        if row_count == 0 || hidden.len() != expected_hidden {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "logits head hidden width mismatch",
+                reason: "logits head hidden rows shape mismatch",
             });
         }
+        let output_len =
+            self.vocab_size
+                .checked_mul(row_count)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "logits head output rows shape overflow",
+                })?;
         let mut graph = self.runner.start_graph();
-        let hidden_tensor = graph.new_tensor_2d_f32(self.d_model, 1, "qwen_llm_logits_hidden")?;
+        let hidden_tensor =
+            graph.new_tensor_2d_f32(self.d_model, row_count, "qwen_llm_logits_hidden_rows")?;
         graph.set_input(hidden_tensor)?;
         let normed = graph.rms_norm(hidden_tensor, self.rms_norm_epsilon)?;
         let normed = graph.mul(normed, self.arena.graph_tensor(self.output_norm_weight))?;
         let logits = graph.mul_mat(self.arena.graph_tensor(self.output_weight), normed)?;
         graph.set_output(logits)?;
         graph.prepare_outputs_for_upload(&[logits])?;
-        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden")?;
-        graph.compute_output_f32(logits, self.vocab_size)
+        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden_rows")?;
+        graph.compute_output_f32(logits, output_len)
     }
 
     fn compute_top1(&mut self, hidden: &[f32]) -> Result<i32, GgmlCpuGraphError> {
@@ -675,12 +796,33 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         // and has segfaulted under Hy-MT2 decode. The hot greedy path is fused
         // into the resident whole-decoder graph instead; keep this shared Qwen
         // helper as a simple fallback with no hidden persistent crash path.
-        self.compute_top1_single_graph(hidden)
+        self.compute_top1_rows(hidden, 1)?.into_iter().next().ok_or(
+            GgmlCpuGraphError::OutputByteSizeMismatch {
+                expected: std::mem::size_of::<i32>(),
+                actual: 0,
+            },
+        )
     }
 
-    fn compute_top1_single_graph(&mut self, hidden: &[f32]) -> Result<i32, GgmlCpuGraphError> {
+    fn compute_top1_rows(
+        &mut self,
+        hidden: &[f32],
+        row_count: usize,
+    ) -> Result<Vec<i32>, GgmlCpuGraphError> {
+        let expected_hidden =
+            self.d_model
+                .checked_mul(row_count)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "logits head top-1 hidden rows shape overflow",
+                })?;
+        if row_count == 0 || hidden.len() != expected_hidden {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "logits head top-1 hidden rows shape mismatch",
+            });
+        }
         let mut graph = self.runner.start_graph();
-        let hidden_tensor = graph.new_tensor_2d_f32(self.d_model, 1, "qwen_llm_logits_hidden")?;
+        let hidden_tensor =
+            graph.new_tensor_2d_f32(self.d_model, row_count, "qwen_llm_logits_top1_hidden_rows")?;
         graph.set_input(hidden_tensor)?;
         let normed = graph.rms_norm(hidden_tensor, self.rms_norm_epsilon)?;
         let normed = graph.mul(normed, self.arena.graph_tensor(self.output_norm_weight))?;
@@ -691,17 +833,14 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         )?;
         graph.set_output(top1)?;
         graph.prepare_outputs_for_upload(&[top1])?;
-        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden")?;
-        let token_ids = graph.compute_output_i32(top1, 1)?;
-        let reversed_token_id =
-            token_ids
-                .first()
-                .copied()
-                .ok_or(GgmlCpuGraphError::OutputByteSizeMismatch {
-                    expected: std::mem::size_of::<i32>(),
-                    actual: 0,
-                })?;
-        first_max_token_id_from_reversed_argmax(reversed_token_id, self.vocab_size)
+        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_top1_hidden_rows")?;
+        graph
+            .compute_output_i32(top1, row_count)?
+            .into_iter()
+            .map(|reversed_token_id| {
+                first_max_token_id_from_reversed_argmax(reversed_token_id, self.vocab_size)
+            })
+            .collect()
     }
 }
 
@@ -937,6 +1076,57 @@ mod tests {
     }
 
     #[test]
+    fn logits_head_host_batch_matches_concatenated_single_rows() {
+        let head = Qwen3AsrLlmLogitsHead {
+            runtime_identity: next_logits_head_runtime_identity(),
+            d_model: 2,
+            vocab_size: 3,
+            rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+            output_norm_weight: vec![0.75, 1.25],
+            output_weight_tensor_name: OUTPUT_WEIGHT_TENSOR_NAME,
+            output_weight_values: Some(vec![
+                0.1, 0.2, //
+                0.3, -0.4, //
+                -0.5, 0.6,
+            ]),
+            output_weight_layout: OutputWeightLayout::VocabHidden,
+            ggml_output_weight: None,
+        };
+        let hidden = [1.0, 2.0, 2.0, 1.0, -1.0, 0.5];
+        let batch = head
+            .compute_logits_for_hidden_rows(&hidden, 3)
+            .expect("host batch logits");
+        let expected = hidden
+            .chunks_exact(2)
+            .flat_map(|row| {
+                head.compute_logits_for_last_hidden(row)
+                    .expect("single-row logits")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batch, expected);
+    }
+
+    #[test]
+    fn logits_head_batch_rejects_empty_mismatched_and_non_finite_rows() {
+        let head = ggml_logits_head(vec![1.0, 1.0]);
+        let mut runtime = head
+            .new_runtime(GgmlCpuGraphBackend::Cpu)
+            .expect("build explicit logits runtime");
+        assert!(matches!(
+            runtime.compute_top1_tokens_for_hidden_rows(&head, &[], 0),
+            Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape { .. })
+        ));
+        assert!(matches!(
+            runtime.compute_top1_tokens_for_hidden_rows(&head, &[1.0, 2.0, 3.0], 2),
+            Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape { .. })
+        ));
+        assert!(matches!(
+            runtime.compute_top1_tokens_for_hidden_rows(&head, &[1.0, f32::NAN, 2.0, 3.0], 2,),
+            Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs)
+        ));
+    }
+
+    #[test]
     fn logits_head_layout_resolves_hidden_vocab_for_canonical_dims() {
         let layout = resolve_output_weight_layout(&[1024, 151936], 1024, 151936)
             .expect("canonical dims should resolve");
@@ -1013,8 +1203,8 @@ mod tests {
             rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
             output_norm_weight,
             output_weight_tensor_name: OUTPUT_WEIGHT_TENSOR_NAME,
-            output_weight_values: None,
-            output_weight_layout: OutputWeightLayout::HiddenVocab,
+            output_weight_values: Some(output_weight_values.to_vec()),
+            output_weight_layout: OutputWeightLayout::VocabHidden,
             ggml_output_weight: Some(OwnedGgmlLogitsWeight {
                 ggml_type: crate::ggml_runtime::GGML_TYPE_F32,
                 dims: vec![2, 3],
@@ -1047,5 +1237,26 @@ mod tests {
             runtime.compute_top1_token_for_last_hidden(&distinct_head, &[1.0, 2.0]),
             Err(Qwen3AsrLlmLogitsHeadError::RuntimeHeadMismatch)
         ));
+    }
+
+    #[test]
+    fn explicit_runtime_batch_top1_matches_repeated_single_row_graphs() {
+        let head = ggml_logits_head(vec![1.0, 0.75]);
+        let hidden = [1.0, 2.0, 2.0, 1.0, -1.0, 0.5];
+        let mut runtime = head
+            .new_runtime(GgmlCpuGraphBackend::Cpu)
+            .expect("build explicit logits runtime");
+        let batched = runtime
+            .compute_top1_tokens_for_hidden_rows(&head, &hidden, 3)
+            .expect("batched top-1");
+        let repeated = hidden
+            .chunks_exact(2)
+            .map(|row| {
+                runtime
+                    .compute_top1_token_for_last_hidden(&head, row)
+                    .expect("single-row top-1")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batched, repeated);
     }
 }

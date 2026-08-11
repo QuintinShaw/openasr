@@ -740,6 +740,11 @@ pub struct NativeExecutionServices {
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
             crate::diarize::segment::DiariZenRuntime,
         >,
+    pyannote_segmenter_actors:
+        super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
+            super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+            crate::diarize::segment::PyannetGgmlRuntime,
+        >,
     redimnet_runtime_actors:
         super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
@@ -813,6 +818,14 @@ impl NativeExecutionServices {
                         crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
                     ),
                 ),
+            pyannote_segmenter_actors:
+                super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool::new(
+                    "openasr-pyannote-owner",
+                    super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPoolLimits::new(
+                        4,
+                        crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+                    ),
+                ),
             redimnet_runtime_actors:
                 super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
                     "openasr-redimnet-owner",
@@ -871,6 +884,15 @@ impl NativeExecutionServices {
         &self.diarizen_segmenter_actors
     }
 
+    pub(crate) fn pyannote_segmenter_actors(
+        &self,
+    ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
+        super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+        crate::diarize::segment::PyannetGgmlRuntime,
+    > {
+        &self.pyannote_segmenter_actors
+    }
+
     pub(crate) fn redimnet_runtime_actors(
         &self,
     ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
@@ -897,6 +919,7 @@ impl NativeExecutionServices {
         self.hymt2_translation_actors.clear();
         self.firered_punc_actors.clear();
         self.diarizen_segmenter_actors.clear();
+        self.pyannote_segmenter_actors.clear();
         self.redimnet_runtime_actors.clear();
     }
 
@@ -914,6 +937,8 @@ impl NativeExecutionServices {
         self.firered_punc_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.diarizen_segmenter_actors
+            .evict_where(|key| key.has_content_id(pack_content_id));
+        self.pyannote_segmenter_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.redimnet_runtime_actors
             .evict_where(|key| key.has_content_id(pack_content_id));

@@ -22,8 +22,8 @@ use crate::diarize::embed::ops::conv1d;
 use crate::diarize::embed::weights::{Weights, WeightsError};
 
 const EPS: f32 = 1e-5;
-const ALPHA: f32 = 0.01;
-const HIDDEN: usize = 128;
+pub(super) const ALPHA: f32 = 0.01;
+pub(super) const HIDDEN: usize = 128;
 /// Minimum input samples that still form one output frame through the SincNet
 /// conv/pool chain (conv0 k251 s10 → 3× maxpool/3 + 2× conv k5). Below this the
 /// segmenter returns no frames instead of underflowing.
@@ -103,7 +103,7 @@ const fn max_usize(lhs: usize, rhs: usize) -> usize {
 
 /// Per-layer LSTM weight names (W input, R recurrent, B bias) in the exported
 /// ONNX graph.
-const LSTM_WEIGHTS: [(&str, &str, &str); 4] = [
+pub(super) const LSTM_WEIGHTS: [(&str, &str, &str); 4] = [
     ("onnx::LSTM_784", "onnx::LSTM_785", "onnx::LSTM_783"),
     ("onnx::LSTM_827", "onnx::LSTM_828", "onnx::LSTM_826"),
     ("onnx::LSTM_870", "onnx::LSTM_871", "onnx::LSTM_869"),
@@ -117,25 +117,19 @@ pub(crate) struct PyannetModel {
 impl PyannetModel {
     #[cfg(test)]
     pub(crate) fn from_safetensors(bytes: &[u8]) -> Result<Self, WeightsError> {
-        Ok(Self {
-            w: Weights::from_safetensors(bytes)?,
-        })
+        Self::from_weights(Weights::from_safetensors(bytes)?)
     }
 
     /// Load from a diarization `.oasr` (GGUF-v0) pack.
     #[cfg(test)]
     pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, WeightsError> {
-        Ok(Self {
-            w: Weights::from_oasr(path)?,
-        })
+        Self::from_weights(Weights::from_oasr(path)?)
     }
 
     pub(crate) fn from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     ) -> Result<Self, WeightsError> {
-        Ok(Self {
-            w: Weights::from_preflight(preflight)?,
-        })
+        Self::from_weights(Weights::from_preflight(preflight)?)
     }
 
     pub(crate) fn quoted_persistent_host_commitment_bytes(
@@ -148,12 +142,50 @@ impl PyannetModel {
         self.w.persistent_host_commitment_bytes()
     }
 
+    fn from_weights(w: Weights) -> Result<Self, WeightsError> {
+        let model = Self { w };
+        model.validate_weight_contract()?;
+        Ok(model)
+    }
+
+    /// Family-owned, validated logical weights. Accelerated implementations
+    /// consume this view only after the same constructor contract has closed.
+    pub(super) const fn weights(&self) -> &Weights {
+        &self.w
+    }
+
     /// Run the network on `samples` (16 kHz mono) and return the per-frame
     /// log-probabilities (`[frames, 7]` row-major) plus the frame count.
     pub(crate) fn forward(&self, samples: &[f32]) -> Result<(Vec<f32>, usize), WeightsError> {
         let (h, frames) = self.sincnet(samples)?;
         // transpose [60, frames] -> [frames, 60] for the recurrent stack.
-        let mut feat = transpose(&h, 60, frames);
+        let feat = transpose(&h, 60, frames);
+        Ok((self.recurrent_classifier(&feat, frames)?, frames))
+    }
+
+    /// Host SincNet boundary shared by the CPU and Metal implementations.
+    /// The returned payload is channel-major `[60, frames]`.
+    pub(super) fn sincnet_features(
+        &self,
+        samples: &[f32],
+    ) -> Result<(Vec<f32>, usize), WeightsError> {
+        self.sincnet(samples)
+    }
+
+    /// Recurrent stack plus classifier on row-major `[frames, 60]` features.
+    pub(super) fn recurrent_classifier(
+        &self,
+        features: &[f32],
+        frames: usize,
+    ) -> Result<Vec<f32>, WeightsError> {
+        let expected = frames.saturating_mul(60);
+        if features.len() != expected {
+            return Err(WeightsError::InvalidInput(format!(
+                "PyanNet recurrent input has {} values, expected {expected}",
+                features.len()
+            )));
+        }
+        let mut feat = features.to_vec();
         let mut in_size = 60;
         for (w_name, r_name, b_name) in LSTM_WEIGHTS {
             let w = self.w.get(w_name)?;
@@ -162,8 +194,7 @@ impl PyannetModel {
             feat = lstm_bidirectional(&feat, frames, in_size, w, r, b, HIDDEN);
             in_size = 2 * HIDDEN;
         }
-        let logp = self.classifier(&feat, frames)?;
-        Ok((logp, frames))
+        self.classifier(&feat, frames)
     }
 
     /// SincNet front-end: returns `([60, frames]` channel-major, `frames)`.
@@ -265,10 +296,56 @@ impl PyannetModel {
         instance_norm_inplace(x, c, l, Some(gamma), Some(beta), EPS);
         Ok(())
     }
+
+    fn validate_weight_contract(&self) -> Result<(), WeightsError> {
+        for (name, shape) in [
+            ("sincnet.wav_norm1d.weight", &[1][..]),
+            ("sincnet.wav_norm1d.bias", &[1][..]),
+            ("/sincnet/conv1d.0/Concat_2_output_0", &[80, 1, 251][..]),
+            ("sincnet.norm1d.0.weight", &[80][..]),
+            ("sincnet.norm1d.0.bias", &[80][..]),
+            ("sincnet.conv1d.1.weight", &[60, 80, 5][..]),
+            ("sincnet.conv1d.1.bias", &[60][..]),
+            ("sincnet.norm1d.1.weight", &[60][..]),
+            ("sincnet.norm1d.1.bias", &[60][..]),
+            ("sincnet.conv1d.2.weight", &[60, 60, 5][..]),
+            ("sincnet.conv1d.2.bias", &[60][..]),
+            ("sincnet.norm1d.2.weight", &[60][..]),
+            ("sincnet.norm1d.2.bias", &[60][..]),
+            ("onnx::MatMul_915", &[256, 128][..]),
+            ("linear.0.bias", &[128][..]),
+            ("onnx::MatMul_916", &[128, 128][..]),
+            ("linear.1.bias", &[128][..]),
+            ("onnx::MatMul_917", &[128, NUM_CLASSES][..]),
+            ("classifier.bias", &[NUM_CLASSES][..]),
+        ] {
+            self.expect_shape(name, shape)?;
+        }
+        for (layer, (w_name, r_name, b_name)) in LSTM_WEIGHTS.into_iter().enumerate() {
+            let input = if layer == 0 { 60 } else { 2 * HIDDEN };
+            self.expect_shape(w_name, &[2, 4 * HIDDEN, input])?;
+            self.expect_shape(r_name, &[2, 4 * HIDDEN, HIDDEN])?;
+            self.expect_shape(b_name, &[2, 8 * HIDDEN])?;
+        }
+        Ok(())
+    }
+
+    fn expect_shape(&self, name: &str, want: &[usize]) -> Result<(), WeightsError> {
+        let got = self.w.shape(name)?;
+        if got == want {
+            Ok(())
+        } else {
+            Err(WeightsError::ShapeMismatch {
+                name: name.to_string(),
+                got: got.to_vec(),
+                want: want.to_vec(),
+            })
+        }
+    }
 }
 
 /// Transpose a `[rows, cols]` channel-major buffer to `[cols, rows]`.
-fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+pub(super) fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
