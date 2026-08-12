@@ -64,6 +64,26 @@ const DEFAULT_RMS_NORM_EPSILON: f32 = 1.0e-6;
 /// still amortizing graph construction and GPU submission across many words.
 /// The bound is independent of transcript length.
 const FORCED_ALIGNER_LOGITS_BATCH_ROWS: usize = 64;
+// A <=2% odds advantage is below the cross-backend reduction-order envelope
+// measured for this Q8 classification head. Treat such candidates as a
+// numerical tie and choose the later timestamp bin deterministically. The
+// logits themselves still run on the selected backend; this is only the
+// ordered-class decision rule that prevents a near-tie from becoming a
+// multi-bin word-boundary jump.
+const FORCED_ALIGNER_TIMESTAMP_TIE_LOGIT_DELTA: f32 = 0.019_802_627;
+
+fn stable_timestamp_bin(logits: &[f32]) -> Option<u32> {
+    if logits.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let best = logits.iter().copied().reduce(f32::max)?;
+    let floor = best - FORCED_ALIGNER_TIMESTAMP_TIE_LOGIT_DELTA;
+    logits.iter().enumerate().rev().find_map(|(index, &value)| {
+        (value >= floor)
+            .then(|| u32::try_from(index).ok())
+            .flatten()
+    })
+}
 
 const KEY_SAMPLE_RATE: &str = "qwen3_forced_aligner.audio.sample_rate_hz";
 const KEY_N_MELS: &str = "qwen3_forced_aligner.audio.n_mels";
@@ -641,16 +661,20 @@ pub(crate) fn align_forced_with_progress(
             )?;
             timestamp_hidden.extend_from_slice(row);
         }
-        let timestamp_bins = logits_runtime.compute_top1_tokens_for_hidden_rows(
+        let logits = logits_runtime.compute_logits_for_hidden_rows(
             &assets.logits_head,
             &timestamp_hidden,
             positions.len(),
         )?;
-        raw_timestamps_ms.extend(
-            timestamp_bins
-                .into_iter()
-                .map(|bin| i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms)),
-        );
+        for row in logits.chunks_exact(assets.metadata.classify_num) {
+            let bin = stable_timestamp_bin(row).ok_or_else(|| {
+                Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                    reason: "timestamp classification produced an empty logits row".to_string(),
+                }
+            })?;
+            raw_timestamps_ms
+                .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
+        }
         report(ForcedAlignerProgressEvent::TimestampLogits {
             completed: raw_timestamps_ms.len(),
             total: timestamp_positions.len(),
@@ -815,6 +839,16 @@ impl Qwen3ForcedAlignerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_timestamp_bin_keeps_clear_winner_and_resolves_near_tie_late() {
+        assert_eq!(stable_timestamp_bin(&[]), None);
+        assert_eq!(stable_timestamp_bin(&[1.0, 1.05, 1.0]), Some(1));
+        assert_eq!(stable_timestamp_bin(&[1.0, 1.01, 1.0]), Some(2));
+        assert_eq!(stable_timestamp_bin(&[1.0, 1.01, 1.01]), Some(2));
+        assert_eq!(stable_timestamp_bin(&[1.0, f32::NAN, 1.0]), None);
+        assert_eq!(stable_timestamp_bin(&[1.0, f32::INFINITY]), None);
+    }
 
     fn quant_floor_index(
         output_type: i32,

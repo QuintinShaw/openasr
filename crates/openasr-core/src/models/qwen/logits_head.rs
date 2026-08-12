@@ -103,6 +103,8 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
     },
     #[error("qwen3-asr llm logits head inputs contain non-finite values")]
     NonFiniteInputs,
+    #[error("qwen3-asr llm logits head outputs contain non-finite values")]
+    NonFiniteOutputs,
     #[error("qwen3-asr llm logits head fallback values are unavailable")]
     OutputWeightValuesUnavailable,
     #[error("qwen3-asr llm logits runtime was paired with a different prepared head")]
@@ -328,7 +330,7 @@ impl Qwen3AsrLlmLogitsHead {
             }
         }
         if logits.iter().any(|value| !value.is_finite()) {
-            return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
+            return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteOutputs);
         }
         Ok(logits)
     }
@@ -388,6 +390,39 @@ impl Qwen3AsrLlmLogitsHead {
 }
 
 impl Qwen3AsrLlmLogitsHeadRuntime {
+    pub(crate) fn compute_logits_for_hidden_rows(
+        &mut self,
+        head: &Qwen3AsrLlmLogitsHead,
+        hidden: &[f32],
+        row_count: usize,
+    ) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+        self.validate_head(head)?;
+        let expected_hidden = head
+            .d_model
+            .checked_mul(row_count)
+            .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+        if row_count == 0 || hidden.len() != expected_hidden {
+            return Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape {
+                got: hidden.len(),
+                row_count,
+                hidden_size: head.d_model,
+            });
+        }
+        if hidden.iter().any(|value| !value.is_finite()) {
+            return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
+        }
+        let logits = if let Some(executor) = self.executor.as_mut() {
+            executor.compute_rows(hidden, row_count).map_err(|source| {
+                Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                    reason: source.to_string(),
+                }
+            })?
+        } else {
+            head.compute_logits_for_hidden_rows(hidden, row_count)?
+        };
+        validate_logits_rows(logits, row_count, head.vocab_size)
+    }
+
     pub(crate) fn compute_logits_for_last_hidden(
         &mut self,
         head: &Qwen3AsrLlmLogitsHead,
@@ -404,11 +439,12 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
             if hidden.iter().any(|value| !value.is_finite()) {
                 return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
             }
-            return executor.compute(hidden).map_err(|source| {
+            let logits = executor.compute(hidden).map_err(|source| {
                 Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
                     reason: source.to_string(),
                 }
-            });
+            })?;
+            return validate_logits_rows(logits, 1, head.vocab_size);
         }
         head.compute_logits_for_last_hidden(hidden)
     }
@@ -439,6 +475,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
         head.compute_top1_token_for_last_hidden(hidden)
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_top1_tokens_for_hidden_rows(
         &mut self,
         head: &Qwen3AsrLlmLogitsHead,
@@ -510,6 +547,27 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
             Err(Qwen3AsrLlmLogitsHeadError::RuntimeHeadMismatch)
         }
     }
+}
+
+fn validate_logits_rows(
+    logits: Vec<f32>,
+    row_count: usize,
+    vocab_size: usize,
+) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+    let expected = vocab_size
+        .checked_mul(row_count)
+        .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+    if logits.len() != expected {
+        return Err(Qwen3AsrLlmLogitsHeadError::InvalidLogitsRowsShape {
+            got: logits.len(),
+            row_count,
+            vocab_size,
+        });
+    }
+    if logits.iter().any(|value| !value.is_finite()) {
+        return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteOutputs);
+    }
+    Ok(logits)
 }
 
 #[cfg(test)]
@@ -1123,12 +1181,40 @@ mod tests {
             Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape { .. })
         ));
         assert!(matches!(
+            runtime.compute_logits_for_hidden_rows(&head, &[], 0),
+            Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape { .. })
+        ));
+        assert!(matches!(
             runtime.compute_top1_tokens_for_hidden_rows(&head, &[1.0, 2.0, 3.0], 2),
+            Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape { .. })
+        ));
+        assert!(matches!(
+            runtime.compute_logits_for_hidden_rows(&head, &[1.0, 2.0, 3.0], 2),
             Err(Qwen3AsrLlmLogitsHeadError::InvalidHiddenRowsShape { .. })
         ));
         assert!(matches!(
             runtime.compute_top1_tokens_for_hidden_rows(&head, &[1.0, f32::NAN, 2.0, 3.0], 2,),
             Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs)
+        ));
+        assert!(matches!(
+            runtime.compute_logits_for_hidden_rows(&head, &[1.0, f32::NAN, 2.0, 3.0], 2,),
+            Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs)
+        ));
+    }
+
+    #[test]
+    fn logits_row_postcondition_rejects_wrong_shape_and_non_finite_outputs() {
+        assert!(matches!(
+            validate_logits_rows(vec![1.0, 2.0], 1, 3),
+            Err(Qwen3AsrLlmLogitsHeadError::InvalidLogitsRowsShape { .. })
+        ));
+        assert!(matches!(
+            validate_logits_rows(vec![1.0, f32::NAN, 2.0], 1, 3),
+            Err(Qwen3AsrLlmLogitsHeadError::NonFiniteOutputs)
+        ));
+        assert!(matches!(
+            validate_logits_rows(vec![1.0, f32::INFINITY, 2.0], 1, 3),
+            Err(Qwen3AsrLlmLogitsHeadError::NonFiniteOutputs)
         ));
     }
 
@@ -1252,6 +1338,18 @@ mod tests {
         let mut runtime = head
             .new_runtime(GgmlCpuGraphBackend::Cpu)
             .expect("build explicit logits runtime");
+        let batched_logits = runtime
+            .compute_logits_for_hidden_rows(&head, &hidden, 3)
+            .expect("batched logits");
+        let repeated_logits = hidden
+            .chunks_exact(2)
+            .flat_map(|row| {
+                runtime
+                    .compute_logits_for_last_hidden(&head, row)
+                    .expect("single-row logits")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batched_logits, repeated_logits);
         let batched = runtime
             .compute_top1_tokens_for_hidden_rows(&head, &hidden, 3)
             .expect("batched top-1");
