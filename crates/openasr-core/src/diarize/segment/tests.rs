@@ -571,9 +571,14 @@ fn pyannet_cpu_and_metal_stay_within_measured_near_tie_envelope_on_aux_audio() {
         activity_mismatches,
         class_mismatches.iter().take(12).collect::<Vec<_>>()
     );
+    // The accelerated runtime now includes SincNet as well as the recurrent
+    // stack. Its direct ggml convolutions use a different, deterministic f32
+    // reduction order from the scalar family oracle; the full-graph regression
+    // pins that bounded numeric envelope while the class assertion below keeps
+    // the semantic contract exact.
     assert!(
-        ggml_cpu_max_abs < 2e-4,
-        "ggml CPU graph drifted from family math"
+        ggml_cpu_max_abs < 5e-4,
+        "ggml CPU full-graph max abs {ggml_cpu_max_abs} drifted from family math"
     );
     assert_eq!(
         ggml_cpu_class_mismatches, 0,
