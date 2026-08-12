@@ -10,7 +10,10 @@ use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d as nn_reshape_bias_4d,
 };
-use crate::nn::encoder::build_relative_positional_encoding;
+use crate::nn::encoder::{
+    SinusoidalChannelLayout, build_sinusoidal_position_encoding_graph,
+    relative_position_inverse_timescales,
+};
 use crate::nn::half::f32_to_f16_bits;
 
 use super::encoder_weights::{CohereEncoderLayerWeights, CohereTranscribeEncoderWeights};
@@ -124,6 +127,7 @@ pub(crate) struct CohereTranscribeEncoderGraphRuntime {
     runner: GgmlCpuGraphRunner,
     loaded_weights: Option<GgmlLoadedWeightContext>,
     arena: GgmlStaticTensorArena,
+    relative_position_inverse_timescales: GgmlStaticTensor,
     prelude: CohereEncoderPreludeRuntime,
     layers: Vec<CohereEncoderLayerRuntime>,
 }
@@ -224,7 +228,7 @@ impl CohereTranscribeEncoderGraphRuntime {
             .layers
             .len()
             .checked_mul(35)
-            .and_then(|count| count.checked_add(14))
+            .and_then(|count| count.checked_add(15))
             .ok_or(CohereTranscribeEncoderError::ShapeOverflow)?;
         let mut arena = runner
             .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
@@ -235,6 +239,17 @@ impl CohereTranscribeEncoderGraphRuntime {
                 source,
             })?;
         let arena_ms = arena_start.elapsed().as_secs_f64() * 1000.0;
+
+        let relative_position_inv = arena
+            .new_tensor_2d_f32(
+                1,
+                metadata.encoder_d_model / 2,
+                "cohere_relative_position_inverse_timescales",
+            )
+            .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
+                step: "relative_position_inverse_timescales",
+                source,
+            })?;
 
         let prelude_decl_start = Instant::now();
         let prelude = CohereEncoderPreludeRuntime {
@@ -501,6 +516,12 @@ impl CohereTranscribeEncoderGraphRuntime {
         let layer_decl_ms = layer_decl_start.elapsed().as_secs_f64() * 1000.0;
 
         let prelude_upload_start = Instant::now();
+        upload_static_f32(
+            &mut arena,
+            relative_position_inv,
+            &relative_position_inverse_timescales(metadata.encoder_d_model),
+            "cohere_relative_position_inverse_timescales",
+        )?;
         upload_static_tensor_weight_with_expected_type(
             &mut arena,
             prelude.pre_conv0_weight,
@@ -614,6 +635,7 @@ impl CohereTranscribeEncoderGraphRuntime {
             runner,
             loaded_weights,
             arena,
+            relative_position_inverse_timescales: relative_position_inv,
             prelude,
             layers,
         })
@@ -629,11 +651,13 @@ impl CohereTranscribeEncoderGraphRuntime {
         let subsampled_freq = conv_out_dim(subsampled_freq, 3, 2, 1)?;
         let subsampled_freq = conv_out_dim(subsampled_freq, 3, 2, 1)?;
         let subsampled_frames = predicted_encoder_time_frames(mel_features.n_frames)?;
-        let positional = build_relative_positional_encoding(
-            metadata.encoder_d_model,
-            subsampled_frames,
-            || CohereTranscribeEncoderError::ShapeOverflow,
-        )?;
+        let relative_position_count = subsampled_frames
+            .checked_mul(2)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(CohereTranscribeEncoderError::ShapeOverflow)?;
+        let positions = (0..relative_position_count)
+            .map(|index| (subsampled_frames - 1) as f32 - index as f32)
+            .collect::<Vec<_>>();
 
         let mut graph = self.runner.start_graph();
         let mel = graph
@@ -642,14 +666,10 @@ impl CohereTranscribeEncoderGraphRuntime {
                 step: "ggml_new_tensor_2d(mel)",
                 source,
             })?;
-        let pos_enc = graph
-            .new_tensor_2d_f32(
-                metadata.encoder_d_model,
-                positional.len() / metadata.encoder_d_model,
-                "cohere_rel_pos",
-            )
+        let position = graph
+            .new_tensor_2d_f32(1, relative_position_count, "cohere_relative_positions")
             .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
-                step: "ggml_new_tensor_2d(pos_enc)",
+                step: "ggml_new_tensor_2d(relative_positions)",
                 source,
             })?;
         graph
@@ -658,11 +678,24 @@ impl CohereTranscribeEncoderGraphRuntime {
                 step: "ggml_set_input(mel)",
                 source,
             })?;
-        graph.set_input(pos_enc).map_err(|source| {
+        graph.set_input(position).map_err(|source| {
             CohereTranscribeEncoderError::GraphBuildFailed {
-                step: "ggml_set_input(pos_enc)",
+                step: "ggml_set_input(relative_positions)",
                 source,
             }
+        })?;
+        let pos_enc = build_sinusoidal_position_encoding_graph(
+            &graph,
+            self.arena
+                .graph_tensor(self.relative_position_inverse_timescales),
+            position,
+            metadata.encoder_d_model / 2,
+            relative_position_count,
+            SinusoidalChannelLayout::Interleaved,
+        )
+        .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
+            step: "ggml_relative_position_encoding",
+            source,
         })?;
 
         let map_graph_error =
@@ -903,7 +936,12 @@ impl CohereTranscribeEncoderGraphRuntime {
         }
 
         upload_f32(&mut graph, mel, &mel_features.data, "cohere_mel")?;
-        upload_f32(&mut graph, pos_enc, &positional, "cohere_rel_pos")?;
+        upload_f32(
+            &mut graph,
+            position,
+            &positions,
+            "cohere_relative_positions",
+        )?;
 
         let rows = if capture_debug {
             let pre_subsample_len = metadata

@@ -793,6 +793,15 @@ fn describe_panic_payload(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::execution_policy::{
+        ExecutionCandidate, ExecutionCandidateFailure, ExecutionDeviceSnapshot, ExecutionPlacement,
+    };
+    use crate::device::execution_route::ResolvedExecutionRoute;
+    use crate::ggml_runtime::GgmlBackendKind;
+    use crate::models::native_execution_services::{
+        record_current_execution_candidate_failure, run_execution_candidate_attempt,
+        test_native_execution_services,
+    };
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Barrier;
@@ -831,6 +840,23 @@ mod tests {
         drops: Arc<AtomicUsize>,
     ) -> Result<PinnedRuntimeActorCheckout<&'static str, ThreadPinnedRuntime>, String> {
         pool.checkout_or_try_build_with(
+            key,
+            || Ok((32, ())),
+            move |()| {
+                let value = builds.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(owner(value, 32, drops))
+            },
+            |error| error.to_string(),
+        )
+    }
+
+    fn shared_actor(
+        pool: &AdmittedPinnedRuntimeActorPool<&'static str, ThreadPinnedRuntime>,
+        key: &'static str,
+        builds: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    ) -> Result<PinnedRuntimeActor<ThreadPinnedRuntime>, String> {
+        pool.get_or_try_insert_with(
             key,
             || Ok((32, ())),
             move |()| {
@@ -1052,6 +1078,49 @@ mod tests {
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
         pool.clear();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn later_candidate_failure_evicts_a_previously_committed_shared_actor() {
+        let pool = AdmittedPinnedRuntimeActorPool::new(
+            "pinned-candidate-rollback-test",
+            AdmittedPinnedRuntimeActorPoolLimits::new(1, 32),
+        );
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let first = shared_actor(&pool, "same", Arc::clone(&builds), Arc::clone(&drops))
+            .expect("initial actor build");
+        assert_eq!(first.call_mut(|runtime| runtime.value.get()).unwrap(), 1);
+        drop(first);
+
+        let candidate = ExecutionCandidate {
+            device: ExecutionDeviceSnapshot {
+                route: ResolvedExecutionRoute::cpu(),
+                ggml_kind: GgmlBackendKind::Cpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: ExecutionPlacement::CpuOnly,
+        };
+        let services = test_native_execution_services();
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let cached = shared_actor(&pool, "same", Arc::clone(&builds), Arc::clone(&drops))?;
+            assert_eq!(cached.call_mut(|runtime| runtime.value.get()).unwrap(), 1);
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
+                "actor-invoke",
+                "synthetic candidate rejection",
+            ));
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let rebuilt = shared_actor(&pool, "same", Arc::clone(&builds), Arc::clone(&drops))
+            .expect("failed candidate must evict the committed actor");
+        assert_eq!(rebuilt.call_mut(|runtime| runtime.value.get()).unwrap(), 2);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[test]

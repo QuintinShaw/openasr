@@ -5,13 +5,8 @@ use crate::ggml_runtime::GgmlCpuGraphThreadingWorkload;
 use crate::models::graph_runtime_config::configure_model_runtime_graph_config;
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
-    gpu_stage_enabled_for_backend, has_explicit_thread_override,
+    has_explicit_thread_override,
 };
-
-const OPENASR_WHISPER_ENABLE_ENCODER_PRELUDE_GPU: &str =
-    "OPENASR_WHISPER_ENABLE_ENCODER_PRELUDE_GPU";
-const OPENASR_WHISPER_ENABLE_ENCODER_PRELUDE_METAL: &str =
-    "OPENASR_WHISPER_GGML_ENABLE_ENCODER_PRELUDE_METAL";
 
 pub(crate) fn whisper_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
@@ -28,7 +23,6 @@ pub(crate) fn whisper_encoder_prelude_graph_config(
 ) -> GgmlCpuGraphConfig {
     whisper_encoder_prelude_graph_config_with_overrides(
         whisper_runtime_graph_config(backend),
-        whisper_encoder_prelude_gpu_enabled,
         has_explicit_thread_override(),
     )
 }
@@ -44,25 +38,10 @@ pub(crate) fn whisper_decoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
     config
 }
 
-fn whisper_encoder_prelude_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_WHISPER_ENABLE_ENCODER_PRELUDE_GPU,
-        true,
-        Some(OPENASR_WHISPER_ENABLE_ENCODER_PRELUDE_METAL),
-        false,
-    )
-}
-
 fn whisper_encoder_prelude_graph_config_with_overrides(
     mut base: GgmlCpuGraphConfig,
-    prelude_gpu_enabled: impl FnOnce(GgmlCpuGraphBackend) -> bool,
     has_explicit_thread_override: bool,
 ) -> GgmlCpuGraphConfig {
-    if base.backend.is_gpu_class() && !prelude_gpu_enabled(base.backend) {
-        base.backend = GgmlCpuGraphBackend::Cpu;
-        base.use_scheduler = false;
-    }
     if !has_explicit_thread_override {
         base.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             base.backend,
@@ -159,30 +138,13 @@ mod tests {
     }
 
     #[test]
-    fn prelude_defaults_metal_runtime_to_cpu_backend() {
+    fn prelude_preserves_the_resolved_metal_backend() {
         let config = whisper_encoder_prelude_graph_config_with_overrides(
             GgmlCpuGraphConfig {
                 backend: GgmlCpuGraphBackend::Metal,
                 use_scheduler: true,
                 ..GgmlCpuGraphConfig::conservative_default()
             },
-            |_| false,
-            false,
-        );
-
-        assert!(matches!(config.backend, GgmlCpuGraphBackend::Cpu));
-        assert!(!config.use_scheduler);
-    }
-
-    #[test]
-    fn prelude_can_explicitly_keep_metal_backend() {
-        let config = whisper_encoder_prelude_graph_config_with_overrides(
-            GgmlCpuGraphConfig {
-                backend: GgmlCpuGraphBackend::Metal,
-                use_scheduler: true,
-                ..GgmlCpuGraphConfig::conservative_default()
-            },
-            |_| true,
             false,
         );
 
@@ -190,30 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn prelude_defaults_gpu_runtime_to_cpu_backend() {
+    fn prelude_preserves_the_resolved_generic_gpu_backend() {
         let config = whisper_encoder_prelude_graph_config_with_overrides(
             GgmlCpuGraphConfig {
                 backend: GgmlCpuGraphBackend::Gpu,
                 use_scheduler: true,
                 ..GgmlCpuGraphConfig::conservative_default()
             },
-            |_| false,
-            false,
-        );
-
-        assert!(matches!(config.backend, GgmlCpuGraphBackend::Cpu));
-        assert!(!config.use_scheduler);
-    }
-
-    #[test]
-    fn prelude_can_explicitly_keep_gpu_backend() {
-        let config = whisper_encoder_prelude_graph_config_with_overrides(
-            GgmlCpuGraphConfig {
-                backend: GgmlCpuGraphBackend::Gpu,
-                use_scheduler: true,
-                ..GgmlCpuGraphConfig::conservative_default()
-            },
-            |_| true,
             false,
         );
 

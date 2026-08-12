@@ -22,6 +22,28 @@ fn benchmark_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
     }
 }
 
+fn assert_selected_backend_compute(
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    observed: &crate::GgmlExecutionPlacementSummary,
+    operation: &str,
+) {
+    if backend != crate::ggml_runtime::GgmlCpuGraphBackend::Metal {
+        return;
+    }
+    assert!(
+        !observed.observed_compute_nodes_by_backend.is_empty()
+            && observed
+                .observed_compute_nodes_by_backend
+                .keys()
+                .all(|backend| {
+                    let backend = backend.to_ascii_lowercase();
+                    backend.starts_with("mtl") || backend.contains("metal")
+                }),
+        "{operation} explicit Metal route observed non-Metal compute: {:?}",
+        observed.observed_compute_nodes_by_backend,
+    );
+}
+
 fn npy_bytes(npz: &std::path::Path, name: &str) -> Vec<u8> {
     let file = std::fs::File::open(npz).expect("open external npz fixture");
     let mut archive = zip::ZipArchive::new(file).expect("parse external npz fixture");
@@ -219,9 +241,18 @@ fn native_graph_matches_external_pytorch_golden() {
     let golden = external_path("OPENASR_DIARIZEN_GOLDEN");
     DiariZenSegmenter::probe_oasr(&pack).expect("strict pack probe");
     let waveform = npy_f32(&golden, "waveform");
-    let mut runtime = DiariZenRuntime::new(&pack, 16_000, true, Some(benchmark_backend()))
+    let backend = benchmark_backend();
+    let mut runtime = DiariZenRuntime::new(&pack, 16_000, true, Some(backend))
         .expect("construct test-geometry runtime");
+    let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+    let _execution_placement_guard = execution_placement.install();
     let trace = runtime.infer_trace(&waveform).expect("native trace");
+    let observed = execution_placement.snapshot();
+    eprintln!(
+        "DIARIZEN_OFFICIAL_PLACEMENT backend={backend:?} observed_compute_nodes={:?} observed_nodes={:?}",
+        observed.observed_compute_nodes_by_backend, observed.observed_nodes_by_backend,
+    );
+    assert_selected_backend_compute(backend, &observed, "DiariZen official parity");
 
     for (name, actual) in &trace {
         if name == "weighted_layer_sum_raw" {
@@ -440,6 +471,8 @@ fn diarizen_fifteen_minute_endurance() {
     let audio_seconds = samples.len() as f64 / super::config::SAMPLE_RATE_HZ as f64;
     assert!(audio_seconds >= 15.0 * 60.0, "endurance audio is too short");
     let backend = benchmark_backend();
+    let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
+    let _execution_placement_guard = execution_placement.install();
     let mut runtime =
         DiariZenRuntime::new(&pack, super::config::WINDOW_SAMPLES, false, Some(backend))
             .expect("construct production runtime");
@@ -474,11 +507,15 @@ fn diarizen_fifteen_minute_endurance() {
     let current_rss_bytes = memory.current_rss_bytes.unwrap_or(0);
     let phys_footprint_bytes = memory.current_phys_footprint_bytes.unwrap_or(0);
     let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
+    let observed = execution_placement.snapshot();
     eprintln!(
-        "AUX_MODEL_ENDURANCE model=diarizen backend={backend:?} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} windows={} activity_sha256={activity_sha256}",
+        "AUX_MODEL_ENDURANCE model=diarizen backend={backend:?} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} windows={} activity_sha256={activity_sha256} observed_compute_nodes={:?} observed_nodes={:?}",
         elapsed_seconds / audio_seconds,
         activity.windows.len(),
+        observed.observed_compute_nodes_by_backend,
+        observed.observed_nodes_by_backend,
     );
+    assert_selected_backend_compute(backend, &observed, "DiariZen endurance");
 }
 
 #[test]

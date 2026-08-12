@@ -38,6 +38,7 @@ use crate::models::qwen::{
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
     QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    build_qwen3_prompt_embeddings_with_audio_positions,
     compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
     quoted_qwen_decoder_system_memory_bytes,
 };
@@ -86,6 +87,8 @@ pub(crate) enum FireRedLlmDecoderError {
     GraphFailed { reason: String },
     #[error("firered-llm decoder token-embedding gather failed: {reason}")]
     TokenEmbeddingFailed { reason: String },
+    #[error("firered-llm decoder prompt embedding failed: {reason}")]
+    PromptEmbeddingFailed { reason: String },
     #[error("firered-llm decoder logits head failed: {reason}")]
     LogitsHeadFailed { reason: String },
     #[error("firered-llm decoder KV cache write failed: {reason}")]
@@ -166,6 +169,7 @@ impl FireRedLlmDecoderRuntime {
                 preflight,
                 rms_norm_epsilon: FIRERED_LLM_RMS_NORM_EPSILON,
                 fused_logits_head: logits_head.fused_top1_spec(),
+                token_embedding: token_embedding.device_graph_spec(),
                 backend,
             },
         )
@@ -343,6 +347,76 @@ impl FireRedLlmDecoderRuntime {
         })
     }
 
+    /// Keep canonical token lookup and audio-row replacement on the selected
+    /// direct GPU backend. CPU/scheduler lanes lazily materialize the same
+    /// prompt through the existing host table and fall back to [`Self::prefill`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_token_ids_with_audio(
+        &mut self,
+        token_ids: &[u32],
+        audio_rows: &[f32],
+        audio_positions: &[usize],
+        layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    ) -> Result<FireRedLlmPrefillOutput, FireRedLlmDecoderError> {
+        if let Some(final_hidden) = self
+            .whole_decoder
+            .run_token_prefill_auto_last_hidden(
+                token_ids,
+                audio_rows,
+                audio_positions,
+                layer_kv_caches,
+                capacity,
+                FIRERED_LLM_ROPE_THETA,
+                control,
+            )
+            .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?
+        {
+            if let Some(token_id) = self
+                .whole_decoder
+                .fused_logits_top1_from_hidden(&final_hidden)
+                .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?
+            {
+                return Ok(FireRedLlmPrefillOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
+            let logits = self
+                .logits_runtime
+                .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
+                .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
+                    reason: error.to_string(),
+                })?;
+            return Ok(FireRedLlmPrefillOutput {
+                logits,
+                greedy_token_hint: None,
+            });
+        }
+        let token_rows = self
+            .token_embedding
+            .gather_rows(token_ids)
+            .map_err(|error| FireRedLlmDecoderError::TokenEmbeddingFailed {
+                reason: error.to_string(),
+            })?;
+        let prompt = build_qwen3_prompt_embeddings_with_audio_positions(
+            token_ids.len(),
+            audio_positions,
+            self.metadata.d_model,
+            token_rows,
+            audio_rows,
+        )
+        .map_err(|error| FireRedLlmDecoderError::PromptEmbeddingFailed {
+            reason: error.to_string(),
+        })?;
+        self.prefill(&prompt, layer_kv_caches, capacity, control)
+    }
+
     /// Run one incremental decode step for `token_id` at `cache_position`
     /// (the position this token's own K/V will occupy), updating
     /// `layer_kv_caches`, and return the logits row for the NEXT token.
@@ -353,15 +427,10 @@ impl FireRedLlmDecoderRuntime {
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
         capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Vec<f32>, FireRedLlmDecoderError> {
-        let hidden = self.gather_token_embedding(token_id)?;
-        // `run_step_auto` transparently reuses the persistent decode graph on
-        // the Metal/single-GPU lane (see `Qwen3AsrLlmWholeDecoderGraphExecutor
-        // ::run_step_auto`'s doc comment); CPU stays on the per-token rebuild
-        // path exactly as before.
-        let step = self
+        let device_step = self
             .whole_decoder
-            .run_step_auto(
-                &hidden,
+            .run_token_step_auto(
+                token_id,
                 cache_position,
                 layer_kv_caches,
                 capacity,
@@ -370,6 +439,23 @@ impl FireRedLlmDecoderRuntime {
             .map_err(|error| FireRedLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
+        let step = match device_step {
+            Some(step) => step,
+            None => {
+                let hidden = self.gather_token_embedding(token_id)?;
+                self.whole_decoder
+                    .run_step_auto(
+                        &hidden,
+                        cache_position,
+                        layer_kv_caches,
+                        capacity,
+                        FIRERED_LLM_ROPE_THETA,
+                    )
+                    .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                        reason: error.to_string(),
+                    })?
+            }
+        };
         write_layer_kv(
             cache_position,
             1,
@@ -397,7 +483,9 @@ impl FireRedLlmDecoderRuntime {
         layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
         capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Option<u32>, FireRedLlmDecoderError> {
-        if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
+        if !self.whole_decoder.supports_device_token_embedding()
+            || !self.whole_decoder.supports_fused_top1()
+        {
             return Ok(None);
         }
         if layer_kv_caches.is_empty() {
@@ -405,11 +493,10 @@ impl FireRedLlmDecoderRuntime {
                 reason: "firered-llm decoder has no layer KV caches".to_string(),
             });
         }
-        let hidden = self.gather_token_embedding(token_id)?;
         let step = self
             .whole_decoder
-            .run_step_reused_batched_top1(
-                &hidden,
+            .run_token_step_reused_batched_top1(
+                &[token_id],
                 &[cache_position],
                 FIRERED_LLM_ROPE_THETA,
                 capacity.resident_positions(),

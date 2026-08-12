@@ -73,23 +73,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -204,23 +204,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -326,23 +326,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -450,23 +450,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -574,22 +574,22 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             }
           ]
         },
@@ -709,23 +709,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -856,23 +856,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -969,23 +969,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -1100,23 +1100,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },
@@ -1497,22 +1497,22 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": true
+              "hybrid": false
             }
           ]
         },
@@ -1921,23 +1921,23 @@
           "providers": [
             {
               "provider": "cuda",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "hip",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "metal",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             },
             {
               "provider": "vulkan",
-              "full_device": false,
-              "hybrid": true
+              "full_device": true,
+              "hybrid": false
             }
           ]
         },

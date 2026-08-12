@@ -54,7 +54,7 @@ use super::frontend::{
     kaldi_min_samples_for_frames,
 };
 use super::hotword_context::{
-    apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
+    apply_hotword_deep_biasing, encode_hotword_context_embeddings_ggml, tokenize_hotword_phrase,
 };
 use super::joint_decode::{
     DolphinCtcHeadRuntime, DolphinJointDecodeConfig, detokenize_char_tokens,
@@ -92,31 +92,20 @@ const DOLPHIN_BEAM_SIZE: usize = 10;
 /// Kept `0.0` so the runtime reproduces the golden reference decode.
 pub(crate) const DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT: f32 = 0.0;
 
-/// Whether a pack tensor is a rank-2 `.weight` matmul operand that should be bound
-/// in its native (quantized / f16) ggml layout rather than dequantized to f32.
+/// Whether a pack tensor is a rank-2 `.weight` operand that should be bound in
+/// its native (quantized / f16) ggml layout rather than dequantized to f32.
 ///
 /// The quantized packs block-quantize exactly these rank-2 `.weight` matrices, and
 /// `mul_mat` runs the quantized/f16 lhs directly -- so keeping them native lets the
 /// backend buffer hold the small quantized weights (q4 < q8 < fp16 in RAM) instead
 /// of a dequantized-to-f32 blow-up. Three tensors are deliberately excluded because
-/// they are consumed outside `mul_mat`: `decoder.embed.0.weight` and
-/// `context_module.context_extractor.word_embedding.weight` are `ggml_get_rows`
-/// (row lookup) / plain-Rust row-lookup operands, and
-/// `context_module.context_encoder.0.weight` is a `Linear` consumed by the
-/// pure-Rust hotword context encoder (`models::dolphin::hotword_context`), not the
-/// ggml graph -- all three only accept f32 (or f32/f16 for get_rows), so they stay
-/// dequantized to f32 -- and only rank-2 `.weight` *matmul* operands actually fed
-/// to a ggml `mul_mat` go native by design.
-const PURE_RUST_MATMUL_WEIGHT_EXCLUSIONS: [&str; 3] = [
-    "decoder.embed.0.weight",
-    "context_module.context_extractor.word_embedding.weight",
-    "context_module.context_encoder.0.weight",
-];
+/// it is still consumed by a host-only lookup: `decoder.embed.0.weight`. The
+/// hotword word embedding now feeds graph `get_rows`, and its context encoder
+/// feeds graph `mul_mat`, so both remain pack-native too.
+const HOST_ONLY_WEIGHT_EXCLUSIONS: [&str; 1] = ["decoder.embed.0.weight"];
 
 fn is_native_matmul_weight(name: &str, dims: &[u64]) -> bool {
-    name.ends_with(".weight")
-        && dims.len() == 2
-        && !PURE_RUST_MATMUL_WEIGHT_EXCLUSIONS.contains(&name)
+    name.ends_with(".weight") && dims.len() == 2 && !HOST_ONLY_WEIGHT_EXCLUSIONS.contains(&name)
 }
 
 /// Materialize one pack tensor into the pool: rank-2 `.weight` matmul operands are
@@ -219,7 +208,7 @@ pub(crate) struct DolphinPipelineOutput {
 }
 
 /// Runtime weights for one pack, shared behind an `Arc` so the process-level pool
-/// can hand the same immutable table to every call. Rank-2 `.weight` matmul
+/// can hand the same immutable table to every call. Rank-2 `.weight` graph
 /// operands are held as their native (quantized / f16) mmap-backed block payload --
 /// zero-copy over the pack mmap, so the pool itself adds no per-tensor host copy
 /// for them and the quantized weight lands in the ggml backend buffer at run time.
@@ -662,8 +651,13 @@ fn run_dolphin_pipeline_with_progress(
                 .iter()
                 .map(|entry| tokenize_hotword_phrase(tokens, entry.phrase()))
                 .collect();
-            let context_emb = encode_hotword_context_embeddings(weights, &hotword_token_ids)
-                .map_err(|error| format!("dolphin hotword context embedding failed: {error}"))?;
+            let context_emb = encode_hotword_context_embeddings_ggml(
+                weights,
+                &hotword_token_ids,
+                tokens.len(),
+                backend,
+            )
+            .map_err(|error| format!("dolphin hotword context embedding failed: {error}"))?;
             let biased = apply_hotword_deep_biasing(
                 weights,
                 &encoder.encoder_out,
@@ -1890,6 +1884,50 @@ mod tests {
                 !qoutput.text.is_empty(),
                 "{} hotword transcript must not be empty",
                 quant.label()
+            );
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let telemetry = crate::ggml_runtime::GgmlExecutionTelemetryCollector::new();
+            let guard = telemetry.install();
+            let metal = transcribe_dolphin_pcm(
+                &reader,
+                &metadata,
+                &samples,
+                DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+                GgmlCpuGraphBackend::Metal,
+                Some("zh-sichuan"),
+                Some(&phrase_bias),
+            )
+            .expect("dolphin transcribe (Metal hotword)");
+            let q4_pack = ensure_dolphin_pack(&root, DolphinQuantizationMode::Q4_K)
+                .expect("q4_k pack builds");
+            let q4_reader = GgufTensorDataReader::from_path(&q4_pack).expect("q4_k reader");
+            let q4_metadata =
+                crate::ggml_runtime::read_gguf_metadata(&q4_pack).expect("q4_k metadata");
+            let q4_metal = transcribe_dolphin_pcm(
+                &q4_reader,
+                &q4_metadata,
+                &samples,
+                DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+                GgmlCpuGraphBackend::Metal,
+                Some("zh-sichuan"),
+                Some(&phrase_bias),
+            )
+            .expect("dolphin transcribe (q4_k Metal hotword)");
+            drop(guard);
+            assert_eq!(metal.text, REFERENCE_WSC_TEXT, "fp16 Metal hotword text");
+            assert_eq!(q4_metal.text, REFERENCE_WSC_TEXT, "q4_k Metal hotword text");
+            let summary = telemetry.snapshot();
+            assert!(
+                !summary.observed_compute_nodes_by_backend.is_empty()
+                    && summary
+                        .observed_compute_nodes_by_backend
+                        .keys()
+                        .all(|backend| backend.starts_with("MTL") || backend.contains("Metal")),
+                "Dolphin explicit Metal neural compute escaped Metal: {:?}",
+                summary.observed_compute_nodes_by_backend
             );
         }
     }

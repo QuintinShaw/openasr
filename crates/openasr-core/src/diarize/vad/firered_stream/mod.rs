@@ -27,6 +27,7 @@ mod tests;
 use std::sync::OnceLock;
 
 pub use model::FireRedStreamVadModel;
+pub(crate) use provider::PolicyResolvedFireRedStreamVadProvider;
 pub use provider::{FireRedStreamVadError, FireRedStreamVadProvider};
 pub(crate) use realtime_runtime::{FireRedRealtimeVadRuntime, FireRedRealtimeVadSession};
 pub use streaming::FireRedStreamingVad;

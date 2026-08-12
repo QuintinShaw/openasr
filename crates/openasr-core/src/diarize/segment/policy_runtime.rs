@@ -1,7 +1,7 @@
 //! Policy-resolved ownership for recording-local activity segmenters.
 //!
-//! Pyannote uses a Send-safe host owner on CPU and a thread-pinned hybrid ggml
-//! owner for an explicit Metal route. DiariZen owns native ggml state for every
+//! Pyannote uses a Send-safe host owner on CPU and a thread-pinned FullDevice
+//! ggml owner for an explicit Metal route. DiariZen owns native ggml state for every
 //! backend. Both providers expose the same local-activity seam; provider
 //! selection is frozen before materialization and never changes after an
 //! inference error.
@@ -86,6 +86,8 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         let source = prepared.source;
         let content_id = source.content_id().to_string();
         let (retained_quote, peak_quote) = pyannote_source_quote(&source)?;
+        let accelerated_retained_quote =
+            PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes();
 
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
@@ -127,7 +129,7 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
                     backend,
                     candidate.placement,
                     peak_quote,
-                    retained_quote,
+                    accelerated_retained_quote,
                 )
                 .map(PyannoteRuntimeOwner::Accelerated)
             }
@@ -206,7 +208,7 @@ fn load_pyannote_actor(
     let key = AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<PyannetGgmlRuntime>(
         PYANNOTE_GGML_ARCHITECTURE_ID,
         expected_content_id,
-        "pyannote-segmentation.hybrid-ggml.v1",
+        "pyannote-segmentation.full-device-ggml.v2",
         backend,
     );
     let preflight = source.preflight().clone();
@@ -219,7 +221,7 @@ fn load_pyannote_actor(
             move || {
                 let quote = SystemMemoryAllocationQuote::new(
                     format!(
-                        "aux.{PYANNOTE_GGML_ARCHITECTURE_ID}.{quote_content_id}.hybrid-host-state"
+                        "aux.{PYANNOTE_GGML_ARCHITECTURE_ID}.{quote_content_id}.device-runtime-state"
                     ),
                     peak_quote,
                     retained_quote,

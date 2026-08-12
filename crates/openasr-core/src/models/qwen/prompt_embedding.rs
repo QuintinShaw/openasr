@@ -10,6 +10,18 @@ pub(crate) struct Qwen3AsrPromptEmbeddings {
     pub token_major_values: Vec<f32>,
 }
 
+/// Canonical prompt source retained until the first decoder step decides
+/// whether token lookup can stay on the selected device. Audio rows are
+/// encoder-produced activations; `audio_positions` identifies the token rows
+/// they replace and supports both contiguous Qwen-style spans and MOSS's
+/// sparse marker layout.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Qwen3AsrPromptTokenInput {
+    pub token_ids: Vec<u32>,
+    pub audio_rows: Vec<f32>,
+    pub audio_positions: Vec<usize>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum Qwen3AsrPromptEmbeddingError {
     #[error(
@@ -36,8 +48,98 @@ pub(crate) enum Qwen3AsrPromptEmbeddingError {
         audio_pad_count: usize,
         token_count: usize,
     },
+    #[error(
+        "qwen3-asr prompt embedding audio positions are invalid: positions_len={positions_len} audio_row_count={audio_row_count} token_count={token_count}"
+    )]
+    InvalidAudioPositions {
+        positions_len: usize,
+        audio_row_count: usize,
+        token_count: usize,
+    },
     #[error("qwen3-asr prompt embedding values contain non-finite elements")]
     NonFiniteValues,
+}
+
+/// Sparse-position counterpart to
+/// [`build_qwen3_prompt_embeddings_with_audio_splice`]. This is the shared
+/// CPU fallback for device prompt prefill: GPU-class direct graphs consume the
+/// same [`Qwen3AsrPromptTokenInput`] through `get_rows` + `set_rows`, while a
+/// CPU/scheduler path gathers the canonical token table once and calls here.
+pub(crate) fn build_qwen3_prompt_embeddings_with_audio_positions(
+    token_count: usize,
+    audio_positions: &[usize],
+    hidden_size: usize,
+    mut token_rows: Vec<f32>,
+    audio_rows: &[f32],
+) -> Result<Qwen3AsrPromptEmbeddings, Qwen3AsrPromptEmbeddingError> {
+    let expected_token_values = token_count.checked_mul(hidden_size).ok_or(
+        Qwen3AsrPromptEmbeddingError::InvalidTokenRowsShape {
+            token_count,
+            hidden_size,
+            values_len: token_rows.len(),
+        },
+    )?;
+    if hidden_size == 0 || token_rows.len() != expected_token_values {
+        return Err(Qwen3AsrPromptEmbeddingError::InvalidTokenRowsShape {
+            token_count,
+            hidden_size,
+            values_len: token_rows.len(),
+        });
+    }
+    if token_rows.iter().any(|value| !value.is_finite())
+        || audio_rows.iter().any(|value| !value.is_finite())
+    {
+        return Err(Qwen3AsrPromptEmbeddingError::NonFiniteValues);
+    }
+    if !audio_rows.len().is_multiple_of(hidden_size) {
+        return Err(Qwen3AsrPromptEmbeddingError::InvalidAudioRowsShape {
+            audio_frame_count: audio_positions.len(),
+            hidden_size,
+            values_len: audio_rows.len(),
+        });
+    }
+    let audio_row_count = audio_rows.len() / hidden_size;
+    let positions_valid = audio_positions.len() == audio_row_count
+        && audio_positions
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(index, position)| {
+                position < token_count
+                    && index
+                        .checked_sub(1)
+                        .is_none_or(|previous| audio_positions[previous] < position)
+            });
+    if !positions_valid {
+        return Err(Qwen3AsrPromptEmbeddingError::InvalidAudioPositions {
+            positions_len: audio_positions.len(),
+            audio_row_count,
+            token_count,
+        });
+    }
+    for (audio_index, &token_position) in audio_positions.iter().enumerate() {
+        let source_start = audio_index.checked_mul(hidden_size).ok_or(
+            Qwen3AsrPromptEmbeddingError::InvalidAudioPositions {
+                positions_len: audio_positions.len(),
+                audio_row_count,
+                token_count,
+            },
+        )?;
+        let target_start = token_position.checked_mul(hidden_size).ok_or(
+            Qwen3AsrPromptEmbeddingError::InvalidAudioPositions {
+                positions_len: audio_positions.len(),
+                audio_row_count,
+                token_count,
+            },
+        )?;
+        token_rows[target_start..target_start + hidden_size]
+            .copy_from_slice(&audio_rows[source_start..source_start + hidden_size]);
+    }
+    Ok(Qwen3AsrPromptEmbeddings {
+        hidden_size,
+        token_count,
+        token_major_values: token_rows,
+    })
 }
 
 /// Splice the audio-encoder rows into the token-embedding buffer at the decode
@@ -198,6 +300,38 @@ mod tests {
         assert!(matches!(
             error,
             Qwen3AsrPromptEmbeddingError::InvalidAudioRowsShape { .. }
+        ));
+    }
+
+    #[test]
+    fn sparse_prompt_embedding_splice_replaces_only_declared_rows() {
+        let result = build_qwen3_prompt_embeddings_with_audio_positions(
+            5,
+            &[1, 4],
+            2,
+            vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0],
+            &[100.0, 101.0, 400.0, 401.0],
+        )
+        .expect("sparse splice");
+        assert_eq!(
+            result.token_major_values,
+            vec![0.0, 1.0, 100.0, 101.0, 20.0, 21.0, 30.0, 31.0, 400.0, 401.0]
+        );
+    }
+
+    #[test]
+    fn sparse_prompt_embedding_splice_rejects_duplicate_positions() {
+        let error = build_qwen3_prompt_embeddings_with_audio_positions(
+            3,
+            &[1, 1],
+            2,
+            vec![0.0; 6],
+            &[1.0; 4],
+        )
+        .expect_err("duplicate positions must fail");
+        assert!(matches!(
+            error,
+            Qwen3AsrPromptEmbeddingError::InvalidAudioPositions { .. }
         ));
     }
 }

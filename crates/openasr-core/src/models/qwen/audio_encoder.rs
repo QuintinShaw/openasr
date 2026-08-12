@@ -11,7 +11,9 @@ use crate::nn::conv::{
     reshape_bias_4d as nn_reshape_bias_4d,
 };
 use crate::nn::encoder::{
-    TransformerEncoderConfig, TransformerEncoderLayerWeights, transformer_layer,
+    SinusoidalChannelLayout, TransformerEncoderConfig, TransformerEncoderLayerWeights,
+    build_sinusoidal_position_encoding_graph, half_split_position_inverse_timescales,
+    transformer_layer,
 };
 use crate::nn::ffn::FeedForwardActivation;
 use crate::{GgufTensorDataReadError, GgufTensorDataReader, GgufTensorMetadata};
@@ -296,10 +298,17 @@ impl Qwen3AsrAudioEncoderRuntime {
         validate_mel_features(metadata, mel_features)?;
         let profile_started = env_var_truthy(QWEN3_ENCODER_PROFILE_ENV).then(Instant::now);
         let chunked_mel = pack_mel_into_chunked_layout(mel_features)?;
-        let positional = build_audio_positional_embedding(
-            metadata.audio_d_model,
-            chunked_mel.chunk_output_frames,
-        )?;
+        if metadata.audio_d_model == 0 || !metadata.audio_d_model.is_multiple_of(2) {
+            return Err(Qwen3AsrAudioEncoderError::InvalidMelFeatures {
+                reason: format!(
+                    "audio positional embedding requires even d_model > 0, got {}",
+                    metadata.audio_d_model
+                ),
+            });
+        }
+        let positions = (0..chunked_mel.chunk_output_frames)
+            .map(|position| position as f32)
+            .collect::<Vec<_>>();
         let mask_len = chunked_mel
             .row_count
             .checked_mul(chunked_mel.row_count)
@@ -326,7 +335,8 @@ impl Qwen3AsrAudioEncoderRuntime {
                 step: "static_tensor_arena",
                 source,
             })?;
-        let resident = build_qwen_audio_resident_weights(&mut arena, weights, loaded)?;
+        let resident =
+            build_qwen_audio_resident_weights(&mut arena, weights, loaded, metadata.audio_d_model)?;
 
         let mut graph = self.runner.start_graph();
 
@@ -336,7 +346,7 @@ impl Qwen3AsrAudioEncoderRuntime {
             weights,
             metadata,
             &chunked_mel,
-            &positional,
+            &positions,
             &mask,
             profile_started,
         )
@@ -360,7 +370,7 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
     weights: &Qwen3AsrAudioEncoderWeights,
     metadata: Qwen3AsrExecutionMetadata,
     chunked_mel: &ChunkedMelInput,
-    positional: &[f32],
+    positions: &[f32],
     mask: &[f32],
     profile_started: Option<Instant>,
 ) -> Result<Qwen3AsrAudioEncoderOutput, Qwen3AsrAudioEncoderError> {
@@ -381,15 +391,10 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
             step: "ggml_new_tensor_4d(mel)",
             source,
         })?;
-    let positional_tensor = graph
-        .new_tensor_3d_f32(
-            metadata.audio_d_model,
-            chunked_mel.chunk_output_frames,
-            1,
-            "audio_positional",
-        )
+    let position_tensor = graph
+        .new_tensor_2d_f32(1, chunked_mel.chunk_output_frames, "audio_positions")
         .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-            step: "ggml_new_tensor_3d(positional)",
+            step: "ggml_new_tensor_2d(positions)",
             source,
         })?;
     let mask_tensor = graph
@@ -402,7 +407,7 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
             step: "ggml_new_tensor_2d(mask)",
             source,
         })?;
-    for tensor in [mel, positional_tensor, mask_tensor] {
+    for tensor in [mel, position_tensor, mask_tensor] {
         graph
             .set_input(tensor)
             .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
@@ -410,6 +415,18 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
                 source,
             })?;
     }
+    let positional_tensor = build_sinusoidal_position_encoding_graph(
+        graph,
+        resident.positional_inverse_timescales,
+        position_tensor,
+        metadata.audio_d_model / 2,
+        chunked_mel.chunk_output_frames,
+        SinusoidalChannelLayout::HalfSplit,
+    )
+    .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
+        step: "ggml_audio_position_encoding",
+        source,
+    })?;
 
     let conv1_weight = resident.conv1_weight;
     let conv1_bias = resident.conv1_bias;
@@ -644,9 +661,9 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
             reason: format!("could not upload mel features: {source}"),
         })?;
     graph
-        .set_f32_slice(positional_tensor, positional, "audio_positional")
+        .set_f32_slice(position_tensor, positions, "audio_positions")
         .map_err(|source| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
-            reason: format!("could not upload positional embedding: {source}"),
+            reason: format!("could not upload audio positions: {source}"),
         })?;
     graph
         .set_f32_slice(mask_tensor, mask, "audio_attention_mask")
@@ -814,6 +831,7 @@ pub(crate) fn qwen3_audio_token_count_for_mel_frames(mel_frames: usize) -> usize
     num_chunks.saturating_mul(chunk_output_frames)
 }
 
+#[cfg(test)]
 fn build_audio_positional_embedding(
     d_model: usize,
     positions: usize,
@@ -1073,6 +1091,7 @@ fn run_audio_encoder_layer<'a>(
 /// the same arena). Only the per-call mel/positional/mask leaves are graph
 /// inputs; every field here is offload-eligible for the ggml scheduler.
 struct QwenAudioResidentTensors<'a> {
+    positional_inverse_timescales: GgmlCpuTensor<'a>,
     conv1_weight: GgmlCpuTensor<'a>,
     conv1_bias: GgmlCpuTensor<'a>,
     conv2_weight: GgmlCpuTensor<'a>,
@@ -1097,7 +1116,7 @@ struct QwenAudioResidentTensors<'a> {
 /// tensor-overhead context; the real weight bytes land in a separately sized
 /// backend buffer.
 fn qwen_audio_encoder_arena_context_bytes(weights: &Qwen3AsrAudioEncoderWeights) -> usize {
-    const FIXED_TENSORS: usize = 16;
+    const FIXED_TENSORS: usize = 17;
     const MAX_TENSORS_PER_LAYER: usize = 16;
     let count =
         FIXED_TENSORS.saturating_add(MAX_TENSORS_PER_LAYER.saturating_mul(weights.layers.len()));
@@ -1232,8 +1251,19 @@ fn build_qwen_audio_resident_weights<'a>(
     arena: &mut GgmlStaticTensorArena,
     weights: &Qwen3AsrAudioEncoderWeights,
     loaded: Option<&GgmlLoadedWeightContext>,
+    audio_d_model: usize,
 ) -> Result<QwenAudioResidentTensors<'a>, Qwen3AsrAudioEncoderError> {
     let mut builder = QwenAudioArenaBuilder::new();
+    let positional_inverse_timescales = arena
+        .new_tensor_2d_f32(
+            1,
+            audio_d_model / 2,
+            "qwen_audio_position_inverse_timescales",
+        )
+        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
+            step: "qwen_audio_position_inverse_timescales",
+            source,
+        })?;
 
     let conv1_weight = builder.arena_4d(arena, &weights.conv1_weight, "conv1_weight")?;
     let conv1_bias = builder.arena_1d(arena, &weights.conv1_bias, "conv1_bias")?;
@@ -1269,8 +1299,19 @@ fn build_qwen_audio_resident_weights<'a>(
     }
 
     builder.upload(arena)?;
+    arena
+        .set_f32_slice(
+            positional_inverse_timescales,
+            &half_split_position_inverse_timescales(audio_d_model),
+            "qwen_audio_position_inverse_timescales",
+        )
+        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
+            step: "upload_qwen_audio_position_inverse_timescales",
+            source,
+        })?;
 
     Ok(QwenAudioResidentTensors {
+        positional_inverse_timescales: arena.graph_tensor(positional_inverse_timescales),
         conv1_weight,
         conv1_bias,
         conv2_weight,

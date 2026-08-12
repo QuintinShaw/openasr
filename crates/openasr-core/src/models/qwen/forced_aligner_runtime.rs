@@ -507,25 +507,28 @@ pub(crate) fn align_forced_with_progress(
         audio_embeddings.row_count,
     )?;
 
-    let token_rows = assets
-        .token_embedding_table
-        .gather_rows(&decode_prompt.token_ids)?;
-    let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
-        &decode_prompt,
-        assets.token_embedding_table.d_model(),
-        token_rows,
-        &audio_embeddings.rows,
-    )?;
-    let prefill_input = build_qwen3_llm_prefill_input(prompt_embeddings)?;
-    drop(audio_embeddings);
-    report(ForcedAlignerProgressEvent::PromptPrepared);
-
     report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
-    let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
-        &assets.decoder_plan,
-        preflight,
-        backend,
-    )
+    let mut whole_decoder = if backend.is_gpu_class() {
+        let device_embedding = assets
+            .token_embedding_table
+            .device_graph_spec()
+            .ok_or_else(|| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                reason: "accelerated forced aligner requires a device-bindable token embedding"
+                    .to_string(),
+            })?;
+        Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_token_embedding(
+            &assets.decoder_plan,
+            preflight,
+            device_embedding,
+            backend,
+        )
+    } else {
+        Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
+            &assets.decoder_plan,
+            preflight,
+            backend,
+        )
+    }
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
@@ -536,6 +539,47 @@ pub(crate) fn align_forced_with_progress(
         // the faster backend default.
         whole_decoder.set_flash_attention_precision(GgmlFlashAttentionPrecision::F32);
     }
+    let hidden_size = assets.token_embedding_table.d_model();
+    let audio_pad_end = decode_prompt
+        .audio_pad_start_index
+        .checked_add(decode_prompt.audio_pad_count)
+        .ok_or_else(|| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+            reason: "forced aligner audio pad position overflowed".to_string(),
+        })?;
+    let audio_positions = (decode_prompt.audio_pad_start_index..audio_pad_end).collect::<Vec<_>>();
+    let prefill_input = if backend.is_gpu_class() {
+        let token_major_embeddings = whole_decoder
+            .materialize_token_prompt_on_device(
+                &decode_prompt.token_ids,
+                &audio_embeddings.rows,
+                &audio_positions,
+            )
+            .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                reason: error.to_string(),
+            })?
+            .ok_or_else(|| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                reason: "accelerated forced aligner did not materialize token rows on device"
+                    .to_string(),
+            })?;
+        super::llm_prefill::Qwen3AsrLlmPrefillInput {
+            token_count: decode_prompt.token_ids.len(),
+            hidden_size,
+            token_major_embeddings,
+        }
+    } else {
+        let token_rows = assets
+            .token_embedding_table
+            .gather_rows(&decode_prompt.token_ids)?;
+        let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
+            &decode_prompt,
+            hidden_size,
+            token_rows,
+            &audio_embeddings.rows,
+        )?;
+        build_qwen3_llm_prefill_input(prompt_embeddings)?
+    };
+    drop(audio_embeddings);
+    report(ForcedAlignerProgressEvent::PromptPrepared);
     let prefill_output = whole_decoder
         .run_stateless_prefill(
             &prefill_input.token_major_embeddings,
@@ -547,7 +591,6 @@ pub(crate) fn align_forced_with_progress(
         })?;
     report(ForcedAlignerProgressEvent::DecoderPrefilled);
 
-    let hidden_size = prefill_input.hidden_size;
     // `prefill_output.hidden` is ordinary host-owned output. Drop the much
     // larger decoder graph/weight runtime before materializing the logits-head
     // runtime so their transient GPU allocations never overlap.

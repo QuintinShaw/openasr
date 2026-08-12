@@ -1465,7 +1465,8 @@ pub(crate) struct LlmReusableDecodeGraph {
     kv_arena: LlmResidentKvArena,
     pub max_positions: usize,
     pub n_seq: usize,
-    pub hidden_tensor: GgmlCpuTensor<'static>,
+    pub hidden_tensor: Option<GgmlCpuTensor<'static>>,
+    pub token_ids: Option<GgmlCpuTensor<'static>>,
     pub row_indices: GgmlCpuTensor<'static>,
     pub positions: GgmlCpuTensor<'static>,
     pub attention_mask: GgmlCpuTensor<'static>,
@@ -1480,7 +1481,8 @@ impl LlmReusableDecodeGraph {
         kv_arena: LlmResidentKvArena,
         max_positions: usize,
         n_seq: usize,
-        hidden_tensor: GgmlCpuTensor<'static>,
+        hidden_tensor: Option<GgmlCpuTensor<'static>>,
+        token_ids: Option<GgmlCpuTensor<'static>>,
         row_indices: GgmlCpuTensor<'static>,
         positions: GgmlCpuTensor<'static>,
         attention_mask: GgmlCpuTensor<'static>,
@@ -1493,6 +1495,7 @@ impl LlmReusableDecodeGraph {
             max_positions,
             n_seq,
             hidden_tensor,
+            token_ids,
             row_indices,
             positions,
             attention_mask,
@@ -1503,6 +1506,18 @@ impl LlmReusableDecodeGraph {
 
     pub(crate) fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
         self.session.builder()
+    }
+
+    pub(crate) fn uses_token_ids(&self) -> bool {
+        self.token_ids.is_some()
+    }
+
+    pub(crate) fn into_resident_kv_arena(self) -> LlmResidentKvArena {
+        let Self {
+            session, kv_arena, ..
+        } = self;
+        drop(session);
+        kv_arena
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {

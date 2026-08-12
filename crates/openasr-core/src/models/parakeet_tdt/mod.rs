@@ -17,6 +17,7 @@ pub use package_import::{
     ParakeetTdtImportRequest, ParakeetTdtImportResult, ParakeetTdtQuantizationMode,
     convert_local_parakeet_tdt_source_to_runtime_pack,
 };
+mod device_decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod encoder_weights;
 pub(crate) mod executor;

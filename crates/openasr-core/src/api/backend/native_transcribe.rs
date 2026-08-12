@@ -2433,16 +2433,14 @@ fn run_native_transcription_impl(
         // reflects the slicing algorithm) is never mistaken for the provider.
         longform_provenance.push(format!("core.native.vad.engine:{vad_engine_label}"));
         request_options.longform_chunk_count_hint = Some(plan_stats.chunk_count);
-        let arch_prefers_cpu_decoder =
-            prefers_cpu_decoder_for_multichunk_metal(selected_family.model_architecture);
-        let multichunk_on_metal = arch_prefers_cpu_decoder
-            && plan_stats.chunk_count > 1
-            && matches!(
-                resolved_runtime_for_request.backend(),
-                GgmlCpuGraphBackend::Metal
-            );
+        let multichunk_on_metal = should_prefer_cpu_decoder_for_multichunk_metal(
+            selected_family.model_architecture,
+            &request_execution_intent,
+            plan_stats.chunk_count,
+            resolved_runtime_for_request.backend(),
+        );
         if multichunk_on_metal {
-            request_options.prefer_cpu_decoder_for_multichunk_metal = true;
+            request_options.auto_prefer_cpu_decoder_for_multichunk_metal = true;
         }
         if multichunk_on_metal {
             longform_provenance.push(
@@ -4461,6 +4459,22 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
         })
 }
 
+fn should_prefer_cpu_decoder_for_multichunk_metal(
+    model_architecture: &str,
+    request_intent: &ExecutionIntent,
+    chunk_count: usize,
+    resolved_backend: GgmlCpuGraphBackend,
+) -> bool {
+    // This is an Auto-mode performance hint, never a license to rewrite an
+    // explicit execution contract. If the user selected any accelerated
+    // target (generic or provider-constrained), every neural stage stays on
+    // that resolved accelerator even when a CPU decoder benchmarked faster.
+    matches!(request_intent, ExecutionIntent::Auto)
+        && chunk_count > 1
+        && resolved_backend == GgmlCpuGraphBackend::Metal
+        && prefers_cpu_decoder_for_multichunk_metal(model_architecture)
+}
+
 /// The `core.native.backend` provenance label. Callers must pass the
 /// family-resolved backend (`ResolvedFamilyRuntimeInput::resolve`, keyed by
 /// this family's `auto_gpu_policy` capability declaration) -- never the
@@ -4507,6 +4521,31 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multichunk_cpu_decoder_hint_is_auto_only() {
+        let architecture = crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID;
+        assert!(should_prefer_cpu_decoder_for_multichunk_metal(
+            architecture,
+            &ExecutionIntent::Auto,
+            2,
+            GgmlCpuGraphBackend::Metal,
+        ));
+        assert!(!should_prefer_cpu_decoder_for_multichunk_metal(
+            architecture,
+            &ExecutionIntent::AcceleratedOnly,
+            2,
+            GgmlCpuGraphBackend::Metal,
+        ));
+        assert!(!should_prefer_cpu_decoder_for_multichunk_metal(
+            architecture,
+            &ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                crate::device::execution_route::ExecutionProvider::Metal,
+            ),),
+            2,
+            GgmlCpuGraphBackend::Metal,
+        ));
+    }
 
     #[test]
     fn request_context_quant_prefers_model_ref_over_content_digest() {

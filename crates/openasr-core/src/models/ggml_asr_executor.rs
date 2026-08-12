@@ -702,10 +702,12 @@ pub struct GgmlAsrExecutionOptions {
     pub in_decoder_speakers: bool,
     pub longform: Option<LongFormOptions>,
     pub longform_chunk_count_hint: Option<usize>,
-    /// Set from the architecture descriptor when the arch signals that multi-chunk
-    /// longform on Metal should prefer the CPU decoder path. Avoids per-executor
-    /// re-derivation of this policy flag.
-    pub prefer_cpu_decoder_for_multichunk_metal: bool,
+    /// Auto-only performance hint set from the architecture descriptor when
+    /// multi-chunk longform on Metal should use the CPU decoder. Explicit or
+    /// provider-constrained accelerated requests must never set this field.
+    /// Keeping it crate-private prevents direct callers from overriding an
+    /// already-resolved accelerator contract.
+    pub(crate) auto_prefer_cpu_decoder_for_multichunk_metal: bool,
     /// Server-owned offline batching policy. The CLI and every non-server call
     /// retain `serial`; only the server derives this from its native-session
     /// admission limit.
@@ -768,7 +770,7 @@ impl GgmlAsrExecutionOptions {
             in_decoder_speakers: false,
             longform,
             longform_chunk_count_hint: None,
-            prefer_cpu_decoder_for_multichunk_metal: false,
+            auto_prefer_cpu_decoder_for_multichunk_metal: false,
             serve_batch: crate::models::serve_batch_env::ServeBatchPolicy::serial(),
             runtime_build_identity: None,
             adapter_path: None,

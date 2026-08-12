@@ -57,43 +57,6 @@ const CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabiliti
         AcceleratedPlacementCapabilities::FULL_DEVICE,
     );
 
-const CPU_AND_HYBRID_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
-    .with_provider(
-        ExecutionProvider::Metal,
-        AcceleratedPlacementCapabilities::HYBRID,
-    )
-    .with_provider(
-        ExecutionProvider::Cuda,
-        AcceleratedPlacementCapabilities::HYBRID,
-    )
-    .with_provider(
-        ExecutionProvider::Hip,
-        AcceleratedPlacementCapabilities::HYBRID,
-    )
-    .with_provider(
-        ExecutionProvider::Vulkan,
-        AcceleratedPlacementCapabilities::HYBRID,
-    );
-
-const CPU_FULL_DEVICE_AND_HYBRID_EXECUTION: ExecutionCapabilities =
-    ExecutionCapabilities::new(true)
-        .with_provider(
-            ExecutionProvider::Metal,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Cuda,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Hip,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Vulkan,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        );
-
 pub const COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str = "cohere-transcribe-conformer-transformer";
 pub const COHERE_TRANSCRIBE_GGML_ADAPTER_ID: &str = "ggml-family-cohere-transcribe-runtime-v1";
 pub const COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID: &str =
@@ -1580,7 +1543,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::cohere::CohereTranscribeGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: true,
@@ -1685,7 +1648,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::whisper::WhisperGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: true,
             supports_source_language_hint: true,
@@ -1769,7 +1732,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::qwen::Qwen3AsrGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
-            execution_capabilities: CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2243,7 +2206,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::moonshine::MoonshineGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2275,9 +2238,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
         optimization_contract: OpenAsrOptimizationContract {
             prefer_cpu_decoder_for_multichunk_metal: false,
-            // Moonshine's host preparation keeps the product stage Hybrid, but
-            // the encoder and decoder are complete device graphs. Their exact
-            // device placement substantially narrows Metal's dispatch gap and
+            // Host waveform/token preparation sits outside Moonshine's neural
+            // graphs; the encoder and decoder themselves are complete device
+            // graphs. Their exact device placement substantially narrows Metal's dispatch gap and
             // lowers physical memory, but M1 q8 remains slightly slower than
             // CPU. Keep explicit Metal available while Auto stays on CPU for
             // Apple Silicon until the speed crossover is stable.
@@ -2342,7 +2305,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::dolphin::executor::DolphinGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::RequiresTensor {
                 tensor_name: crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
             },
@@ -2534,7 +2497,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::firered_aed::executor::FireRedAedGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2632,7 +2595,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::firered_llm::executor::FireRedLlmGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2727,7 +2690,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::funasr_nano::executor::FunasrNanoGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2814,7 +2777,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::mimo_asr::executor::MimoAsrGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2907,7 +2870,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::moss_transcribe_diarize::executor::MossTdGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -3035,7 +2998,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::granite_speech::executor::GraniteSpeechGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_HYBRID_EXECUTION,
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -3155,6 +3118,37 @@ mod tests {
         OpenAsrArchitectureRegistry::with_builtins()
             .validate_references()
             .expect("builtins must satisfy inventory invariants");
+    }
+
+    #[test]
+    fn builtin_accelerated_routes_are_full_device_only() {
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            let capabilities = descriptor.execution_contract.execution_capabilities;
+            assert!(capabilities.supports_cpu());
+            for provider in [
+                ExecutionProvider::Metal,
+                ExecutionProvider::Cuda,
+                ExecutionProvider::Hip,
+                ExecutionProvider::Vulkan,
+            ] {
+                assert!(
+                    capabilities.supports(
+                        provider,
+                        crate::device::execution_policy::ExecutionPlacement::FullDevice,
+                    ),
+                    "architecture '{}' lost its full-device {provider} route",
+                    descriptor.identity.model_architecture,
+                );
+                assert!(
+                    !capabilities.supports(
+                        provider,
+                        crate::device::execution_policy::ExecutionPlacement::Hybrid,
+                    ),
+                    "architecture '{}' must not accept CPU neural compute under {provider}",
+                    descriptor.identity.model_architecture,
+                );
+            }
+        }
     }
 
     #[test]

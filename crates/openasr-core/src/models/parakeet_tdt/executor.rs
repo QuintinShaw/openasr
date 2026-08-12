@@ -1,5 +1,7 @@
 //! parakeet-tdt transcription core: frontend -> encoder graph (with in-graph
-//! joint encoder projection) -> host TDT greedy decode -> detokenize.
+//! joint encoder projection) -> TDT greedy control -> detokenize. CPU keeps
+//! the exact scalar predictor/joint oracle; accelerated routes execute both
+//! neural stages through persistent device graphs.
 
 use std::fmt;
 use std::sync::Arc;
@@ -31,12 +33,15 @@ use crate::models::system_memory_owner::{
 };
 use crate::{NativeAsrSession, PARAKEET_TDT_GGML_ADAPTER_ID};
 
+use super::device_decoder_graph::planned_retained_system_memory_bytes as device_decoder_quote_bytes;
 use super::encoder_graph::{ParakeetTdtEncoderGraph, ParakeetTdtMelFeatures};
 use super::encoder_weights::{
     ParakeetTdtLstmLayerWeights, load_parakeet_tdt_encoder_weights,
     load_parakeet_tdt_joint_weights, load_parakeet_tdt_predictor_weights,
 };
-use super::greedy::{ParakeetTdtJoint, tdt_greedy_decode_with_progress};
+use super::greedy::{
+    ParakeetTdtJoint, tdt_greedy_decode_with_backend, tdt_greedy_decode_with_progress,
+};
 use super::predictor::ParakeetTdtPredictor;
 use super::runtime_contract::{
     ParakeetTdtExecutionMetadata, parse_parakeet_tdt_execution_metadata,
@@ -58,6 +63,15 @@ struct ParakeetTdtPreparedRuntime {
     metadata: ParakeetTdtExecutionMetadata,
     tokenizer: ParakeetTdtTokenizer,
     graph: ParakeetTdtEncoderGraph,
+    decoder: ParakeetTdtDecoderRuntime,
+}
+
+enum ParakeetTdtDecoderRuntime {
+    Host(Box<ParakeetTdtHostDecoderRuntime>),
+    Device,
+}
+
+struct ParakeetTdtHostDecoderRuntime {
     predictor: ParakeetTdtPredictor,
     joint: ParakeetTdtJoint,
 }
@@ -106,6 +120,7 @@ fn checkout_parakeet_tdt_prepared_runtime(
                 &preflight.tensor_index,
                 metadata,
                 &pack_content_id,
+                backend,
             )
             .map_err(|error| error.to_string())?;
             Ok((
@@ -121,24 +136,43 @@ fn checkout_parakeet_tdt_prepared_runtime(
                 let encoder_weights = load_parakeet_tdt_encoder_weights(&reader, &metadata)
                     .map_err(|error| error.to_string())?;
                 let encoder_weights_bytes = encoder_weights.retained_system_memory_bytes()?;
-                let graph =
+                let mut graph =
                     ParakeetTdtEncoderGraph::new(&encoder_weights, metadata, &preflight, backend)
                         .map_err(|error| error.to_string())?;
                 let graph_bytes = graph.retained_system_memory_bytes()?;
                 drop(encoder_weights);
 
-                let predictor_weights = load_parakeet_tdt_predictor_weights(&reader, &metadata)
-                    .map_err(|error| error.to_string())?;
-                let predictor_bytes = predictor_weights.retained_system_memory_bytes()?;
-                let predictor = ParakeetTdtPredictor::new(
-                    predictor_weights,
-                    metadata.pred_hidden,
-                    metadata.vocab_size,
-                );
-                let joint_weights = load_parakeet_tdt_joint_weights(&reader, &metadata)
-                    .map_err(|error| error.to_string())?;
-                let joint_bytes = joint_weights.retained_system_memory_bytes()?;
-                let joint = ParakeetTdtJoint::new(joint_weights, metadata.joint_hidden);
+                let (decoder, predictor_bytes, joint_bytes) = if backend == GgmlCpuGraphBackend::Cpu
+                {
+                    let predictor_weights = load_parakeet_tdt_predictor_weights(&reader, &metadata)
+                        .map_err(|error| error.to_string())?;
+                    let predictor_bytes = predictor_weights.retained_system_memory_bytes()?;
+                    let predictor = ParakeetTdtPredictor::new(
+                        predictor_weights,
+                        metadata.pred_hidden,
+                        metadata.vocab_size,
+                    );
+                    let joint_weights = load_parakeet_tdt_joint_weights(&reader, &metadata)
+                        .map_err(|error| error.to_string())?;
+                    let joint_bytes = joint_weights.retained_system_memory_bytes()?;
+                    let joint = ParakeetTdtJoint::new(joint_weights, metadata.joint_hidden);
+                    (
+                        ParakeetTdtDecoderRuntime::Host(Box::new(ParakeetTdtHostDecoderRuntime {
+                            predictor,
+                            joint,
+                        })),
+                        predictor_bytes,
+                        joint_bytes,
+                    )
+                } else {
+                    if graph.device_decoder_mut().is_none() {
+                        return Err(
+                            "parakeet-tdt accelerated runtime is missing its device decoder"
+                                .to_string(),
+                        );
+                    }
+                    (ParakeetTdtDecoderRuntime::Device, 0, 0)
+                };
 
                 let retained = checked_sum(
                     [tokenizer_bytes, graph_bytes, predictor_bytes, joint_bytes],
@@ -157,8 +191,7 @@ fn checkout_parakeet_tdt_prepared_runtime(
                     metadata,
                     tokenizer,
                     graph,
-                    predictor,
-                    joint,
+                    decoder,
                 };
                 Ok(SystemMemoryAllocationOutcome::new(
                     runtime,
@@ -184,6 +217,7 @@ fn parakeet_tdt_runtime_system_memory_quote(
     tensor_index: &crate::GgufTensorIndex,
     metadata: ParakeetTdtExecutionMetadata,
     pack_content_id: &str,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<(SystemMemoryAllocationQuote, FastConformerSystemMemoryPlan), SystemMemoryOwnerError> {
     let tokenizer_bytes = tokenizer_quote_bytes(gguf_metadata, "parakeet-tdt")?;
     let plan = plan_fastconformer_system_memory(
@@ -197,22 +231,33 @@ fn parakeet_tdt_runtime_system_memory_quote(
             retained_tail_bias: "enc.proj.bias",
         },
     )?;
-    let predictor_bytes = parakeet_tdt_predictor_quote_bytes(tensor_index, metadata.pred_layers)?;
-    let joint_bytes = checked_sum(
-        [
-            named_tensor_quote_bytes(tensor_index, "joint.pred.weight", true)?,
-            named_tensor_quote_bytes(tensor_index, "joint.pred.bias", true)?,
-            named_tensor_quote_bytes(tensor_index, "joint.out.weight", true)?,
-            named_tensor_quote_bytes(tensor_index, "joint.out.bias", true)?,
-        ],
-        "parakeet-tdt quoted joint bytes",
-    )?;
+    let (predictor_bytes, joint_bytes, device_decoder_bytes) = if backend
+        == GgmlCpuGraphBackend::Cpu
+    {
+        let predictor = parakeet_tdt_predictor_quote_bytes(tensor_index, metadata.pred_layers)?;
+        let joint = checked_sum(
+            [
+                named_tensor_quote_bytes(tensor_index, "joint.pred.weight", true)?,
+                named_tensor_quote_bytes(tensor_index, "joint.pred.bias", true)?,
+                named_tensor_quote_bytes(tensor_index, "joint.out.weight", true)?,
+                named_tensor_quote_bytes(tensor_index, "joint.out.bias", true)?,
+            ],
+            "parakeet-tdt quoted joint bytes",
+        )?;
+        (predictor, joint, 0)
+    } else {
+        let device = device_decoder_quote_bytes(metadata).map_err(|reason| {
+            SystemMemoryOwnerError::capacity_failure("parakeet_tdt_device_decoder_quote", reason)
+        })?;
+        (0, 0, device)
+    };
     let retained_bytes = checked_sum(
         [
             tokenizer_bytes,
             plan.graph_retained_bytes,
             predictor_bytes,
             joint_bytes,
+            device_decoder_bytes,
         ],
         "parakeet-tdt quoted runtime retained bytes",
     )?;
@@ -284,15 +329,30 @@ impl ParakeetTdtPreparedRuntime {
                 output.joint_hidden, self.metadata.joint_hidden
             ));
         }
-        let emitted = tdt_greedy_decode_with_progress(
-            &output.features,
-            output.frame_count,
-            &self.metadata,
-            &self.predictor,
-            &self.joint,
-            is_canceled,
-            decode_work_progress,
-        )?;
+        let emitted = match &mut self.decoder {
+            ParakeetTdtDecoderRuntime::Host(host) => tdt_greedy_decode_with_progress(
+                &output.features,
+                output.frame_count,
+                &self.metadata,
+                &host.predictor,
+                &host.joint,
+                is_canceled,
+                decode_work_progress,
+            )?,
+            ParakeetTdtDecoderRuntime::Device => {
+                let decoder = self.graph.device_decoder_mut().ok_or_else(|| {
+                    "parakeet-tdt accelerated runtime lost its device decoder".to_string()
+                })?;
+                tdt_greedy_decode_with_backend(
+                    &output.features,
+                    output.frame_count,
+                    &self.metadata,
+                    decoder,
+                    is_canceled,
+                    decode_work_progress,
+                )?
+            }
+        };
         let token_ids: Vec<u32> = emitted.iter().map(|token| token.token_id).collect();
         let text = self.tokenizer.decode(&token_ids)?;
         let words = if word_timestamps {
@@ -553,5 +613,105 @@ mod tests {
                 output.words
             );
         }
+    }
+
+    /// Product-level acceptance for the predictor/joint migration: CPU keeps
+    /// the scalar oracle while explicit Metal uses the device LSTM and joint
+    /// graphs. The transcript must remain exact and every observed graph node
+    /// in the accelerated route must execute on Metal.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "host-local: needs OPENASR_PARAKEET_TDT_PACK and Metal"]
+    fn explicit_metal_predictor_joint_matches_cpu_transcript_and_uses_only_metal() {
+        let Some(pack) =
+            std::env::var_os("OPENASR_PARAKEET_TDT_PACK").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipping: OPENASR_PARAKEET_TDT_PACK is not set");
+            return;
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let clip = root.join("fixtures/jfk.wav");
+        let samples = read_wav_mono_16k(&clip).expect("wav");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("validate runtime source");
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .expect("preflight");
+        let transcribe = |backend| {
+            transcribe_parakeet_tdt_pcm_cached(
+                &new_parakeet_tdt_runtime_pool(),
+                &samples,
+                &preflight,
+                true,
+                backend,
+                Arc::new(crate::api::backend::TranscriptionControl::new()),
+                None,
+            )
+            .expect("transcribe")
+        };
+        let cpu = transcribe(GgmlCpuGraphBackend::Cpu);
+        let placement = crate::GgmlExecutionTelemetryCollector::new();
+        let _placement_guard = placement.install();
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let candidate = crate::device::execution_policy::ExecutionCandidate {
+            device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                route: crate::device::execution_route::ResolvedExecutionRoute {
+                    provider: crate::device::execution_route::ExecutionProvider::Metal,
+                    stable_id: "MTL0".to_string(),
+                    registry_ordinal: 0,
+                    kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+                    addressability:
+                        crate::device::execution_route::DeviceAddressability::NotExactlyAddressable {
+                            reason: "Metal uses the system default device",
+                        },
+                },
+                ggml_kind: crate::ggml_runtime::GgmlBackendKind::Gpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        };
+        let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
+            services.as_ref(),
+            &candidate,
+            || Ok::<_, String>(transcribe(GgmlCpuGraphBackend::Metal)),
+        );
+        assert!(
+            attempt.candidate_failure.is_none(),
+            "explicit Metal attempt failed placement: {:?}",
+            attempt.candidate_failure
+        );
+        let metal = attempt.result.expect("Metal candidate operation");
+        let observed = placement.snapshot();
+        assert_eq!(metal.text, cpu.text);
+        assert_eq!(metal.words.len(), cpu.words.len());
+        let mut max_confidence_drift = 0.0_f32;
+        for (metal_word, cpu_word) in metal.words.iter().zip(&cpu.words) {
+            assert_eq!(metal_word.word, cpu_word.word);
+            assert_eq!(metal_word.start, cpu_word.start);
+            assert_eq!(metal_word.end, cpu_word.end);
+            match (metal_word.confidence, cpu_word.confidence) {
+                (Some(metal), Some(cpu)) => {
+                    max_confidence_drift = max_confidence_drift.max((metal - cpu).abs());
+                }
+                (None, None) => {}
+                pair => panic!("CPU/Metal confidence presence drifted: {pair:?}"),
+            }
+        }
+        assert!(
+            max_confidence_drift <= 0.01,
+            "CPU/Metal confidence drift {max_confidence_drift} exceeded 0.01"
+        );
+        assert!(
+            !observed.observed_compute_nodes_by_backend.is_empty()
+                && observed
+                    .observed_compute_nodes_by_backend
+                    .keys()
+                    .all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.starts_with("mtl") || backend.contains("metal")
+                    }),
+            "explicit Metal Parakeet-TDT observed non-Metal compute: {:?}",
+            observed.observed_compute_nodes_by_backend
+        );
     }
 }

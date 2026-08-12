@@ -1170,7 +1170,9 @@ mod tests {
             RouteDeviceKind,
         },
     };
-    use crate::ggml_runtime::GgmlBackendKind;
+    use crate::ggml_runtime::{
+        GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    };
 
     fn cpu_candidate() -> ExecutionCandidate {
         ExecutionCandidate {
@@ -1311,6 +1313,26 @@ mod tests {
             outcome.candidate_failure.unwrap().kind,
             crate::device::execution_policy::ExecutionCandidateFailureKind::PlacementViolation
         );
+    }
+
+    #[test]
+    fn full_device_candidate_rejects_cpu_graph_before_backend_construction() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Metal,
+            "MTL0",
+            "0000:00:02.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default()).map(|_| ())
+        });
+        assert!(matches!(
+            outcome.result,
+            Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "FullDevice execution requires a GPU-class graph backend",
+            })
+        ));
     }
 
     #[test]

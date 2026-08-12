@@ -410,9 +410,9 @@ impl PreparedExternalDiarizer {
         execution_intent: ExecutionIntent,
         embedder: Arc<dyn SpeakerEmbedder>,
     ) -> Result<ExternalDiarizer, ExternalDiarizationError> {
-        let vad = super::vad::FireRedStreamVadProvider::shared_for_intent(
-            execution_services.as_ref(),
-            &execution_intent,
+        let vad = super::vad::PolicyResolvedFireRedStreamVadProvider::for_intent(
+            Arc::clone(&execution_services),
+            execution_intent.clone(),
         )
         .map_err(|error| ExternalDiarizationError::Vad(error.to_string()))?
         .ok_or(ExternalDiarizationError::VadUnavailable)?;
@@ -436,7 +436,7 @@ impl PreparedExternalDiarizer {
 pub(crate) struct ExternalDiarizer {
     segmenter: PolicyResolvedSegmenterRuntime,
     embedder: Arc<dyn SpeakerEmbedder>,
-    vad: super::vad::FireRedStreamVadProvider,
+    vad: super::vad::PolicyResolvedFireRedStreamVadProvider,
     clusterer: AutomaticClusterer,
 }
 

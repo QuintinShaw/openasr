@@ -63,7 +63,7 @@
 
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
-| Metal command batching + wired memory budget respected | Supported | Native Apple M1 qualification ran through the Metal scheduler with graph optimization, concurrency and residency sets enabled; system-memory construction remains transactionally admitted. |
+| Metal command batching + wired memory budget respected | Supported | Native Apple M1 qualification ran on the direct Metal FullDevice backend with graph optimization, concurrency and residency sets enabled; system-memory construction remains transactionally admitted. |
 | CPU thread pool sized for P/E cores | Supported | Candidate resolution uses shared `GgmlCpuGraphConfig::resolve_runtime_thread_count_for(...EncoderPrelude)` rather than a family-local thread count. |
 | Accelerate/BLAS used where it wins | Supported | The shared ggml CPU/Metal runner selects host kernels; the family adds no scalar matrix implementation or BLAS bypass. |
 
@@ -75,7 +75,7 @@ justification and an unlock plan -- "nobody tried" is not a justification.
 | Backend | Supported? | Golden-verified? | Utilization measured? | Justification + unlock plan if unsupported |
 | --- | --- | --- | --- | --- |
 | CPU | yes | yes (stage tensors, logits and powerset argmax vs pinned PyTorch dump) | yes (explicit CPU test backend) | Production fallback and parity reference. |
-| Metal | yes | yes (locked native six-file DER and exact final segment parity) | yes (benchmark log identifies Apple M1 Metal scheduler) | 16 s median 1.8334 s; 60 s / 29-window effective RTF 0.5128. |
+| Metal | yes | yes (locked native six-file DER and exact final segment parity) | yes (benchmark log identifies Apple M1 Metal backend) | 16 s median 1.8334 s; 60 s / 29-window effective RTF 0.5128. |
 | CUDA | no | no | no | Auxiliary ggml CUDA qualification is not shipped. Unlock: run the same external golden, six-file DER and memory gate on a supported CUDA runner. |
 | Vulkan | no | no | no | Auxiliary ggml Vulkan qualification is not shipped. Unlock: same parity/DER/resource suite on the Vulkan runner. |
 | HIP | no | no | no | Auxiliary ggml HIP qualification is not shipped. Unlock: same parity/DER/resource suite on the HIP runner. |

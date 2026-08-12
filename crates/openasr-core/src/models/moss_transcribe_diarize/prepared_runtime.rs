@@ -2,7 +2,7 @@
 //!
 //! Native runners, schedulers, uploaded arenas, and reusable KV graphs remain
 //! lane-keyed actor state. This object owns only immutable metadata, tokenizer
-//! state, host adaptor/encoder weights, and the metadata-only Qwen decoder
+//! state, host encoder weights, and the metadata-only Qwen decoder
 //! plan. Keeping that boundary explicit lets CPU/GPU candidate retries share
 //! the expensive host materialization without sharing a device owner.
 
@@ -22,14 +22,13 @@ use crate::models::qwen::{
 };
 use crate::models::system_memory_owner::{SystemMemoryAllocationQuote, SystemMemoryOwnerError};
 
-use super::adaptor_graph::{MossAdaptorWeights, load_moss_adaptor_weights_from_reader};
 use super::encoder_graph::{
     MossEncoderConfig, MossEncoderWeights, load_moss_encoder_weights_from_reader,
 };
 use super::runtime_contract::{
-    MOSS_TD_ADAPTOR_NORM_EPSILON, MOSS_TD_RMS_NORM_EPSILON, MossTdAdaptorMetadata,
-    MossTdDecoderMetadata, MossTdEncoderMetadata, moss_td_qwen_decoder_contract,
-    parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
+    MOSS_TD_RMS_NORM_EPSILON, MossTdAdaptorMetadata, MossTdDecoderMetadata, MossTdEncoderMetadata,
+    moss_td_qwen_decoder_contract, parse_adaptor_metadata, parse_decoder_metadata,
+    parse_encoder_metadata,
 };
 use super::tokenizer::MossTdTokenizer;
 
@@ -39,7 +38,6 @@ pub(crate) struct MossTdPreparedRuntime {
     pub(crate) adaptor_metadata: MossTdAdaptorMetadata,
     pub(crate) decoder_metadata: MossTdDecoderMetadata,
     pub(crate) tokenizer: MossTdTokenizer,
-    pub(crate) adaptor_weights: Arc<MossAdaptorWeights>,
     pub(crate) encoder_weights: Arc<MossEncoderWeights>,
     pub(crate) decoder_plan: Arc<QwenWholeDecoderPlan>,
     pub(crate) token_embedding: Arc<MappedTokenEmbeddingTable>,
@@ -87,7 +85,6 @@ impl MossTdPreparedRuntime {
             MossTdTokenizer::quoted_retained_system_memory_bytes(context.metadata)?,
             "moss tokenizer",
         )?;
-        MossAdaptorWeights::add_system_memory_quote(&mut quote, context.tensor_index)?;
         MossEncoderWeights::add_system_memory_quote(
             &mut quote,
             context.tensor_index,
@@ -102,10 +99,6 @@ impl MossTdPreparedRuntime {
         bytes.add(
             self.tokenizer.retained_system_memory_bytes()?,
             "moss prepared tokenizer",
-        )?;
-        bytes.add(
-            self.adaptor_weights.retained_system_memory_bytes()?,
-            "moss prepared adaptor",
         )?;
         bytes.add(
             self.encoder_weights.retained_system_memory_bytes()?,
@@ -150,8 +143,6 @@ pub(crate) enum MossTdPreparedRuntimeError {
     Tokenizer { reason: String },
     #[error("moss prepared tensor reader failed: {reason}")]
     TensorReader { reason: String },
-    #[error("moss prepared adaptor failed: {reason}")]
-    Adaptor { reason: String },
     #[error("moss prepared encoder weights failed: {reason}")]
     Encoder { reason: String },
     #[error("moss prepared decoder plan failed: {reason}")]
@@ -191,16 +182,6 @@ pub(crate) fn build_moss_td_prepared_runtime(
             .map_err(|error| MossTdPreparedRuntimeError::TensorReader {
                 reason: error.to_string(),
             })?;
-    let adaptor_weights = load_moss_adaptor_weights_from_reader(
-        &reader,
-        encoder_metadata.d_model,
-        adaptor_metadata.merge_size,
-        decoder_metadata.d_model,
-        MOSS_TD_ADAPTOR_NORM_EPSILON,
-    )
-    .map_err(|error| MossTdPreparedRuntimeError::Adaptor {
-        reason: error.to_string(),
-    })?;
     let encoder_weights = load_moss_encoder_weights_from_reader(
         &reader,
         MossTdPreparedRuntime::encoder_config(encoder_metadata),
@@ -238,7 +219,6 @@ pub(crate) fn build_moss_td_prepared_runtime(
         adaptor_metadata,
         decoder_metadata,
         tokenizer,
-        adaptor_weights: Arc::new(adaptor_weights),
         encoder_weights: Arc::new(encoder_weights),
         decoder_plan: Arc::new(decoder_plan),
         token_embedding: Arc::new(token_embedding),

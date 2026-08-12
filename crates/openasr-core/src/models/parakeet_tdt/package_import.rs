@@ -227,9 +227,9 @@ fn enc_blk(layer: usize, suffix: &str) -> String {
 /// Storage class for a mapped tensor when it is not quantized: `F32` for
 /// norms/biases/conv/BN/subsampling (numerically sensitive or ggml-required
 /// f32), `F16Quantizable` for the encoder 2-D linears (quantized when a quant
-/// mode is selected), `F16` for the host-consumed predictor/joint weights
-/// (kept f16 across quant modes — the greedy loop dequantizes to host f32
-/// once at load; quantizing them would not change the resident footprint).
+/// mode is selected), `F16` for the predictor/joint weights. CPU dequantizes
+/// those small recurrent tensors once for the scalar oracle; accelerated
+/// routes bind the same f16 tensors directly into their persistent graphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TensorStorage {
     F32,

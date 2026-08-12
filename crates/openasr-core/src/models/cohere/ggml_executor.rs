@@ -393,7 +393,7 @@ impl CohereTranscribeGgmlExecutor {
         let decoder_start = debug_timing_start();
         let prefer_cpu_decoder = request
             .request_options
-            .prefer_cpu_decoder_for_multichunk_metal;
+            .auto_prefer_cpu_decoder_for_multichunk_metal;
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config =
             cohere_serve_batch_config_from_server_policy(request.request_options.serve_batch);
@@ -1701,11 +1701,11 @@ mod tests {
     #[test]
     fn decoder_cpu_preference_is_off_by_default_and_on_when_set() {
         let options = GgmlAsrExecutionOptions::default();
-        assert!(!options.prefer_cpu_decoder_for_multichunk_metal);
+        assert!(!options.auto_prefer_cpu_decoder_for_multichunk_metal);
 
         let mut options_with_preference = options;
-        options_with_preference.prefer_cpu_decoder_for_multichunk_metal = true;
-        assert!(options_with_preference.prefer_cpu_decoder_for_multichunk_metal);
+        options_with_preference.auto_prefer_cpu_decoder_for_multichunk_metal = true;
+        assert!(options_with_preference.auto_prefer_cpu_decoder_for_multichunk_metal);
     }
 
     #[test]

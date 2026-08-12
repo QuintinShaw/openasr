@@ -58,6 +58,65 @@ pub(crate) struct ParakeetTdtJointScratch {
     pred_out: Vec<f32>,
 }
 
+/// The control loop is shared by the exact host oracle and the accelerated
+/// predictor/joint graphs. Implementations own recurrent state and expose only
+/// the fused logit row needed for TDT token/duration decisions.
+pub(crate) trait ParakeetTdtDecodeBackend {
+    fn output_rows(&self) -> usize;
+    fn begin(&mut self, blank_token_id: u32) -> Result<(), String>;
+    fn logits<'a>(&'a mut self, encoder_frame: &[f32]) -> Result<&'a [f32], String>;
+    fn accept_token(&mut self, token_id: u32) -> Result<(), String>;
+}
+
+struct HostParakeetTdtDecodeBackend<'a> {
+    predictor: &'a ParakeetTdtPredictor,
+    joint: &'a ParakeetTdtJoint,
+    state: super::predictor::ParakeetTdtLstmState,
+    scratch: ParakeetTdtJointScratch,
+    pred_out: Vec<f32>,
+}
+
+impl<'a> HostParakeetTdtDecodeBackend<'a> {
+    fn new(predictor: &'a ParakeetTdtPredictor, joint: &'a ParakeetTdtJoint) -> Self {
+        let mut scratch = joint.scratch();
+        let pred_out = std::mem::take(&mut scratch.pred_out);
+        Self {
+            predictor,
+            joint,
+            state: predictor.initial_state(),
+            scratch,
+            pred_out,
+        }
+    }
+}
+
+impl ParakeetTdtDecodeBackend for HostParakeetTdtDecodeBackend<'_> {
+    fn output_rows(&self) -> usize {
+        self.joint.out_rows
+    }
+
+    fn begin(&mut self, blank_token_id: u32) -> Result<(), String> {
+        self.state = self.predictor.initial_state();
+        self.predictor
+            .step(blank_token_id, &mut self.state, &mut self.pred_out)?;
+        self.joint
+            .project_predictor(&self.pred_out, &mut self.scratch);
+        Ok(())
+    }
+
+    fn logits<'a>(&'a mut self, encoder_frame: &[f32]) -> Result<&'a [f32], String> {
+        Ok(self.joint.logits(encoder_frame, &mut self.scratch))
+    }
+
+    fn accept_token(&mut self, token_id: u32) -> Result<(), String> {
+        self.predictor
+            .step(token_id, &mut self.state, &mut self.pred_out)?;
+        self.joint
+            .project_predictor(&self.pred_out, &mut self.scratch);
+        Ok(())
+    }
+}
+
 impl ParakeetTdtJoint {
     pub(crate) fn new(weights: ParakeetTdtJointWeights, joint_hidden: usize) -> Self {
         let out_rows = weights.out_bias.values.len();
@@ -137,6 +196,25 @@ pub(crate) fn tdt_greedy_decode_with_progress(
     is_canceled: &dyn Fn() -> bool,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Vec<ParakeetTdtEmittedToken>, String> {
+    let mut backend = HostParakeetTdtDecodeBackend::new(predictor, joint);
+    tdt_greedy_decode_with_backend(
+        enc_features,
+        frame_count,
+        metadata,
+        &mut backend,
+        is_canceled,
+        decode_work_progress,
+    )
+}
+
+pub(crate) fn tdt_greedy_decode_with_backend(
+    enc_features: &[f32],
+    frame_count: usize,
+    metadata: &ParakeetTdtExecutionMetadata,
+    backend: &mut impl ParakeetTdtDecodeBackend,
+    is_canceled: &dyn Fn() -> bool,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+) -> Result<Vec<ParakeetTdtEmittedToken>, String> {
     if is_canceled() {
         return Err("parakeet-tdt decode canceled before predictor prefill".to_string());
     }
@@ -152,24 +230,19 @@ pub(crate) fn tdt_greedy_decode_with_progress(
     }
     let vocab = metadata.vocab_size; // includes the blank (last id)
     let n_durations = metadata.n_durations;
-    if joint.out_rows != vocab + n_durations {
+    if backend.output_rows() != vocab + n_durations {
         return Err(format!(
             "parakeet-tdt joint head has {} rows, expected vocab {vocab} + durations {n_durations}",
-            joint.out_rows
+            backend.output_rows()
         ));
     }
     let blank = metadata.blank_token_id;
     let max_symbols = metadata.max_symbols_per_step.max(1);
 
     let mut emitted = Vec::new();
-    let mut state = predictor.initial_state();
-    let mut scratch = joint.scratch();
-
     // SOS: feed the blank through the LSTM from the zero state (NeMo
     // convention; the blank embedding row is the trained padding_idx zeros).
-    let mut pred_out = std::mem::take(&mut scratch.pred_out);
-    predictor.step(blank, &mut state, &mut pred_out)?;
-    joint.project_predictor(&pred_out, &mut scratch);
+    backend.begin(blank)?;
 
     let mut t = 0usize;
     while t < frame_count {
@@ -186,7 +259,7 @@ pub(crate) fn tdt_greedy_decode_with_progress(
                     "parakeet-tdt decode canceled at encoder frame {t}, symbol {symbols_this_frame}"
                 ));
             }
-            let logits = joint.logits(enc_frame, &mut scratch);
+            let logits = backend.logits(enc_frame)?;
             let token_id = argmax(&logits[..vocab])
                 .ok_or_else(|| "parakeet-tdt joint produced no token logits".to_string())?;
             let duration = argmax(&logits[vocab..vocab + n_durations])
@@ -201,8 +274,7 @@ pub(crate) fn tdt_greedy_decode_with_progress(
                     end_frame: (t + duration).min(frame_count),
                     probability,
                 });
-                predictor.step(token_id, &mut state, &mut pred_out)?;
-                joint.project_predictor(&pred_out, &mut scratch);
+                backend.accept_token(token_id)?;
             }
 
             if duration > 0 {
@@ -223,7 +295,6 @@ pub(crate) fn tdt_greedy_decode_with_progress(
             observer.report(t.min(frame_count), frame_count);
         }
     }
-    scratch.pred_out = pred_out;
     Ok(emitted)
 }
 

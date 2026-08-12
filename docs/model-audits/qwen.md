@@ -32,7 +32,7 @@
 | Op fusion opportunities reviewed (norm+matmul, QKV, rope, ...) | Supported | Fused QKV projection load + fused logits head (`llm_transformer.rs`, `logits_head.rs`); shared with mimo/firered2/moss. No qwen-specific stitching debt beyond shared executor. |
 | Batching / serve-batch path | Supported | qwen is a serve-batch consumer (`batched_decode.rs` + #215 policy). Owner-thread cancel carried on job Arc (PR #237, #236). `qwen_policy_derives_width_and_queue_from_admission_limit` test covers policy wiring. |
 | Encode-decode pipelining | Not applicable | Encoder produces fixed-length audio embeddings first; decoder runs prefill + greedy after encoder completes. Architecture requires full audio before prompt construction. Long-form is sliced upstream by the generic longform planner. |
-| Arena / gallocr reuse across steps (no per-step allocator churn) | Supported | Metal path: persistent reuse graph writes KV into resident arena (`run_prefill_into_reused_batched`). CPU path: step-buffer grow-to-fit reuse (#172). Shared scheduler gallocr on. |
+| Arena / gallocr reuse across steps (no per-step allocator churn) | Supported | Metal FullDevice path uses the direct persistent reuse graph and writes KV into the resident arena (`run_prefill_into_reused_batched`). CPU uses step-buffer grow-to-fit reuse (#172) and may use shared scheduler gallocr. |
 
 ## 2. Precision & quantization
 

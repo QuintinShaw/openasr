@@ -19,6 +19,7 @@ use crate::models::qwen::{
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
     QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    build_qwen3_prompt_embeddings_with_audio_positions,
     compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
     quoted_qwen_decoder_system_memory_bytes,
 };
@@ -42,6 +43,8 @@ pub(crate) enum MimoLlmDecoderError {
     GraphFailed { reason: String },
     #[error("mimo-asr backbone token-embedding gather failed: {reason}")]
     TokenEmbeddingFailed { reason: String },
+    #[error("mimo-asr backbone prompt embedding failed: {reason}")]
+    PromptEmbeddingFailed { reason: String },
     #[error("mimo-asr backbone logits head failed: {reason}")]
     LogitsHeadFailed { reason: String },
     #[error("mimo-asr backbone KV cache write failed: {reason}")]
@@ -126,6 +129,7 @@ impl MimoLlmDecoderRuntime {
                 preflight,
                 rms_norm_epsilon: metadata.rms_norm_epsilon,
                 fused_logits_head: logits_head.fused_top1_spec(),
+                token_embedding: token_embedding.device_graph_spec(),
                 backend,
             },
         )
@@ -294,6 +298,73 @@ impl MimoLlmDecoderRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_token_ids_with_audio(
+        &mut self,
+        token_ids: &[u32],
+        audio_rows: &[f32],
+        audio_positions: &[usize],
+        layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    ) -> Result<MimoLlmPrefillOutput, MimoLlmDecoderError> {
+        if let Some(final_hidden) = self
+            .whole_decoder
+            .run_token_prefill_auto_last_hidden(
+                token_ids,
+                audio_rows,
+                audio_positions,
+                layer_kv_caches,
+                capacity,
+                self.metadata.rope_theta,
+                control,
+            )
+            .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?
+        {
+            if let Some(token_id) = self
+                .whole_decoder
+                .fused_logits_top1_from_hidden(&final_hidden)
+                .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?
+            {
+                return Ok(MimoLlmPrefillOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
+            let logits = self
+                .logits_runtime
+                .compute_logits_for_last_hidden(&self.logits_head, &final_hidden)
+                .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
+                    reason: error.to_string(),
+                })?;
+            return Ok(MimoLlmPrefillOutput {
+                logits,
+                greedy_token_hint: None,
+            });
+        }
+        let token_rows = self
+            .token_embedding
+            .gather_rows(token_ids)
+            .map_err(|error| MimoLlmDecoderError::TokenEmbeddingFailed {
+                reason: error.to_string(),
+            })?;
+        let prompt = build_qwen3_prompt_embeddings_with_audio_positions(
+            token_ids.len(),
+            audio_positions,
+            self.metadata.d_model,
+            token_rows,
+            audio_rows,
+        )
+        .map_err(|error| MimoLlmDecoderError::PromptEmbeddingFailed {
+            reason: error.to_string(),
+        })?;
+        self.prefill(&prompt, layer_kv_caches, capacity, control)
+    }
+
     pub(crate) fn decode_step(
         &mut self,
         token_id: u32,
@@ -301,15 +372,10 @@ impl MimoLlmDecoderRuntime {
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
         capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Vec<f32>, MimoLlmDecoderError> {
-        let hidden = self.gather_token_embedding(token_id)?;
-        // `run_step_auto` transparently reuses the persistent decode graph on
-        // the Metal/single-GPU lane (see `Qwen3AsrLlmWholeDecoderGraphExecutor
-        // ::run_step_auto`'s doc comment); CPU stays on the per-token rebuild
-        // path exactly as before.
-        let step = self
+        let device_step = self
             .whole_decoder
-            .run_step_auto(
-                &hidden,
+            .run_token_step_auto(
+                token_id,
                 cache_position,
                 layer_kv_caches,
                 capacity,
@@ -318,6 +384,23 @@ impl MimoLlmDecoderRuntime {
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
+        let step = match device_step {
+            Some(step) => step,
+            None => {
+                let hidden = self.gather_token_embedding(token_id)?;
+                self.whole_decoder
+                    .run_step_auto(
+                        &hidden,
+                        cache_position,
+                        layer_kv_caches,
+                        capacity,
+                        self.metadata.rope_theta,
+                    )
+                    .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                        reason: error.to_string(),
+                    })?
+            }
+        };
         write_layer_kv(
             cache_position,
             1,
@@ -345,7 +428,9 @@ impl MimoLlmDecoderRuntime {
         layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
         capacity: Qwen3AsrKvCacheCapacity,
     ) -> Result<Option<u32>, MimoLlmDecoderError> {
-        if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
+        if !self.whole_decoder.supports_device_token_embedding()
+            || !self.whole_decoder.supports_fused_top1()
+        {
             return Ok(None);
         }
         if layer_kv_caches.is_empty() {
@@ -353,11 +438,10 @@ impl MimoLlmDecoderRuntime {
                 reason: "mimo-asr backbone has no layer KV caches".to_string(),
             });
         }
-        let hidden = self.gather_token_embedding(token_id)?;
         let step = self
             .whole_decoder
-            .run_step_reused_batched_top1(
-                &hidden,
+            .run_token_step_reused_batched_top1(
+                &[token_id],
                 &[cache_position],
                 self.metadata.rope_theta,
                 capacity.resident_positions(),

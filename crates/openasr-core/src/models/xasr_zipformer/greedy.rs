@@ -1,10 +1,54 @@
 //! RNN-T greedy search for X-ASR.
 
 use super::decoder::XasrDecoder;
-use super::joiner::XasrJoiner;
+use super::joiner::{XasrJoiner, XasrJoinerScratch};
 use super::tokenizer::XasrZipformerTokenizer;
 
 pub(crate) const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 8;
+
+pub(crate) trait XasrGreedyDecodeBackend {
+    fn project_encoder_frame(&mut self, frame: &[f32]) -> Result<(), String>;
+    fn project_decoder_context(&mut self, context: &[u32]) -> Result<(), String>;
+    fn next_token(&mut self) -> Result<u32, String>;
+    fn token_probability(&self, token: u32) -> Result<f32, String>;
+}
+
+struct HostXasrGreedyDecodeBackend<'a> {
+    decoder: &'a XasrDecoder,
+    joiner: &'a XasrJoiner,
+    scratch: XasrJoinerScratch,
+}
+
+impl<'a> HostXasrGreedyDecodeBackend<'a> {
+    fn new(decoder: &'a XasrDecoder, joiner: &'a XasrJoiner) -> Self {
+        Self {
+            decoder,
+            joiner,
+            scratch: joiner.scratch(),
+        }
+    }
+}
+
+impl XasrGreedyDecodeBackend for HostXasrGreedyDecodeBackend<'_> {
+    fn project_encoder_frame(&mut self, frame: &[f32]) -> Result<(), String> {
+        self.joiner.project_encoder_frame(frame, &mut self.scratch)
+    }
+
+    fn project_decoder_context(&mut self, context: &[u32]) -> Result<(), String> {
+        let decoder_state = self.decoder.decode_context(context)?;
+        self.joiner
+            .project_decoder_state(&decoder_state, &mut self.scratch)
+    }
+
+    fn next_token(&mut self) -> Result<u32, String> {
+        let logits = self.joiner.logits_from_projected(&mut self.scratch)?;
+        argmax(logits).ok_or_else(|| "xasr joiner produced no logits".to_string())
+    }
+
+    fn token_probability(&self, token: u32) -> Result<f32, String> {
+        self.joiner.token_probability(&self.scratch, token)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct XasrGreedyDecodeResult {
@@ -110,6 +154,38 @@ pub(crate) fn greedy_decode_frames_incremental(
     frame_offset: usize,
     is_canceled: &dyn Fn() -> bool,
 ) -> Result<usize, String> {
+    let mut backend = HostXasrGreedyDecodeBackend::new(decoder, joiner);
+    greedy_decode_frames_incremental_with_backend(
+        encoder_frames,
+        frame_count,
+        encoder_dim,
+        &mut backend,
+        blank_id,
+        max_symbols_per_frame,
+        context,
+        emitted,
+        emit_frames,
+        emit_probabilities,
+        frame_offset,
+        is_canceled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeBackend>(
+    encoder_frames: &[f32],
+    frame_count: usize,
+    encoder_dim: usize,
+    backend: &mut B,
+    blank_id: u32,
+    max_symbols_per_frame: usize,
+    context: &mut Vec<u32>,
+    emitted: &mut Vec<u32>,
+    emit_frames: &mut Vec<usize>,
+    emit_probabilities: &mut Vec<f32>,
+    frame_offset: usize,
+    is_canceled: &dyn Fn() -> bool,
+) -> Result<usize, String> {
     let expected = frame_count
         .checked_mul(encoder_dim)
         .ok_or_else(|| "xasr greedy encoder shape overflow".to_string())?;
@@ -120,41 +196,30 @@ pub(crate) fn greedy_decode_frames_incremental(
         ));
     }
     let start_len = emitted.len();
-    let mut scratch = joiner.scratch();
     let mut decoder_projection_valid = false;
     for frame_idx in 0..frame_count {
-        // Cooperative cancellation fence: the dedicated transducer loop is
-        // CPU-side (not a ggml graph), so it polls the shared request control
-        // at each encoder-frame boundary rather than relying on a graph-abort
-        // callback (the parakeet-tdt transducer precedent).
+        // The token-control loop remains host-side on every backend, so poll at
+        // each encoder-frame boundary in addition to the shared graph-abort
+        // callback used by device graph execution.
         if is_canceled() {
             return Err(format!(
                 "xasr-zipformer decode canceled at encoder frame {frame_idx}"
             ));
         }
         let frame = &encoder_frames[frame_idx * encoder_dim..(frame_idx + 1) * encoder_dim];
-        joiner.project_encoder_frame(frame, &mut scratch)?;
+        backend.project_encoder_frame(frame)?;
         for _ in 0..max_symbols_per_frame {
             if !decoder_projection_valid {
-                let decoder_state = decoder.decode_context(context)?;
-                joiner.project_decoder_state(&decoder_state, &mut scratch)?;
+                backend.project_decoder_context(context)?;
                 decoder_projection_valid = true;
             }
-            let logits = joiner.logits_from_projected(&mut scratch)?;
-            let Some(token_id) = argmax(logits) else {
-                return Err("xasr joiner produced no logits".to_string());
-            };
+            let token_id = backend.next_token()?;
             if token_id == blank_id {
                 break;
             }
             emitted.push(token_id);
             emit_frames.push(frame_offset + frame_idx);
-            emit_probabilities.push(
-                crate::models::seq2seq_greedy_decode::token_softmax_probability(
-                    logits,
-                    token_id as usize,
-                ),
-            );
+            emit_probabilities.push(backend.token_probability(token_id)?);
             context.remove(0);
             context.push(token_id);
             decoder_projection_valid = false;

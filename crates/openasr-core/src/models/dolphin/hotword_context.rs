@@ -10,15 +10,10 @@
 //!     bidirectional LSTM over its own char embeddings; the last forward/backward
 //!     hidden+cell states concat to a 3072-dim vector, then `context_encoder`
 //!     (`Linear(3072, 768)` + `LayerNorm(768)`) projects it to one 768-dim context
-//!     row. This stage runs in plain Rust, not a ggml graph: ggml has no LSTM
-//!     primitive, one hotword list is a handful of short sequences (not a
-//!     per-frame op), and the codebase already has pure-Rust recurrent/hand-written
-//!     numeric forward-pass precedent (e.g. `diarize::vad::firered_stream`'s
-//!     causal DFSMN VAD) for exactly this shape of workload. The 3072-dim
-//!     recurrent weights and the embedding table are never quantized for the same
-//!     reason convs/embeddings elsewhere aren't: no established block-quant
-//!     precedent for recurrent/lookup operands in this codebase, and the
-//!     workload is tiny so there is nothing to gain from shrinking them.
+//!     row. Production executes the recurrent cell algebra as a dynamically
+//!     unrolled ggml graph on the selected backend; the scalar Rust path remains
+//!     the numerical oracle used by tests. Rank-2 recurrent/context weights and
+//!     the lookup table stay in their pack-native representation.
 //!  2. **Biasing fusion** ([`apply_hotword_deep_biasing`]): a small ggml graph --
 //!     plain (non-rel-pos) multi-head cross-attention (`biasing_layer`, query =
 //!     encoder frames, key/value = the context rows) + `combiner` linear +
@@ -405,6 +400,7 @@ pub(crate) fn tokenize_hotword_phrase(vocab: &[String], phrase: &str) -> Vec<u32
 /// `linear_q`/`linear_k`/`linear_v`/`linear_out` (weight+bias each) +
 /// `combiner` (weight+bias) + `norm_aft_combiner` (weight+bias) == 12 tensors.
 const HOTWORD_BIASING_ARENA_TENSORS: usize = 12;
+const HOTWORD_CONTEXT_ARENA_TENSORS: usize = 21;
 
 /// Pending f32 weight upload into the static arena: `(handle, source-slice,
 /// static-label)`.
@@ -416,9 +412,8 @@ type NativeUpload<'p> = (GgmlStaticTensor, &'p [u8], &'static str);
 /// Allocates the biasing fusion's weights into the runtime's persistent
 /// [`GgmlStaticTensorArena`] (a `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` backend
 /// buffer) rather than as per-call transient graph leaves. This is what lets
-/// the ggml multi-backend scheduler offload the fusion's matmuls to an
-/// accelerator: the scheduler only considers an op for `op_offload` when its
-/// weight `src` lives in a WEIGHTS-usage buffer, which the old per-call
+/// the selected accelerator keep the fusion's matmuls device-resident: the
+/// weight `src` must live in a WEIGHTS-usage buffer, which the old per-call
 /// graph-input weights were not, so this graph was pinned to the CPU even
 /// under an explicit Metal backend (unlike the encoder/CTC head, which already
 /// moved -- see `encoder_graph::WeightBuilder` / `joint_decode`'s CTC arena).
@@ -456,10 +451,9 @@ impl<'p> WeightBuilder<'p> {
         Ok(tensor)
     }
 
-    /// A rank-2 `.weight` matmul operand, bound at its pack-native ggml type
-    /// (quantized/f16) when the provider keeps it that way, else f32 -- the
-    /// same policy `encoder_graph`/`joint_decode` use for every other family
-    /// matmul weight.
+    /// A rank-2 `.weight` graph operand, bound at its pack-native ggml type
+    /// (quantized/f16) when the provider keeps it that way, else f32. It is
+    /// valid for both `mul_mat` and `get_rows` consumers.
     fn w2(
         &mut self,
         arena: &GgmlStaticTensorArena,
@@ -501,6 +495,380 @@ impl<'p> WeightBuilder<'p> {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+struct LstmDirectionStaticWeights {
+    w_ih: GgmlStaticTensor,
+    w_hh: GgmlStaticTensor,
+    b_ih: GgmlStaticTensor,
+    b_hh: GgmlStaticTensor,
+}
+
+struct HotwordContextStaticWeights {
+    embedding: GgmlStaticTensor,
+    layer0_fwd: LstmDirectionStaticWeights,
+    layer0_bwd: LstmDirectionStaticWeights,
+    layer1_fwd: LstmDirectionStaticWeights,
+    layer1_bwd: LstmDirectionStaticWeights,
+    context_w: GgmlStaticTensor,
+    context_b: GgmlStaticTensor,
+    norm_w: GgmlStaticTensor,
+    norm_b: GgmlStaticTensor,
+}
+
+fn build_lstm_direction_static(
+    builder: &mut WeightBuilder<'_>,
+    arena: &GgmlStaticTensorArena,
+    layer: usize,
+    reverse: bool,
+    input_size: usize,
+) -> Result<LstmDirectionStaticWeights, DolphinHotwordError> {
+    let suffix = if reverse { "_reverse" } else { "" };
+    let p =
+        |field: &str| format!("context_module.context_extractor.sen_rnn.{field}_l{layer}{suffix}");
+    Ok(LstmDirectionStaticWeights {
+        w_ih: builder.w2(arena, &p("weight_ih"), input_size, 4 * HOTWORD_EMBED_DIM)?,
+        w_hh: builder.w2(
+            arena,
+            &p("weight_hh"),
+            HOTWORD_EMBED_DIM,
+            4 * HOTWORD_EMBED_DIM,
+        )?,
+        b_ih: builder.w1(arena, &p("bias_ih"), 4 * HOTWORD_EMBED_DIM)?,
+        b_hh: builder.w1(arena, &p("bias_hh"), 4 * HOTWORD_EMBED_DIM)?,
+    })
+}
+
+fn build_hotword_context_static_weights(
+    builder: &mut WeightBuilder<'_>,
+    arena: &GgmlStaticTensorArena,
+    vocab_size: usize,
+) -> Result<HotwordContextStaticWeights, DolphinHotwordError> {
+    Ok(HotwordContextStaticWeights {
+        embedding: builder.w2(
+            arena,
+            CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+            HOTWORD_EMBED_DIM,
+            vocab_size,
+        )?,
+        layer0_fwd: build_lstm_direction_static(builder, arena, 0, false, HOTWORD_EMBED_DIM)?,
+        layer0_bwd: build_lstm_direction_static(builder, arena, 0, true, HOTWORD_EMBED_DIM)?,
+        layer1_fwd: build_lstm_direction_static(builder, arena, 1, false, 2 * HOTWORD_EMBED_DIM)?,
+        layer1_bwd: build_lstm_direction_static(builder, arena, 1, true, 2 * HOTWORD_EMBED_DIM)?,
+        context_w: builder.w2(
+            arena,
+            "context_module.context_encoder.0.weight",
+            HOTWORD_CONTEXT_STATE_DIM,
+            HOTWORD_EMBED_DIM,
+        )?,
+        context_b: builder.w1(
+            arena,
+            "context_module.context_encoder.0.bias",
+            HOTWORD_EMBED_DIM,
+        )?,
+        norm_w: builder.w1(
+            arena,
+            "context_module.context_encoder.1.weight",
+            HOTWORD_EMBED_DIM,
+        )?,
+        norm_b: builder.w1(
+            arena,
+            "context_module.context_encoder.1.bias",
+            HOTWORD_EMBED_DIM,
+        )?,
+    })
+}
+
+fn lstm_cell_graph<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    input: GgmlCpuTensor<'a>,
+    h: GgmlCpuTensor<'a>,
+    c: GgmlCpuTensor<'a>,
+    weights: LstmDirectionStaticWeights,
+    arena: &GgmlStaticTensorArena,
+) -> Result<(GgmlCpuTensor<'a>, GgmlCpuTensor<'a>), DolphinHotwordError> {
+    let mut packed = graph
+        .mul_mat(arena.graph_tensor(weights.w_ih), input)
+        .map_err(ggml_err("hotword_lstm_input"))?;
+    packed = graph
+        .add(packed, arena.graph_tensor(weights.b_ih))
+        .map_err(ggml_err("hotword_lstm_input_bias"))?;
+    let recurrent = graph
+        .mul_mat(arena.graph_tensor(weights.w_hh), h)
+        .map_err(ggml_err("hotword_lstm_recurrent"))?;
+    packed = graph
+        .add(packed, recurrent)
+        .map_err(ggml_err("hotword_lstm_recurrent_add"))?;
+    packed = graph
+        .add(packed, arena.graph_tensor(weights.b_hh))
+        .map_err(ggml_err("hotword_lstm_recurrent_bias"))?;
+
+    let d = HOTWORD_EMBED_DIM;
+    let bytes = std::mem::size_of::<f32>();
+    let input_gate = graph
+        .sigmoid(
+            graph
+                .view_1d(packed, d, 0)
+                .map_err(ggml_err("hotword_lstm_input_view"))?,
+        )
+        .map_err(ggml_err("hotword_lstm_input_gate"))?;
+    let forget_gate = graph
+        .sigmoid(
+            graph
+                .view_1d(packed, d, d * bytes)
+                .map_err(ggml_err("hotword_lstm_forget_view"))?,
+        )
+        .map_err(ggml_err("hotword_lstm_forget_gate"))?;
+    let cell_gate = graph
+        .tanh(
+            graph
+                .view_1d(packed, d, 2 * d * bytes)
+                .map_err(ggml_err("hotword_lstm_cell_view"))?,
+        )
+        .map_err(ggml_err("hotword_lstm_cell_gate"))?;
+    let output_gate = graph
+        .sigmoid(
+            graph
+                .view_1d(packed, d, 3 * d * bytes)
+                .map_err(ggml_err("hotword_lstm_output_view"))?,
+        )
+        .map_err(ggml_err("hotword_lstm_output_gate"))?;
+    let new_c = graph
+        .add(
+            graph
+                .mul(forget_gate, c)
+                .map_err(ggml_err("hotword_lstm_forget_mul"))?,
+            graph
+                .mul(input_gate, cell_gate)
+                .map_err(ggml_err("hotword_lstm_input_mul"))?,
+        )
+        .map_err(ggml_err("hotword_lstm_cell_add"))?;
+    let new_h = graph
+        .mul(
+            output_gate,
+            graph
+                .tanh(new_c)
+                .map_err(ggml_err("hotword_lstm_cell_tanh"))?,
+        )
+        .map_err(ggml_err("hotword_lstm_hidden"))?;
+    Ok((new_h, new_c))
+}
+
+fn lstm_direction_graph<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    inputs: &[GgmlCpuTensor<'a>],
+    zero: GgmlCpuTensor<'a>,
+    weights: LstmDirectionStaticWeights,
+    arena: &GgmlStaticTensorArena,
+    reverse: bool,
+) -> Result<(GgmlCpuTensor<'a>, GgmlCpuTensor<'a>, Vec<GgmlCpuTensor<'a>>), DolphinHotwordError> {
+    let mut h = zero;
+    let mut c = zero;
+    let mut outputs = vec![zero; inputs.len()];
+    if reverse {
+        for index in (0..inputs.len()).rev() {
+            (h, c) = lstm_cell_graph(graph, inputs[index], h, c, weights, arena)?;
+            outputs[index] = h;
+        }
+    } else {
+        for (index, input) in inputs.iter().copied().enumerate() {
+            (h, c) = lstm_cell_graph(graph, input, h, c, weights, arena)?;
+            outputs[index] = h;
+        }
+    }
+    Ok((h, c, outputs))
+}
+
+/// Production hotword context extractor. The scalar implementation above is
+/// retained as a test oracle; every neural op here runs through the selected
+/// ggml backend, including embedding lookup, both BiLSTM layers, projection,
+/// and LayerNorm.
+pub(crate) fn encode_hotword_context_embeddings_ggml(
+    provider: &dyn DolphinWeightProvider,
+    hotword_token_ids: &[Vec<u32>],
+    vocab_size: usize,
+    backend: GgmlCpuGraphBackend,
+) -> Result<Vec<f32>, DolphinHotwordError> {
+    if vocab_size == 0 {
+        return Err(DolphinHotwordError::Shape {
+            reason: "hotword vocabulary must be non-empty".to_string(),
+        });
+    }
+    let no_bias = vec![HOTWORD_NO_BIAS_TOKEN_ID];
+    let mut phrases = Vec::with_capacity(hotword_token_ids.len() + 1);
+    phrases.push(no_bias);
+    for tokens in hotword_token_ids {
+        if tokens.is_empty() {
+            return Err(DolphinHotwordError::Shape {
+                reason: "hotword phrase produced zero tokens".to_string(),
+            });
+        }
+        if tokens
+            .iter()
+            .any(|&token_id| token_id as usize >= vocab_size)
+        {
+            return Err(DolphinHotwordError::Shape {
+                reason: "hotword token id exceeds vocabulary".to_string(),
+            });
+        }
+        phrases.push(tokens.clone());
+    }
+    let max_tokens = phrases.iter().map(Vec::len).max().unwrap_or(1);
+    let graph_size = max_tokens
+        .checked_mul(128)
+        .and_then(|nodes| nodes.checked_add(512))
+        .ok_or_else(|| DolphinHotwordError::Shape {
+            reason: "hotword recurrent graph capacity overflowed".to_string(),
+        })?
+        .max(DOLPHIN_HOTWORD_GRAPH_NODE_CAPACITY);
+    let graph_config = GgmlCpuGraphConfig {
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(graph_size),
+        graph_size,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
+        ),
+        backend,
+        use_scheduler: !backend.is_gpu_class(),
+    };
+    let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("context_runner"))?;
+    let arena = runner
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+            HOTWORD_CONTEXT_ARENA_TENSORS,
+        ))
+        .map_err(ggml_err("context_arena"))?;
+    let mut builder = WeightBuilder::new(provider);
+    let weights = build_hotword_context_static_weights(&mut builder, &arena, vocab_size)?;
+    let mut arena = arena;
+    builder.upload(&mut arena)?;
+
+    let mut context_rows = Vec::with_capacity(phrases.len() * HOTWORD_EMBED_DIM);
+    let zeros = vec![0.0f32; HOTWORD_EMBED_DIM];
+    for phrase in phrases {
+        let token_values = phrase
+            .iter()
+            .copied()
+            .map(|token_id| {
+                i32::try_from(token_id).map_err(|_| DolphinHotwordError::Shape {
+                    reason: "hotword token id exceeds i32".to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut graph = runner.start_graph();
+        let token_tensor = graph
+            .new_tensor_1d_i32(phrase.len(), "dolphin_hotword_tokens")
+            .map_err(ggml_err("context_tokens_alloc"))?;
+        let zero = graph
+            .new_tensor_1d_f32(HOTWORD_EMBED_DIM, "dolphin_hotword_zero_state")
+            .map_err(ggml_err("context_zero_alloc"))?;
+        graph
+            .set_input(token_tensor)
+            .map_err(ggml_err("context_tokens_input"))?;
+        graph
+            .set_input(zero)
+            .map_err(ggml_err("context_zero_input"))?;
+        let embedded = graph
+            .get_rows(arena.graph_tensor(weights.embedding), token_tensor)
+            .map_err(ggml_err("context_embedding_lookup"))?;
+        let embedded_rows = (0..phrase.len())
+            .map(|index| {
+                let offset = index
+                    .checked_mul(HOTWORD_EMBED_DIM)
+                    .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                    .ok_or_else(|| DolphinHotwordError::Shape {
+                        reason: "hotword embedding row offset overflowed".to_string(),
+                    })?;
+                graph
+                    .view_1d(embedded, HOTWORD_EMBED_DIM, offset)
+                    .map_err(ggml_err("context_embedding_row"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (_, _, fwd0) = lstm_direction_graph(
+            &graph,
+            &embedded_rows,
+            zero,
+            weights.layer0_fwd,
+            &arena,
+            false,
+        )?;
+        let (_, _, bwd0) = lstm_direction_graph(
+            &graph,
+            &embedded_rows,
+            zero,
+            weights.layer0_bwd,
+            &arena,
+            true,
+        )?;
+        let layer1_inputs = fwd0
+            .iter()
+            .copied()
+            .zip(bwd0.iter().copied())
+            .map(|(fwd, bwd)| {
+                graph
+                    .concat(fwd, bwd, 0)
+                    .map_err(ggml_err("context_layer1_concat"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (fwd_h, fwd_c, _) = lstm_direction_graph(
+            &graph,
+            &layer1_inputs,
+            zero,
+            weights.layer1_fwd,
+            &arena,
+            false,
+        )?;
+        let (bwd_h, bwd_c, _) = lstm_direction_graph(
+            &graph,
+            &layer1_inputs,
+            zero,
+            weights.layer1_bwd,
+            &arena,
+            true,
+        )?;
+        let context_state = graph
+            .concat(bwd_h, fwd_h, 0)
+            .and_then(|state| graph.concat(state, bwd_c, 0))
+            .and_then(|state| graph.concat(state, fwd_c, 0))
+            .map_err(ggml_err("context_state_concat"))?;
+        let projected = linear(
+            &graph,
+            arena.graph_tensor(weights.context_w),
+            context_state,
+            arena.graph_tensor(weights.context_b),
+            "context_projection",
+        )?;
+        let output = apply_affine_layer_norm(
+            &graph,
+            projected,
+            HOTWORD_LAYER_NORM_EPS,
+            arena.graph_tensor(weights.norm_w),
+            arena.graph_tensor(weights.norm_b),
+            AffineLayerNormSteps {
+                norm: "context_norm",
+                scale: "context_norm",
+                bias: "context_norm",
+            },
+            |stage, source| DolphinHotwordError::Ggml { stage, source },
+        )?;
+        graph
+            .set_output(output)
+            .map_err(ggml_err("context_set_output"))?;
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .map_err(ggml_err("context_prepare"))?;
+        graph
+            .set_i32_slice(token_tensor, &token_values, "dolphin_hotword_tokens")
+            .map_err(ggml_err("context_upload_tokens"))?;
+        graph
+            .set_f32_slice(zero, &zeros, "dolphin_hotword_zero_state")
+            .map_err(ggml_err("context_upload_zero"))?;
+        let row = graph
+            .compute_output_f32(output, HOTWORD_EMBED_DIM)
+            .map_err(ggml_err("context_compute"))?;
+        context_rows.extend_from_slice(&row);
+    }
+    Ok(context_rows)
 }
 
 fn linear<'a>(
@@ -562,17 +930,17 @@ pub(crate) fn apply_hotword_deep_biasing(
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
         ),
         backend,
-        // See the matching comment in encoder_graph.rs: unconditionally
-        // enabling the gallocr scheduler only bounds memory footprint, never
-        // the hotword biasing layer's computed output.
-        use_scheduler: true,
+        // Explicit accelerated execution is direct so every neural op stays on
+        // the selected device. CPU retains the gallocr scheduler's bounded
+        // transient workspace.
+        use_scheduler: !backend.is_gpu_class(),
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
 
     // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
     // biasing-fusion weight here -- instead of the per-call transient graph
-    // leaves this used before -- is what lets the ggml multi-backend scheduler
-    // offload the fusion's matmuls to an accelerator (see `WeightBuilder`).
+    // leaves this used before -- is what lets the selected accelerator keep
+    // the fusion's matmuls device-resident (see `WeightBuilder`).
     // Mirrors `encoder_graph::WeightBuilder` and `joint_decode`'s CTC-head
     // arena. The arena is an owned value carrying a raw pointer into the
     // runner's backend, so it and the per-call graph (a `&mut runner` borrow)
@@ -859,6 +1227,101 @@ mod tests {
         let phrases = vec![vec![3u32, 4, 5], vec![10u32]];
         let emb = encode_hotword_context_embeddings(&provider, &phrases).expect("embeddings");
         assert_eq!(emb.len(), (phrases.len() + 1) * HOTWORD_EMBED_DIM);
+    }
+
+    #[test]
+    fn ggml_context_embeddings_match_the_scalar_oracle_on_cpu() {
+        let provider = fixture_provider(16);
+        let phrases = vec![vec![3u32, 4, 5]];
+        let expected =
+            encode_hotword_context_embeddings(&provider, &phrases).expect("scalar embeddings");
+        let actual = encode_hotword_context_embeddings_ggml(
+            &provider,
+            &phrases,
+            16,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("ggml embeddings");
+        assert_eq!(actual.len(), expected.len());
+        let max_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 1.0e-3,
+            "ggml/scalar hotword context max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn metal_hotword_pipeline_matches_scalar_and_computes_only_on_metal() {
+        let provider = fixture_provider(16);
+        let phrases = vec![vec![3u32]];
+        let expected =
+            encode_hotword_context_embeddings(&provider, &phrases).expect("scalar embeddings");
+        let frames = 2;
+        let encoder_out = (0..frames * HOTWORD_EMBED_DIM)
+            .map(|index| (index as f32 * 0.01).sin())
+            .collect::<Vec<_>>();
+        let expected_fused = apply_hotword_deep_biasing(
+            &provider,
+            &encoder_out,
+            frames,
+            &expected,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("scalar/CPU fusion");
+        let telemetry = crate::ggml_runtime::GgmlExecutionTelemetryCollector::new();
+        let guard = telemetry.install();
+        let actual = encode_hotword_context_embeddings_ggml(
+            &provider,
+            &phrases,
+            16,
+            GgmlCpuGraphBackend::Metal,
+        )
+        .expect("Metal embeddings");
+        let actual_fused = apply_hotword_deep_biasing(
+            &provider,
+            &encoder_out,
+            frames,
+            &actual,
+            GgmlCpuGraphBackend::Metal,
+        )
+        .expect("Metal fusion");
+        drop(guard);
+        let summary = telemetry.snapshot();
+        let max_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 5.0e-3,
+            "Metal/scalar hotword context max_abs={max_abs}"
+        );
+        let fused_max_abs = actual_fused
+            .iter()
+            .zip(&expected_fused)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            fused_max_abs <= 1.0e-2,
+            "Metal/CPU hotword fusion max_abs={fused_max_abs}"
+        );
+        assert!(
+            !summary.observed_compute_nodes_by_backend.is_empty(),
+            "Metal context graph must expose compute placement"
+        );
+        assert!(
+            summary
+                .observed_compute_nodes_by_backend
+                .keys()
+                .all(|backend| backend.starts_with("MTL") || backend.contains("Metal")),
+            "hotword context compute escaped Metal: {:?}",
+            summary.observed_compute_nodes_by_backend
+        );
     }
 
     #[test]

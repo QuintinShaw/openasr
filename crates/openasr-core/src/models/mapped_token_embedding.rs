@@ -28,6 +28,19 @@ pub(crate) struct MappedTokenEmbeddingTable {
     storage: TokenEmbeddingStorage,
 }
 
+/// Zero-copy token-embedding binding for a native decoder graph.
+///
+/// Only ggml's canonical `[d_model, vocab]` layout is row-addressable by
+/// token id. The descriptor borrows the already-validated tensor name; the
+/// graph executor resolves that name inside its own pack-wide loaded-weight
+/// context, so this never creates a second mapping or device allocation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MappedTokenEmbeddingDeviceSpec<'a> {
+    pub tensor_name: &'a str,
+    pub d_model: usize,
+    pub vocab_size: usize,
+}
+
 #[derive(Debug, Clone)]
 enum TokenEmbeddingStorage {
     /// F32/F16 in either supported orientation, or quantized token-major
@@ -147,6 +160,30 @@ impl MappedTokenEmbeddingTable {
 
     pub fn d_model(&self) -> usize {
         self.d_model
+    }
+
+    pub(crate) fn device_graph_spec(&self) -> Option<MappedTokenEmbeddingDeviceSpec<'_>> {
+        match &self.storage {
+            TokenEmbeddingStorage::Mapped {
+                payload: TokenEmbeddingPayload::Mapped(payload),
+                layout: TokenEmbeddingLayout::TokenMajor,
+                ..
+            } => Some(MappedTokenEmbeddingDeviceSpec {
+                tensor_name: &payload.metadata.name,
+                d_model: self.d_model,
+                vocab_size: self.vocab_size,
+            }),
+            #[cfg(test)]
+            TokenEmbeddingStorage::Mapped {
+                payload: TokenEmbeddingPayload::TestBytes(_),
+                ..
+            } => None,
+            TokenEmbeddingStorage::Mapped {
+                layout: TokenEmbeddingLayout::HiddenMajor,
+                ..
+            }
+            | TokenEmbeddingStorage::F32Token(_) => None,
+        }
     }
 
     pub fn gather_rows(&self, token_ids: &[u32]) -> Result<Vec<f32>, MappedTokenEmbeddingError> {
@@ -483,6 +520,12 @@ mod tests {
         write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
 
         let table = load_test_table(&runtime_path);
+        let device = table
+            .device_graph_spec()
+            .expect("canonical token-major embedding should be graph-bindable");
+        assert_eq!(device.tensor_name, TEST_TENSOR_NAME);
+        assert_eq!(device.d_model, TEST_D_MODEL);
+        assert_eq!(device.vocab_size, TEST_VOCAB_SIZE);
         let rows = table.gather_rows(&[0, 1]).expect("gather");
         assert_eq!(rows.len(), 8);
 
@@ -501,6 +544,10 @@ mod tests {
         write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
 
         let table = load_test_table(&runtime_path);
+        assert!(
+            table.device_graph_spec().is_none(),
+            "transposed host storage must not be exposed as a canonical graph tensor"
+        );
         let rows = table.gather_rows(&[2]).expect("gather");
         assert_eq!(rows.len(), 4);
 

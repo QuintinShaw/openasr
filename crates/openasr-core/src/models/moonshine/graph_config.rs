@@ -2,13 +2,8 @@ use crate::device::execution_policy::ExecutionPlacement;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
-    gpu_stage_enabled_for_backend, has_explicit_thread_override,
+    has_explicit_thread_override,
 };
-
-const OPENASR_MOONSHINE_ENABLE_ENCODER_METAL: &str = "OPENASR_MOONSHINE_ENABLE_ENCODER_METAL";
-const OPENASR_MOONSHINE_ENABLE_DECODER_METAL: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_METAL";
-const OPENASR_MOONSHINE_ENABLE_ENCODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_ENCODER_GPU";
-const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_GPU";
 
 /// Shared base for both stages: everything except the scheduler default,
 /// which the encoder and decoder now set independently (see
@@ -26,12 +21,10 @@ fn moonshine_runtime_graph_config_with_scheduler_default(
     )
 }
 
-/// Moonshine's product stage is Hybrid because waveform preparation and token
-/// handling stay on the host. The ggml encoder and decoder owned by this module
-/// are nevertheless complete device graphs. Keep that distinction explicit:
-/// a GPU-backed neural graph must not inherit the stage-level Hybrid scheduler,
-/// which would retain fallback capacity and add scheduler dispatch overhead even
-/// when every compute node is already placed on the same device.
+/// Moonshine's waveform preparation and token handling stay on the host, while
+/// the neural encoder and decoder are complete device graphs. Bind those graphs
+/// to the exact accelerator lane selected by policy; FullDevice also removes
+/// ggml's mandatory CPU scheduler fallback.
 fn apply_moonshine_neural_graph_placement(config: GgmlCpuGraphConfig) -> GgmlCpuGraphConfig {
     if config.backend.is_gpu_class() {
         crate::models::graph_runtime_config::apply_execution_placement(
@@ -48,10 +41,6 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     // its device-complete placement below.
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, Some(true));
     config.graph_size = config.graph_size.max(16_384);
-    if config.backend.is_gpu_class() && !encoder_gpu_enabled(config.backend) {
-        config.backend = GgmlCpuGraphBackend::Cpu;
-        config.use_scheduler = false;
-    }
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -65,7 +54,7 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
 /// activates when the backend is GPU-class *and* the scheduler is off (a
 /// multi-backend scheduler's `sched_alloc_graph` drops the per-token inputs
 /// a reused, in-place-KV graph depends on). The decoder previously inherited
-/// the stage-level Hybrid scheduler, which meant Metal decode never got the
+/// a cross-backend scheduler, which meant Metal decode never got the
 /// persistent incremental-step graph
 /// (`compute_incremental_step_logits`) and always fell back to rebuilding a
 /// full-prefix graph every token (`compute_full_prefix_step_logits`) -- an
@@ -77,18 +66,10 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
 /// (verified via the moonshine golden test), since it does not change which
 /// arithmetic runs, only whether the graph is rebuilt per token. The encoder
 /// and decoder are complete neural subgraphs, so both now use their exact
-/// device placement even though host-side product preparation keeps the outer
-/// stage Hybrid.
-pub(crate) fn moonshine_decoder_graph_config(
-    backend: GgmlCpuGraphBackend,
-    prefer_cpu_backend: bool,
-) -> GgmlCpuGraphConfig {
+/// FullDevice placement. Host-side product preparation is outside the neural
+/// placement contract.
+pub(crate) fn moonshine_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, None);
-    if config.backend.is_gpu_class() && (!decoder_gpu_enabled(config.backend) || prefer_cpu_backend)
-    {
-        config.backend = GgmlCpuGraphBackend::Cpu;
-        config.use_scheduler = false;
-    }
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -98,43 +79,12 @@ pub(crate) fn moonshine_decoder_graph_config(
     apply_moonshine_neural_graph_placement(config)
 }
 
-fn encoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_MOONSHINE_ENABLE_ENCODER_GPU,
-        true,
-        Some(OPENASR_MOONSHINE_ENABLE_ENCODER_METAL),
-        true,
-    )
-}
-
-fn decoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_MOONSHINE_ENABLE_DECODER_GPU,
-        true,
-        Some(OPENASR_MOONSHINE_ENABLE_DECODER_METAL),
-        true,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decoder_gpu_defaults_to_unified_gpu_lane() {
-        assert!(decoder_gpu_enabled(GgmlCpuGraphBackend::Gpu));
-    }
-
-    #[test]
-    fn decoder_gpu_keeps_cpu_and_metal_defaults() {
-        assert!(decoder_gpu_enabled(GgmlCpuGraphBackend::Cpu));
-        assert!(decoder_gpu_enabled(GgmlCpuGraphBackend::Metal));
-    }
-
-    #[test]
-    fn hybrid_stage_keeps_moonshine_neural_graphs_on_device() {
+    fn full_device_keeps_moonshine_neural_graphs_on_device() {
         let mut config =
             GgmlCpuGraphConfig::runtime_default_for_resolved_backend(GgmlCpuGraphBackend::Metal);
         config.use_scheduler = true;
@@ -144,5 +94,17 @@ mod tests {
             GgmlCpuGraphConfig::runtime_default_for_resolved_backend(GgmlCpuGraphBackend::Cpu);
         cpu.use_scheduler = true;
         assert!(apply_moonshine_neural_graph_placement(cpu).use_scheduler);
+    }
+
+    #[test]
+    fn encoder_and_decoder_preserve_the_resolved_metal_backend() {
+        assert_eq!(
+            moonshine_encoder_graph_config(GgmlCpuGraphBackend::Metal).backend,
+            GgmlCpuGraphBackend::Metal
+        );
+        assert_eq!(
+            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Metal).backend,
+            GgmlCpuGraphBackend::Metal
+        );
     }
 }

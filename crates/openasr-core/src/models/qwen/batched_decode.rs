@@ -18,6 +18,7 @@ use super::llm_transformer::{
     resolve_qwen_family_production_kv_cache_policy,
 };
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
+use super::prompt_embedding::Qwen3AsrPromptTokenInput;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tokenizer::Qwen3AsrTokenizer;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
@@ -59,6 +60,37 @@ pub(super) struct Qwen3AsrServeBatchConfig {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum Qwen3AsrServeBatchPromptInput {
+    Host(Qwen3AsrLlmPrefillInput),
+    TokenIds(Qwen3AsrPromptTokenInput),
+}
+
+impl Qwen3AsrServeBatchPromptInput {
+    fn token_count(&self) -> usize {
+        match self {
+            Self::Host(input) => input.token_count,
+            Self::TokenIds(input) => input.token_ids.len(),
+        }
+    }
+
+    fn hidden_size(&self, metadata: Qwen3AsrExecutionMetadata) -> usize {
+        match self {
+            Self::Host(input) => input.hidden_size,
+            Self::TokenIds(_) => metadata.llm_d_model,
+        }
+    }
+
+    fn host(&self) -> Result<&Qwen3AsrLlmPrefillInput, Qwen3AsrServeBatchError> {
+        match self {
+            Self::Host(input) => Ok(input),
+            Self::TokenIds(_) => Err(Qwen3AsrServeBatchError::DecodeFailed {
+                reason: "qwen serve batch prompt rows were not materialized on device".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct Qwen3AsrServeBatchJob {
     pub runtime_cache_path: PathBuf,
     /// The exact preflight provenance unit used by the submitting executor.
@@ -71,7 +103,7 @@ pub(super) struct Qwen3AsrServeBatchJob {
     /// so it carries the admission lease itself rather than cloning large
     /// token/logits/decoder payloads out of the cache entry.
     pub prepared_assets: Qwen3AsrServeBatchPreparedAssets,
-    pub llm_prefill_input: Qwen3AsrLlmPrefillInput,
+    pub prompt_input: Qwen3AsrServeBatchPromptInput,
     /// Current invocation's exact host span plus the stable resident envelope.
     /// The resident half is part of the engine key, so one owner never mixes
     /// incompatible reusable graph shapes.
@@ -800,27 +832,27 @@ impl Qwen3AsrOwnerThreadState {
                 break;
             };
             let n_seq = slots.len();
-            let mut hidden = Vec::with_capacity(d_model.saturating_mul(n_seq));
+            let mut token_ids = Vec::with_capacity(n_seq);
             let mut cache_positions = Vec::with_capacity(n_seq);
             let mut pack_errors = Vec::new();
             for (slot_index, active) in slots.iter().enumerate() {
                 if let Some(active) = active {
                     match (
-                        active.slot.gather_last_generated_token_hidden(),
+                        active.slot.last_generated_token_id(),
                         active.slot.next_cache_position(),
                     ) {
-                        (Ok(slot_hidden), Ok(cache_position)) => {
-                            hidden.extend(slot_hidden);
+                        (Ok(token_id), Ok(cache_position)) => {
+                            token_ids.push(token_id);
                             cache_positions.push(cache_position);
                         }
                         (Err(error), _) | (_, Err(error)) => {
                             pack_errors.push((slot_index, error));
-                            hidden.extend(std::iter::repeat_n(0.0_f32, d_model));
+                            token_ids.push(0);
                             cache_positions.push(0);
                         }
                     }
                 } else {
-                    hidden.extend(std::iter::repeat_n(0.0_f32, d_model));
+                    token_ids.push(0);
                     cache_positions.push(if graph_initialized {
                         max_positions.saturating_sub(1)
                     } else {
@@ -843,8 +875,8 @@ impl Qwen3AsrOwnerThreadState {
             }
 
             let step = if graph_initialized {
-                decoder.run_step_reused_batched(
-                    &hidden,
+                decoder.run_token_step_reused_batched(
+                    &token_ids,
                     &cache_positions,
                     QWEN_ROPE_THETA,
                     max_positions,
@@ -883,8 +915,8 @@ impl Qwen3AsrOwnerThreadState {
                         break;
                     }
                 };
-                decoder.run_step_reused_batched_seeded(
-                    &hidden,
+                decoder.run_token_step_reused_batched_seeded(
+                    &token_ids,
                     &cache_positions,
                     &seed_layers,
                     QWEN_ROPE_THETA,
@@ -1004,9 +1036,17 @@ impl Qwen3AsrOwnerThreadState {
         entries: &mut [Qwen3AsrPrefillSlotRef<'_>],
     ) -> Vec<(usize, Qwen3AsrServeBatchError)> {
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut failures = Vec::new();
         #[allow(clippy::needless_range_loop)]
         for entry_index in 0..entries.len() {
-            let token_count = entries[entry_index].slot.job.llm_prefill_input.token_count;
+            if let Err(error) = entries[entry_index]
+                .slot
+                .ensure_device_prompt_materialized(decoder)
+            {
+                failures.push((entries[entry_index].slot_index, error));
+                continue;
+            }
+            let token_count = entries[entry_index].slot.job.prompt_input.token_count();
             if let Some((_, group)) = groups
                 .iter_mut()
                 .find(|(group_token_count, _)| *group_token_count == token_count)
@@ -1017,7 +1057,6 @@ impl Qwen3AsrOwnerThreadState {
             }
         }
 
-        let mut failures = Vec::new();
         for (group_token_count, group) in groups {
             if group.len() > 1 {
                 if let Some(chunk_size) =
@@ -1082,12 +1121,16 @@ impl Qwen3AsrOwnerThreadState {
             });
         }
         let first = group[0];
-        let token_count = entries[first].slot.job.llm_prefill_input.token_count;
-        let hidden_size = entries[first].slot.job.llm_prefill_input.hidden_size;
+        let token_count = entries[first].slot.job.prompt_input.token_count();
+        let hidden_size = entries[first]
+            .slot
+            .job
+            .prompt_input
+            .hidden_size(entries[first].slot.job.metadata);
         for &entry_index in group {
             let slot = &entries[entry_index].slot;
-            if slot.job.llm_prefill_input.token_count != token_count
-                || slot.job.llm_prefill_input.hidden_size != hidden_size
+            if slot.job.prompt_input.token_count() != token_count
+                || slot.job.prompt_input.hidden_size(slot.job.metadata) != hidden_size
             {
                 return Err(Qwen3AsrServeBatchError::DecodeFailed {
                     reason: "qwen serve batch grouped prefill shape mismatch".to_string(),
@@ -1141,7 +1184,7 @@ impl Qwen3AsrOwnerThreadState {
             })?;
             let mut hidden = Vec::with_capacity(hidden_len.saturating_mul(n_seq));
             for &entry_index in group {
-                let input = &entries[entry_index].slot.job.llm_prefill_input;
+                let input = entries[entry_index].slot.job.prompt_input.host()?;
                 hidden.extend_from_slice(
                     input
                         .token_major_embeddings
@@ -1661,9 +1704,17 @@ impl Qwen3AsrOwnerThreadState {
     > {
         if self.decoder.is_none() && self.logits_runtime.is_none() {
             let prepared_runtime = slot.job.prepared_runtime()?;
-            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
+            let token_embedding = prepared_runtime
+                .token_embedding_table
+                .device_graph_spec()
+                .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
+                    reason: "qwen serve batch requires canonical device token embedding"
+                        .to_string(),
+                })?;
+            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_token_embedding(
                 prepared_runtime.decoder_plan.as_ref(),
                 &slot.job.runtime_source_preflight,
+                token_embedding,
                 slot.job.backend,
             )
             .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
@@ -1833,12 +1884,40 @@ impl Qwen3AsrBatchSlot {
         Ok(layers)
     }
 
+    fn ensure_device_prompt_materialized(
+        &mut self,
+        decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+    ) -> Result<(), Qwen3AsrServeBatchError> {
+        let Qwen3AsrServeBatchPromptInput::TokenIds(input) = &self.job.prompt_input else {
+            return Ok(());
+        };
+        let hidden_size = self.job.metadata.llm_d_model;
+        let token_count = input.token_ids.len();
+        let token_major_embeddings = decoder
+            .materialize_token_prompt_on_device(
+                &input.token_ids,
+                &input.audio_rows,
+                &input.audio_positions,
+            )
+            .map_err(map_serve_batch_graph_error)?
+            .ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
+                reason: "qwen serve batch GPU lane has no device token embedding".to_string(),
+            })?;
+        self.job.prompt_input = Qwen3AsrServeBatchPromptInput::Host(Qwen3AsrLlmPrefillInput {
+            token_count,
+            hidden_size,
+            token_major_embeddings,
+        });
+        Ok(())
+    }
+
     fn run_prefill(
         &mut self,
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
         logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
     ) -> Result<(), Qwen3AsrServeBatchError> {
-        let token_count = self.job.llm_prefill_input.token_count;
+        self.ensure_device_prompt_materialized(decoder)?;
+        let token_count = self.job.prompt_input.token_count();
         if token_count == 0 {
             return Err(Qwen3AsrServeBatchError::DecodeFailed {
                 reason: "qwen serve batch prefill token count is zero".to_string(),
@@ -1866,18 +1945,15 @@ impl Qwen3AsrBatchSlot {
                 reason: "qwen serve batch prefill chunk size is zero".to_string(),
             });
         }
-        let token_count = self.job.llm_prefill_input.token_count;
+        let token_count = self.job.prompt_input.token_count();
         if token_count <= chunk_size {
+            let input = self.job.prompt_input.host()?;
             let step = decoder
-                .run_prefill(
-                    &self.job.llm_prefill_input.token_major_embeddings,
-                    token_count,
-                    QWEN_ROPE_THETA,
-                )
+                .run_prefill(&input.token_major_embeddings, token_count, QWEN_ROPE_THETA)
                 .map_err(map_serve_batch_graph_error)?;
             return self.write_prefill_step_outputs(token_count, step, logits_runtime);
         }
-        let hidden_size = self.job.llm_prefill_input.hidden_size;
+        let hidden_size = self.job.prompt_input.hidden_size(self.job.metadata);
         let require_even_chunks = decoder.prefill_chunks_require_even_width();
         let mut position_offset = 0usize;
         let mut final_hidden = None;
@@ -1912,7 +1988,7 @@ impl Qwen3AsrBatchSlot {
             })?;
             let step = decoder
                 .run_prefill_chunk(
-                    &self.job.llm_prefill_input.token_major_embeddings[hidden_start..hidden_end],
+                    &self.job.prompt_input.host()?.token_major_embeddings[hidden_start..hidden_end],
                     chunk_len,
                     position_offset,
                     total_token_count,
@@ -1943,7 +2019,7 @@ impl Qwen3AsrBatchSlot {
         decoder: &mut Qwen3AsrLlmWholeDecoderGraphExecutor,
         logits_runtime: &mut Qwen3AsrLlmLogitsHeadRuntime,
     ) -> Result<(), Qwen3AsrServeBatchError> {
-        let token_count = self.job.llm_prefill_input.token_count;
+        let token_count = self.job.prompt_input.token_count();
         let mut final_hidden = None;
         for token_position in 0..token_count {
             // Serial host-step prefill is the chunk-size-1 fallback; poll the
@@ -2076,7 +2152,7 @@ impl Qwen3AsrBatchSlot {
                     .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
             }
         }
-        let hidden_size = self.job.llm_prefill_input.hidden_size;
+        let hidden_size = self.job.prompt_input.hidden_size(self.job.metadata);
         let final_output_index = sequence_index
             .checked_mul(token_count)
             .and_then(|base| base.checked_add(token_count.checked_sub(1)?))
@@ -2112,7 +2188,7 @@ impl Qwen3AsrBatchSlot {
         &self,
         token_position: usize,
     ) -> Result<Vec<f32>, Qwen3AsrServeBatchError> {
-        let hidden_size = self.job.llm_prefill_input.hidden_size;
+        let hidden_size = self.job.prompt_input.hidden_size(self.job.metadata);
         let start = token_position.checked_mul(hidden_size).ok_or_else(|| {
             Qwen3AsrServeBatchError::DecodeFailed {
                 reason: "qwen serve batch prefill hidden indexing overflowed".to_string(),
@@ -2124,7 +2200,8 @@ impl Qwen3AsrBatchSlot {
             }
         })?;
         self.job
-            .llm_prefill_input
+            .prompt_input
+            .host()?
             .token_major_embeddings
             .get(start..end)
             .ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
@@ -2148,21 +2225,13 @@ impl Qwen3AsrBatchSlot {
         self.select_next_token_from_logits(logits)
     }
 
-    fn gather_last_generated_token_hidden(&self) -> Result<Vec<f32>, Qwen3AsrServeBatchError> {
-        let last_token =
-            *self
-                .generated_tokens
-                .last()
-                .ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: "qwen serve batch generated token history is unexpectedly empty"
-                        .to_string(),
-                })?;
-        self.job
-            .prepared_runtime()?
-            .token_embedding_table
-            .gather_rows(&[last_token])
-            .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                reason: error.to_string(),
+    fn last_generated_token_id(&self) -> Result<u32, Qwen3AsrServeBatchError> {
+        self.generated_tokens
+            .last()
+            .copied()
+            .ok_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
+                reason: "qwen serve batch generated token history is unexpectedly empty"
+                    .to_string(),
             })
     }
 
@@ -2624,6 +2693,143 @@ mod tests {
         (temp, fixture)
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn qwen_tiny_device_token_decoder(
+        fixture: &Qwen3AsrServeBatchFixture,
+    ) -> Qwen3AsrLlmWholeDecoderGraphExecutor {
+        let token_embedding = fixture
+            .token_embedding_table
+            .device_graph_spec()
+            .expect("tiny qwen fixture should expose canonical device token embeddings");
+        Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_token_embedding(
+            &fixture.decoder_plan,
+            &fixture.runtime_source_preflight,
+            token_embedding,
+            GgmlCpuGraphBackend::Metal,
+        )
+        .expect("tiny qwen Metal decoder should compile")
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_qwen_hidden_close(label: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{label} length mismatch");
+        let max_abs = actual
+            .iter()
+            .zip(expected)
+            .map(|(&actual, &expected)| {
+                assert!(
+                    actual.is_finite() && expected.is_finite(),
+                    "{label} produced non-finite output"
+                );
+                (actual - expected).abs()
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(max_abs <= 1.0e-5, "{label} diverged: max_abs={max_abs:.9}");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_device_token_lookup_matches_host_gather_and_preserves_kv_across_input_modes() {
+        let (_temp, fixture) = write_qwen_tiny_serve_batch_fixture();
+        let first_token = fixture.prompt_tokens[0];
+        let second_token = fixture.prompt_tokens[1];
+        let first_hidden = fixture
+            .token_embedding_table
+            .gather_rows(&[first_token])
+            .expect("first host token embedding");
+        let second_hidden = fixture
+            .token_embedding_table
+            .gather_rows(&[second_token])
+            .expect("second host token embedding");
+        let max_positions = 8;
+
+        let mut hidden_reference = qwen_tiny_device_token_decoder(&fixture);
+        let reference_first = hidden_reference
+            .run_step_reused_batched(&first_hidden, &[0], QWEN_ROPE_THETA, max_positions)
+            .expect("reference hidden step zero");
+        let reference_second = hidden_reference
+            .run_step_reused_batched(&second_hidden, &[1], QWEN_ROPE_THETA, max_positions)
+            .expect("reference hidden step one");
+
+        let mut hidden_to_token = qwen_tiny_device_token_decoder(&fixture);
+        let switched_first = hidden_to_token
+            .run_step_reused_batched(&first_hidden, &[0], QWEN_ROPE_THETA, max_positions)
+            .expect("hidden-to-token hidden step");
+        let switched_second = hidden_to_token
+            .run_token_step_reused_batched(&[second_token], &[1], QWEN_ROPE_THETA, max_positions)
+            .expect("hidden-to-token token step");
+        assert_qwen_hidden_close(
+            "hidden-to-token first step",
+            &switched_first.hidden,
+            &reference_first.hidden,
+        );
+        assert_qwen_hidden_close(
+            "hidden-to-token second step",
+            &switched_second.hidden,
+            &reference_second.hidden,
+        );
+        assert_eq!(hidden_to_token.reused_batch_width_for_test(), Some(1));
+
+        let mut token_to_hidden = qwen_tiny_device_token_decoder(&fixture);
+        let reverse_first = token_to_hidden
+            .run_token_step_reused_batched(&[first_token], &[0], QWEN_ROPE_THETA, max_positions)
+            .expect("token-to-hidden token step");
+        let reverse_second = token_to_hidden
+            .run_step_reused_batched(&second_hidden, &[1], QWEN_ROPE_THETA, max_positions)
+            .expect("token-to-hidden hidden step");
+        assert_qwen_hidden_close(
+            "token-to-hidden first step",
+            &reverse_first.hidden,
+            &reference_first.hidden,
+        );
+        assert_qwen_hidden_close(
+            "token-to-hidden second step",
+            &reverse_second.hidden,
+            &reference_second.hidden,
+        );
+        assert_eq!(token_to_hidden.reused_batch_width_for_test(), Some(1));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_device_prompt_materialization_matches_sparse_host_splice() {
+        let (_temp, fixture) = write_qwen_tiny_serve_batch_fixture();
+        assert!(fixture.prompt_tokens.len() >= 2);
+        let d_model = fixture.metadata.llm_d_model;
+        let audio_positions = vec![0, fixture.prompt_tokens.len() - 1];
+        let mut audio_rows = vec![0.0_f32; audio_positions.len() * d_model];
+        for (index, value) in audio_rows.iter_mut().enumerate() {
+            *value = 0.25 + index as f32 * 0.03125;
+        }
+        let host_rows = fixture
+            .token_embedding_table
+            .gather_rows(&fixture.prompt_tokens)
+            .expect("host prompt rows");
+        let expected =
+            super::super::prompt_embedding::build_qwen3_prompt_embeddings_with_audio_positions(
+                fixture.prompt_tokens.len(),
+                &audio_positions,
+                d_model,
+                host_rows,
+                &audio_rows,
+            )
+            .expect("host sparse splice");
+        let mut decoder = qwen_tiny_device_token_decoder(&fixture);
+        let actual = decoder
+            .materialize_token_prompt_on_device(
+                &fixture.prompt_tokens,
+                &audio_rows,
+                &audio_positions,
+            )
+            .expect("device prompt graph")
+            .expect("Metal prompt materialization");
+        assert_qwen_hidden_close(
+            "device prompt sparse splice",
+            &actual,
+            &expected.token_major_values,
+        );
+    }
+
     fn with_qwen_direct_cpu_backend_for_test<T>(run: impl FnOnce() -> T) -> T {
         // Flattened into one multi-key override rather than nesting
         // `with_forced_cpu_backend_for_test` inside a second env guard: the
@@ -2698,10 +2904,10 @@ mod tests {
                 logits_head: Arc::new(fixture.logits_head.clone()),
                 decoder_plan: Arc::clone(&fixture.decoder_plan),
             },
-            llm_prefill_input: qwen_real_pack_prefill_input(
+            prompt_input: Qwen3AsrServeBatchPromptInput::Host(qwen_real_pack_prefill_input(
                 &fixture.token_embedding_table,
                 &fixture.prompt_tokens,
-            ),
+            )),
             kv_capacity: Qwen3AsrKvCacheCapacity::new(logical_positions, resident_positions)
                 .expect("fixture KV capacity"),
             decode_config: Seq2SeqGreedyDecodeConfig {

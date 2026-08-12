@@ -16,9 +16,9 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlRopeExtParams, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
-    env_var_truthy,
+    GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor, GgmlRopeExtParams,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
+    env_toggle_with_raw, env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
@@ -31,7 +31,9 @@ use super::logits_head::{
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::{Qwen3AsrExecutionMetadata, qwen3_asr_decoder_contract};
 use super::tensor_names::llm_layer_tensor_names;
-use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
+use crate::models::mapped_token_embedding::{
+    MappedTokenEmbeddingDeviceSpec, MappedTokenEmbeddingTable,
+};
 use crate::models::prepared_runtime_cache::{
     PreparedRuntimeQuoteBuilder, PreparedRuntimeQuoteContext,
 };
@@ -53,6 +55,7 @@ const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 // former 768 MiB byte guess: ggml reserves the full context address range even
 // though tensor payloads live in separate backend buffers.
 const QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE: usize = 1usize << 12;
+const QWEN3_LLM_RESIDENT_PREFILL_MAX_QUERY_TOKENS: usize = 256;
 // Worst-case arena handles per layer: norms/biases (5), split QKV (3), four
 // non-bindable projections, and seven two-tensor LoRA slots. Current Qwen3 ASR
 // packs use materially fewer; this bound also covers Qwen2-shaped adapters.
@@ -2150,6 +2153,7 @@ pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
     pub preflight: &'a crate::ggml_runtime::GgufRuntimeSourcePreflight,
     pub rms_norm_epsilon: f32,
     pub fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'a>>,
+    pub token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'a>>,
     pub backend: GgmlCpuGraphBackend,
 }
 
@@ -2170,6 +2174,7 @@ pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
         request.plan,
         request.rms_norm_epsilon,
         request.fused_logits_head,
+        request.token_embedding,
         None,
         request.preflight,
         request.backend,
@@ -2187,6 +2192,7 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     // drop first — keep it the first field. `loaded` must outlive the graph but
     // its backend buffer is tied to `runner`, so it sits between them.
     reuse: Option<LlmReusableDecodeGraph>,
+    device_token_embedding: Option<QwenDeviceTokenEmbedding>,
     // Never READ, but load-bearing: owns the mmap backing the zero-copy bound LLM
     // weights, so it MUST stay alive (and drop after `reuse`). Removing it would
     // dangle the bound tensor pointers (UB) — hence allow(dead_code), not deletion.
@@ -2203,6 +2209,42 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     flash_attention_precision: GgmlFlashAttentionPrecision,
     #[cfg(test)]
     materialization_peak_staging_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QwenDeviceTokenEmbedding {
+    tensor: GgmlLoadedTensor,
+    vocab_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwenReusableDecodeInputKind {
+    Hidden,
+    TokenIds,
+}
+
+#[derive(Clone, Copy)]
+enum QwenReusableDecodeInput<'a> {
+    Hidden(&'a [f32]),
+    TokenIds(&'a [u32]),
+}
+
+enum QwenResidentPrefillInput<'a> {
+    Hidden(&'a [f32]),
+    TokenIds {
+        token_ids: &'a [u32],
+        audio_rows: &'a [f32],
+        audio_positions_in_chunk: &'a [usize],
+    },
+}
+
+impl QwenReusableDecodeInput<'_> {
+    fn kind(&self) -> QwenReusableDecodeInputKind {
+        match self {
+            Self::Hidden(_) => QwenReusableDecodeInputKind::Hidden,
+            Self::TokenIds(_) => QwenReusableDecodeInputKind::TokenIds,
+        }
+    }
 }
 
 impl fmt::Debug for Qwen3AsrLlmWholeDecoderGraphExecutor {
@@ -2240,6 +2282,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         plan: &QwenWholeDecoderPlan,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
@@ -2247,6 +2290,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             plan,
             DEFAULT_RMS_NORM_EPSILON,
             fused_logits_head,
+            token_embedding,
             adapter,
             preflight,
             backend,
@@ -2264,6 +2308,25 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 preflight,
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: None,
+                token_embedding: None,
+                backend,
+            },
+        )
+    }
+
+    pub(crate) fn new_from_plan_with_preflight_and_token_embedding(
+        plan: &QwenWholeDecoderPlan,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        token_embedding: MappedTokenEmbeddingDeviceSpec<'_>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        compile_qwen_whole_decoder_graph_from_prepared_plan(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan,
+                preflight,
+                rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+                fused_logits_head: None,
+                token_embedding: Some(token_embedding),
                 backend,
             },
         )
@@ -2277,6 +2340,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         plan: &QwenWholeDecoderPlan,
         rms_norm_epsilon: f32,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
@@ -2351,6 +2415,41 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 Ok::<_, GgmlCpuGraphError>(handles)
             })
             .transpose()?;
+        let device_token_embedding = token_embedding
+            .map(|spec| {
+                if spec.d_model != dims.d_model {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "device token embedding width does not match decoder d_model",
+                    });
+                }
+                let metadata = reader.tensor_index().get(spec.tensor_name).ok_or_else(|| {
+                    GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: format!(
+                            "device token embedding tensor '{}' is missing",
+                            spec.tensor_name
+                        ),
+                    }
+                })?;
+                if metadata.dims != [spec.d_model as u64, spec.vocab_size as u64] {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "device token embedding must use canonical [d_model, vocab] layout",
+                    });
+                }
+                let tensor = loaded
+                    .as_ref()
+                    .and_then(|context| context.tensor(spec.tensor_name))
+                    .ok_or_else(|| GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: format!(
+                            "device token embedding tensor '{}' was not bound",
+                            spec.tensor_name
+                        ),
+                    })?;
+                Ok(QwenDeviceTokenEmbedding {
+                    tensor,
+                    vocab_size: spec.vocab_size,
+                })
+            })
+            .transpose()?;
 
         // Materialization pass. Direct projections are borrowed from the mmap
         // and uploaded without a host copy. Fallback projections and vectors
@@ -2377,6 +2476,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         let mut executor = Self {
             reuse: None,
+            device_token_embedding,
             loaded,
             runner,
             arena,
@@ -2627,6 +2727,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         let mut executor = Self {
             reuse: None,
+            device_token_embedding: None,
             loaded,
             runner,
             arena,
@@ -2735,16 +2836,33 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.fused_logits_head.is_some()
     }
 
+    pub(crate) fn supports_device_token_embedding(&self) -> bool {
+        self.device_token_embedding.is_some() && self.supports_graph_reuse()
+    }
+
     #[cfg(test)]
     pub(crate) fn reused_batch_width_for_test(&self) -> Option<usize> {
         self.reuse.as_ref().map(|reuse| reuse.n_seq)
     }
 
     pub(crate) fn reused_graph_matches(&self, n_seq: usize, max_positions: usize) -> bool {
+        self.reused_graph_matches_input(n_seq, max_positions, QwenReusableDecodeInputKind::Hidden)
+    }
+
+    fn reused_graph_matches_input(
+        &self,
+        n_seq: usize,
+        max_positions: usize,
+        input_kind: QwenReusableDecodeInputKind,
+    ) -> bool {
         self.reuse
             .as_ref()
             .map(|reuse| {
-                !reuse.is_poisoned() && reuse.n_seq == n_seq && reuse.max_positions == max_positions
+                !reuse.is_poisoned()
+                    && reuse.n_seq == n_seq
+                    && reuse.max_positions == max_positions
+                    && reuse.uses_token_ids()
+                        == matches!(input_kind, QwenReusableDecodeInputKind::TokenIds)
             })
             .unwrap_or(false)
     }
@@ -2975,6 +3093,32 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
     }
 
+    /// Device-token variant of [`Self::run_step_auto`]. Direct GPU lanes bind
+    /// the canonical token-embedding tensor from the executor's existing
+    /// pack-wide loaded context and run `get_rows` inside the persistent decode
+    /// graph. CPU/scheduler paths return `None` so callers keep their existing
+    /// mmap-backed host gather without changing numerical behavior.
+    pub(crate) fn run_token_step_auto(
+        &mut self,
+        token_id: u32,
+        cache_position: usize,
+        layer_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
+        rope_theta: f32,
+    ) -> Result<Option<Qwen3AsrLlmWholeStepOutput>, GgmlCpuGraphError> {
+        self.validate_logical_cache_capacity(layer_caches, capacity)?;
+        if !self.supports_device_token_embedding() {
+            return Ok(None);
+        }
+        self.run_token_step_reused_batched(
+            &[token_id],
+            &[cache_position],
+            rope_theta,
+            capacity.resident_positions(),
+        )
+        .map(Some)
+    }
+
     /// Prompt prefill for families that keep the plain "whole prompt as one
     /// `run_prefill` call" CPU path (no HIP/GPU chunk tuning) but still want
     /// `run_step_auto`'s Metal/GPU decode-graph reuse: `run_step_auto` and
@@ -3021,6 +3165,232 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             control,
         )?;
         Ok(Some(step.hidden))
+    }
+
+    /// Device-resident counterpart to [`Self::run_prefill_auto_last_hidden`].
+    /// Canonical prompt token embeddings are gathered from the pack-bound
+    /// embedding tensor inside each resident prefill graph; encoder-produced
+    /// audio rows replace only the declared contiguous placeholder span via
+    /// `ggml_set_rows`. CPU/non-reuse backends return `None` so family wrappers
+    /// retain their existing host gather + splice fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_token_prefill_auto_last_hidden(
+        &mut self,
+        token_ids: &[u32],
+        audio_rows: &[f32],
+        audio_positions: &[usize],
+        layer_caches: &[Qwen3AsrLayerKvCacheState],
+        capacity: Qwen3AsrKvCacheCapacity,
+        rope_theta: f32,
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    ) -> Result<Option<Vec<f32>>, GgmlCpuGraphError> {
+        self.validate_logical_cache_capacity(layer_caches, capacity)?;
+        if !self.supports_device_token_embedding() {
+            return Ok(None);
+        }
+        if token_ids.is_empty() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident token prefill requires at least one token",
+            });
+        }
+        if !audio_rows.len().is_multiple_of(self.dims.d_model) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident token prefill audio row width mismatch",
+            });
+        }
+        let audio_count = audio_rows.len() / self.dims.d_model;
+        if audio_positions.len() != audio_count {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident token prefill audio position count mismatch",
+            });
+        }
+        let mut previous = None;
+        for &position in audio_positions {
+            if position >= token_ids.len() || previous.is_some_and(|previous| position <= previous)
+            {
+                return Err(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident token prefill audio positions must be sorted, unique, and in range",
+                });
+            }
+            previous = Some(position);
+        }
+
+        let mut final_step = None;
+        for position_offset in
+            (0..token_ids.len()).step_by(QWEN3_LLM_RESIDENT_PREFILL_MAX_QUERY_TOKENS)
+        {
+            if control.is_canceled() {
+                return Err(GgmlCpuGraphError::Canceled);
+            }
+            let chunk_tokens = (token_ids.len() - position_offset)
+                .min(QWEN3_LLM_RESIDENT_PREFILL_MAX_QUERY_TOKENS);
+            let chunk_end = position_offset + chunk_tokens;
+            let first_audio =
+                audio_positions.partition_point(|&position| position < position_offset);
+            let end_audio = audio_positions.partition_point(|&position| position < chunk_end);
+            let chunk_audio_positions = audio_positions[first_audio..end_audio]
+                .iter()
+                .map(|position| position - position_offset)
+                .collect::<Vec<_>>();
+            let chunk_audio_rows = if first_audio < end_audio {
+                let row_start = first_audio.checked_mul(self.dims.d_model).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident token prefill audio offset overflow",
+                    },
+                )?;
+                let row_end = end_audio.checked_mul(self.dims.d_model).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident token prefill audio end overflow",
+                    },
+                )?;
+                audio_rows
+                    .get(row_start..row_end)
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident token prefill audio slice is invalid",
+                    })?
+            } else {
+                &[][..]
+            };
+            let is_final_chunk = chunk_end == token_ids.len();
+            let step = self.run_prefill_chunk_into_reused_batched(
+                QwenResidentPrefillInput::TokenIds {
+                    token_ids: &token_ids[position_offset..chunk_end],
+                    audio_rows: chunk_audio_rows,
+                    audio_positions_in_chunk: &chunk_audio_positions,
+                },
+                chunk_tokens,
+                1,
+                position_offset,
+                capacity.resident_positions(),
+                rope_theta,
+                is_final_chunk,
+            )?;
+            if is_final_chunk {
+                final_step = Some(step);
+            }
+        }
+        Ok(Some(
+            final_step
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident token prefill produced no final chunk",
+                })?
+                .hidden,
+        ))
+    }
+
+    /// Materialize canonical token rows and sparse audio replacements on the
+    /// selected GPU without touching the host token table. This compatibility
+    /// bridge is used by the multi-request serve-batch prefill and stateless
+    /// consumers that still accept a hidden-row buffer; their transformer
+    /// compute remains unchanged while the embedding lookup itself is no
+    /// longer Rust/CPU model math.
+    pub(crate) fn materialize_token_prompt_on_device(
+        &mut self,
+        token_ids: &[u32],
+        audio_rows: &[f32],
+        audio_positions: &[usize],
+    ) -> Result<Option<Vec<f32>>, GgmlCpuGraphError> {
+        let Some(embedding) = self.device_token_embedding else {
+            return Ok(None);
+        };
+        if !self.runner.backend_kind().is_gpu_class() {
+            return Ok(None);
+        }
+        if token_ids.is_empty() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder device prompt materialization requires at least one token",
+            });
+        }
+        if token_ids
+            .iter()
+            .any(|&token_id| token_id as usize >= embedding.vocab_size)
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder device prompt token id exceeds vocabulary",
+            });
+        }
+        if !audio_rows.len().is_multiple_of(self.dims.d_model) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder device prompt audio row width mismatch",
+            });
+        }
+        let audio_count = audio_rows.len() / self.dims.d_model;
+        if audio_positions.len() != audio_count
+            || audio_positions
+                .iter()
+                .any(|&position| position >= token_ids.len())
+            || audio_positions
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder device prompt audio positions are invalid",
+            });
+        }
+
+        let token_values = token_ids
+            .iter()
+            .map(|&token_id| {
+                i32::try_from(token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder device prompt token id exceeds i32",
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut graph = self.runner.start_graph();
+        let token_tensor =
+            graph.new_tensor_1d_i32(token_ids.len(), "qwen_llm_device_prompt_token_ids")?;
+        graph.set_input(token_tensor)?;
+        let token_rows = graph.get_rows(embedding.tensor.as_graph_tensor(), token_tensor)?;
+        let mut audio_upload = None;
+        let output = if audio_count == 0 {
+            token_rows
+        } else {
+            let audio_tensor = graph.new_tensor_2d_f32(
+                self.dims.d_model,
+                audio_count,
+                "qwen_llm_device_prompt_audio_rows",
+            )?;
+            let audio_indices_tensor =
+                graph.new_tensor_1d_i32(audio_count, "qwen_llm_device_prompt_audio_indices")?;
+            graph.set_input(audio_tensor)?;
+            graph.set_input(audio_indices_tensor)?;
+            let audio_indices = audio_positions
+                .iter()
+                .copied()
+                .map(|position| {
+                    i32::try_from(position).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder device prompt audio index exceeds i32",
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            audio_upload = Some((audio_tensor, audio_indices_tensor, audio_indices));
+            graph.set_rows(token_rows, audio_tensor, audio_indices_tensor)?
+        };
+        graph.set_output(output)?;
+        graph.prepare_outputs_for_upload(&[output])?;
+        graph.set_i32_slice(
+            token_tensor,
+            &token_values,
+            "qwen_llm_device_prompt_token_ids",
+        )?;
+        if let Some((audio_tensor, audio_indices_tensor, audio_indices)) = audio_upload {
+            graph.set_f32_slice(
+                audio_tensor,
+                audio_rows,
+                "qwen_llm_device_prompt_audio_rows",
+            )?;
+            graph.set_i32_slice(
+                audio_indices_tensor,
+                &audio_indices,
+                "qwen_llm_device_prompt_audio_indices",
+            )?;
+        }
+        let output_len = token_ids.len().checked_mul(self.dims.d_model).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder device prompt output width overflow",
+            },
+        )?;
+        graph.compute_output_f32(output, output_len).map(Some)
     }
 
     fn validate_logical_cache_capacity(
@@ -3391,14 +3761,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         rope_theta: f32,
         control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
-        const RESIDENT_PREFILL_MAX_QUERY_TOKENS: usize = 256;
         if token_count == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder resident prefill token count must be positive",
             });
         }
         let mut final_step = None;
-        for position_offset in (0..token_count).step_by(RESIDENT_PREFILL_MAX_QUERY_TOKENS) {
+        for position_offset in (0..token_count).step_by(QWEN3_LLM_RESIDENT_PREFILL_MAX_QUERY_TOKENS)
+        {
             // L1.2 cooperative cancel: poll between resident prefill chunks so
             // stop lands at a chunk boundary instead of waiting for the whole
             // prompt bulk (or the long-form slice boundary). Pause stays L0-only.
@@ -3406,7 +3776,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 return Err(GgmlCpuGraphError::Canceled);
             }
             let chunk_tokens =
-                (token_count - position_offset).min(RESIDENT_PREFILL_MAX_QUERY_TOKENS);
+                (token_count - position_offset).min(QWEN3_LLM_RESIDENT_PREFILL_MAX_QUERY_TOKENS);
             let chunk_hidden = Self::sequence_major_prefill_chunk(
                 sequence_major_hidden,
                 token_count,
@@ -3417,7 +3787,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             )?;
             let is_final_chunk = position_offset.checked_add(chunk_tokens) == Some(token_count);
             let step = self.run_prefill_chunk_into_reused_batched(
-                &chunk_hidden,
+                QwenResidentPrefillInput::Hidden(&chunk_hidden),
                 chunk_tokens,
                 n_seq,
                 position_offset,
@@ -3436,7 +3806,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
     fn run_prefill_chunk_into_reused_batched(
         &mut self,
-        sequence_major_hidden: &[f32],
+        input: QwenResidentPrefillInput<'_>,
         token_count: usize,
         n_seq: usize,
         position_offset: usize,
@@ -3476,13 +3846,65 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: "whole-decoder resident prefill hidden width overflow",
             },
         )?;
-        if sequence_major_hidden.len() != expected_hidden {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "whole-decoder resident prefill hidden width mismatch",
-            });
+        match &input {
+            QwenResidentPrefillInput::Hidden(hidden) => {
+                if hidden.len() != expected_hidden {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident prefill hidden width mismatch",
+                    });
+                }
+            }
+            QwenResidentPrefillInput::TokenIds {
+                token_ids,
+                audio_rows,
+                audio_positions_in_chunk,
+            } => {
+                if n_seq != 1 || token_ids.len() != token_count {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder token prefill requires one token-id row per token",
+                    });
+                }
+                if audio_rows.len() % dims.d_model != 0 {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder token prefill audio row width mismatch",
+                    });
+                }
+                let audio_count = audio_rows.len() / dims.d_model;
+                if audio_positions_in_chunk.len() != audio_count
+                    || audio_positions_in_chunk
+                        .iter()
+                        .any(|&position| position >= token_count)
+                    || audio_positions_in_chunk
+                        .windows(2)
+                        .any(|window| window[0] >= window[1])
+                {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder token prefill audio positions are invalid",
+                    });
+                }
+                let embedding =
+                    self.device_token_embedding
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "whole-decoder token prefill requires a device token embedding",
+                        })?;
+                if token_ids
+                    .iter()
+                    .any(|&token_id| token_id as usize >= embedding.vocab_size)
+                {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder token prefill token id exceeds vocabulary",
+                    });
+                }
+            }
         }
         if !self.reused_graph_matches(n_seq, max_positions) {
-            self.rebuild_reused_batched_graph(n_seq, max_positions, rope_theta, None)?;
+            self.rebuild_reused_batched_graph(
+                n_seq,
+                max_positions,
+                rope_theta,
+                None,
+                QwenReusableDecodeInputKind::Hidden,
+            )?;
         }
         let use_flash_attention = self.llm_prefill_uses_flash_attention(token_count, max_positions);
 
@@ -3519,11 +3941,82 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             let build_started_at = std::time::Instant::now();
             let resident_kv = reuse.resident_kv_arena_mut().graph_tensors();
             let mut graph = self.runner.start_graph();
-            let hidden_tensor = graph.new_tensor_2d_f32(
-                dims.d_model,
-                output_tokens,
-                "qwen_llm_prefill_resident_hidden",
-            )?;
+            let mut hidden_upload = None;
+            let mut token_upload = None;
+            let mut audio_upload = None;
+            let state = match input {
+                QwenResidentPrefillInput::Hidden(hidden) => {
+                    let hidden_tensor = graph.new_tensor_2d_f32(
+                        dims.d_model,
+                        output_tokens,
+                        "qwen_llm_prefill_resident_hidden",
+                    )?;
+                    graph.set_input(hidden_tensor)?;
+                    hidden_upload = Some((hidden_tensor, hidden));
+                    hidden_tensor
+                }
+                QwenResidentPrefillInput::TokenIds {
+                    token_ids,
+                    audio_rows,
+                    audio_positions_in_chunk,
+                } => {
+                    let embedding = self
+                        .device_token_embedding
+                        .expect("device token embedding validated before resident token prefill");
+                    let token_values = token_ids
+                        .iter()
+                        .map(|&token_id| {
+                            i32::try_from(token_id).map_err(|_| {
+                                GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "whole-decoder token prefill token id exceeds i32",
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let token_tensor = graph
+                        .new_tensor_1d_i32(token_count, "qwen_llm_prefill_resident_token_ids")?;
+                    graph.set_input(token_tensor)?;
+                    let token_rows =
+                        graph.get_rows(embedding.tensor.as_graph_tensor(), token_tensor)?;
+                    token_upload = Some((token_tensor, token_values));
+                    if audio_rows.is_empty() {
+                        token_rows
+                    } else {
+                        let audio_count = audio_rows.len() / dims.d_model;
+                        let audio_tensor = graph.new_tensor_2d_f32(
+                            dims.d_model,
+                            audio_count,
+                            "qwen_llm_prefill_resident_audio_rows",
+                        )?;
+                        let audio_indices = audio_positions_in_chunk
+                            .iter()
+                            .copied()
+                            .map(|index| {
+                                i32::try_from(index).map_err(|_| {
+                                    GgmlCpuGraphError::UnsupportedInputs {
+                                        reason: "whole-decoder token prefill audio index exceeds i32",
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let audio_indices_tensor = graph.new_tensor_1d_i32(
+                            audio_count,
+                            "qwen_llm_prefill_resident_audio_indices",
+                        )?;
+                        graph.set_input(audio_tensor)?;
+                        graph.set_input(audio_indices_tensor)?;
+                        let spliced =
+                            graph.set_rows(token_rows, audio_tensor, audio_indices_tensor)?;
+                        audio_upload = Some((
+                            audio_tensor,
+                            audio_rows,
+                            audio_indices_tensor,
+                            audio_indices,
+                        ));
+                        spliced
+                    }
+                }
+            };
             let row_indices_tensor = graph.new_tensor_4d_i32(
                 token_count,
                 1,
@@ -3540,7 +4033,6 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 n_seq,
                 "qwen_llm_prefill_resident_self_mask",
             )?;
-            graph.set_input(hidden_tensor)?;
             graph.set_input(row_indices_tensor)?;
             graph.set_input(positions_tensor)?;
             graph.set_input(attention_mask)?;
@@ -3561,7 +4053,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     true,
                 ),
                 LlmDecoderStackInputs {
-                    state: hidden_tensor,
+                    state,
                     row_indices: row_indices_tensor,
                     positions: positions_tensor,
                     attention_mask: Some(attention_mask),
@@ -3596,11 +4088,20 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             };
             graph.set_output(output_state)?;
             graph.prepare_outputs_for_upload(&[output_state])?;
-            graph.set_f32_slice(
-                hidden_tensor,
-                sequence_major_hidden,
-                "qwen_llm_prefill_resident_hidden",
-            )?;
+            if let Some((tensor, values)) = hidden_upload {
+                graph.set_f32_slice(tensor, values, "qwen_llm_prefill_resident_hidden")?;
+            }
+            if let Some((tensor, values)) = token_upload {
+                graph.set_i32_slice(tensor, &values, "qwen_llm_prefill_resident_token_ids")?;
+            }
+            if let Some((audio, values, indices, index_values)) = audio_upload {
+                graph.set_f32_slice(audio, values, "qwen_llm_prefill_resident_audio_rows")?;
+                graph.set_i32_slice(
+                    indices,
+                    &index_values,
+                    "qwen_llm_prefill_resident_audio_indices",
+                )?;
+            }
             graph.set_i32_slice(
                 row_indices_tensor,
                 &row_indices,
@@ -4131,7 +4632,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 resident_kv_arena,
                 max_positions,
                 n_seq,
-                hidden_tensor,
+                Some(hidden_tensor),
+                None,
                 row_indices,
                 positions,
                 attention_mask,
@@ -4141,7 +4643,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
 
         let reuse = self.reuse.as_mut().expect("reuse graph built above");
-        let hidden_tensor = reuse.hidden_tensor;
+        let hidden_tensor = reuse
+            .hidden_tensor
+            .expect("serial hidden-input reuse graph built above");
         let row_indices = reuse.row_indices;
         let positions = reuse.positions;
         let attention_mask = reuse.attention_mask;
@@ -4181,7 +4685,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         rope_theta: f32,
         max_positions: usize,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
-        self.run_step_reused_batched_inner(hidden, cache_positions, rope_theta, max_positions, None)
+        self.run_step_reused_batched_inner(
+            QwenReusableDecodeInput::Hidden(hidden),
+            cache_positions,
+            rope_theta,
+            max_positions,
+            None,
+        )
     }
 
     /// Same graph as `run_step_reused_batched`, but seeds the resident KV arena
@@ -4198,7 +4708,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         max_positions: usize,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         self.run_step_reused_batched_inner(
-            hidden,
+            QwenReusableDecodeInput::Hidden(hidden),
             cache_positions,
             rope_theta,
             max_positions,
@@ -4214,7 +4724,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         max_positions: usize,
     ) -> Result<Qwen3AsrLlmWholeStepTop1Output, GgmlCpuGraphError> {
         self.run_step_reused_batched_top1_inner(
-            hidden,
+            QwenReusableDecodeInput::Hidden(hidden),
             cache_positions,
             rope_theta,
             max_positions,
@@ -4231,11 +4741,60 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         max_positions: usize,
     ) -> Result<Qwen3AsrLlmWholeStepTop1Output, GgmlCpuGraphError> {
         self.run_step_reused_batched_top1_inner(
-            hidden,
+            QwenReusableDecodeInput::Hidden(hidden),
             cache_positions,
             rope_theta,
             max_positions,
             Some(seeded_layer_kv_by_sequence),
+        )
+    }
+
+    pub(crate) fn run_token_step_reused_batched(
+        &mut self,
+        token_ids: &[u32],
+        cache_positions: &[usize],
+        rope_theta: f32,
+        max_positions: usize,
+    ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        self.run_step_reused_batched_inner(
+            QwenReusableDecodeInput::TokenIds(token_ids),
+            cache_positions,
+            rope_theta,
+            max_positions,
+            None,
+        )
+    }
+
+    pub(crate) fn run_token_step_reused_batched_seeded(
+        &mut self,
+        token_ids: &[u32],
+        cache_positions: &[usize],
+        seeded_layer_kv_by_sequence: &[&[Qwen3AsrLayerKvCacheState]],
+        rope_theta: f32,
+        max_positions: usize,
+    ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        self.run_step_reused_batched_inner(
+            QwenReusableDecodeInput::TokenIds(token_ids),
+            cache_positions,
+            rope_theta,
+            max_positions,
+            Some(seeded_layer_kv_by_sequence),
+        )
+    }
+
+    pub(crate) fn run_token_step_reused_batched_top1(
+        &mut self,
+        token_ids: &[u32],
+        cache_positions: &[usize],
+        rope_theta: f32,
+        max_positions: usize,
+    ) -> Result<Qwen3AsrLlmWholeStepTop1Output, GgmlCpuGraphError> {
+        self.run_step_reused_batched_top1_inner(
+            QwenReusableDecodeInput::TokenIds(token_ids),
+            cache_positions,
+            rope_theta,
+            max_positions,
+            None,
         )
     }
 
@@ -4262,6 +4821,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             max_positions,
             rope_theta,
             Some((&prefix_lengths, seeded_layer_kv_by_sequence)),
+            QwenReusableDecodeInputKind::Hidden,
         )
     }
 
@@ -4347,6 +4907,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         max_positions: usize,
         rope_theta: f32,
         seed: Option<(&[usize], &[&[Qwen3AsrLayerKvCacheState]])>,
+        input_kind: QwenReusableDecodeInputKind,
     ) -> Result<(), GgmlCpuGraphError> {
         if n_seq == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -4355,16 +4916,34 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         let dims = self.dims;
         let rope = GgmlRopeExtParams::qwen_neox(dims.head_dim, max_positions, rope_theta)?;
-        let mut resident_kv_arena = allocate_zeroed_llm_resident_kv_arena(
-            &self.runner,
-            self.layers.len(),
-            dims.head_dim,
-            max_positions,
-            dims.kv_heads,
-            n_seq,
-            "qwen_llm_resident_kv",
-            self.kv_cache_spec,
-        )?;
+        // Switching the persistent graph from host-hidden input to token-id
+        // input must preserve the prompt/generated KV already resident on the
+        // device. Reuse the arena when only the graph input contract changes;
+        // shape changes, poison, and explicit seeds allocate a fresh arena.
+        let reusable_arena = if seed.is_none()
+            && self.reuse.as_ref().is_some_and(|reuse| {
+                !reuse.is_poisoned() && reuse.n_seq == n_seq && reuse.max_positions == max_positions
+            }) {
+            self.reuse
+                .take()
+                .map(LlmReusableDecodeGraph::into_resident_kv_arena)
+        } else {
+            self.reuse = None;
+            None
+        };
+        let mut resident_kv_arena = match reusable_arena {
+            Some(arena) => arena,
+            None => allocate_zeroed_llm_resident_kv_arena(
+                &self.runner,
+                self.layers.len(),
+                dims.head_dim,
+                max_positions,
+                dims.kv_heads,
+                n_seq,
+                "qwen_llm_resident_kv",
+                self.kv_cache_spec,
+            )?,
+        };
         if let Some((prefix_lengths, seed_layers)) = seed {
             seed_qwen_batched_resident_kv_arena(
                 &mut resident_kv_arena,
@@ -4381,14 +4960,30 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .runner
             .start_persistent_graph_session(qwen_llm_graph_context_bytes())?;
         let graph = session.builder();
-        let hidden_tensor =
-            graph.new_tensor_2d_f32(dims.d_model, n_seq, "qwen_llm_reuse_hidden")?;
+        let (hidden_tensor, token_ids, input_state) = match input_kind {
+            QwenReusableDecodeInputKind::Hidden => {
+                let hidden =
+                    graph.new_tensor_2d_f32(dims.d_model, n_seq, "qwen_llm_reuse_hidden")?;
+                graph.set_input(hidden)?;
+                (Some(hidden), None, hidden)
+            }
+            QwenReusableDecodeInputKind::TokenIds => {
+                let embedding =
+                    self.device_token_embedding
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "whole-decoder device token embedding is not configured",
+                        })?;
+                let token_ids = graph.new_tensor_1d_i32(n_seq, "qwen_llm_reuse_token_ids")?;
+                graph.set_input(token_ids)?;
+                let state = graph.get_rows(embedding.tensor.as_graph_tensor(), token_ids)?;
+                (None, Some(token_ids), state)
+            }
+        };
         let row_indices_tensor =
             graph.new_tensor_4d_i32(1, 1, n_seq, 1, "qwen_llm_reuse_row_index")?;
         let positions = graph.new_tensor_1d_i32(n_seq, "qwen_llm_reuse_position")?;
         let attention_mask =
             graph.new_tensor_4d_f16(max_positions, 1, 1, n_seq, "qwen_llm_reuse_self_mask")?;
-        graph.set_input(hidden_tensor)?;
         graph.set_input(row_indices_tensor)?;
         graph.set_input(positions)?;
         graph.set_input(attention_mask)?;
@@ -4409,7 +5004,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 true,
             ),
             LlmDecoderStackInputs {
-                state: hidden_tensor,
+                state: input_state,
                 row_indices: row_indices_tensor,
                 positions,
                 attention_mask: Some(attention_mask),
@@ -4448,6 +5043,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             max_positions,
             n_seq,
             hidden_tensor,
+            token_ids,
             row_indices_tensor,
             positions,
             attention_mask,
@@ -4459,7 +5055,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
     fn run_step_reused_batched_inner(
         &mut self,
-        hidden: &[f32],
+        input: QwenReusableDecodeInput<'_>,
         cache_positions: &[usize],
         rope_theta: f32,
         max_positions: usize,
@@ -4478,11 +5074,48 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                     reason: "whole-decoder hidden width overflow",
                 })?;
-        if hidden.len() != expected_hidden {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "whole-decoder hidden width mismatch",
-            });
-        }
+        let input_kind = input.kind();
+        let token_ids_i32 = match input {
+            QwenReusableDecodeInput::Hidden(hidden) => {
+                if hidden.len() != expected_hidden {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder hidden width mismatch",
+                    });
+                }
+                None
+            }
+            QwenReusableDecodeInput::TokenIds(token_ids) => {
+                let embedding =
+                    self.device_token_embedding
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "whole-decoder device token embedding is not configured",
+                        })?;
+                if token_ids.len() != n_seq {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder token-id batch width mismatch",
+                    });
+                }
+                Some(
+                    token_ids
+                        .iter()
+                        .map(|&token_id| {
+                            if usize::try_from(token_id).ok().is_none_or(|token_id| {
+                                token_id >= embedding.vocab_size
+                            }) {
+                                return Err(GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "whole-decoder token id is outside the embedding vocabulary",
+                                });
+                            }
+                            i32::try_from(token_id).map_err(|_| {
+                                GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "whole-decoder token id exceeds ggml int boundary",
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+        };
 
         let mut total_tokens_by_sequence = Vec::with_capacity(n_seq);
         let mut row_indices = Vec::with_capacity(n_seq);
@@ -4519,29 +5152,43 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             });
         }
 
-        let needs_build = self
-            .reuse
-            .as_ref()
-            .map(|reuse| {
-                reuse.is_poisoned() || reuse.max_positions != max_positions || reuse.n_seq != n_seq
-            })
-            .unwrap_or(true)
+        let needs_build = !self.reused_graph_matches_input(n_seq, max_positions, input_kind)
             || seeded_layer_kv_by_sequence.is_some();
         if needs_build {
             let seed =
                 seeded_layer_kv_by_sequence.map(|seed_layers| (cache_positions, seed_layers));
-            self.rebuild_reused_batched_graph(n_seq, max_positions, rope_theta, seed)?;
+            self.rebuild_reused_batched_graph(n_seq, max_positions, rope_theta, seed, input_kind)?;
         }
 
         let reuse = self.reuse.as_mut().expect("reuse graph built above");
         let hidden_tensor = reuse.hidden_tensor;
+        let token_ids_tensor = reuse.token_ids;
         let row_indices_tensor = reuse.row_indices;
         let positions = reuse.positions;
         let attention_mask = reuse.attention_mask;
         let state = reuse.state;
         let graph = reuse.builder();
 
-        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_reuse_hidden")?;
+        match input {
+            QwenReusableDecodeInput::Hidden(hidden) => {
+                let hidden_tensor = hidden_tensor.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder hidden-input graph is missing its input tensor",
+                })?;
+                graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_reuse_hidden")?;
+            }
+            QwenReusableDecodeInput::TokenIds(_) => {
+                let token_ids = token_ids_tensor.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder token-input graph is missing its input tensor",
+                })?;
+                graph.set_i32_slice(
+                    token_ids,
+                    token_ids_i32
+                        .as_deref()
+                        .expect("token input validated above"),
+                    "qwen_llm_reuse_token_ids",
+                )?;
+            }
+        }
         let mask_bits = build_fixed_kv_attention_mask_bits_for_sequences(
             max_positions,
             &total_tokens_by_sequence,
@@ -4563,7 +5210,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
     fn run_step_reused_batched_top1_inner(
         &mut self,
-        hidden: &[f32],
+        input: QwenReusableDecodeInput<'_>,
         cache_positions: &[usize],
         rope_theta: f32,
         max_positions: usize,
@@ -4592,11 +5239,48 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                     reason: "whole-decoder hidden width overflow",
                 })?;
-        if hidden.len() != expected_hidden {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "whole-decoder hidden width mismatch",
-            });
-        }
+        let input_kind = input.kind();
+        let token_ids_i32 = match input {
+            QwenReusableDecodeInput::Hidden(hidden) => {
+                if hidden.len() != expected_hidden {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder hidden width mismatch",
+                    });
+                }
+                None
+            }
+            QwenReusableDecodeInput::TokenIds(token_ids) => {
+                let embedding =
+                    self.device_token_embedding
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "whole-decoder device token embedding is not configured",
+                        })?;
+                if token_ids.len() != n_seq {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder token-id batch width mismatch",
+                    });
+                }
+                Some(
+                    token_ids
+                        .iter()
+                        .map(|&token_id| {
+                            if usize::try_from(token_id).ok().is_none_or(|token_id| {
+                                token_id >= embedding.vocab_size
+                            }) {
+                                return Err(GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "whole-decoder token id is outside the embedding vocabulary",
+                                });
+                            }
+                            i32::try_from(token_id).map_err(|_| {
+                                GgmlCpuGraphError::UnsupportedInputs {
+                                    reason: "whole-decoder token id exceeds ggml int boundary",
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+        };
 
         let mut total_tokens_by_sequence = Vec::with_capacity(n_seq);
         let mut row_indices = Vec::with_capacity(n_seq);
@@ -4633,25 +5317,18 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             });
         }
 
-        let needs_build = self
-            .reuse
-            .as_ref()
-            .map(|reuse| {
-                reuse.is_poisoned()
-                    || reuse.max_positions != max_positions
-                    || reuse.n_seq != n_seq
-                    || reuse.top1.is_none()
-            })
-            .unwrap_or(true)
+        let needs_build = !self.reused_graph_matches_input(n_seq, max_positions, input_kind)
+            || self.reuse.as_ref().is_none_or(|reuse| reuse.top1.is_none())
             || seeded_layer_kv_by_sequence.is_some();
         if needs_build {
             let seed =
                 seeded_layer_kv_by_sequence.map(|seed_layers| (cache_positions, seed_layers));
-            self.rebuild_reused_batched_graph(n_seq, max_positions, rope_theta, seed)?;
+            self.rebuild_reused_batched_graph(n_seq, max_positions, rope_theta, seed, input_kind)?;
         }
 
         let reuse = self.reuse.as_mut().expect("reuse graph built above");
         let hidden_tensor = reuse.hidden_tensor;
+        let token_ids_tensor = reuse.token_ids;
         let row_indices_tensor = reuse.row_indices;
         let positions = reuse.positions;
         let attention_mask = reuse.attention_mask;
@@ -4660,7 +5337,26 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         })?;
         let graph = reuse.builder();
 
-        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_reuse_hidden")?;
+        match input {
+            QwenReusableDecodeInput::Hidden(hidden) => {
+                let hidden_tensor = hidden_tensor.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder hidden-input graph is missing its input tensor",
+                })?;
+                graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_reuse_hidden")?;
+            }
+            QwenReusableDecodeInput::TokenIds(_) => {
+                let token_ids = token_ids_tensor.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder token-input graph is missing its input tensor",
+                })?;
+                graph.set_i32_slice(
+                    token_ids,
+                    token_ids_i32
+                        .as_deref()
+                        .expect("token input validated above"),
+                    "qwen_llm_reuse_token_ids",
+                )?;
+            }
+        }
         let mask_bits = build_fixed_kv_attention_mask_bits_for_sequences(
             max_positions,
             &total_tokens_by_sequence,
@@ -7043,6 +7739,7 @@ mod tests {
                 preflight: &preflight,
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: tail.logits_head.fused_top1_spec(),
+                token_embedding: None,
                 backend: GgmlCpuGraphBackend::Cpu,
             },
         )
@@ -7168,6 +7865,7 @@ mod tests {
                         preflight,
                         rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                         fused_logits_head: None,
+                        token_embedding: None,
                         backend: GgmlCpuGraphBackend::Cpu,
                     },
                 )
@@ -7389,6 +8087,7 @@ mod tests {
                 preflight: &preflight,
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: None,
+                token_embedding: None,
                 backend: GgmlCpuGraphBackend::Cpu,
             },
         )

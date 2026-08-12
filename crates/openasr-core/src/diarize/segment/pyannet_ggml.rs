@@ -1,15 +1,14 @@
-//! Hybrid ggml execution for PyanNet segmentation-3.0.
+//! Full-device ggml execution for PyanNet segmentation-3.0.
 //!
-//! SincNet stays on the host because its small valid convolutions, pooling and
-//! instance normalization are already a compact family-owned implementation.
-//! The four bidirectional LSTMs and classifier are the compute-dominant block;
-//! this module uploads those weights once and owns a persistent backend graph.
-//! An explicit Metal request therefore reaches real Metal kernels without
-//! changing PyanNet's window geometry or ONNX gate semantics.
+//! SincNet, the four bidirectional LSTMs, and the classifier all execute on the
+//! selected backend. Host code only supplies waveform samples and performs the
+//! reversible layout/reordering between recurrent direction graphs. All model
+//! weights are uploaded once, then the construction-only host materialization
+//! is dropped so accelerated execution does not retain a second f32 copy.
 
 use thiserror::Error;
 
-use super::pyannet::{ALPHA, HIDDEN, LSTM_WEIGHTS, NUM_CLASSES, PyannetModel, transpose};
+use super::pyannet::{ALPHA, HIDDEN, LSTM_WEIGHTS, NUM_CLASSES, PyannetModel, output_frame_count};
 use crate::{
     device::execution_policy::ExecutionPlacement,
     diarize::embed::weights::{Weights, WeightsError},
@@ -22,13 +21,17 @@ use crate::{
 
 const INPUT_FEATURES: usize = 60;
 const GATE_COUNT: usize = 4;
+const SINC_EPSILON: f32 = 1.0e-5;
+const SINC_GRAPH_SIZE: usize = 1 << 9;
 // One reusable direction graph contains one full recurrent scan. Keeping the
 // two input-width variants separate avoids padding the first layer from 60 to
 // 256 channels, while reducing live graph metadata by more than 5x versus one
 // monolithic four-layer bidirectional graph.
 const DIRECTION_GRAPH_SIZE: usize = 1 << 14;
 const MAX_DIRECTION_FRAMES: usize = 800;
-const ARENA_TENSORS: usize = 1 << 8;
+// 13 SincNet handles + 6 stacked LSTM handles + 6 classifier handles + zero.
+const ARENA_TENSORS: usize = 26;
+const ACCELERATED_HOST_COMMITMENT_BYTES: u64 = 64 * 1024;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const LSTM_GROUP_SPECS: [(usize, usize); 2] = [(INPUT_FEATURES, 2), (2 * HIDDEN, 6)];
 
@@ -42,6 +45,27 @@ pub(crate) enum PyannetGgmlError {
     InvalidFeaturePayload { got: usize, expected: usize },
     #[error("PyanNet recurrent input has {frames} frames, maximum supported is {maximum}")]
     TooManyFrames { frames: usize, maximum: usize },
+    #[error("PyanNet SincNet output has {got} values, expected {expected}")]
+    InvalidSincOutput { got: usize, expected: usize },
+}
+
+#[derive(Clone, Copy)]
+struct SincConvHandles {
+    weight: GgmlStaticTensor,
+    bias: Option<GgmlStaticTensor>,
+    norm_weight: GgmlStaticTensor,
+    norm_bias: GgmlStaticTensor,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    stride: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SincHandles {
+    waveform_norm_weight: GgmlStaticTensor,
+    waveform_norm_bias: GgmlStaticTensor,
+    convs: [SincConvHandles; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +84,7 @@ struct LinearHandles {
 }
 
 struct WeightHandles {
+    sinc: SincHandles,
     lstm_groups: [LstmStackHandles; 2],
     classifier: [LinearHandles; 3],
     zero_state: GgmlStaticTensor,
@@ -68,6 +93,15 @@ struct WeightHandles {
 impl WeightHandles {
     fn allocate(arena: &GgmlStaticTensorArena) -> Result<Self, GgmlCpuGraphError> {
         Ok(Self {
+            sinc: SincHandles {
+                waveform_norm_weight: arena.new_tensor_1d_f32(1, "pyannet_waveform_norm_weight")?,
+                waveform_norm_bias: arena.new_tensor_1d_f32(1, "pyannet_waveform_norm_bias")?,
+                convs: [
+                    allocate_sinc_conv(arena, 1, 80, 251, 10, false)?,
+                    allocate_sinc_conv(arena, 80, 60, 5, 1, true)?,
+                    allocate_sinc_conv(arena, 60, 60, 5, 1, true)?,
+                ],
+            },
             lstm_groups: [
                 allocate_lstm_stack(arena, INPUT_FEATURES, 2)?,
                 allocate_lstm_stack(arena, 2 * HIDDEN, 6)?,
@@ -86,6 +120,44 @@ impl WeightHandles {
         arena: &mut GgmlStaticTensorArena,
         weights: &Weights,
     ) -> Result<(), PyannetGgmlError> {
+        arena.set_f32_slice(
+            self.sinc.waveform_norm_weight,
+            weights.get("sincnet.wav_norm1d.weight")?,
+            "pyannet_waveform_norm_weight",
+        )?;
+        arena.set_f32_slice(
+            self.sinc.waveform_norm_bias,
+            weights.get("sincnet.wav_norm1d.bias")?,
+            "pyannet_waveform_norm_bias",
+        )?;
+        for (index, handles) in self.sinc.convs.iter().copied().enumerate() {
+            let (weight_name, bias_name) = if index == 0 {
+                ("/sincnet/conv1d.0/Concat_2_output_0".to_string(), None)
+            } else {
+                (
+                    format!("sincnet.conv1d.{index}.weight"),
+                    Some(format!("sincnet.conv1d.{index}.bias")),
+                )
+            };
+            arena.set_f32_slice(
+                handles.weight,
+                weights.get(&weight_name)?,
+                "pyannet_sinc_conv_weight",
+            )?;
+            if let (Some(handle), Some(name)) = (handles.bias, bias_name) {
+                arena.set_f32_slice(handle, weights.get(&name)?, "pyannet_sinc_conv_bias")?;
+            }
+            arena.set_f32_slice(
+                handles.norm_weight,
+                weights.get(&format!("sincnet.norm1d.{index}.weight"))?,
+                "pyannet_sinc_norm_weight",
+            )?;
+            arena.set_f32_slice(
+                handles.norm_bias,
+                weights.get(&format!("sincnet.norm1d.{index}.bias"))?,
+                "pyannet_sinc_norm_bias",
+            )?;
+        }
         let gate = GATE_COUNT * HIDDEN;
         let mut input_weight_stacks = LSTM_GROUP_SPECS
             .map(|(input, slots)| vec![0.0f32; input.saturating_mul(gate).saturating_mul(slots)]);
@@ -157,6 +229,34 @@ impl WeightHandles {
     }
 }
 
+fn allocate_sinc_conv(
+    arena: &GgmlStaticTensorArena,
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    stride: usize,
+    with_bias: bool,
+) -> Result<SincConvHandles, GgmlCpuGraphError> {
+    Ok(SincConvHandles {
+        weight: arena.new_tensor_4d_f32(
+            kernel,
+            1,
+            input_channels,
+            output_channels,
+            "pyannet_sinc_conv_weight",
+        )?,
+        bias: with_bias
+            .then(|| arena.new_tensor_1d_f32(output_channels, "pyannet_sinc_conv_bias"))
+            .transpose()?,
+        norm_weight: arena.new_tensor_1d_f32(output_channels, "pyannet_sinc_norm_weight")?,
+        norm_bias: arena.new_tensor_1d_f32(output_channels, "pyannet_sinc_norm_bias")?,
+        input_channels,
+        output_channels,
+        kernel,
+        stride,
+    })
+}
+
 fn allocate_lstm_stack(
     arena: &GgmlStaticTensorArena,
     input: usize,
@@ -213,6 +313,14 @@ struct ResidentWeights {
     arena: GgmlStaticTensorArena,
 }
 
+struct PersistentSincGraph {
+    session: GgmlPersistentGraphSession,
+    input: GgmlCpuTensor<'static>,
+    output: GgmlCpuTensor<'static>,
+    samples: usize,
+    frames: usize,
+}
+
 struct PersistentDirectionGraph {
     session: GgmlPersistentGraphSession,
     input: GgmlCpuTensor<'static>,
@@ -221,14 +329,14 @@ struct PersistentDirectionGraph {
     frames: usize,
 }
 
-/// Thread-confined hybrid PyanNet runtime.
+/// Thread-confined full-device PyanNet runtime.
 ///
 /// Field order is load-bearing: graph tensors drop before their static arena,
 /// and the arena drops before the backend runner that allocated it.
 pub(crate) struct PyannetGgmlRuntime {
+    sinc_graph: Option<PersistentSincGraph>,
     direction_graphs: [Option<PersistentDirectionGraph>; 2],
     resident: ResidentWeights,
-    model: PyannetModel,
     runner: GgmlCpuGraphRunner,
 }
 
@@ -249,13 +357,11 @@ impl PyannetGgmlRuntime {
         let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
         config.graph_size = DIRECTION_GRAPH_SIZE;
         config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(DIRECTION_GRAPH_SIZE);
-        // The stage remains Hybrid because SincNet runs on the host, but this
-        // runtime owns only the recurrent/classifier subgraph.  A GPU-backed
-        // instance must therefore execute that subgraph directly on-device;
-        // enabling the multi-backend scheduler here would permit an implicit
-        // CPU fallback and retain scheduler high-water for an otherwise
-        // device-complete graph.
-        let graph_placement = recurrent_graph_placement(backend, placement);
+        // A GPU-backed instance owns the complete neural graph. Enabling the
+        // multi-backend scheduler here would permit an implicit CPU fallback
+        // and retain scheduler high-water for an otherwise device-complete
+        // runtime.
+        let graph_placement = device_graph_placement(backend, placement);
         let config =
             crate::models::graph_runtime_config::apply_execution_placement(config, graph_placement);
         let runner = GgmlCpuGraphRunner::new(config)?;
@@ -264,16 +370,21 @@ impl PyannetGgmlRuntime {
         let handles = WeightHandles::allocate(&arena)?;
         let mut arena = arena;
         handles.upload(&mut arena, model.weights())?;
+        drop(model);
         Ok(Self {
+            sinc_graph: None,
             direction_graphs: std::array::from_fn(|_| None),
             resident: ResidentWeights { handles, arena },
-            model,
             runner,
         })
     }
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, PyannetGgmlError> {
-        Ok(self.model.persistent_host_commitment_bytes()?)
+        Ok(ACCELERATED_HOST_COMMITMENT_BYTES)
+    }
+
+    pub(crate) const fn quoted_persistent_host_commitment_bytes() -> u64 {
+        ACCELERATED_HOST_COMMITMENT_BYTES
     }
 
     #[cfg(test)]
@@ -292,13 +403,190 @@ impl PyannetGgmlRuntime {
         &mut self,
         samples: &[f32],
     ) -> Result<(Vec<f32>, usize), PyannetGgmlError> {
-        let (channel_major, frames) = self.model.sincnet_features(samples)?;
+        let frames = output_frame_count(samples.len());
         if frames == 0 {
             return Ok((Vec::new(), 0));
         }
-        let features = transpose(&channel_major, INPUT_FEATURES, frames);
+        let features = self.run_sincnet(samples, frames)?;
         let output = self.forward_features(&features, frames)?;
         Ok((output, frames))
+    }
+
+    fn run_sincnet(
+        &mut self,
+        samples: &[f32],
+        frames: usize,
+    ) -> Result<Vec<f32>, PyannetGgmlError> {
+        if self.sinc_graph.as_ref().is_none_or(|graph| {
+            graph.samples != samples.len() || graph.frames != frames || graph.session.is_poisoned()
+        }) {
+            self.sinc_graph = None;
+            self.sinc_graph = Some(self.build_sinc_graph(samples.len(), frames)?);
+        }
+        let persistent = self
+            .sinc_graph
+            .as_mut()
+            .expect("PyanNet SincNet graph built");
+        let graph = persistent.session.builder();
+        graph.set_f32_slice(persistent.input, samples, "pyannet_waveform")?;
+        let output = graph.compute_output_f32(persistent.output, frames * INPUT_FEATURES)?;
+        let expected = frames.saturating_mul(INPUT_FEATURES);
+        if output.len() != expected {
+            return Err(PyannetGgmlError::InvalidSincOutput {
+                got: output.len(),
+                expected,
+            });
+        }
+        Ok(output)
+    }
+
+    fn build_sinc_graph(
+        &mut self,
+        samples: usize,
+        expected_frames: usize,
+    ) -> Result<PersistentSincGraph, GgmlCpuGraphError> {
+        let mut session = self
+            .runner
+            .start_persistent_graph_session_with_node_capacity(SINC_GRAPH_SIZE)?;
+        let graph = session.builder();
+        let input = graph.new_tensor_2d_f32(samples, 1, "pyannet_waveform")?;
+        let sinc = self.resident.handles.sinc;
+        let normalized = graph.norm(input, SINC_EPSILON)?;
+        let normalized = graph.mul(
+            normalized,
+            self.resident.arena.graph_tensor(sinc.waveform_norm_weight),
+        )?;
+        let mut state = graph.add(
+            normalized,
+            self.resident.arena.graph_tensor(sinc.waveform_norm_bias),
+        )?;
+        let mut time = samples;
+        for (index, handles) in sinc.convs.iter().copied().enumerate() {
+            debug_assert_eq!(
+                handles.input_channels,
+                if index == 0 {
+                    1
+                } else {
+                    sinc.convs[index - 1].output_channels
+                }
+            );
+            let state_4d = graph.reshape_4d(state, time, 1, handles.input_channels, 1)?;
+            state = graph.conv_2d_direct(
+                self.resident.arena.graph_tensor(handles.weight),
+                state_4d,
+                handles.stride,
+                1,
+                0,
+                0,
+                1,
+                1,
+            )?;
+            time = valid_output_count(time, handles.kernel, handles.stride);
+            state = graph.reshape_2d(state, time, handles.output_channels)?;
+            if index == 0 {
+                state = graph.abs(state)?;
+            } else if let Some(bias) = handles.bias {
+                state = apply_channel_affine(
+                    graph,
+                    state,
+                    None,
+                    Some(self.resident.arena.graph_tensor(bias)),
+                )?;
+            }
+            state = graph.max_pool_1d(state, 3, 3, 0)?;
+            time = valid_output_count(time, 3, 3);
+            state = apply_channel_instance_norm(
+                graph,
+                state,
+                time,
+                handles.output_channels,
+                self.resident.arena.graph_tensor(handles.norm_weight),
+                self.resident.arena.graph_tensor(handles.norm_bias),
+            )?;
+            state = graph.leaky_relu(state, ALPHA)?;
+        }
+        if time != expected_frames {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "PyanNet SincNet graph geometry does not match family contract",
+            });
+        }
+        // ggml conv tensors are `[time, channels]` with time contiguous. The
+        // recurrent graph consumes `[frames, channels]` row-major, so make the
+        // transposed view contiguous before readback.
+        let output = graph.cont(graph.transpose(state)?)?;
+        graph.set_input(input)?;
+        graph.set_output(output)?;
+        graph.prepare_outputs_for_upload(&[output])?;
+        Ok(PersistentSincGraph {
+            session,
+            input,
+            output,
+            samples,
+            frames: expected_frames,
+        })
+    }
+
+    #[cfg(test)]
+    fn run_sincnet_first_block_probe(
+        &mut self,
+        samples: &[f32],
+        stage: usize,
+    ) -> Result<Vec<f32>, PyannetGgmlError> {
+        let mut graph = self.runner.start_graph();
+        let input = graph.new_tensor_2d_f32(samples.len(), 1, "pyannet_probe_input")?;
+        let sinc = self.resident.handles.sinc;
+        let normalized = graph.norm(input, SINC_EPSILON)?;
+        let normalized = graph.mul(
+            normalized,
+            self.resident.arena.graph_tensor(sinc.waveform_norm_weight),
+        )?;
+        let waveform = graph.add(
+            normalized,
+            self.resident.arena.graph_tensor(sinc.waveform_norm_bias),
+        )?;
+        let conv_handles = sinc.convs[0];
+        let waveform_4d = graph.reshape_4d(waveform, samples.len(), 1, 1, 1)?;
+        let conv = graph.conv_2d_direct(
+            self.resident.arena.graph_tensor(conv_handles.weight),
+            waveform_4d,
+            conv_handles.stride,
+            1,
+            0,
+            0,
+            1,
+            1,
+        )?;
+        let conv_time = valid_output_count(samples.len(), conv_handles.kernel, conv_handles.stride);
+        let conv = graph.reshape_2d(conv, conv_time, conv_handles.output_channels)?;
+        let absolute = graph.abs(conv)?;
+        let pooled = graph.max_pool_1d(absolute, 3, 3, 0)?;
+        let pooled_time = valid_output_count(conv_time, 3, 3);
+        let normalized = apply_channel_instance_norm(
+            &graph,
+            pooled,
+            pooled_time,
+            conv_handles.output_channels,
+            self.resident.arena.graph_tensor(conv_handles.norm_weight),
+            self.resident.arena.graph_tensor(conv_handles.norm_bias),
+        )?;
+        let activated = graph.leaky_relu(normalized, ALPHA)?;
+        let (output, len) = match stage {
+            0 => (waveform, samples.len()),
+            1 => (conv, conv_time * conv_handles.output_channels),
+            2 => (absolute, conv_time * conv_handles.output_channels),
+            3 => (pooled, pooled_time * conv_handles.output_channels),
+            4 => (normalized, pooled_time * conv_handles.output_channels),
+            5 => (activated, pooled_time * conv_handles.output_channels),
+            _ => {
+                return Err(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet first-block probe stage out of range",
+                }
+                .into());
+            }
+        };
+        graph.set_input(input)?;
+        graph.set_f32_slice(input, samples, "pyannet_probe_input")?;
+        Ok(graph.compute_output_f32(output, len)?)
     }
 
     fn forward_features(
@@ -459,7 +747,46 @@ impl PyannetGgmlRuntime {
     }
 }
 
-fn recurrent_graph_placement(
+const fn valid_output_count(input: usize, kernel: usize, stride: usize) -> usize {
+    if input < kernel {
+        0
+    } else {
+        (input - kernel) / stride + 1
+    }
+}
+
+fn apply_channel_affine<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    input: GgmlCpuTensor<'a>,
+    scale: Option<GgmlCpuTensor<'a>>,
+    bias: Option<GgmlCpuTensor<'a>>,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    let mut feature_major = graph.cont(graph.transpose(input)?)?;
+    if let Some(scale) = scale {
+        feature_major = graph.mul(feature_major, scale)?;
+    }
+    if let Some(bias) = bias {
+        feature_major = graph.add(feature_major, bias)?;
+    }
+    graph.cont(graph.transpose(feature_major)?)
+}
+
+fn apply_channel_instance_norm<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    input: GgmlCpuTensor<'a>,
+    _time: usize,
+    _channels: usize,
+    scale: GgmlCpuTensor<'a>,
+    bias: GgmlCpuTensor<'a>,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    // Conv output is `[time, channels]`, so each channel is one ggml row and
+    // `norm` applies the exact per-channel InstanceNorm reduction over time.
+    // This also avoids backend-specific GroupNorm channel partition kernels.
+    let normalized = graph.norm(input, SINC_EPSILON)?;
+    apply_channel_affine(graph, normalized, Some(scale), Some(bias))
+}
+
+fn device_graph_placement(
     backend: GgmlCpuGraphBackend,
     stage_placement: ExecutionPlacement,
 ) -> ExecutionPlacement {
@@ -580,13 +907,13 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_stage_keeps_its_metal_subgraph_on_device() {
+    fn legacy_hybrid_input_is_normalized_to_the_complete_device_graph() {
         assert_eq!(
-            recurrent_graph_placement(GgmlCpuGraphBackend::Metal, ExecutionPlacement::Hybrid,),
+            device_graph_placement(GgmlCpuGraphBackend::Metal, ExecutionPlacement::Hybrid,),
             ExecutionPlacement::FullDevice,
         );
         assert_eq!(
-            recurrent_graph_placement(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly,),
+            device_graph_placement(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly,),
             ExecutionPlacement::CpuOnly,
         );
     }
@@ -606,10 +933,16 @@ mod tests {
             .collect();
         let reference_model = PyannetModel::from_oasr(&pack).expect("reference model");
         let (reference, frames) = reference_model.forward(&samples).expect("family forward");
+        let (reference_sinc, _, stage_frames) =
+            reference_model.stages(&samples).expect("family stages");
+        assert_eq!(stage_frames, frames);
+        let reference_sinc =
+            crate::diarize::segment::pyannet::transpose(&reference_sinc, INPUT_FEATURES, frames);
         assert_eq!(frames, 589);
-        for (backend, tolerance) in [
-            (GgmlCpuGraphBackend::Cpu, 2.0e-4f32),
-            (GgmlCpuGraphBackend::Metal, 1.0e-2f32),
+        let mut cpu_first_block_probes: Option<Vec<Vec<f32>>> = None;
+        for (backend, sinc_tolerance, tolerance) in [
+            (GgmlCpuGraphBackend::Cpu, 1.0e-3f32, 5.0e-4f32),
+            (GgmlCpuGraphBackend::Metal, 5.0e-3f32, 1.0e-2f32),
         ] {
             let model = PyannetModel::from_oasr(&pack).expect("runtime model");
             let placement = if backend == GgmlCpuGraphBackend::Cpu {
@@ -622,7 +955,54 @@ mod tests {
             if backend == GgmlCpuGraphBackend::Metal {
                 assert!(!runtime.runner.uses_scheduler());
             }
-            let (actual, actual_frames) = runtime.forward(&samples).expect("ggml forward");
+            let probes = [1usize, 4]
+                .into_iter()
+                .map(|stage| {
+                    runtime
+                        .run_sincnet_first_block_probe(&samples, stage)
+                        .expect("first-block probe")
+                })
+                .collect::<Vec<_>>();
+            if backend == GgmlCpuGraphBackend::Cpu {
+                cpu_first_block_probes = Some(probes);
+            } else {
+                for ((stage, tolerance), (actual, expected)) in
+                    [(1usize, 2.0e-6), (4, 1.0e-3)].into_iter().zip(
+                        probes.iter().zip(
+                            cpu_first_block_probes
+                                .as_ref()
+                                .expect("CPU first-block probes"),
+                        ),
+                    )
+                {
+                    let max_abs = actual
+                        .iter()
+                        .zip(expected)
+                        .map(|(actual, expected)| (actual - expected).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_abs < tolerance,
+                        "PyanNet SincNet stage {stage} Metal/CPU max abs {max_abs} exceeds {tolerance}"
+                    );
+                }
+            }
+            let sinc = runtime
+                .run_sincnet(&samples, frames)
+                .expect("ggml SincNet forward");
+            let sinc_max_abs = sinc
+                .iter()
+                .zip(&reference_sinc)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("PYANNET_SINC backend={backend:?} max_abs={sinc_max_abs:.9}");
+            assert!(
+                sinc_max_abs < sinc_tolerance,
+                "{backend:?} PyanNet SincNet max abs {sinc_max_abs} exceeds {sinc_tolerance}"
+            );
+            let actual = runtime
+                .forward_features(&sinc, frames)
+                .expect("ggml recurrent forward");
+            let actual_frames = frames;
             if backend == GgmlCpuGraphBackend::Metal {
                 let prepared_bytes = runtime
                     .prepared_graph_allocation_bytes()
@@ -641,7 +1021,7 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(
                 max_abs < tolerance,
-                "{backend:?} PyanNet recurrent max abs {max_abs} exceeds {tolerance}"
+                "{backend:?} PyanNet full graph max abs {max_abs} exceeds {tolerance}"
             );
         }
     }

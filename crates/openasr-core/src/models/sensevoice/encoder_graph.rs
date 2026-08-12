@@ -1,5 +1,5 @@
-//! sensevoice encoder graph: [prompt + LFR features] (host-prepared, already
-//! scaled by sqrt(d_model) with the sinusoidal PE added) -> SAN-M blocks
+//! sensevoice encoder graph: device prompt lookup + LFR features -> scale +
+//! sinusoidal PE -> SAN-M blocks
 //! (`enc.blk.0` at 560-dim input, then 512-dim blocks) -> `enc.after_norm` ->
 //! `tp.blk.*` -> `tp.norm` -> CTC head -> `[vocab, frames]` logits.
 //!
@@ -10,11 +10,12 @@
 #![allow(dead_code)]
 
 use crate::ggml_runtime::{
-    ArenaAllocError, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
-    WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
-    alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
-    upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
+    ArenaAllocError, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
+    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
+    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
+    upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::runtime_memory::{checked_sum, element_bytes};
 use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
@@ -30,9 +31,9 @@ use super::graph_config::sensevoice_encoder_graph_config;
 use super::runtime_contract::SenseVoiceExecutionMetadata;
 
 const SANM_ARENA_TENSORS_PER_LAYER: usize = 9;
-const SENSEVOICE_FIXED_ARENA_TENSORS: usize = 5;
-const SENSEVOICE_FIXED_GRAPH_NODES: usize = 9;
-const SENSEVOICE_FIXED_GRAPH_LEAFS: usize = 7;
+const SENSEVOICE_FIXED_ARENA_TENSORS: usize = 6;
+const SENSEVOICE_FIXED_GRAPH_NODES: usize = 19;
+const SENSEVOICE_FIXED_GRAPH_LEAFS: usize = 11;
 /// FunASR LayerNorm epsilon (torch LayerNorm eps=1e-12 in EncoderLayerSANM).
 const ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-12;
 
@@ -196,6 +197,9 @@ pub(crate) struct SenseVoiceEncoderGraph {
     tp_norm_bias: GgmlStaticTensor,
     ctc_head_weight: WeightSlot,
     ctc_head_bias: GgmlStaticTensor,
+    prompt_embedding: GgmlLoadedTensor,
+    prompt_embedding_rows: usize,
+    positional_inv_timescales: GgmlStaticTensor,
 }
 
 impl SenseVoiceEncoderGraph {
@@ -239,6 +243,21 @@ impl SenseVoiceEncoderGraph {
                 })?,
         );
         let loaded = loaded_weights.as_ref();
+        let prompt_embedding = loaded
+            .and_then(|loaded| loaded.tensor("embed.prompt.weight"))
+            .ok_or_else(|| SenseVoiceEncoderError::Shape {
+                reason: "missing device-bound SenseVoice prompt embedding".to_string(),
+            })?;
+        let prompt_embedding_rows = weights.prompt_embed.values.len() / metadata.feature_dim;
+        let positional_half = metadata.feature_dim / 2;
+        if positional_half < 2 || !metadata.feature_dim.is_multiple_of(2) {
+            return Err(SenseVoiceEncoderError::Shape {
+                reason: format!(
+                    "SenseVoice feature dim {} cannot form sinusoidal pairs",
+                    metadata.feature_dim
+                ),
+            });
+        }
         let arena_tensor_capacity = total_layers
             .saturating_mul(SANM_ARENA_TENSORS_PER_LAYER)
             .saturating_add(SENSEVOICE_FIXED_ARENA_TENSORS);
@@ -268,6 +287,12 @@ impl SenseVoiceEncoderGraph {
         let tp_norm_bias_t = alloc_static(&arena, &weights.tp_norm_bias, "tp_norm_b")?;
         let ctc_head_weight_slot = bind_loaded(loaded, &weights.ctc_head_weight.name)?;
         let ctc_head_bias_t = alloc_static(&arena, &weights.ctc_head_bias, "ctc_head_b")?;
+        let positional_inv_timescales_t = arena
+            .new_tensor_2d_f32(1, positional_half, "sensevoice_positional_inv_timescales")
+            .map_err(|source| SenseVoiceEncoderError::GraphBuildFailed {
+                step: "positional_inv_timescales_alloc",
+                source,
+            })?;
 
         // ----- upload all arena values -----
         for (layer, handles) in weights.enc_layers.iter().zip(&enc_handles) {
@@ -306,6 +331,20 @@ impl SenseVoiceEncoderGraph {
             &weights.ctc_head_bias,
             "ctc_head_b",
         )?;
+        let log_timescale_increment = (10_000.0f64).ln() / (positional_half as f64 - 1.0);
+        let positional_inv_timescales = (0..positional_half)
+            .map(|index| (-(index as f64) * log_timescale_increment).exp() as f32)
+            .collect::<Vec<_>>();
+        arena
+            .set_f32_slice(
+                positional_inv_timescales_t,
+                &positional_inv_timescales,
+                "sensevoice_positional_inv_timescales",
+            )
+            .map_err(|source| SenseVoiceEncoderError::GraphBuildFailed {
+                step: "positional_inv_timescales_upload",
+                source,
+            })?;
 
         Ok(Self {
             metadata,
@@ -320,6 +359,9 @@ impl SenseVoiceEncoderGraph {
             tp_norm_bias: tp_norm_bias_t,
             ctc_head_weight: ctc_head_weight_slot,
             ctc_head_bias: ctc_head_bias_t,
+            prompt_embedding,
+            prompt_embedding_rows,
+            positional_inv_timescales: positional_inv_timescales_t,
         })
     }
 
@@ -328,7 +370,6 @@ impl SenseVoiceEncoderGraph {
         input: &SenseVoiceEncoderInput,
     ) -> Result<SenseVoiceEncoderOutput, SenseVoiceEncoderError> {
         let metadata = self.metadata;
-        let d_model = metadata.d_model;
         let frames = input.n_frames;
         if input.feature_dim != metadata.feature_dim
             || input.data.len() != frames * metadata.feature_dim
@@ -347,81 +388,21 @@ impl SenseVoiceEncoderGraph {
             .map_err(bf("new_input"))?;
         graph.set_input(input_t).map_err(bf("set_input"))?;
 
-        let map = |step, source| SenseVoiceEncoderError::GraphBuildFailed { step, source };
-        let mut state = input_t;
-        for handles in self.enc_layers.iter() {
-            state = sanm_fsmn_encoder_layer(
-                &mut graph,
-                state,
-                SanMFsmnBlockConfig {
-                    d_model,
-                    input_dim: handles.input_dim,
-                    attention_heads: metadata.n_heads,
-                    head_dim: metadata.head_dim,
-                    frame_count: frames,
-                    fsmn_kernel: metadata.fsmn_kernel,
-                    layer_norm_epsilon: ENCODER_LAYER_NORM_EPSILON,
-                },
-                sanm_weights(&self.arena, handles),
-                map,
-            )?;
-        }
-        state = apply_affine_layer_norm(
-            &graph,
-            state,
-            ENCODER_LAYER_NORM_EPSILON,
-            self.arena.graph_tensor(self.enc_after_norm_weight),
-            self.arena.graph_tensor(self.enc_after_norm_bias),
-            AffineLayerNormSteps {
-                norm: "ggml_norm(layer_norm)",
-                scale: "enc_after_norm",
-                bias: "enc_after_norm",
-            },
-            map,
+        let logits = compose_sensevoice_encoder_logits(
+            &mut graph,
+            input_t,
+            frames,
+            metadata,
+            &self.arena,
+            &self.enc_layers,
+            &self.tp_layers,
+            self.enc_after_norm_weight,
+            self.enc_after_norm_bias,
+            self.tp_norm_weight,
+            self.tp_norm_bias,
+            self.ctc_head_weight,
+            self.ctc_head_bias,
         )?;
-        for handles in self.tp_layers.iter() {
-            state = sanm_fsmn_encoder_layer(
-                &mut graph,
-                state,
-                SanMFsmnBlockConfig {
-                    d_model,
-                    input_dim: handles.input_dim,
-                    attention_heads: metadata.n_heads,
-                    head_dim: metadata.head_dim,
-                    frame_count: frames,
-                    fsmn_kernel: metadata.fsmn_kernel,
-                    layer_norm_epsilon: ENCODER_LAYER_NORM_EPSILON,
-                },
-                sanm_weights(&self.arena, handles),
-                map,
-            )?;
-        }
-        state = apply_affine_layer_norm(
-            &graph,
-            state,
-            ENCODER_LAYER_NORM_EPSILON,
-            self.arena.graph_tensor(self.tp_norm_weight),
-            self.arena.graph_tensor(self.tp_norm_bias),
-            AffineLayerNormSteps {
-                norm: "ggml_norm(layer_norm)",
-                scale: "tp_norm",
-                bias: "tp_norm",
-            },
-            map,
-        )?;
-
-        // ----- CTC head -----
-        let head = graph
-            .reshape_2d(
-                self.ctc_head_weight.graph(&self.arena),
-                d_model,
-                metadata.vocab_size,
-            )
-            .map_err(bf("ctc_head_reshape"))?;
-        let mut logits = graph.mul_mat(head, state).map_err(bf("ctc_head_matmul"))?;
-        logits = graph
-            .add(logits, self.arena.graph_tensor(self.ctc_head_bias))
-            .map_err(bf("ctc_head_bias"))?;
         graph.set_output(logits).map_err(bf("set_output_logits"))?;
 
         graph
@@ -447,6 +428,222 @@ impl SenseVoiceEncoderGraph {
             logits,
         })
     }
+
+    /// Build the four prompt rows, input scaling, and sinusoidal position
+    /// encoding inside the selected backend. The caller supplies only ordinary
+    /// LFR+CMVN frontend features and prompt token indices.
+    pub(crate) fn encode_lfr_with_prompt(
+        &mut self,
+        lfr_features: &[f32],
+        prompt_indices: &[usize],
+    ) -> Result<SenseVoiceEncoderOutput, SenseVoiceEncoderError> {
+        let metadata = self.metadata;
+        if lfr_features.is_empty() || !lfr_features.len().is_multiple_of(metadata.feature_dim) {
+            return Err(SenseVoiceEncoderError::Shape {
+                reason: format!(
+                    "SenseVoice LFR payload {} is not a positive multiple of {}",
+                    lfr_features.len(),
+                    metadata.feature_dim
+                ),
+            });
+        }
+        let prompt_ids = prompt_indices
+            .iter()
+            .map(|&index| {
+                if index >= self.prompt_embedding_rows {
+                    return Err(SenseVoiceEncoderError::Shape {
+                        reason: format!(
+                            "SenseVoice prompt index {index} exceeds {} rows",
+                            self.prompt_embedding_rows
+                        ),
+                    });
+                }
+                i32::try_from(index).map_err(|_| SenseVoiceEncoderError::Shape {
+                    reason: format!("SenseVoice prompt index {index} exceeds i32"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let lfr_frames = lfr_features.len() / metadata.feature_dim;
+        let frames = prompt_ids.len().checked_add(lfr_frames).ok_or_else(|| {
+            SenseVoiceEncoderError::Shape {
+                reason: "SenseVoice encoder frame count overflowed".to_string(),
+            }
+        })?;
+        let positions = (1..=frames)
+            .map(|position| position as f32)
+            .collect::<Vec<_>>();
+
+        let mut graph = self.runner.start_graph();
+        let lfr = graph
+            .new_tensor_2d_f32(metadata.feature_dim, lfr_frames, "sensevoice_lfr")
+            .map_err(bf("new_lfr"))?;
+        let prompt = graph
+            .new_tensor_1d_i32(prompt_ids.len(), "sensevoice_prompt_ids")
+            .map_err(bf("new_prompt_ids"))?;
+        let position = graph
+            .new_tensor_2d_f32(1, frames, "sensevoice_positions")
+            .map_err(bf("new_positions"))?;
+        graph.set_input(lfr).map_err(bf("set_lfr_input"))?;
+        graph.set_input(prompt).map_err(bf("set_prompt_input"))?;
+        graph
+            .set_input(position)
+            .map_err(bf("set_position_input"))?;
+
+        let prompt_rows = graph
+            .get_rows(self.prompt_embedding.as_graph_tensor(), prompt)
+            .map_err(bf("prompt_get_rows"))?;
+        let combined = graph
+            .concat(prompt_rows, lfr, 1)
+            .map_err(bf("prompt_lfr_concat"))?;
+        let scaled = graph
+            .scale(combined, (metadata.d_model as f32).sqrt())
+            .map_err(bf("input_scale"))?;
+        let angles = graph
+            .mul_mat(
+                self.arena.graph_tensor(self.positional_inv_timescales),
+                position,
+            )
+            .map_err(bf("positional_outer_product"))?;
+        let sin = graph.sin(angles).map_err(bf("positional_sin"))?;
+        let cos = graph.cos(angles).map_err(bf("positional_cos"))?;
+        let positional = graph.concat(sin, cos, 0).map_err(bf("positional_concat"))?;
+        let state = graph
+            .add(scaled, positional)
+            .map_err(bf("positional_add"))?;
+        let logits = compose_sensevoice_encoder_logits(
+            &mut graph,
+            state,
+            frames,
+            metadata,
+            &self.arena,
+            &self.enc_layers,
+            &self.tp_layers,
+            self.enc_after_norm_weight,
+            self.enc_after_norm_bias,
+            self.tp_norm_weight,
+            self.tp_norm_bias,
+            self.ctc_head_weight,
+            self.ctc_head_bias,
+        )?;
+        graph.set_output(logits).map_err(bf("set_output_logits"))?;
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(bf("prepare_outputs"))?;
+        graph
+            .set_f32_slice(lfr, lfr_features, "sensevoice_lfr")
+            .map_err(bf("upload_lfr"))?;
+        graph
+            .set_i32_slice(prompt, &prompt_ids, "sensevoice_prompt_ids")
+            .map_err(bf("upload_prompt_ids"))?;
+        graph
+            .set_f32_slice(position, &positions, "sensevoice_positions")
+            .map_err(bf("upload_positions"))?;
+        let want = metadata.vocab_size.checked_mul(frames).ok_or_else(|| {
+            SenseVoiceEncoderError::Shape {
+                reason: "SenseVoice logits size overflowed".to_string(),
+            }
+        })?;
+        let logits = graph.compute_output_f32(logits, want).map_err(|error| {
+            SenseVoiceEncoderError::GraphExecutionFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        Ok(SenseVoiceEncoderOutput {
+            frame_count: frames,
+            vocab_size: metadata.vocab_size,
+            logits,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_sensevoice_encoder_logits<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    mut state: GgmlCpuTensor<'a>,
+    frames: usize,
+    metadata: SenseVoiceExecutionMetadata,
+    arena: &'a GgmlStaticTensorArena,
+    enc_layers: &[LayerArena],
+    tp_layers: &[LayerArena],
+    enc_after_norm_weight: GgmlStaticTensor,
+    enc_after_norm_bias: GgmlStaticTensor,
+    tp_norm_weight: GgmlStaticTensor,
+    tp_norm_bias: GgmlStaticTensor,
+    ctc_head_weight: WeightSlot,
+    ctc_head_bias: GgmlStaticTensor,
+) -> Result<GgmlCpuTensor<'a>, SenseVoiceEncoderError> {
+    let map = |step, source| SenseVoiceEncoderError::GraphBuildFailed { step, source };
+    for handles in enc_layers {
+        state = sanm_fsmn_encoder_layer(
+            graph,
+            state,
+            SanMFsmnBlockConfig {
+                d_model: metadata.d_model,
+                input_dim: handles.input_dim,
+                attention_heads: metadata.n_heads,
+                head_dim: metadata.head_dim,
+                frame_count: frames,
+                fsmn_kernel: metadata.fsmn_kernel,
+                layer_norm_epsilon: ENCODER_LAYER_NORM_EPSILON,
+            },
+            sanm_weights(arena, handles),
+            map,
+        )?;
+    }
+    state = apply_affine_layer_norm(
+        graph,
+        state,
+        ENCODER_LAYER_NORM_EPSILON,
+        arena.graph_tensor(enc_after_norm_weight),
+        arena.graph_tensor(enc_after_norm_bias),
+        AffineLayerNormSteps {
+            norm: "ggml_norm(layer_norm)",
+            scale: "enc_after_norm",
+            bias: "enc_after_norm",
+        },
+        map,
+    )?;
+    for handles in tp_layers {
+        state = sanm_fsmn_encoder_layer(
+            graph,
+            state,
+            SanMFsmnBlockConfig {
+                d_model: metadata.d_model,
+                input_dim: handles.input_dim,
+                attention_heads: metadata.n_heads,
+                head_dim: metadata.head_dim,
+                frame_count: frames,
+                fsmn_kernel: metadata.fsmn_kernel,
+                layer_norm_epsilon: ENCODER_LAYER_NORM_EPSILON,
+            },
+            sanm_weights(arena, handles),
+            map,
+        )?;
+    }
+    state = apply_affine_layer_norm(
+        graph,
+        state,
+        ENCODER_LAYER_NORM_EPSILON,
+        arena.graph_tensor(tp_norm_weight),
+        arena.graph_tensor(tp_norm_bias),
+        AffineLayerNormSteps {
+            norm: "ggml_norm(layer_norm)",
+            scale: "tp_norm",
+            bias: "tp_norm",
+        },
+        map,
+    )?;
+    let head = graph
+        .reshape_2d(
+            ctc_head_weight.graph(arena),
+            metadata.d_model,
+            metadata.vocab_size,
+        )
+        .map_err(bf("ctc_head_reshape"))?;
+    let logits = graph.mul_mat(head, state).map_err(bf("ctc_head_matmul"))?;
+    graph
+        .add(logits, arena.graph_tensor(ctc_head_bias))
+        .map_err(bf("ctc_head_bias"))
 }
 
 fn alloc_layer(

@@ -3,7 +3,9 @@
 //! with the TDT differences: `scale_input` honored from pack metadata (false
 //! for v3) and the joint ENCODER PROJECTION (`enc.proj`, d_model -> joint
 //! hidden) applied in-graph instead of a CTC head. Output is the per-frame
-//! projected encoder representation the host-side TDT greedy loop consumes.
+//! projected encoder representation the shared TDT greedy control loop
+//! consumes. CPU evaluates predictor/joint with its scalar oracle; accelerated
+//! routes keep those neural stages in persistent device graphs.
 
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlStaticTensor, GgufRuntimeSourcePreflight, WeightSlot,
@@ -13,6 +15,7 @@ use crate::models::fastconformer::{
 };
 use crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config;
 
+use super::device_decoder_graph::ParakeetTdtDeviceDecoder;
 use super::encoder_weights::ParakeetTdtEncoderWeights;
 use super::runtime_contract::ParakeetTdtExecutionMetadata;
 
@@ -60,6 +63,9 @@ pub(crate) struct ParakeetTdtEncoderOutput {
 
 pub(crate) struct ParakeetTdtEncoderGraph {
     metadata: ParakeetTdtExecutionMetadata,
+    // Must drop before `core`: both persistent sessions reference the core's
+    // runner/backend and mmap-backed loaded tensors.
+    device_decoder: Option<ParakeetTdtDeviceDecoder>,
     core: FastConformerEncoderCore,
     enc_proj_weight: WeightSlot,
     enc_proj_bias: GgmlStaticTensor,
@@ -67,7 +73,15 @@ pub(crate) struct ParakeetTdtEncoderGraph {
 
 impl ParakeetTdtEncoderGraph {
     pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
-        crate::models::parakeet_runtime_memory::graph_retained_bytes(&self.core)
+        let core = crate::models::parakeet_runtime_memory::graph_retained_bytes(&self.core)?;
+        let decoder = self
+            .device_decoder
+            .as_ref()
+            .map(ParakeetTdtDeviceDecoder::retained_system_memory_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        core.checked_add(decoder)
+            .ok_or_else(|| "parakeet-tdt graph retained bytes overflowed".to_string())
     }
 
     pub(crate) fn new(
@@ -77,9 +91,10 @@ impl ParakeetTdtEncoderGraph {
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetTdtEncoderError> {
         let config = parakeet_tdt_encoder_graph_config(backend);
-        let (core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
+        let (mut core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_TDT_TAIL_STATIC_TENSORS,
+            metadata.hidden_size,
             runtime_preflight,
             &weights.subsampling,
             &weights.layers,
@@ -94,12 +109,38 @@ impl ParakeetTdtEncoderGraph {
             },
         )?;
 
+        let device_decoder =
+            if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+                None
+            } else {
+                let loaded = core.loaded_weights.as_ref().ok_or_else(|| {
+                    ParakeetTdtEncoderError::Shape {
+                    reason:
+                        "accelerated predictor/joint requires the verified loaded-weight context"
+                            .to_string(),
+                }
+                })?;
+                Some(
+                    ParakeetTdtDeviceDecoder::new(&mut core.runner, loaded, metadata).map_err(
+                        |source| ParakeetTdtEncoderError::GraphBuildFailed {
+                            step: "device_predictor_joint",
+                            source,
+                        },
+                    )?,
+                )
+            };
+
         Ok(Self {
             metadata,
+            device_decoder,
             core,
             enc_proj_weight,
             enc_proj_bias,
         })
+    }
+
+    pub(crate) fn device_decoder_mut(&mut self) -> Option<&mut ParakeetTdtDeviceDecoder> {
+        self.device_decoder.as_mut()
     }
 
     pub(crate) fn encode(
@@ -112,6 +153,7 @@ impl ParakeetTdtEncoderGraph {
         let stack = fastconformer::build_conformer_stack::<ParakeetTdtEncoderError>(
             &mut graph,
             &self.core.arena,
+            self.core.relative_position_inverse_timescales,
             &self.core.sub,
             &self.core.layers,
             FastConformerStackConfig {
@@ -171,7 +213,12 @@ impl ParakeetTdtEncoderGraph {
                 source,
             })?;
         fastconformer::upload_graph_f32(&mut graph, stack.mel_t, &mel.data, "upload_mel")?;
-        fastconformer::upload_graph_f32(&mut graph, stack.pos_t, &stack.positional, "upload_pos")?;
+        fastconformer::upload_graph_f32(
+            &mut graph,
+            stack.positions_t,
+            &stack.positions,
+            "upload_positions",
+        )?;
 
         let want = metadata
             .joint_hidden

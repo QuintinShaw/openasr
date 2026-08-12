@@ -49,25 +49,6 @@ pub(crate) enum AuxiliaryExecutionPolicy {
     },
 }
 
-const AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION: ExecutionCapabilities =
-    ExecutionCapabilities::new(true)
-        .with_provider(
-            ExecutionProvider::Metal,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Cuda,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Hip,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        )
-        .with_provider(
-            ExecutionProvider::Vulkan,
-            AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
-        );
-
 const AUX_CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
     .with_provider(
         ExecutionProvider::Metal,
@@ -90,12 +71,6 @@ const AUX_CPU_AND_METAL_FULL_DEVICE_EXECUTION: ExecutionCapabilities =
     ExecutionCapabilities::new(true).with_provider(
         ExecutionProvider::Metal,
         AcceleratedPlacementCapabilities::FULL_DEVICE,
-    );
-
-const AUX_CPU_AND_METAL_HYBRID_EXECUTION: ExecutionCapabilities = ExecutionCapabilities::new(true)
-    .with_provider(
-        ExecutionProvider::Metal,
-        AcceleratedPlacementCapabilities::HYBRID,
     );
 
 /// Which pull-time error prefix a matched aux family reports, preserving the
@@ -260,11 +235,11 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
         catalog_family_id: "pyannote-segmentation",
         kind: AuxPackKind::Diarization,
-        // SincNet remains host-side while the compute-dominant recurrent stack
-        // and classifier have a real Metal graph. Auto stays on the bounded
+        // The accelerated runtime owns SincNet, the recurrent stack, and the
+        // classifier as one complete device graph. Auto stays on the bounded
         // parallel CPU path until current-pack performance/RSS gates promote it.
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_AND_METAL_HYBRID_EXECUTION,
+            capabilities: AUX_CPU_AND_METAL_FULL_DEVICE_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::Never,
         },
         ownership: AuxiliaryRuntimeOwnership::AdmittedHostOrPinnedActor,
@@ -316,7 +291,7 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         catalog_family_id: "firered-punc",
         kind: AuxPackKind::Punctuation,
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_FULL_DEVICE_AND_HYBRID_EXECUTION,
+            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
         },
         ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
@@ -543,11 +518,11 @@ mod tests {
         assert!(capabilities.supports_cpu());
         assert!(capabilities.supports(
             ExecutionProvider::Metal,
-            crate::device::execution_policy::ExecutionPlacement::Hybrid,
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
         ));
         assert!(!capabilities.supports(
             ExecutionProvider::Metal,
-            crate::device::execution_policy::ExecutionPlacement::FullDevice,
+            crate::device::execution_policy::ExecutionPlacement::Hybrid,
         ));
         for provider in [
             ExecutionProvider::Cuda,
@@ -563,6 +538,29 @@ mod tests {
             auxiliary_runtime_ownership(architecture),
             Some(AuxiliaryRuntimeOwnership::AdmittedHostOrPinnedActor),
         );
+    }
+
+    #[test]
+    fn auxiliary_accelerated_routes_never_accept_hybrid_compute() {
+        for descriptor in AUX_PACK_DESCRIPTORS {
+            let AuxiliaryExecutionPolicy::RequestScoped { capabilities, .. } =
+                descriptor.execution_policy;
+            for provider in [
+                ExecutionProvider::Metal,
+                ExecutionProvider::Cuda,
+                ExecutionProvider::Hip,
+                ExecutionProvider::Vulkan,
+            ] {
+                assert!(
+                    !capabilities.supports(
+                        provider,
+                        crate::device::execution_policy::ExecutionPlacement::Hybrid,
+                    ),
+                    "auxiliary architecture '{}' must not accept CPU neural compute under {provider}",
+                    descriptor.architecture_id,
+                );
+            }
+        }
     }
 
     #[test]

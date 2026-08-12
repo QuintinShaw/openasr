@@ -34,6 +34,9 @@ use super::decode_session::{GraniteSpeechDecodeSession, GraniteSpeechKvCacheCapa
 use super::decoder_graph::{
     GraniteSpeechDecoderConfig, GraniteSpeechDecoderError, embed_token_row,
 };
+use super::prompt::{
+    GRANITE_SPEECH_AUDIO_TOKEN_ID, materialize_audio_prompt_embeddings_from_mapped_table,
+};
 
 fn map_step_error(
     step_index: usize,
@@ -250,7 +253,8 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
 pub(crate) struct GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
     session: &'s mut GraniteSpeechDecodeSession,
     embedding_table: &'s MappedTokenEmbeddingTable,
-    initial_prompt_embeddings: Vec<f32>,
+    initial_prompt_token_ids: Vec<u32>,
+    initial_audio_embeddings: Vec<f32>,
     prompt_len: usize,
     prefilled: bool,
     capacity: GraniteSpeechKvCacheCapacity,
@@ -260,13 +264,15 @@ impl<'s> GraniteSpeechResidentAudioDecodeStepExecutor<'s> {
     pub(crate) fn new(
         session: &'s mut GraniteSpeechDecodeSession,
         embedding_table: &'s MappedTokenEmbeddingTable,
-        initial_prompt_embeddings: Vec<f32>,
+        initial_prompt_token_ids: Vec<u32>,
+        initial_audio_embeddings: Vec<f32>,
         capacity: GraniteSpeechKvCacheCapacity,
     ) -> Self {
         Self {
             session,
             embedding_table,
-            initial_prompt_embeddings,
+            initial_prompt_token_ids,
+            initial_audio_embeddings,
             prompt_len: 0,
             prefilled: false,
             capacity,
@@ -282,6 +288,16 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
         // Steps after the first advance the resident session by one token.
         if self.prefilled {
             let new_token = incremental_new_token(self.session, self.prompt_len, &input)?;
+            if let Some(logits) = self
+                .session
+                .decode_step_from_token_id(new_token)
+                .map_err(map_step_error(input.step_index, "audio"))?
+            {
+                return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                });
+            }
             let embedding = self
                 .embedding_table
                 .gather_rows(&[new_token])
@@ -296,17 +312,56 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
             });
         }
 
-        // First call: prefill the audio-spliced prompt embeddings into the
-        // resident (released, so empty-K/V) session.
-        let logits = self
+        // First call: the accelerated resident path gathers token rows and
+        // splices audio rows in the same graph that seeds K/V. CPU/scheduler
+        // runners retain the exact mapped-table host oracle as a lazy fallback.
+        if input.initial_prompt_tokens != self.initial_prompt_token_ids {
+            return Err(Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: "granite-speech initial prompt tokens changed before prefill".to_string(),
+            });
+        }
+        let audio_positions = self
+            .initial_prompt_token_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &token_id)| {
+                (token_id == GRANITE_SPEECH_AUDIO_TOKEN_ID).then_some(position)
+            })
+            .collect::<Vec<_>>();
+        let logits = match self
             .session
-            .prefill(
-                &self.initial_prompt_embeddings,
-                input.initial_prompt_tokens.len(),
+            .prefill_token_ids_with_audio(
+                &self.initial_prompt_token_ids,
+                &self.initial_audio_embeddings,
+                &audio_positions,
                 self.capacity,
             )
-            .map_err(map_step_error(input.step_index, "audio"))?;
-        self.prompt_len = input.initial_prompt_tokens.len();
+            .map_err(map_step_error(input.step_index, "audio"))?
+        {
+            Some(logits) => logits,
+            None => {
+                let prompt_embeddings = materialize_audio_prompt_embeddings_from_mapped_table(
+                    self.session.config(),
+                    self.embedding_table,
+                    &self.initial_prompt_token_ids,
+                    &self.initial_audio_embeddings,
+                )
+                .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                    reason: format!(
+                        "granite-speech audio decoder step {} prompt embedding fallback failed: {error}",
+                        input.step_index
+                    ),
+                })?;
+                self.session
+                    .prefill(
+                        &prompt_embeddings,
+                        self.initial_prompt_token_ids.len(),
+                        self.capacity,
+                    )
+                    .map_err(map_step_error(input.step_index, "audio"))?
+            }
+        };
+        self.prompt_len = self.initial_prompt_token_ids.len();
         self.prefilled = true;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits,

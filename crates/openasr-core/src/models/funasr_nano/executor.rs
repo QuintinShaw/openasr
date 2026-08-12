@@ -38,7 +38,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrPromptTokenInput,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::sensevoice::encoder_graph::build_sensevoice_encoder_input;
@@ -189,7 +189,7 @@ struct FunasrNanoGreedyStepExecutor<'a> {
     decoder: &'a mut FunasrNanoDecoderRuntime,
     layer_kv_caches: Qwen3AsrHostKvCacheOwner,
     kv_capacity: Qwen3AsrKvCacheCapacity,
-    prompt_embeddings: Option<Qwen3AsrPromptEmbeddings>,
+    prompt_input: Option<Qwen3AsrPromptTokenInput>,
     cache_prompt_tokens: usize,
     control: Arc<crate::api::backend::TranscriptionControl>,
 }
@@ -199,12 +199,14 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
         &mut self,
         input: Seq2SeqGreedyDecodeStepInput<'_>,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
-        if let Some(prompt_embeddings) = self.prompt_embeddings.take() {
-            self.cache_prompt_tokens = prompt_embeddings.token_count;
+        if let Some(prompt_input) = self.prompt_input.take() {
+            self.cache_prompt_tokens = prompt_input.token_ids.len();
             let prefill = self
                 .decoder
-                .prefill(
-                    &prompt_embeddings,
+                .prefill_token_ids_with_audio(
+                    &prompt_input.token_ids,
+                    &prompt_input.audio_rows,
+                    &prompt_input.audio_positions,
                     &mut self.layer_kv_caches,
                     self.kv_capacity,
                     &self.control,
@@ -647,31 +649,17 @@ fn decode_with_decoder(
     control: &Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, FunasrNanoExecutorError> {
-    let token_value_count = decode_prompt
-        .token_ids
-        .len()
-        .checked_mul(decoder_metadata.d_model)
+    let audio_pad_end = decode_prompt
+        .audio_pad_start_index
+        .checked_add(decode_prompt.audio_pad_count)
         .ok_or_else(|| FunasrNanoExecutorError::PromptEmbeddingFailed {
-            reason: "token embedding row allocation overflowed".to_string(),
+            reason: "audio pad position overflowed".to_string(),
         })?;
-    let mut token_rows = Vec::with_capacity(token_value_count);
-    for &token_id in &decode_prompt.token_ids {
-        let row = decoder.gather_token_embedding(token_id).map_err(|error| {
-            FunasrNanoExecutorError::DecoderFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        token_rows.extend_from_slice(&row);
-    }
-    let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
-        decode_prompt,
-        decoder_metadata.d_model,
-        token_rows,
-        speech_rows,
-    )
-    .map_err(|error| FunasrNanoExecutorError::PromptEmbeddingFailed {
-        reason: error.to_string(),
-    })?;
+    let prompt_input = Qwen3AsrPromptTokenInput {
+        token_ids: decode_prompt.token_ids.clone(),
+        audio_rows: speech_rows.to_vec(),
+        audio_positions: (decode_prompt.audio_pad_start_index..audio_pad_end).collect(),
+    };
 
     let layer_kv_caches = decoder
         .new_kv_caches(kv_capacity)
@@ -680,7 +668,7 @@ fn decode_with_decoder(
         decoder,
         layer_kv_caches,
         kv_capacity,
-        prompt_embeddings: Some(prompt_embeddings),
+        prompt_input: Some(prompt_input),
         cache_prompt_tokens: 0,
         control: Arc::clone(control),
     };

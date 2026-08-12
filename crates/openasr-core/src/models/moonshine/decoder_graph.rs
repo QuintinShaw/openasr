@@ -451,7 +451,6 @@ impl MoonshineDecoderGraphRuntime {
 
     pub(crate) fn new(
         input: MoonshineDecoderRuntimeInput<'_>,
-        prefer_cpu_backend: bool,
         runtime_preflight: &GgufRuntimeSourcePreflight,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
@@ -460,7 +459,6 @@ impl MoonshineDecoderGraphRuntime {
             input.metadata,
             input.decoder_state,
             input.backend,
-            prefer_cpu_backend,
             runtime_preflight,
             1,
             adapter,
@@ -471,7 +469,6 @@ impl MoonshineDecoderGraphRuntime {
     #[allow(dead_code)]
     pub(crate) fn new_synthetic(
         input: MoonshineDecoderRuntimeInput<'_>,
-        prefer_cpu_backend: bool,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq_impl(
@@ -479,7 +476,6 @@ impl MoonshineDecoderGraphRuntime {
             input.metadata,
             input.decoder_state,
             input.backend,
-            prefer_cpu_backend,
             RuntimeWeightSource::Synthetic,
             1,
             adapter,
@@ -492,7 +488,6 @@ impl MoonshineDecoderGraphRuntime {
         metadata: MoonshineExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
-        prefer_cpu_backend: bool,
         runtime_preflight: &GgufRuntimeSourcePreflight,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
@@ -502,7 +497,6 @@ impl MoonshineDecoderGraphRuntime {
             metadata,
             decoder_state,
             backend,
-            prefer_cpu_backend,
             RuntimeWeightSource::Verified(runtime_preflight),
             n_seq,
             adapter,
@@ -516,7 +510,6 @@ impl MoonshineDecoderGraphRuntime {
         metadata: MoonshineExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
-        prefer_cpu_backend: bool,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
@@ -525,7 +518,6 @@ impl MoonshineDecoderGraphRuntime {
             metadata,
             decoder_state,
             backend,
-            prefer_cpu_backend,
             RuntimeWeightSource::Synthetic,
             n_seq,
             adapter,
@@ -538,7 +530,6 @@ impl MoonshineDecoderGraphRuntime {
         metadata: MoonshineExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
-        prefer_cpu_backend: bool,
         runtime_source: RuntimeWeightSource<'_>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
@@ -572,7 +563,7 @@ impl MoonshineDecoderGraphRuntime {
             });
         }
 
-        let mut config = moonshine_decoder_graph_config(backend, prefer_cpu_backend);
+        let mut config = moonshine_decoder_graph_config(backend);
         config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
         config.context_bytes =
             config
@@ -2975,7 +2966,6 @@ mod tests {
                 decoder_state: decoder_state(metadata, encoder_output_0.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
-            false,
             &preflight,
             None,
         )
@@ -2994,7 +2984,6 @@ mod tests {
                 decoder_state: decoder_state(metadata, encoder_output_1.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
-            false,
             &preflight,
             None,
         )
@@ -3011,7 +3000,6 @@ mod tests {
             metadata,
             decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
             &preflight,
             2,
             None,
@@ -3060,7 +3048,6 @@ mod tests {
                 decoder_state: decoder_state(metadata, encoder_output_0.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
-            false,
             &preflight,
             None,
         )
@@ -3084,7 +3071,6 @@ mod tests {
                 decoder_state: decoder_state(metadata, encoder_output_1.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             },
-            false,
             &preflight,
             None,
         )
@@ -3106,7 +3092,6 @@ mod tests {
             metadata,
             decoder_state(metadata, encoder_output_0.frame_count),
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
             &preflight,
             2,
             None,

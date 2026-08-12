@@ -41,9 +41,7 @@ use super::decode_session::{
 };
 use super::decoder_graph::GraniteSpeechDecoderConfig;
 use super::encoder_graph::{GraniteSpeechEncoderConfig, GraniteSpeechEncoderRuntime};
-use super::prompt::{
-    build_audio_prompt_embeddings_from_mapped_table, build_granite_speech_prompt_text,
-};
+use super::prompt::{build_audio_prompt_token_ids, build_granite_speech_prompt_text};
 use super::qformer::{GraniteSpeechProjectorConfig, GraniteSpeechProjectorRuntime};
 use super::runtime_contract::{
     parse_decoder_metadata, parse_encoder_metadata, parse_projector_metadata,
@@ -294,6 +292,7 @@ impl GraniteSpeechPreparedRuntime {
         let session = GraniteSpeechDecodeSession::new_keep_quantized_from_preflight(
             decoder_config,
             preflight,
+            embed_table.device_graph_spec(),
             backend,
         )
         .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
@@ -591,20 +590,16 @@ impl GraniteSpeechGgmlExecutor {
                             });
                         }
                     };
-                    let (prompt_token_ids, prompt_embeddings) =
-                        build_audio_prompt_embeddings_from_mapped_table(
-                            &prepared.decoder_config,
-                            &prepared.embed_table,
-                            &prepared.tokenizer,
-                            &prompt_text,
-                            &projector_output.projected,
-                            projector_output.tokens,
-                        )
-                        .map_err(|error| {
-                            GraniteSpeechGgmlExecutorError::PromptFailed {
-                                reason: error.to_string(),
-                            }
-                        })?;
+                    let prompt_token_ids = build_audio_prompt_token_ids(
+                        &prepared.tokenizer,
+                        &prompt_text,
+                        projector_output.tokens,
+                    )
+                    .map_err(|error| {
+                        GraniteSpeechGgmlExecutorError::PromptFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
                     let measured_positions =
                         crate::capacity::topology::causal_prefix_positions_with_context_cap(
                             super::capacity::GRANITE_SPEECH_SELF_KV_STATE_ID,
@@ -624,7 +619,7 @@ impl GraniteSpeechGgmlExecutor {
                                 GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source }
                             })?;
                     let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
-                        initial_prompt_tokens: prompt_token_ids,
+                        initial_prompt_tokens: prompt_token_ids.clone(),
                         eot_token_id: GRANITE_SPEECH_EOT_TOKEN_ID,
                         vocab_size: prepared.decoder_config.vocab_size,
                         max_generated_tokens: GRANITE_SPEECH_MAX_GENERATED_TOKENS,
@@ -641,7 +636,8 @@ impl GraniteSpeechGgmlExecutor {
                     let mut step_executor = GraniteSpeechResidentAudioDecodeStepExecutor::new(
                         &mut prepared.session,
                         &prepared.embed_table,
-                        prompt_embeddings,
+                        prompt_token_ids,
+                        projector_output.projected,
                         kv_capacity,
                     );
                     run_builtin_seq2seq_decode_policy(
@@ -982,7 +978,7 @@ mod tests {
                 "macOS Granite Metal acceptance must not silently run another backend"
             );
         }
-        let request = GgmlAsrExecutionViewRequest {
+        let mut request = GgmlAsrExecutionViewRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
             decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,
@@ -1000,6 +996,20 @@ mod tests {
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),
+        };
+        request.decoder_state = {
+            let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_offline_view_request(
+                request.runtime_source_preflight(),
+                &request.prepared_audio,
+                &request.request_options,
+                request.resolved_runtime.backend(),
+            )
+            .expect("build Granite decoder-state planning input");
+            GraniteSpeechGgmlExecutor::default()
+                .decoder_state_contract(&request.selected_family)
+                .expect("load Granite decoder-state contract")
+                .plan(&planning_input)
+                .expect("plan Granite decoder state")
         };
         let _backend_guard = crate::ggml_runtime::install_request_backend_override(
             request.backend_preference.request_backend_override(),

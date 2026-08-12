@@ -19,6 +19,7 @@ use crate::models::system_memory_owner::{
 };
 
 use super::decoder::XasrDecoder;
+use super::device_head_graph::XasrDeviceHead;
 use super::encoder_graph::{
     XasrEncoderChunkState, XasrEncoderFeatureInput, XasrZipformerEncoderGraph,
 };
@@ -27,6 +28,7 @@ use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XasrFbankFeatures, Xasr
 use super::graph_config::xasr_zipformer_encoder_graph_config;
 use super::greedy::{
     DEFAULT_MAX_SYMBOLS_PER_FRAME, XasrGreedyDecodeResult, greedy_decode_frames_incremental,
+    greedy_decode_frames_incremental_with_backend,
 };
 use super::joiner::XasrJoiner;
 use super::runtime_contract::{
@@ -52,14 +54,42 @@ pub(super) type XasrRuntimeActorPool =
 pub(super) type XasrRuntimeActor =
     PinnedRuntimeActorCheckout<XasrRuntimeActorKey, XasrZipformerPreparedRuntime>;
 
-#[derive(Debug)]
+enum XasrPreparedDecodeBackend {
+    Host(Box<XasrHostDecodeBackend>),
+    Device(Box<XasrDeviceHead>),
+}
+
+struct XasrHostDecodeBackend {
+    decoder: XasrDecoder,
+    joiner: XasrJoiner,
+}
+
 pub(super) struct XasrZipformerPreparedRuntime {
     metadata: XasrZipformerExecutionMetadata,
     tokenizer: XasrZipformerTokenizer,
     encoder: XasrZipformerEncoderGraph,
-    decoder: XasrDecoder,
-    joiner: XasrJoiner,
+    decode_backend: XasrPreparedDecodeBackend,
     retained_system_memory_bytes: u64,
+}
+
+impl std::fmt::Debug for XasrZipformerPreparedRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("XasrZipformerPreparedRuntime")
+            .field("metadata", &self.metadata)
+            .field(
+                "decode_backend",
+                &match &self.decode_backend {
+                    XasrPreparedDecodeBackend::Host(_) => "host",
+                    XasrPreparedDecodeBackend::Device(_) => "device",
+                },
+            )
+            .field(
+                "retained_system_memory_bytes",
+                &self.retained_system_memory_bytes,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result of decoding a single streaming hop via
@@ -201,6 +231,7 @@ pub(super) fn checkout_prepared_runtime(
                 &preflight.metadata,
                 reader.tensor_index(),
                 &pack_content_id,
+                backend,
             )
             .map_err(|error| error.to_string())?;
             Ok((quote.retained_bytes, (preflight, reader, quote, backend)))
@@ -231,6 +262,7 @@ fn xasr_runtime_system_memory_quote(
     gguf_metadata: &GgufMetadata,
     tensor_index: &crate::GgufTensorIndex,
     pack_content_id: &str,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<SystemMemoryAllocationQuote, SystemMemoryOwnerError> {
     use crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder;
 
@@ -319,6 +351,14 @@ fn xasr_runtime_system_memory_quote(
     )?;
 
     for tensor in tensor_index.tensors() {
+        let device_head_tensor = backend.is_gpu_class()
+            && (tensor.name.starts_with("decoder.") || tensor.name.starts_with("joiner."));
+        if device_head_tensor {
+            // The accelerated lane keeps these tensors only in its native
+            // WEIGHTS arena. The shared ggml layer admits that buffer and its
+            // metadata contexts independently; no host-f32 copy survives load.
+            continue;
+        }
         let native_encoder_linear = tensor.rank() == 2
             && tensor.name.ends_with(".weight")
             && !tensor.name.starts_with("decoder.")
@@ -410,12 +450,9 @@ impl XasrZipformerPreparedRuntime {
         let metadata =
             parse_xasr_zipformer_execution_metadata(gguf_metadata).map_err(|e| e.to_string())?;
         let tokenizer = XasrZipformerTokenizer::from_metadata(gguf_metadata, metadata.blank_id)?;
+        let backend = xasr_zipformer_encoder_graph_config(backend).backend;
         let encoder_weights =
             load_xasr_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
-        let decoder_weights =
-            load_xasr_decoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
-        let joiner_weights =
-            load_xasr_joiner_weights(reader, &metadata).map_err(|e| e.to_string())?;
         let mut retained = crate::models::system_memory_owner::SystemMemoryCapacity::default();
         retained.add(
             metadata
@@ -429,28 +466,44 @@ impl XasrZipformerPreparedRuntime {
             encoder_weights.retained_system_memory_bytes()?,
             "xasr encoder weights",
         )?;
-        retained.add(
-            decoder_weights.retained_system_memory_bytes()?,
-            "xasr decoder weights",
-        )?;
-        retained.add(
-            joiner_weights.retained_system_memory_bytes()?,
-            "xasr joiner weights",
-        )?;
-        let retained_system_memory_bytes = retained.finish();
         let encoder = XasrZipformerEncoderGraph::new_ggml_cpu_full_encoder(
             metadata.clone(),
             encoder_weights,
             xasr_zipformer_encoder_graph_config(backend),
         )
         .map_err(|e| e.to_string())?;
+        let decode_backend = if backend == GgmlCpuGraphBackend::Cpu {
+            let decoder_weights =
+                load_xasr_decoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
+            let joiner_weights =
+                load_xasr_joiner_weights(reader, &metadata).map_err(|e| e.to_string())?;
+            retained.add(
+                decoder_weights.retained_system_memory_bytes()?,
+                "xasr decoder weights",
+            )?;
+            retained.add(
+                joiner_weights.retained_system_memory_bytes()?,
+                "xasr joiner weights",
+            )?;
+            XasrPreparedDecodeBackend::Host(Box::new(XasrHostDecodeBackend {
+                decoder: XasrDecoder::new(
+                    decoder_weights,
+                    metadata.decoder_context_size,
+                    metadata.blank_id,
+                ),
+                joiner: XasrJoiner::new(joiner_weights),
+            }))
+        } else {
+            let device = XasrDeviceHead::new(reader, &metadata, backend)?;
+            retained.add(
+                device.retained_system_memory_bytes(),
+                "xasr device predictor and joiner",
+            )?;
+            XasrPreparedDecodeBackend::Device(Box::new(device))
+        };
+        let retained_system_memory_bytes = retained.finish();
         Ok(Self {
-            decoder: XasrDecoder::new(
-                decoder_weights,
-                metadata.decoder_context_size,
-                metadata.blank_id,
-            ),
-            joiner: XasrJoiner::new(joiner_weights),
+            decode_backend,
             metadata,
             tokenizer,
             encoder,
@@ -516,7 +569,11 @@ impl XasrZipformerPreparedRuntime {
     }
 
     pub(super) fn new_decode_state(&self) -> XasrChunkedDecodeState {
-        XasrChunkedDecodeState::new(self.decoder.initial_context())
+        let context = match &self.decode_backend {
+            XasrPreparedDecodeBackend::Host(host) => host.decoder.initial_context(),
+            XasrPreparedDecodeBackend::Device(device) => device.initial_context(),
+        };
+        XasrChunkedDecodeState::new(context)
     }
 
     /// Feature-frame count the very first streaming chunk needs before
@@ -667,21 +724,39 @@ impl XasrZipformerPreparedRuntime {
             .checked_add(chunk.output.frames)
             .ok_or_else(|| "xasr encoder frame count overflows".to_string())?;
         let greedy_profile = xasr_profile_start();
-        let emitted = greedy_decode_frames_incremental(
-            &chunk.output.rows,
-            chunk.output.frames,
-            self.metadata.encoder_output_dim(),
-            &self.decoder,
-            &self.joiner,
-            self.metadata.blank_id,
-            DEFAULT_MAX_SYMBOLS_PER_FRAME,
-            &mut state.context,
-            &mut state.emitted,
-            &mut state.emitted_frames,
-            &mut state.emitted_probabilities,
-            chunk_frame_offset,
-            is_canceled,
-        )?;
+        let emitted = match &mut self.decode_backend {
+            XasrPreparedDecodeBackend::Host(host) => greedy_decode_frames_incremental(
+                &chunk.output.rows,
+                chunk.output.frames,
+                self.metadata.encoder_output_dim(),
+                &host.decoder,
+                &host.joiner,
+                self.metadata.blank_id,
+                DEFAULT_MAX_SYMBOLS_PER_FRAME,
+                &mut state.context,
+                &mut state.emitted,
+                &mut state.emitted_frames,
+                &mut state.emitted_probabilities,
+                chunk_frame_offset,
+                is_canceled,
+            )?,
+            XasrPreparedDecodeBackend::Device(device) => {
+                greedy_decode_frames_incremental_with_backend(
+                    &chunk.output.rows,
+                    chunk.output.frames,
+                    self.metadata.encoder_output_dim(),
+                    device.as_mut(),
+                    self.metadata.blank_id,
+                    DEFAULT_MAX_SYMBOLS_PER_FRAME,
+                    &mut state.context,
+                    &mut state.emitted,
+                    &mut state.emitted_frames,
+                    &mut state.emitted_probabilities,
+                    chunk_frame_offset,
+                    is_canceled,
+                )?
+            }
+        };
         let greedy_elapsed =
             greedy_profile.map_or(Duration::ZERO, |started_at| started_at.elapsed());
         state.encoder_state = Some(chunk.state);

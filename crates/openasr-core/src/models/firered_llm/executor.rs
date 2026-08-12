@@ -50,7 +50,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrPromptTokenInput,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
@@ -195,7 +195,7 @@ struct FireRedLlmGreedyStepExecutor<'a> {
     decoder: &'a mut FireRedLlmDecoderRuntime,
     layer_kv_caches: Qwen3AsrHostKvCacheOwner,
     kv_capacity: Qwen3AsrKvCacheCapacity,
-    prompt_embeddings: Option<crate::models::qwen::Qwen3AsrPromptEmbeddings>,
+    prompt_input: Option<Qwen3AsrPromptTokenInput>,
     cache_prompt_tokens: usize,
     /// Explicit cancel/pause/resume control for this decode -- never a
     /// thread-local. See [`crate::RequestExecutionContext`].
@@ -207,12 +207,14 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
         &mut self,
         input: Seq2SeqGreedyDecodeStepInput<'_>,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
-        if let Some(prompt_embeddings) = self.prompt_embeddings.take() {
-            self.cache_prompt_tokens = prompt_embeddings.token_count;
+        if let Some(prompt_input) = self.prompt_input.take() {
+            self.cache_prompt_tokens = prompt_input.token_ids.len();
             let prefill = self
                 .decoder
-                .prefill(
-                    &prompt_embeddings,
+                .prefill_token_ids_with_audio(
+                    &prompt_input.token_ids,
+                    &prompt_input.audio_rows,
+                    &prompt_input.audio_positions,
                     &mut self.layer_kv_caches,
                     self.kv_capacity,
                     &self.control,
@@ -545,33 +547,17 @@ impl FireRedLlmGgmlExecutor {
                         decoder.backend_label()
                     );
                 }
-                let token_rows_len = decode_prompt
-                    .token_ids
-                    .len()
-                    .checked_mul(decoder_metadata.d_model)
+                let audio_pad_end = decode_prompt
+                    .audio_pad_start_index
+                    .checked_add(decode_prompt.audio_pad_count)
                     .ok_or_else(|| FireRedLlmExecutorError::PromptEmbeddingFailed {
-                        reason: "token embedding row allocation overflowed".to_string(),
+                        reason: "audio pad position overflowed".to_string(),
                     })?;
-                let mut token_rows = Vec::with_capacity(token_rows_len);
-                for &token_id in &decode_prompt.token_ids {
-                    let row = decoder.gather_token_embedding(token_id).map_err(|error| {
-                        FireRedLlmExecutorError::DecoderFailed {
-                            reason: error.to_string(),
-                        }
-                    })?;
-                    token_rows.extend_from_slice(&row);
-                }
-                let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
-                    &decode_prompt,
-                    decoder_metadata.d_model,
-                    token_rows,
-                    &speech_rows,
-                )
-                .map_err(|error| {
-                    FireRedLlmExecutorError::PromptEmbeddingFailed {
-                        reason: error.to_string(),
-                    }
-                })?;
+                let prompt_input = Qwen3AsrPromptTokenInput {
+                    token_ids: decode_prompt.token_ids.clone(),
+                    audio_rows: speech_rows,
+                    audio_positions: (decode_prompt.audio_pad_start_index..audio_pad_end).collect(),
+                };
                 let layer_kv_caches = decoder
                     .new_kv_caches(kv_capacity)
                     .map_err(|reason| FireRedLlmExecutorError::DecoderFailed { reason })?;
@@ -579,7 +565,7 @@ impl FireRedLlmGgmlExecutor {
                     decoder,
                     layer_kv_caches,
                     kv_capacity,
-                    prompt_embeddings: Some(prompt_embeddings),
+                    prompt_input: Some(prompt_input),
                     cache_prompt_tokens: 0,
                     control: Arc::clone(&decoder_control),
                 };

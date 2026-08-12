@@ -28,6 +28,7 @@ use crate::ggml_runtime::{
 use crate::nn::norm::{RmsNormSteps, apply_rms_norm};
 
 use super::runtime_contract::MimoInlocalMetadata;
+use super::rvq::MimoRvqCodes;
 use super::tensor_names::{
     INLOCAL_NORM_WEIGHT, SPEECH_GROUP_PROJ_WEIGHT, mimo_inlocal_layer_tensor_names,
     speech_embd_weight_name,
@@ -87,6 +88,13 @@ pub(crate) enum MimoInputLocalError {
         frame_count: usize,
         group_size: usize,
     },
+    #[error(
+        "mimo-asr speech-embedding table count {table_count} does not match RVQ channel count {code_channels}"
+    )]
+    SpeechEmbeddingLayoutMismatch {
+        table_count: usize,
+        code_channels: usize,
+    },
     #[error("mimo-asr input-local shape overflowed")]
     ShapeOverflow,
 }
@@ -95,7 +103,11 @@ fn build_err(step: &'static str, source: GgmlCpuGraphError) -> MimoInputLocalErr
     MimoInputLocalError::GraphBuildFailed { step, source }
 }
 
-// --- Step 1: 8-codebook embedding sum (host-side, small one-shot lookup) ---
+// --- Step 1: 8-codebook embedding sum ---
+//
+// CPU keeps this scalar implementation as the exact oracle. Accelerated
+// execution binds the native GGUF tables below and performs get_rows + sum in
+// the input-local graph, retaining no full host-f32 table copy.
 
 pub(crate) struct MimoSpeechEmbeddingTables {
     d_model: usize,
@@ -194,14 +206,26 @@ pub(crate) fn load_speech_embedding_tables_from_reader(
 /// `zeroemb_idx`).
 pub(crate) fn sum_speech_embeddings(
     tables: &MimoSpeechEmbeddingTables,
-    codes: &[Vec<u32>],
-) -> Vec<f32> {
+    codes: &MimoRvqCodes,
+) -> Result<Vec<f32>, MimoInputLocalError> {
+    if tables.tables.len() != codes.channels()
+        || tables.vocab_sizes.len() != codes.channels()
+        || tables.zeroemb_idx.len() != codes.channels()
+    {
+        return Err(MimoInputLocalError::SpeechEmbeddingLayoutMismatch {
+            table_count: tables.tables.len(),
+            code_channels: codes.channels(),
+        });
+    }
     let d_model = tables.d_model;
-    let frame_count = codes.len();
+    let frame_count = codes.frame_count();
     let mut out = vec![0.0_f32; frame_count * d_model];
-    for (frame_idx, frame_codes) in codes.iter().enumerate() {
+    for frame_idx in 0..frame_count {
         let row = &mut out[frame_idx * d_model..(frame_idx + 1) * d_model];
-        for (channel, &code) in frame_codes.iter().enumerate() {
+        for channel in 0..codes.channels() {
+            let Some(code) = codes.code(frame_idx, channel) else {
+                continue;
+            };
             if code == tables.zeroemb_idx[channel] {
                 continue;
             }
@@ -216,7 +240,7 @@ pub(crate) fn sum_speech_embeddings(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // --- Step 2+3: 6L batched bidirectional transformer + group downcast ---
@@ -245,16 +269,36 @@ pub(crate) struct MimoInputLocalRuntime {
     final_norm: GgmlStaticTensor,
     group_proj: GgmlLoadedTensor,
     layers: Vec<LayerRuntime>,
+    device_speech_embeddings: Option<Vec<GgmlLoadedTensor>>,
+}
+
+pub(crate) enum MimoInputLocalInput<'a> {
+    HostSummedEmbeddings(&'a [f32]),
+    DeviceRvqCodes(&'a MimoRvqCodes),
 }
 
 impl MimoInputLocalRuntime {
     pub(crate) fn quoted_retained_system_memory_bytes(
         metadata: &MimoInlocalMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<u64, String> {
-        let bytes = metadata
+        let layer_bytes = metadata
             .n_layers
             .checked_mul(std::mem::size_of::<LayerRuntime>())
             .ok_or_else(|| "mimo-asr input-local handle quote overflowed".to_string())?;
+        let speech_handle_bytes = if backend.is_gpu_class() {
+            metadata
+                .audio_channels
+                .checked_mul(std::mem::size_of::<GgmlLoadedTensor>())
+                .ok_or_else(|| {
+                    "mimo-asr device speech-embedding handle quote overflowed".to_string()
+                })?
+        } else {
+            0
+        };
+        let bytes = layer_bytes
+            .checked_add(speech_handle_bytes)
+            .ok_or_else(|| "mimo-asr input-local retained quote overflowed".to_string())?;
         u64::try_from(bytes)
             .map_err(|_| "mimo-asr input-local handle quote exceeds u64".to_string())
     }
@@ -265,6 +309,9 @@ impl MimoInputLocalRuntime {
         // contexts are admitted by their constructors and intentionally do not
         // belong to this Rust-container accounting.
         bytes.add_vec(&self.layers, "mimo-asr input-local layer handles")?;
+        if let Some(tables) = &self.device_speech_embeddings {
+            bytes.add_vec(tables, "mimo-asr device speech-embedding handles")?;
+        }
         Ok(bytes.finish())
     }
 }
@@ -315,9 +362,11 @@ impl MimoInputLocalRuntime {
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoInlocalMetadata,
+        speech_vocab_sizes: &[u32],
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoInputLocalError> {
         let config = mimo_input_local_graph_config(backend);
+        let device_speech_embeddings_enabled = config.backend.is_gpu_class();
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| build_err("runner_init", source))?;
         let loaded_weights = runner
@@ -363,6 +412,24 @@ impl MimoInputLocalRuntime {
                 ffn_down: bind(&loaded_weights, &names.ffn_down_weight)?,
             });
         }
+        let device_speech_embeddings = if device_speech_embeddings_enabled {
+            if speech_vocab_sizes.len() != metadata.audio_channels {
+                return Err(MimoInputLocalError::GraphExecutionFailed {
+                    reason: format!(
+                        "speech vocab count {} != audio channels {}",
+                        speech_vocab_sizes.len(),
+                        metadata.audio_channels
+                    ),
+                });
+            }
+            let mut tables = Vec::with_capacity(metadata.audio_channels);
+            for channel in 0..metadata.audio_channels {
+                tables.push(bind(&loaded_weights, &speech_embd_weight_name(channel))?);
+            }
+            Some(tables)
+        } else {
+            None
+        };
 
         upload(
             &mut arena,
@@ -418,16 +485,18 @@ impl MimoInputLocalRuntime {
             final_norm,
             group_proj,
             layers,
+            device_speech_embeddings,
         })
     }
 
-    /// `summed_embeddings`: `[frame_count][d_model]` row-major (from
-    /// [`sum_speech_embeddings`]); `frame_count` must be a multiple of
-    /// `group_size`. Returns `[T_groups][llm_hidden_size]` row-major
-    /// prompt-splice-ready embeddings, `T_groups = frame_count / group_size`.
+    /// CPU accepts already-summed `[frame][d_model]` embeddings from the exact
+    /// scalar oracle. Accelerated execution accepts compact channel-major RVQ
+    /// ids and performs all eight native table gathers plus their sum in this
+    /// graph. `frame_count` must be a multiple of `group_size`. Returns
+    /// `[T_groups][llm_hidden_size]` row-major prompt-splice-ready embeddings.
     pub(crate) fn run(
         &mut self,
-        summed_embeddings: &[f32],
+        input: MimoInputLocalInput<'_>,
         frame_count: usize,
         llm_hidden_size: usize,
     ) -> Result<Vec<f32>, MimoInputLocalError> {
@@ -440,25 +509,83 @@ impl MimoInputLocalRuntime {
         }
         let n_groups = frame_count / group_size;
         let d_model = self.metadata.d_model;
-        let expected_len = frame_count
-            .checked_mul(d_model)
-            .ok_or(MimoInputLocalError::ShapeOverflow)?;
-        if summed_embeddings.len() != expected_len {
-            return Err(MimoInputLocalError::GraphExecutionFailed {
-                reason: format!(
-                    "summed_embeddings len {} != frame_count {frame_count} * d_model {d_model}",
-                    summed_embeddings.len()
-                ),
-            });
-        }
 
         let mut graph = self.runner.start_graph();
-        let input = graph
-            .new_tensor_2d_f32(d_model, frame_count, "inlocal_input")
-            .map_err(|source| build_err("inlocal_input", source))?;
-        graph
-            .set_input(input)
-            .map_err(|source| build_err("inlocal_input_set", source))?;
+        let (mut hidden, host_upload, codes_upload) = match input {
+            MimoInputLocalInput::HostSummedEmbeddings(summed_embeddings) => {
+                let expected_len = frame_count
+                    .checked_mul(d_model)
+                    .ok_or(MimoInputLocalError::ShapeOverflow)?;
+                if summed_embeddings.len() != expected_len {
+                    return Err(MimoInputLocalError::GraphExecutionFailed {
+                        reason: format!(
+                            "summed_embeddings len {} != frame_count {frame_count} * d_model {d_model}",
+                            summed_embeddings.len()
+                        ),
+                    });
+                }
+                let tensor = graph
+                    .new_tensor_2d_f32(d_model, frame_count, "inlocal_input")
+                    .map_err(|source| build_err("inlocal_input", source))?;
+                graph
+                    .set_input(tensor)
+                    .map_err(|source| build_err("inlocal_input_set", source))?;
+                (tensor, Some((tensor, summed_embeddings)), None)
+            }
+            MimoInputLocalInput::DeviceRvqCodes(codes) => {
+                let tables = self.device_speech_embeddings.as_ref().ok_or_else(|| {
+                    MimoInputLocalError::GraphExecutionFailed {
+                        reason: "device RVQ codes require device speech-embedding handles"
+                            .to_string(),
+                    }
+                })?;
+                if codes.frame_count() != frame_count
+                    || codes.channels() != tables.len()
+                    || codes.channels() != self.metadata.audio_channels
+                {
+                    return Err(MimoInputLocalError::GraphExecutionFailed {
+                        reason: format!(
+                            "device RVQ layout frames={} channels={} does not match frames={frame_count} channels={}",
+                            codes.frame_count(),
+                            codes.channels(),
+                            self.metadata.audio_channels
+                        ),
+                    });
+                }
+                let code_count = frame_count
+                    .checked_mul(codes.channels())
+                    .ok_or(MimoInputLocalError::ShapeOverflow)?;
+                let code_tensor = graph
+                    .new_tensor_1d_i32(code_count, "inlocal_rvq_codes")
+                    .map_err(|source| build_err("inlocal_rvq_codes", source))?;
+                graph
+                    .set_input(code_tensor)
+                    .map_err(|source| build_err("inlocal_rvq_codes_set", source))?;
+                let mut summed = None;
+                for (channel, table) in tables.iter().enumerate() {
+                    let offset = channel
+                        .checked_mul(frame_count)
+                        .and_then(|elements| elements.checked_mul(std::mem::size_of::<i32>()))
+                        .ok_or(MimoInputLocalError::ShapeOverflow)?;
+                    let channel_codes = graph
+                        .view_1d(code_tensor, frame_count, offset)
+                        .map_err(|source| build_err("inlocal_channel_codes", source))?;
+                    let rows = graph
+                        .get_rows(table.as_graph_tensor(), channel_codes)
+                        .map_err(|source| build_err("inlocal_speech_embedding_lookup", source))?;
+                    summed = Some(match summed {
+                        Some(previous) => graph
+                            .add(previous, rows)
+                            .map_err(|source| build_err("inlocal_speech_embedding_sum", source))?,
+                        None => rows,
+                    });
+                }
+                let summed = summed.ok_or_else(|| MimoInputLocalError::GraphExecutionFailed {
+                    reason: "device speech-embedding table set is empty".to_string(),
+                })?;
+                (summed, None, Some((code_tensor, codes.values())))
+            }
+        };
 
         // Local (within-group) positions 0..group_size, shared identically
         // across every group (ggml rope batches the same positions vector
@@ -479,7 +606,6 @@ impl MimoInputLocalRuntime {
         )
         .map_err(|source| build_err("inlocal_rope_params", source))?;
 
-        let mut hidden = input;
         for layer in &self.layers {
             hidden = run_layer(
                 &mut graph,
@@ -529,9 +655,16 @@ impl MimoInputLocalRuntime {
             .prepare_outputs_for_upload(&[projected])
             .map_err(|source| build_err("inlocal_prepare_outputs", source))?;
 
-        graph
-            .set_f32_slice(input, summed_embeddings, "inlocal_input")
-            .map_err(|source| build_err("inlocal_input_upload", source))?;
+        if let Some((tensor, values)) = host_upload {
+            graph
+                .set_f32_slice(tensor, values, "inlocal_input")
+                .map_err(|source| build_err("inlocal_input_upload", source))?;
+        }
+        if let Some((tensor, values)) = codes_upload {
+            graph
+                .set_i32_slice(tensor, values, "inlocal_rvq_codes")
+                .map_err(|source| build_err("inlocal_rvq_codes_upload", source))?;
+        }
         let position_values: Vec<i32> = (0..group_size as i32).collect();
         graph
             .set_i32_slice(positions, &position_values, "inlocal_positions")
@@ -729,8 +862,9 @@ mod tests {
         };
         // frame 0: both channels real (code 0) -> sum (3,3).
         // frame 1: channel 0 hits zeroemb (code 1) -> masked; channel 1 real (code 0) -> (2,2).
-        let codes = vec![vec![0, 0], vec![1, 0]];
-        let out = sum_speech_embeddings(&tables, &codes);
+        let codes = MimoRvqCodes::from_channel_major(2, 2, vec![0, 1, 0, 0])
+            .expect("valid channel-major codes");
+        let out = sum_speech_embeddings(&tables, &codes).expect("speech embedding sum");
         assert_eq!(out, vec![3.0, 3.0, 2.0, 2.0]);
     }
 

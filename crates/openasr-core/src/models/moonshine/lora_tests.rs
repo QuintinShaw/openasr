@@ -167,7 +167,6 @@ fn first_step_logits(
             decoder_state: decoder_state(prepared.metadata, encoder_output.frame_count),
             backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         },
-        true,
         preflight,
         adapter,
     )
@@ -261,7 +260,6 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
                 decoder_state: decoder_state(metadata, encoder_output.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
             },
-            true,
             &preflight,
             adapter,
         )

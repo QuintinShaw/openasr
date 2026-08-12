@@ -481,12 +481,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "host-local: requires the X-ASR q8_0 pack under tmp/xasr-test/out"]
+    #[ignore = "host-local: requires OPENASR_XASR_PACK or the legacy X-ASR q8_0 fixture"]
     fn xasr_accelerated_request_engages_gpu_and_matches_cpu_text() {
-        use crate::ggml_runtime::{RequestBackendPreference, ResolvedFamilyRuntimeInput};
+        use crate::ggml_runtime::{
+            GgmlExecutionTelemetryCollector, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+        };
 
-        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr");
+        let pack = std::env::var_os("OPENASR_XASR_PACK")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr")
+            });
         if !pack.exists() {
             eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
             return;
@@ -512,7 +518,7 @@ mod tests {
         let policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
             crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
         );
-        let (cpu_text, cpu_elapsed) = {
+        let (cpu_output, cpu_elapsed) = {
             let resolved = ResolvedFamilyRuntimeInput::resolve(
                 Some(RequestBackendPreference::CpuOnly),
                 policy,
@@ -523,14 +529,15 @@ mod tests {
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
             );
             let started = std::time::Instant::now();
-            let text =
-                transcribe_xasr_zipformer_pcm(&reader, metadata, &samples, None, false, resolved)
-                    .expect("cpu xasr")
-                    .text;
-            (text, started.elapsed())
+            let output =
+                transcribe_xasr_zipformer_pcm(&reader, metadata, &samples, None, true, resolved)
+                    .expect("cpu xasr");
+            (output, started.elapsed())
         };
 
-        let (gpu_text, gpu_elapsed) = {
+        let collector = GgmlExecutionTelemetryCollector::new();
+        let (gpu_output, gpu_elapsed) = {
+            let _telemetry = collector.install();
             let resolved = ResolvedFamilyRuntimeInput::resolve(
                 Some(RequestBackendPreference::Accelerated),
                 policy,
@@ -541,18 +548,50 @@ mod tests {
                 "accelerated request must keep the GPU-class backend, got {resolved:?}"
             );
             let started = std::time::Instant::now();
-            let text =
-                transcribe_xasr_zipformer_pcm(&reader, metadata, &samples, None, false, resolved)
-                    .expect("gpu xasr")
-                    .text;
-            (text, started.elapsed())
+            let output =
+                transcribe_xasr_zipformer_pcm(&reader, metadata, &samples, None, true, resolved)
+                    .expect("gpu xasr");
+            (output, started.elapsed())
         };
+        let telemetry = collector.snapshot();
 
         eprintln!(
-            "xasr accelerated parity: cpu={cpu_elapsed:?} gpu={gpu_elapsed:?} text={cpu_text:?}"
+            "xasr accelerated parity: cpu={cpu_elapsed:?} gpu={gpu_elapsed:?} text={:?} telemetry={telemetry:?}",
+            cpu_output.text,
         );
-        assert!(!cpu_text.trim().is_empty());
-        assert_eq!(cpu_text, gpu_text, "GPU and CPU transcripts must match");
+        assert!(!cpu_output.text.trim().is_empty());
+        assert_eq!(
+            cpu_output.text, gpu_output.text,
+            "GPU and CPU transcripts must match"
+        );
+        assert_eq!(cpu_output.words.len(), gpu_output.words.len());
+        let mut max_confidence_drift = 0.0_f32;
+        for (cpu, gpu) in cpu_output.words.iter().zip(&gpu_output.words) {
+            assert_eq!(cpu.word, gpu.word);
+            assert_eq!(cpu.start, gpu.start);
+            assert_eq!(cpu.end, gpu.end);
+            let confidence_drift = match (cpu.confidence, gpu.confidence) {
+                (Some(cpu), Some(gpu)) => (cpu - gpu).abs(),
+                (None, None) => 0.0,
+                _ => f32::INFINITY,
+            };
+            max_confidence_drift = max_confidence_drift.max(confidence_drift);
+        }
+        eprintln!("xasr accelerated parity max_confidence_drift={max_confidence_drift:.8}");
+        assert!(
+            max_confidence_drift <= 0.03,
+            "X-ASR CPU/Metal word-confidence drift {max_confidence_drift} exceeded 0.03"
+        );
+        assert!(telemetry.direct_graph_computes + telemetry.scheduler_graph_computes > 0);
+        assert!(!telemetry.observed_compute_nodes_by_backend.is_empty());
+        assert!(
+            telemetry
+                .observed_compute_nodes_by_backend
+                .keys()
+                .all(|backend| backend.starts_with("MTL") || backend.contains("Metal")),
+            "explicit Metal X-ASR observed non-Metal compute: {:?}",
+            telemetry.observed_compute_nodes_by_backend
+        );
     }
 
     #[test]

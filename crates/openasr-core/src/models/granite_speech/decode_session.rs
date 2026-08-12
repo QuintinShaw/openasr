@@ -76,8 +76,10 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlKvElementType, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession,
+    GgmlRopeExtParams,
 };
+use crate::models::mapped_token_embedding::MappedTokenEmbeddingDeviceSpec;
 use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote, SystemMemoryOwner,
 };
@@ -419,6 +421,10 @@ pub(crate) struct GraniteSpeechDecodeSession {
     config: GraniteSpeechDecoderConfig,
     runner: GgmlCpuGraphRunner,
     weights: GraniteDecoderWeights,
+    /// Canonical token-major embedding matrix bound inside `_loaded`. Direct
+    /// GPU decode consumes token ids through `get_rows`; CPU and synthetic
+    /// f32-arena sessions keep using their existing host embedding provider.
+    device_token_embedding: Option<GraniteDeviceTokenEmbedding>,
     /// Kept alive so the keep-quantized `weights`' zero-copy handles (raw
     /// pointers into this context's mmap-backed backend buffer) stay valid for
     /// the session's lifetime. `None` on the f32-arena path (the arena owns its
@@ -472,11 +478,39 @@ struct GraniteReusableDecodeGraph {
     /// against the session's current `resident_capacity` forces a rebuild.
     max_positions: usize,
     use_flash_attention: bool,
-    embed: GgmlCpuTensor<'static>,
+    input_kind: GraniteReusableDecodeInputKind,
+    embed: Option<GgmlCpuTensor<'static>>,
+    token_id: Option<GgmlCpuTensor<'static>>,
     row_index: GgmlCpuTensor<'static>,
     position: GgmlCpuTensor<'static>,
     mask: GgmlCpuTensor<'static>,
     logits: GgmlCpuTensor<'static>,
+}
+
+#[derive(Clone, Copy)]
+struct GraniteDeviceTokenEmbedding {
+    tensor: GgmlLoadedTensor,
+    vocab_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraniteReusableDecodeInputKind {
+    Embedding,
+    TokenId,
+}
+
+enum GraniteReusableDecodeInput<'a> {
+    Embedding(&'a [f32]),
+    TokenId(i32),
+}
+
+impl GraniteReusableDecodeInput<'_> {
+    fn kind(&self) -> GraniteReusableDecodeInputKind {
+        match self {
+            Self::Embedding(_) => GraniteReusableDecodeInputKind::Embedding,
+            Self::TokenId(_) => GraniteReusableDecodeInputKind::TokenId,
+        }
+    }
 }
 
 impl GraniteSpeechDecodeSession {
@@ -507,6 +541,7 @@ impl GraniteSpeechDecodeSession {
             runner,
             GraniteDecoderWeights::Arena(weights),
             None,
+            None,
         ))
     }
 
@@ -520,6 +555,7 @@ impl GraniteSpeechDecodeSession {
     pub(crate) fn new_keep_quantized_from_preflight(
         config: GraniteSpeechDecoderConfig,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = decoder_graph_config(backend);
@@ -529,10 +565,38 @@ impl GraniteSpeechDecodeSession {
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(map_ggml("session_load_gguf_weight_context"))?;
         let weights = GraniteDecoderLoadedWeights::load(&loaded, &config)?;
+        let device_token_embedding = token_embedding
+            .map(|spec| {
+                if spec.d_model != config.hidden_size || spec.vocab_size != config.vocab_size {
+                    return Err(GraniteSpeechDecoderError::Shape {
+                        reason: format!(
+                            "granite device token embedding is {}x{}, expected {}x{}",
+                            spec.d_model, spec.vocab_size, config.hidden_size, config.vocab_size
+                        ),
+                    });
+                }
+                Ok(GraniteDeviceTokenEmbedding {
+                    tensor: loaded.tensor(spec.tensor_name).ok_or_else(|| {
+                        GraniteSpeechDecoderError::MissingWeight {
+                            name: spec.tensor_name.to_string(),
+                        }
+                    })?,
+                    vocab_size: spec.vocab_size,
+                })
+            })
+            .transpose()?;
+        if reusable_decode_graph_supported_for_runner(&runner) && device_token_embedding.is_none() {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason:
+                    "direct GPU Granite decode requires a canonical token-major embedding tensor"
+                        .to_string(),
+            });
+        }
         Ok(Self::assemble(
             config,
             runner,
             GraniteDecoderWeights::Loaded(weights),
+            device_token_embedding,
             Some(loaded),
         ))
     }
@@ -541,6 +605,7 @@ impl GraniteSpeechDecodeSession {
         config: GraniteSpeechDecoderConfig,
         runner: GgmlCpuGraphRunner,
         weights: GraniteDecoderWeights,
+        device_token_embedding: Option<GraniteDeviceTokenEmbedding>,
         loaded: Option<GgmlLoadedWeightContext>,
     ) -> Self {
         Self {
@@ -548,6 +613,7 @@ impl GraniteSpeechDecodeSession {
             config,
             runner,
             weights,
+            device_token_embedding,
             _loaded: loaded,
             host_kv: None,
             seq_len: 0,
@@ -582,6 +648,10 @@ impl GraniteSpeechDecodeSession {
 
     pub(crate) fn is_prefilled(&self) -> bool {
         self.prefilled
+    }
+
+    pub(crate) fn config(&self) -> &GraniteSpeechDecoderConfig {
+        &self.config
     }
 
     /// Number of tokens (prompt + generated) whose K/V is currently cached.
@@ -639,7 +709,7 @@ impl GraniteSpeechDecodeSession {
                 self.resident_kv
                     .as_ref()
                     .expect("resident arena allocated above"),
-                embeddings,
+                GraniteResidentPrefillInput::Embeddings(embeddings),
                 n_tokens,
             )?;
             self.seq_len = n_tokens;
@@ -671,6 +741,82 @@ impl GraniteSpeechDecodeSession {
         self.prefilled = true;
         self.logical_capacity = capacity.logical_positions();
         Ok(last_logits)
+    }
+
+    /// GPU-only first-prompt path: gather canonical token rows from the
+    /// pack-bound embedding matrix and replace audio placeholders inside the
+    /// same resident prefill graph. CPU/scheduler callers receive `None` and
+    /// retain the existing host-gather fallback.
+    pub(crate) fn prefill_token_ids_with_audio(
+        &mut self,
+        token_ids: &[u32],
+        audio_rows: &[f32],
+        audio_positions: &[usize],
+        capacity: GraniteSpeechKvCacheCapacity,
+    ) -> Result<Option<Vec<f32>>, GraniteSpeechDecoderError> {
+        if !self.reuse_supported() {
+            return Ok(None);
+        }
+        if self.prefilled {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: "granite decode session already prefilled".to_string(),
+            });
+        }
+        let n_tokens = token_ids.len();
+        if n_tokens == 0 || n_tokens > capacity.logical_positions() {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: "granite device prompt token span is invalid".to_string(),
+            });
+        }
+        let embedding =
+            self.device_token_embedding
+                .ok_or_else(|| GraniteSpeechDecoderError::Shape {
+                    reason: "granite device prompt requires a bound token embedding".to_string(),
+                })?;
+        if !audio_rows.len().is_multiple_of(self.config.hidden_size) {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: "granite device prompt audio row width mismatch".to_string(),
+            });
+        }
+        let audio_count = audio_rows.len() / self.config.hidden_size;
+        if audio_positions.len() != audio_count
+            || audio_positions.iter().any(|&position| position >= n_tokens)
+            || audio_positions
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+        {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: "granite device prompt audio positions are invalid".to_string(),
+            });
+        }
+        if token_ids.iter().enumerate().any(|(position, &token_id)| {
+            audio_positions.binary_search(&position).is_err()
+                && token_id as usize >= embedding.vocab_size
+        }) {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: "granite device prompt token id exceeds vocabulary".to_string(),
+            });
+        }
+        self.ensure_resident_arena(capacity.resident_positions())?;
+        let last_logits = run_prefill_graph_seeding_resident(
+            &mut self.runner,
+            &self.weights,
+            &self.config,
+            self.resident_kv
+                .as_ref()
+                .expect("resident arena allocated above"),
+            GraniteResidentPrefillInput::TokenIds {
+                embedding,
+                token_ids,
+                audio_rows,
+                audio_positions,
+            },
+            n_tokens,
+        )?;
+        self.seq_len = n_tokens;
+        self.prefilled = true;
+        self.logical_capacity = capacity.logical_positions();
+        Ok(Some(last_logits))
     }
 
     /// Run one incremental decode step for `new_token_id` (the position it
@@ -706,6 +852,40 @@ impl GraniteSpeechDecodeSession {
         self.decode_step_from_embedding_unchecked(embed_row)
     }
 
+    /// Advance a direct-GPU session from a token id without materializing its
+    /// embedding row on the host. `None` means this session intentionally uses
+    /// the CPU/scheduler path and the caller should retain its existing host
+    /// gather fallback.
+    pub(crate) fn decode_step_from_token_id(
+        &mut self,
+        token_id: u32,
+    ) -> Result<Option<Vec<f32>>, GraniteSpeechDecoderError> {
+        if !self.reuse_supported() || self.device_token_embedding.is_none() {
+            return Ok(None);
+        }
+        self.ensure_can_decode_step()?;
+        let embedding = self
+            .device_token_embedding
+            .expect("checked Granite device token embedding above");
+        let token_index =
+            usize::try_from(token_id).map_err(|_| GraniteSpeechDecoderError::Shape {
+                reason: format!("granite token id {token_id} does not fit usize"),
+            })?;
+        if token_index >= embedding.vocab_size {
+            return Err(GraniteSpeechDecoderError::Shape {
+                reason: format!(
+                    "granite token id {token_id} exceeds vocabulary {}",
+                    embedding.vocab_size
+                ),
+            });
+        }
+        let token_id = i32::try_from(token_id).map_err(|_| GraniteSpeechDecoderError::Shape {
+            reason: format!("granite token id {token_id} does not fit i32"),
+        })?;
+        self.decode_step_reused(GraniteReusableDecodeInput::TokenId(token_id))
+            .map(Some)
+    }
+
     fn ensure_can_decode_step(&self) -> Result<(), GraniteSpeechDecoderError> {
         if !self.prefilled {
             return Err(GraniteSpeechDecoderError::Shape {
@@ -731,7 +911,7 @@ impl GraniteSpeechDecodeSession {
             // Metal reuse path: one persistent single-token step against the
             // resident KV arena (write the new row via `set_rows`, attend the
             // fixed span). No graph rebuild, no host K/V round-trip.
-            return self.decode_step_reused(embed_row);
+            return self.decode_step_reused(GraniteReusableDecodeInput::Embedding(embed_row));
         }
 
         let seq_len = self.seq_len;
@@ -789,7 +969,7 @@ impl GraniteSpeechDecodeSession {
     /// tripping to the host. The new token occupies row `self.seq_len`.
     fn decode_step_reused(
         &mut self,
-        embed_row: &[f32],
+        input: GraniteReusableDecodeInput<'_>,
     ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
         let position = self.seq_len;
         let max_positions = self.resident_capacity;
@@ -803,10 +983,14 @@ impl GraniteSpeechDecodeSession {
         let needs_build = self
             .reuse
             .as_ref()
-            .map(|reuse| reuse.session.is_poisoned() || reuse.max_positions != max_positions)
+            .map(|reuse| {
+                reuse.session.is_poisoned()
+                    || reuse.max_positions != max_positions
+                    || reuse.input_kind != input.kind()
+            })
             .unwrap_or(true);
         if needs_build {
-            self.build_reusable_decode_graph()?;
+            self.build_reusable_decode_graph(input.kind())?;
         }
 
         let vocab_size = self.config.vocab_size;
@@ -835,15 +1019,29 @@ impl GraniteSpeechDecodeSession {
             .as_mut()
             .expect("granite reusable decode graph built above");
         let embed = reuse.embed;
+        let token_id = reuse.token_id;
         let row_index = reuse.row_index;
         let position_tensor = reuse.position;
         let mask = reuse.mask;
         let logits = reuse.logits;
         let graph = reuse.session.builder();
 
-        graph
-            .set_f32_slice(embed, embed_row, "granite_reuse_embed")
-            .map_err(map_ggml("reuse_upload_embed"))?;
+        match input {
+            GraniteReusableDecodeInput::Embedding(values) => graph
+                .set_f32_slice(
+                    embed.expect("embedding-mode Granite reuse input"),
+                    values,
+                    "granite_reuse_embed",
+                )
+                .map_err(map_ggml("reuse_upload_embed"))?,
+            GraniteReusableDecodeInput::TokenId(value) => graph
+                .set_i32_slice(
+                    token_id.expect("token-mode Granite reuse input"),
+                    &[value],
+                    "granite_reuse_token_id",
+                )
+                .map_err(map_ggml("reuse_upload_token_id"))?,
+        }
         graph
             .set_i32_slice(row_index, &[position_i32], "granite_reuse_row")
             .map_err(map_ggml("reuse_upload_row"))?;
@@ -882,7 +1080,10 @@ impl GraniteSpeechDecodeSession {
     /// reads the whole fixed span, with the per-step additive `-inf` tail mask
     /// zeroing every not-yet-written (or masked-future) column so the result is
     /// numerically the growing-KV attention over exactly `position + 1` keys.
-    fn build_reusable_decode_graph(&mut self) -> Result<(), GraniteSpeechDecoderError> {
+    fn build_reusable_decode_graph(
+        &mut self,
+        input_kind: GraniteReusableDecodeInputKind,
+    ) -> Result<(), GraniteSpeechDecoderError> {
         let config = self.config;
         let head_dim = config.head_dim;
         let hidden_size = config.hidden_size;
@@ -911,9 +1112,35 @@ impl GraniteSpeechDecodeSession {
             .map_err(map_ggml("reuse_session_start"))?;
         let graph = session.builder();
 
-        let embed = graph
-            .new_tensor_2d_f32(hidden_size, 1, "granite_reuse_embed")
-            .map_err(map_ggml("reuse_embed_alloc"))?;
+        let (embed, token_id, hidden_input) = match input_kind {
+            GraniteReusableDecodeInputKind::Embedding => {
+                let embed = graph
+                    .new_tensor_2d_f32(hidden_size, 1, "granite_reuse_embed")
+                    .map_err(map_ggml("reuse_embed_alloc"))?;
+                graph
+                    .set_input(embed)
+                    .map_err(map_ggml("reuse_embed_input"))?;
+                (Some(embed), None, embed)
+            }
+            GraniteReusableDecodeInputKind::TokenId => {
+                let token_id = graph
+                    .new_tensor_1d_i32(1, "granite_reuse_token_id")
+                    .map_err(map_ggml("reuse_token_id_alloc"))?;
+                graph
+                    .set_input(token_id)
+                    .map_err(map_ggml("reuse_token_id_input"))?;
+                let embedding = self.device_token_embedding.ok_or_else(|| {
+                    GraniteSpeechDecoderError::Shape {
+                        reason: "Granite token-id graph has no device embedding binding"
+                            .to_string(),
+                    }
+                })?;
+                let hidden = graph
+                    .get_rows(embedding.tensor.as_graph_tensor(), token_id)
+                    .map_err(map_ggml("reuse_token_embedding_lookup"))?;
+                (None, Some(token_id), hidden)
+            }
+        };
         let row_index = graph
             .new_tensor_1d_i32(1, "granite_reuse_row")
             .map_err(map_ggml("reuse_row_alloc"))?;
@@ -930,9 +1157,6 @@ impl GraniteSpeechDecodeSession {
                 .map_err(map_ggml("reuse_mask_alloc"))?
         };
         graph
-            .set_input(embed)
-            .map_err(map_ggml("reuse_embed_input"))?;
-        graph
             .set_input(row_index)
             .map_err(map_ggml("reuse_row_input"))?;
         graph
@@ -943,7 +1167,7 @@ impl GraniteSpeechDecodeSession {
             .map_err(map_ggml("reuse_mask_input"))?;
 
         let mut hidden = graph
-            .scale(embed, config.embedding_multiplier)
+            .scale(hidden_input, config.embedding_multiplier)
             .map_err(map_ggml("reuse_embed_scale"))?;
 
         for (index, (arena_k, arena_v)) in kv_tensors.iter().copied().enumerate() {
@@ -1028,7 +1252,9 @@ impl GraniteSpeechDecodeSession {
             session,
             max_positions,
             use_flash_attention,
+            input_kind,
             embed,
+            token_id,
             row_index,
             position,
             mask,
@@ -1255,12 +1481,34 @@ fn run_prefill_graph(
 /// written straight into the resident arena instead of tapped back to the host,
 /// so prefill also avoids the O(n) K/V readback. Returns only the last-position
 /// logits row.
+enum GraniteResidentPrefillInput<'a> {
+    Embeddings(&'a [f32]),
+    TokenIds {
+        embedding: GraniteDeviceTokenEmbedding,
+        token_ids: &'a [u32],
+        audio_rows: &'a [f32],
+        audio_positions: &'a [usize],
+    },
+}
+
+enum GraniteResidentPrefillUpload<'a> {
+    Embeddings {
+        tensor: GgmlCpuTensor<'a>,
+        values: &'a [f32],
+    },
+    TokenIds {
+        tensor: GgmlCpuTensor<'a>,
+        values: Vec<i32>,
+        audio: Option<(GgmlCpuTensor<'a>, &'a [f32], GgmlCpuTensor<'a>, Vec<i32>)>,
+    },
+}
+
 fn run_prefill_graph_seeding_resident(
     runner: &mut GgmlCpuGraphRunner,
     weights: &GraniteDecoderWeights,
     config: &GraniteSpeechDecoderConfig,
     resident_kv: &LlmResidentKvArena,
-    embeddings: &[f32],
+    input: GraniteResidentPrefillInput<'_>,
     n_tokens: usize,
 ) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
@@ -1270,9 +1518,98 @@ fn run_prefill_graph_seeding_resident(
 
     let mut graph = runner.start_graph();
 
-    let embed_tensor = graph
-        .new_tensor_2d_f32(hidden_size, n_tokens, "granite_seed_prefill_embeds")
-        .map_err(map_ggml("seed_prefill_input_alloc"))?;
+    let (prompt_rows, prompt_upload) = match input {
+        GraniteResidentPrefillInput::Embeddings(values) => {
+            let tensor = graph
+                .new_tensor_2d_f32(hidden_size, n_tokens, "granite_seed_prefill_embeds")
+                .map_err(map_ggml("seed_prefill_input_alloc"))?;
+            graph
+                .set_input(tensor)
+                .map_err(map_ggml("seed_prefill_mark_input_embeds"))?;
+            (
+                tensor,
+                GraniteResidentPrefillUpload::Embeddings { tensor, values },
+            )
+        }
+        GraniteResidentPrefillInput::TokenIds {
+            embedding,
+            token_ids,
+            audio_rows,
+            audio_positions,
+        } => {
+            let token_tensor = graph
+                .new_tensor_1d_i32(n_tokens, "granite_seed_prefill_token_ids")
+                .map_err(map_ggml("seed_prefill_token_ids_alloc"))?;
+            graph
+                .set_input(token_tensor)
+                .map_err(map_ggml("seed_prefill_mark_input_token_ids"))?;
+            // Granite's audio placeholder may be outside the decoder vocab.
+            // Match HF's masked-scatter contract: gather row zero at every
+            // audio slot, then overwrite those rows with projector output.
+            let token_values = token_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(position, token_id)| {
+                    let token_id = if audio_positions.binary_search(&position).is_ok() {
+                        0
+                    } else {
+                        token_id
+                    };
+                    i32::try_from(token_id).map_err(|_| GraniteSpeechDecoderError::Shape {
+                        reason: "granite device prompt token id exceeds i32".to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let token_rows = graph
+                .get_rows(embedding.tensor.as_graph_tensor(), token_tensor)
+                .map_err(map_ggml("seed_prefill_token_lookup"))?;
+            if audio_positions.is_empty() {
+                (
+                    token_rows,
+                    GraniteResidentPrefillUpload::TokenIds {
+                        tensor: token_tensor,
+                        values: token_values,
+                        audio: None,
+                    },
+                )
+            } else {
+                let audio_count = audio_positions.len();
+                let audio_tensor = graph
+                    .new_tensor_2d_f32(hidden_size, audio_count, "granite_seed_prefill_audio_rows")
+                    .map_err(map_ggml("seed_prefill_audio_rows_alloc"))?;
+                let audio_indices = graph
+                    .new_tensor_1d_i32(audio_count, "granite_seed_prefill_audio_positions")
+                    .map_err(map_ggml("seed_prefill_audio_positions_alloc"))?;
+                graph
+                    .set_input(audio_tensor)
+                    .map_err(map_ggml("seed_prefill_mark_input_audio_rows"))?;
+                graph
+                    .set_input(audio_indices)
+                    .map_err(map_ggml("seed_prefill_mark_input_audio_positions"))?;
+                let audio_index_values = audio_positions
+                    .iter()
+                    .copied()
+                    .map(|position| {
+                        i32::try_from(position).map_err(|_| GraniteSpeechDecoderError::Shape {
+                            reason: "granite device prompt audio position exceeds i32".to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let prompt_rows = graph
+                    .set_rows(token_rows, audio_tensor, audio_indices)
+                    .map_err(map_ggml("seed_prefill_audio_splice"))?;
+                (
+                    prompt_rows,
+                    GraniteResidentPrefillUpload::TokenIds {
+                        tensor: token_tensor,
+                        values: token_values,
+                        audio: Some((audio_tensor, audio_rows, audio_indices, audio_index_values)),
+                    },
+                )
+            }
+        }
+    };
     let positions = graph
         .new_tensor_1d_i32(n_tokens, "granite_seed_prefill_positions")
         .map_err(map_ggml("seed_prefill_positions_alloc"))?;
@@ -1292,7 +1629,7 @@ fn run_prefill_graph_seeding_resident(
     let kv_tensors = resident_kv.graph_tensors();
 
     let mut hidden = graph
-        .scale(embed_tensor, config.embedding_multiplier)
+        .scale(prompt_rows, config.embedding_multiplier)
         .map_err(map_ggml("seed_prefill_embed_scale"))?;
     let rope = GgmlRopeExtParams::qwen_neox(head_dim, n_tokens, config.rope_theta)
         .map_err(map_ggml("seed_prefill_rope_params"))?;
@@ -1388,9 +1725,6 @@ fn run_prefill_graph_seeding_resident(
         .set_output(logits)
         .map_err(map_ggml("seed_prefill_set_output_logits"))?;
     graph
-        .set_input(embed_tensor)
-        .map_err(map_ggml("seed_prefill_mark_input_embeds"))?;
-    graph
         .set_input(positions)
         .map_err(map_ggml("seed_prefill_mark_input_positions"))?;
     graph
@@ -1403,9 +1737,32 @@ fn run_prefill_graph_seeding_resident(
     graph
         .prepare_outputs_for_upload(&[logits])
         .map_err(map_ggml("seed_prefill_prepare_outputs"))?;
-    graph
-        .set_f32_slice(embed_tensor, embeddings, "granite_seed_prefill_embeds")
-        .map_err(map_ggml("seed_prefill_upload_embeds"))?;
+    match prompt_upload {
+        GraniteResidentPrefillUpload::Embeddings { tensor, values } => graph
+            .set_f32_slice(tensor, values, "granite_seed_prefill_embeds")
+            .map_err(map_ggml("seed_prefill_upload_embeds"))?,
+        GraniteResidentPrefillUpload::TokenIds {
+            tensor,
+            values,
+            audio,
+        } => {
+            graph
+                .set_i32_slice(tensor, &values, "granite_seed_prefill_token_ids")
+                .map_err(map_ggml("seed_prefill_upload_token_ids"))?;
+            if let Some((audio_tensor, audio_rows, audio_indices, audio_index_values)) = audio {
+                graph
+                    .set_f32_slice(audio_tensor, audio_rows, "granite_seed_prefill_audio_rows")
+                    .map_err(map_ggml("seed_prefill_upload_audio_rows"))?;
+                graph
+                    .set_i32_slice(
+                        audio_indices,
+                        &audio_index_values,
+                        "granite_seed_prefill_audio_positions",
+                    )
+                    .map_err(map_ggml("seed_prefill_upload_audio_positions"))?;
+            }
+        }
+    }
     let position_ids: Vec<i32> = (0..n_tokens as i32).collect();
     graph
         .set_i32_slice(positions, &position_ids, "granite_seed_prefill_positions")

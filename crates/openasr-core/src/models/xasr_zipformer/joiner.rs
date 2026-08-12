@@ -91,6 +91,21 @@ impl XasrJoiner {
         Ok(&scratch.logits)
     }
 
+    pub(crate) fn token_probability(
+        &self,
+        scratch: &XasrJoinerScratch,
+        token: u32,
+    ) -> Result<f32, String> {
+        let token = token as usize;
+        if token >= scratch.logits.len() {
+            return Err(format!(
+                "xasr joiner token {token} out of range for {} logits",
+                scratch.logits.len()
+            ));
+        }
+        Ok(crate::models::seq2seq_greedy_decode::token_softmax_probability(&scratch.logits, token))
+    }
+
     pub(crate) fn logits(
         &self,
         encoder_frame: &[f32],

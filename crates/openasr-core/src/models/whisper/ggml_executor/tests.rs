@@ -633,7 +633,8 @@ fn mel_feature_extraction_failure_fails_before_encoder_execution() {
 fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fail_closed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let runtime_path = temp.path().join("whisper-real-mel.gguf");
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-fixture");
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("whisper-fixture")
+        .with_whisper_minimal_tokenizer();
     write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write gguf fixture");
     let runtime_source =
         validate_ggml_runtime_source_path(&runtime_path).expect("validate runtime source");
@@ -692,6 +693,111 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
             );
         }
     }
+
+    let mut cached_prelude = WhisperEncoderPreludeCachedRuntime::build(
+        &encoder_weights,
+        &prelude_plan,
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("build cached prelude runtime");
+    let first_cached = cached_prelude
+        .run(&mel_input)
+        .expect("run cached prelude first time");
+    let second_cached = cached_prelude
+        .run(&mel_input)
+        .expect("reuse cached prelude second time");
+    let (
+        WhisperEncoderPreludeSeamResult::GraphExecuted {
+            output_hidden_f32: first_values,
+            ..
+        },
+        WhisperEncoderPreludeSeamResult::GraphExecuted {
+            output_hidden_f32: second_values,
+            ..
+        },
+    ) = (first_cached, second_cached);
+    assert_eq!(
+        first_values, second_values,
+        "owner-thread cached prelude must be byte-identical across reuse"
+    );
+    assert_eq!(
+        sha256_f32_le(&first_values),
+        GOLDEN_DIFF_TINY_WHISPER_ENCODER_PRELUDE_SHA256
+    );
+
+    let services = crate::models::native_execution_services::test_native_execution_services();
+    let broker = Arc::clone(services.memory_broker());
+    let _services_scope =
+        crate::models::native_execution_services::install_native_execution_services(&services);
+    let system_domain = crate::device::execution_memory::MemoryDomainKey::SystemMemory;
+    let preflight = GgufRuntimeSourcePreflight {
+        runtime_source: runtime_source.clone(),
+        metadata: Arc::new(metadata.clone()),
+        tensor_index: Arc::new(tensor_index.clone()),
+    };
+    let prepared_owner = Arc::new(SystemMemoryOwner::without_allocation(
+        build_whisper_prepared_runtime(&preflight).expect("build prepared runtime"),
+    ));
+    let executor = WhisperGgmlExecutor::default();
+    let first_actor = checkout_whisper_encoder_runtime(
+        &executor.encoder_runtimes,
+        &runtime_source,
+        Arc::clone(&prepared_owner),
+        Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("checkout first encoder actor");
+    let first_actor_output = run_whisper_encoder_prelude_actor(
+        &first_actor,
+        Arc::clone(&prepared_owner),
+        prelude_plan.clone(),
+        mel_input.clone(),
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("run first actor prelude");
+    let first_runtime_identity = first_actor
+        .call_mut(|state| {
+            state
+                .prelude
+                .as_ref()
+                .map(|runtime| runtime as *const WhisperEncoderPreludeCachedRuntime as usize)
+        })
+        .expect("inspect first actor prelude")
+        .expect("first actor must retain its prelude runtime");
+    drop(first_actor);
+    assert_eq!(executor.encoder_runtimes.usage_for_test(), (1, 0));
+    let after_first = broker.usage(&system_domain);
+
+    let second_actor = checkout_whisper_encoder_runtime(
+        &executor.encoder_runtimes,
+        &runtime_source,
+        Arc::clone(&prepared_owner),
+        Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("checkout returned encoder actor");
+    let second_actor_output = run_whisper_encoder_prelude_actor(
+        &second_actor,
+        Arc::clone(&prepared_owner),
+        prelude_plan.clone(),
+        mel_input.clone(),
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("run cached actor prelude");
+    let second_runtime_identity = second_actor
+        .call_mut(|state| {
+            state
+                .prelude
+                .as_ref()
+                .map(|runtime| runtime as *const WhisperEncoderPreludeCachedRuntime as usize)
+        })
+        .expect("inspect cached actor prelude")
+        .expect("cached actor must retain its prelude runtime");
+    assert_eq!(second_runtime_identity, first_runtime_identity);
+    assert_eq!(second_actor_output, first_actor_output);
+    drop(second_actor);
+    assert_eq!(executor.encoder_runtimes.usage_for_test(), (1, 0));
+    assert_eq!(broker.usage(&system_domain), after_first);
 
     let output = execute_whisper_ggml_non_streaming_cpu(
         &builtin_adapter_descriptor(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
@@ -1192,7 +1298,7 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         in_decoder_speakers: false,
         longform: Some(crate::LongFormOptions::default()),
         longform_chunk_count_hint: None,
-        prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_prefer_cpu_decoder_for_multichunk_metal: false,
         serve_batch: crate::models::serve_batch_env::ServeBatchPolicy::serial(),
         runtime_build_identity: None,
         adapter_path: None,

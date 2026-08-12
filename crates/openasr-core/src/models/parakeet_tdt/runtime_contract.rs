@@ -422,9 +422,9 @@ pub(crate) fn parakeet_tdt_runtime_tensor_binding_descriptors(
             });
         };
     // TDT tail storage matches the packer reverse of HF [out, in] -> ggml
-    // [in, out]. Graph mul_mat (enc.proj) and host matvecs (joint.*) both pin
-    // that ordered layout; embed/LSTM keep the reversed GGUF dims even though
-    // the flat host buffer is still HF row-major.
+    // [in, out]. Both device graph mul_mat and the CPU scalar oracle pin that
+    // ordered layout; embed/LSTM keep the reversed GGUF dims even though the
+    // CPU oracle's flat host buffer is still HF row-major.
     push(
         "enc.proj.weight",
         TensorBindingDescriptorRequirement::ExactDims(vec![hidden, joint]),
@@ -791,8 +791,9 @@ mod tests {
     }
 
     /// Ordered ExactDims must reject HF [out, in] orientation that Rank2EitherDims
-    /// used to admit. Covers graph (enc.proj) and host-consumed (joint.out / LSTM)
-    /// tails so a pack cannot ship the wrong dim order.
+    /// used to admit. Covers enc.proj plus the predictor/joint tensors consumed
+    /// by both the CPU oracle and accelerated graphs, so a pack cannot ship the
+    /// wrong dim order.
     #[test]
     fn rejects_transposed_tdt_tail_weights() {
         let metadata = tiny_execution_metadata();

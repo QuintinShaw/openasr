@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod decoder;
+pub(crate) mod device_head_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod encoder_ops;
 pub(crate) mod encoder_reference;

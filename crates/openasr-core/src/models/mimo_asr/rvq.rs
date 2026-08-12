@@ -1,7 +1,8 @@
 //! RVQ (residual vector quantization) encode over the first 8 packed
-//! codebooks -- a pure host-side computation (mirrors `firered_llm::adapter_graph`'s
-//! precedent: small, runs once per utterance, not per decode step, so a ggml
-//! graph would be plumbing for no benefit).
+//! codebooks. CPU keeps the scalar f32 implementation as the exact numerical
+//! oracle. Accelerated execution builds the same sequential residual loop in
+//! the audio-tokenizer ggml graph, so the large hidden rows and codebooks never
+//! round-trip through host memory.
 //!
 //! Reference (`quantization.py::EuclideanCodebook.quantize` /
 //! `ResidualVectorQuantization.encode`, P2.0 findings SS2): for each of the 8
@@ -13,7 +14,10 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuTensor, GgufTensorDataReadError,
+    GgufTensorDataReader,
+};
 
 use super::runtime_contract::MimoAudiotokMetadata;
 use super::tensor_names::audiotok_codebook_name;
@@ -34,6 +38,106 @@ pub(crate) enum MimoRvqError {
         d_model: usize,
         values_len: usize,
     },
+    #[error(
+        "mimo-asr RVQ codebook shape is invalid: vocab_size={vocab_size} d_model={d_model} values_len={values_len}"
+    )]
+    InvalidCodebookShape {
+        vocab_size: usize,
+        d_model: usize,
+        values_len: usize,
+    },
+    #[error(
+        "mimo-asr RVQ code tensor layout is invalid: frame_count={frame_count} channels={channels} values_len={values_len}"
+    )]
+    InvalidCodeLayout {
+        frame_count: usize,
+        channels: usize,
+        values_len: usize,
+    },
+    #[error("mimo-asr RVQ graph construction failed at '{step}': {source}")]
+    GraphBuildFailed {
+        step: &'static str,
+        #[source]
+        source: GgmlCpuGraphError,
+    },
+}
+
+fn graph_err(step: &'static str, source: GgmlCpuGraphError) -> MimoRvqError {
+    MimoRvqError::GraphBuildFailed { step, source }
+}
+
+/// Compact channel-major `[channel][frame]` RVQ ids. This is the only payload
+/// copied from the audio-tokenizer device graph back to the host before the
+/// input-local graph uploads it again; the f32 hidden rows and both large table
+/// families remain device-resident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MimoRvqCodes {
+    frame_count: usize,
+    channels: usize,
+    values: Vec<i32>,
+}
+
+impl MimoRvqCodes {
+    pub(crate) fn from_channel_major(
+        frame_count: usize,
+        channels: usize,
+        values: Vec<i32>,
+    ) -> Result<Self, MimoRvqError> {
+        if values.len() != frame_count.saturating_mul(channels)
+            || values.iter().any(|&value| value < 0)
+        {
+            return Err(MimoRvqError::InvalidCodeLayout {
+                frame_count,
+                channels,
+                values_len: values.len(),
+            });
+        }
+        Ok(Self {
+            frame_count,
+            channels,
+            values,
+        })
+    }
+
+    pub(crate) const fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    pub(crate) const fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub(crate) fn values(&self) -> &[i32] {
+        &self.values
+    }
+
+    pub(crate) fn code(&self, frame: usize, channel: usize) -> Option<u32> {
+        if frame >= self.frame_count || channel >= self.channels {
+            return None;
+        }
+        u32::try_from(self.values[channel * self.frame_count + frame]).ok()
+    }
+
+    pub(crate) fn truncate_frames(&mut self, frame_count: usize) -> Result<(), MimoRvqError> {
+        if frame_count > self.frame_count {
+            return Err(MimoRvqError::InvalidCodeLayout {
+                frame_count,
+                channels: self.channels,
+                values_len: self.values.len(),
+            });
+        }
+        if frame_count == self.frame_count {
+            return Ok(());
+        }
+        let mut truncated = Vec::with_capacity(frame_count.saturating_mul(self.channels));
+        for channel in 0..self.channels {
+            let start = channel * self.frame_count;
+            truncated.extend_from_slice(&self.values[start..start + frame_count]);
+        }
+        self.frame_count = frame_count;
+        self.values = truncated;
+        Ok(())
+    }
 }
 
 pub(crate) struct MimoRvqCodebooks {
@@ -88,6 +192,27 @@ impl MimoRvqCodebooks {
         bytes.add_vec(&self.vocab_sizes, "mimo-asr RVQ vocabulary sizes")?;
         Ok(bytes.finish())
     }
+
+    /// Peak temporary host allocation used by the accelerated constructor to
+    /// derive one norm vector at a time. The full codebooks themselves stay in
+    /// their native GGUF storage and are not retained as host f32 tables.
+    pub(crate) fn quoted_device_construction_peak_system_memory_bytes(
+        metadata: &MimoAudiotokMetadata,
+    ) -> Result<u64, String> {
+        let largest_vocab = metadata.codebook_sizes.iter().copied().max().unwrap_or(0) as usize;
+        let values = largest_vocab
+            .checked_mul(metadata.d_model)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "mimo-asr device RVQ construction quote overflowed".to_string())?;
+        let norms = largest_vocab
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "mimo-asr device RVQ norm quote overflowed".to_string())?;
+        let peak = values
+            .checked_add(norms)
+            .ok_or_else(|| "mimo-asr device RVQ construction quote overflowed".to_string())?;
+        u64::try_from(peak)
+            .map_err(|_| "mimo-asr device RVQ construction quote exceeds u64".to_string())
+    }
 }
 
 pub(crate) fn load_mimo_rvq_codebooks_from_reader(
@@ -122,7 +247,7 @@ pub(crate) fn encode_rvq_codes(
     codebooks: &MimoRvqCodebooks,
     hidden_rows: &[f32],
     frame_count: usize,
-) -> Result<Vec<Vec<u32>>, MimoRvqError> {
+) -> Result<MimoRvqCodes, MimoRvqError> {
     let d_model = codebooks.d_model;
     let expected_len = frame_count.saturating_mul(d_model);
     if hidden_rows.len() != expected_len {
@@ -133,21 +258,101 @@ pub(crate) fn encode_rvq_codes(
         });
     }
     let rvq_packed = codebooks.levels.len();
-    let mut codes = vec![vec![0u32; rvq_packed]; frame_count];
+    let mut codes = vec![0_i32; frame_count.saturating_mul(rvq_packed)];
     let mut residual = vec![0.0_f32; d_model];
     for frame_idx in 0..frame_count {
         residual.copy_from_slice(&hidden_rows[frame_idx * d_model..(frame_idx + 1) * d_model]);
-        for (level, code_slot) in codes[frame_idx].iter_mut().enumerate() {
+        for level in 0..rvq_packed {
             let table = &codebooks.levels[level];
             let vocab_size = codebooks.vocab_sizes[level];
             let (best_idx, best_row) = nearest_code(&residual, table, vocab_size, d_model);
-            *code_slot = best_idx as u32;
+            codes[level * frame_count + frame_idx] = best_idx as i32;
             for (r, c) in residual.iter_mut().zip(best_row.iter()) {
                 *r -= *c;
             }
         }
     }
-    Ok(codes)
+    MimoRvqCodes::from_channel_major(frame_count, rvq_packed, codes)
+}
+
+/// Per-codebook squared row norms used by both the scalar oracle's distance
+/// identity and the accelerated graph's broadcast subtraction.
+pub(crate) fn codebook_row_norm_sq(
+    table: &[f32],
+    vocab_size: usize,
+    d_model: usize,
+) -> Result<Vec<f32>, MimoRvqError> {
+    if table.len() != vocab_size.saturating_mul(d_model) {
+        return Err(MimoRvqError::InvalidCodebookShape {
+            vocab_size,
+            d_model,
+            values_len: table.len(),
+        });
+    }
+    Ok(table
+        .chunks_exact(d_model)
+        .map(|row| row.iter().map(|value| value * value).sum())
+        .collect())
+}
+
+/// Build the sequential device RVQ loop. `hidden` is `[d_model, frames]`;
+/// each level is `(codebook[d_model,vocab], row_norm_sq[vocab])`. The output
+/// is one contiguous i32 tensor `[frames, levels]`, whose physical order is
+/// channel-major and can be uploaded directly to the device-side speech-table
+/// lookup graph.
+pub(crate) fn build_rvq_codes_graph<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    hidden: GgmlCpuTensor<'a>,
+    levels: &[(GgmlCpuTensor<'a>, GgmlCpuTensor<'a>)],
+    frame_count: usize,
+) -> Result<GgmlCpuTensor<'a>, MimoRvqError> {
+    if levels.is_empty() || frame_count == 0 {
+        return Err(MimoRvqError::InvalidCodeLayout {
+            frame_count,
+            channels: levels.len(),
+            values_len: 0,
+        });
+    }
+    let mut residual = hidden;
+    let mut packed_codes = None;
+    for &(codebook, norm_sq) in levels {
+        let dot = graph
+            .mul_mat(codebook, residual)
+            .map_err(|source| graph_err("rvq_dot", source))?;
+        let doubled = graph
+            .scale(dot, 2.0)
+            .map_err(|source| graph_err("rvq_double_dot", source))?;
+        let scores = graph
+            .sub(doubled, norm_sq)
+            .map_err(|source| graph_err("rvq_distance_scores", source))?;
+        // ggml backends may choose different indices for an exact score tie.
+        // Real codebooks do not contain duplicate rows; CPU remains the exact
+        // first-max oracle and the real-pack CPU/Metal bridge gate catches any
+        // numerically meaningful decision drift.
+        let indices = graph
+            .top1_argmax(scores)
+            .map_err(|source| graph_err("rvq_argmax", source))?;
+        let selected = graph
+            .get_rows(codebook, indices)
+            .map_err(|source| graph_err("rvq_select", source))?;
+        residual = graph
+            .sub(residual, selected)
+            .map_err(|source| graph_err("rvq_residual", source))?;
+        let indices = graph
+            .reshape_2d(indices, frame_count, 1)
+            .map_err(|source| graph_err("rvq_codes_row", source))?;
+        packed_codes = Some(match packed_codes {
+            Some(previous) => graph
+                .concat(previous, indices, 1)
+                .map_err(|source| graph_err("rvq_codes_concat", source))?,
+            None => indices,
+        });
+    }
+    packed_codes.ok_or(MimoRvqError::InvalidCodeLayout {
+        frame_count,
+        channels: 0,
+        values_len: 0,
+    })
 }
 
 /// `argmax_v(2 * x.dot(C[v]) - ||C[v]||^2)` -- mathematically equivalent to
@@ -185,6 +390,7 @@ fn nearest_code<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 
     fn toy_codebooks() -> MimoRvqCodebooks {
         // d_model=2, 2 packed levels, vocab 2 each.
@@ -213,8 +419,10 @@ mod tests {
         // level1 picks code0=(0.5,0) [closer to (0.4,0.1) than (0,0.5)].
         let hidden = vec![1.4_f32, 0.1];
         let codes = encode_rvq_codes(&codebooks, &hidden, 1).expect("encode");
-        assert_eq!(codes.len(), 1);
-        assert_eq!(codes[0], vec![0, 0]);
+        assert_eq!(codes.frame_count(), 1);
+        assert_eq!(codes.channels(), 2);
+        assert_eq!(codes.code(0, 0), Some(0));
+        assert_eq!(codes.code(0, 1), Some(0));
     }
 
     #[test]
@@ -222,5 +430,60 @@ mod tests {
         let codebooks = toy_codebooks();
         let error = encode_rvq_codes(&codebooks, &[1.0, 2.0, 3.0], 2).expect_err("must fail");
         assert!(matches!(error, MimoRvqError::InvalidHiddenRowsShape { .. }));
+    }
+
+    #[test]
+    fn device_rvq_graph_matches_scalar_sequential_oracle() {
+        let codebooks = toy_codebooks();
+        let hidden = vec![1.4_f32, 0.1, 0.1, 1.4];
+        let expected = encode_rvq_codes(&codebooks, &hidden, 2).expect("scalar RVQ");
+
+        let mut runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("CPU graph runner");
+        let mut graph = runner.start_graph();
+        let hidden_tensor = graph
+            .new_tensor_2d_f32(2, 2, "rvq_hidden")
+            .expect("hidden tensor");
+        graph.set_input(hidden_tensor).expect("hidden input");
+
+        let mut level_tensors = Vec::with_capacity(codebooks.levels.len());
+        let mut uploads = Vec::with_capacity(codebooks.levels.len());
+        for (level, table) in codebooks.levels.iter().enumerate() {
+            let vocab_size = codebooks.vocab_sizes[level];
+            let codebook = graph
+                .new_tensor_2d_f32(2, vocab_size, "rvq_codebook")
+                .expect("codebook tensor");
+            let norms = graph
+                .new_tensor_1d_f32(vocab_size, "rvq_norms")
+                .expect("norm tensor");
+            graph.set_input(codebook).expect("codebook input");
+            graph.set_input(norms).expect("norm input");
+            level_tensors.push((codebook, norms));
+            uploads.push((
+                codebook,
+                table,
+                norms,
+                codebook_row_norm_sq(table, vocab_size, 2).expect("row norms"),
+            ));
+        }
+
+        let codes =
+            build_rvq_codes_graph(&graph, hidden_tensor, &level_tensors, 2).expect("RVQ graph");
+        graph.set_output(codes).expect("RVQ graph output");
+        graph
+            .set_f32_slice(hidden_tensor, &hidden, "rvq_hidden")
+            .expect("hidden upload");
+        for (codebook, table, norms, norm_values) in uploads {
+            graph
+                .set_f32_slice(codebook, table, "rvq_codebook")
+                .expect("codebook upload");
+            graph
+                .set_f32_slice(norms, &norm_values, "rvq_norms")
+                .expect("norm upload");
+        }
+        let actual = graph
+            .compute_output_i32(codes, expected.values().len())
+            .expect("RVQ compute");
+        assert_eq!(actual, expected.values());
     }
 }

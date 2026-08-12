@@ -29,7 +29,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext, GgufRuntimeSourcePreflight,
+    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -39,7 +40,12 @@ use crate::nn::attn::{
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation, reshape_bias_4d,
 };
+#[cfg(test)]
 use crate::nn::encoder::build_relative_positional_encoding;
+use crate::nn::encoder::{
+    SinusoidalChannelLayout, build_sinusoidal_position_encoding_graph,
+    relative_position_inverse_timescales,
+};
 use crate::nn::ffn::{
     FeedForwardActivation, FeedForwardResidualSteps, apply_feed_forward_residual,
 };
@@ -104,6 +110,8 @@ fn conv_out_dim(input: usize, kernel: usize, stride: usize) -> Result<usize, Fir
 pub(crate) struct FireRedEncoderGraphRuntime {
     runner: GgmlCpuGraphRunner,
     _loaded: GgmlLoadedWeightContext,
+    relative_position_arena: GgmlStaticTensorArena,
+    relative_position_inverse_timescales: GgmlStaticTensor,
     weights: FireRedEncoderWeights,
     metadata: FireRedAedExecutionMetadata,
 }
@@ -150,9 +158,28 @@ impl FireRedEncoderGraphRuntime {
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers)?;
+        let mut relative_position_arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(1))
+            .map_err(|source| map_err("relative_position_arena", source))?;
+        let relative_position_inv = relative_position_arena
+            .new_tensor_2d_f32(
+                1,
+                metadata.d_model / 2,
+                "firered_relative_position_inverse_timescales",
+            )
+            .map_err(|source| map_err("relative_position_inverse_timescales", source))?;
+        relative_position_arena
+            .set_f32_slice(
+                relative_position_inv,
+                &relative_position_inverse_timescales(metadata.d_model),
+                "firered_relative_position_inverse_timescales",
+            )
+            .map_err(|source| map_err("upload_relative_position_inverse_timescales", source))?;
         Ok(Self {
             runner,
             _loaded: loaded,
+            relative_position_arena,
+            relative_position_inverse_timescales: relative_position_inv,
             weights,
             metadata,
         })
@@ -165,6 +192,8 @@ impl FireRedEncoderGraphRuntime {
     ) -> Result<FireRedEncoderOutput, FireRedEncoderError> {
         encode_firered_aed_audio_embeddings(
             &mut self.runner,
+            self.relative_position_arena
+                .graph_tensor(self.relative_position_inverse_timescales),
             &self.weights,
             self.metadata,
             cmvn_features,
@@ -203,6 +232,7 @@ pub(crate) fn predicted_encoder_time_frames(n_frames: usize) -> Result<usize, Fi
 /// already-loaded runner/weights pair.
 fn encode_firered_aed_audio_embeddings(
     runner: &mut GgmlCpuGraphRunner,
+    relative_position_inverse_timescales: crate::ggml_runtime::GgmlCpuTensor<'_>,
     weights: &FireRedEncoderWeights,
     metadata: FireRedAedExecutionMetadata,
     cmvn_features: &[f32],
@@ -247,16 +277,28 @@ fn encode_firered_aed_audio_embeddings(
         .set_input(mel)
         .map_err(|source| map_err("ggml_set_input(mel)", source))?;
 
-    let positional_values =
-        build_relative_positional_encoding(metadata.d_model, frame_count, || {
-            FireRedEncoderError::ShapeOverflow
-        })?;
-    let pos_enc = graph
-        .new_tensor_2d_f32(metadata.d_model, 2 * frame_count - 1, "firered_enc_rel_pos")
-        .map_err(|source| map_err("ggml_new_tensor_2d(pos_enc)", source))?;
+    let relative_position_count = frame_count
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(FireRedEncoderError::ShapeOverflow)?;
+    let relative_positions = (0..relative_position_count)
+        .map(|index| (frame_count - 1) as f32 - index as f32)
+        .collect::<Vec<_>>();
+    let position = graph
+        .new_tensor_2d_f32(1, relative_position_count, "firered_enc_relative_positions")
+        .map_err(|source| map_err("ggml_new_tensor_2d(relative_positions)", source))?;
     graph
-        .set_input(pos_enc)
-        .map_err(|source| map_err("ggml_set_input(pos_enc)", source))?;
+        .set_input(position)
+        .map_err(|source| map_err("ggml_set_input(relative_positions)", source))?;
+    let pos_enc = build_sinusoidal_position_encoding_graph(
+        &graph,
+        relative_position_inverse_timescales,
+        position,
+        metadata.d_model / 2,
+        relative_position_count,
+        SinusoidalChannelLayout::Interleaved,
+    )
+    .map_err(|source| map_err("ggml_relative_position_encoding", source))?;
 
     // Additive self-attention key mask: 0.0 for valid (unpadded) key frames,
     // -inf for context-pad frames at/after `valid_frame_count`. Broadcasts
@@ -380,8 +422,12 @@ fn encode_firered_aed_audio_embeddings(
         .set_f32_slice(mel, &padded, "firered_enc_mel")
         .map_err(|source| map_err("ggml_set_f32_slice(mel)", source))?;
     graph
-        .set_f32_slice(pos_enc, &positional_values, "firered_enc_rel_pos")
-        .map_err(|source| map_err("ggml_set_f32_slice(pos_enc)", source))?;
+        .set_f32_slice(
+            position,
+            &relative_positions,
+            "firered_enc_relative_positions",
+        )
+        .map_err(|source| map_err("ggml_set_f32_slice(relative_positions)", source))?;
     graph
         .set_f32_slice(key_mask, &key_mask_values, "firered_enc_key_mask")
         .map_err(|source| map_err("ggml_set_f32_slice(key_mask)", source))?;

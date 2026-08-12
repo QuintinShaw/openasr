@@ -374,7 +374,10 @@ fn dolphin_decoder_parity() {
 #[test]
 #[ignore = "requires local Dolphin full.safetensors + hotword_parity.py golden under tmp/publish (not committed)"]
 fn dolphin_hotword_context_parity() {
-    use super::hotword_context::{apply_hotword_deep_biasing, encode_hotword_context_embeddings};
+    use super::hotword_context::{
+        CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME, apply_hotword_deep_biasing,
+        encode_hotword_context_embeddings, encode_hotword_context_embeddings_ggml,
+    };
 
     let Some(root) = root() else {
         return;
@@ -405,6 +408,23 @@ fn dolphin_hotword_context_parity() {
     assert!(
         ctx_max < 1.0e-3,
         "context_emb max abs diff {ctx_max:.3e} exceeds the 1e-3 parity bound"
+    );
+    let vocab_size = weights
+        .get(CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME)
+        .expect("hotword embedding")
+        .len()
+        / 768;
+    let graph_context = encode_hotword_context_embeddings_ggml(
+        &weights,
+        &hotword_token_ids,
+        vocab_size,
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("CPU graph context emb");
+    let (graph_ctx_max, _) = diff(&graph_context, &golden_ctx);
+    assert!(
+        graph_ctx_max < 1.0e-3,
+        "CPU graph context_emb max abs diff {graph_ctx_max:.3e} exceeds the 1e-3 parity bound"
     );
 
     let (enc_shape, encoder_out_unbiased) =
@@ -439,4 +459,46 @@ fn dolphin_hotword_context_parity() {
         bias_max < 1.0e-3,
         "biased encoder_out max abs diff {bias_max:.3e} exceeds the 1e-3 parity bound"
     );
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let telemetry = crate::ggml_runtime::GgmlExecutionTelemetryCollector::new();
+        let guard = telemetry.install();
+        let metal_context = encode_hotword_context_embeddings_ggml(
+            &weights,
+            &hotword_token_ids,
+            vocab_size,
+            GgmlCpuGraphBackend::Metal,
+        )
+        .expect("Metal graph context emb");
+        let metal_biased = apply_hotword_deep_biasing(
+            &weights,
+            &encoder_out_unbiased,
+            frames,
+            &metal_context,
+            GgmlCpuGraphBackend::Metal,
+        )
+        .expect("Metal hotword fusion");
+        drop(guard);
+        let (metal_ctx_max, _) = diff(&metal_context, &golden_ctx);
+        let (metal_bias_max, _) = diff(&metal_biased, &golden_biased);
+        assert!(
+            metal_ctx_max < 5.0e-3,
+            "Metal context_emb max abs diff {metal_ctx_max:.3e} exceeds 5e-3"
+        );
+        assert!(
+            metal_bias_max < 1.0e-2,
+            "Metal biased encoder_out max abs diff {metal_bias_max:.3e} exceeds 1e-2"
+        );
+        let summary = telemetry.snapshot();
+        assert!(
+            !summary.observed_compute_nodes_by_backend.is_empty()
+                && summary
+                    .observed_compute_nodes_by_backend
+                    .keys()
+                    .all(|backend| backend.starts_with("MTL") || backend.contains("Metal")),
+            "Dolphin hotword neural compute escaped Metal: {:?}",
+            summary.observed_compute_nodes_by_backend
+        );
+    }
 }

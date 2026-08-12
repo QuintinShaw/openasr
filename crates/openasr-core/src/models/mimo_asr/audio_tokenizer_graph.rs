@@ -2,8 +2,10 @@
 //! -> 32 rope transformer layers (pre-LN, asymmetric qkv bias, plain GELU FFN)
 //! **with the layer-3 (idx 2) output added back onto the layer-32 (idx 31)
 //! output before the final LayerNorm** -> `down_sample(k2,s2,no bias)+gelu` ->
-//! `down_sample_norm`. Produces the 25Hz `[T, 1280]` hidden-state rows that
-//! [`super::rvq`] quantizes into 8 RVQ codebook indices per frame.
+//! `down_sample_norm`. CPU returns the 25Hz `[T, 1280]` hidden-state rows to
+//! the scalar RVQ oracle. Accelerated execution appends the sequential
+//! 8-level RVQ graph and returns only compact code ids, so neither the hidden
+//! rows nor full codebooks cross back to host memory.
 //!
 //! This is the P2.0 "blood lesson #1/#2" surface: the skip connection and the
 //! conv1/conv2 stride asymmetry are graph-shape facts, not weights -- get
@@ -25,10 +27,12 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::mel_frontend::MimoMelFeatures;
 use super::runtime_contract::MimoAudiotokMetadata;
+use super::rvq::{MimoRvqCodes, build_rvq_codes_graph, codebook_row_norm_sq};
 use super::tensor_names::{
     AUDIOTOK_CONV1_BIAS, AUDIOTOK_CONV1_WEIGHT, AUDIOTOK_CONV2_BIAS, AUDIOTOK_CONV2_WEIGHT,
     AUDIOTOK_DOWN_SAMPLE_NORM_BIAS, AUDIOTOK_DOWN_SAMPLE_NORM_WEIGHT, AUDIOTOK_DOWN_SAMPLE_WEIGHT,
-    AUDIOTOK_NORM_BIAS, AUDIOTOK_NORM_WEIGHT, mimo_audiotok_layer_tensor_names,
+    AUDIOTOK_NORM_BIAS, AUDIOTOK_NORM_WEIGHT, audiotok_codebook_name,
+    mimo_audiotok_layer_tensor_names,
 };
 
 const LAYER_NORM_EPSILON: f32 = 1.0e-5;
@@ -47,11 +51,17 @@ pub(crate) const MIMO_AUDIOTOK_N_MELS: usize = 128;
 pub(crate) const MIMO_AUDIOTOK_DOWN_SAMPLE_KERNEL: usize = 2;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MimoAudiotokEncoderOutput {
-    pub frame_count: usize,
-    pub d_model: usize,
-    /// Frame-major (`[frame][d_model]`) contiguous f32.
-    pub rows: Vec<f32>,
+pub(crate) enum MimoAudiotokEncoderOutput {
+    /// CPU exact-oracle path: frame-major `[frame][d_model]` f32 rows for the
+    /// scalar RVQ implementation.
+    HostHiddenRows {
+        frame_count: usize,
+        d_model: usize,
+        rows: Vec<f32>,
+    },
+    /// Accelerated path: encoder and sequential RVQ stayed in one graph; only
+    /// compact channel-major integer ids cross the stage boundary.
+    DeviceCodes(MimoRvqCodes),
 }
 
 #[derive(Debug, Error)]
@@ -114,6 +124,15 @@ struct LayerRuntime {
     ffn_down_bias: GgmlStaticTensor,
 }
 
+struct DeviceRvqLevelRuntime {
+    codebook: GgmlLoadedTensor,
+    norm_sq: GgmlStaticTensor,
+}
+
+struct DeviceRvqRuntime {
+    levels: Vec<DeviceRvqLevelRuntime>,
+}
+
 pub(crate) struct MimoAudiotokEncoderRuntime {
     metadata: MimoAudiotokMetadata,
     runner: GgmlCpuGraphRunner,
@@ -131,11 +150,13 @@ pub(crate) struct MimoAudiotokEncoderRuntime {
     down_sample_norm_weight: GgmlStaticTensor,
     down_sample_norm_bias: GgmlStaticTensor,
     layers: Vec<LayerRuntime>,
+    device_rvq: Option<DeviceRvqRuntime>,
 }
 
 impl MimoAudiotokEncoderRuntime {
     pub(crate) fn quoted_retained_system_memory_bytes(
         metadata: &MimoAudiotokMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<u64, String> {
         let metadata_bytes = metadata
             .codebook_sizes
@@ -146,8 +167,17 @@ impl MimoAudiotokEncoderRuntime {
             .n_layers
             .checked_mul(std::mem::size_of::<LayerRuntime>())
             .ok_or_else(|| "mimo-asr audio-tokenizer handle quote overflowed".to_string())?;
+        let device_rvq_bytes = if backend.is_gpu_class() {
+            metadata
+                .rvq_packed
+                .checked_mul(std::mem::size_of::<DeviceRvqLevelRuntime>())
+                .ok_or_else(|| "mimo-asr device RVQ handle quote overflowed".to_string())?
+        } else {
+            0
+        };
         let bytes = metadata_bytes
             .checked_add(layer_bytes)
+            .and_then(|bytes| bytes.checked_add(device_rvq_bytes))
             .ok_or_else(|| "mimo-asr audio-tokenizer retained quote overflowed".to_string())?;
         u64::try_from(bytes).map_err(|_| "mimo-asr audio-tokenizer quote exceeds u64".to_string())
     }
@@ -162,6 +192,9 @@ impl MimoAudiotokEncoderRuntime {
         // contexts are admitted by their constructors and intentionally do not
         // belong to this Rust-container accounting.
         bytes.add_vec(&self.layers, "mimo-asr audio-tokenizer layer handles")?;
+        if let Some(device_rvq) = &self.device_rvq {
+            bytes.add_vec(&device_rvq.levels, "mimo-asr device RVQ handles")?;
+        }
         Ok(bytes.finish())
     }
 }
@@ -172,8 +205,27 @@ impl MimoAudiotokEncoderRuntime {
         metadata: MimoAudiotokMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoAudiotokEncoderError> {
+        Self::new_from_preflight_with_rvq_fusion(preflight, metadata, backend, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_from_preflight_without_rvq_fusion_for_test(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        metadata: MimoAudiotokMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, MimoAudiotokEncoderError> {
+        Self::new_from_preflight_with_rvq_fusion(preflight, metadata, backend, false)
+    }
+
+    fn new_from_preflight_with_rvq_fusion(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        metadata: MimoAudiotokMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        enable_rvq_fusion: bool,
+    ) -> Result<Self, MimoAudiotokEncoderError> {
         let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
         config.set_graph_node_capacity(config.graph_size);
+        let device_rvq_enabled = enable_rvq_fusion && config.backend.is_gpu_class();
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| build_err("runner_init", source))?;
         // Zero-copy binding for the big 2-D attn/ffn matmul weights (mmap'd,
@@ -194,7 +246,12 @@ impl MimoAudiotokEncoderRuntime {
                     reason: format!("build_runtime_tensor_reader_from_preflight: {error}"),
                 })?;
         let arena_tensor_capacity = FIXED_STATIC_TENSOR_COUNT
-            .saturating_add(metadata.n_layers.saturating_mul(STATIC_TENSORS_PER_LAYER));
+            .saturating_add(metadata.n_layers.saturating_mul(STATIC_TENSORS_PER_LAYER))
+            .saturating_add(if device_rvq_enabled {
+                metadata.rvq_packed
+            } else {
+                0
+            });
         let mut arena = runner
             .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
                 arena_tensor_capacity,
@@ -267,6 +324,18 @@ impl MimoAudiotokEncoderRuntime {
                 ffn_down_bias: new_vector(&arena, d_model, "audiotok_ffn_down_b")?,
             });
         }
+        let device_rvq = if device_rvq_enabled {
+            let mut levels = Vec::with_capacity(metadata.rvq_packed);
+            for (level, &vocab_size) in metadata.codebook_sizes.iter().enumerate() {
+                levels.push(DeviceRvqLevelRuntime {
+                    codebook: bind(&loaded_weights, &audiotok_codebook_name(level))?,
+                    norm_sq: new_vector(&arena, vocab_size as usize, "audiotok_rvq_norm_sq")?,
+                });
+            }
+            Some(DeviceRvqRuntime { levels })
+        } else {
+            None
+        };
 
         let k = metadata.conv_kernel_size as u64;
         let dm = d_model as u64;
@@ -388,6 +457,27 @@ impl MimoAudiotokEncoderRuntime {
                 &[dm],
             )?;
         }
+        if let Some(device_rvq) = &device_rvq {
+            for (level, runtime) in device_rvq.levels.iter().enumerate() {
+                let vocab_size = metadata.codebook_sizes[level] as usize;
+                let name = audiotok_codebook_name(level);
+                let values = reader
+                    .host_tensor_f32_copy_dequantized_by_name(
+                        &name,
+                        &[d_model as u64, vocab_size as u64],
+                    )
+                    .map_err(|source| MimoAudiotokEncoderError::TensorRead { name, source })?;
+                let norm_sq =
+                    codebook_row_norm_sq(&values, vocab_size, d_model).map_err(|error| {
+                        MimoAudiotokEncoderError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
+                arena
+                    .set_f32_slice(runtime.norm_sq, &norm_sq, "audiotok_rvq_norm_sq")
+                    .map_err(|source| build_err("audiotok_rvq_norm_sq", source))?;
+            }
+        }
 
         Ok(Self {
             metadata,
@@ -405,13 +495,15 @@ impl MimoAudiotokEncoderRuntime {
             down_sample_norm_weight,
             down_sample_norm_bias,
             layers,
+            device_rvq,
         })
     }
 
     /// `mel`: `[n_mels][n_frames]` mel-major features from
     /// [`super::mel_frontend::mimo_mel_features_from_samples`]. Returns the
-    /// down-sampled (25Hz) `[frame][d_model]` hidden-state rows the RVQ
-    /// encoder quantizes.
+    /// down-sampled (25Hz) hidden-state rows. CPU returns those rows for the
+    /// scalar exact-oracle RVQ; accelerated execution appends RVQ to this graph
+    /// and returns only compact integer codes.
     pub(crate) fn encode(
         &mut self,
         mel: &MimoMelFeatures,
@@ -627,11 +719,32 @@ impl MimoAudiotokEncoderRuntime {
             build_err,
         )?;
 
+        let device_codes = self
+            .device_rvq
+            .as_ref()
+            .map(|runtime| {
+                let levels = runtime
+                    .levels
+                    .iter()
+                    .map(|level| {
+                        (
+                            level.codebook.as_graph_tensor(),
+                            self.arena.graph_tensor(level.norm_sq),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                build_rvq_codes_graph(&graph, down, &levels, down_frame_count)
+            })
+            .transpose()
+            .map_err(|error| MimoAudiotokEncoderError::GraphExecutionFailed {
+                reason: error.to_string(),
+            })?;
+        let output = device_codes.unwrap_or(down);
         graph
-            .set_output(down)
+            .set_output(output)
             .map_err(|source| build_err("audiotok_output", source))?;
         graph
-            .prepare_outputs_for_upload(&[down])
+            .prepare_outputs_for_upload(&[output])
             .map_err(|source| build_err("audiotok_prepare_outputs", source))?;
 
         graph
@@ -642,19 +755,41 @@ impl MimoAudiotokEncoderRuntime {
             .set_i32_slice(positions, &position_values, "audiotok_positions")
             .map_err(|source| build_err("audiotok_positions_upload", source))?;
 
-        let total = d_model
-            .checked_mul(down_frame_count)
-            .ok_or(MimoAudiotokEncoderError::ShapeOverflow)?;
-        let rows = graph.compute_output_f32(down, total).map_err(|error| {
-            MimoAudiotokEncoderError::GraphExecutionFailed {
+        if device_codes.is_some() {
+            let total = self
+                .metadata
+                .rvq_packed
+                .checked_mul(down_frame_count)
+                .ok_or(MimoAudiotokEncoderError::ShapeOverflow)?;
+            let values = graph.compute_output_i32(output, total).map_err(|error| {
+                MimoAudiotokEncoderError::GraphExecutionFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+            let codes = MimoRvqCodes::from_channel_major(
+                down_frame_count,
+                self.metadata.rvq_packed,
+                values,
+            )
+            .map_err(|error| MimoAudiotokEncoderError::GraphExecutionFailed {
                 reason: error.to_string(),
-            }
-        })?;
-        Ok(MimoAudiotokEncoderOutput {
-            frame_count: down_frame_count,
-            d_model,
-            rows,
-        })
+            })?;
+            Ok(MimoAudiotokEncoderOutput::DeviceCodes(codes))
+        } else {
+            let total = d_model
+                .checked_mul(down_frame_count)
+                .ok_or(MimoAudiotokEncoderError::ShapeOverflow)?;
+            let rows = graph.compute_output_f32(down, total).map_err(|error| {
+                MimoAudiotokEncoderError::GraphExecutionFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+            Ok(MimoAudiotokEncoderOutput::HostHiddenRows {
+                frame_count: down_frame_count,
+                d_model,
+                rows,
+            })
+        }
     }
 
     pub(crate) fn release_transient_compute_memory(

@@ -528,6 +528,7 @@ where
 /// `rel_shift` view consumes. Pure math, no model-specific state -- generic
 /// over the caller's error `E` (via `overflow_err`) like every other `nn/`
 /// builder, so no family's error type leaks into another's.
+#[cfg(test)]
 pub(crate) fn build_relative_positional_encoding<E>(
     d_model: usize,
     frame_count: usize,
@@ -551,6 +552,61 @@ pub(crate) fn build_relative_positional_encoding<E>(
         }
     }
     Ok(values)
+}
+
+/// Channel layout used by the two sinusoidal encodings in the native ASR
+/// families. Transformer-XL relative attention alternates sin/cos channels,
+/// while the Qwen/SenseVoice absolute table stores all sin channels before all
+/// cos channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SinusoidalChannelLayout {
+    Interleaved,
+    HalfSplit,
+}
+
+/// Build a sinusoidal position table inside the active ggml graph. The caller
+/// supplies a resident `[1, half]` inverse-timescale tensor and a per-request
+/// `[1, positions]` position tensor. This keeps the model math (outer product,
+/// sin, cos, and channel packing) on the selected execution backend while the
+/// host only uploads the small position vector.
+pub(crate) fn build_sinusoidal_position_encoding_graph<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    inverse_timescales: GgmlCpuTensor<'a>,
+    positions: GgmlCpuTensor<'a>,
+    half: usize,
+    position_count: usize,
+    layout: SinusoidalChannelLayout,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    let angles = graph.mul_mat(inverse_timescales, positions)?;
+    let sin = graph.sin(angles)?;
+    let cos = graph.cos(angles)?;
+    match layout {
+        SinusoidalChannelLayout::HalfSplit => graph.concat(sin, cos, 0),
+        SinusoidalChannelLayout::Interleaved => {
+            let sin = graph.reshape_3d(sin, 1, half, position_count)?;
+            let cos = graph.reshape_3d(cos, 1, half, position_count)?;
+            let packed = graph.concat(sin, cos, 0)?;
+            graph.reshape_2d(packed, half.saturating_mul(2), position_count)
+        }
+    }
+}
+
+/// Inverse timescales for the Transformer-XL interleaved relative-position
+/// table: `10000^(-2j/d_model)` for `j in 0..d_model/2`.
+pub(crate) fn relative_position_inverse_timescales(d_model: usize) -> Vec<f32> {
+    (0..d_model / 2)
+        .map(|index| 10000.0_f32.powf(-(2.0 * index as f32) / d_model as f32))
+        .collect()
+}
+
+/// Inverse timescales for the half-split absolute table used by Qwen audio and
+/// SenseVoice: `exp(-ln(10000) * j / max(half-1, 1))`.
+pub(crate) fn half_split_position_inverse_timescales(d_model: usize) -> Vec<f32> {
+    let half = d_model / 2;
+    let log_inc = 10000.0_f32.ln() / half.saturating_sub(1).max(1) as f32;
+    (0..half)
+        .map(|index| (-log_inc * index as f32).exp())
+        .collect()
 }
 
 /// Scalar/shape knobs for one standard pre-norm Transformer encoder block
@@ -1209,6 +1265,82 @@ mod tests {
                 assert!(
                     diff < 1e-4,
                     "row {row_idx} col {col}: actual={actual} expected={expected_value} diff={diff}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn device_sinusoidal_position_graph_matches_host_oracles_for_both_layouts() {
+        const D_MODEL: usize = 8;
+        const HALF: usize = D_MODEL / 2;
+        const FRAMES: usize = 3;
+        let relative_count = 2 * FRAMES - 1;
+        let relative_positions = (0..relative_count)
+            .map(|index| (FRAMES - 1) as f32 - index as f32)
+            .collect::<Vec<_>>();
+        let absolute_positions = (0..relative_count)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+
+        for (layout, inverse, positions, expected) in [
+            (
+                SinusoidalChannelLayout::Interleaved,
+                relative_position_inverse_timescales(D_MODEL),
+                relative_positions,
+                build_relative_positional_encoding(D_MODEL, FRAMES, || "overflow").unwrap(),
+            ),
+            (
+                SinusoidalChannelLayout::HalfSplit,
+                half_split_position_inverse_timescales(D_MODEL),
+                absolute_positions.clone(),
+                absolute_positions
+                    .iter()
+                    .flat_map(|position| {
+                        let inverse = half_split_position_inverse_timescales(D_MODEL);
+                        inverse
+                            .iter()
+                            .map(|value| (position * value).sin())
+                            .chain(inverse.iter().map(|value| (position * value).cos()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            ),
+        ] {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("runner");
+            let mut graph = runner.start_graph();
+            let inverse_tensor = graph
+                .new_tensor_2d_f32(1, HALF, "sinusoidal_inverse")
+                .expect("inverse tensor");
+            let position_tensor = graph
+                .new_tensor_2d_f32(1, relative_count, "sinusoidal_positions")
+                .expect("position tensor");
+            graph.set_input(inverse_tensor).expect("inverse input");
+            graph.set_input(position_tensor).expect("position input");
+            let output = build_sinusoidal_position_encoding_graph(
+                &graph,
+                inverse_tensor,
+                position_tensor,
+                HALF,
+                relative_count,
+                layout,
+            )
+            .expect("sinusoidal graph");
+            graph.set_output(output).expect("output");
+            graph
+                .set_f32_slice(inverse_tensor, &inverse, "sinusoidal_inverse")
+                .expect("inverse upload");
+            graph
+                .set_f32_slice(position_tensor, &positions, "sinusoidal_positions")
+                .expect("position upload");
+            let actual = graph
+                .compute_output_f32(output, expected.len())
+                .expect("compute");
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-5,
+                    "layout={layout:?} index={index} actual={actual} expected={expected}"
                 );
             }
         }

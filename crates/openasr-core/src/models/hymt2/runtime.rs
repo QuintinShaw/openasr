@@ -325,6 +325,7 @@ impl Hymt2RuntimeSession {
                 preflight,
                 rms_norm_epsilon: metadata.rms_norm_epsilon,
                 fused_logits_head,
+                token_embedding: None,
                 backend,
             },
         )

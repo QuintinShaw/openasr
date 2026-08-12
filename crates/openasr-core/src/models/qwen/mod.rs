@@ -86,7 +86,8 @@ pub(crate) use prepared_runtime::{
     Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError, build_qwen_prepared_runtime,
 };
 pub(crate) use prompt_embedding::{
-    Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrPromptEmbeddings, Qwen3AsrPromptTokenInput,
+    build_qwen3_prompt_embeddings_with_audio_positions,
 };
 pub(crate) use token_embedding::load_qwen3_token_embedding_table_from_reader;
 pub(crate) use tokenizer::Qwen3AsrTokenizer;

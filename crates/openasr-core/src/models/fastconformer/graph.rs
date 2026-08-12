@@ -24,8 +24,9 @@ use crate::nn::conv::{
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d,
 };
 use crate::nn::encoder::{
-    ConformerBlockConfig, ConformerBlockWeights, build_relative_positional_encoding,
-    conformer_block,
+    ConformerBlockConfig, ConformerBlockWeights, SinusoidalChannelLayout,
+    build_sinusoidal_position_encoding_graph, conformer_block,
+    relative_position_inverse_timescales,
 };
 use crate::nn::half::f32_to_f16_bits;
 
@@ -347,6 +348,7 @@ pub(crate) struct FastConformerEncoderCore {
     #[allow(dead_code)]
     pub(crate) loaded_weights: Option<GgmlLoadedWeightContext>,
     pub(crate) arena: GgmlStaticTensorArena,
+    pub(crate) relative_position_inverse_timescales: GgmlStaticTensor,
     pub(crate) sub: SubsamplingArena,
     pub(crate) layers: Vec<LayerArena>,
 }
@@ -361,6 +363,7 @@ impl FastConformerEncoderCore {
     pub(crate) fn build<E, T>(
         graph_config: GgmlCpuGraphConfig,
         tail_static_tensor_count: usize,
+        d_model: usize,
         runtime_preflight: &GgufRuntimeSourcePreflight,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
@@ -376,6 +379,7 @@ impl FastConformerEncoderCore {
         Self::build_impl(
             graph_config,
             tail_static_tensor_count,
+            d_model,
             RuntimeWeightSource::Verified(runtime_preflight),
             subsampling,
             layers,
@@ -390,6 +394,7 @@ impl FastConformerEncoderCore {
     pub(crate) fn build_synthetic<E, T>(
         graph_config: GgmlCpuGraphConfig,
         tail_static_tensor_count: usize,
+        d_model: usize,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
         declare_tail: impl FnOnce(
@@ -404,6 +409,7 @@ impl FastConformerEncoderCore {
         Self::build_impl(
             graph_config,
             tail_static_tensor_count,
+            d_model,
             RuntimeWeightSource::Synthetic,
             subsampling,
             layers,
@@ -416,6 +422,7 @@ impl FastConformerEncoderCore {
     fn build_impl<E, T>(
         mut graph_config: GgmlCpuGraphConfig,
         tail_static_tensor_count: usize,
+        d_model: usize,
         runtime_source: RuntimeWeightSource<'_>,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
@@ -454,12 +461,18 @@ impl FastConformerEncoderCore {
             RuntimeWeightSource::Synthetic => None,
         };
         let loaded = loaded_weights.as_ref();
-        // The arena holds 11 subsampling tensors, 24 tensors per Conformer
-        // layer, and the family tail supplied by the caller. Bulk linears are
-        // mmap-backed `WeightSlot::Loaded` values and do not consume arena
-        // metadata. Size this context from that exact contract instead of
-        // duplicating the runner's historical flat 768 MiB reservation.
-        let arena_tensor_capacity = 11usize
+        if d_model == 0 || !d_model.is_multiple_of(2) {
+            return Err(E::shape(format!(
+                "FastConformer hidden size must be positive and even, got {d_model}"
+            )));
+        }
+        // The arena holds one resident inverse-timescale tensor, 11
+        // subsampling tensors, 24 tensors per Conformer layer, and the family
+        // tail supplied by the caller. Bulk linears are mmap-backed
+        // `WeightSlot::Loaded` values and do not consume arena metadata. Size
+        // this context from that exact contract instead of duplicating the
+        // runner's historical flat 768 MiB reservation.
+        let arena_tensor_capacity = 12usize
             .saturating_add(layers.len().saturating_mul(24))
             .saturating_add(tail_static_tensor_count);
         let mut arena = runner
@@ -469,6 +482,15 @@ impl FastConformerEncoderCore {
             .map_err(|source| E::graph_build_failed("static_tensor_arena", source))?;
 
         // ----- declare (allocate) all arena tensors first (first upload freezes) -----
+        let relative_position_inverse_timescales_t = arena
+            .new_tensor_2d_f32(
+                1,
+                d_model / 2,
+                "fastconformer_relative_position_inv_timescales",
+            )
+            .map_err(|source| {
+                E::graph_build_failed("relative_position_inverse_timescales", source)
+            })?;
         let s = |n: &str| find_sub::<E>(subsampling, n);
         let conv0_w_t = alloc_static(&arena, s("enc.sub.layers.0.weight")?, "sub0_w")?;
         let conv0_b_t = alloc_static(&arena, s("enc.sub.layers.0.bias")?, "sub0_b")?;
@@ -492,6 +514,15 @@ impl FastConformerEncoderCore {
         let tail = declare_tail(&arena, loaded)?;
 
         // ----- upload all values (arena now freezes on first set) -----
+        arena
+            .set_f32_slice(
+                relative_position_inverse_timescales_t,
+                &relative_position_inverse_timescales(d_model),
+                "upload_fastconformer_relative_position_inv_timescales",
+            )
+            .map_err(|source| {
+                E::graph_build_failed("upload_relative_position_inverse_timescales", source)
+            })?;
         upload_static(
             &mut arena,
             conv0_w_t,
@@ -544,6 +575,7 @@ impl FastConformerEncoderCore {
                 runner,
                 loaded_weights,
                 arena,
+                relative_position_inverse_timescales: relative_position_inverse_timescales_t,
                 sub: SubsamplingArena {
                     conv0_w: conv0_w_t,
                     conv0_b: conv0_b_t,
@@ -581,13 +613,13 @@ pub(crate) struct FastConformerStackConfig {
 }
 
 /// Output of the shared subsampling + conformer stack: the last block's
-/// output tensor (`state`, pre-tail), the mel/positional input tensors (for
+/// output tensor (`state`, pre-tail), the mel/position input tensors (for
 /// the caller to upload after building its own tail), and the frame count.
 pub(crate) struct FastConformerStackOutput<'a> {
     pub state: GgmlCpuTensor<'a>,
     pub mel_t: GgmlCpuTensor<'a>,
-    pub pos_t: GgmlCpuTensor<'a>,
-    pub positional: Vec<f32>,
+    pub positions_t: GgmlCpuTensor<'a>,
+    pub positions: Vec<f32>,
     pub subsampled_frames: usize,
 }
 
@@ -611,8 +643,8 @@ pub(crate) fn require_mel_n_mels_matches_metadata(
 /// linear + optional `scale_input` + the conformer layer loop (the shared
 /// `nn::encoder::conformer_block`). The caller builds its own tail from
 /// `state`, then must call `graph.set_output`, `prepare_outputs_for_upload`,
-/// and upload `mel_t`/`pos_t` (via [`upload_graph_f32`] with
-/// `output.positional`) before computing -- mirroring the ordering the two
+/// and upload `mel_t`/`positions_t` (via [`upload_graph_f32`] with
+/// `output.positions`) before computing -- mirroring the ordering the two
 /// families' `encode()` used before this was shared.
 ///
 /// `expected_n_mels` is the pack metadata geometry; `n_mels` is the runtime
@@ -621,6 +653,7 @@ pub(crate) fn require_mel_n_mels_matches_metadata(
 pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     arena: &'a GgmlStaticTensorArena,
+    relative_position_inverse_timescales: GgmlStaticTensor,
     sub: &SubsamplingArena,
     layers: &[LayerArena],
     config: FastConformerStackConfig,
@@ -631,21 +664,39 @@ pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
     pos_tensor_name: &'static str,
 ) -> Result<FastConformerStackOutput<'a>, E> {
     require_mel_n_mels_matches_metadata(n_mels, expected_n_mels).map_err(E::shape)?;
+    if n_frames == 0 {
+        return Err(E::shape(
+            "FastConformer requires at least one mel frame".to_string(),
+        ));
+    }
     let d_model = config.hidden_size;
     let subsampled_frames = conv_out_dim(conv_out_dim(conv_out_dim(n_frames)));
     let subsampled_freq = conv_out_dim(conv_out_dim(conv_out_dim(n_mels)));
-    let positional = build_relative_positional_encoding(d_model, subsampled_frames, || {
-        E::shape("relative positional encoding shape overflow".to_string())
-    })?;
+    let relative_position_count = subsampled_frames
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| E::shape("relative positional encoding shape overflow".to_string()))?;
+    let positions = (0..relative_position_count)
+        .map(|index| (subsampled_frames - 1) as f32 - index as f32)
+        .collect::<Vec<_>>();
 
     let mel_t = graph
         .new_tensor_2d_f32(n_mels, n_frames, mel_tensor_name)
         .map_err(bf("new_mel"))?;
-    let pos_t = graph
-        .new_tensor_2d_f32(d_model, positional.len() / d_model, pos_tensor_name)
+    let positions_t = graph
+        .new_tensor_2d_f32(1, relative_position_count, pos_tensor_name)
         .map_err(bf("new_pos"))?;
     graph.set_input(mel_t).map_err(bf("set_input_mel"))?;
-    graph.set_input(pos_t).map_err(bf("set_input_pos"))?;
+    graph.set_input(positions_t).map_err(bf("set_input_pos"))?;
+    let pos_enc = build_sinusoidal_position_encoding_graph(
+        graph,
+        arena.graph_tensor(relative_position_inverse_timescales),
+        positions_t,
+        d_model / 2,
+        relative_position_count,
+        SinusoidalChannelLayout::Interleaved,
+    )
+    .map_err(bf("build_relative_position_encoding"))?;
 
     let conv_map = |step, source| E::graph_build_failed(step, source);
     let stride2 = Conv2dParams {
@@ -813,7 +864,6 @@ pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
         rel_shift_nb2: (2 * frame - 1) * frame * element,
         rel_shift_offset: (frame - 1) * element,
     };
-    let pos_enc = pos_t;
     for handles in layers {
         let weights = conformer_weights(arena, handles);
         let block = conformer_block(graph, state, pos_enc, block_config, weights, conv_map)?;
@@ -823,8 +873,8 @@ pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
     Ok(FastConformerStackOutput {
         state,
         mel_t,
-        pos_t,
-        positional,
+        positions_t,
+        positions,
         subsampled_frames,
     })
 }

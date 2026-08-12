@@ -192,7 +192,6 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
                 decoder_state: job.decoder_state,
                 backend: job.backend,
             },
-            false,
             &job.runtime_preflight,
             None,
         )
@@ -205,7 +204,6 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             job.prepared_runtime.metadata,
             job.decoder_state,
             job.backend,
-            false,
             &job.runtime_preflight,
             n_seq,
             None,
@@ -1024,7 +1022,6 @@ mod tests {
         let encoder_output_1 = sample_encoder_output(metadata, 0.25, 32);
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1093,7 +1090,6 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1242,7 +1238,6 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1333,7 +1328,6 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1433,7 +1427,6 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
-            false,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,

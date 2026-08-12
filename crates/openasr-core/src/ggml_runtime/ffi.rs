@@ -15,6 +15,7 @@ pub(crate) type GgufContextRaw = *mut c_void;
 pub(crate) const GGML_MAX_DIMS: usize = 4;
 pub(crate) const GGML_PREC_DEFAULT: c_int = 0;
 pub(crate) const GGML_PREC_F32: c_int = 10;
+pub(crate) const GGML_OP_POOL_MAX: c_int = 0;
 
 pub(crate) type GgmlToFloatFn = unsafe extern "C" fn(x: *const c_void, y: *mut f32, k: i64);
 
@@ -435,6 +436,7 @@ unsafe extern "C" {
         op_offload: bool,
     ) -> GgmlBackendSchedRaw;
     pub(crate) fn ggml_backend_sched_free(sched: GgmlBackendSchedRaw);
+    pub(crate) fn ggml_backend_sched_reset(sched: GgmlBackendSchedRaw);
     pub(crate) fn ggml_backend_sched_get_tensor_backend(
         sched: GgmlBackendSchedRaw,
         node: GgmlTensorRaw,
@@ -649,7 +651,10 @@ unsafe extern "C" {
     ) -> GgmlTensorRaw;
     pub(crate) fn ggml_sqr(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_sqrt(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_abs(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_log(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_sin(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_cos(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_leaky_relu(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
@@ -844,7 +849,26 @@ unsafe extern "C" {
         p0: c_int,
         d0: c_int,
     ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_pool_1d(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        op: c_int,
+        k0: c_int,
+        s0: c_int,
+        p0: c_int,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_conv_2d(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        b: GgmlTensorRaw,
+        s0: c_int,
+        s1: c_int,
+        p0: c_int,
+        p1: c_int,
+        d0: c_int,
+        d1: c_int,
+    ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_conv_2d_direct(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
         b: GgmlTensorRaw,

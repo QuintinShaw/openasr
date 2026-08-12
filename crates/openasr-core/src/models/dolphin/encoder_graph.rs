@@ -183,10 +183,10 @@ pub(crate) trait DolphinWeightProvider {
     /// provider keeps in f32.
     fn tensor(&self, name: &str) -> Option<&[f32]>;
 
-    /// Native (quantized / f16) block bytes of a rank-2 `.weight` matmul operand,
-    /// when the provider keeps it quantized. Default `None` means every tensor is
-    /// served as f32 (the raw-safetensors parity provider), so the graph binds
-    /// f32xf32 and stays bit-exact.
+    /// Native (quantized / f16) block bytes of a rank-2 graph operand (matmul or
+    /// embedding lookup), when the provider keeps it quantized. Default `None`
+    /// means every tensor is served as f32 (the raw-safetensors parity provider),
+    /// so the graph binds f32 and stays bit-exact.
     fn native_weight(&self, _name: &str) -> Option<DolphinNativeWeight<'_>> {
         None
     }
@@ -472,11 +472,10 @@ enum PendingUpload<'p> {
 /// Allocates every encoder weight into the runtime's persistent
 /// [`GgmlStaticTensorArena`] (a `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` backend
 /// buffer) rather than as per-call transient graph leaves. This is what lets the
-/// ggml multi-backend scheduler offload the encoder's matmuls to an accelerator:
-/// the scheduler only considers an op for `op_offload` when its weight `src`
-/// lives in a WEIGHTS-usage buffer, which the old per-call graph-input weights
-/// were not, so the whole E-Branchformer (the FLOPs-heavy stage) was pinned to
-/// the CPU even under an explicit Metal backend. Mirrors the sibling
+/// selected accelerator backend keep the encoder's matmuls device-resident:
+/// its weight `src` must live in a WEIGHTS-usage buffer. The old per-call graph
+/// inputs did not, so the whole E-Branchformer (the FLOPs-heavy stage) was
+/// pinned to CPU even under an explicit Metal backend. Mirrors the sibling
 /// `decoder_graph::StaticWeightBuilder` and `sensevoice::SenseVoiceEncoderGraph`
 /// exactly: allocate every tensor first (the arena's first upload freezes
 /// further creation), then upload once. Weight placement changes no value the
@@ -1333,9 +1332,9 @@ impl DolphinEncoderRuntime {
         let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
         // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
         // encoder weight here -- instead of the per-call transient graph leaves the
-        // pre-arena encoder used -- is what lets the ggml multi-backend scheduler
-        // offload the E-Branchformer's matmuls to an accelerator (see
-        // `WeightBuilder`). The arena is an owned value carrying a raw pointer
+        // pre-arena encoder used -- is what lets the selected accelerator keep
+        // the E-Branchformer's matmuls device-resident (see `WeightBuilder`).
+        // The arena is an owned value carrying a raw pointer
         // into the runner's backend, so it and the per-call graphs (a
         // `&mut runner` borrow) coexist; `runner` outlives it.
         let arena = runner

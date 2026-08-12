@@ -6,7 +6,8 @@
 //! NeMo dw_striding: regular conv0+ReLU, depthwise conv2, pointwise conv3+ReLU,
 //! depthwise conv5, pointwise conv6+ReLU), so the #1 frame-count risk is borrowed
 //! from a proven impl. The conformer layers reuse `nn::encoder::conformer_block`
-//! and the rel-pos table reuses `nn::encoder::build_relative_positional_encoding`;
+//! and the rel-pos table is generated on the selected backend from a resident
+//! inverse-timescale tensor plus per-request position indices;
 //! the shared arena/subsampling/conformer-loop skeleton is
 //! `models::fastconformer`, which `parakeet_tdt` builds on identically save
 //! for its tail (joint encoder projection instead of a CTC head).
@@ -94,6 +95,7 @@ impl ParakeetCtcEncoderGraph {
         let (core, (ctc_head_weight, ctc_head_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_CTC_TAIL_STATIC_TENSORS,
+            metadata.hidden_size,
             runtime_preflight,
             &weights.subsampling,
             &weights.layers,
@@ -126,6 +128,7 @@ impl ParakeetCtcEncoderGraph {
         let stack = fastconformer::build_conformer_stack::<ParakeetEncoderError>(
             &mut graph,
             &self.core.arena,
+            self.core.relative_position_inverse_timescales,
             &self.core.sub,
             &self.core.layers,
             FastConformerStackConfig {
@@ -187,7 +190,12 @@ impl ParakeetCtcEncoderGraph {
                 source,
             })?;
         fastconformer::upload_graph_f32(&mut graph, stack.mel_t, &mel.data, "upload_mel")?;
-        fastconformer::upload_graph_f32(&mut graph, stack.pos_t, &stack.positional, "upload_pos")?;
+        fastconformer::upload_graph_f32(
+            &mut graph,
+            stack.positions_t,
+            &stack.positions,
+            "upload_positions",
+        )?;
 
         let want = metadata
             .vocab_size

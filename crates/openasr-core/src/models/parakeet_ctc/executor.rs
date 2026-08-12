@@ -732,4 +732,106 @@ mod tests {
             "WER {wer:.3} too high; hypothesis: {hypothesis:?}"
         );
     }
+
+    /// Product-level acceptance for the shared FastConformer device path:
+    /// explicit Metal must preserve the CPU transcript/timestamps and every
+    /// observed graph compute node must stay on the selected Metal device.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "host-local: needs OPENASR_PARAKEET_CTC_PACK and Metal"]
+    fn explicit_metal_fastconformer_matches_cpu_transcript_and_uses_only_metal() {
+        let Some(pack) =
+            std::env::var_os("OPENASR_PARAKEET_CTC_PACK").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipping: OPENASR_PARAKEET_CTC_PACK is not set");
+            return;
+        };
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("fixtures/jfk.wav");
+        let samples = read_wav_mono_16k(&clip).expect("wav");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("validate runtime source");
+        let preflight = load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .expect("preflight");
+        let transcribe = |backend| {
+            transcribe_parakeet_ctc_pcm_cached(
+                &new_parakeet_ctc_runtime_pool(),
+                &samples,
+                &preflight,
+                None,
+                true,
+                backend,
+                None,
+            )
+            .expect("transcribe")
+        };
+
+        let cpu = transcribe(GgmlCpuGraphBackend::Cpu);
+        let telemetry = crate::GgmlExecutionTelemetryCollector::new();
+        let _telemetry_guard = telemetry.install();
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let candidate = crate::device::execution_policy::ExecutionCandidate {
+            device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                route: crate::device::execution_route::ResolvedExecutionRoute {
+                    provider: crate::device::execution_route::ExecutionProvider::Metal,
+                    stable_id: "MTL0".to_string(),
+                    registry_ordinal: 0,
+                    kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+                    addressability:
+                        crate::device::execution_route::DeviceAddressability::NotExactlyAddressable {
+                            reason: "Metal uses the system default device",
+                        },
+                },
+                ggml_kind: crate::ggml_runtime::GgmlBackendKind::Gpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        };
+        let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
+            services.as_ref(),
+            &candidate,
+            || Ok::<_, String>(transcribe(GgmlCpuGraphBackend::Metal)),
+        );
+        assert!(
+            attempt.candidate_failure.is_none(),
+            "explicit Metal attempt failed placement: {:?}",
+            attempt.candidate_failure
+        );
+        let metal = attempt.result.expect("Metal candidate operation");
+        assert_eq!(metal.text, cpu.text);
+        assert_eq!(metal.words.len(), cpu.words.len());
+        let mut max_confidence_drift = 0.0_f32;
+        for (metal_word, cpu_word) in metal.words.iter().zip(&cpu.words) {
+            assert_eq!(metal_word.word, cpu_word.word);
+            assert_eq!(metal_word.start, cpu_word.start);
+            assert_eq!(metal_word.end, cpu_word.end);
+            match (metal_word.confidence, cpu_word.confidence) {
+                (Some(metal), Some(cpu)) => {
+                    max_confidence_drift = max_confidence_drift.max((metal - cpu).abs());
+                }
+                (None, None) => {}
+                pair => panic!("CPU/Metal confidence presence drifted: {pair:?}"),
+            }
+        }
+        assert!(
+            max_confidence_drift <= 0.001,
+            "CPU/Metal confidence drift {max_confidence_drift} exceeded 0.001"
+        );
+
+        let observed = telemetry.snapshot();
+        assert!(
+            !observed.observed_compute_nodes_by_backend.is_empty()
+                && observed
+                    .observed_compute_nodes_by_backend
+                    .keys()
+                    .all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.starts_with("mtl") || backend.contains("metal")
+                    }),
+            "explicit Metal Parakeet-CTC observed non-Metal compute: {:?}",
+            observed.observed_compute_nodes_by_backend
+        );
+    }
 }

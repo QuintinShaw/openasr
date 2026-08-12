@@ -2,8 +2,9 @@
 //! encoder stack (the shared `models::fastconformer::weights` skeleton --
 //! BatchNorm fold + zero-bias synthesis for the checkpoint's missing
 //! attn/conv/FFN biases -- `parakeet_ctc::encoder_weights` also builds on),
-//! the encoder joint projection, and the host-side prediction-network /
-//! joint tensors (parakeet-tdt-only, no `parakeet_ctc` equivalent).
+//! the encoder joint projection, and the CPU oracle's prediction-network /
+//! joint tensors (parakeet-tdt-only, no `parakeet_ctc` equivalent). Accelerated
+//! execution binds those latter tensors directly from the verified pack.
 //!
 //! The v3 checkpoint has NO attention/conv/FFN biases (`attention_bias` /
 //! `convolution_bias` false), so the shared loader synthesizes zero biases
@@ -63,9 +64,8 @@ pub(crate) struct ParakeetTdtEncoderWeights {
     pub enc_proj_bias: NamedTensor,
 }
 
-/// Host-side prediction network + joint weights (consumed by the per-symbol
-/// greedy loop on the CPU, mirroring the xasr decoder/joiner split: these are
-/// per-step matvecs, not ggml graph matmuls).
+/// CPU-oracle prediction network weights. Accelerated execution never builds
+/// this host-f32 representation; it binds the verified pack tensors directly.
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetTdtPredictorWeights {
     /// Token embedding, row-major `[vocab][pred_hidden]` (the blank row is

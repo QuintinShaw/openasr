@@ -163,15 +163,6 @@ impl PyannetModel {
         Ok((self.recurrent_classifier(&feat, frames)?, frames))
     }
 
-    /// Host SincNet boundary shared by the CPU and Metal implementations.
-    /// The returned payload is channel-major `[60, frames]`.
-    pub(super) fn sincnet_features(
-        &self,
-        samples: &[f32],
-    ) -> Result<(Vec<f32>, usize), WeightsError> {
-        self.sincnet(samples)
-    }
-
     /// Recurrent stack plus classifier on row-major `[frames, 60]` features.
     pub(super) fn recurrent_classifier(
         &self,

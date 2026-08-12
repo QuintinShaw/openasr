@@ -9,7 +9,7 @@ use super::audio_encoder::{
 };
 use super::batched_decode::{
     Qwen3AsrServeBatchConfig, Qwen3AsrServeBatchEngineRegistry, Qwen3AsrServeBatchJob,
-    shutdown_qwen_serve_batch_engines, submit_qwen_serve_batch_job,
+    Qwen3AsrServeBatchPromptInput, shutdown_qwen_serve_batch_engines, submit_qwen_serve_batch_job,
 };
 #[cfg(test)]
 use super::decode_budget::QWEN3_DECODE_MIN_GENERATED_TOKENS;
@@ -25,7 +25,7 @@ use super::kv_cache::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrKvCacheCapacityError,
 };
-use super::llm_prefill::{Qwen3AsrLlmPrefillInputError, build_qwen3_llm_prefill_input};
+use super::llm_prefill::build_qwen3_llm_prefill_input;
 use super::llm_transformer::{Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan};
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::lora::{qwen_adapter_cache_fingerprint, resolve_qwen_lora_adapter};
@@ -33,7 +33,7 @@ use super::lora::{qwen_adapter_cache_fingerprint, resolve_qwen_lora_adapter};
 use super::prepared_runtime::Qwen3AsrPreparedRuntime;
 use super::prepared_runtime::Qwen3AsrPreparedRuntimeError;
 use super::prompt_embedding::{
-    Qwen3AsrPromptEmbeddingError, build_qwen3_prompt_embeddings_with_audio_splice,
+    Qwen3AsrPromptTokenInput, build_qwen3_prompt_embeddings_with_audio_positions,
 };
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
@@ -59,7 +59,6 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::lora_adapter::{
     ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle, resolved_lora_adapter,
 };
-use crate::models::mapped_token_embedding::MappedTokenEmbeddingError;
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
@@ -198,8 +197,6 @@ enum Qwen3AsrGgmlExecutorError {
     TokenEmbeddingPrefillFailed { reason: String },
     #[error("qwen3-asr prompt embedding assembly failed: {reason}")]
     PromptEmbeddingAssemblyFailed { reason: String },
-    #[error("qwen3-asr llm prefill input assembly failed: {reason}")]
-    LlmPrefillInputAssemblyFailed { reason: String },
     #[error("qwen3-asr greedy decode loop failed: {reason}")]
     GreedyDecodeFailed { reason: String },
     #[error("qwen3-asr decode token budget is unavailable: {reason}")]
@@ -371,6 +368,7 @@ impl Qwen3AsrGgmlExecutor {
                         &prepared_runtime.decoder_plan,
                         &preflight,
                         prepared_runtime.logits_head.fused_top1_spec(),
+                        prepared_runtime.token_embedding_table.device_graph_spec(),
                         adapter.as_ref().map(resolved_lora_adapter),
                         backend,
                     )
@@ -567,24 +565,19 @@ impl Qwen3AsrGgmlExecutor {
         )
         .map_err(map_decode_prompt_error)?;
         qwen_decode_profile_log_opt("decode_prompt", decode_prompt_started_at);
-        let token_embedding_started_at = qwen_decode_profile_start();
-        let token_rows = token_embedding_table
-            .gather_rows(&decode_prompt.token_ids)
-            .map_err(map_token_embedding_error)?;
-        qwen_decode_profile_log_opt("token_embedding_gather", token_embedding_started_at);
-        let prompt_embedding_started_at = qwen_decode_profile_start();
-        let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
-            &decode_prompt,
-            token_embedding_table.d_model(),
-            token_rows,
-            &audio_embeddings.rows,
-        )
-        .map_err(map_prompt_embedding_error)?;
-        qwen_decode_profile_log_opt("prompt_embedding_splice", prompt_embedding_started_at);
-        let llm_prefill_started_at = qwen_decode_profile_start();
-        let llm_prefill_input =
-            build_qwen3_llm_prefill_input(prompt_embeddings).map_err(map_llm_prefill_error)?;
-        qwen_decode_profile_log_opt("llm_prefill_input", llm_prefill_started_at);
+        let audio_pad_end = decode_prompt
+            .audio_pad_start_index
+            .checked_add(decode_prompt.audio_pad_count)
+            .ok_or_else(
+                || Qwen3AsrGgmlExecutorError::PromptEmbeddingAssemblyFailed {
+                    reason: "audio pad position overflowed".to_string(),
+                },
+            )?;
+        let prompt_token_input = Qwen3AsrPromptTokenInput {
+            token_ids: decode_prompt.token_ids.clone(),
+            audio_rows: audio_embeddings.rows,
+            audio_positions: (decode_prompt.audio_pad_start_index..audio_pad_end).collect(),
+        };
         if decoder_plan.layer_count() == 0 {
             return Err(Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
                 reason: "qwen3-asr runtime exposes zero llm layers; at least 1 is required"
@@ -694,7 +687,7 @@ impl Qwen3AsrGgmlExecutor {
                         super::batched_decode::Qwen3AsrServeBatchPreparedAssets::Admitted(
                             prepared_runtime_owner,
                         ),
-                    llm_prefill_input,
+                    prompt_input: Qwen3AsrServeBatchPromptInput::TokenIds(prompt_token_input),
                     kv_capacity,
                     decode_config: seq2seq_decode_config,
                     text_postprocess_kind: decode_policy.seq2seq_text_postprocess_kind,
@@ -795,7 +788,7 @@ impl Qwen3AsrGgmlExecutor {
                 let logits_head = Arc::clone(&state.logits_head);
                 let mut step_executor = Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     metadata,
-                    prefill_input: llm_prefill_input,
+                    prompt_input: Qwen3AsrRuntimePromptInput::TokenIds(prompt_token_input),
                     logits_head: logits_head.as_ref(),
                     logits_head_runtime: &mut state.logits_head_runtime,
                     token_embedding_table,
@@ -1106,12 +1099,6 @@ fn map_audio_encoder_error(error: Qwen3AsrAudioEncoderError) -> Qwen3AsrGgmlExec
     }
 }
 
-fn map_token_embedding_error(error: MappedTokenEmbeddingError) -> Qwen3AsrGgmlExecutorError {
-    Qwen3AsrGgmlExecutorError::TokenEmbeddingPrefillFailed {
-        reason: error.to_string(),
-    }
-}
-
 fn map_prepared_runtime_error(error: Qwen3AsrPreparedRuntimeError) -> Qwen3AsrGgmlExecutorError {
     match error {
         Qwen3AsrPreparedRuntimeError::RuntimeContractViolation { reason } => {
@@ -1148,18 +1135,6 @@ fn map_prepared_runtime_registry_error(
         other => Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
             reason: other.to_string(),
         },
-    }
-}
-
-fn map_prompt_embedding_error(error: Qwen3AsrPromptEmbeddingError) -> Qwen3AsrGgmlExecutorError {
-    Qwen3AsrGgmlExecutorError::PromptEmbeddingAssemblyFailed {
-        reason: error.to_string(),
-    }
-}
-
-fn map_llm_prefill_error(error: Qwen3AsrLlmPrefillInputError) -> Qwen3AsrGgmlExecutorError {
-    Qwen3AsrGgmlExecutorError::LlmPrefillInputAssemblyFailed {
-        reason: error.to_string(),
     }
 }
 
@@ -1223,9 +1198,23 @@ struct Qwen3AsrPrefillStepOutput {
     greedy_token_hint: Option<u32>,
 }
 
+enum Qwen3AsrRuntimePromptInput {
+    Host(super::llm_prefill::Qwen3AsrLlmPrefillInput),
+    TokenIds(Qwen3AsrPromptTokenInput),
+}
+
+impl Qwen3AsrRuntimePromptInput {
+    fn token_count(&self) -> usize {
+        match self {
+            Self::Host(input) => input.token_count,
+            Self::TokenIds(input) => input.token_ids.len(),
+        }
+    }
+}
+
 struct Qwen3AsrPrefillOnlyGreedyStepExecutor<'a> {
     metadata: Qwen3AsrExecutionMetadata,
-    prefill_input: super::llm_prefill::Qwen3AsrLlmPrefillInput,
+    prompt_input: Qwen3AsrRuntimePromptInput,
     logits_head: &'a Qwen3AsrLlmLogitsHead,
     logits_head_runtime: &'a mut Qwen3AsrLlmLogitsHeadRuntime,
     token_embedding_table: Arc<crate::models::mapped_token_embedding::MappedTokenEmbeddingTable>,
@@ -1302,15 +1291,15 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor<'
                 greedy_token_hint: Some(token_id),
             });
         }
-        let mut hidden = self
-            .gather_last_generated_token_hidden(input.generated_tokens)
+        let token_id = self
+            .last_generated_token_id(input.generated_tokens)
             .map_err(|error| {
                 crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 }
             })?;
-        hidden = self
-            .run_llm_layers_with_kv(hidden, cache_position)
+        let hidden = self
+            .run_llm_token_with_kv(token_id, cache_position)
             .map_err(|error| {
                 crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
@@ -1368,7 +1357,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         cache_position: usize,
     ) -> Result<Option<u32>, Qwen3AsrGreedyDecodeError> {
         if !self.fused_top1_hint_allowed
-            || !self.whole_decoder.supports_graph_reuse()
+            || !self.whole_decoder.supports_device_token_embedding()
             || !self.whole_decoder.supports_fused_top1()
         {
             return Ok(None);
@@ -1378,11 +1367,11 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                 reason: "qwen3-asr decoder has no layer KV caches".to_string(),
             });
         }
-        let hidden = self.gather_last_generated_token_hidden(generated_tokens)?;
+        let token_id = self.last_generated_token_id(generated_tokens)?;
         let step = self
             .whole_decoder
-            .run_step_reused_batched_top1(
-                &hidden,
+            .run_token_step_reused_batched_top1(
+                &[token_id],
                 &[cache_position],
                 1_000_000.0,
                 self.kv_capacity.resident_positions(),
@@ -1397,7 +1386,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         &mut self,
     ) -> Result<Qwen3AsrPrefillStepOutput, Qwen3AsrGreedyDecodeError> {
         let profile_started_at = qwen_decode_profile_start();
-        let token_count = self.prefill_input.token_count;
+        let token_count = self.prompt_input.token_count();
         if token_count == 0 {
             return Err(Qwen3AsrGreedyDecodeError::DecoderStepFailed {
                 reason: "qwen3-asr prefill token count is zero".to_string(),
@@ -1412,6 +1401,71 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                 ),
             });
         }
+        if let Qwen3AsrRuntimePromptInput::TokenIds(prompt) = &self.prompt_input
+            && let Some(final_hidden) = self
+                .whole_decoder
+                .run_token_prefill_auto_last_hidden(
+                    &prompt.token_ids,
+                    &prompt.audio_rows,
+                    &prompt.audio_positions,
+                    &self.layer_kv_caches,
+                    self.kv_capacity,
+                    1_000_000.0,
+                    &self.control,
+                )
+                .map_err(map_prefill_graph_error)?
+        {
+            self.cache_prompt_tokens = token_count;
+            qwen_decode_profile_log_opt("prefill_prompt_resident_token_ids", profile_started_at);
+            if self.fused_top1_hint_allowed
+                && let Some(token_id) = self
+                    .whole_decoder
+                    .fused_logits_top1_from_hidden(&final_hidden)
+                    .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                        reason: error.to_string(),
+                    })?
+            {
+                return Ok(Qwen3AsrPrefillStepOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
+            let logits = self
+                .logits_head_runtime
+                .compute_logits_for_last_hidden(self.logits_head, &final_hidden)
+                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: error.to_string(),
+                })?;
+            return Ok(Qwen3AsrPrefillStepOutput {
+                logits,
+                greedy_token_hint: None,
+            });
+        }
+        if let Qwen3AsrRuntimePromptInput::TokenIds(prompt) = &self.prompt_input {
+            let token_rows = self
+                .token_embedding_table
+                .gather_rows(&prompt.token_ids)
+                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: error.to_string(),
+                })?;
+            let embeddings = build_qwen3_prompt_embeddings_with_audio_positions(
+                prompt.token_ids.len(),
+                &prompt.audio_positions,
+                self.token_embedding_table.d_model(),
+                token_rows,
+                &prompt.audio_rows,
+            )
+            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?;
+            self.prompt_input = Qwen3AsrRuntimePromptInput::Host(
+                build_qwen3_llm_prefill_input(embeddings).map_err(|error| {
+                    Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                        reason: error.to_string(),
+                    }
+                })?,
+            );
+        }
         // Prefer the shared resident-KV bulk seed used by mimo/firered/moss.
         // On single-GPU backends (CUDA/Metal/HIP) this is one batched prefill
         // into the same arena `run_step_auto` will reuse for decode — avoiding
@@ -1419,10 +1473,11 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         // mix-up. Discrete-GPU wide steps fail closed to non-flash attention
         // inside the shared executor (see llm_prefill_uses_flash_attention).
         let resident_started_at = qwen_decode_profile_start();
+        let prefill_input = Self::host_prefill_input(&self.prompt_input)?;
         if let Some(final_hidden) = self
             .whole_decoder
             .run_prefill_auto_last_hidden(
-                &self.prefill_input.token_major_embeddings,
+                &prefill_input.token_major_embeddings,
                 token_count,
                 &self.layer_kv_caches,
                 self.kv_capacity,
@@ -1489,11 +1544,12 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         &mut self,
     ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
         let profile_started_at = qwen_decode_profile_start();
-        let token_count = self.prefill_input.token_count;
+        let prefill_input = Self::host_prefill_input(&self.prompt_input)?;
+        let token_count = prefill_input.token_count;
         let step = self
             .whole_decoder
             .run_prefill(
-                &self.prefill_input.token_major_embeddings,
+                &prefill_input.token_major_embeddings,
                 token_count,
                 1_000_000.0,
             )
@@ -1514,23 +1570,27 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                 reason: "qwen3-asr prefill chunk size is zero".to_string(),
             });
         }
-        let token_count = self.prefill_input.token_count;
+        let (token_count, hidden_size) = {
+            let prefill_input = Self::host_prefill_input(&self.prompt_input)?;
+            (prefill_input.token_count, prefill_input.hidden_size)
+        };
         if token_count <= chunk_size {
             let chunk_started_at = qwen_decode_profile_start();
-            let step = self
-                .whole_decoder
-                .run_prefill(
-                    &self.prefill_input.token_major_embeddings,
-                    token_count,
-                    1_000_000.0,
-                )
-                .map_err(map_prefill_graph_error)?;
+            let step = {
+                let prefill_input = Self::host_prefill_input(&self.prompt_input)?;
+                self.whole_decoder
+                    .run_prefill(
+                        &prefill_input.token_major_embeddings,
+                        token_count,
+                        1_000_000.0,
+                    )
+                    .map_err(map_prefill_graph_error)?
+            };
             qwen_decode_profile_log_prefill_chunk(0, token_count, chunk_started_at);
             let result = self.write_prefill_step_outputs_and_compute_last_logits(token_count, step);
             qwen_decode_profile_log_opt("prefill_prompt_chunked", profile_started_at);
             return result;
         }
-        let hidden_size = self.prefill_input.hidden_size;
         let require_even_chunks = self.whole_decoder.prefill_chunks_require_even_width();
         let mut position_offset = 0usize;
         let mut final_hidden = None;
@@ -1564,17 +1624,19 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                 }
             })?;
             let chunk_started_at = qwen_decode_profile_start();
-            let step = self
-                .whole_decoder
-                .run_prefill_chunk(
-                    &self.prefill_input.token_major_embeddings[hidden_start..hidden_end],
-                    chunk_len,
-                    position_offset,
-                    total_token_count,
-                    &self.layer_kv_caches,
-                    1_000_000.0,
-                )
-                .map_err(map_prefill_graph_error)?;
+            let step = {
+                let prefill_input = Self::host_prefill_input(&self.prompt_input)?;
+                self.whole_decoder
+                    .run_prefill_chunk(
+                        &prefill_input.token_major_embeddings[hidden_start..hidden_end],
+                        chunk_len,
+                        position_offset,
+                        total_token_count,
+                        &self.layer_kv_caches,
+                        1_000_000.0,
+                    )
+                    .map_err(map_prefill_graph_error)?
+            };
             qwen_decode_profile_log_prefill_chunk(position_offset, chunk_len, chunk_started_at);
             final_hidden =
                 Some(self.write_prefill_chunk_outputs(position_offset, chunk_len, step)?);
@@ -1661,7 +1723,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                     .map_err(|reason| Qwen3AsrGreedyDecodeError::DecoderStepFailed { reason })?;
             }
         }
-        let hidden_size = self.prefill_input.hidden_size;
+        let hidden_size = Self::host_prefill_input(&self.prompt_input)?.hidden_size;
         let final_hidden_start = token_count
             .checked_sub(1)
             .and_then(|position| position.checked_mul(hidden_size))
@@ -1681,6 +1743,19 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
             })?
             .to_vec();
         Ok(final_hidden)
+    }
+
+    fn host_prefill_input(
+        prompt_input: &Qwen3AsrRuntimePromptInput,
+    ) -> Result<&super::llm_prefill::Qwen3AsrLlmPrefillInput, Qwen3AsrGreedyDecodeError> {
+        match prompt_input {
+            Qwen3AsrRuntimePromptInput::Host(input) => Ok(input),
+            Qwen3AsrRuntimePromptInput::TokenIds(_) => {
+                Err(Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: "qwen3-asr host prefill input was not materialized".to_string(),
+                })
+            }
+        }
     }
 
     fn run_llm_layers_with_kv(
@@ -1746,20 +1821,67 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         Ok(step.hidden)
     }
 
-    fn gather_last_generated_token_hidden(
+    fn run_llm_token_with_kv(
+        &mut self,
+        token_id: u32,
+        cache_position: usize,
+    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
+        if self.whole_decoder.supports_device_token_embedding() {
+            let started_at = if qwen_decode_profile_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let step = self
+                .whole_decoder
+                .run_token_step_auto(
+                    token_id,
+                    cache_position,
+                    &self.layer_kv_caches,
+                    self.kv_capacity,
+                    1_000_000.0,
+                )
+                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: error.to_string(),
+                })?
+                .ok_or_else(|| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: "qwen device token embedding became unavailable".to_string(),
+                })?;
+            for (layer_index, (projected_k, projected_v)) in step.layer_kv.iter().enumerate() {
+                self.layer_kv_caches[layer_index]
+                    .write(cache_position, projected_k, projected_v)
+                    .map_err(|reason| Qwen3AsrGreedyDecodeError::DecoderStepFailed { reason })?;
+            }
+            if let Some(started_at) = started_at {
+                eprintln!(
+                    "openasr_qwen_decode_profile: cache_position={} layers={} total_us={} build_us={} compute_us={} input=token_ids",
+                    cache_position,
+                    step.layer_kv.len(),
+                    started_at.elapsed().as_micros(),
+                    step.build_micros,
+                    step.compute_micros,
+                );
+            }
+            return Ok(step.hidden);
+        }
+        let hidden = self
+            .token_embedding_table
+            .gather_rows(&[token_id])
+            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?;
+        self.run_llm_layers_with_kv(hidden, cache_position)
+    }
+
+    fn last_generated_token_id(
         &self,
         generated_tokens: &[u32],
-    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
-        let last_token = *generated_tokens.last().ok_or_else(|| {
+    ) -> Result<u32, Qwen3AsrGreedyDecodeError> {
+        generated_tokens.last().copied().ok_or_else(|| {
             Qwen3AsrGreedyDecodeError::DecoderStepFailed {
                 reason: "qwen3-asr generated token history is unexpectedly empty".to_string(),
             }
-        })?;
-        self.token_embedding_table
-            .gather_rows(&[last_token])
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            })
+        })
     }
 }
 

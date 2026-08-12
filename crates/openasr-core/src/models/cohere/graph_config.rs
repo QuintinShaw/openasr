@@ -3,13 +3,8 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphT
 use crate::models::graph_runtime_config::configure_model_runtime_graph_config;
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
-    gpu_stage_enabled_for_backend, has_explicit_thread_override,
+    has_explicit_thread_override,
 };
-
-const OPENASR_COHERE_ENABLE_ENCODER_METAL: &str = "OPENASR_COHERE_ENABLE_ENCODER_METAL";
-const OPENASR_COHERE_ENABLE_DECODER_METAL: &str = "OPENASR_COHERE_ENABLE_DECODER_METAL";
-const OPENASR_COHERE_ENABLE_ENCODER_GPU: &str = "OPENASR_COHERE_ENABLE_ENCODER_GPU";
-const OPENASR_COHERE_ENABLE_DECODER_GPU: &str = "OPENASR_COHERE_ENABLE_DECODER_GPU";
 
 pub(crate) fn cohere_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
@@ -26,9 +21,7 @@ pub(crate) fn cohere_decoder_graph_config(
     prefer_cpu_backend: bool,
 ) -> GgmlCpuGraphConfig {
     let mut config = cohere_runtime_graph_config(backend);
-    if config.backend.is_gpu_class()
-        && (!cohere_decoder_gpu_enabled(config.backend) || prefer_cpu_backend)
-    {
+    if config.backend.is_gpu_class() && prefer_cpu_backend {
         config.backend = GgmlCpuGraphBackend::Cpu;
         config.use_scheduler = false;
     }
@@ -44,41 +37,15 @@ pub(crate) fn cohere_decoder_graph_config(
 pub(crate) fn cohere_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     cohere_encoder_graph_config_with_overrides(
         cohere_runtime_graph_config(backend),
-        cohere_encoder_gpu_enabled,
         has_explicit_thread_override(),
-    )
-}
-
-fn cohere_encoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_COHERE_ENABLE_ENCODER_GPU,
-        true,
-        Some(OPENASR_COHERE_ENABLE_ENCODER_METAL),
-        true,
-    )
-}
-
-fn cohere_decoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_COHERE_ENABLE_DECODER_GPU,
-        true,
-        Some(OPENASR_COHERE_ENABLE_DECODER_METAL),
-        true,
     )
 }
 
 fn cohere_encoder_graph_config_with_overrides(
     mut base: GgmlCpuGraphConfig,
-    encoder_gpu_enabled: impl FnOnce(GgmlCpuGraphBackend) -> bool,
     has_explicit_thread_override: bool,
 ) -> GgmlCpuGraphConfig {
     base.graph_size = base.graph_size.max(16_384);
-    if base.backend.is_gpu_class() && !encoder_gpu_enabled(base.backend) {
-        base.backend = GgmlCpuGraphBackend::Cpu;
-        base.use_scheduler = false;
-    }
     if !has_explicit_thread_override {
         base.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             base.backend,
@@ -160,7 +127,6 @@ mod tests {
                 use_scheduler: true,
                 ..GgmlCpuGraphConfig::conservative_default()
             },
-            |_| true,
             false,
         );
 
@@ -168,19 +134,17 @@ mod tests {
     }
 
     #[test]
-    fn encoder_can_fallback_to_cpu_when_explicitly_disabled() {
+    fn encoder_preserves_the_resolved_generic_gpu_backend() {
         let config = cohere_encoder_graph_config_with_overrides(
             GgmlCpuGraphConfig {
-                backend: GgmlCpuGraphBackend::Metal,
+                backend: GgmlCpuGraphBackend::Gpu,
                 use_scheduler: true,
                 ..GgmlCpuGraphConfig::conservative_default()
             },
-            |_| false,
             false,
         );
 
-        assert!(matches!(config.backend, GgmlCpuGraphBackend::Cpu));
-        assert!(!config.use_scheduler);
+        assert!(matches!(config.backend, GgmlCpuGraphBackend::Gpu));
     }
 
     #[test]

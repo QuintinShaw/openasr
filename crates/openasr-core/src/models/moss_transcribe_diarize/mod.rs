@@ -44,6 +44,7 @@ mod graph_config;
 mod llm_decoder;
 pub(crate) mod package_import;
 mod prepared_runtime;
+#[cfg(test)]
 mod prompt_embedding;
 pub(crate) mod runtime_contract;
 pub(crate) mod speaker_segments;

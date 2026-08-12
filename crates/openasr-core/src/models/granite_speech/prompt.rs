@@ -172,6 +172,29 @@ pub(crate) fn build_audio_prompt_embeddings_from_mapped_table(
     )
 }
 
+/// Materialize an already-tokenized Granite prompt for the CPU/scheduler
+/// fallback. The accelerated resident-prefill path consumes the same token ids
+/// and audio rows directly on device instead of calling this helper.
+pub(crate) fn materialize_audio_prompt_embeddings_from_mapped_table(
+    config: &GraniteSpeechDecoderConfig,
+    table: &MappedTokenEmbeddingTable,
+    token_ids: &[u32],
+    audio_embeddings: &[f32],
+) -> Result<Vec<f32>, GraniteSpeechPromptError> {
+    materialize_audio_prompt_embeddings_with(
+        config,
+        token_ids,
+        audio_embeddings,
+        |text_token_ids| {
+            table.gather_rows(text_token_ids).map_err(|error| {
+                GraniteSpeechPromptError::MappedTokenEmbedding {
+                    reason: error.to_string(),
+                }
+            })
+        },
+    )
+}
+
 fn build_audio_prompt_embeddings_with(
     config: &GraniteSpeechDecoderConfig,
     tokenizer: &GraniteSpeechTokenizer,
@@ -191,6 +214,39 @@ fn build_audio_prompt_embeddings_with(
     }
 
     let token_ids = build_audio_prompt_token_ids(tokenizer, prompt_text, audio_token_count)?;
+    let embeddings = materialize_audio_prompt_embeddings_with(
+        config,
+        &token_ids,
+        audio_embeddings,
+        gather_text_rows,
+    )?;
+    Ok((token_ids, embeddings))
+}
+
+fn materialize_audio_prompt_embeddings_with(
+    config: &GraniteSpeechDecoderConfig,
+    token_ids: &[u32],
+    audio_embeddings: &[f32],
+    gather_text_rows: impl FnOnce(&[u32]) -> Result<Vec<f32>, GraniteSpeechPromptError>,
+) -> Result<Vec<f32>, GraniteSpeechPromptError> {
+    let audio_token_count = token_ids
+        .iter()
+        .filter(|&&token_id| token_id == GRANITE_SPEECH_AUDIO_TOKEN_ID)
+        .count();
+    let expected_audio_values = audio_token_count
+        .checked_mul(config.hidden_size)
+        .ok_or_else(|| GraniteSpeechPromptError::Shape {
+            reason: "granite prompt audio embedding size overflowed".to_string(),
+        })?;
+    if audio_embeddings.len() != expected_audio_values {
+        return Err(GraniteSpeechPromptError::Shape {
+            reason: format!(
+                "audio_embeddings has {} values, expected {audio_token_count}x{}",
+                audio_embeddings.len(),
+                config.hidden_size
+            ),
+        });
+    }
     let text_token_ids = token_ids
         .iter()
         .copied()
@@ -215,7 +271,7 @@ fn build_audio_prompt_embeddings_with(
     let mut embeddings = Vec::with_capacity(token_ids.len() * config.hidden_size);
     let mut next_audio_slot = 0usize;
     let mut next_text_slot = 0usize;
-    for &token_id in &token_ids {
+    for &token_id in token_ids {
         if token_id == GRANITE_SPEECH_AUDIO_TOKEN_ID {
             let start = next_audio_slot * config.hidden_size;
             embeddings.extend_from_slice(&audio_embeddings[start..start + config.hidden_size]);
@@ -227,7 +283,7 @@ fn build_audio_prompt_embeddings_with(
         }
     }
 
-    Ok((token_ids, embeddings))
+    Ok(embeddings)
 }
 
 #[cfg(test)]

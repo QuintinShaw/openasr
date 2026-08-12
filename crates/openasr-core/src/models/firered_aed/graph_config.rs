@@ -6,9 +6,9 @@
 //! for the CPU-only-era history). That parity is now verified end to end
 //! (CPU vs Metal transcripts match byte-for-byte on real packs), so this
 //! mirrors the cohere/moonshine template -- dynamic backend resolution via
-//! [`configure_model_runtime_graph_config_from_env`] (Metal auto-selected
-//! through the generic runtime-default resolver), with an explicit per-stage
-//! opt-out that falls back to CPU.
+//! [`configure_model_runtime_graph_config_from_env`] after execution policy
+//! has selected the request backend. Family graph configuration may tune
+//! scheduling and threading, but it must not replace that resolved backend.
 //!
 //! Note this is narrower than it may read: firered-aed's own executor never
 //! batches *multiple* longform slices into one graph call the way cohere's
@@ -30,16 +30,11 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphT
 use crate::models::graph_runtime_config::configure_model_runtime_graph_config;
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
-    gpu_stage_enabled_for_backend, has_explicit_thread_override,
+    has_explicit_thread_override,
 };
 
 const FIRERED_ENCODER_GRAPH_SIZE: usize = 32_768;
 const FIRERED_DECODER_GRAPH_SIZE: usize = 8192;
-
-const OPENASR_FIRERED_ENABLE_ENCODER_METAL: &str = "OPENASR_FIRERED_ENABLE_ENCODER_METAL";
-const OPENASR_FIRERED_ENABLE_DECODER_METAL: &str = "OPENASR_FIRERED_ENABLE_DECODER_METAL";
-const OPENASR_FIRERED_ENABLE_ENCODER_GPU: &str = "OPENASR_FIRERED_ENABLE_ENCODER_GPU";
-const OPENASR_FIRERED_ENABLE_DECODER_GPU: &str = "OPENASR_FIRERED_ENABLE_DECODER_GPU";
 
 /// Shared base for both stages: everything except the Metal scheduler
 /// default, which the encoder and decoder set independently (see
@@ -65,10 +60,10 @@ pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
     // hardcoded 512 MiB per cached encoder runtime (formerly held in the
     // thread-local cache that `executor.rs` replaced with admitted actors).
     //
-    // The encoder keeps the scheduler on for Metal: the conformer forward
-    // graph was built and parity-verified under multi-backend scheduling and
-    // has not been re-verified with the scheduler off. Only the decoder's
-    // `use_scheduler` default changed (see `firered_decoder_graph_config`).
+    // Preserve the scheduler as the family-local default for CPU/Auto graph
+    // construction. An active FullDevice candidate overrides it at the shared
+    // placement/runner boundary because ggml's scheduler requires a CPU
+    // fallback participant.
     let mut config = firered_runtime_graph_config_with_scheduler_default(backend, Some(true));
     config.graph_size = config.graph_size.max(FIRERED_ENCODER_GRAPH_SIZE);
     config.context_bytes = config
@@ -76,10 +71,6 @@ pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
         .max(GgmlCpuGraphConfig::metadata_context_bytes(
             config.graph_size,
         ));
-    if config.backend.is_gpu_class() && !firered_encoder_gpu_enabled(config.backend) {
-        config.backend = GgmlCpuGraphBackend::Cpu;
-        config.use_scheduler = false;
-    }
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -116,10 +107,6 @@ pub(crate) fn firered_decoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
         .max(GgmlCpuGraphConfig::metadata_context_bytes(
             config.graph_size,
         ));
-    if config.backend.is_gpu_class() && !firered_decoder_gpu_enabled(config.backend) {
-        config.backend = GgmlCpuGraphBackend::Cpu;
-        config.use_scheduler = false;
-    }
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -127,26 +114,6 @@ pub(crate) fn firered_decoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
         );
     }
     config
-}
-
-fn firered_encoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_FIRERED_ENABLE_ENCODER_GPU,
-        true,
-        Some(OPENASR_FIRERED_ENABLE_ENCODER_METAL),
-        true,
-    )
-}
-
-fn firered_decoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
-    gpu_stage_enabled_for_backend(
-        backend,
-        OPENASR_FIRERED_ENABLE_DECODER_GPU,
-        true,
-        Some(OPENASR_FIRERED_ENABLE_DECODER_METAL),
-        true,
-    )
 }
 
 /// Test-only mirror of [`firered_runtime_graph_config_with_scheduler_default`]
@@ -231,28 +198,22 @@ mod tests {
     }
 
     #[test]
-    fn encoder_gpu_defaults_to_unified_gpu_lane() {
-        assert!(firered_encoder_gpu_enabled(GgmlCpuGraphBackend::Gpu));
-    }
-
-    #[test]
-    fn decoder_gpu_defaults_to_unified_gpu_lane() {
-        assert!(firered_decoder_gpu_enabled(GgmlCpuGraphBackend::Gpu));
-    }
-
-    #[test]
-    fn encoder_and_decoder_gpu_keep_cpu_and_metal_defaults() {
-        assert!(firered_encoder_gpu_enabled(GgmlCpuGraphBackend::Cpu));
-        assert!(firered_encoder_gpu_enabled(GgmlCpuGraphBackend::Metal));
-        assert!(firered_decoder_gpu_enabled(GgmlCpuGraphBackend::Cpu));
-        assert!(firered_decoder_gpu_enabled(GgmlCpuGraphBackend::Metal));
-    }
-
-    #[test]
     fn encoder_graph_size_floor_is_preserved() {
         assert!(
             firered_encoder_graph_config(GgmlCpuGraphBackend::Cpu).graph_size
                 >= FIRERED_ENCODER_GRAPH_SIZE
+        );
+    }
+
+    #[test]
+    fn encoder_and_decoder_preserve_the_resolved_metal_backend() {
+        assert_eq!(
+            firered_encoder_graph_config(GgmlCpuGraphBackend::Metal).backend,
+            GgmlCpuGraphBackend::Metal
+        );
+        assert_eq!(
+            firered_decoder_graph_config(GgmlCpuGraphBackend::Metal).backend,
+            GgmlCpuGraphBackend::Metal
         );
     }
 

@@ -55,7 +55,7 @@ use crate::models::system_memory_owner::{
 };
 use crate::{NativeAsrSession, SENSEVOICE_GGML_ADAPTER_ID};
 
-use super::encoder_graph::{SenseVoiceEncoderGraph, build_sensevoice_encoder_input};
+use super::encoder_graph::SenseVoiceEncoderGraph;
 use super::encoder_weights::{load_sensevoice_encoder_weights, plan_sensevoice_system_memory};
 use super::frontend::{SenseVoiceFbankFrontend, apply_cmvn, apply_lfr};
 use super::graph_config::sensevoice_encoder_graph_config;
@@ -101,8 +101,6 @@ struct SenseVoicePreparedRuntime {
     metadata: SenseVoiceExecutionMetadata,
     tokenizer: SenseVoiceTokenizer,
     graph: SenseVoiceEncoderGraph,
-    /// 16x560 prompt-embedding rows (host f32).
-    prompt_embed: Vec<f32>,
     cmvn_neg_mean: Vec<f32>,
     cmvn_inv_stddev: Vec<f32>,
 }
@@ -110,7 +108,6 @@ struct SenseVoicePreparedRuntime {
 impl SenseVoicePreparedRuntime {
     fn retained_system_memory_bytes(&self) -> Result<u64, String> {
         let mut direct = crate::models::system_memory_owner::SystemMemoryCapacity::default();
-        direct.add_vec(&self.prompt_embed, "sensevoice prompt embedding clone")?;
         direct.add_vec(&self.cmvn_neg_mean, "sensevoice CMVN mean clone")?;
         direct.add_vec(&self.cmvn_inv_stddev, "sensevoice CMVN stddev clone")?;
         checked_sum(
@@ -145,7 +142,6 @@ fn materialize_sensevoice_prepared_runtime(
     let tokenizer = SenseVoiceTokenizer::from_metadata(gguf_metadata)?;
     let weights = load_sensevoice_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_sensevoice_block_stack(metadata, weights.enc_layers.len())?;
-    let prompt_embed = weights.prompt_embed.values.clone();
     let cmvn_neg_mean = weights.cmvn_neg_mean.values.clone();
     let cmvn_inv_stddev = weights.cmvn_inv_stddev.values.clone();
     let graph = SenseVoiceEncoderGraph::new(&weights, metadata, preflight, backend)
@@ -154,7 +150,6 @@ fn materialize_sensevoice_prepared_runtime(
         metadata,
         tokenizer,
         graph,
-        prompt_embed,
         cmvn_neg_mean,
         cmvn_inv_stddev,
     })
@@ -204,8 +199,6 @@ impl SenseVoicePreparedRuntime {
         // request-level toggle for this (no back-compat surface to preserve),
         // so it is a fixed default rather than a plumbed parameter.
         let prompt = build_sensevoice_prompt(language, true).map_err(|e| e.to_string())?;
-        let dim = self.metadata.feature_dim;
-
         let fbank = SenseVoiceFbankFrontend::new()
             .compute(samples)
             .map_err(|e| e.to_string())?;
@@ -218,20 +211,10 @@ impl SenseVoicePreparedRuntime {
         )
         .map_err(|e| e.to_string())?;
 
-        let embed_rows = self.prompt_embed.len() / dim;
-        let mut prompt_rows: Vec<&[f32]> = Vec::with_capacity(prompt.embed_indices.len());
-        for &index in &prompt.embed_indices {
-            if index >= embed_rows {
-                return Err(format!(
-                    "sensevoice prompt embed index {index} out of range (table has {embed_rows} rows)"
-                ));
-            }
-            prompt_rows.push(&self.prompt_embed[index * dim..(index + 1) * dim]);
-        }
-        let input =
-            build_sensevoice_encoder_input(&prompt_rows, &lfr.data, dim, self.metadata.d_model)
-                .map_err(|e| e.to_string())?;
-        let output = self.graph.encode(&input).map_err(|e| e.to_string())?;
+        let output = self
+            .graph
+            .encode_lfr_with_prompt(&lfr.data, &prompt.embed_indices)
+            .map_err(|e| e.to_string())?;
 
         let frame_logits: Vec<&[f32]> = (0..output.frame_count)
             .map(|f| &output.logits[f * output.vocab_size..(f + 1) * output.vocab_size])
@@ -422,11 +405,7 @@ fn sensevoice_runtime_system_memory_quote(
         crate::models::runtime_memory::tokenizer_btree_quote_bytes(gguf_metadata, "sensevoice")?;
     let plan = plan_sensevoice_system_memory(tensor_index, metadata)?;
     let cloned_frontend_bytes = checked_sum(
-        [
-            plan.prompt_embed_bytes,
-            plan.cmvn_neg_mean_bytes,
-            plan.cmvn_inv_stddev_bytes,
-        ],
+        [plan.cmvn_neg_mean_bytes, plan.cmvn_inv_stddev_bytes],
         "sensevoice",
         "quoted frontend clones",
     )?;

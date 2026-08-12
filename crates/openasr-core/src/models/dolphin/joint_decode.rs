@@ -256,8 +256,8 @@ impl DolphinCtcHeadRuntime {
 
         // Persistent weight arena (a WEIGHTS-usage backend buffer): the CTC
         // head's `ctc.ctc_lo.weight` matmul operand + bias live here so the ggml
-        // multi-backend scheduler can offload the projection to an accelerator,
-        // the same reason the encoder/decoder weights are arena-resident.
+        // selected accelerator can keep the projection device-resident, the
+        // same reason the encoder/decoder weights are arena-resident.
         // Binding them as per-call transient graph leaves (the pre-arena path)
         // pinned this matmul to the CPU even under an explicit Metal backend.
         // Only `encoder_out` is a genuine per-call graph input. Weight placement
@@ -310,8 +310,9 @@ impl DolphinCtcHeadRuntime {
     }
 
     /// `ctc.ctc_lo(encoder_out)` -> `log_softmax`, returned row-major
-    /// `[frames, vocab]` (vocab innermost). The linear runs in the ggml graph
-    /// (like the encoder); the softmax is a cheap Rust pass.
+    /// `[frames, vocab]` (vocab innermost). Both the projection and
+    /// normalization stay in the selected ggml backend; explicit GPU requests
+    /// do not read the full logits matrix back merely to normalize it on CPU.
     pub(crate) fn compute_log_probs(
         &mut self,
         encoder_out: &[f32],
@@ -342,7 +343,9 @@ impl DolphinCtcHeadRuntime {
         let logits = graph
             .add(logits, bias_tensor)
             .map_err(ggml("ctc_bias_add"))?;
-        graph.set_output(logits).map_err(ggml("set_output"))?;
+        let probabilities = graph.soft_max(logits).map_err(ggml("ctc_softmax"))?;
+        let log_probs = graph.log(probabilities).map_err(ggml("ctc_log"))?;
+        graph.set_output(log_probs).map_err(ggml("set_output"))?;
         // Only `encoder_out` is a fresh per-call graph leaf with no buffer of
         // its own; the weight + bias are arena-resident (backend buffer already
         // allocated), so -- like the encoder/decoder arena paths -- they need
@@ -354,22 +357,16 @@ impl DolphinCtcHeadRuntime {
         // liveness-based buffer reuse before uploading inputs (mirrors the
         // encoder/decoder graphs).
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .prepare_outputs_for_upload(&[log_probs])
             .map_err(ggml("prepare_outputs"))?;
 
         graph
             .set_f32_slice(encoder_tensor, encoder_out, "dolphin_ctc_encoder_out")
             .map_err(ggml("upload_encoder"))?;
 
-        let mut logits = graph
-            .compute_output_f32(logits, frames * vocab)
-            .map_err(ggml("compute"))?;
-
-        // In-place log_softmax over each frame's vocab row.
-        for row in logits.chunks_exact_mut(vocab) {
-            log_softmax_in_place(row);
-        }
-        Ok(logits)
+        graph
+            .compute_output_f32(log_probs, frames * vocab)
+            .map_err(ggml("compute"))
     }
 }
 

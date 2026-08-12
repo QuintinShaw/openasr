@@ -14,8 +14,9 @@
 //!
 //! This always runs a fixed-size 30s chunk (3000 mel frames -> 1500 encoder
 //! output frames, `max_source_positions`); audio longer than 30s is chunked
-//! by the executor (see `executor.rs`), which trims each chunk's output to
-//! its own valid frame count before concatenating -- mirrors
+//! by the executor (see `executor.rs`). [`MossEncoderRuntime::encode_and_adapt`]
+//! trims each chunk to its valid prefix and returns final adaptor rows for
+//! concatenation -- mirrors
 //! `MossTranscribeDiarizeModel.get_audio_features`'s
 //! `whisper_features[chunk_idx:chunk_idx+1, :token_len*4]` truncation.
 //!
@@ -28,7 +29,7 @@
 //! and `loaded_or_arena_2d` below), never touching host memory; everything
 //! else small (conv stem, every 1D norm/bias, the fixed positional embedding,
 //! the final LayerNorm) lives in a WEIGHTS-usage static-tensor arena uploaded
-//! once per `encode()` call. Only the per-chunk mel features and the (always
+//! once per `encode_and_adapt()` call. Only the per-chunk mel features and the (always
 //! all-zero, but genuinely re-uploaded per call for op-order clarity)
 //! attention mask stay real graph inputs.
 
@@ -49,6 +50,10 @@ use crate::nn::encoder::{
     TransformerEncoderConfig, TransformerEncoderLayerWeights, transformer_layer,
 };
 
+use super::adaptor_graph::{
+    MossAdaptorError, MossAdaptorGraphWeights, MossAdaptorWeights,
+    load_moss_adaptor_weights_from_reader, run_moss_adaptor,
+};
 use super::tensor_names::{
     ENC_CONV1_BIAS, ENC_CONV1_WEIGHT, ENC_CONV2_BIAS, ENC_CONV2_WEIGHT, ENC_OUT_NORM_BIAS,
     ENC_OUT_NORM_WEIGHT, ENC_POS_EMBD_WEIGHT, moss_encoder_layer_tensor_names,
@@ -98,6 +103,11 @@ pub(crate) enum MossEncoderError {
         expected: usize,
         n_mels: usize,
         frames: usize,
+    },
+    #[error("moss-transcribe-diarize encoder adaptor failed: {source}")]
+    Adaptor {
+        #[source]
+        source: MossAdaptorError,
     },
 }
 
@@ -357,17 +367,23 @@ pub(crate) fn load_moss_encoder_weights_from_reader(
     })
 }
 
-/// Owns the encoder's graph runner, the optional zero-copy weight context,
-/// and the fully-loaded [`MossEncoderWeights`]; all three are expensive to
-/// rebuild per chunk (the loaded-weight context mmaps the whole pack, and
-/// loading the weights reads every small tensor off disk), so callers build
-/// one runtime via the owner-actor checkout pool in `executor.rs`, mirroring
-/// `firered_aed::executor`'s
-/// `FireRedEncoderGraphRuntime`) and call [`Self::encode`] once per 30s
-/// chunk. Mirrors `qwen::audio_encoder::Qwen3AsrAudioEncoderRuntime`.
+enum MossAdaptorRuntime {
+    /// Exact CPU reference path. Its f32 allocation is admitted with the
+    /// actor and is never constructed for an accelerated lane.
+    Host(MossAdaptorWeights),
+    /// Native GGUF handles appended to the encoder graph on Metal/GPU.
+    Device(MossAdaptorGraphWeights),
+}
+
+/// Owns the encoder graph runner, zero-copy encoder weight context, one
+/// backend-appropriate adaptor implementation, and fully-loaded
+/// [`MossEncoderWeights`]. They are expensive to rebuild per chunk, so callers
+/// build one runtime via the owner-actor checkout pool in `executor.rs` and
+/// call [`Self::encode_and_adapt`] once per 30s chunk.
 pub(crate) struct MossEncoderRuntime {
     runner: GgmlCpuGraphRunner,
     loaded: GgmlLoadedWeightContext,
+    adaptor: MossAdaptorRuntime,
     weights: Arc<MossEncoderWeights>,
 }
 
@@ -375,6 +391,11 @@ impl MossEncoderRuntime {
     pub(crate) fn new_with_prepared_weights_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         weights: Arc<MossEncoderWeights>,
+        host_adaptor_reader: Option<&GgufTensorDataReader>,
+        encoder_d_model: usize,
+        adaptor_merge_size: usize,
+        llm_dim: usize,
+        adaptor_norm_epsilon: f32,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossEncoderError> {
         let graph_config = super::graph_config::moss_td_encoder_graph_config(backend);
@@ -383,27 +404,64 @@ impl MossEncoderRuntime {
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_graph_error("load_gguf_weight_context", source))?;
+        let adaptor = if graph_config.backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+            let reader = host_adaptor_reader.ok_or_else(|| MossEncoderError::GraphExecution {
+                reason: "CPU adaptor construction requires the verified tensor reader".to_string(),
+            })?;
+            MossAdaptorRuntime::Host(
+                load_moss_adaptor_weights_from_reader(
+                    reader,
+                    encoder_d_model,
+                    adaptor_merge_size,
+                    llm_dim,
+                    adaptor_norm_epsilon,
+                )
+                .map_err(|source| MossEncoderError::Adaptor { source })?,
+            )
+        } else {
+            MossAdaptorRuntime::Device(
+                MossAdaptorGraphWeights::from_loaded(&loaded)
+                    .map_err(|source| MossEncoderError::Adaptor { source })?,
+            )
+        };
         Ok(Self {
             runner,
             loaded,
+            adaptor,
             weights,
         })
     }
 
-    /// Run one 30s-chunk forward pass: `mel` is `[n_mels, mel_frames]`
+    pub(crate) fn retained_host_system_memory_bytes(&self) -> Result<u64, String> {
+        match &self.adaptor {
+            MossAdaptorRuntime::Host(weights) => weights.retained_system_memory_bytes(),
+            MossAdaptorRuntime::Device(_) => Ok(0),
+        }
+    }
+
+    /// Run one 30s-chunk encoder+adaptor forward pass: `mel` is
+    /// `[n_mels, mel_frames]`
     /// row-major (mel-major, frame-minor -- matches
     /// `whisper::whisper_log_mel_spectrogram_16khz_mono_v0`'s own output
     /// layout, so it uploads with zero reshaping). Always produces exactly
     /// `max_source_positions` output frames (a full un-trimmed 30s chunk);
     /// the caller trims to the chunk's own valid length (see `executor.rs`).
     ///
-    /// Returns frame-major rows: `[frame][d_model]`, `max_source_positions *
-    /// d_model` values.
-    pub(crate) fn encode(
+    /// Accelerated lanes view and time-merge the valid encoder prefix on the
+    /// device before the adaptor MLP. The CPU lane reads back only that prefix
+    /// and executes the original scalar numerical oracle. Both return
+    /// token-major adaptor rows: `[valid_encoder_frames / merge_size][llm_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_and_adapt(
         &mut self,
         config: MossEncoderConfig,
         mel: &[f32],
         mel_frames: usize,
+        valid_encoder_frames: usize,
+        adaptor_merge_size: usize,
+        adaptor_input_dim: usize,
+        llm_dim: usize,
+        adaptor_norm_epsilon: f32,
     ) -> Result<Vec<f32>, MossEncoderError> {
         let weights = &self.weights;
         let expected_mel_len = config.n_mels * mel_frames;
@@ -551,17 +609,57 @@ impl MossEncoderRuntime {
             map_graph_error,
         )?;
 
+        let (adaptor_output, output_len) = match &self.adaptor {
+            MossAdaptorRuntime::Host(_) => {
+                let row_stride = config
+                    .d_model
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| MossEncoderError::GraphExecution {
+                        reason: "valid encoder row stride overflowed".to_string(),
+                    })?;
+                let valid_state = graph
+                    .view_2d(state, config.d_model, valid_encoder_frames, row_stride, 0)
+                    .map_err(|source| map_graph_error("ggml_view_2d(valid_encoder)", source))?;
+                let output_len = valid_encoder_frames
+                    .checked_mul(config.d_model)
+                    .ok_or_else(|| MossEncoderError::GraphExecution {
+                        reason: "valid encoder output length overflowed".to_string(),
+                    })?;
+                (valid_state, output_len)
+            }
+            MossAdaptorRuntime::Device(adaptor) => {
+                let adaptor_output = adaptor
+                    .apply(
+                        &graph,
+                        state,
+                        valid_encoder_frames,
+                        config.d_model,
+                        adaptor_merge_size,
+                        adaptor_input_dim,
+                        llm_dim,
+                        adaptor_norm_epsilon,
+                    )
+                    .map_err(|source| MossEncoderError::Adaptor { source })?;
+                let adaptor_token_count = valid_encoder_frames / adaptor_merge_size.max(1);
+                let output_len = adaptor_token_count.checked_mul(llm_dim).ok_or_else(|| {
+                    MossEncoderError::GraphExecution {
+                        reason: "adaptor output length overflowed".to_string(),
+                    }
+                })?;
+                (adaptor_output, output_len)
+            }
+        };
         graph
-            .set_output(state)
-            .map_err(|source| map_graph_error("ggml_set_output(encoder_out)", source))?;
+            .set_output(adaptor_output)
+            .map_err(|source| map_graph_error("ggml_set_output(adaptor_out)", source))?;
 
         // Peak-RSS lever: allocate the compute graph via the scheduler's
         // gallocr (liveness-based buffer REUSE) before uploading inputs, so
         // the per-layer intermediates collapse to the working-set peak
         // instead of each getting its own buffer.
         graph
-            .prepare_outputs_for_upload(&[state])
-            .map_err(|source| map_graph_error("ggml_prepare_outputs(encoder_out)", source))?;
+            .prepare_outputs_for_upload(&[adaptor_output])
+            .map_err(|source| map_graph_error("ggml_prepare_outputs(adaptor_out)", source))?;
 
         // Only the genuine per-call inputs are uploaded here; every weight
         // already resides in the arena's WEIGHTS-usage buffer (uploaded once
@@ -579,11 +677,39 @@ impl MossEncoderRuntime {
             })?;
 
         let values = graph
-            .compute_output_f32(state, output_frames * config.d_model)
+            .compute_output_f32(adaptor_output, output_len)
             .map_err(|source| MossEncoderError::GraphExecution {
-                reason: format!("encoder graph compute failed: {source}"),
+                reason: format!("encoder+adaptor graph compute failed: {source}"),
             })?;
-        Ok(values)
+        match &self.adaptor {
+            MossAdaptorRuntime::Host(weights) => {
+                let (values, token_count) = run_moss_adaptor(
+                    weights,
+                    &values,
+                    valid_encoder_frames,
+                    config.d_model,
+                    adaptor_merge_size,
+                )
+                .map_err(|source| MossEncoderError::Adaptor { source })?;
+                let expected_tokens = valid_encoder_frames / adaptor_merge_size.max(1);
+                if token_count != expected_tokens {
+                    return Err(MossEncoderError::GraphExecution {
+                        reason: format!(
+                            "host adaptor token count {token_count} != expected {expected_tokens}"
+                        ),
+                    });
+                }
+                Ok(values)
+            }
+            MossAdaptorRuntime::Device(_) => {
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(MossEncoderError::GraphExecution {
+                        reason: "adaptor output contains non-finite values".to_string(),
+                    });
+                }
+                Ok(values)
+            }
+        }
     }
 
     /// Drops the completed encoder phase's scheduler/gallocr working set
@@ -598,7 +724,7 @@ impl MossEncoderRuntime {
     }
 }
 
-/// Test-only twin of [`MossEncoderRuntime::encode`] for the CPU-vs-Metal
+/// Test-only encoder-only twin of [`MossEncoderRuntime::encode_and_adapt`] for the CPU-vs-Metal
 /// numeric-divergence bisection (see `parity_tests` below): builds the
 /// identical graph but taps every layer's final output (post-`transformer_layer`,
 /// pre-final-norm) plus the subsample stem's output and the post-final-norm
@@ -843,7 +969,7 @@ struct MossEncoderLayerGraphTensors<'a> {
 }
 
 /// Resident tensors shared by every chunk's forward pass. Only the mel input
-/// and the attention mask (built in [`MossEncoderRuntime::encode`]) are
+/// and the attention mask (built in [`MossEncoderRuntime::encode_and_adapt`]) are
 /// genuine per-call graph inputs.
 struct MossEncoderResidentTensors<'a> {
     conv1_weight: crate::ggml_runtime::GgmlCpuTensor<'a>,

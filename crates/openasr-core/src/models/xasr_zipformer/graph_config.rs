@@ -14,6 +14,11 @@ use crate::models::graph_runtime_config::{
 /// [`GgmlCpuGraphConfig::metadata_context_bytes`]), OOM'd CPU transcription.
 pub(super) const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 
+/// The stateless predictor and joiner use three tiny persistent graphs. Keep
+/// their runner independent from the 65k-node streaming encoder so the head
+/// does not inherit another full-encoder metadata context.
+pub(super) const DEVICE_HEAD_GRAPH_SIZE: usize = 64;
+
 /// Auto prefers the accelerator on the generic GPU lane (HIP/CUDA/Vulkan),
 /// and only falls back to CPU when no accelerator is present or the request
 /// targets Apple Silicon Metal specifically (see below). An explicit
@@ -54,8 +59,26 @@ pub(crate) fn xasr_zipformer_encoder_graph_config(
             },
         ),
         has_explicit_thread_override(),
-        backend.is_gpu_class(),
     )
+}
+
+pub(crate) fn xasr_zipformer_device_head_graph_config(
+    backend: GgmlCpuGraphBackend,
+) -> GgmlCpuGraphConfig {
+    let mut config = configure_model_runtime_graph_config_from_env(
+        GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
+        ModelMetalRuntimeOverrides {
+            default_use_scheduler_when_unset: Some(false),
+            default_n_threads_when_unset: Some(1),
+        },
+    );
+    config.set_graph_node_capacity(DEVICE_HEAD_GRAPH_SIZE);
+    if config.backend.is_gpu_class() {
+        // X-ASR advertises FullDevice, and every predictor/joiner op used by
+        // this graph is supported by the direct Metal/GPU backend.
+        config.use_scheduler = false;
+    }
+    config
 }
 
 /// Pure encoder-graph policy: env-derived inputs are dependency-injected so this
@@ -64,7 +87,6 @@ pub(crate) fn xasr_zipformer_encoder_graph_config(
 fn xasr_zipformer_encoder_graph_config_with_overrides(
     mut config: GgmlCpuGraphConfig,
     has_explicit_thread_override: bool,
-    encoder_gpu_enabled: bool,
 ) -> GgmlCpuGraphConfig {
     config.graph_size = config.graph_size.max(FULL_ENCODER_GRAPH_SIZE);
     config.context_bytes = config
@@ -77,16 +99,11 @@ fn xasr_zipformer_encoder_graph_config_with_overrides(
     // CPU-fallback can't move the op because the prepared graph's tensors are
     // pre-allocated to the GPU buffer. Instead the graph builder emits the
     // im2col-based depthwise conv (Metal-native) on GPU-class backends, so the
-    // whole encoder runs on a single GPU backend with no scheduler. Default
-    // fail-closed to CPU; only an explicit accelerated request keeps the GPU
-    // backend (single-backend).
+    // whole encoder runs on the resolved single GPU backend with no scheduler.
+    // Auto-mode backend policy is resolved before this function; a family graph
+    // config must never reinterpret that resolved request contract.
     if config.backend.is_gpu_class() {
-        if encoder_gpu_enabled {
-            config.use_scheduler = false;
-        } else {
-            config.backend = GgmlCpuGraphBackend::Cpu;
-            config.use_scheduler = false;
-        }
+        config.use_scheduler = false;
     }
     // The streaming encoder runs a small (29-frame) chunk graph per hop, so it is
     // latency-bound and oversubscription-sensitive like an autoregressive
@@ -120,7 +137,6 @@ mod tests {
         let config = xasr_zipformer_encoder_graph_config_with_overrides(
             base_with(GgmlCpuGraphBackend::Cpu, None),
             false,
-            false,
         );
         assert!(config.graph_size >= FULL_ENCODER_GRAPH_SIZE);
         assert!(
@@ -140,7 +156,6 @@ mod tests {
         let config = xasr_zipformer_encoder_graph_config_with_overrides(
             base_with(GgmlCpuGraphBackend::Cpu, None),
             false,
-            false,
         );
         // Three coexisting contexts must stay well under a CPU commit budget...
         assert!(config.context_bytes * 3 < 256 * 1024 * 1024);
@@ -149,23 +164,10 @@ mod tests {
     }
 
     #[test]
-    fn gpu_encoder_falls_back_to_cpu_when_gate_disabled() {
+    fn gpu_encoder_keeps_the_resolved_single_gpu_backend() {
         let config = xasr_zipformer_encoder_graph_config_with_overrides(
             base_with(GgmlCpuGraphBackend::Metal, None),
             false,
-            false,
-        );
-
-        assert_eq!(config.backend, GgmlCpuGraphBackend::Cpu);
-        assert!(!config.use_scheduler);
-    }
-
-    #[test]
-    fn gpu_encoder_keeps_single_gpu_backend_when_gate_enabled() {
-        let config = xasr_zipformer_encoder_graph_config_with_overrides(
-            base_with(GgmlCpuGraphBackend::Metal, None),
-            false,
-            true,
         );
 
         // GPU runs single-backend (im2col depthwise conv is Metal-native), so no
@@ -178,7 +180,6 @@ mod tests {
     fn config_uses_chunk_friendly_cpu_threads_when_unset() {
         let config = xasr_zipformer_encoder_graph_config_with_overrides(
             base_with(GgmlCpuGraphBackend::Cpu, None),
-            false,
             false,
         );
 
@@ -196,7 +197,6 @@ mod tests {
         let config = xasr_zipformer_encoder_graph_config_with_overrides(
             base_with(GgmlCpuGraphBackend::Cpu, Some(2)),
             true,
-            false,
         );
 
         assert_eq!(config.n_threads, Some(2));

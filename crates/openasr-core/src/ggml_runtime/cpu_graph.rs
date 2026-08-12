@@ -4,7 +4,7 @@
 //! numeric drift.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, c_int, c_void},
     marker::PhantomData,
@@ -33,7 +33,7 @@ use super::{
     GgmlBackendKind, GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader,
     GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
-use crate::device::execution_policy::ExecutionCandidateFailure;
+use crate::device::execution_policy::{ExecutionCandidateFailure, ExecutionPlacement};
 use crate::device::pack_weight_residency::PackWeightResidencyHandle;
 use crate::device::{
     execution_memory::{
@@ -86,6 +86,20 @@ fn flash_attn_ext_head_dim_supported_on_backend(
 ) -> bool {
     backend_kind != GgmlCpuGraphBackend::Metal
         || METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS.contains(&head_dim)
+}
+
+fn backend_satisfies_execution_placement(
+    backend: GgmlCpuGraphBackend,
+    placement: Option<ExecutionPlacement>,
+) -> bool {
+    placement != Some(ExecutionPlacement::FullDevice) || backend.is_gpu_class()
+}
+
+fn scheduler_allows_cpu_participants(
+    backend: GgmlCpuGraphBackend,
+    placement: Option<ExecutionPlacement>,
+) -> bool {
+    !(backend.is_gpu_class() && placement == Some(ExecutionPlacement::FullDevice))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1388,6 +1402,7 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     backend_kind: GgmlCpuGraphBackend,
     scheduler: Option<NonNull<c_void>>,
     scheduler_memory_owner: Option<GgmlSchedulerMemoryOwner>,
+    scheduler_graph_lifetime: Option<GgmlSchedulerGraphLifetime>,
     backend_private_memory_owner: GgmlBackendPrivateLeaseOwner,
     graph_size: usize,
     buffer: Option<GgmlBackendBufferGuard>,
@@ -1469,6 +1484,27 @@ impl GgmlPersistentGraphSession {
     }
 }
 
+struct GgmlSchedulerGraphLifetime {
+    scheduler: NonNull<c_void>,
+    memory_owner: GgmlSchedulerMemoryOwner,
+    graph: Option<NonNull<c_void>>,
+}
+
+impl Drop for GgmlSchedulerGraphLifetime {
+    fn drop(&mut self) {
+        let Some(graph) = self.graph else {
+            return;
+        };
+        if self.memory_owner.active_graph_address.get() == Some(graph.as_ptr() as usize) {
+            // Detach while both the graph context and the scheduler buffers are
+            // alive. The native reset also restores scheduler-inserted source
+            // copies before its scratch context can be reused.
+            unsafe { ffi::ggml_backend_sched_reset(self.scheduler.as_ptr()) };
+            self.memory_owner.active_graph_address.set(None);
+        }
+    }
+}
+
 impl GgmlCpuGraphRunner {
     pub fn new(config: GgmlCpuGraphConfig) -> Result<Self, GgmlCpuGraphError> {
         if config.context_bytes == 0 {
@@ -1477,6 +1513,22 @@ impl GgmlCpuGraphRunner {
         if config.graph_size == 0 {
             return Err(GgmlCpuGraphError::InvalidGraphSize);
         }
+
+        let execution_placement =
+            crate::models::native_execution_services::current_execution_placement();
+        if !backend_satisfies_execution_placement(config.backend, execution_placement) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "FullDevice execution requires a GPU-class graph backend",
+            });
+        }
+        let scheduler_allows_cpu =
+            scheduler_allows_cpu_participants(config.backend, execution_placement);
+        // Some family-local configs are also constructed outside the shared
+        // graph-runtime helper. Enforce FullDevice again at the runner boundary
+        // so none of those call sites can hand ggml a scheduler without its
+        // mandatory CPU fallback (which would either abort during construction
+        // or execute CPU work before telemetry can reject the attempt).
+        let use_scheduler = config.use_scheduler && scheduler_allows_cpu;
 
         let context = GgmlContextGuard::new(config.context_bytes, "ggml.runner-context")?;
         let mut backend = match config.backend {
@@ -1490,16 +1542,20 @@ impl GgmlCpuGraphRunner {
             backend.set_n_threads(n_threads)?;
         }
 
-        let cpu_accelerator_policy =
-            GgmlCpuGraphConfig::resolve_runtime_cpu_accelerator_policy(config.backend);
-        let scheduler_accel_backends = if config.use_scheduler {
+        let cpu_accelerator_policy = if scheduler_allows_cpu {
+            GgmlCpuGraphConfig::resolve_runtime_cpu_accelerator_policy(config.backend)
+        } else {
+            GgmlCpuGraphCpuAcceleratorPolicy::Disabled
+        };
+        let scheduler_accel_backends = if use_scheduler {
             GgmlBackendGuard::accelerators(config.n_threads, cpu_accelerator_policy)
         } else {
             Vec::new()
         };
 
         let mut scheduler_cpu_fallback = None;
-        if config.use_scheduler
+        if use_scheduler
+            && scheduler_allows_cpu
             && matches!(
                 config.backend,
                 GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu
@@ -1511,7 +1567,7 @@ impl GgmlCpuGraphRunner {
             }
             scheduler_cpu_fallback = Some(cpu);
         }
-        let scheduler = if config.use_scheduler {
+        let scheduler = if use_scheduler {
             Some(build_graph_scheduler(
                 config.backend,
                 &backend,
@@ -1568,9 +1624,30 @@ impl GgmlCpuGraphRunner {
     pub(crate) fn start_capacity_sized_persistent_graph_session(
         &mut self,
     ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
-        self.start_persistent_graph_session(GgmlCpuGraphConfig::metadata_context_bytes(
-            self.graph_size,
-        ))
+        self.start_persistent_graph_session_with_node_capacity(self.graph_size)
+    }
+
+    /// Starts a reusable graph whose cgraph and metadata context are both
+    /// right-sized for a known subgraph capacity. Small persistent decoder
+    /// heads often share a runner with a much larger encoder; inheriting the
+    /// encoder's node budget would otherwise multiply unrelated resident
+    /// metadata for every coexisting session.
+    pub(crate) fn start_persistent_graph_session_with_node_capacity(
+        &mut self,
+        graph_size: usize,
+    ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
+        if graph_size == 0 {
+            return Err(GgmlCpuGraphError::InvalidGraphSize);
+        }
+        if graph_size > self.graph_size {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "persistent graph node capacity exceeds its runner capacity",
+            });
+        }
+        self.start_persistent_graph_session_with_capacities(
+            GgmlCpuGraphConfig::metadata_context_bytes(graph_size),
+            graph_size,
+        )
     }
 
     pub(crate) fn backend_kind(&self) -> GgmlCpuGraphBackend {
@@ -1672,12 +1749,27 @@ impl GgmlCpuGraphRunner {
     }
 
     pub(crate) fn start_graph(&mut self) -> GgmlCpuGraphBuilder<'_> {
+        if let Some(scheduler) = self.scheduler.as_ref() {
+            // `ggml_reset` discards the old graph metadata. Detach any
+            // scheduler-owned tensor bindings first, while that graph and the
+            // scheduler's buffer objects are still alive.
+            unsafe { ffi::ggml_backend_sched_reset(scheduler.raw.as_ptr()) };
+            scheduler.memory_owner.active_graph_address.set(None);
+        }
         unsafe { ffi::ggml_reset(self.context.raw.as_ptr()) };
         let scheduler = self.scheduler.as_ref().map(|scheduler| scheduler.raw);
         let scheduler_memory_owner = self
             .scheduler
             .as_ref()
             .map(|scheduler| scheduler.memory_owner.clone());
+        let scheduler_graph_lifetime =
+            scheduler
+                .zip(scheduler_memory_owner.clone())
+                .map(|(scheduler, memory_owner)| GgmlSchedulerGraphLifetime {
+                    scheduler,
+                    memory_owner,
+                    graph: None,
+                });
         // Grow-to-fit CPU step buffer only applies to the plain per-token
         // rebuild path (no scheduler); Metal/GPU already get the equivalent
         // behavior from the scheduler's own `ggml_gallocr`.
@@ -1690,6 +1782,7 @@ impl GgmlCpuGraphRunner {
             backend_kind: self.backend_kind,
             scheduler,
             scheduler_memory_owner,
+            scheduler_graph_lifetime,
             backend_private_memory_owner: Rc::clone(&self.backend.private_memory_leases),
             graph_size: self.graph_size,
             buffer: None,
@@ -1830,8 +1923,19 @@ impl GgmlCpuGraphRunner {
         &mut self,
         context_bytes: usize,
     ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
+        self.start_persistent_graph_session_with_capacities(context_bytes, self.graph_size)
+    }
+
+    fn start_persistent_graph_session_with_capacities(
+        &mut self,
+        context_bytes: usize,
+        graph_size: usize,
+    ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
         if context_bytes == 0 {
             return Err(GgmlCpuGraphError::InvalidContextBytes);
+        }
+        if graph_size == 0 {
+            return Err(GgmlCpuGraphError::InvalidGraphSize);
         }
         let context = GgmlContextGuard::new(context_bytes, "ggml.persistent-graph-context")?;
         let builder = GgmlCpuGraphBuilder {
@@ -1843,8 +1947,15 @@ impl GgmlCpuGraphRunner {
                 .scheduler
                 .as_ref()
                 .map(|scheduler| scheduler.memory_owner.clone()),
+            scheduler_graph_lifetime: self.scheduler.as_ref().map(|scheduler| {
+                GgmlSchedulerGraphLifetime {
+                    scheduler: scheduler.raw,
+                    memory_owner: scheduler.memory_owner.clone(),
+                    graph: None,
+                }
+            }),
             backend_private_memory_owner: Rc::clone(&self.backend.private_memory_leases),
-            graph_size: self.graph_size,
+            graph_size,
             buffer: None,
             graph_allocator: None,
             // A persistent session allocates its graph once and keeps that
@@ -3040,6 +3151,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_sqrt")
     }
 
+    pub(crate) fn abs(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_abs")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_abs input")?;
+        let raw = unsafe { ffi::ggml_abs(self.context.as_ptr(), input.raw.as_ptr()) };
+        self.new_tensor_checked(raw, "ggml_abs")
+    }
+
     #[allow(dead_code)]
     pub(crate) fn log(
         &self,
@@ -3049,6 +3170,26 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_log input")?;
         let raw = unsafe { ffi::ggml_log(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_log")
+    }
+
+    pub(crate) fn sin(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_sin")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_sin input")?;
+        let raw = unsafe { ffi::ggml_sin(self.context.as_ptr(), input.raw.as_ptr()) };
+        self.new_tensor_checked(raw, "ggml_sin")
+    }
+
+    pub(crate) fn cos(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_cos")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_cos input")?;
+        let raw = unsafe { ffi::ggml_cos(self.context.as_ptr(), input.raw.as_ptr()) };
+        self.new_tensor_checked(raw, "ggml_cos")
     }
 
     pub(crate) fn mul_mat(
@@ -3308,10 +3449,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_group_norm")
     }
 
-    /// Concatenate two tensors along `dim`. Used to stitch the per-group
-    /// `conv_1d` outputs of the wav2vec2 grouped positional conv back into one
-    /// `[out_channels, T]` tensor (concat along the channel axis, dim 1). Both
-    /// inputs must be f32 and contiguous, and match in every axis except `dim`.
+    /// Concatenate two tensors along `dim`. Used both to stitch f32 activation
+    /// shards and to pack i32 index rows produced by device-side argmax. Both
+    /// inputs must have the same supported type, be contiguous, and match in
+    /// every axis except `dim`.
     pub(crate) fn concat(
         &self,
         a: GgmlCpuTensor<'a>,
@@ -3319,8 +3460,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         dim: usize,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_concat")?;
-        self.ensure_tensor_type(a, ffi::GGML_TYPE_F32, "ggml_concat a")?;
-        self.ensure_tensor_type(b, ffi::GGML_TYPE_F32, "ggml_concat b")?;
+        self.ensure_tensor_type_in(
+            a,
+            &[ffi::GGML_TYPE_F32, ffi::GGML_TYPE_I32],
+            "ggml_concat a",
+        )?;
+        self.ensure_tensor_type(b, self.tensor_type(a), "ggml_concat b")?;
         self.ensure_tensor_contiguous(a, "ggml_concat a")?;
         self.ensure_tensor_contiguous(b, "ggml_concat b")?;
         if dim >= ffi::GGML_MAX_DIMS {
@@ -4400,6 +4545,42 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_conv_1d")
     }
 
+    pub(crate) fn max_pool_1d(
+        &self,
+        input: GgmlCpuTensor<'a>,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_pool_1d")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_pool_1d input")?;
+        if kernel == 0 || stride == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "pool kernel and stride must be positive",
+            });
+        }
+        let kernel = i32::try_from(kernel).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "pool kernel exceeds ggml int boundary",
+        })?;
+        let stride = i32::try_from(stride).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "pool stride exceeds ggml int boundary",
+        })?;
+        let padding = i32::try_from(padding).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "pool padding exceeds ggml int boundary",
+        })?;
+        let raw = unsafe {
+            ffi::ggml_pool_1d(
+                self.context.as_ptr(),
+                input.raw.as_ptr(),
+                ffi::GGML_OP_POOL_MAX,
+                kernel,
+                stride,
+                padding,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_pool_1d")
+    }
+
     pub(crate) fn conv_2d(
         &self,
         kernel: GgmlCpuTensor<'a>,
@@ -4454,6 +4635,44 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             )
         };
         self.new_tensor_checked(raw, "ggml_conv_2d")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv_2d_direct(
+        &self,
+        kernel: GgmlCpuTensor<'a>,
+        data: GgmlCpuTensor<'a>,
+        stride0: usize,
+        stride1: usize,
+        padding0: usize,
+        padding1: usize,
+        dilation0: usize,
+        dilation1: usize,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_conv_2d_direct")?;
+        self.ensure_tensor_type_in(
+            kernel,
+            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32],
+            "ggml_conv_2d_direct kernel",
+        )?;
+        self.ensure_tensor_type(data, ffi::GGML_TYPE_F32, "ggml_conv_2d_direct data")?;
+        let int = |value: usize, reason| {
+            i32::try_from(value).map_err(|_| GgmlCpuGraphError::UnsupportedInputs { reason })
+        };
+        let raw = unsafe {
+            ffi::ggml_conv_2d_direct(
+                self.context.as_ptr(),
+                kernel.raw.as_ptr(),
+                data.raw.as_ptr(),
+                int(stride0, "conv stride exceeds ggml int boundary")?,
+                int(stride1, "conv stride exceeds ggml int boundary")?,
+                int(padding0, "conv padding exceeds ggml int boundary")?,
+                int(padding1, "conv padding exceeds ggml int boundary")?,
+                int(dilation0, "conv dilation exceeds ggml int boundary")?,
+                int(dilation1, "conv dilation exceeds ggml int boundary")?,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_conv_2d_direct")
     }
 
     pub(crate) fn conv_2d_dw_direct(
@@ -4720,6 +4939,26 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let (Some(_scheduler), Some(graph)) = (self.scheduler, self.prepared_graph) else {
             return Ok(());
         };
+        self.ensure_scheduler_graph_active(graph)
+    }
+
+    /// A ggml scheduler owns one graph-specific tensor allocation at a time.
+    /// Multiple persistent sessions may intentionally share one runner, so the
+    /// graph that was prepared first must be rebound after a sibling graph (or
+    /// a transient graph) becomes active. The shared scheduler owner is the
+    /// only layer that can observe switches across builders.
+    fn ensure_scheduler_graph_active(
+        &mut self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
+        let Some(memory_owner) = &self.scheduler_memory_owner else {
+            return Ok(());
+        };
+        let graph_address = graph.as_ptr() as usize;
+        if memory_owner.active_graph_address.get() == Some(graph_address) {
+            return Ok(());
+        }
         self.allocate_scheduler_graph(graph)
     }
 
@@ -4741,6 +4980,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             .scheduler_memory_owner
             .clone()
             .expect("scheduler raw pointer and memory owner are installed together");
+        // From this point onward a failed plan/commit cannot prove that the
+        // previously active graph is still bound. A conservative miss only
+        // triggers a later rebind; a false hit would reuse dangling buffers.
+        memory_owner.active_graph_address.set(None);
 
         let plan = match unsafe { SchedulerMemoryPlan::create(scheduler.as_ptr(), graph.as_ptr()) }
         {
@@ -4775,7 +5018,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         else {
             #[cfg(test)]
             {
-                return plan.commit().map_err(|error| {
+                let committed = plan.commit().map_err(|error| {
                     let requires_quarantine = error.requires_quarantine();
                     self.scheduler_plan_error(
                         "scheduler-plan/test-direct-commit",
@@ -4783,6 +5026,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                         requires_quarantine,
                     )
                 });
+                if committed.is_ok() {
+                    memory_owner
+                        .active_graph_address
+                        .set(Some(graph.as_ptr() as usize));
+                    if let Some(lifetime) = &mut self.scheduler_graph_lifetime {
+                        lifetime.graph = Some(graph);
+                    }
+                }
+                return committed;
             }
             #[cfg(not(test))]
             {
@@ -5038,6 +5290,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 source.to_string(),
             ));
         }
+        memory_owner
+            .active_graph_address
+            .set(Some(graph.as_ptr() as usize));
+        if let Some(lifetime) = &mut self.scheduler_graph_lifetime {
+            lifetime.graph = Some(graph);
+        }
         Ok(())
     }
 
@@ -5195,6 +5453,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
         }
+        self.ensure_scheduler_graph_active(graph)?;
         self.prepare_direct_graph_private_gate(graph)?;
         self.record_execution_placement(graph);
         let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
@@ -5662,6 +5921,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
     fn ensure_backend_buffer(&mut self) -> Result<(), GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
+        if let Some(graph) = self.prepared_graph {
+            self.ensure_scheduler_graph_active(graph)?;
+        }
         if self.frozen {
             return Ok(());
         }
@@ -6715,6 +6977,11 @@ struct GgmlSchedulerMemoryOwner {
     backend_private_leases: BTreeMap<usize, GgmlBackendPrivateLeaseOwner>,
     scheduler_private_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
     scheduler_leases: Arc<Mutex<Vec<NativeOwnerAttachedMemoryLease>>>,
+    /// Process-local cgraph address whose tensor bindings currently belong to
+    /// this scheduler's single graph allocation. Scheduler use is thread-bound,
+    /// so `Rc<Cell<_>>` preserves that ownership contract without pretending
+    /// the raw native graph can be synchronized across threads.
+    active_graph_address: Rc<Cell<Option<usize>>>,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -7814,6 +8081,7 @@ impl GgmlBackendSchedulerGuard {
                     backend_private_leases,
                     scheduler_private_leases: Rc::new(RefCell::new(Vec::new())),
                     scheduler_leases: Arc::new(Mutex::new(Vec::new())),
+                    active_graph_address: Rc::new(Cell::new(None)),
                     poisoned: Arc::new(AtomicBool::new(false)),
                 },
             })
@@ -8631,10 +8899,39 @@ mod tests {
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
         GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
         GpuProbeCache, GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
-        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, memory_admission_failure, runtime_gpu_is_available,
+        backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
+        gpu_probe_failed_log_message, gpu_probe_log_message, memory_admission_failure,
+        runtime_gpu_is_available, scheduler_allows_cpu_participants,
         validate_graph_cancel_capability,
     };
+
+    #[test]
+    fn full_device_runner_rejects_cpu_backend_and_excludes_cpu_scheduler_participants() {
+        use crate::device::execution_policy::ExecutionPlacement;
+
+        for backend in [GgmlCpuGraphBackend::Metal, GgmlCpuGraphBackend::Gpu] {
+            assert!(backend_satisfies_execution_placement(
+                backend,
+                Some(ExecutionPlacement::FullDevice),
+            ));
+            assert!(!scheduler_allows_cpu_participants(
+                backend,
+                Some(ExecutionPlacement::FullDevice),
+            ));
+            assert!(scheduler_allows_cpu_participants(
+                backend,
+                Some(ExecutionPlacement::Hybrid),
+            ));
+        }
+        assert!(!backend_satisfies_execution_placement(
+            GgmlCpuGraphBackend::Cpu,
+            Some(ExecutionPlacement::FullDevice),
+        ));
+        assert!(scheduler_allows_cpu_participants(
+            GgmlCpuGraphBackend::Cpu,
+            Some(ExecutionPlacement::CpuOnly),
+        ));
+    }
 
     #[test]
     fn graph_node_capacity_keeps_metadata_backing_in_lockstep() {
@@ -8653,6 +8950,28 @@ mod tests {
             config.context_bytes,
             GgmlCpuGraphConfig::metadata_context_bytes(1)
         );
+    }
+
+    #[test]
+    fn persistent_subgraph_capacity_is_independent_but_bounded_by_runner() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.set_graph_node_capacity(128);
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner");
+
+        let session = runner
+            .start_persistent_graph_session_with_node_capacity(37)
+            .expect("right-sized persistent subgraph");
+        assert_eq!(session.builder.graph_size, 37);
+        drop(session);
+
+        assert!(matches!(
+            runner.start_persistent_graph_session_with_node_capacity(0),
+            Err(GgmlCpuGraphError::InvalidGraphSize)
+        ));
+        assert!(matches!(
+            runner.start_persistent_graph_session_with_node_capacity(129),
+            Err(GgmlCpuGraphError::UnsupportedInputs { .. })
+        ));
     }
 
     #[test]
@@ -10714,6 +11033,84 @@ mod tests {
     }
 
     #[test]
+    fn sibling_persistent_graphs_rebind_the_shared_scheduler_before_reuse() {
+        // A scheduler has one graph-specific gallocr binding. Model stages such
+        // as a bidirectional recurrent stack keep two persistent graphs on one
+        // runner and alternate between them; preparing or computing the sibling
+        // invalidates the prior graph's tensor buffers until it is rebound.
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler CPU runner should initialize");
+
+        let mut first = runner
+            .start_persistent_graph_session(config.context_bytes)
+            .expect("first persistent session");
+        let (first_input, first_output) = {
+            let graph = first.builder();
+            let input = graph.new_tensor_1d_f32(2, "first_input").expect("input");
+            graph.set_input(input).expect("input flag");
+            let output = graph.mul(input, input).expect("square");
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare first graph");
+            (input, output)
+        };
+        first
+            .builder()
+            .set_f32_slice(first_input, &[2.0, 3.0], "first_input")
+            .expect("first upload");
+        assert_eq!(
+            first
+                .builder()
+                .compute_output_f32(first_output, 2)
+                .expect("first compute"),
+            vec![4.0, 9.0]
+        );
+
+        let mut second = runner
+            .start_persistent_graph_session(config.context_bytes)
+            .expect("second persistent session");
+        let (second_input, second_output) = {
+            let graph = second.builder();
+            let input = graph.new_tensor_1d_f32(2, "second_input").expect("input");
+            graph.set_input(input).expect("input flag");
+            let output = graph.add(input, input).expect("double");
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare second graph");
+            (input, output)
+        };
+        second
+            .builder()
+            .set_f32_slice(second_input, &[5.0, 7.0], "second_input")
+            .expect("second upload");
+        assert_eq!(
+            second
+                .builder()
+                .compute_output_f32(second_output, 2)
+                .expect("second compute"),
+            vec![10.0, 14.0]
+        );
+
+        // Reusing the first graph after the sibling ran used to write through
+        // its dangling buffer binding and abort inside ggml_backend_tensor_set.
+        first
+            .builder()
+            .set_f32_slice(first_input, &[4.0, 6.0], "first_input")
+            .expect("first graph should rebind before upload");
+        assert_eq!(
+            first
+                .builder()
+                .compute_output_f32(first_output, 2)
+                .expect("rebound first graph should compute"),
+            vec![16.0, 36.0]
+        );
+    }
+
+    #[test]
     fn scheduler_graph_compute_add_success() {
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.use_scheduler = true;
@@ -10898,6 +11295,17 @@ mod tests {
             .expect("first scheduler graph should compute");
         assert_eq!(values, vec![2.0, 3.0]);
         drop(graph);
+        assert_eq!(
+            runner
+                .scheduler
+                .as_ref()
+                .expect("scheduler was requested")
+                .memory_owner
+                .active_graph_address
+                .get(),
+            None,
+            "the one-shot graph must detach before its external arena can drop"
+        );
         assert!(retired_scheduler_leases.upgrade().is_some());
 
         runner
